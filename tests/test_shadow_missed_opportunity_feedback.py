@@ -41,7 +41,7 @@ def test_shadow_missed_opportunity_memory_with_clean_chinese_is_usable() -> None
     assert _memory_row_usable(_memory()) is True
 
 
-def test_missed_opportunity_memory_feedback_scales_repeated_evidence_without_hard_gate() -> None:
+def test_missed_opportunity_memory_feedback_remains_observation_only() -> None:
     feedback = MemoryFeedbackPolicy().build(
         [
             {
@@ -57,8 +57,9 @@ def test_missed_opportunity_memory_feedback_scales_repeated_evidence_without_har
 
     long_side = feedback["by_side"]["long"]
     habit = feedback["decision_habit"]["by_side"]["long"]
-    assert long_side["allow_probe"] is True
-    assert long_side["candidate_score_bonus"] >= 0.20
-    assert habit["stance"] == "probe_when_ev_ok"
-    assert habit["proactive_level"] >= 0.80
-    assert habit["probe_budget_pct"] >= 0.025
+    assert long_side["allow_probe"] is False
+    assert long_side["candidate_score_bonus"] == 0.0
+    assert long_side["canonical_outcome_count"] == 0
+    assert habit["stance"] == "fee_after_observation_only"
+    assert habit["proactive_level"] == 0.0
+    assert habit["probe_budget_pct"] == 0.0

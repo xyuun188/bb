@@ -822,6 +822,78 @@ def _timeseries_close_sequence(features: dict[str, Any]) -> tuple[list[float], s
     return closes, "", source
 
 
+def _rolling_forecast_quality(
+    closes: list[float],
+    forecast_price: float,
+    horizon_step: int,
+) -> dict[str, Any]:
+    """Build a scale-aware forecast interval from the current rolling distribution."""
+
+    prices = np.asarray(closes, dtype=float)
+    if (
+        prices.size < 2
+        or not np.all(np.isfinite(prices))
+        or np.any(prices <= 0)
+        or not math.isfinite(forecast_price)
+        or forecast_price <= 0
+    ):
+        return {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": "invalid_forecast_price_scale",
+            "threshold_source": "rolling_horizon_empirical_order_statistics",
+            "sample_count": 0,
+        }
+
+    effective_horizon = min(max(int(horizon_step), 1), prices.size - 1)
+    historical_returns = (
+        (prices[effective_horizon:] - prices[:-effective_horizon])
+        / prices[:-effective_horizon]
+        * 100.0
+    )
+    historical_returns = historical_returns[np.isfinite(historical_returns)]
+    if historical_returns.size == 0:
+        return {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": "rolling_horizon_distribution_unavailable",
+            "threshold_source": "rolling_horizon_empirical_order_statistics",
+            "sample_count": 0,
+        }
+
+    ordered = np.sort(historical_returns)
+    tail_count = max(int(math.sqrt(ordered.size)), 1)
+    lower_index = min(tail_count - 1, ordered.size - 1)
+    upper_index = max(ordered.size - tail_count, lower_index)
+    lower_bound = float(ordered[lower_index])
+    upper_bound = float(ordered[upper_index])
+    predicted_return = float((forecast_price - prices[-1]) / prices[-1] * 100.0)
+    anomalous = predicted_return < lower_bound or predicted_return > upper_bound
+    rank = int(np.searchsorted(ordered, predicted_return, side="right"))
+    empirical_cdf = (rank + 0.5) / (ordered.size + 1.0)
+    distribution_confidence = max(
+        0.0,
+        min(2.0 * min(empirical_cdf, 1.0 - empirical_cdf), 1.0),
+    )
+    return {
+        "production_eligible": not anomalous,
+        "anomalous": anomalous,
+        "reason": (
+            "outside_dynamic_rolling_forecast_interval"
+            if anomalous
+            else "within_dynamic_rolling_forecast_interval"
+        ),
+        "threshold_source": "rolling_horizon_empirical_order_statistics",
+        "threshold_policy": "tail_count_is_square_root_of_current_rolling_sample_count",
+        "sample_count": int(ordered.size),
+        "effective_horizon_step": int(effective_horizon),
+        "lower_return_bound_pct": round(lower_bound, 6),
+        "upper_return_bound_pct": round(upper_bound, 6),
+        "predicted_return_pct": round(predicted_return, 6),
+        "distribution_confidence": round(distribution_confidence, 6),
+    }
+
+
 def _load_timesfm_model(model_dir: str):
     def loader():
         official_error = ""
@@ -1161,7 +1233,8 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             if len(diff)
             else 0.0
         )
-        confidence = clamp(abs(expected_move_pct) / max(realized_vol_pct * 2.5, 0.35), 0.0, 1.0)
+        prediction_quality = _rolling_forecast_quality(closes, forecast_price, horizon_step)
+        confidence = float(prediction_quality.get("distribution_confidence") or 0.0)
         direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
         return {
             "available": True,
@@ -1182,6 +1255,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "direction": direction,
             "best_side": "long" if direction == "up" else "short" if direction == "down" else "hold",
             "confidence": round(confidence, 6),
+            "prediction_quality": prediction_quality,
             "realized_vol_pct": round(realized_vol_pct, 6),
             "prediction_count": len(predictions),
             "adapter": "chronos_2_pipeline_adapter",
@@ -1267,7 +1341,8 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             if len(diff)
             else 0.0
         )
-        confidence = clamp(abs(expected_move_pct) / max(realized_vol_pct * 2.5, 0.35), 0.0, 1.0)
+        prediction_quality = _rolling_forecast_quality(closes, forecast_price, horizon_step)
+        confidence = float(prediction_quality.get("distribution_confidence") or 0.0)
         direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
         return {
             "available": True,
@@ -1288,6 +1363,7 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "direction": direction,
             "best_side": "long" if direction == "up" else "short" if direction == "down" else "hold",
             "confidence": round(confidence, 6),
+            "prediction_quality": prediction_quality,
             "realized_vol_pct": round(realized_vol_pct, 6),
             "prediction_count": len(predictions),
             "adapter": "timesfm_official_adapter"

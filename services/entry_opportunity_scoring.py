@@ -19,6 +19,7 @@ from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
     signal_available,
+    signal_production_eligible,
 )
 from services.entry_signal_extraction import (
     expected_return_pct as signal_expected_return_pct,
@@ -138,85 +139,30 @@ class EntryOpportunityScoringPolicy:
         habit = self._safe_dict(feedback.get("decision_habit"))
         by_side = self._safe_dict(habit.get("by_side"))
         side_habit = self._safe_dict(by_side.get(side))
-        if not side_habit:
-            legacy_side = self._safe_dict(self._safe_dict(feedback.get("by_side")).get(side))
-            action_bias = str(legacy_side.get("action_bias") or "")
-            if action_bias == "prefer_small_probe_when_current_ev_positive":
-                side_habit = {
-                    "stance": "probe_when_ev_ok",
-                    "proactive_level": 0.35,
-                    "probe_budget_pct": legacy_side.get("max_probe_size_pct", 0.015),
-                    "min_expected_net_pct": 0.12,
-                    "max_loss_probability": 0.58,
-                    "max_tail_risk": 0.98,
-                }
-            elif action_bias == "require_stronger_confirmation":
-                side_habit = {
-                    "stance": "strict_confirm",
-                    "proactive_level": 0.0,
-                    "probe_budget_pct": 0.0,
-                    "min_expected_net_pct": 0.35,
-                    "max_loss_probability": 0.42,
-                    "max_tail_risk": 0.82,
-                }
         stance = str(side_habit.get("stance") or "neutral")
-        if stance == "probe_when_ev_ok":
-            min_expected = self._safe_float(side_habit.get("min_expected_net_pct"), 0.12)
-            max_loss_probability = self._safe_float(side_habit.get("max_loss_probability"), 0.58)
-            max_tail_risk = self._safe_float(side_habit.get("max_tail_risk"), 0.98)
-            quality_ok = bool(
-                expected_net_return_pct >= min_expected
-                and loss_probability <= max_loss_probability
-                and tail_risk_score <= max_tail_risk
-                and profit_quality_ratio > 0
-            )
-            proactive_level = min(
-                max(self._safe_float(side_habit.get("proactive_level"), 0.35), 0.0),
-                1.0,
-            )
-            if quality_ok:
-                score_adjustment = min(0.30, 0.08 + proactive_level * 0.18)
-                relaxed_min = max(
-                    0.35,
-                    base_min_score_required - min(0.22, 0.08 + proactive_level * 0.10),
-                )
-                return {
-                    "applied": True,
-                    "stance": stance,
-                    "quality_ok": True,
-                    "score_adjustment": round(score_adjustment, 6),
-                    "min_score_required": round(relaxed_min, 6),
-                    "max_size_pct": round(
-                        self._safe_float(side_habit.get("probe_budget_pct"), 0.015), 6
-                    ),
-                    "reason": (
-                        "review memory shows repeated missed opportunities; current EV and "
-                        "tail risk allow a small probe"
-                    ),
-                }
-            return {
-                "applied": False,
-                "stance": stance,
-                "quality_ok": False,
-                "score_adjustment": 0.0,
-                "reason": "missed-opportunity memory exists but current quality gates failed",
-            }
         if stance == "strict_confirm":
+            score_adjustment = min(
+                self._safe_float(side_habit.get("score_adjustment"), 0.0),
+                0.0,
+            )
             return {
-                "applied": True,
+                "applied": score_adjustment < 0.0,
                 "stance": stance,
                 "quality_ok": False,
-                "score_adjustment": -0.28,
-                "min_score_required": round(max(base_min_score_required + 0.22, 1.05), 6),
+                "score_adjustment": round(score_adjustment, 6),
                 "max_size_pct": 0.0,
-                "reason": "review memory says realized or shadow losses dominate this side",
+                "reason": (
+                    "authoritative fee-after return lower bound is negative; memory can only "
+                    "tighten current risk and cannot create a fixed entry threshold"
+                ),
             }
         return {
             "applied": False,
             "stance": stance,
             "quality_ok": False,
             "score_adjustment": 0.0,
-            "reason": "no memory habit adjustment",
+            "max_size_pct": 0.0,
+            "reason": "memory is observation-only and cannot authorize production probes",
         }
 
     def _vector_memory_adjustment(self, raw: dict[str, Any], *, side: str) -> dict[str, Any]:
@@ -519,8 +465,9 @@ class EntryOpportunityScoringPolicy:
             "profit",
         )
         local_best_side = payload_side(local_profit)
-        local_expected = signal_expected_return_pct(local_profit, side)
-        local_available = signal_available(local_profit)
+        local_available = signal_production_eligible(local_profit)
+        local_raw_expected = signal_expected_return_pct(local_profit, side)
+        local_expected = local_raw_expected if local_available else 0.0
         ml_aligned = (
             side_influence_enabled
             and expected_pct > 0
@@ -544,8 +491,14 @@ class EntryOpportunityScoringPolicy:
             "time_series",
         )
         ts_best_side = payload_side(ts_prediction)
-        ts_expected = directional_expected_return_pct(ts_prediction, side)
-        ts_aligned = signal_available(ts_prediction) and ts_best_side == side and ts_expected > 0
+        ts_production_eligible = signal_production_eligible(ts_prediction)
+        ts_raw_expected = directional_expected_return_pct(ts_prediction, side)
+        ts_expected = ts_raw_expected if ts_production_eligible else 0.0
+        ts_aligned = (
+            ts_production_eligible
+            and ts_best_side == side
+            and ts_expected > 0
+        )
         sentiment_prediction = _tool_signal(
             raw,
             "sentiment_analysis",
@@ -558,14 +511,16 @@ class EntryOpportunityScoringPolicy:
             sentiment_prediction, sentiment_best_side or side
         )
         sentiment_aligned = (
-            signal_available(sentiment_prediction)
+            signal_production_eligible(sentiment_prediction)
             and sentiment_best_side == side
             and sentiment_expected > 0
         )
         if exposure.get("dominant_side") in {"long", "short"}:
             dominant = str(exposure.get("dominant_side") or "")
             opposite_dominant = "short" if dominant == "long" else "long"
-            if side == opposite_dominant and (expected_pct > 0 or local_expected > 0 or ts_aligned):
+            if side == opposite_dominant and (
+                expected_pct > 0 or local_aligned or ts_aligned
+            ):
                 # Prefer portfolio balance only when this side has profit evidence.
                 exposure_balance_bonus += min(
                     abs(self._safe_float(exposure.get("net_ratio"), 0.0)) * 0.18, 0.22
@@ -997,10 +952,12 @@ class EntryOpportunityScoringPolicy:
                     "key": "server_profit",
                     "label": "服务器盈利模型",
                     "available": local_available,
+                    "raw_available": signal_available(local_profit),
+                    "production_eligible": local_available,
                     "side": local_best_side or "unknown",
-                    "raw_return_pct": round(local_expected, 6),
+                    "raw_return_pct": round(local_raw_expected, 6),
                     "weight": ENTRY_NET_WEIGHT_SERVER_PROFIT,
-                    "contribution_pct": round(local_expected * ENTRY_NET_WEIGHT_SERVER_PROFIT, 6),
+                    "contribution_pct": round(server_profit_contribution, 6),
                     "loss_probability": round(local_loss_probability, 6),
                     "note": (
                         "同向正期望。" if local_aligned else "未同向或期望为负，会拉低净收益。"
@@ -1010,8 +967,9 @@ class EntryOpportunityScoringPolicy:
                     "key": "timeseries",
                     "label": "时序模型",
                     "available": signal_available(ts_prediction),
+                    "production_eligible": ts_production_eligible,
                     "side": ts_best_side or "unknown",
-                    "raw_return_pct": round(ts_expected, 6),
+                    "raw_return_pct": round(ts_raw_expected, 6),
                     "weight": ENTRY_NET_WEIGHT_TIMESERIES,
                     "contribution_pct": round(timeseries_contribution, 6),
                     "note": "同向参与收益公式。" if ts_aligned else "未形成同向正期望。",
@@ -1053,6 +1011,7 @@ class EntryOpportunityScoringPolicy:
                     "key": "sentiment",
                     "label": "情绪模型",
                     "available": signal_available(sentiment_prediction),
+                    "production_eligible": signal_production_eligible(sentiment_prediction),
                     "side": sentiment_best_side or "unknown",
                     "raw_return_pct": round(sentiment_expected, 6),
                     "aligned": bool(sentiment_aligned),
@@ -1152,20 +1111,6 @@ class EntryOpportunityScoringPolicy:
         habit_score_adjustment = self._safe_float(
             memory_habit_adjustment.get("score_adjustment"), 0.0
         )
-        habit_min_score = memory_habit_adjustment.get("min_score_required")
-        if habit_min_score is not None:
-            min_score_required = self._safe_float(habit_min_score, min_score_required)
-        habit_size_cap = self._safe_float(memory_habit_adjustment.get("max_size_pct"), 0.0)
-        if (
-            habit_size_cap > 0
-            and memory_habit_adjustment.get("stance") == "probe_when_ev_ok"
-            and size > habit_size_cap
-        ):
-            original_size = size
-            size = habit_size_cap
-            decision.position_size_pct = size
-            memory_habit_adjustment["original_position_size"] = round(original_size, 6)
-            memory_habit_adjustment["adjusted_position_size"] = round(size, 6)
         vector_memory_adjustment = self._vector_memory_adjustment(raw, side=side)
         vector_memory_score_adjustment = self._safe_float(
             vector_memory_adjustment.get("score_adjustment"), 0.0
@@ -1238,11 +1183,13 @@ class EntryOpportunityScoringPolicy:
             "diagnostic_win_rate": round(diagnostic_win_rate, 6),
             "ml_profit_quality_score": round(ml_quality, 6),
             "server_profit_expected_return_pct": round(local_expected, 6),
+            "server_profit_raw_expected_return_pct": round(local_raw_expected, 6),
             "server_profit_best_side": local_best_side,
             "server_profit_conflict": bool(local_conflicts),
             "server_profit_loss_probability": round(local_loss_probability, 6),
             "server_profit_quality_score": round(local_quality, 6),
             "timeseries_expected_return_pct": round(ts_expected, 6),
+            "timeseries_raw_expected_return_pct": round(ts_raw_expected, 6),
             "timeseries_aligned": bool(ts_aligned),
             "confidence": round(confidence, 6),
             "ai_expected_return_pct": round(ai_expected_return_pct, 6),

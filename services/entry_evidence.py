@@ -15,7 +15,7 @@ from services.entry_signal_extraction import (
     expected_return_pct,
     payload_side,
     safe_float,
-    signal_available,
+    signal_production_eligible,
 )
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
@@ -264,7 +264,7 @@ def _server_profit_component(
     profit_side: str,
     entry_side: str,
 ) -> tuple[float, dict[str, Any]]:
-    available = signal_available(profit)
+    available = signal_production_eligible(profit)
     expected = expected_return_pct(profit, profit_side or entry_side)
     if available and profit_side == entry_side:
         expected = expected_return_pct(profit, entry_side)
@@ -307,40 +307,33 @@ def _memory_component(raw: dict[str, Any], entry_side: str) -> tuple[float, dict
     by_side = feedback.get("by_side") if isinstance(feedback.get("by_side"), dict) else {}
     if isinstance(by_side, dict):
         side_feedback = by_side.get(entry_side) if isinstance(by_side.get(entry_side), dict) else {}
-    memory_adjustment = safe_float(raw.get("memory_adjustment"), 0.0)
-    positive = int(safe_float(summary.get("positive_lessons"), 0.0))
-    risk = int(safe_float(summary.get("risk_lessons"), 0.0))
     used = int(safe_float(summary.get("used"), 0.0))
-    feedback_available = bool(side_feedback)
-    if used <= 0 and not feedback_available:
+    canonical_count = int(safe_float(side_feedback.get("canonical_outcome_count"), 0.0))
+    canonical_feedback = bool(canonical_count > 0 and side_feedback.get("cost_complete") is True)
+    if not canonical_feedback:
         points = 0.0
         status = "missing"
     else:
-        points = max(min(memory_adjustment * 45.0 + (positive - risk) * 1.5, 10.0), -10.0)
-        if feedback_available:
-            feedback_points = safe_float(side_feedback.get("score_adjustment"), 0.0) * 18.0
-            if side_feedback.get("allow_probe"):
-                feedback_points += 1.25
-            if side_feedback.get("action_bias") == "require_stronger_confirmation":
-                feedback_points -= 2.0
-            points = max(min(points + feedback_points, 10.0), -10.0)
-        status = "aligned" if points > 1.0 else "opposite" if points < -1.0 else "neutral"
+        points = min(safe_float(side_feedback.get("score_adjustment"), 0.0) * 18.0, 0.0)
+        status = "opposite" if points < 0.0 else "neutral"
     return points, {
-        "source": "shadow_memory",
-        "label": "影子/交易记忆",
-        "available": used > 0 or feedback_available,
+        "source": "authoritative_fee_after_memory",
+        "label": "权威费后交易记忆",
+        "available": canonical_feedback,
         "side": entry_side,
         "entry_side": entry_side,
         "weight": 10.0,
         "points": round(points, 6),
         "status": status,
-        "memory_adjustment": round(memory_adjustment, 6),
+        "memory_adjustment": 0.0,
         "used": used,
-        "positive_lessons": positive,
-        "risk_lessons": risk,
+        "positive_lessons": 0,
+        "risk_lessons": int(safe_float(side_feedback.get("risk_evidence_count"), 0.0)),
         "review_feedback": {
             "action_bias": side_feedback.get("action_bias"),
-            "allow_probe": bool(side_feedback.get("allow_probe")),
+            "allow_probe": False,
+            "canonical_outcome_count": canonical_count,
+            "cost_complete": bool(side_feedback.get("cost_complete")),
             "missed_opportunity_count": int(
                 safe_float(side_feedback.get("missed_opportunity_count"), 0.0)
             ),
@@ -513,7 +506,7 @@ def build_entry_evidence_score(
         _signal_component(
             label="时序",
             source="timeseries",
-            available=signal_available(timeseries),
+            available=signal_production_eligible(timeseries),
             side=timeseries_side,
             entry_side=entry_side,
             weight=20.0,
@@ -527,7 +520,7 @@ def build_entry_evidence_score(
         _signal_component(
             label="情绪",
             source="sentiment",
-            available=signal_available(sentiment),
+            available=signal_production_eligible(sentiment),
             side=sentiment_side,
             entry_side=entry_side,
             weight=10.0,
@@ -538,7 +531,7 @@ def build_entry_evidence_score(
         _signal_component(
             label="盈利模型",
             source="server_profit",
-            available=signal_available(profit),
+            available=signal_production_eligible(profit),
             side=profit_side,
             entry_side=entry_side,
             weight=5.0,
@@ -788,29 +781,6 @@ def build_entry_evidence_score(
             _ENTRY_EVIDENCE_PARAMS.elite_positive_relief_min_opportunity_score,
         )
     )
-    memory_component = next(
-        (item for item in components if item.get("source") == "shadow_memory"),
-        {},
-    )
-    memory_review = (
-        memory_component.get("review_feedback")
-        if isinstance(memory_component.get("review_feedback"), dict)
-        else {}
-    )
-    memory_missed_count = int(safe_float(memory_review.get("missed_opportunity_count"), 0.0))
-    memory_score_adjustment = safe_float(memory_review.get("score_adjustment"), 0.0)
-    memory_relief_allowed = bool(
-        positive_net_probe_allowed
-        and bool(memory_review.get("allow_probe"))
-        and memory_missed_count >= 6
-        and memory_score_adjustment >= 0.12
-        and expected_net_return >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_expected_pct
-        and profit_quality_ratio >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
-        and loss_probability <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
-        and tail_risk_score <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
-        and "shadow_memory" not in major_opposites
-        and not strong_opposites
-    )
     if positive_net_probe_allowed:
         original_effective_score = effective_score
         if effective_score < ENTRY_EVIDENCE_SCORE_WEAK_PROBE:
@@ -830,27 +800,6 @@ def build_entry_evidence_score(
                 "机会评分为正但仍处于弱冲突档；本轮只沉淀影子样本和复盘证据，"
                 "不再提交微小真实/模拟订单。只有净收益、盈利质量、置信度和多源同向证据"
                 "继续增强并抬升到 exploration/small 档后才允许执行。"
-            ),
-        }
-    if memory_relief_allowed:
-        original_effective_score = effective_score
-        effective_score = max(effective_score, ENTRY_EVIDENCE_SCORE_PROBE)
-        tradeable_probe = True
-        memory_missed_opportunity_relief = {
-            "applied": True,
-            "tradeable_probe": True,
-            "shadow_only": False,
-            "from_effective_score": round(original_effective_score, 6),
-            "to_effective_score": round(effective_score, 6),
-            "missed_opportunity_count": memory_missed_count,
-            "memory_score_adjustment": round(memory_score_adjustment, 6),
-            "expected_net_return_pct": round(expected_net_return, 6),
-            "profit_quality_ratio": round(profit_quality_ratio, 6),
-            "loss_probability": round(loss_probability, 6),
-            "tail_risk_score": round(tail_risk_score, 6),
-            "reason": (
-                "影子复盘多次证明观望错过同方向机会，且当前预期净收益、盈利质量、"
-                "亏损概率和尾部风险达标；允许受控小仓质量试单，但不绕过硬风控。"
             ),
         }
     if strong_positive_relief_allowed:

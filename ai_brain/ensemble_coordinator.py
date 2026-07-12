@@ -26,7 +26,7 @@ from config.settings import (
 from core.safe_output import safe_error_text
 from services.entry_signal_extraction import (
     enrich_signal_payload,
-    signal_available,
+    signal_production_eligible,
     unwrap_tool_payload,
 )
 from services.entry_signal_extraction import (
@@ -1548,7 +1548,7 @@ class EnsembleCoordinator:
         opposite = "short" if side == "long" else "long"
 
         profit = self._local_profit_signal(context)
-        if profit and signal_available(profit):
+        if profit and signal_production_eligible(profit):
             expected = self._local_expected_return(profit, side)
             opposite_expected = self._local_expected_return(profit, opposite)
             loss_probability = self._safe_float(profit.get(f"{side}_loss_probability"), 0.0)
@@ -2848,16 +2848,14 @@ class EnsembleCoordinator:
         size = min(max(avg_size, 0.02), 1.0)
         if confidence < settings.confidence_threshold:
             size = max(size, 0.02)
-        leverage = min(max(self._avg(leverage_votes, 3.0), 3.0), settings.max_leverage)
+        requested_leverage = self._avg(leverage_votes, 1.0)
+        leverage = min(max(requested_leverage, 1.0), settings.max_leverage)
         if probe_entry:
             size = min(size, MAX_PROBE_ENTRY_SIZE)
         if profit_first_probe:
             size = min(size, PROFIT_FIRST_PROBE_SIZE)
         if recovery_probe_entry:
             size = min(size, ENTRY_RISK_SIZING_PARAMS.ensemble_recovery_probe_size_cap)
-        leverage_cap = self._entry_leverage_cap(confidence, quality_points)
-        min_leverage = self._entry_min_leverage(confidence, quality_points)
-        leverage = min(max(leverage, min_leverage), leverage_cap, settings.max_leverage)
         memory_size_multiplier = self._memory_size_multiplier(context, action)
         size = max(min(size * memory_size_multiplier, 1.0), 0.0)
         size = min(size, 1.0)
@@ -2923,7 +2921,6 @@ class EnsembleCoordinator:
                 "readable_reason": crowded_reason,
                 "reason": "同方向敞口已偏高，仅允许盈利质量强的小仓机会，避免普通加仓堆单。",
             }
-        leverage = min(max(leverage, min_leverage), leverage_cap, settings.max_leverage)
         if 0.0 < risk_size_multiplier < 1.0:
             original_size = size
             size = max(min(size * risk_size_multiplier, 1.0), 0.0)
@@ -3020,11 +3017,10 @@ class EnsembleCoordinator:
             "disagreement": round(disagreement, 4),
             "policy": "专家同向支持是开仓主条件；ML/服务器盈利模型只作为辅助加分和过滤。",
         }
-        raw_response["min_leverage"] = min_leverage
-        raw_response["leverage_cap"] = leverage_cap
+        raw_response["requested_leverage"] = round(requested_leverage, 6)
         raw_response["leverage_policy"] = (
-            f"满足 {quality_points}/3 项入场质量过滤，最低杠杆 {min_leverage:.1f}x，"
-            f"杠杆上限 {leverage_cap:.1f}x，AI 最终选择 {leverage:.1f}x"
+            "上游只提供请求杠杆；最终杠杆由动态分配器按费后收益分布、止损距离、"
+            "波动率、流动性、组合敞口和账户风险预算计算，不按置信度提供杠杆保底。"
         )
         return DecisionOutput(
             model_name=ENSEMBLE_TRADER_NAME,
@@ -3611,7 +3607,7 @@ class EnsembleCoordinator:
         if not isinstance(tools, dict) or not tools.get("enabled"):
             return {"enabled": False, "allow": True, "status": "unavailable"}
         profit = self._local_profit_signal(context)
-        if not profit or not signal_available(profit):
+        if not profit or not signal_production_eligible(profit):
             return {"enabled": False, "allow": True, "status": "no_profit_prediction"}
         side = "long" if direction == "long" else "short"
         expected = self._local_expected_return(profit, side)
@@ -3708,7 +3704,7 @@ class EnsembleCoordinator:
         if side not in {"long", "short"}:
             return False
         profit = self._local_profit_signal(context)
-        if not profit or not signal_available(profit):
+        if not profit or not signal_production_eligible(profit):
             return False
         expected = self._local_expected_return(profit, side)
         best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
@@ -3724,7 +3720,7 @@ class EnsembleCoordinator:
         if side not in {"long", "short"}:
             return False
         prediction = self._local_timeseries_signal(context)
-        if not prediction or not signal_available(prediction):
+        if not prediction or not signal_production_eligible(prediction):
             return False
         best_side = signal_payload_side(prediction)
         expected = self._local_expected_return(prediction, side)
@@ -4065,7 +4061,7 @@ class EnsembleCoordinator:
         result["source_policy"] = source_policy
 
         profit = self._local_profit_signal(context)
-        if not profit or not signal_available(profit):
+        if not profit or not signal_production_eligible(profit):
             result.update(
                 {
                     "status": "blocked_no_local_profit_prediction",
@@ -4285,7 +4281,7 @@ class EnsembleCoordinator:
         if not isinstance(local_gate, dict):
             local_gate = {}
         profit = self._local_profit_signal(context)
-        if not profit or not signal_available(profit):
+        if not profit or not signal_production_eligible(profit):
             result.update(
                 {"status": "blocked_no_local_profit_prediction", "reason": "服务器盈利预测不可用。"}
             )
@@ -4526,20 +4522,6 @@ class EnsembleCoordinator:
             )
             if passed
         )
-
-    def _entry_leverage_cap(self, confidence: float, quality_points: int) -> float:
-        if confidence < 0.68:
-            return min(5.0, settings.max_leverage)
-        if confidence < 0.78 or quality_points < 2:
-            return min(10.0, settings.max_leverage)
-        return settings.max_leverage
-
-    def _entry_min_leverage(self, confidence: float, quality_points: int) -> float:
-        if confidence >= 0.78 and quality_points >= 2:
-            return min(10.0, settings.max_leverage)
-        if confidence >= 0.68:
-            return min(5.0, settings.max_leverage)
-        return min(1.0, settings.max_leverage)
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -4836,7 +4818,7 @@ class EnsembleCoordinator:
                 ),
                 1.0,
             ),
-            self._entry_leverage_cap(max(max_conf, MIN_EXECUTABLE_ENTRY_CONFIDENCE), 3),
+            settings.max_leverage,
         )
         stop_loss_pct = min(
             max(
@@ -4948,7 +4930,11 @@ class EnsembleCoordinator:
             profit.get(f"{current_side}_loss_probability"), 0.50
         )
         local_best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
-        local_available = isinstance(profit, dict) and bool(profit) and signal_available(profit)
+        local_available = (
+            isinstance(profit, dict)
+            and bool(profit)
+            and signal_production_eligible(profit)
+        )
 
         ts_prediction = self._local_timeseries_signal(context)
         ts_best_side = signal_payload_side(ts_prediction)
@@ -5069,13 +5055,18 @@ class EnsembleCoordinator:
                     f"扩亏证据 {expansion_score} 项；由亏转盈概率不足，优先全平防止亏损扩大。"
                 )
             else:
-                should_close = False
-                action_plan = "hold"
-                position_size_pct = 0.0
+                should_close = True
+                action_plan = "reduce"
+                position_size_pct = self._dynamic_loss_reduce_fraction(
+                    position_risk_usage=position_risk_usage,
+                    loss_abs=loss_abs,
+                    dynamic_loss_reduce_usdt=dynamic_loss_reduce_usdt,
+                    dynamic_loss_full_usdt=dynamic_loss_full_usdt,
+                )
                 reason = (
                     f"亏损修复评估：当前浮亏 {position_unrealized_pnl:.2f}U，"
                     f"服务器亏损概率 {local_loss_probability:.0%}，修复证据 {repair_score} 项，"
-                    f"扩亏证据 {expansion_score} 项；先减仓 60%，保留少量观察反转。"
+                    f"扩亏证据 {expansion_score} 项；按动态风险预算占用减仓，保留剩余仓位观察反转。"
                 )
 
         return {
@@ -5200,6 +5191,20 @@ class EnsembleCoordinator:
             "adx_14": round(adx_14, 4),
         }
 
+    @staticmethod
+    def _dynamic_loss_reduce_fraction(
+        *,
+        position_risk_usage: float,
+        loss_abs: float,
+        dynamic_loss_reduce_usdt: float,
+        dynamic_loss_full_usdt: float,
+    ) -> float:
+        """Scale reduction continuously from the current dynamic risk budget usage."""
+
+        full_budget = max(dynamic_loss_full_usdt, dynamic_loss_reduce_usdt, 1e-9)
+        budget_usage = max(loss_abs, 0.0) / full_budget
+        return min(max(position_risk_usage, budget_usage, 0.0), 1.0)
+
     def _position_close_evidence(
         self,
         current_side: str | None,
@@ -5259,6 +5264,7 @@ class EnsembleCoordinator:
         position_profit_pct = 0.0
         planned_risk_price = 0.0
         planned_risk_usdt = 0.0
+        planned_stop_crossed = False
         age_minutes = 9999.0
         if symbol_positions:
             pos = symbol_positions[0] or {}
@@ -5283,18 +5289,11 @@ class EnsembleCoordinator:
             if entry_price > 0 and current_price > 0:
                 if current_side == "long":
                     adverse_move = max(entry_price - current_price, 0.0)
-                    planned_risk = (
-                        max(entry_price - stop_loss, entry_price * 0.02)
-                        if stop_loss > 0
-                        else entry_price * 0.05
-                    )
+                    planned_stop_crossed = stop_loss > 0 and current_price <= stop_loss
                 else:
                     adverse_move = max(current_price - entry_price, 0.0)
-                    planned_risk = (
-                        max(stop_loss - entry_price, entry_price * 0.02)
-                        if stop_loss > 0
-                        else entry_price * 0.05
-                    )
+                    planned_stop_crossed = stop_loss > 0 and current_price >= stop_loss
+                planned_risk = abs(entry_price - stop_loss) if stop_loss > 0 else 0.0
                 planned_risk_price = planned_risk
                 planned_risk_usdt = planned_risk * quantity
                 position_loss = adverse_move > 0 or position_unrealized_pnl < 0
@@ -5665,6 +5664,12 @@ class EnsembleCoordinator:
         dynamic_loss_reduce_usdt *= loss_threshold_scale
         dynamic_loss_full_usdt *= loss_threshold_scale
         loss_abs = abs(min(position_unrealized_pnl, 0.0))
+        dynamic_loss_reduce_fraction = self._dynamic_loss_reduce_fraction(
+            position_risk_usage=position_risk_usage,
+            loss_abs=loss_abs,
+            dynamic_loss_reduce_usdt=dynamic_loss_reduce_usdt,
+            dynamic_loss_full_usdt=dynamic_loss_full_usdt,
+        )
         loss_repair = self._loss_repair_evidence(
             current_side=current_side,
             score=score,
@@ -5684,12 +5689,24 @@ class EnsembleCoordinator:
             momentum_waning=momentum_waning,
         )
 
-        if hard_risk:
+        if planned_stop_crossed:
+            should_close = True
+            action_plan = "full_close"
+            position_size_pct = 1.0
+            reason = "当前价格已经穿越该仓位的计划止损价，计划风险优先于专家继续持有意见，立即全平。"
+            suggested_confidence = max(max_conf, 0.82)
+        elif hard_risk:
             should_close = True
             action_plan = "full_close"
             position_size_pct = 1.0
             reason = "风控专家触发硬风险，且当前仓位已有足够真实风险证据，立即全平。"
             suggested_confidence = max(max_conf, 0.82)
+        elif position_loss and position_risk_usage >= 1.0:
+            should_close = True
+            action_plan = "full_close"
+            position_size_pct = 1.0
+            reason = f"浮亏已经达到或超过计划止损风险的 {position_risk_usage * 100:.0f}%，执行全平，避免继续拖延。"
+            suggested_confidence = max(max_conf, 0.72)
         elif (
             position_profit
             and predictive_exit
@@ -5710,7 +5727,9 @@ class EnsembleCoordinator:
         elif loss_repair.get("should_close"):
             should_close = True
             action_plan = str(loss_repair.get("action_plan") or "reduce")
-            position_size_pct = float(loss_repair.get("position_size_pct") or 0.60)
+            position_size_pct = (
+                1.0 if action_plan == "full_close" else dynamic_loss_reduce_fraction
+            )
             reason = str(
                 loss_repair.get("reason") or "亏损修复评估显示扩亏概率更高，先处理亏损仓位。"
             )
@@ -5727,24 +5746,21 @@ class EnsembleCoordinator:
             should_close = True
             action_plan = (
                 "full_close"
-                if predictive_full_exit or loss_abs >= dynamic_loss_full_usdt * 0.70
-                else "hold"
+                if predictive_full_exit or loss_abs >= dynamic_loss_full_usdt
+                else "reduce"
             )
-            position_size_pct = 1.0 if action_plan == "full_close" else 0.0
+            position_size_pct = (
+                1.0 if action_plan == "full_close" else dynamic_loss_reduce_fraction
+            )
             reason = (
                 f"亏损修复预判：当前浮亏 {position_unrealized_pnl:.2f}U，"
                 f"反向风险评分 {predictive_reversal_score:.0f}，且修复证据不足；"
                 "先减仓/平仓，避免小亏拖成大亏。"
             )
-            if action_plan == "hold":
-                should_close = False
-                block_reason = reason
-            else:
-                suggested_confidence = max(max_conf, 0.72)
+            suggested_confidence = max(max_conf, 0.72)
         elif (
             position_loss
             and loss_abs >= dynamic_loss_full_usdt
-            and (position_risk_usage >= 0.45 or bool(support) or strong_opposite_pressure)
         ):
             should_close = True
             action_plan = "full_close"
@@ -5757,11 +5773,13 @@ class EnsembleCoordinator:
         elif (
             position_loss
             and loss_abs >= dynamic_loss_reduce_usdt
-            and (position_risk_usage >= 0.30 or bool(support) or moderate_opposite_pressure)
         ):
-            block_reason = (
+            should_close = True
+            action_plan = "reduce"
+            position_size_pct = dynamic_loss_reduce_fraction
+            reason = (
                 f"亏损压缩：当前浮亏 {position_unrealized_pnl:.2f}U / {position_profit_pct * 100:.2f}%，"
-                f"已经超过动态减仓线 {dynamic_loss_reduce_usdt:.2f}U，先减仓 60%，降低单笔亏损继续扩大的概率。"
+                f"已经超过动态减仓线 {dynamic_loss_reduce_usdt:.2f}U，按当前风险预算占用动态减仓，降低左尾继续扩大的概率。"
             )
             suggested_confidence = max(max_conf, 0.66)
         elif (
@@ -5774,12 +5792,6 @@ class EnsembleCoordinator:
                 f"仓位仍处于早期验证阶段，已持仓 {age_minutes:.1f} 分钟；"
                 "当前退出证据还不够强，暂不因普通波动、单个专家分歧或小幅浮盈主动平仓。"
             )
-        elif position_loss and position_risk_usage >= 1.0:
-            should_close = True
-            action_plan = "full_close"
-            position_size_pct = 1.0
-            reason = f"浮亏已经达到或超过计划止损风险的 {position_risk_usage * 100:.0f}%，执行全平，避免继续拖延。"
-            suggested_confidence = max(max_conf, 0.72)
         elif (
             position_loss
             and position_risk_usage >= LOSS_FULL_MIN_RISK_USAGE
@@ -5795,22 +5807,11 @@ class EnsembleCoordinator:
             and position_risk_usage >= LOSS_REDUCE_MIN_RISK_USAGE
             and (len(strong_support) >= 2 or strong_opposite_pressure)
         ):
-            should_close = False
-            action_plan = "hold"
-            position_size_pct = 0.0
-            reason = f"浮亏已达到止损风险的 {position_risk_usage * 100:.0f}%，且已有退出线索，先减仓 50%，保留后续确认空间。"
-            suggested_confidence = max(max_conf, 0.66)
-        elif (
-            False
-            and position_loss
-            and position_risk_usage >= 0.45
-            and (support or strong_opposite_pressure)
-        ):
             should_close = True
             action_plan = "reduce"
-            position_size_pct = 0.5
-            reason = f"浮亏已达到止损风险的 {position_risk_usage * 100:.0f}%，且出现反向压力，先减仓 50%。"
-            suggested_confidence = max(max_conf, 0.62)
+            position_size_pct = dynamic_loss_reduce_fraction
+            reason = f"浮亏已达到动态止损风险预算的 {position_risk_usage * 100:.0f}%，且已有退出线索，按风险预算占用动态减仓。"
+            suggested_confidence = max(max_conf, 0.66)
         elif (
             position_profit
             and profit_protect
@@ -6107,9 +6108,14 @@ class EnsembleCoordinator:
             ),
             "planned_risk_price": round(planned_risk_price, 8),
             "planned_risk_usdt": round(planned_risk_usdt, 6),
+            "planned_stop_crossed": bool(planned_stop_crossed),
             "loss_repair_evidence": loss_repair,
             "loss_compress_reduce_line": round(dynamic_loss_reduce_usdt, 6),
             "loss_compress_full_line": round(dynamic_loss_full_usdt, 6),
+            "dynamic_loss_reduce_fraction": round(dynamic_loss_reduce_fraction, 6),
+            "dynamic_loss_reduce_fraction_policy": (
+                "max(planned_risk_usage, loss_abs/dynamic_full_loss_budget)"
+            ),
             "loss_compress_formula": (
                 "减仓线=max(3U, 名义价值0.6%, 计划风险35%); "
                 "全平线=max(8U, 名义价值1.2%, 计划风险65%)"

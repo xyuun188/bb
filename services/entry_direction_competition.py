@@ -10,6 +10,7 @@ from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
     signal_available,
+    signal_production_eligible,
 )
 from services.entry_signal_extraction import (
     expected_return_pct as signal_expected_return_pct,
@@ -110,6 +111,7 @@ def _tool_model_evidence(
         evidence[tool] = {
             "tool": tool,
             "available": signal_available(payload),
+            "production_eligible": signal_production_eligible(payload),
             "status": payload.get("status"),
             "primary_model": payload.get("primary_model") or payload.get("model"),
             "challenger_model": payload.get("challenger_model"),
@@ -268,7 +270,7 @@ class EntryDirectionCompetitionPolicy:
             "server_profit_model",
             "profit",
         )
-        if not signal_available(profit):
+        if not signal_production_eligible(profit):
             return
 
         weight = self._source_weight(strategy, "server_profit_model")
@@ -305,7 +307,7 @@ class EntryDirectionCompetitionPolicy:
             "timeseries",
             "time_series",
         )
-        if not signal_available(prediction):
+        if not signal_production_eligible(prediction):
             return
 
         weight = self._source_weight(strategy, "timeseries_model")
@@ -341,7 +343,7 @@ class EntryDirectionCompetitionPolicy:
             "sentiment_model",
             "sentiment",
         )
-        if not signal_available(sentiment):
+        if not signal_production_eligible(sentiment):
             return
 
         side = payload_side(sentiment)

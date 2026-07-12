@@ -183,13 +183,12 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
 
 
 @pytest.mark.asyncio
-async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
+async def test_shadow_backtest_cost_incomplete_positive_move_does_not_create_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from config.settings import settings
 
     monkeypatch.setattr(settings, "shadow_memory_enabled", True)
-    monkeypatch.setattr(settings, "shadow_memory_min_return_pct", 0.40)
     repo = _FakeRepo()
     row = SimpleNamespace(
         id=7,
@@ -217,11 +216,49 @@ async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
             "actual_price": 101.0,
             "long_return_pct": pytest.approx(1.0),
             "short_return_pct": pytest.approx(-1.0),
-            "best_action": "long",
-            "missed_opportunity": True,
-            "note": "当时观望，但 10 分钟后做多方向收益约1.00%。",
+            "best_action": "hold",
+            "missed_opportunity": False,
+            "note": "",
         }
     ]
+    assert repo.memories == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_records_fee_after_observation_without_probe_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=8,
+        decision_id=123,
+        model_name="ensemble_trader",
+        symbol="btc/usdt",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={
+            "adx_14": 28.0,
+            "volume_ratio": 1.4,
+            "returns_5": 0.004,
+            "orderbook_imbalance": 0.15,
+            "bid": 99.99,
+            "ask": 100.01,
+            "orderbook_bid_depth": 100_000.0,
+            "orderbook_ask_depth": 100_000.0,
+            "funding_rate": 0.0,
+            "funding_interval_minutes": 480.0,
+        },
+    )
+    repo.due_rows = [row]
+
+    await _service(repo, latest_price=101.0).update_due()
+
     assert len(repo.memories) == 4
     assert {item["expert_name"] for item in repo.memories} == {
         "trend_expert",
@@ -231,6 +268,57 @@ async def test_shadow_backtest_service_updates_due_rows_and_records_memory(
     }
     assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
     assert repo.memories[0]["extra"]["actual_price"] == 101.0
+    assert all(item["confidence_adjustment"] == 0.0 for item in repo.memories)
+    assert all(item["position_size_multiplier"] == 1.0 for item in repo.memories)
+    assert all(item["success_count"] == 0 for item in repo.memories)
+    assert all(item["failure_count"] == 0 for item in repo.memories)
+    assert all(item["extra"]["cost_complete"] is True for item in repo.memories)
+    assert all(
+        item["extra"]["production_evidence_eligible"] is False for item in repo.memories
+    )
+    assert all(item["recommended_action"] == "shadow_observation_only" for item in repo.memories)
+    assert repo.memories[0]["extra"]["net_return_after_cost_pct"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_shadow_horizons_share_one_correlated_memory_key_per_expert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+    repo = _FakeRepo()
+    feature_snapshot = {
+        "bid": 99.99,
+        "ask": 100.01,
+        "orderbook_bid_depth": 100_000.0,
+        "orderbook_ask_depth": 100_000.0,
+        "funding_rate": 0.0,
+        "funding_interval_minutes": 480.0,
+    }
+    repo.due_rows = [
+        SimpleNamespace(
+            id=row_id,
+            decision_id=456,
+            model_name="ensemble_trader",
+            symbol="BTC/USDT",
+            decision_action="hold",
+            entry_price=100.0,
+            horizon_minutes=horizon,
+            status="pending",
+            note="",
+            feature_snapshot=feature_snapshot,
+        )
+        for row_id, horizon in ((10, 10), (11, 30))
+    ]
+
+    await _service(repo, latest_price=101.0).update_due()
+
+    assert len(repo.memories) == 8
+    assert len({item["memory_key"] for item in repo.memories}) == 4
+    assert {
+        item["extra"]["correlation_group"] for item in repo.memories
+    } == {"shadow_decision:456"}
 
 
 @pytest.mark.asyncio

@@ -254,7 +254,8 @@ def test_direction_competition_reads_wrapped_server_quant_payloads() -> None:
                 "primary_model": "catboost_lgbm_profit_v2",
                 "challenger_model": "tabnet_profit_shadow_v1",
                 "model_version": "2026-06-26T08:00:00Z",
-                "route_mode": "shadow_compare",
+                "route_mode": "live",
+                "live_mutation": True,
                 "fallback_reason": None,
                 "feature_coverage": {"ratio": 0.92, "status": "ok"},
                 "data": {
@@ -285,7 +286,7 @@ def test_direction_competition_reads_wrapped_server_quant_payloads() -> None:
     assert model_evidence["available"] is True
     assert model_evidence["primary_model"] == "catboost_lgbm_profit_v2"
     assert model_evidence["challenger_model"] == "tabnet_profit_shadow_v1"
-    assert model_evidence["route_mode"] == "shadow_compare"
+    assert model_evidence["route_mode"] == "live"
     assert model_evidence["feature_coverage"] == {"ratio": 0.92, "status": "ok"}
 
 
@@ -375,6 +376,33 @@ def test_strategy_side_weights_do_not_override_strong_opposing_evidence() -> Non
 
     assert context["preferred_side"] == "short"
     assert context["short"]["score"] > context["long"]["score"]
+
+
+def test_shadow_timesfm_extreme_prediction_cannot_change_production_direction() -> None:
+    feature = _feature(returns_5=0.002, returns_20=0.004, adx_14=22.0)
+    baseline = _context(feature=feature)
+    with_shadow = _context(
+        feature=feature,
+        tools={
+            "time_series_prediction": {
+                "available": True,
+                "route_mode": "shadow_candidate",
+                "live_mutation": False,
+                "model": "timesfm-2.5-primary",
+                "best_side": "short",
+                "direction": "down",
+                "expected_move_pct": -92.244972,
+                "expected_return_pct": -92.244972,
+            }
+        },
+    )
+
+    assert with_shadow["preferred_side"] == baseline["preferred_side"]
+    assert with_shadow["long"]["score"] == baseline["long"]["score"]
+    assert with_shadow["short"]["score"] == baseline["short"]["score"]
+    evidence = with_shadow["local_ai_tools_model_evidence"]["time_series_prediction"]
+    assert evidence["available"] is True
+    assert evidence["production_eligible"] is False
 
 
 def test_direction_competition_ignores_diagnostic_ml_win_rate() -> None:

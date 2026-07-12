@@ -428,6 +428,25 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
     assert result["shadow_payload"]["specialist_inference_active"] is True
 
 
+def test_timeseries_forecast_quality_uses_rolling_distribution_not_fixed_move() -> None:
+    module = ModuleType("local_ai_tools_api_dynamic_forecast_quality_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    calm_closes = [100.0 + index * 0.01 for index in range(60)]
+    volatile_closes = [100.0 + ((-1) ** index) * index * 0.2 for index in range(60)]
+    calm = module._rolling_forecast_quality(calm_closes, 10.0, 2)
+    volatile = module._rolling_forecast_quality(volatile_closes, 10.0, 2)
+
+    assert calm["anomalous"] is True
+    assert calm["production_eligible"] is False
+    assert calm["reason"] == "outside_dynamic_rolling_forecast_interval"
+    assert calm["threshold_source"] == "rolling_horizon_empirical_order_statistics"
+    assert calm["sample_count"] == len(calm_closes) - 2
+    assert volatile["lower_return_bound_pct"] != calm["lower_return_bound_pct"]
+    assert volatile["upper_return_bound_pct"] != calm["upper_return_bound_pct"]
+
+
 def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

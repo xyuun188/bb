@@ -15,7 +15,7 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
-    signal_available,
+    signal_production_eligible,
 )
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryQuantProfitProbeParams
 
@@ -70,7 +70,7 @@ class EntryQuantProfitProbePolicy:
             return None
         tools = local_ai_tools_context if isinstance(local_ai_tools_context, dict) else {}
         profit = _profit_signal(local_ai_tools_context)
-        if not signal_available(profit):
+        if not signal_production_eligible(profit):
             return None
         side = payload_side(profit)
         if side not in {"long", "short"}:

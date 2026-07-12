@@ -224,11 +224,10 @@ Rules:
 - Return ONLY one compact JSON object, no markdown, no prose, no <think>.
 - You may approve, hold, reverse direction, open a trade even when the preliminary decision is hold, or actively close/reduce a position.
 - Do not force long/short when evidence is poor. Borderline positive-EV entries must use small/probe sizing; never bypass hard risk into a normal-size entry.
-- If memory_feedback or entry_candidate_evidence says a side has repeated missed opportunities, do not default to HOLD solely from caution. Approve at most a small/probe entry when current expected net profit, loss probability, liquidity, and tail risk are acceptable.
+- Shadow missed-opportunity memory is observation-only and cannot authorize an entry, probe, size, leverage, or threshold change.
 - If entry_candidate_evidence marks the chosen side as non-positive EV, low payoff quality, or probe_conversion_blocked, treat that side as not ready for real execution; choose hold or the better opposite side instead of relying on later filters to reject it.
 - If strategy/exposure shows one side is already crowded, do not add ordinary same-side entries. Same-side action needs clearly superior symbol-specific net profit and independent confirmation; otherwise hold or choose the better opposite side.
-- If memory_feedback.decision_habit marks a side as probe_when_ev_ok, treat HOLD as a decision that needs evidence; use the probe budget only when EV is positive and hard risk is absent.
-- If memory_feedback.decision_habit marks a side as strict_confirm, require stronger current evidence and smaller size/leverage even when the direction looks attractive.
+- If memory_feedback.decision_habit marks a side as strict_confirm from authoritative fee-after losses, require stronger current evidence and smaller dynamic risk allocation even when the direction looks attractive.
 - If memory_feedback says realized loss lessons dominate, keep the habit conservative for that side: require stronger current evidence and reduce size/leverage.
 - Choose action, leverage, position size, entry timing, and exit timing. The system only overrides for hard account/exchange safety.
 - Maximize realized net profit after fees/slippage. Be slightly aggressive when expected value is positive and risk is controllable.
@@ -422,8 +421,8 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             "entry: non-positive chosen-side EV, probe_conversion_blocked, or poor payoff quality should become hold/opposite-side, not a trade that downstream guards must reject.",
             "entry: respect crowded-side exposure; ordinary same-side adds should not be generated unless symbol-specific profit evidence is clearly superior.",
             "entry: do not force trades; borderline opportunities can only be small/probe.",
-            "entry: repeated missed-opportunity feedback is a reason to consider a small probe, not a reason to bypass hard risk.",
-            "entry: decision_habit.probe_when_ev_ok means be selectively earlier; decision_habit.strict_confirm means demand stronger evidence.",
+            "entry: shadow missed-opportunity feedback is observation-only and never grants a production probe.",
+            "entry: decision_habit.strict_confirm must come from authoritative fee-after loss evidence and can only tighten dynamic risk.",
             "entry: realized-loss feedback means require stronger confirmation or reduce size/leverage.",
             "entry: use profit_first_guidance to read which source/lane/exit patterns recently made or lost real net profit.",
             "entry: profit_first missed-positive-shadow means quality opportunities may deserve earlier attention; tiny-probe fee drag means weak edges should stay shadow/small.",

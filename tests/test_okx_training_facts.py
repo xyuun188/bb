@@ -56,13 +56,37 @@ def _history(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
-    entry = SimpleNamespace(okx_fill_contracts=2.0, okx_trade_ids="trade-entry")
-    close = SimpleNamespace(okx_fill_contracts=2.0, okx_trade_ids="trade-close")
+def _complete_lineage() -> dict:
+    return {
+        "positions_by_id": {
+            7: SimpleNamespace(
+                model_name="ensemble_trader",
+                stop_loss_price=98_000.0,
+                take_profit_price=104_000.0,
+            )
+        },
+        "orders_by_exchange_id": {
+            "entry-1": SimpleNamespace(
+                okx_fill_contracts=2.0,
+                okx_trade_ids="trade-entry",
+                decision_id=91,
+            ),
+            "close-1": SimpleNamespace(
+                okx_fill_contracts=2.0,
+                okx_trade_ids="trade-close",
+                decision_id=92,
+            ),
+        },
+        "decision_raw_by_order_id": {
+            "entry-1": {"opportunity_score": {"expected_net_return_pct": 0.8}}
+        },
+    }
 
+
+def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     sample = build_okx_history_training_sample(
         _history(),
-        orders_by_exchange_id={"entry-1": entry, "close-1": close},
+        **_complete_lineage(),
     )
 
     assert sample["source"] == "okx_position_history"
@@ -73,6 +97,7 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["okx_trade_ids"] == ["trade-entry", "trade-close"]
     assert sample["trade_fact_trusted"] is True
     assert sample["training_evidence_gaps"] == []
+    assert sample["strategy_lineage_complete"] is True
 
 
 def test_authoritative_sample_uses_exact_entry_order_decision_evidence() -> None:
@@ -118,7 +143,7 @@ def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons
 
 
 def test_training_report_blocks_pnl_return_sign_mismatch() -> None:
-    sample = build_okx_history_training_sample(_history())
+    sample = build_okx_history_training_sample(_history(), **_complete_lineage())
     sample["authoritative_pnl_ratio_pct"] = -8.5
     payload = annotate_training_payload(
         shadow_samples=[],
@@ -133,7 +158,7 @@ def test_training_report_blocks_pnl_return_sign_mismatch() -> None:
     assert consistency["errors"][0]["reason"] == "pnl_return_sign_mismatch"
 
 
-def test_authoritative_loss_remains_profit_supervision_when_exit_cause_is_unknown() -> None:
+def test_authoritative_loss_with_exact_entry_lineage_remains_supervision_ready() -> None:
     history = _history(realized_pnl=-8.5, pnl=-7.0, pnl_ratio=-0.085)
     history.raw_row = {
         **history.raw_row,
@@ -141,7 +166,7 @@ def test_authoritative_loss_remains_profit_supervision_when_exit_cause_is_unknow
         "pnl": "-7",
         "pnlRatio": "-0.085",
     }
-    sample = build_okx_history_training_sample(history)
+    sample = build_okx_history_training_sample(history, **_complete_lineage())
 
     payload = annotate_training_payload(
         shadow_samples=[],
@@ -152,8 +177,35 @@ def test_authoritative_loss_remains_profit_supervision_when_exit_cause_is_unknow
 
     assert len(payload["trade_samples"]) == 1
     trade = payload["trade_samples"][0]
-    assert trade["data_quality_status"] == "downweighted"
+    assert trade["data_quality_status"] == "included"
     labels = trade["profit_learning_labels"]
     assert labels["training_supervision_ready"] is True
-    assert labels["exit_attribution_supervision_ready"] is False
+    assert labels["exit_attribution_supervision_ready"] is True
+    assert labels["losing_exit_attribution"] == "model_false_positive"
     assert labels["realized_net_pnl_usdt"] == -8.5
+
+
+def test_entry_order_decision_id_is_preserved_when_raw_payload_is_empty() -> None:
+    sample = build_okx_history_training_sample(
+        _history(),
+        orders_by_exchange_id={
+            "entry-1": SimpleNamespace(decision_id=91, okx_fill_contracts=2.0),
+            "close-1": SimpleNamespace(decision_id=92),
+        },
+    )
+
+    assert sample["decision_id"] == 91
+    assert sample["decision_lineage_source"] == "exact_entry_order_decision_id"
+    assert "missing_exact_entry_order_decision_link" not in sample["strategy_lineage_gaps"]
+    assert "missing_exact_entry_order_decision_payload" in sample["strategy_lineage_gaps"]
+
+
+def test_position_fallback_payload_is_not_misreported_as_exact_entry_lineage() -> None:
+    sample = build_okx_history_training_sample(
+        _history(),
+        decision_raw_by_position_id={7: {"opportunity_score": {"score": 1.0}}},
+    )
+
+    assert sample["decision_id"] == 0
+    assert sample["decision_lineage_source"] == "position_time_fallback_payload"
+    assert "missing_exact_entry_order_decision_link" in sample["strategy_lineage_gaps"]

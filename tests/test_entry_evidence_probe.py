@@ -107,7 +107,7 @@ def test_entry_evidence_probe_records_market_quality_block() -> None:
     assert decision.raw_response["evidence_profit_probe_blocked"]["blocked"] is True
 
 
-def test_repeated_missed_opportunity_memory_creates_tradeable_probe() -> None:
+def test_repeated_missed_opportunity_memory_cannot_create_tradeable_probe() -> None:
     decision = _hold_decision(
         {
             "long": {
@@ -132,13 +132,7 @@ def test_repeated_missed_opportunity_memory_creates_tradeable_probe() -> None:
 
     candidate = _policy().create(decision, _fv(), {}, {"ml": True}, {"tools": True}, None)
 
-    assert candidate is not None
-    assert candidate.action == Action.LONG
-    assert candidate.position_size_pct == 0.035
-    probe = candidate.raw_response["evidence_profit_probe"]
-    assert probe["source"] == "missed_opportunity_memory"
-    assert probe["missed_opportunity_count"] == 8
-    assert probe["memory_supported"] is True
+    assert candidate is None
 
 
 def test_missed_opportunity_memory_does_not_override_negative_expectancy() -> None:

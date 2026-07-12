@@ -61,7 +61,7 @@ def test_directional_expected_return_flips_generic_short_move() -> None:
     assert directional_expected_return_pct(payload, "long") == -0.42
 
 
-def test_entry_evidence_uses_structured_review_feedback():
+def test_entry_evidence_ignores_shadow_probe_feedback():
     decision = _decision(
         Action.LONG,
         {
@@ -84,12 +84,14 @@ def test_entry_evidence_uses_structured_review_feedback():
 
     evidence = build_entry_evidence_score(decision, {"ml_influence_enabled": False})
     memory_component = next(
-        item for item in evidence["components"] if item["source"] == "shadow_memory"
+        item
+        for item in evidence["components"]
+        if item["source"] == "authoritative_fee_after_memory"
     )
 
-    assert memory_component["available"] is True
-    assert memory_component["status"] == "aligned"
-    assert memory_component["review_feedback"]["allow_probe"] is True
+    assert memory_component["available"] is False
+    assert memory_component["status"] == "missing"
+    assert memory_component["review_feedback"]["allow_probe"] is False
     assert memory_component["review_feedback"]["missed_opportunity_count"] == 4
 
 
@@ -516,7 +518,7 @@ def test_roster_underfilled_relief_keeps_major_opposite_blocked() -> None:
     assert evidence["tier"] == "blocked"
 
 
-def test_repeated_missed_opportunity_memory_lifts_positive_weak_probe_to_tradeable():
+def test_repeated_missed_opportunity_memory_cannot_lift_probe_to_tradeable():
     decision = _decision(
         Action.LONG,
         {
@@ -567,13 +569,9 @@ def test_repeated_missed_opportunity_memory_lifts_positive_weak_probe_to_tradeab
     )
 
     relief = evidence["memory_missed_opportunity_relief"]
-    assert relief["applied"] is True
-    assert relief["missed_opportunity_count"] == 12
-    assert relief["tradeable_probe"] is True
-    assert evidence["tier"] == "exploration"
-    assert evidence["tradeable_probe"] is True
-    assert evidence["shadow_only"] is False
-    assert evidence["max_size_pct"] <= 0.015
+    assert relief["applied"] is False
+    assert evidence["tradeable_probe"] is False
+    assert evidence["shadow_only"] is True
 
 
 def test_strong_positive_net_relief_lifts_weak_conflict_out_of_micro_probe():
@@ -625,9 +623,10 @@ def test_strong_positive_net_relief_lifts_weak_conflict_out_of_micro_probe():
     assert evidence["positive_net_probe_relief"]["shadow_only"] is False
     assert evidence["strong_positive_net_relief"]["applied"] is True
     assert evidence["strong_positive_net_relief"]["tier_floor"] == "small"
-    assert evidence["tier"] == "small"
-    assert evidence["size_multiplier"] == pytest.approx(0.18)
-    assert evidence["max_size_pct"] <= 0.025
+    assert evidence["tier"] == "medium"
+    assert evidence["size_multiplier"] == pytest.approx(0.6)
+    assert evidence["max_size_pct"] is None
+    assert evidence["memory_missed_opportunity_relief"]["applied"] is False
     assert evidence["tradeable_probe"] is True
     assert evidence["shadow_only"] is False
 

@@ -48,7 +48,7 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
-    signal_available,
+    signal_production_eligible,
 )
 from services.runtime_entry_filters import entry_filters_from_context, entry_filters_from_decision
 
@@ -327,7 +327,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "server_profit_model",
         "profit",
     )
-    if signal_available(profit):
+    if signal_production_eligible(profit):
         best_side = payload_side(profit) or profit.get("direction")
         expected = signal_expected_return_pct(profit, str(best_side or ""))
         edge = profit.get("profit_edge_pct", profit.get("edge_pct"))
@@ -348,7 +348,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "timeseries",
         "time_series",
     )
-    if signal_available(ts):
+    if signal_production_eligible(ts):
         trend = (
             payload_side(ts)
             or ts.get("trend")
@@ -373,7 +373,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "sentiment_model",
         "sentiment",
     )
-    if signal_available(sentiment):
+    if signal_production_eligible(sentiment):
         label = sentiment.get("label") or sentiment.get("sentiment") or payload_side(sentiment)
         score = sentiment.get("score", sentiment.get("sentiment_score"))
         risk = sentiment.get("risk_level", sentiment.get("risk"))
@@ -507,53 +507,12 @@ def _apply_aggressive_hold_policy(
     decision.action = edge_action
     decision.confidence = max(decision.confidence, 0.52 + min(edge, 5) * 0.03)
     decision.position_size_pct = 0.04 if edge < 4 else 0.07
-    decision.suggested_leverage = (
-        5.0 if decision.confidence < 0.68 else (10.0 if decision.confidence >= 0.78 else 7.0)
-    )
     decision.stop_loss_pct = min(max(decision.stop_loss_pct or 0.03, 0.02), 0.06)
     decision.take_profit_pct = max(decision.take_profit_pct or 0.06, decision.stop_loss_pct * 1.6)
     decision.reasoning += (
         " [进攻型改写：原始输出为观望，但技术边际足够清楚，"
         f"改为{edge_action.value}试探；依据：{'、'.join(reasons)}]"
     )
-
-
-def _leverage_cap_for_entry(decision: DecisionOutput) -> float:
-    if decision.confidence < 0.68:
-        return min(5.0, settings.max_leverage)
-    if decision.confidence < 0.78:
-        return min(10.0, settings.max_leverage)
-    return settings.max_leverage
-
-
-def _apply_entry_leverage_policy(decision: DecisionOutput) -> None:
-    if not decision.is_entry:
-        return
-
-    if decision.confidence < 0.50:
-        decision.action = Action.HOLD
-        decision.position_size_pct = 0.0
-        decision.suggested_leverage = 1.0
-        decision.reasoning += " [置信度低于 0.50，未达到试探开仓要求，改为观望]"
-        return
-
-    original_leverage = decision.suggested_leverage
-    leverage_cap = _leverage_cap_for_entry(decision)
-    if decision.confidence >= 0.78:
-        min_leverage = 10.0
-    elif decision.confidence >= 0.68:
-        min_leverage = 5.0
-    else:
-        min_leverage = 1.0
-    decision.suggested_leverage = min(max(decision.suggested_leverage, min_leverage), leverage_cap)
-
-    if original_leverage != decision.suggested_leverage:
-        if decision.confidence < 0.68:
-            decision.reasoning += " [杠杆规则：普通信号最高 5x]"
-        elif decision.confidence < 0.78:
-            decision.reasoning += " [杠杆规则：高质量信号使用 5-10x]"
-        else:
-            decision.reasoning += " [杠杆规则：强信号最低 10x，最高使用系统最大杠杆]"
 
 
 def _strip_trailing_json_commas(text: str) -> str:

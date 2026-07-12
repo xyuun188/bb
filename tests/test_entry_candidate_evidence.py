@@ -124,7 +124,7 @@ def test_candidate_evidence_marks_low_quality_side_as_tiny_probe_only() -> None:
     assert evidence["short"]["recommendation"] == "hold_or_tiny_probe_only"
 
 
-def test_candidate_evidence_uses_memory_feedback_without_changing_expected_return() -> None:
+def test_candidate_evidence_ignores_untrusted_memory_probe_feedback() -> None:
     opportunities = {
         "long": {
             "expected_net_return_pct": 0.35,
@@ -198,18 +198,20 @@ def test_candidate_evidence_uses_memory_feedback_without_changing_expected_retur
         memory_feedback,
     )
 
-    assert evidence["preferred_side_by_evidence"] == "long"
+    assert evidence["preferred_side_by_evidence"] == "neutral"
     assert evidence["memory_feedback"]["preferred_side_by_memory"] == "long"
     assert evidence["memory_feedback"]["vector_memory"]["status"] == "ok"
     assert evidence["memory_feedback"]["vector_memory"]["matched_count"] == 1
     assert evidence["memory_feedback"]["vector_memory"]["hits"][0]["pnl_pct"] == -0.8
-    assert evidence["memory_feedback"]["decision_habit"]["posture"] == "selective_probe"
-    assert evidence["memory_feedback"]["decision_habit"]["long"]["stance"] == "probe_when_ev_ok"
-    assert evidence["memory_feedback"]["decision_habit"]["long"]["probe_budget_pct"] == 0.015
+    assert evidence["memory_feedback"]["decision_habit"]["posture"] == "neutral"
+    assert evidence["memory_feedback"]["decision_habit"]["long"]["stance"] == (
+        "fee_after_observation_only"
+    )
+    assert evidence["memory_feedback"]["decision_habit"]["long"]["probe_budget_pct"] == 0.0
     assert evidence["long"]["score_before_memory_feedback"] == 0.52
-    assert evidence["long"]["score"] == 0.70
+    assert evidence["long"]["score"] == 0.52
     assert evidence["long"]["expected_net_return_pct"] == 0.35
-    assert evidence["long"]["recommendation"] == "memory_supported_probe_candidate"
+    assert evidence["long"]["recommendation"] == "needs_stronger_ai_confirmation"
     assert evidence["long"]["probe_conversion_ready"] is True
     assert evidence["long"]["probe_conversion_block_reasons"] == []
     assert evidence["long"]["review_feedback"]["missed_opportunity_count"] == 5
@@ -257,7 +259,7 @@ def test_candidate_evidence_does_not_label_subthreshold_memory_as_probe_candidat
         memory_feedback,
     )
 
-    assert evidence["long"]["recommendation"] == "memory_watchlist_needs_probe_threshold"
+    assert evidence["long"]["recommendation"] == "needs_stronger_ai_confirmation"
     assert evidence["long"]["probe_conversion_ready"] is False
     assert evidence["long"]["probe_conversion_block_reasons"] == [
         "expected_net_below_probe_threshold"

@@ -338,3 +338,105 @@ def test_position_close_evidence_keeps_strong_small_winner_running() -> None:
     assert evidence["small_position_profit_lock"] is False
     assert evidence["winner_run_protected"] is True
     assert "盈利仓继续奔跑" in evidence["block_reason"]
+
+
+def test_position_close_evidence_prioritizes_crossed_planned_stop_over_hold() -> None:
+    coordinator = EnsembleCoordinator(SimpleNamespace())
+
+    evidence = coordinator._position_close_evidence(
+        current_side="long",
+        close_action=Action.CLOSE_LONG,
+        exit_votes=[],
+        risk_vetoes=[],
+        score=0.8,
+        raw_opinions=[
+            {"model_name": "position_expert", "action": "hold", "confidence": 0.95}
+        ],
+        symbol_positions=[
+            {
+                "side": "long",
+                "entry_price": 100.0,
+                "current_price": 93.0,
+                "quantity": 1.0,
+                "unrealized_pnl": -7.0,
+                "stop_loss": 94.0,
+                "created_at": datetime.now(UTC) - timedelta(hours=2),
+            }
+        ],
+        features=FeatureVector(symbol="INJ/USDT", current_price=93.0),
+        context={},
+    )
+
+    assert evidence["planned_stop_crossed"] is True
+    assert evidence["should_close"] is True
+    assert evidence["action_plan"] == "full_close"
+    assert evidence["position_size_pct"] == 1.0
+
+
+def test_position_close_evidence_executes_dynamic_loss_reduction() -> None:
+    coordinator = EnsembleCoordinator(SimpleNamespace())
+
+    evidence = coordinator._position_close_evidence(
+        current_side="long",
+        close_action=Action.CLOSE_LONG,
+        exit_votes=[],
+        risk_vetoes=[],
+        score=0.0,
+        raw_opinions=[],
+        symbol_positions=[
+            {
+                "side": "long",
+                "entry_price": 100.0,
+                "current_price": 99.2,
+                "quantity": 10.0,
+                "unrealized_pnl": -8.0,
+                "stop_loss": 0.0,
+                "created_at": datetime.now(UTC) - timedelta(hours=2),
+            }
+        ],
+        features=FeatureVector(symbol="YB/USDT", current_price=99.2),
+        context={},
+    )
+
+    assert evidence["position_loss"] is True
+    assert evidence["should_close"] is True
+    assert evidence["action_plan"] == "reduce"
+    assert evidence["position_size_pct"] == pytest.approx(
+        evidence["dynamic_loss_reduce_fraction"]
+    )
+    assert 0.0 < evidence["position_size_pct"] < 1.0
+
+
+def test_loss_repair_expansion_branch_returns_executable_dynamic_reduce() -> None:
+    coordinator = EnsembleCoordinator(SimpleNamespace())
+
+    evidence = coordinator._loss_repair_evidence(
+        current_side="long",
+        score=-1.0,
+        raw_opinions=[
+            {"action": "short", "confidence": 0.9},
+            {"action": "close_long", "confidence": 0.9},
+        ],
+        context={},
+        features=FeatureVector(
+            symbol="INJ/USDT",
+            returns_1=-0.01,
+            returns_5=-0.02,
+        ),
+        position_unrealized_pnl=-6.0,
+        position_profit_pct=-0.06,
+        position_risk_usage=0.5,
+        loss_abs=6.0,
+        dynamic_loss_reduce_usdt=5.0,
+        dynamic_loss_full_usdt=10.0,
+        support_count=2,
+        strong_support_count=2,
+        strong_opposite_pressure=True,
+        moderate_opposite_pressure=True,
+        momentum_waning=True,
+    )
+
+    assert evidence["likely_expanding_loss"] is True
+    assert evidence["should_close"] is True
+    assert evidence["action_plan"] == "reduce"
+    assert evidence["position_size_pct"] == pytest.approx(0.6)

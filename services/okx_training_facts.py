@@ -179,12 +179,17 @@ def build_okx_history_training_sample(
     position_id = position_ids[0] if position_ids else 0
     raw_llm_response: dict[str, Any] = {}
     decision_id = 0
+    decision_lineage_source = "missing"
     for order_id in entry_order_ids:
+        order = orders_by_exchange_id.get(order_id)
+        order_decision_id = int(_value(order, "decision_id", 0) or 0)
+        if decision_id <= 0 and order_decision_id > 0:
+            decision_id = order_decision_id
+            decision_lineage_source = "exact_entry_order_decision_id"
         candidate = decision_raw_by_order_id.get(order_id)
         if isinstance(candidate, dict) and candidate:
             raw_llm_response = candidate
-            order = orders_by_exchange_id.get(order_id)
-            decision_id = int(_value(order, "decision_id", 0) or 0)
+            decision_lineage_source = "exact_entry_order_decision_payload"
             break
     if not raw_llm_response:
         raw_llm_response = next(
@@ -195,6 +200,31 @@ def build_okx_history_training_sample(
             ),
             {},
         )
+        if raw_llm_response:
+            decision_lineage_source = "position_time_fallback_payload"
+
+    stop_loss_price = _safe_float(_value(local_position, "stop_loss_price"), None)
+    take_profit_price = _safe_float(_value(local_position, "take_profit_price"), None)
+    lineage_gaps: list[str] = []
+    if not entry_order_ids:
+        lineage_gaps.append("missing_position_history_entry_orders")
+    elif not entry_orders:
+        lineage_gaps.append("missing_loaded_entry_order_facts")
+    if not close_order_ids:
+        lineage_gaps.append("missing_position_history_close_orders")
+    elif not any(order_id in orders_by_exchange_id for order_id in close_order_ids):
+        lineage_gaps.append("missing_loaded_close_order_facts")
+    if decision_id <= 0:
+        lineage_gaps.append("missing_exact_entry_order_decision_link")
+    if decision_lineage_source != "exact_entry_order_decision_payload":
+        lineage_gaps.append("missing_exact_entry_order_decision_payload")
+    if local_position is None:
+        lineage_gaps.append("missing_local_position_strategy_lineage")
+    if stop_loss_price is None or stop_loss_price <= 0:
+        lineage_gaps.append("missing_planned_stop_loss_lineage")
+    if take_profit_price is None or take_profit_price <= 0:
+        lineage_gaps.append("missing_planned_take_profit_lineage")
+    lineage_gaps = list(dict.fromkeys(lineage_gaps))
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
     official_ratio_pct = _official_ratio_pct(raw, _value(history, "pnl_ratio"))
     lifecycle_key = _text(_value(history, "row_identity"))
@@ -204,6 +234,7 @@ def build_okx_history_training_sample(
         "lifecycle_key": lifecycle_key,
         "position_id": position_id,
         "decision_id": decision_id,
+        "decision_lineage_source": decision_lineage_source,
         "position_ids": position_ids,
         "okx_pos_id": _text(_value(history, "pos_id")),
         "entry_order_ids": entry_order_ids,
@@ -235,6 +266,8 @@ def build_okx_history_training_sample(
         "settlement_components_total": settlement_expected,
         "hold_minutes": hold_minutes,
         "leverage": _safe_float(_value(history, "leverage"), 1.0) or 1.0,
+        "planned_stop_loss_price": stop_loss_price,
+        "planned_take_profit_price": take_profit_price,
         "raw_llm_response": raw_llm_response,
         "outcome": "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat",
         "pnl_source": "okx_position_history_realized_pnl",
@@ -243,6 +276,8 @@ def build_okx_history_training_sample(
         "fee_source": "okx_positions_history.fee",
         "trade_fact_trusted": not gaps,
         "trade_fact_trust_reason": gaps[0] if gaps else "",
-        "training_evidence_gaps": gaps,
+        "strategy_lineage_complete": not lineage_gaps,
+        "strategy_lineage_gaps": lineage_gaps,
+        "training_evidence_gaps": list(dict.fromkeys([*gaps, *lineage_gaps])),
         "label_timestamp": closed_at.isoformat() if closed_at else None,
     }

@@ -1,41 +1,30 @@
-"""Turn review memories into structured decision feedback."""
+"""Turn authoritative fee-after trade memories into advisory decision feedback."""
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
+from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 SIDES = ("long", "short")
 ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
-POSITIVE_MEMORY_TYPES = {
-    "profit_pattern",
-    "shadow_good_signal",
-    "shadow_missed_opportunity",
-}
-RISK_MEMORY_TYPES = {
-    "loss_lesson",
-    "flat_lesson",
-    "shadow_bad_signal",
-}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return default
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        if value is None:
-            return default
-        return int(value)
+        return int(value) if value is not None else default
     except (TypeError, ValueError):
         return default
 
@@ -56,23 +45,69 @@ def _safe_extra(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return min(max(value, low), high)
+def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
+    extra = _safe_extra(memory.get("extra"))
+    source = str(extra.get("source") or "").lower()
+    if source.startswith("shadow") or str(memory.get("memory_type") or "").startswith("shadow_"):
+        return None
+    if extra.get("cost_complete") is not True:
+        return None
+    if extra.get("production_evidence_eligible") is not True:
+        return None
+    if extra.get("objective") != RETURN_OBJECTIVE_NAME:
+        return None
+    if extra.get("objective_version") != RETURN_OBJECTIVE_VERSION:
+        return None
+
+    aggregation = _safe_dict(extra.get("outcome_aggregation"))
+    if aggregation:
+        count = _safe_int(aggregation.get("count"), 0)
+        position_ids = {
+            _safe_int(value, 0)
+            for value in aggregation.get("source_position_ids", [])
+            if _safe_int(value, 0) > 0
+        }
+        if count <= 0 or not position_ids:
+            return None
+        return {
+            "count": count,
+            "position_ids": position_ids,
+            "total_return_pct": _safe_float(aggregation.get("total_net_return_pct")),
+            "return_lcb_pct": _safe_float(
+                aggregation.get("return_lcb_pct"),
+                _safe_float(aggregation.get("avg_net_return_pct")),
+            ),
+            "total_pnl_usdt": _safe_float(
+                aggregation.get("total_realized_net_pnl_usdt")
+            ),
+            "gross_profit_usdt": _safe_float(aggregation.get("gross_profit_usdt")),
+            "gross_loss_usdt": _safe_float(aggregation.get("gross_loss_usdt")),
+            "worst_return_pct": _safe_float(
+                aggregation.get("worst_net_return_pct"),
+                min(_safe_float(aggregation.get("avg_net_return_pct")), 0.0),
+            ),
+        }
+
+    position_id = _safe_int(extra.get("source_position_id"), 0)
+    if position_id <= 0 or "net_return_after_cost_pct" not in extra:
+        return None
+    net_return = _safe_float(extra.get("net_return_after_cost_pct"))
+    pnl = _safe_float(extra.get("realized_pnl"))
+    return {
+        "count": 1,
+        "position_ids": {position_id},
+        "total_return_pct": net_return,
+        "return_lcb_pct": net_return,
+        "total_pnl_usdt": pnl,
+        "gross_profit_usdt": max(pnl, 0.0),
+        "gross_loss_usdt": max(-pnl, 0.0),
+        "worst_return_pct": min(net_return, 0.0),
+    }
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryFeedbackPolicy:
-    """Aggregate shadow backtests, trade reflections, and expert memory.
-
-    The result is intentionally advisory. It may bias the model toward a small
-    probe when repeated missed opportunities are present, but it never creates
-    permission to bypass hard risk checks.
-    """
-
-    max_candidate_bonus: float = 0.24
-    max_candidate_penalty: float = -0.32
-    max_expected_return_hint_pct: float = 0.35
-    expected_return_hint_weight: float = 0.55
+    """Keep memory observable while denying it independent production permission."""
 
     def build(self, memories: list[dict[str, Any]]) -> dict[str, Any]:
         side_rows = {side: [] for side in SIDES}
@@ -88,106 +123,76 @@ class MemoryFeedbackPolicy:
             for side, side_memories in side_rows.items()
         }
         preferred = self._preferred_side(by_side)
-        habit = self._decision_habit(by_side, preferred)
         return {
             "enabled": bool(memories),
             "preferred_side_by_memory": preferred,
             "by_side": by_side,
-            "decision_habit": habit,
+            "decision_habit": self._decision_habit(by_side, preferred),
             "policy": (
-                "Review feedback is advisory evidence from shadow backtests, trade reflections, "
-                "and expert long-term memory. Use it to choose small probes or stricter "
-                "confirmation; never use it to bypass hard risk."
+                "Shadow and cost-incomplete memories are observation-only. Only authoritative "
+                "fee-after outcomes may tighten risk; memory never grants a production probe."
             ),
         }
 
     def _side_feedback(self, side: str, memories: list[dict[str, Any]]) -> dict[str, Any]:
-        missed = 0
-        positive = 0
-        risk = 0
         shadow = 0
         trade = 0
-        contribution = 0.0
-        missed_return_total = 0.0
-        missed_return_evidence = 0
+        positive = 0
+        risk = 0
+        missed = 0
         top_reasons: list[str] = []
+        outcomes: list[dict[str, Any]] = []
+        seen_positions: set[int] = set()
 
         for memory in memories:
             memory_type = str(memory.get("memory_type") or "lesson")
             evidence = max(_safe_int(memory.get("evidence_count"), 1), 1)
-            capped_evidence = min(evidence, 10)
-            confidence = _clamp(_safe_float(memory.get("confidence_score"), 0.5), 0.10, 0.95)
-            adjustment = _safe_float(memory.get("confidence_adjustment"), 0.0)
-            weight = confidence * (1.0 + capped_evidence * 0.08)
-
             if memory_type.startswith("shadow_"):
                 shadow += evidence
+                if memory_type == "shadow_missed_opportunity":
+                    missed += evidence
             else:
                 trade += evidence
-
-            if memory_type == "shadow_missed_opportunity":
-                missed += evidence
-                positive += evidence
-                contribution += max(adjustment, 0.035) * weight * 1.20
-                extra = _safe_extra(memory.get("extra"))
-                best_action = str(extra.get("best_action") or memory.get("side") or "").lower()
-                if best_action == side:
-                    return_pct = _safe_float(extra.get(f"{side}_return_pct"), 0.0)
-                    if 0.0 < return_pct <= 20.0:
-                        missed_return_total += return_pct * evidence
-                        missed_return_evidence += evidence
-            elif memory_type in POSITIVE_MEMORY_TYPES:
-                positive += evidence
-                contribution += max(adjustment, 0.020) * weight
-            elif memory_type in RISK_MEMORY_TYPES:
-                risk += evidence
-                contribution += min(adjustment, -0.035) * weight * 1.15
-            elif adjustment:
-                if adjustment > 0:
-                    positive += evidence
-                else:
-                    risk += evidence
-                contribution += adjustment * weight
-
+            outcome = canonical_memory_outcome(memory)
+            if outcome is not None:
+                position_ids = set(outcome["position_ids"])
+                if not position_ids.intersection(seen_positions):
+                    outcomes.append(outcome)
+                    seen_positions.update(position_ids)
+                    if outcome["total_pnl_usdt"] > 0:
+                        positive += outcome["count"]
+                    elif outcome["total_pnl_usdt"] < 0:
+                        risk += outcome["count"]
             if len(top_reasons) < 3:
                 lesson = str(memory.get("lesson") or memory.get("market_pattern") or "").strip()
                 if lesson:
                     top_reasons.append(lesson[:96])
 
-        net_evidence = positive - risk
-        repeated_missed_boost = 0.0
-        if missed >= 2 and positive >= max(risk, 1):
-            repeated_missed_boost = min(max(missed - 1, 0) * 0.014, 0.12)
-        score_adjustment = _clamp(contribution + repeated_missed_boost, -0.25, 0.18)
-        candidate_bonus = _clamp(
-            score_adjustment * 1.35, self.max_candidate_penalty, self.max_candidate_bonus
+        count = sum(int(item["count"]) for item in outcomes)
+        total_return = sum(float(item["total_return_pct"]) for item in outcomes)
+        total_pnl = sum(float(item["total_pnl_usdt"]) for item in outcomes)
+        gross_profit = sum(float(item["gross_profit_usdt"]) for item in outcomes)
+        gross_loss = sum(float(item["gross_loss_usdt"]) for item in outcomes)
+        avg_return = total_return / count if count else 0.0
+        return_lcb = (
+            sum(float(item["return_lcb_pct"]) * int(item["count"]) for item in outcomes)
+            / count
+            if count
+            else 0.0
         )
-        missed_avg_return = (
-            missed_return_total / missed_return_evidence if missed_return_evidence > 0 else 0.0
+        worst_return = min(
+            [float(item["worst_return_pct"]) for item in outcomes],
+            default=0.0,
         )
-        expected_return_hint = _clamp(
-            missed_avg_return * self.expected_return_hint_weight,
-            0.0,
-            self.max_expected_return_hint_pct,
-        )
-        allow_probe = bool(missed >= 2 and positive >= max(risk, 1) and score_adjustment >= 0.035)
-        risk_dominant = bool(risk >= positive + 2 and score_adjustment < 0)
-        if risk_dominant:
-            action_bias = "require_stronger_confirmation"
-            max_probe_size_pct = 0.0
-        elif allow_probe:
-            action_bias = "prefer_small_probe_when_current_ev_positive"
-            max_probe_size_pct = (
-                ENTRY_RISK_SIZING_PARAMS.memory_feedback_strong_probe_size_pct
-                if missed >= 6 and score_adjustment >= 0.08
-                else ENTRY_RISK_SIZING_PARAMS.memory_feedback_normal_probe_size_pct
-            )
-        elif score_adjustment > 0.02:
-            action_bias = "slightly_improve_entry_confidence"
-            max_probe_size_pct = ENTRY_RISK_SIZING_PARAMS.memory_feedback_light_probe_size_pct
-        else:
-            action_bias = "neutral"
-            max_probe_size_pct = 0.0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+        pnl_activity = gross_profit + gross_loss
+        pnl_efficiency = total_pnl / pnl_activity if pnl_activity > 0 else 0.0
+        downside_scale = max(abs(worst_return), abs(avg_return), 1e-9)
+        return_quality = return_lcb / downside_scale if count else 0.0
+        utility = (return_quality + pnl_efficiency) / 2.0
+        credibility = math.sqrt(count) / (math.sqrt(count) + 1.0) if count else 0.0
+        score_adjustment = min(math.tanh(utility) * credibility, 0.0)
+        risk_dominant = bool(count and return_lcb < 0.0)
 
         return {
             "side": side,
@@ -197,115 +202,78 @@ class MemoryFeedbackPolicy:
             "missed_opportunity_count": missed,
             "positive_evidence_count": positive,
             "risk_evidence_count": risk,
-            "net_evidence_count": net_evidence,
-            "missed_return_evidence_count": missed_return_evidence,
-            "missed_avg_return_pct": round(missed_avg_return, 6),
-            "expected_return_hint_pct": round(expected_return_hint, 6),
+            "net_evidence_count": positive - risk,
+            "canonical_outcome_count": count,
+            "canonical_position_count": len(seen_positions),
+            "cost_complete": bool(count),
+            "total_realized_net_pnl_usdt": round(total_pnl, 6),
+            "avg_net_return_after_cost_pct": round(avg_return, 6),
+            "return_lcb_pct": round(return_lcb, 6),
+            "worst_net_return_pct": round(worst_return, 6),
+            "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
+            "utility": round(utility, 6),
             "score_adjustment": round(score_adjustment, 6),
-            "candidate_score_bonus": round(candidate_bonus, 6),
-            "allow_probe": allow_probe,
-            "action_bias": action_bias,
-            "max_probe_size_pct": round(max_probe_size_pct, 6),
+            "candidate_score_bonus": 0.0,
+            "allow_probe": False,
+            "action_bias": (
+                "require_stronger_confirmation" if risk_dominant else "fee_after_observation_only"
+            ),
+            "max_probe_size_pct": 0.0,
+            "expected_return_hint_pct": 0.0,
+            "missed_return_evidence_count": 0,
+            "missed_avg_return_pct": 0.0,
             "top_reasons": top_reasons,
         }
 
+    @staticmethod
     def _decision_habit(
-        self,
         by_side: dict[str, dict[str, Any]],
         preferred_side: str,
     ) -> dict[str, Any]:
-        """Summarize review memory as an explicit LLM behavior contract."""
-
-        side_habits = {side: self._side_habit(_safe_dict(by_side.get(side))) for side in SIDES}
-        active_probe_sides = [
-            side for side, habit in side_habits.items() if habit.get("stance") == "probe_when_ev_ok"
+        side_habits: dict[str, dict[str, Any]] = {}
+        for side in SIDES:
+            item = _safe_dict(by_side.get(side))
+            strict = bool(item.get("canonical_outcome_count") and _safe_float(item.get("return_lcb_pct")) < 0)
+            side_habits[side] = {
+                "stance": "strict_confirm" if strict else "fee_after_observation_only",
+                "proactive_level": 0.0,
+                "probe_budget_pct": 0.0,
+                "expected_return_hint_pct": 0.0,
+                "score_adjustment": _safe_float(item.get("score_adjustment")),
+                "return_lcb_pct": item.get("return_lcb_pct"),
+                "canonical_outcome_count": item.get("canonical_outcome_count", 0),
+                "cost_complete": bool(item.get("cost_complete")),
+                "reason": (
+                    "authoritative fee-after return lower bound is negative"
+                    if strict
+                    else "memory is observation-only and cannot authorize production probes"
+                ),
+            }
+        conservative = [
+            side for side, habit in side_habits.items() if habit["stance"] == "strict_confirm"
         ]
-        conservative_sides = [
-            side for side, habit in side_habits.items() if habit.get("stance") == "strict_confirm"
-        ]
-        if active_probe_sides:
-            posture = "selective_probe"
-        elif conservative_sides:
-            posture = "defensive_selective"
-        else:
-            posture = "neutral"
         return {
-            "posture": posture,
+            "posture": "defensive_selective" if conservative else "neutral",
             "preferred_side": preferred_side,
-            "active_probe_sides": active_probe_sides,
-            "conservative_sides": conservative_sides,
+            "active_probe_sides": [],
+            "conservative_sides": conservative,
             "by_side": side_habits,
             "rule": (
-                "Act slightly earlier only for sides with repeated missed opportunities, "
-                "positive current EV and controlled tail risk; tighten confirmation and size "
-                "for sides dominated by realized losses."
+                "Memory cannot grant probes. Negative authoritative fee-after lower bounds "
+                "tighten risk; current dynamic strategy must independently authorize entries."
             ),
         }
 
     @staticmethod
-    def _side_habit(item: dict[str, Any]) -> dict[str, Any]:
-        missed = _safe_int(item.get("missed_opportunity_count"), 0)
-        positive = _safe_int(item.get("positive_evidence_count"), 0)
-        risk = _safe_int(item.get("risk_evidence_count"), 0)
-        score_adjustment = _safe_float(item.get("score_adjustment"), 0.0)
-        candidate_bonus = _safe_float(item.get("candidate_score_bonus"), 0.0)
-        max_probe_size = _safe_float(item.get("max_probe_size_pct"), 0.0)
-        expected_return_hint = _safe_float(item.get("expected_return_hint_pct"), 0.0)
-        if risk >= positive + 2 and score_adjustment < 0:
-            return {
-                "stance": "strict_confirm",
-                "proactive_level": 0.0,
-                "probe_budget_pct": 0.0,
-                "expected_return_hint_pct": 0.0,
-                "min_expected_net_pct": 0.35,
-                "max_loss_probability": 0.42,
-                "max_tail_risk": 0.82,
-                "score_adjustment": round(candidate_bonus, 6),
-                "reason": "realized or shadow losses dominate this side",
-            }
-        if missed >= 2 and positive >= max(risk, 1) and score_adjustment >= 0.035:
-            proactive_level = _clamp(0.25 + missed * 0.055 + score_adjustment, 0.30, 0.85)
-            return {
-                "stance": "probe_when_ev_ok",
-                "proactive_level": round(proactive_level, 6),
-                "probe_budget_pct": round(max(max_probe_size, 0.012), 6),
-                "expected_return_hint_pct": round(expected_return_hint, 6),
-                "min_expected_net_pct": 0.12,
-                "max_loss_probability": 0.58,
-                "max_tail_risk": 0.98,
-                "score_adjustment": round(candidate_bonus, 6),
-                "reason": "shadow or trade reviews show repeated missed opportunities",
-            }
-        if score_adjustment > 0.02:
-            return {
-                "stance": "slightly_support",
-                "proactive_level": round(_clamp(score_adjustment * 2.5, 0.05, 0.30), 6),
-                "probe_budget_pct": round(max_probe_size, 6),
-                "expected_return_hint_pct": round(expected_return_hint, 6),
-                "min_expected_net_pct": 0.20,
-                "max_loss_probability": 0.54,
-                "max_tail_risk": 0.92,
-                "score_adjustment": round(candidate_bonus, 6),
-                "reason": "positive review evidence is present but not repeated enough",
-            }
-        return {
-            "stance": "neutral",
-            "proactive_level": 0.0,
-            "probe_budget_pct": 0.0,
-            "expected_return_hint_pct": round(expected_return_hint, 6),
-            "min_expected_net_pct": 0.25,
-            "max_loss_probability": 0.50,
-            "max_tail_risk": 0.90,
-            "score_adjustment": round(candidate_bonus, 6),
-            "reason": "no strong review habit adjustment",
-        }
-
-    @staticmethod
     def _preferred_side(by_side: dict[str, dict[str, Any]]) -> str:
-        long_score = _safe_float(by_side.get("long", {}).get("score_adjustment"), 0.0)
-        short_score = _safe_float(by_side.get("short", {}).get("score_adjustment"), 0.0)
-        if long_score > short_score + 0.025:
-            return "long"
-        if short_score > long_score + 0.025:
-            return "short"
-        return "neutral"
+        long_item = _safe_dict(by_side.get("long"))
+        short_item = _safe_dict(by_side.get("short"))
+        long_count = _safe_int(long_item.get("canonical_outcome_count"), 0)
+        short_count = _safe_int(short_item.get("canonical_outcome_count"), 0)
+        if not long_count and not short_count:
+            return "neutral"
+        long_lcb = _safe_float(long_item.get("return_lcb_pct")) if long_count else -math.inf
+        short_lcb = _safe_float(short_item.get("return_lcb_pct")) if short_count else -math.inf
+        if long_lcb == short_lcb:
+            return "neutral"
+        return "long" if long_lcb > short_lcb else "short"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta, timezone
@@ -17,7 +18,7 @@ from models.decision import AIDecision
 from models.learning import TradeReflection
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
-from services.memory_feedback import MemoryFeedbackPolicy
+from services.memory_feedback import MemoryFeedbackPolicy, canonical_memory_outcome
 from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
@@ -338,6 +339,12 @@ class ExpertMemoryService:
             notional = abs(entry_price * quantity)
             pnl_pct = realized_pnl / notional if notional > 0 else 0.0
             funding_fee = float(getattr(pos, "funding_fee", 0.0) or 0.0)
+            cost_complete = bool(
+                notional > 0
+                and entry_fee is not None
+                and close_fee is not None
+                and hasattr(pos, "funding_fee")
+            )
             hold_minutes = position_hold_minutes(pos)
             outcome = "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat"
             pattern = reflection_pattern(pos, pnl_pct, hold_minutes)
@@ -389,6 +396,11 @@ class ExpertMemoryService:
                             "pnl_pct": pnl_pct,
                             "pnl_pct_deprecated_ratio": True,
                             "net_return_after_cost_pct": pnl_pct * 100.0,
+                            "objective": "maximize_expected_realized_net_return_after_cost",
+                            "objective_version": "2026-07-12.v1",
+                            "cost_complete": cost_complete,
+                            "production_evidence_eligible": cost_complete,
+                            "source": source,
                             "hold_minutes": hold_minutes,
                             "gross_pnl": gross_pnl,
                             "entry_fee": entry_fee,
@@ -539,7 +551,7 @@ def dynamic_expert_weights_from_memories(
     by_expert: dict[str, list[dict[str, Any]]],
     model_slots: Sequence[dict[str, Any]] = FIXED_AI_MODEL_SLOTS,
 ) -> dict[str, dict[str, Any]]:
-    """Conservative long-term-memory based expert weight adjustment."""
+    """Adjust expert weights only from authoritative fee-after outcome quality."""
 
     result: dict[str, dict[str, Any]] = {}
     slot_weights = {
@@ -549,49 +561,60 @@ def dynamic_expert_weights_from_memories(
     }
     for expert_name, base_weight in slot_weights.items():
         memories = [memory for memory in by_expert.get(expert_name, []) if isinstance(memory, dict)]
-        if not memories:
-            result[expert_name] = {
-                "base_weight": base_weight,
-                "multiplier": 1.0,
-                "effective_weight": base_weight,
-                "memory_count": 0,
-                "evidence_count": 0,
-                "success_count": 0,
-                "failure_count": 0,
-                "reason": "暂无足够历史样本，使用基础权重。",
-            }
-            continue
+        outcomes: list[dict[str, Any]] = []
+        seen_positions: set[int] = set()
+        for memory in memories:
+            outcome = canonical_memory_outcome(memory)
+            if outcome is None:
+                continue
+            position_ids = set(outcome["position_ids"])
+            if position_ids.intersection(seen_positions):
+                continue
+            outcomes.append(outcome)
+            seen_positions.update(position_ids)
 
         evidence = sum(max(int(memory.get("evidence_count", 1) or 1), 1) for memory in memories)
         success = sum(max(int(memory.get("success_count", 0) or 0), 0) for memory in memories)
         failure = sum(max(int(memory.get("failure_count", 0) or 0), 0) for memory in memories)
-        weighted_adjustment = 0.0
-        weight_sum = 0.0
-        for memory in memories:
-            confidence_score = min(max(float(memory.get("confidence_score", 0.5) or 0.5), 0.1), 1.0)
-            memory_evidence = max(int(memory.get("evidence_count", 1) or 1), 1)
-            weight = confidence_score * min(memory_evidence, 6)
-            weighted_adjustment += float(memory.get("confidence_adjustment", 0.0) or 0.0) * weight
-            weight_sum += weight
+        if not outcomes:
+            result[expert_name] = {
+                "base_weight": base_weight,
+                "multiplier": 1.0,
+                "effective_weight": base_weight,
+                "memory_count": len(memories),
+                "evidence_count": evidence,
+                "success_count": success,
+                "failure_count": failure,
+                "canonical_outcome_count": 0,
+                "canonical_position_count": 0,
+                "reason": "暂无成本完整的权威费后收益样本，使用基础权重。",
+            }
+            continue
 
-        average_adjustment = weighted_adjustment / weight_sum if weight_sum > 0 else 0.0
-        performance_edge = ((success + 1) / (success + failure + 2)) - 0.5
-        raw_multiplier = 1.0 + average_adjustment * 0.70 + performance_edge * 0.35
-        if evidence < 2 and success + failure < 2:
-            raw_multiplier = 1.0
-
-        multiplier = min(max(raw_multiplier, 0.70), 1.15)
-        if failure >= success + 2:
-            multiplier = min(multiplier, 0.90)
-        elif success >= failure + 3:
-            multiplier = max(multiplier, 1.05)
-
-        if multiplier > 1.03:
-            reason = f"近期记忆中成功样本较多或正向教训更稳定，权重提高到 {multiplier:.2f} 倍。"
-        elif multiplier < 0.97:
-            reason = f"近期记忆提示该专家相关场景亏损偏多，权重降到 {multiplier:.2f} 倍。"
+        count = sum(int(item["count"]) for item in outcomes)
+        total_pnl = sum(float(item["total_pnl_usdt"]) for item in outcomes)
+        gross_profit = sum(float(item["gross_profit_usdt"]) for item in outcomes)
+        gross_loss = sum(float(item["gross_loss_usdt"]) for item in outcomes)
+        total_return = sum(float(item["total_return_pct"]) for item in outcomes)
+        avg_return = total_return / count
+        return_lcb = sum(
+            float(item["return_lcb_pct"]) * int(item["count"]) for item in outcomes
+        ) / count
+        worst_return = min(float(item["worst_return_pct"]) for item in outcomes)
+        pnl_activity = gross_profit + gross_loss
+        pnl_efficiency = total_pnl / pnl_activity if pnl_activity > 0 else 0.0
+        downside_scale = max(abs(worst_return), abs(avg_return), 1e-9)
+        return_quality = return_lcb / downside_scale
+        utility = (return_quality + pnl_efficiency) / 2.0
+        credibility = math.sqrt(count) / (math.sqrt(count) + 1.0)
+        multiplier = math.exp(math.tanh(utility) * credibility)
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+        if utility > 0:
+            reason = f"权威费后收益质量为正，按收益分布动态提高权重到 {multiplier:.2f} 倍。"
+        elif utility < 0:
+            reason = f"权威费后收益下界或左尾为负，按收益分布动态降低权重到 {multiplier:.2f} 倍。"
         else:
-            reason = "历史样本未显示明显优势，保持基础权重。"
+            reason = "权威费后收益质量相对中性，保持基础权重。"
 
         result[expert_name] = {
             "base_weight": base_weight,
@@ -601,6 +624,15 @@ def dynamic_expert_weights_from_memories(
             "evidence_count": evidence,
             "success_count": success,
             "failure_count": failure,
+            "canonical_outcome_count": count,
+            "canonical_position_count": len(seen_positions),
+            "total_realized_net_pnl_usdt": round(total_pnl, 6),
+            "avg_net_return_after_cost_pct": round(avg_return, 6),
+            "return_lcb_pct": round(return_lcb, 6),
+            "worst_net_return_pct": round(worst_return, 6),
+            "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
+            "utility": round(utility, 6),
+            "weight_policy": "fee_after_return_distribution_not_success_failure_counts",
             "reason": reason,
         }
     return result

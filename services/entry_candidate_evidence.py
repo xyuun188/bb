@@ -135,7 +135,15 @@ class EntryCandidateEvidencePolicy:
         )
         score_before_memory = self.score_candidate(decision, strategy)
         side_feedback = self._side_memory_feedback(memory_feedback, side)
-        memory_bonus = _safe_float(side_feedback.get("candidate_score_bonus"), 0.0)
+        canonical_memory = bool(
+            _safe_int(side_feedback.get("canonical_outcome_count"), 0) > 0
+            and side_feedback.get("cost_complete") is True
+        )
+        memory_bonus = (
+            min(_safe_float(side_feedback.get("score_adjustment"), 0.0), 0.0)
+            if canonical_memory
+            else 0.0
+        )
         score = score_before_memory + memory_bonus
         raw = _safe_dict(decision.raw_response)
         opportunity = _safe_dict(raw.get("opportunity_score"))
@@ -236,21 +244,14 @@ class EntryCandidateEvidencePolicy:
         probe_conversion_ready: bool,
     ) -> str:
         action_bias = str(side_feedback.get("action_bias") or "")
-        allow_probe = bool(side_feedback.get("allow_probe"))
-        if action_bias == "require_stronger_confirmation":
+        canonical_memory = bool(
+            _safe_int(side_feedback.get("canonical_outcome_count"), 0) > 0
+            and side_feedback.get("cost_complete") is True
+        )
+        if canonical_memory and action_bias == "require_stronger_confirmation":
             return "memory_risk_requires_stronger_confirmation"
         if high_profit_potential:
             return "high_profit_candidate_allow_larger_size_and_leverage"
-        if allow_probe and probe_conversion_ready:
-            return "memory_supported_probe_candidate"
-        if (
-            allow_probe
-            and expected_net > 0
-            and profit_quality >= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_min_profit_quality
-            and loss_probability <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_loss_probability
-            and tail_risk <= _ENTRY_EVIDENCE_PARAMS.positive_net_probe_max_tail_risk
-        ):
-            return "memory_watchlist_needs_probe_threshold"
         if expected_net <= 0 or profit_quality <= 0.12 or tail_risk >= 1.15:
             return "hold_or_tiny_probe_only"
         if score >= min_score and expected_net > 0 and tail_risk < 0.95:
@@ -317,7 +318,7 @@ class EntryCandidateEvidencePolicy:
                 "allow_probe": False,
                 "action_bias": "neutral",
             }
-        return item
+        return EntryCandidateEvidencePolicy._compact_side_feedback(item)
 
     @staticmethod
     def _compact_memory_feedback(memory_feedback: dict[str, Any] | None) -> dict[str, Any]:
@@ -368,14 +369,30 @@ class EntryCandidateEvidencePolicy:
     def _compact_side_feedback(item: dict[str, Any]) -> dict[str, Any]:
         if not item:
             return {}
+        canonical = bool(
+            _safe_int(item.get("canonical_outcome_count"), 0) > 0
+            and item.get("cost_complete") is True
+        )
+        score_adjustment = (
+            min(_safe_float(item.get("score_adjustment"), 0.0), 0.0)
+            if canonical
+            else 0.0
+        )
         return {
-            "action_bias": item.get("action_bias"),
-            "allow_probe": bool(item.get("allow_probe")),
+            "action_bias": (
+                "require_stronger_confirmation"
+                if canonical and score_adjustment < 0.0
+                else "fee_after_observation_only"
+            ),
+            "allow_probe": False,
+            "canonical_outcome_count": _safe_int(item.get("canonical_outcome_count"), 0),
+            "cost_complete": canonical,
+            "score_adjustment": round(score_adjustment, 6),
             "missed_opportunity_count": _safe_int(item.get("missed_opportunity_count"), 0),
             "positive_evidence_count": _safe_int(item.get("positive_evidence_count"), 0),
             "risk_evidence_count": _safe_int(item.get("risk_evidence_count"), 0),
-            "candidate_score_bonus": round(_safe_float(item.get("candidate_score_bonus"), 0.0), 6),
-            "max_probe_size_pct": round(_safe_float(item.get("max_probe_size_pct"), 0.0), 6),
+            "candidate_score_bonus": 0.0,
+            "max_probe_size_pct": 0.0,
         }
 
     @staticmethod
@@ -383,30 +400,44 @@ class EntryCandidateEvidencePolicy:
         if not item:
             return {}
         by_side = _safe_dict(item.get("by_side"))
+        long_habit = EntryCandidateEvidencePolicy._compact_side_habit(
+            _safe_dict(by_side.get("long"))
+        )
+        short_habit = EntryCandidateEvidencePolicy._compact_side_habit(
+            _safe_dict(by_side.get("short"))
+        )
+        conservative_sides = [
+            side
+            for side, habit in (("long", long_habit), ("short", short_habit))
+            if habit.get("stance") == "strict_confirm"
+        ]
         return {
-            "posture": item.get("posture"),
+            "posture": "defensive_selective" if conservative_sides else "neutral",
             "preferred_side": item.get("preferred_side"),
-            "active_probe_sides": item.get("active_probe_sides") or [],
-            "conservative_sides": item.get("conservative_sides") or [],
-            "long": EntryCandidateEvidencePolicy._compact_side_habit(
-                _safe_dict(by_side.get("long"))
-            ),
-            "short": EntryCandidateEvidencePolicy._compact_side_habit(
-                _safe_dict(by_side.get("short"))
-            ),
+            "active_probe_sides": [],
+            "conservative_sides": conservative_sides,
+            "long": long_habit,
+            "short": short_habit,
         }
 
     @staticmethod
     def _compact_side_habit(item: dict[str, Any]) -> dict[str, Any]:
         if not item:
             return {}
+        canonical = bool(
+            _safe_int(item.get("canonical_outcome_count"), 0) > 0
+            and item.get("cost_complete") is True
+        )
         return {
-            "stance": item.get("stance"),
-            "proactive_level": round(_safe_float(item.get("proactive_level"), 0.0), 6),
-            "probe_budget_pct": round(_safe_float(item.get("probe_budget_pct"), 0.0), 6),
-            "min_expected_net_pct": round(_safe_float(item.get("min_expected_net_pct"), 0.0), 6),
-            "max_loss_probability": round(_safe_float(item.get("max_loss_probability"), 0.0), 6),
-            "max_tail_risk": round(_safe_float(item.get("max_tail_risk"), 0.0), 6),
+            "stance": (
+                "strict_confirm"
+                if canonical and _safe_float(item.get("score_adjustment"), 0.0) < 0.0
+                else "fee_after_observation_only"
+            ),
+            "proactive_level": 0.0,
+            "probe_budget_pct": 0.0,
+            "canonical_outcome_count": _safe_int(item.get("canonical_outcome_count"), 0),
+            "cost_complete": canonical,
         }
 
     @staticmethod

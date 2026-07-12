@@ -14,13 +14,14 @@ from config.settings import FIXED_AI_MODEL_SLOTS, settings
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
+from services.execution_cost_model import execution_cost_estimate
+from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 from services.runtime_entry_filters import default_entry_filters
 from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
 logger = structlog.get_logger(__name__)
 
 SHADOW_BACKTEST_HORIZONS_MINUTES = (10, 30, 60)
-SHADOW_MISSED_OPPORTUNITY_THRESHOLD = 0.004
 
 LatestPriceProvider = Callable[[str], Awaitable[float]]
 SymbolNormalizer = Callable[[str | None], str]
@@ -193,6 +194,72 @@ def compact_local_ai_tools_shadow(local_ai_tools_context: dict[str, Any] | None)
     return compact if any(key in compact for key in _SHADOW_TOOL_NAMES) else {}
 
 
+def _shadow_fee_after_outcome(
+    row: Any,
+    *,
+    long_return: float,
+    short_return: float,
+) -> dict[str, Any]:
+    snapshot = getattr(row, "feature_snapshot", None)
+    features = snapshot if isinstance(snapshot, dict) else {}
+    execution_cost = execution_cost_estimate(features)
+    funding_present = "funding_rate" in features
+    funding_rate = _safe_shadow_number(features.get("funding_rate")) if funding_present else None
+    funding_interval_minutes = _safe_shadow_number(features.get("funding_interval_minutes"))
+    if funding_interval_minutes is None:
+        funding_interval_hours = _safe_shadow_number(features.get("funding_interval_hours"))
+        funding_interval_minutes = (
+            funding_interval_hours * 60.0 if funding_interval_hours is not None else None
+        )
+    cost_complete = bool(
+        execution_cost.spread_source != "missing"
+        and funding_rate is not None
+        and funding_interval_minutes is not None
+        and funding_interval_minutes > 0
+    )
+    horizon_minutes = max(int(getattr(row, "horizon_minutes", 0) or 0), 0)
+    funding_drag_long_pct = (
+        float(funding_rate or 0.0)
+        * 100.0
+        * horizon_minutes
+        / float(funding_interval_minutes or 1.0)
+    )
+    funding_return_long_pct = -funding_drag_long_pct
+    funding_return_short_pct = funding_drag_long_pct
+    gross_long_pct = long_return * 100.0
+    gross_short_pct = short_return * 100.0
+    long_net_pct = (
+        gross_long_pct
+        - execution_cost.fee_pct
+        - execution_cost.slippage_pct
+        + funding_return_long_pct
+        if cost_complete
+        else None
+    )
+    short_net_pct = (
+        gross_short_pct
+        - execution_cost.fee_pct
+        - execution_cost.slippage_pct
+        + funding_return_short_pct
+        if cost_complete
+        else None
+    )
+    return {
+        "objective": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "cost_complete": cost_complete,
+        "cost_source": "dynamic_execution_estimate_from_shadow_snapshot",
+        "fee_return_pct": execution_cost.fee_pct,
+        "slippage_return_pct": execution_cost.slippage_pct,
+        "funding_return_long_pct": funding_return_long_pct if funding_present else None,
+        "funding_return_short_pct": funding_return_short_pct if funding_present else None,
+        "funding_interval_minutes": funding_interval_minutes,
+        "long_net_return_after_cost_pct": long_net_pct,
+        "short_net_return_after_cost_pct": short_net_pct,
+        "execution_cost": execution_cost.to_dict(),
+    }
+
+
 @dataclass(slots=True)
 class ShadowBacktestService:
     """Record delayed market outcomes and convert strong results into memory."""
@@ -203,7 +270,6 @@ class ShadowBacktestService:
     session_factory: SessionFactory = get_session_ctx
     repository_factory: RepositoryFactory = MemoryRepository
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
-    missed_opportunity_threshold: float = SHADOW_MISSED_OPPORTUNITY_THRESHOLD
     fixed_model_slots: list[dict[str, Any]] = field(
         default_factory=lambda: list(FIXED_AI_MODEL_SLOTS)
     )
@@ -299,15 +365,19 @@ class ShadowBacktestService:
 
                 long_return = (actual_price - entry_price) / entry_price
                 short_return = (entry_price - actual_price) / entry_price
-                threshold = max(
-                    float(settings.shadow_memory_min_return_pct or 0.40) / 100.0,
-                    self.missed_opportunity_threshold,
+                fee_after_outcome = _shadow_fee_after_outcome(
+                    row,
+                    long_return=long_return,
+                    short_return=short_return,
                 )
+                long_net = fee_after_outcome.get("long_net_return_after_cost_pct")
+                short_net = fee_after_outcome.get("short_net_return_after_cost_pct")
                 best_action = "hold"
-                if long_return >= threshold and long_return >= short_return:
-                    best_action = "long"
-                elif short_return >= threshold and short_return > long_return:
-                    best_action = "short"
+                if fee_after_outcome.get("cost_complete"):
+                    if float(long_net) > 0.0 and float(long_net) >= float(short_net):
+                        best_action = "long"
+                    elif float(short_net) > 0.0 and float(short_net) > float(long_net):
+                        best_action = "short"
 
                 decision_action = str(row.decision_action or "hold")
                 missed = decision_action == "hold" and best_action in {"long", "short"}
@@ -317,7 +387,7 @@ class ShadowBacktestService:
                     "short_return": short_return,
                     "best_action": best_action,
                     "missed": missed,
-                    "threshold": threshold,
+                    "fee_after_outcome": fee_after_outcome,
                     "note": self._completion_note(
                         decision_action,
                         best_action,
@@ -370,7 +440,7 @@ class ShadowBacktestService:
                             long_return=completion["long_return"],
                             short_return=completion["short_return"],
                             best_action=completion["best_action"],
-                            threshold=completion["threshold"],
+                            fee_after_outcome=completion["fee_after_outcome"],
                         )
             logger.info("shadow backtests updated", count=completed_count)
             return completed_count
@@ -409,7 +479,7 @@ class ShadowBacktestService:
         long_return: float,
         short_return: float,
         best_action: str,
-        threshold: float,
+        fee_after_outcome: dict[str, Any],
     ) -> None:
         """Turn shadow backtest outcomes into small, reusable expert memories."""
         decision_action = str(getattr(row, "decision_action", "") or "hold")
@@ -417,50 +487,61 @@ class ShadowBacktestService:
         horizon = int(getattr(row, "horizon_minutes", 0) or 0)
         if not symbol or horizon <= 0:
             return
+        if fee_after_outcome.get("cost_complete") is not True:
+            return
 
         if decision_action == "hold" and best_action in {"long", "short"}:
-            realized = long_return if best_action == "long" else short_return
-            if realized < threshold:
+            realized_net_pct = self.float_parser(
+                fee_after_outcome.get(f"{best_action}_net_return_after_cost_pct"),
+                0.0,
+            )
+            if realized_net_pct <= 0.0:
                 return
             memory_type = "shadow_missed_opportunity"
             side = best_action
-            confidence_adjustment = 0.04
-            position_size_multiplier = 1.04
-            success_count = 1
+            confidence_adjustment = 0.0
+            position_size_multiplier = 1.0
+            success_count = 0
             failure_count = 0
             outcome_text = (
                 f"当时选择观望，但 {horizon} 分钟后"
-                f"{side_label(side)}方向涨跌收益约 {realized * 100:.2f}%。"
+                f"{side_label(side)}方向估算费后收益约 {realized_net_pct:.2f}%。"
             )
-            recommended = "allow_small_probe_with_filters"
+            recommended = "shadow_observation_only"
         elif decision_action in {"long", "short"}:
-            realized = long_return if decision_action == "long" else short_return
             side = decision_action
-            if realized >= threshold:
+            realized_net_pct = self.float_parser(
+                fee_after_outcome.get(f"{side}_net_return_after_cost_pct"),
+                0.0,
+            )
+            if realized_net_pct > 0.0:
                 memory_type = "shadow_good_signal"
-                confidence_adjustment = 0.025
-                position_size_multiplier = 1.02
-                success_count = 1
+                confidence_adjustment = 0.0
+                position_size_multiplier = 1.0
+                success_count = 0
                 failure_count = 0
                 outcome_text = (
                     f"影子复盘显示：{side_label(side)}信号在 {horizon} 分钟后"
-                    f"收益约 {realized * 100:.2f}%，该形态短线有效。"
+                    f"估算费后收益约 {realized_net_pct:.2f}%，仅保留为待验证观察。"
                 )
-                recommended = "keep_with_filters"
-            elif realized <= -threshold:
+                recommended = "shadow_observation_only"
+            elif realized_net_pct < 0.0:
                 memory_type = "shadow_bad_signal"
-                confidence_adjustment = -0.06
-                position_size_multiplier = 0.78
+                confidence_adjustment = 0.0
+                position_size_multiplier = 1.0
                 success_count = 0
-                failure_count = 1
+                failure_count = 0
                 opposite = "short" if side == "long" else "long"
-                opposite_return = short_return if opposite == "short" else long_return
+                opposite_net_pct = self.float_parser(
+                    fee_after_outcome.get(f"{opposite}_net_return_after_cost_pct"),
+                    0.0,
+                )
                 outcome_text = (
                     f"影子复盘显示：{side_label(side)}信号在 {horizon} 分钟后"
-                    f"亏损约 {abs(realized) * 100:.2f}%，而"
-                    f"{side_label(opposite)}方向收益约 {opposite_return * 100:.2f}%。"
+                    f"估算费后亏损约 {abs(realized_net_pct):.2f}%，而"
+                    f"{side_label(opposite)}方向估算费后收益约 {opposite_net_pct:.2f}%。"
                 )
-                recommended = "reduce_risk"
+                recommended = "shadow_risk_observation_only"
             else:
                 return
         else:
@@ -492,8 +573,9 @@ class ShadowBacktestService:
                     "failure_count": failure_count,
                     "confidence_score": 0.52,
                     "memory_key": (
-                        f"{expert_name}|shadow|{symbol}|{side}|{memory_type}|"
-                        f"{horizon}m|{self._feature_bucket(feature_snapshot)}"
+                        f"{expert_name}|shadow_correlated_path|"
+                        f"{getattr(row, 'decision_id', None) or getattr(row, 'id', None)}|"
+                        f"{symbol}|{side}|{self._feature_bucket(feature_snapshot)}"
                     ),
                     "extra": {
                         "source": "shadow_backtest",
@@ -506,6 +588,15 @@ class ShadowBacktestService:
                         "actual_price": getattr(row, "actual_price", None),
                         "long_return_pct": long_return * 100,
                         "short_return_pct": short_return * 100,
+                        "net_return_after_cost_pct": realized_net_pct,
+                        "objective": RETURN_OBJECTIVE_NAME,
+                        "objective_version": RETURN_OBJECTIVE_VERSION,
+                        "cost_complete": True,
+                        "production_evidence_eligible": False,
+                        "correlation_group": (
+                            f"shadow_decision:{getattr(row, 'decision_id', None) or getattr(row, 'id', None)}"
+                        ),
+                        "fee_after_outcome": fee_after_outcome,
                     },
                 }
             )

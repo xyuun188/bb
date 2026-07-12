@@ -20,7 +20,7 @@ from services.entry_signal_extraction import (
     first_tool_payload,
     has_signal_evidence,
     payload_side,
-    signal_available,
+    signal_production_eligible,
 )
 
 
@@ -306,7 +306,7 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到服务器盈利模型预测。",
             )
-        available = signal_available(profit)
+        available = signal_production_eligible(profit)
         side = payload_side(profit)
         expected = self._first_number(
             profit, "expected_return_pct", "expected_net_return_pct", "profit_edge_pct"
@@ -371,7 +371,7 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到时序预测。",
             )
-        available = signal_available(series)
+        available = signal_production_eligible(series)
         side = payload_side(series)
         expected = self._first_number(series, "expected_return_pct", "expected_move_pct")
         if expected is None and has_signal_evidence(series):
@@ -429,7 +429,7 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到情绪模型预测。",
             )
-        available = signal_available(sentiment)
+        available = signal_production_eligible(sentiment)
         side = payload_side(sentiment)
         score = self._first_number(sentiment, "score", "sentiment_score")
         return SkillResult(

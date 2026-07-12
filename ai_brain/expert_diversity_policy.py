@@ -19,7 +19,7 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
-    signal_available,
+    signal_production_eligible,
 )
 
 if TYPE_CHECKING:
@@ -269,7 +269,7 @@ def _score_local_profit_model(
         if isinstance(tools, dict)
         else {}
     )
-    if not signal_available(profit):
+    if not signal_production_eligible(profit):
         return
     side = _normal_side(payload_side(profit) or profit.get("direction"))
     if side is None:

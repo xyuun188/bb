@@ -44,7 +44,7 @@ def test_dynamic_expert_weights_use_chinese_reasons() -> None:
     )
 
     reason = weights["trend_expert"]["reason"]
-    assert reason == "暂无足够历史样本，使用基础权重。"
+    assert reason == "暂无成本完整的权威费后收益样本，使用基础权重。"
     _assert_clean_chinese(reason)
 
 
@@ -55,9 +55,20 @@ def test_dynamic_expert_weights_reduce_losing_memory() -> None:
                 {
                     "confidence_score": 0.9,
                     "evidence_count": 5,
-                    "success_count": 0,
-                    "failure_count": 4,
+                    "success_count": 100,
+                    "failure_count": 0,
                     "confidence_adjustment": -0.12,
+                    "memory_type": "loss_lesson",
+                    "extra": {
+                        "source": "authoritative_settlement_backfill",
+                        "source_position_id": 77,
+                        "net_return_after_cost_pct": -8.0,
+                        "realized_pnl": -12.0,
+                        "objective": "maximize_expected_realized_net_return_after_cost",
+                        "objective_version": "2026-07-12.v1",
+                        "cost_complete": True,
+                        "production_evidence_eligible": True,
+                    },
                 }
             ]
         },
@@ -65,9 +76,36 @@ def test_dynamic_expert_weights_reduce_losing_memory() -> None:
     )
 
     trend = weights["trend_expert"]
-    assert trend["multiplier"] <= 0.9
-    assert "权重降到" in trend["reason"]
+    assert trend["multiplier"] < 1.0
+    assert trend["canonical_outcome_count"] == 1
+    assert trend["return_lcb_pct"] == -8.0
+    assert "动态降低权重" in trend["reason"]
     _assert_clean_chinese(trend["reason"])
+
+
+def test_dynamic_expert_weights_ignore_shadow_success_counts() -> None:
+    weights = dynamic_expert_weights_from_memories(
+        {
+            "trend_expert": [
+                {
+                    "memory_type": "shadow_missed_opportunity",
+                    "evidence_count": 164,
+                    "success_count": 164,
+                    "failure_count": 0,
+                    "confidence_adjustment": 1.0,
+                    "extra": {
+                        "source": "shadow_backtest",
+                        "production_evidence_eligible": False,
+                    },
+                }
+            ]
+        },
+        [{"name": "trend_expert", "weight": 1.0}],
+    )
+
+    trend = weights["trend_expert"]
+    assert trend["multiplier"] == 1.0
+    assert trend["canonical_outcome_count"] == 0
 
 
 def test_trade_reflection_templates_are_clean_chinese() -> None:

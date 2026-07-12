@@ -78,6 +78,9 @@ def test_memory_outcomes_merge_conflicting_evidence_by_fee_after_return() -> Non
     assert outcome["conflict"] is True
     assert outcome["total_realized_net_pnl_usdt"] == pytest.approx(-4.0)
     assert outcome["avg_net_return_pct"] == pytest.approx(-3.0)
+    assert outcome["return_lcb_pct"] == pytest.approx(-10.0)
+    assert outcome["worst_net_return_pct"] == pytest.approx(-10.0)
+    assert outcome["squared_net_return_sum_pct2"] == pytest.approx(116.0)
     assert outcome["profit_factor"] == pytest.approx(0.2)
     assert outcome["return_unit"] == "percentage_points"
 

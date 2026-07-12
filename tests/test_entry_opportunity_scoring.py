@@ -112,6 +112,41 @@ def test_entry_score_does_not_change_when_only_diagnostic_win_rate_changes() -> 
     assert high_payload["diagnostic_win_rate"] == pytest.approx(0.85)
 
 
+def test_shadow_timesfm_extreme_move_cannot_change_opportunity_score() -> None:
+    now = datetime(2026, 7, 12, tzinfo=UTC)
+    baseline = _decision()
+    baseline.raw_response["local_ai_tools"].pop("time_series_prediction")
+    with_shadow = deepcopy(baseline)
+    with_shadow.raw_response["local_ai_tools"]["time_series_prediction"] = {
+        "available": True,
+        "route_mode": "shadow_candidate",
+        "live_mutation": False,
+        "model": "timesfm-2.5-primary",
+        "best_side": "short",
+        "direction": "down",
+        "expected_move_pct": -92.244972,
+        "expected_return_pct": -92.244972,
+    }
+
+    baseline_score = _policy(now).score_candidate(
+        baseline,
+        {"min_opportunity_score": 0.95},
+    )
+    shadow_score = _policy(now).score_candidate(
+        with_shadow,
+        {"min_opportunity_score": 0.95},
+    )
+
+    assert shadow_score == baseline_score
+    shadow_breakdown = with_shadow.raw_response["opportunity_score"]["expected_net_breakdown"]
+    timeseries = next(
+        item for item in shadow_breakdown["components"] if item["key"] == "timeseries"
+    )
+    assert timeseries["available"] is True
+    assert timeseries["production_eligible"] is False
+    assert timeseries["contribution_pct"] == 0.0
+
+
 def test_entry_opportunity_scoring_embeds_recent_winner_decay() -> None:
     now = datetime(2026, 6, 10, tzinfo=UTC)
     decision = _decision()
@@ -145,7 +180,7 @@ def test_entry_opportunity_scoring_does_not_relax_stale_winner() -> None:
     assert opportunity["symbol_tier_score_adjustment"] == 0.0
 
 
-def test_entry_opportunity_scoring_turns_memory_habit_into_probe_cap() -> None:
+def test_entry_opportunity_scoring_ignores_legacy_memory_probe_permission() -> None:
     now = datetime(2026, 6, 10, tzinfo=UTC)
     decision = _decision()
     decision.raw_response["memory_feedback"] = {
@@ -166,12 +201,12 @@ def test_entry_opportunity_scoring_turns_memory_habit_into_probe_cap() -> None:
     _policy(now).score_candidate(decision, {"min_opportunity_score": 0.95})
 
     habit = decision.raw_response["opportunity_score"]["memory_habit_adjustment"]
-    assert habit["applied"] is True
+    assert habit["applied"] is False
     assert habit["stance"] == "probe_when_ev_ok"
-    assert habit["quality_ok"] is True
-    assert habit["score_adjustment"] > 0
-    assert habit["adjusted_position_size"] == 0.015
-    assert decision.position_size_pct == 0.015
+    assert habit["quality_ok"] is False
+    assert habit["score_adjustment"] == 0.0
+    assert habit["max_size_pct"] == 0.0
+    assert decision.position_size_pct == 0.04
 
 
 def test_entry_opportunity_scoring_adds_limited_shadow_memory_return_hint() -> None:

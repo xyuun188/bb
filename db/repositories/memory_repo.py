@@ -420,12 +420,30 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
     if source_position_id > 0 and source_position_id in source_position_ids:
         return {**existing, **incoming, "outcome_aggregation": previous}
 
-    count = int(previous.get("count") or 0) + 1
+    previous_count = int(previous.get("count") or 0)
+    count = previous_count + 1
     total_pnl = float(previous.get("total_realized_net_pnl_usdt") or 0.0) + float(
         realized_pnl or 0.0
     )
     total_return = float(previous.get("total_net_return_pct") or 0.0) + float(
         net_return or 0.0
+    )
+    squared_return_sum = float(previous.get("squared_net_return_sum_pct2") or 0.0) + float(
+        net_return or 0.0
+    ) ** 2
+    avg_return = total_return / count
+    if count > 1:
+        return_variance = max(
+            (squared_return_sum - count * avg_return**2) / (count - 1),
+            0.0,
+        )
+        return_lcb = avg_return - (return_variance / count) ** 0.5
+    else:
+        return_lcb = avg_return
+    previous_worst = _finite_float(previous.get("worst_net_return_pct"), None)
+    worst_return = min(
+        float(net_return or 0.0),
+        float(previous_worst) if previous_worst is not None else float(net_return or 0.0),
     )
     positive_count = int(previous.get("positive_count") or 0) + int(
         (realized_pnl or 0.0) > 0
@@ -455,7 +473,10 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         "total_realized_net_pnl_usdt": round(total_pnl, 8),
         "avg_realized_net_pnl_usdt": round(total_pnl / count, 8),
         "total_net_return_pct": round(total_return, 8),
-        "avg_net_return_pct": round(total_return / count, 8),
+        "avg_net_return_pct": round(avg_return, 8),
+        "squared_net_return_sum_pct2": round(squared_return_sum, 8),
+        "return_lcb_pct": round(return_lcb, 8),
+        "worst_net_return_pct": round(worst_return, 8),
         "gross_profit_usdt": round(gross_profit, 8),
         "gross_loss_usdt": round(gross_loss, 8),
         "profit_factor": round(profit_factor, 8),

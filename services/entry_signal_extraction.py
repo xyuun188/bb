@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
+
 LEGACY_MOJIBAKE_LONG_LABELS = ("\u934b\u6c2c\ue63f",)
 LEGACY_MOJIBAKE_SHORT_LABELS = ("\u934b\u6c31\u2516",)
 
@@ -37,6 +39,21 @@ _WRAPPER_METADATA_KEYS = (
     "challenger_model",
     "model_version",
     "route_mode",
+    "live_mutation",
+    "live_influence",
+    "influence_enabled",
+    "allow_live_position_influence",
+    "promotion_ready",
+    "readiness",
+    "evaluation_policy",
+    "model_stage",
+    "training_mode",
+    "objective",
+    "objective_name",
+    "objective_version",
+    "artifact_objective",
+    "artifact_objective_version",
+    "prediction_quality",
     "fallback_reason",
     "feature_coverage",
     "backend",
@@ -165,6 +182,148 @@ def signal_available(payload: dict[str, Any]) -> bool:
         if key in payload and payload.get(key) is False:
             return False
     return True
+
+
+_NON_PRODUCTION_ROUTE_MARKERS = (
+    "shadow",
+    "candidate",
+    "observation",
+    "inference_only",
+    "learning_only",
+    "promotion_blocked",
+)
+_NON_PRODUCTION_STAGES = {
+    "shadow",
+    "shadow_evaluating",
+    "candidate",
+    "inference_only",
+    "learning_only",
+    "promotion_blocked",
+}
+
+
+def _signal_governance_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    current = payload
+    seen: set[int] = set()
+    while isinstance(current, dict) and id(current) not in seen:
+        seen.add(id(current))
+        nodes.append(current)
+        child = next(
+            (
+                current.get(key)
+                for key in _WRAPPED_TOOL_KEYS
+                if isinstance(current.get(key), dict)
+            ),
+            None,
+        )
+        if not isinstance(child, dict):
+            break
+        current = child
+    return nodes
+
+
+def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return auditable live-decision eligibility without hiding shadow observations."""
+
+    if not signal_available(payload):
+        return {"eligible": False, "reason": "signal_unavailable"}
+
+    governance_seen = False
+    for node in _signal_governance_nodes(payload):
+        route_mode = str(node.get("route_mode") or "").strip().lower()
+        if route_mode:
+            governance_seen = True
+            if any(marker in route_mode for marker in _NON_PRODUCTION_ROUTE_MARKERS):
+                return {
+                    "eligible": False,
+                    "reason": "non_production_route_mode",
+                    "route_mode": route_mode,
+                }
+
+        stage = str(node.get("model_stage") or node.get("training_mode") or "").strip().lower()
+        if stage:
+            governance_seen = True
+            if stage in _NON_PRODUCTION_STAGES:
+                return {
+                    "eligible": False,
+                    "reason": "non_production_model_stage",
+                    "model_stage": stage,
+                }
+
+        for key in (
+            "live_mutation",
+            "live_influence",
+            "influence_enabled",
+            "allow_live_position_influence",
+        ):
+            if key in node:
+                governance_seen = True
+                if node.get(key) is False:
+                    return {"eligible": False, "reason": f"{key}_disabled"}
+
+        if "promotion_ready" in node:
+            governance_seen = True
+            if node.get("promotion_ready") is False:
+                return {"eligible": False, "reason": "promotion_not_ready"}
+
+        readiness = safe_dict(node.get("readiness"))
+        if readiness:
+            governance_seen = True
+            if readiness.get("allow_live_position_influence") is False:
+                return {
+                    "eligible": False,
+                    "reason": "readiness_blocks_live_influence",
+                }
+
+        evaluation_policy = safe_dict(node.get("evaluation_policy"))
+        if evaluation_policy:
+            governance_seen = True
+            if evaluation_policy.get("live_mutation") is False:
+                return {
+                    "eligible": False,
+                    "reason": "evaluation_policy_blocks_live_mutation",
+                }
+
+        prediction_quality = safe_dict(node.get("prediction_quality"))
+        if prediction_quality:
+            governance_seen = True
+            if prediction_quality.get("production_eligible") is False or prediction_quality.get(
+                "anomalous"
+            ) is True:
+                return {
+                    "eligible": False,
+                    "reason": str(
+                        prediction_quality.get("reason") or "prediction_quality_blocked"
+                    ),
+                }
+
+        objective_name = str(
+            node.get("artifact_objective")
+            or node.get("objective_name")
+            or node.get("objective")
+            or ""
+        ).strip()
+        objective_version = str(
+            node.get("artifact_objective_version") or node.get("objective_version") or ""
+        ).strip()
+        if objective_name:
+            governance_seen = True
+            if objective_name != RETURN_OBJECTIVE_NAME:
+                return {"eligible": False, "reason": "artifact_objective_mismatch"}
+        if objective_version:
+            governance_seen = True
+            if objective_version != RETURN_OBJECTIVE_VERSION:
+                return {"eligible": False, "reason": "artifact_objective_version_mismatch"}
+
+    return {
+        "eligible": True,
+        "reason": "governance_allows_live_influence" if governance_seen else "legacy_internal_signal",
+    }
+
+
+def signal_production_eligible(payload: dict[str, Any]) -> bool:
+    return bool(signal_production_eligibility(payload).get("eligible"))
 
 
 def payload_side(payload: dict[str, Any] | None, side_key: str = "best_side") -> str:

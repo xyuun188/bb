@@ -91,12 +91,7 @@ class EntryEvidenceProbePolicy:
         missed_count = int(_safe_float(review_feedback.get("missed_opportunity_count"), 0.0))
         positive_count = int(_safe_float(review_feedback.get("positive_evidence_count"), 0.0))
         risk_count = int(_safe_float(review_feedback.get("risk_evidence_count"), 0.0))
-        memory_supported = bool(
-            recommendation == "memory_supported_probe_candidate"
-            and review_feedback.get("allow_probe")
-            and missed_count >= 6
-            and positive_count >= max(risk_count + 1, 2)
-        )
+        memory_supported = False
         threshold_block_reasons = self._threshold_block_reasons(
             expected_net=expected_net,
             quality=quality,
@@ -173,13 +168,8 @@ class EntryEvidenceProbePolicy:
             return None
 
         sizing = self._sizing(expected_net, quality, loss_probability, tail_risk, high_profit)
-        source = "missed_opportunity_memory" if memory_supported else "entry_candidate_evidence"
-        reason = (
-            "影子复盘多次证明观望错过同方向机会，且当前正期望、盈利质量、"
-            "亏损概率和尾部风险达标，生成受控记忆反哺候选。"
-            if memory_supported
-            else "AI 原始观望，但入场候选证据包显示该方向为正期望且风险可控，" "生成受控探针候选。"
-        )
+        source = "entry_candidate_evidence"
+        reason = "AI 原始观望，但当前入场候选证据包显示该方向为正期望且风险可控，生成受控探针候选。"
         raw_response = dict(raw)
         raw_response.update(
             {
