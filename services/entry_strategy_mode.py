@@ -288,27 +288,31 @@ class EntryStrategyModeContextPolicy:
             pnl = _safe_float(bucket.get("pnl"), 0.0)
             avg_pnl = _safe_float(bucket.get("avg_pnl"), 0.0)
             win_rate = _safe_float(bucket.get("win_rate"), 0.0)
+            profit_factor = _safe_float(
+                bucket.get("profit_factor"),
+                2.0 if pnl > 0 else 0.5 if pnl < 0 else 1.0,
+            )
             md_bucket = _safe_dict(multiday.get(side))
             md_count = int(_safe_float(md_bucket.get("count"), 0.0))
-            md_wins = int(_safe_float(md_bucket.get("wins"), 0.0))
-            md_losses = int(_safe_float(md_bucket.get("losses"), 0.0))
             md_pnl = _safe_float(md_bucket.get("pnl"), 0.0)
             md_win_rate = _safe_float(md_bucket.get("win_rate"), 0.0)
-            md_degraded = (
-                md_count >= 6 and md_pnl < 0 and (md_losses >= md_wins + 4 or md_win_rate <= 0.30)
+            md_profit_factor = _safe_float(
+                md_bucket.get("profit_factor"),
+                2.0 if md_pnl > 0 else 0.5 if md_pnl < 0 else 1.0,
             )
+            md_degraded = md_count >= 6 and (md_pnl < 0 or md_profit_factor < 0.90)
             state = "neutral"
             score_adjustment = 0.0
             min_score_delta = 0.0
             size_multiplier = 1.0
             reason = "no strong realized side feedback"
-            if count >= 2 and pnl < 0 and (losses >= wins + 2 or win_rate <= 0.35):
+            if count >= 2 and (pnl < 0 or profit_factor < 0.90):
                 state = "degraded"
                 score_adjustment = -0.25
                 min_score_delta = 0.22
                 size_multiplier = 0.65
                 reason = "today realized side performance is weak; require stronger proof"
-            elif count >= 3 and pnl > 0 and win_rate >= 0.55 and avg_pnl > 0:
+            elif count >= 3 and pnl > 0 and profit_factor > 1.0 and avg_pnl > 0:
                 state = "working"
                 score_adjustment = 0.08
                 min_score_delta = -0.05
@@ -335,9 +339,11 @@ class EntryStrategyModeContextPolicy:
                 "pnl": round(pnl, 6),
                 "avg_pnl": round(avg_pnl, 6),
                 "win_rate": round(win_rate, 6),
+                "profit_factor": round(profit_factor, 6),
                 "multiday_count": md_count,
                 "multiday_pnl": round(md_pnl, 6),
                 "multiday_win_rate": round(md_win_rate, 6),
+                "multiday_profit_factor": round(md_profit_factor, 6),
                 "multiday_degraded": bool(md_degraded),
                 "score_adjustment": round(score_adjustment, 6),
                 "min_score_delta": round(min_score_delta, 6),

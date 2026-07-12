@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -32,6 +33,7 @@ def _decision() -> DecisionOutput:
                     {
                         "long_expected_return_pct": 0.6,
                         "short_expected_return_pct": -0.1,
+                        "long_lower_quantile_return_pct": 0.25,
                         "long_win_rate": 0.66,
                         "profit_quality_score": 1.1,
                     }
@@ -86,6 +88,28 @@ def _strategy(last_closed_at: str) -> dict[str, Any]:
             }
         },
     }
+
+
+def test_entry_score_does_not_change_when_only_diagnostic_win_rate_changes() -> None:
+    now = datetime(2026, 7, 12, tzinfo=UTC)
+    low_win = _decision()
+    high_win = deepcopy(low_win)
+    low_win.raw_response["ml_signal"]["predictions"][0]["long_win_rate"] = 0.35
+    high_win.raw_response["ml_signal"]["predictions"][0]["long_win_rate"] = 0.85
+
+    low_score = _policy(now).score_candidate(low_win, {"min_opportunity_score": 0.95})
+    high_score = _policy(now).score_candidate(high_win, {"min_opportunity_score": 0.95})
+    low_payload = low_win.raw_response["opportunity_score"]
+    high_payload = high_win.raw_response["opportunity_score"]
+
+    assert low_score == high_score
+    assert low_payload["score"] == high_payload["score"]
+    assert (
+        low_payload["expected_return_confidence"]
+        == high_payload["expected_return_confidence"]
+    )
+    assert low_payload["diagnostic_win_rate"] == pytest.approx(0.35)
+    assert high_payload["diagnostic_win_rate"] == pytest.approx(0.85)
 
 
 def test_entry_opportunity_scoring_embeds_recent_winner_decay() -> None:

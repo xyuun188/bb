@@ -3,6 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from services.return_objective import (
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_NAME,
+    RETURN_OBJECTIVE_VERSION,
+)
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import DATA_QUALITY_VERSION
 
@@ -11,12 +16,9 @@ _PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
 ML_READINESS_MIN_SAMPLE_COUNT = _PARAMS.influence_min_sample_count
 ML_READINESS_MIN_TEST_COUNT = _PARAMS.influence_min_test_count
-ML_READINESS_MIN_AUC = _PARAMS.influence_min_auc
-ML_READINESS_MIN_PR_AUC = _PARAMS.influence_min_pr_auc
-ML_READINESS_MIN_ACCURACY = _PARAMS.influence_min_accuracy
 ML_READINESS_MAX_DIRTY_SAMPLE_RATIO = _PARAMS.readiness_max_dirty_sample_ratio
 ML_READINESS_MAX_MODEL_AGE_SECONDS = _PARAMS.readiness_max_model_age_seconds
-ML_READINESS_MIN_TOP_RETURN_PCT = _PARAMS.win_return_threshold_pct
+ML_READINESS_MIN_TOP_RETURN_PCT = _PARAMS.positive_net_return_threshold_pct
 
 
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -72,49 +74,12 @@ def _quality_totals(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
-    auc = _safe_float(metrics.get(f"{side}_auc"), 0.0) or 0.0
-    pr_auc = _safe_float(metrics.get(f"{side}_pr_auc"), None)
-    accuracy = _safe_float(metrics.get(f"{side}_accuracy"), 0.0) or 0.0
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0) or 0.0
     bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), 0.0) or 0.0
-    top_win = _safe_float(metrics.get(f"top_{side}_win_rate"), 0.0) or 0.0
-    bottom_win = _safe_float(metrics.get(f"bottom_{side}_win_rate"), 0.0) or 0.0
-
-    if auc < ML_READINESS_MIN_AUC:
-        blockers.append(
-            _reason(
-                f"{side}_auc_below_threshold",
-                f"{side} AUC is below the configured threshold.",
-                actual=round(auc, 4),
-                required=ML_READINESS_MIN_AUC,
-            )
-        )
-    if pr_auc is None:
-        blockers.append(
-            _reason(
-                f"{side}_pr_auc_missing",
-                f"{side} PR-AUC is missing; retrain with the current trainer.",
-                required=ML_READINESS_MIN_PR_AUC,
-            )
-        )
-    elif pr_auc < ML_READINESS_MIN_PR_AUC:
-        blockers.append(
-            _reason(
-                f"{side}_pr_auc_below_threshold",
-                f"{side} PR-AUC is below the configured threshold.",
-                actual=round(pr_auc, 4),
-                required=ML_READINESS_MIN_PR_AUC,
-            )
-        )
-    if accuracy < ML_READINESS_MIN_ACCURACY:
-        blockers.append(
-            _reason(
-                f"{side}_accuracy_below_threshold",
-                f"{side} accuracy is below the configured threshold.",
-                actual=round(accuracy, 4),
-                required=ML_READINESS_MIN_ACCURACY,
-            )
-        )
+    top_return_lcb = _safe_float(metrics.get(f"top_{side}_return_lcb_pct"), None)
+    top_profit_factor = _safe_float(metrics.get(f"top_{side}_profit_factor"), None)
+    top_tail_loss = _safe_float(metrics.get(f"top_{side}_tail_loss_rate"), None)
+    bottom_tail_loss = _safe_float(metrics.get(f"bottom_{side}_tail_loss_rate"), None)
     if top_return <= ML_READINESS_MIN_TOP_RETURN_PCT:
         blockers.append(
             _reason(
@@ -133,13 +98,35 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
                 required=round(bottom_return, 4),
             )
         )
-    if top_win <= bottom_win:
+    if top_return_lcb is None or top_return_lcb <= 0:
         blockers.append(
             _reason(
-                f"{side}_top_win_not_above_bottom",
-                f"{side} top-score win rate is not above the bottom bucket.",
-                actual=round(top_win, 4),
-                required=round(bottom_win, 4),
+                f"{side}_top_return_lcb_not_positive",
+                f"{side} top-score return confidence lower bound is not positive.",
+                actual=None if top_return_lcb is None else round(top_return_lcb, 4),
+                required=0.0,
+            )
+        )
+    if top_profit_factor is None or top_profit_factor <= 1.0:
+        blockers.append(
+            _reason(
+                f"{side}_top_profit_factor_not_above_one",
+                f"{side} top-score Profit Factor is not above one.",
+                actual=None if top_profit_factor is None else round(top_profit_factor, 4),
+                required=1.0,
+            )
+        )
+    if (
+        top_tail_loss is None
+        or bottom_tail_loss is None
+        or top_tail_loss > bottom_tail_loss
+    ):
+        blockers.append(
+            _reason(
+                f"{side}_top_tail_loss_not_improved",
+                f"{side} top-score tail-loss rate is missing or worse than the bottom bucket.",
+                actual=None if top_tail_loss is None else round(top_tail_loss, 4),
+                required=None if bottom_tail_loss is None else round(bottom_tail_loss, 4),
             )
         )
     return blockers
@@ -156,6 +143,8 @@ def _side_profit_quality_diagnostics(
     bottom_bucket = _safe_dict(side_buckets.get("bottom"))
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), None)
     bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), None)
+    top_return_lcb = _safe_float(metrics.get(f"top_{side}_return_lcb_pct"), None)
+    top_profit_factor = _safe_float(metrics.get(f"top_{side}_profit_factor"), None)
     top_win = _safe_float(metrics.get(f"top_{side}_win_rate"), None)
     bottom_win = _safe_float(metrics.get(f"bottom_{side}_win_rate"), None)
     top_tail_loss = _safe_float(metrics.get(f"top_{side}_tail_loss_rate"), None)
@@ -174,8 +163,10 @@ def _side_profit_quality_diagnostics(
         diagnosis.append("top_score_bucket_not_fee_after_profitable")
     if spread is not None and spread <= 0:
         diagnosis.append("top_score_bucket_not_better_than_bottom")
-    if top_win is not None and bottom_win is not None and top_win <= bottom_win:
-        diagnosis.append("top_score_win_rate_not_better_than_bottom")
+    if top_return_lcb is None or top_return_lcb <= 0:
+        diagnosis.append("top_score_return_lcb_not_positive")
+    if top_profit_factor is None or top_profit_factor <= 1.0:
+        diagnosis.append("top_score_profit_factor_not_above_one")
     if top_tail_loss is not None and bottom_tail_loss is not None and top_tail_loss > bottom_tail_loss:
         diagnosis.append("top_score_tail_loss_worse_than_bottom")
     return {
@@ -184,6 +175,8 @@ def _side_profit_quality_diagnostics(
         "top_avg_return_pct": top_return,
         "bottom_avg_return_pct": bottom_return,
         "top_bottom_return_spread_pct": spread,
+        "top_return_lcb_pct": top_return_lcb,
+        "top_profit_factor": top_profit_factor,
         "top_win_rate": top_win,
         "bottom_win_rate": bottom_win,
         "top_tail_loss_rate": top_tail_loss,
@@ -220,8 +213,29 @@ def build_ml_readiness_report(
     if trained_at is not None:
         age_seconds = max(((now or datetime.now(UTC)) - trained_at).total_seconds(), 0.0)
     data_quality_version = quality.get("data_quality_version")
+    objective_name = metadata.get("objective_name")
+    objective_version = metadata.get("objective_version")
+    label_version = metadata.get("label_version")
 
     global_blockers: list[dict[str, Any]] = []
+    if objective_name != RETURN_OBJECTIVE_NAME or objective_version != RETURN_OBJECTIVE_VERSION:
+        global_blockers.append(
+            _reason(
+                "artifact_objective_version_mismatch",
+                "Artifact does not use the required fee-after return objective.",
+                actual=f"{objective_name or 'unknown'}@{objective_version or 'unknown'}",
+                required=f"{RETURN_OBJECTIVE_NAME}@{RETURN_OBJECTIVE_VERSION}",
+            )
+        )
+    if label_version != RETURN_LABEL_VERSION:
+        global_blockers.append(
+            _reason(
+                "artifact_return_label_version_mismatch",
+                "Artifact does not use the required fee-after return label contract.",
+                actual=label_version or "unknown",
+                required=RETURN_LABEL_VERSION,
+            )
+        )
     if sample_count < ML_READINESS_MIN_SAMPLE_COUNT:
         global_blockers.append(
             _reason(
@@ -295,8 +309,6 @@ def build_ml_readiness_report(
         in {
             "sample_count_below_threshold",
             "test_count_below_threshold",
-            "long_pr_auc_missing",
-            "short_pr_auc_missing",
         }
         for item in blockers
     )
@@ -336,10 +348,9 @@ def build_ml_readiness_report(
             "min_test_samples": ML_READINESS_MIN_TEST_COUNT,
         },
         "thresholds": {
-            "min_auc": ML_READINESS_MIN_AUC,
-            "min_pr_auc": ML_READINESS_MIN_PR_AUC,
-            "min_accuracy": ML_READINESS_MIN_ACCURACY,
             "min_top_return_pct": ML_READINESS_MIN_TOP_RETURN_PCT,
+            "min_top_return_lcb_pct": 0.0,
+            "min_top_profit_factor": 1.0,
             "max_dirty_sample_ratio": ML_READINESS_MAX_DIRTY_SAMPLE_RATIO,
             "max_model_age_seconds": ML_READINESS_MAX_MODEL_AGE_SECONDS,
         },
@@ -356,6 +367,12 @@ def build_ml_readiness_report(
             "long_pr_auc": _safe_float(metrics.get("long_pr_auc"), None),
             "short_pr_auc": _safe_float(metrics.get("short_pr_auc"), None),
             "top_long_avg_return_pct": _safe_float(metrics.get("top_long_avg_return_pct"), None),
+            "top_long_return_lcb_pct": _safe_float(
+                metrics.get("top_long_return_lcb_pct"), None
+            ),
+            "top_long_profit_factor": _safe_float(
+                metrics.get("top_long_profit_factor"), None
+            ),
             "bottom_long_avg_return_pct": _safe_float(
                 metrics.get("bottom_long_avg_return_pct"), None
             ),
@@ -369,6 +386,12 @@ def build_ml_readiness_report(
                 metrics.get("bottom_long_tail_loss_rate"), None
             ),
             "top_short_avg_return_pct": _safe_float(metrics.get("top_short_avg_return_pct"), None),
+            "top_short_return_lcb_pct": _safe_float(
+                metrics.get("top_short_return_lcb_pct"), None
+            ),
+            "top_short_profit_factor": _safe_float(
+                metrics.get("top_short_profit_factor"), None
+            ),
             "bottom_short_avg_return_pct": _safe_float(
                 metrics.get("bottom_short_avg_return_pct"), None
             ),
@@ -385,6 +408,12 @@ def build_ml_readiness_report(
             "model_age_seconds": None if age_seconds is None else round(age_seconds, 1),
             "training_data_version": data_quality_version,
             "required_training_data_version": DATA_QUALITY_VERSION,
+            "objective_name": objective_name,
+            "objective_version": objective_version,
+            "required_objective_name": RETURN_OBJECTIVE_NAME,
+            "required_objective_version": RETURN_OBJECTIVE_VERSION,
+            "label_version": label_version,
+            "required_label_version": RETURN_LABEL_VERSION,
         },
     }
 
@@ -402,10 +431,9 @@ def disabled_ml_readiness(reason_code: str, message: str) -> dict[str, Any]:
             "min_test_samples": ML_READINESS_MIN_TEST_COUNT,
         },
         "thresholds": {
-            "min_auc": ML_READINESS_MIN_AUC,
-            "min_pr_auc": ML_READINESS_MIN_PR_AUC,
-            "min_accuracy": ML_READINESS_MIN_ACCURACY,
             "min_top_return_pct": ML_READINESS_MIN_TOP_RETURN_PCT,
+            "min_top_return_lcb_pct": 0.0,
+            "min_top_profit_factor": 1.0,
             "max_dirty_sample_ratio": ML_READINESS_MAX_DIRTY_SAMPLE_RATIO,
             "max_model_age_seconds": ML_READINESS_MAX_MODEL_AGE_SECONDS,
         },

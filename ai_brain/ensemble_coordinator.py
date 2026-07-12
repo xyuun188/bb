@@ -103,7 +103,6 @@ PROFIT_QUALITY_EXPAND_CROWDED_MAX_SIZE = (
 )
 MAX_NORMAL_ENTRY_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_max_normal_entry_size
 MAX_PROBE_ENTRY_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_max_probe_entry_size
-ML_SOFT_CAUTION_MAX_ENTRY_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_ml_soft_caution_max_entry_size
 MARKET_DIRECTION_EXCLUDED_EXPERTS = set(
     ENSEMBLE_ENTRY_DECISION_PARAMS.market_direction_excluded_experts
 )
@@ -235,11 +234,8 @@ PREDICTIVE_REVERSAL_FULL_EXIT_SCORE = (
 PREDICTIVE_REVERSAL_REDUCE_SIZE = ENSEMBLE_EXIT_DECISION_PARAMS.predictive_reversal_reduce_size
 ML_MIN_EXPECTED_RETURN_PCT = ENSEMBLE_ML_PROBE_PARAMS.ml_min_expected_return_pct
 ML_MIN_PROFIT_EDGE_PCT = ENSEMBLE_ML_PROBE_PARAMS.ml_min_profit_edge_pct
-ML_MIN_SUPPORT_WIN_RATE = ENSEMBLE_ML_PROBE_PARAMS.ml_min_support_win_rate
-ML_STRONG_SUPPORT_WIN_RATE = ENSEMBLE_ML_PROBE_PARAMS.ml_strong_support_win_rate
 ML_SUPPORT_CONFIDENCE_BONUS = ENSEMBLE_ML_PROBE_PARAMS.ml_support_confidence_bonus
 ML_LOW_EDGE_CONFIDENCE_BONUS = ENSEMBLE_ML_PROBE_PARAMS.ml_low_edge_confidence_bonus
-ML_LOW_WIN_CONFIDENCE_BONUS = ENSEMBLE_ML_PROBE_PARAMS.ml_low_win_confidence_bonus
 ML_PROFIT_FIRST_SCORE_RELIEF = ENSEMBLE_ML_PROBE_PARAMS.ml_profit_first_score_relief
 ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT = (
     ENSEMBLE_ML_PROBE_PARAMS.ml_profit_first_min_expected_return_pct
@@ -250,9 +246,6 @@ ML_QUANT_ONLY_MIN_EXPECTED_RETURN_PCT = (
 )
 ML_QUANT_ONLY_MIN_EDGE_PCT = ENSEMBLE_ML_PROBE_PARAMS.ml_quant_only_min_edge_pct
 ML_QUANT_ONLY_MAX_LOSS_PROBABILITY = ENSEMBLE_ML_PROBE_PARAMS.ml_quant_only_max_loss_probability
-ML_PROFIT_FIRST_LOW_WIN_RATE_SIZE_MULTIPLIER = (
-    ENSEMBLE_ML_PROBE_PARAMS.ml_profit_first_low_win_rate_size_multiplier
-)
 LOCAL_TOOLS_MAX_LOSS_PROBABILITY = ENSEMBLE_ML_PROBE_PARAMS.local_tools_max_loss_probability
 PROFIT_FIRST_PROBE_CONFIDENCE = ENSEMBLE_ML_PROBE_PARAMS.profit_first_probe_confidence
 PROFIT_FIRST_PROBE_SIZE = ENTRY_RISK_SIZING_PARAMS.ensemble_profit_first_probe_size
@@ -2900,14 +2893,6 @@ class EnsembleCoordinator:
                 "max_position_size": QUANT_VALIDATION_PROBE_SIZE,
                 "reason": "本地量化验证单只允许小仓，先收集真实执行结果，再用结果反向优化模型。",
             }
-        ml_soft_caution_size_cap = None
-        if ml_gate.get("status") == "passed_high_confidence_slight_negative_expectancy":
-            size = min(size, ML_SOFT_CAUTION_MAX_ENTRY_SIZE)
-            ml_soft_caution_size_cap = {
-                "applied": True,
-                "max_position_size": ML_SOFT_CAUTION_MAX_ENTRY_SIZE,
-                "reason": "ML was slightly negative, so the AI signal is allowed but only as a small controlled entry.",
-            }
         exposure = (
             ((context.get("strategy_mode") or {}).get("position_exposure") or {})
             if isinstance(context, dict)
@@ -2978,8 +2963,6 @@ class EnsembleCoordinator:
         raw_response["profit_quality_position_boost"] = profit_quality_expand
         if risk_size_discount:
             raw_response["risk_expert_size_discount"] = risk_size_discount
-        if ml_soft_caution_size_cap:
-            raw_response["ml_soft_caution_size_cap"] = ml_soft_caution_size_cap
         if crowded_side_size_cap:
             raw_response["profit_first_crowded_side_size_cap"] = crowded_side_size_cap
         if quant_validation_size_cap:
@@ -3089,10 +3072,13 @@ class EnsembleCoordinator:
         side = "long" if long_expected >= short_expected else "short"
         expected = long_expected if side == "long" else short_expected
         opposite_expected = short_expected if side == "long" else long_expected
-        win_rate = self._safe_float(primary.get(f"{side}_win_rate"), 0.0)
+        lower_quantile = self._safe_float(
+            primary.get(f"{side}_lower_quantile_return_pct"), expected
+        )
         edge = expected - opposite_expected
         strong = (
             expected >= ML_PROFIT_FIRST_MIN_EXPECTED_RETURN_PCT
+            and lower_quantile > 0
             and edge >= ML_PROFIT_FIRST_MIN_EDGE_PCT
             and str(primary.get("best_side") or side) == side
         )
@@ -3102,20 +3088,11 @@ class EnsembleCoordinator:
             "side": side,
             "horizon_minutes": primary.get("horizon_minutes"),
             "expected_return_pct": round(expected, 4),
+            "lower_quantile_return_pct": round(lower_quantile, 4),
             "opposite_expected_return_pct": round(opposite_expected, 4),
             "profit_edge_pct": round(edge, 4),
-            "win_rate": round(win_rate, 4),
-            "low_win_rate": bool(win_rate < ML_STRONG_SUPPORT_WIN_RATE),
-            "score_relief": (
-                ML_PROFIT_FIRST_SCORE_RELIEF
-                * (
-                    ML_PROFIT_FIRST_LOW_WIN_RATE_SIZE_MULTIPLIER
-                    if win_rate < ML_STRONG_SUPPORT_WIN_RATE
-                    else 1.0
-                )
-                if strong
-                else 0.0
-            ),
+            "diagnostic_win_rate": self._safe_float(primary.get(f"{side}_win_rate"), None),
+            "score_relief": ML_PROFIT_FIRST_SCORE_RELIEF if strong else 0.0,
             "reason": (
                 "ML 盈亏期望强，允许盈利优先小仓机会降低入场门槛。"
                 if strong
@@ -3467,7 +3444,9 @@ class EnsembleCoordinator:
         opposite = "short" if direction == "long" else "long"
         expected = self._safe_float(primary.get(f"{direction}_expected_return_pct"), 0.0)
         opposite_expected = self._safe_float(primary.get(f"{opposite}_expected_return_pct"), 0.0)
-        win_rate = self._safe_float(primary.get(f"{direction}_win_rate"), 0.0)
+        lower_quantile = self._safe_float(
+            primary.get(f"{direction}_lower_quantile_return_pct"), expected
+        )
         best_side = str(primary.get("best_side") or "")
         edge = expected - opposite_expected
 
@@ -3478,9 +3457,12 @@ class EnsembleCoordinator:
             "direction": direction,
             "horizon_minutes": primary.get("horizon_minutes"),
             "expected_return_pct": round(expected, 4),
+            "lower_quantile_return_pct": round(lower_quantile, 4),
             "opposite_expected_return_pct": round(opposite_expected, 4),
             "profit_edge_pct": round(edge, 4),
-            "direction_win_rate": round(win_rate, 4),
+            "diagnostic_win_rate": self._safe_float(
+                primary.get(f"{direction}_win_rate"), 0.0
+            ),
             "best_side": best_side,
             "confidence_before_ml": round(confidence, 4),
             "min_confidence_before_ml": round(min_confidence, 4),
@@ -3518,19 +3500,6 @@ class EnsembleCoordinator:
             )
 
         if expected < 0:
-            required = min_confidence + 0.06
-            if expected > -ML_MIN_EXPECTED_RETURN_PCT and confidence >= required:
-                gate.update(
-                    {
-                        "status": "passed_high_confidence_slight_negative_expectancy",
-                        "required_confidence": round(required, 4),
-                        "reason": (
-                            "ML expected return is slightly negative, but AI confidence is strong enough. "
-                            "Allow a small controlled entry instead of hard-blocking the signal."
-                        ),
-                    }
-                )
-                return gate
             gate.update(
                 {
                     "allow": False,
@@ -3538,6 +3507,19 @@ class EnsembleCoordinator:
                     "reason": (
                         f"ML 预测 AI 方向（{'做多' if direction == 'long' else '做空'}）预期盈亏为负 "
                         f"{expected:.4f}%，本轮不执行该方向开仓。"
+                    ),
+                }
+            )
+            return gate
+
+        if lower_quantile <= 0:
+            gate.update(
+                {
+                    "allow": False,
+                    "status": "blocked_non_positive_return_lower_bound",
+                    "reason": (
+                        f"ML 预测该方向平均费后收益为 {expected:.4f}%，但收益分布下界 "
+                        f"{lower_quantile:.4f}% 未转正；继续 shadow，不允许置信度覆盖收益风险。"
                     ),
                 }
             )
@@ -3569,25 +3551,14 @@ class EnsembleCoordinator:
             return gate
 
         if expected < ML_MIN_EXPECTED_RETURN_PCT:
-            required = min_confidence + ML_LOW_EDGE_CONFIDENCE_BONUS
-            if confidence < required:
-                gate.update(
-                    {
-                        "allow": False,
-                        "status": "blocked_low_expected_return",
-                        "required_confidence": round(required, 4),
-                        "reason": (
-                            f"ML 预测该方向预期收益 {expected:.4f}% 低于最低盈利质量门槛 "
-                            f"{ML_MIN_EXPECTED_RETURN_PCT:.4f}%，且置信度不足以覆盖手续费/滑点风险。"
-                        ),
-                    }
-                )
-                return gate
             gate.update(
                 {
-                    "status": "passed_high_confidence_low_expected_return",
-                    "required_confidence": round(required, 4),
-                    "reason": "ML 预期收益偏低，但 AI 置信度足够高，仅小心放行。",
+                    "allow": False,
+                    "status": "blocked_low_expected_return",
+                    "reason": (
+                        f"ML 预测该方向费后收益 {expected:.4f}% 低于最低盈利质量门槛 "
+                        f"{ML_MIN_EXPECTED_RETURN_PCT:.4f}%；AI 置信度不能覆盖收益不足。"
+                    ),
                 }
             )
             return gate
@@ -3616,34 +3587,9 @@ class EnsembleCoordinator:
             )
             return gate
 
-        if win_rate < ML_MIN_SUPPORT_WIN_RATE:
-            required = min_confidence + ML_LOW_WIN_CONFIDENCE_BONUS
-            if confidence < required:
-                gate.update(
-                    {
-                        "allow": False,
-                        "status": "blocked_low_ml_win_rate",
-                        "required_confidence": round(required, 4),
-                        "reason": (
-                            f"ML 预期收益为正但该方向胜率仅 {win_rate:.2%}，"
-                            f"当前置信度 {confidence:.2f} 低于低胜率补偿门槛 {required:.2f}。"
-                        ),
-                    }
-                )
-                return gate
-            gate.update(
-                {
-                    "status": "passed_high_confidence_low_win_rate",
-                    "required_confidence": round(required, 4),
-                    "reason": "ML 预期收益为正但胜率偏低，AI 置信度足够高，仅小心放行。",
-                }
-            )
-            return gate
-
         if (
             expected >= ML_MIN_EXPECTED_RETURN_PCT
             and edge >= ML_MIN_PROFIT_EDGE_PCT
-            and win_rate >= ML_STRONG_SUPPORT_WIN_RATE
             and best_side == direction
         ):
             gate.update(

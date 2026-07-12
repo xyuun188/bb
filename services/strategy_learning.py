@@ -1373,12 +1373,10 @@ class StrategyFeedbackCompiler:
     def _side_state(bucket: dict[str, Any]) -> str:
         count = _safe_int(bucket.get("count"), 0)
         pnl = _safe_float(bucket.get("pnl"), 0.0)
-        wins = _safe_int(bucket.get("wins"), 0)
-        losses = _safe_int(bucket.get("losses"), 0)
-        win_rate = _safe_float(bucket.get("win_rate"), 0.0)
-        if count >= 3 and pnl < 0 and (losses >= wins + 2 or win_rate <= 0.30):
+        profit_factor = _safe_float(bucket.get("profit_factor"), 0.0)
+        if count >= 3 and (pnl < 0 or profit_factor < 0.90):
             return "degraded"
-        if count >= 3 and pnl > 0 and win_rate >= 0.45:
+        if count >= 3 and pnl > 0 and profit_factor > 1.0:
             return "working"
         return "neutral"
 
@@ -3709,6 +3707,12 @@ class StrategyScheduler:
                 "Profit-First 已多次把低收益探针转为影子样本，调度质量开仓恢复画像，"
                 "不再让低样本问题继续生成探针闭环。"
             )
+        elif (
+            "small_wins_large_losses" in problem_keys
+            or "reflection_small_wins_large_losses" in problem_keys
+        ) and "winner_hold" in by_id:
+            selected = by_id["winner_hold"]
+            reason = "高胜率小赚大亏导致负期望，优先调度收益保留和左尾压缩画像。"
         else:
             degraded_sides = [
                 side
@@ -3735,12 +3739,6 @@ class StrategyScheduler:
                 ) and "balanced_probe" in by_id:
                     selected = by_id["balanced_probe"]
                     reason = "开仓样本不足或专家 fallback 拦截偏多，调度平衡探针画像。"
-                elif (
-                    "small_wins_large_losses" in problem_keys
-                    or "reflection_small_wins_large_losses" in problem_keys
-                ) and "winner_hold" in by_id:
-                    selected = by_id["winner_hold"]
-                    reason = "盈利仓小盈过多且大亏存在，调度赢家持仓优化画像。"
 
         if not manual_lock_active and not pressure_guard_active:
             structured = self._best_structured_candidate(
@@ -4457,7 +4455,7 @@ class StrategyScheduler:
         reasons: list[str] = []
 
         net_pnl = _safe_float(feedback.totals.get("net_pnl"), 0.0)
-        win_rate = _safe_float(feedback.totals.get("win_rate"), 0.0)
+        profit_factor = _safe_float(feedback.totals.get("profit_factor"), 0.0)
         low_trade_count = bool(feedback.totals.get("low_trade_count_penalty"))
         risk_mode = str(_safe_dict(feedback.totals).get("risk_mode") or "")
         open_pressure = _safe_dict(feedback.open_position_pressure)
@@ -4469,12 +4467,17 @@ class StrategyScheduler:
         )
         entry_preference = _safe_dict(profile.params.get("entry_filters"))
 
-        if net_pnl > 0 and win_rate >= 0.52 and not low_trade_count:
+        if net_pnl > 0 and profit_factor > 1.0 and not low_trade_count:
             factor = params.entry_filter_profit_tighten_factor
             volume_ratio *= 1.0 + (1.0 - factor) * 0.50
             adx *= 1.0 + (1.0 - factor) * 0.35
             reasons.append("profitable_recent_feedback_tightens_quality_reference")
-        elif low_trade_count or "missed_opportunities" in problem_keys or net_pnl < 0:
+        elif (
+            low_trade_count
+            or "missed_opportunities" in problem_keys
+            or net_pnl < 0
+            or profit_factor < 1.0
+        ):
             factor = params.entry_filter_loss_relax_factor
             volume_ratio *= factor
             adx *= 0.82
@@ -6034,7 +6037,6 @@ class StrategyLearningService:
                 "count",
                 "pnl",
                 "avg_pnl",
-                "win_rate",
                 "avg_hold_hours",
                 "profit_factor",
                 "state",
@@ -6283,7 +6285,7 @@ class StrategyLearningService:
         minimal_summary["side_performance"] = {
             side: {
                 key: _safe_dict(bucket).get(key)
-                for key in ("pnl", "win_rate", "avg_hold_hours", "profit_factor", "state")
+                for key in ("pnl", "avg_hold_hours", "profit_factor", "state")
             }
             for side, bucket in _safe_dict(minimal_summary.get("side_performance")).items()
         }
@@ -6512,7 +6514,7 @@ class StrategyLearningService:
                     "training_trade_count": feedback.totals.get("training_trade_count"),
                     "trade_count_target": feedback.totals.get("trade_count_target"),
                     "net_pnl": feedback.totals.get("net_pnl"),
-                    "win_rate": feedback.totals.get("win_rate"),
+                    "profit_factor": feedback.totals.get("profit_factor"),
                     "avg_loss_hold_hours": feedback.totals.get("avg_loss_hold_hours"),
                     "payoff_profile": self._compact_payoff_profile(
                         feedback.totals.get("payoff_profile")
@@ -6624,7 +6626,7 @@ class StrategyLearningService:
                             "training_trade_count",
                             "trade_count_target",
                             "net_pnl",
-                            "win_rate",
+                            "profit_factor",
                             "small_win_count",
                             "large_loss_count",
                             "avg_hold_hours",
@@ -6645,7 +6647,6 @@ class StrategyLearningService:
                             "losses",
                             "pnl",
                             "avg_pnl",
-                            "win_rate",
                             "avg_hold_hours",
                             "profit_factor",
                             "largest_loss",

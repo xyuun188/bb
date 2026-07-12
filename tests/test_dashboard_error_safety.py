@@ -1475,6 +1475,75 @@ async def test_daily_pnl_today_row_uses_current_okx_equity(
 
 
 @pytest.mark.asyncio
+async def test_daily_pnl_assigns_midnight_equity_change_to_completed_beijing_day(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-daily-equity-date.db').as_posix()}",
+    )
+    await init_db()
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 30, 12, 0, tzinfo=tz or UTC)
+
+    async def okx_snapshot(_mode: str):
+        return {"equity": 5015.0, "total": 5015.0, "free": 4900.0}
+
+    monkeypatch.setattr(dashboard, "datetime", FrozenDatetime)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    monkeypatch.setattr(dashboard, "_get_exchange_open_position_symbols", lambda _mode: _async_value(set()))
+    monkeypatch.setattr(dashboard, "_get_dashboard_okx_account_snapshot", okx_snapshot)
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    ExecutionEquitySnapshot(
+                        mode="paper",
+                        model_name="ensemble_trader",
+                        snapshot_date="2026-06-28",
+                        snapshot_at=datetime(2026, 6, 27, 16, 0, tzinfo=UTC),
+                        equity=5000.0,
+                        source="okx_snapshot",
+                    ),
+                    ExecutionEquitySnapshot(
+                        mode="paper",
+                        model_name="ensemble_trader",
+                        snapshot_date="2026-06-29",
+                        snapshot_at=datetime(2026, 6, 28, 16, 0, tzinfo=UTC),
+                        equity=4990.0,
+                        source="okx_snapshot",
+                    ),
+                    ExecutionEquitySnapshot(
+                        mode="paper",
+                        model_name="ensemble_trader",
+                        snapshot_date="2026-06-30",
+                        snapshot_at=datetime(2026, 6, 29, 16, 0, tzinfo=UTC),
+                        equity=5010.0,
+                        source="okx_snapshot",
+                    ),
+                ]
+            )
+        payload = await dashboard.get_daily_pnl_records(mode="paper", days=3)
+    finally:
+        await close_db()
+
+    rows = {row["date"]: row for row in payload["records"]}
+    assert rows["2026-06-28"]["okx_equity_pnl"] == pytest.approx(-10.0)
+    assert rows["2026-06-28"]["okx_equity_pnl_source"] == (
+        "next_beijing_midnight_minus_day_baseline"
+    )
+    assert rows["2026-06-29"]["okx_equity_pnl"] == pytest.approx(20.0)
+    assert rows["2026-06-30"]["okx_equity_pnl"] == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
 async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

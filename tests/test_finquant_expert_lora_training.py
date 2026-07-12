@@ -18,13 +18,29 @@ def _dataset_contract(monkeypatch: pytest.MonkeyPatch) -> tuple[str, dict]:
                     {"role": "system", "content": "system"},
                     {"role": "user", "content": '{"task":"trade"}'},
                     {"role": "assistant", "content": '{"result":"ok"}'},
-                ]
+                ],
+                "preference": {
+                    "contract_version": training.PREFERENCE_CONTRACT_VERSION,
+                    "objective": training.RETURN_OBJECTIVE_NAME,
+                    "prompt": "prompt",
+                    "chosen": '{"candidate":"positive_return"}',
+                    "rejected": '{"candidate":"negative_return"}',
+                },
             },
             separators=(",", ":"),
         )
         + "\n"
     )
-    return dataset, training._finalize_dataset_contract(dataset, {"source": "test"})
+    return dataset, training._finalize_dataset_contract(
+        dataset,
+        {
+            "source": "test",
+            "objective_name": training.RETURN_OBJECTIVE_NAME,
+            "objective_version": training.RETURN_OBJECTIVE_VERSION,
+            "preference_contract_version": training.PREFERENCE_CONTRACT_VERSION,
+            "preference_example_count": 1,
+        },
+    )
 
 
 def test_dataset_contract_is_content_addressed_and_tamper_evident(
@@ -83,12 +99,28 @@ def test_dataset_contract_rejects_invalid_json_message_content(
                     {"role": "system", "content": "system"},
                     {"role": "user", "content": '{"truncated":'},
                     {"role": "assistant", "content": "{}"},
-                ]
+                ],
+                "preference": {
+                    "contract_version": training.PREFERENCE_CONTRACT_VERSION,
+                    "objective": training.RETURN_OBJECTIVE_NAME,
+                    "prompt": "prompt",
+                    "chosen": "{}",
+                    "rejected": "{}",
+                },
             }
         )
         + "\n"
     )
-    manifest = training._finalize_dataset_contract(dataset, {"source": "test"})
+    manifest = training._finalize_dataset_contract(
+        dataset,
+        {
+            "source": "test",
+            "objective_name": training.RETURN_OBJECTIVE_NAME,
+            "objective_version": training.RETURN_OBJECTIVE_VERSION,
+            "preference_contract_version": training.PREFERENCE_CONTRACT_VERSION,
+            "preference_example_count": 1,
+        },
+    )
 
     with pytest.raises(ValueError, match="invalid JSON message content"):
         training._validate_dataset_contract(dataset, manifest)
@@ -132,6 +164,18 @@ def test_trade_response_uses_authoritative_net_pnl_without_double_deducting_cost
     assert "after_fee_pnl_usdt" not in response
 
 
+def test_finquant_preference_counterexample_prefers_low_win_positive_expectancy() -> None:
+    row = training._return_objective_counterexample()
+    preference = row["preference"]
+    user_payload = json.loads(row["messages"][1]["content"])["payload"]
+
+    assert user_payload["candidate_a"]["win_rate"] == pytest.approx(0.35)
+    assert user_payload["candidate_b"]["win_rate"] == pytest.approx(0.80)
+    assert preference["metrics"]["chosen_net_return_after_cost_pct"] > 0
+    assert preference["metrics"]["rejected_net_return_after_cost_pct"] < 0
+    assert json.loads(preference["chosen"])["best_side"] == "candidate_a"
+
+
 def test_remote_json_parser_returns_root_object_instead_of_last_nested_object() -> None:
     raw = 'remote-prefix\n{"verified":true,"adapter_path":"/adapter","manifest":{"training_config":{"rank":8}}}'
 
@@ -168,11 +212,31 @@ def test_remote_trainer_and_registry_enforce_hashes_atomic_pointers_and_rollback
     assert "dataset SHA-256 does not match its manifest" in training.REMOTE_TRAINER_CODE
     assert '"adapter_files": adapter_files' in training.REMOTE_TRAINER_CODE
     assert '"held_out_eval_loss": eval_loss' in training.REMOTE_TRAINER_CODE
+    assert "from trl import DPOConfig, DPOTrainer" in training.REMOTE_TRAINER_CODE
+    assert '"training_stages": ["sft_format_domain", "trl_dpo_return_preference"]' in (
+        training.REMOTE_TRAINER_CODE
+    )
+    assert '"preference_selection_accuracy": preference_selection_accuracy' in (
+        training.REMOTE_TRAINER_CODE
+    )
     assert '"training_config": {' in training.REMOTE_TRAINER_CODE
     assert '"trainer_code_sha256": sha256_file(Path(__file__))' in training.REMOTE_TRAINER_CODE
     assert "os.replace(staging_dir, output_dir)" in training.REMOTE_TRAINER_CODE
     assert "os.replace(temporary, path)" in training.REMOTE_REGISTRY_TOOL_CODE
     assert 'subparsers.add_parser("rollback")' in training.REMOTE_REGISTRY_TOOL_CODE
+    assert 'RETIRED = ROOT / "retired"' in training.REMOTE_REGISTRY_TOOL_CODE
+    assert '"can_influence_live": False' in training.REMOTE_REGISTRY_TOOL_CODE
+    assert '"retired_incompatible_previous": retired_previous' in (
+        training.REMOTE_REGISTRY_TOOL_CODE
+    )
+    assert '"retired_incompatible_rollback": retired_rollback' in (
+        training.REMOTE_REGISTRY_TOOL_CODE
+    )
+    assert (
+        'previous.get("adapter_path") == new_pointer.get("adapter_path")'
+        in training.REMOTE_REGISTRY_TOOL_CODE
+    )
+    assert "ROLLBACK.unlink()" in training.REMOTE_REGISTRY_TOOL_CODE
     assert 'subparsers.add_parser("status")' in training.REMOTE_REGISTRY_TOOL_CODE
     assert "validate_pointer(target)" in training.REMOTE_REGISTRY_TOOL_CODE
     assert '"verification_status": verification_status' in training.REMOTE_REGISTRY_TOOL_CODE

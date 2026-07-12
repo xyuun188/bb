@@ -347,3 +347,58 @@ def test_quant_only_probe_allows_tiny_short_when_quant_timeseries_and_direction_
     assert result["side"] == "short"
     assert result["supports"] == ["server_profit_model", "time_series_model"]
     assert result["direction_preferred_side"] == "short"
+
+
+def test_ml_gate_allows_low_win_rate_when_fee_after_return_distribution_is_strong() -> None:
+    gate = _coordinator()._ml_profit_quality_entry_gate(
+        Action.LONG,
+        {
+            "ml_signal": {
+                "available": True,
+                "influence_enabled": True,
+                "influence_policy": {"long": {"enabled": True}},
+                "predictions": [
+                    {
+                        "long_expected_return_pct": 0.20,
+                        "short_expected_return_pct": -0.08,
+                        "long_lower_quantile_return_pct": 0.09,
+                        "long_win_rate": 0.35,
+                        "best_side": "long",
+                    }
+                ],
+            }
+        },
+        confidence=0.70,
+        min_confidence=0.65,
+    )
+
+    assert gate["allow"] is True
+    assert gate["status"] == "supported_by_profit_quality"
+    assert gate["diagnostic_win_rate"] == pytest.approx(0.35)
+
+
+def test_ml_gate_blocks_high_win_rate_when_fee_after_return_is_negative() -> None:
+    gate = _coordinator()._ml_profit_quality_entry_gate(
+        Action.LONG,
+        {
+            "ml_signal": {
+                "available": True,
+                "influence_enabled": True,
+                "influence_policy": {"long": {"enabled": True}},
+                "predictions": [
+                    {
+                        "long_expected_return_pct": -0.03,
+                        "short_expected_return_pct": -0.08,
+                        "long_lower_quantile_return_pct": -0.12,
+                        "long_win_rate": 0.80,
+                        "best_side": "long",
+                    }
+                ],
+            }
+        },
+        confidence=0.99,
+        min_confidence=0.65,
+    )
+
+    assert gate["allow"] is False
+    assert gate["status"] == "blocked_negative_expectancy"

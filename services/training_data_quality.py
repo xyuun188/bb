@@ -13,8 +13,8 @@ from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-07-11.v5"
-PROFIT_LEARNING_VERSION = "profit-first-training-v2"
+DATA_QUALITY_VERSION = "2026-07-12.v1"
+PROFIT_LEARNING_VERSION = "fee-after-return-training-v3"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 HIGH_CONTAMINATION_EXCLUDED_RATIO = 0.05
 HIGH_CONTAMINATION_BLOCKED_REASON_RATIO = 0.02
@@ -831,10 +831,43 @@ def _trade_profit_learning_labels(
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
     fee_dominated = bool(fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple)
     notional = _trade_notional_usdt(sample)
-    return_after_cost_pct = _trade_return_after_cost_pct(
+    net_return_after_cost_pct = _trade_return_after_cost_pct(
         sample,
         pnl=pnl,
         notional=notional,
+    )
+    gross_pnl = _safe_float(sample.get("gross_pnl"), None)
+    gross_return_on_notional_pct = (
+        gross_pnl / notional * 100.0
+        if gross_pnl is not None and notional is not None and notional > 0
+        else None
+    )
+    fee_return_pct = (
+        abs(fee) / notional * 100.0
+        if fee is not None and notional is not None and notional > 0
+        else None
+    )
+    funding_return_pct = (
+        funding_fee / notional * 100.0
+        if funding_fee is not None and notional is not None and notional > 0
+        else None
+    )
+    slippage_cost = _first_float(
+        sample.get("slippage_cost_usdt"),
+        sample.get("execution_slippage_usdt"),
+    )
+    slippage_return_pct = (
+        abs(slippage_cost) / notional * 100.0
+        if slippage_cost is not None and notional is not None and notional > 0
+        else None
+    )
+    return_on_margin_pct = (
+        pnl / (notional / actual_leverage) * 100.0
+        if notional is not None
+        and notional > 0
+        and actual_leverage is not None
+        and actual_leverage > 0
+        else None
     )
     return {
         "version": PROFIT_LEARNING_VERSION,
@@ -860,7 +893,14 @@ def _trade_profit_learning_labels(
         "cost_basis_label": cost_basis_label,
         "fee_dominated": fee_dominated,
         "realized_net_pnl_usdt": pnl,
-        "return_after_cost_pct": return_after_cost_pct,
+        "gross_return_on_notional_pct": gross_return_on_notional_pct,
+        "fee_return_pct": fee_return_pct,
+        "slippage_return_pct": slippage_return_pct,
+        "funding_return_pct": funding_return_pct,
+        "net_return_after_cost_pct": net_return_after_cost_pct,
+        "return_on_margin_pct": return_on_margin_pct,
+        "return_after_cost_pct": net_return_after_cost_pct,
+        "return_after_cost_pct_deprecated": True,
         "fee_estimate_usdt": fee,
         "funding_fee_usdt": funding_fee,
         "notional_usdt": notional,
@@ -986,7 +1026,10 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                         loss_count += 1
                     else:
                         flat_count += 1
-                return_pct = _safe_float(labels.get("return_after_cost_pct"), None)
+                return_pct = _safe_float(
+                    labels.get("net_return_after_cost_pct"),
+                    None,
+                )
                 if return_pct is not None:
                     trade_returns.append(return_pct)
         for key, value in labels.items():
@@ -1059,7 +1102,10 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
             continue
         ready_count += 1
         pnl = _safe_float(labels.get("realized_net_pnl_usdt"), None)
-        return_pct = _safe_float(labels.get("return_after_cost_pct"), None)
+        return_pct = _safe_float(
+            labels.get("net_return_after_cost_pct"),
+            None,
+        )
         sample_key = _safe_str(sample.get("lifecycle_key") or sample.get("position_id"))
         if pnl is None:
             errors.append({"sample_key": sample_key, "reason": "missing_realized_net_pnl"})
@@ -1068,7 +1114,12 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
         positive_pnl_count += int(pnl > 0)
         negative_pnl_count += int(pnl < 0)
         if return_pct is None:
-            errors.append({"sample_key": sample_key, "reason": "missing_return_after_cost"})
+            errors.append(
+                {
+                    "sample_key": sample_key,
+                    "reason": "missing_net_return_after_cost_pct",
+                }
+            )
             continue
         return_total += return_pct
         return_count += 1
@@ -1762,6 +1813,22 @@ def governance_report(
             "清洗策略变更后应重训本地 ML、服务器量化工具，并重建向量索引。",
         ],
     }
+
+
+def artifact_bound_governance_report(
+    quality: dict[str, Any],
+    *,
+    persist_artifact: bool,
+) -> dict[str, Any]:
+    """Bind a newly persisted artifact to the exact clean-view fingerprint."""
+
+    report = governance_report(quality)
+    if not persist_artifact:
+        return report
+    return governance_report(
+        quality,
+        artifact_quality_fingerprint=str(report.get("quality_fingerprint") or ""),
+    )
 
 
 def _contamination_risk(

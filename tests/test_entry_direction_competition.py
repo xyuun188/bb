@@ -375,3 +375,31 @@ def test_strategy_side_weights_do_not_override_strong_opposing_evidence() -> Non
 
     assert context["preferred_side"] == "short"
     assert context["short"]["score"] > context["long"]["score"]
+
+
+def test_direction_competition_ignores_diagnostic_ml_win_rate() -> None:
+    def build(win_rate: float) -> dict:
+        return _context(
+            ml={
+                "influence_enabled": True,
+                "predictions": [
+                    {
+                        "long_expected_return_pct": 0.40,
+                        "short_expected_return_pct": -0.10,
+                        "long_lower_quantile_return_pct": 0.18,
+                        "short_lower_quantile_return_pct": -0.20,
+                        "long_tail_loss_probability": 0.12,
+                        "short_tail_loss_probability": 0.55,
+                        "long_win_rate": win_rate,
+                        "short_win_rate": 1.0 - win_rate,
+                    }
+                ],
+            }
+        )
+
+    low_win = build(0.35)
+    high_win = build(0.85)
+
+    assert low_win["long"]["score"] == high_win["long"]["score"]
+    assert low_win["long"]["loss_probability"] == 0.12
+    assert high_win["long"]["loss_probability"] == 0.12

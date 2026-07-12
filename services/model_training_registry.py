@@ -27,6 +27,46 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _fee_after_evaluation(
+    bucket: dict[str, Any] | None,
+    *,
+    missing_reason: str = "fee_after_return_evaluation_missing",
+) -> dict[str, Any]:
+    evidence = _safe_dict(bucket)
+    count = _safe_int(evidence.get("count"))
+    if count <= 0:
+        return {
+            "evaluation_mode": "not_evaluated",
+            "evaluation_objective": "fee_after_realized_net_pnl_and_profit_factor",
+            "evaluation_sample_count": 0,
+            "quality_state": "promotion_blocked",
+            "blocking_reasons": [missing_reason],
+            "realized_net_pnl_usdt": 0.0,
+            "avg_realized_net_pnl_usdt": 0.0,
+            "profit_factor": 0.0,
+        }
+    pnl = float(evidence.get("pnl") or 0.0)
+    profit_factor = float(evidence.get("profit_factor") or 0.0)
+    state = str(evidence.get("state") or "learning")
+    blockers = []
+    if pnl <= 0:
+        blockers.append("realized_net_pnl_non_positive")
+    if profit_factor < 1.0:
+        blockers.append("profit_factor_below_unity")
+    if state == "learning":
+        blockers.append("fee_after_sample_floor_not_met")
+    return {
+        "evaluation_mode": "fee_after_shadow_evaluated",
+        "evaluation_objective": "fee_after_realized_net_pnl_and_profit_factor",
+        "evaluation_sample_count": count,
+        "quality_state": "promotion_blocked" if blockers else "fee_after_positive",
+        "blocking_reasons": blockers,
+        "realized_net_pnl_usdt": round(pnl, 6),
+        "avg_realized_net_pnl_usdt": round(float(evidence.get("avg_pnl") or 0.0), 6),
+        "profit_factor": round(profit_factor, 6),
+    }
+
+
 def _finquant_specialization_verified(
     slot: dict[str, Any],
     evidence: dict[str, Any],
@@ -39,6 +79,19 @@ def _finquant_specialization_verified(
         return False
     if str(evidence.get("legacy_read_only") or "").lower() == "true":
         return False
+    if evidence.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
+        return False
+    if evidence.get("objective_version") != "2026-07-12.v1":
+        return False
+    if evidence.get("preference_contract_version") != "bb_finquant_return_preference.v1":
+        return False
+    if "trl_dpo_return_preference" not in str(evidence.get("training_stages") or ""):
+        return False
+    try:
+        if float(evidence.get("preference_selection_accuracy") or 0.0) < 0.5:
+            return False
+    except (TypeError, ValueError):
+        return False
     required_text = (
         "adapter_version",
         "adapter_path",
@@ -48,6 +101,11 @@ def _finquant_specialization_verified(
         "source_code_version",
         "base_model_repo",
         "trained_at",
+        "objective_name",
+        "objective_version",
+        "preference_contract_version",
+        "preference_selection_accuracy",
+        "training_stages",
     )
     if any(not str(evidence.get(key) or "").strip() for key in required_text):
         return False
@@ -295,6 +353,21 @@ def _specialist_rows(
                 "authoritative_sample_count": _safe_int(
                     report.get("authoritative_direction_aligned_count")
                 ),
+                "evaluation_objective": "fee_after_net_return_profit_factor_tail_loss",
+                "avg_net_return_after_cost_pct": report.get(
+                    "avg_shadow_return_after_cost_pct"
+                ),
+                "authoritative_avg_net_return_after_cost_pct": report.get(
+                    "authoritative_avg_return_after_cost_pct"
+                ),
+                "profit_factor": report.get("profit_factor"),
+                "authoritative_profit_factor": report.get(
+                    "authoritative_profit_factor"
+                ),
+                "tail_loss_count": _safe_int(report.get("tail_loss_count")),
+                "authoritative_tail_loss_count": _safe_int(
+                    report.get("authoritative_tail_loss_count")
+                ),
                 "promotion_ready": promotion_ready,
                 "evaluation_generated_at": specialist_report.get("generated_at"),
             }
@@ -302,7 +375,10 @@ def _specialist_rows(
     return rows
 
 
-def _llm_rows(model_server_report: dict[str, Any]) -> list[dict[str, Any]]:
+def _llm_rows(
+    model_server_report: dict[str, Any],
+    contribution_performance: dict[str, Any],
+) -> list[dict[str, Any]]:
     old_takeover = _safe_dict(
         model_server_report.get("old_takeover_runtime") or model_server_report.get("old_takeover")
     )
@@ -376,9 +452,22 @@ def _llm_rows(model_server_report: dict[str, Any]) -> list[dict[str, Any]]:
     ]
     normalized_base_rows = []
     for row in base_rows:
+        evaluation_bucket = None
+        missing_reason = "model_specific_fee_after_attribution_missing"
+        if row["model_id"] == "deepseek_r1_14b_risk":
+            evaluation_bucket = _safe_dict(contribution_performance.get("high_risk_review"))
+            missing_reason = "high_risk_review_fee_after_evaluation_missing"
+        elif row["model_id"] == "deepseek_online_decision":
+            evaluation_bucket = _safe_dict(contribution_performance.get("decision_llm"))
+            missing_reason = "decision_llm_fee_after_evaluation_missing"
+        evaluation = _fee_after_evaluation(
+            evaluation_bucket,
+            missing_reason=missing_reason,
+        )
         normalized_base_rows.append(
             {
                 **row,
+                **evaluation,
                 "trainable": False,
                 "training_owner": None,
                 "runtime_role": row["task"],
@@ -387,12 +476,10 @@ def _llm_rows(model_server_report: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "artifact_available": bool(row["runtime_available"]),
                 "trained_at": None,
-                "sample_count": 0,
+                "sample_count": evaluation["evaluation_sample_count"],
                 "live_influence": bool(
                     row["model_id"] == "deepseek_online_decision" and row["runtime_available"]
                 ),
-                "quality_state": "provider_or_base_model",
-                "blocking_reasons": [],
                 "identity_verified": bool(row["runtime_available"]),
                 "alias_only": False,
             }
@@ -406,6 +493,7 @@ def build_model_training_registry(
     local_tools_status: dict[str, Any] | None = None,
     specialist_report: dict[str, Any] | None = None,
     model_server_report: dict[str, Any] | None = None,
+    contribution_performance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one truthful model lifecycle view for APIs and audits."""
 
@@ -413,11 +501,12 @@ def build_model_training_registry(
     local_tools = _safe_dict(local_tools_status)
     specialist = _safe_dict(specialist_report)
     server = _safe_dict(model_server_report)
+    contributions = _safe_dict(contribution_performance)
     models = [
         _local_ml_row(local_ml),
         *_local_tool_rows(local_tools),
         *_specialist_rows(local_tools, specialist),
-        *_llm_rows(server),
+        *_llm_rows(server, contributions),
     ]
     lifecycle_counts = Counter(str(row.get("lifecycle") or "unknown") for row in models)
     trainable_count = sum(1 for row in models if bool(row.get("trainable")))

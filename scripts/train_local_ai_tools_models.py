@@ -35,11 +35,17 @@ from services.okx_training_gate import okx_training_refresh_gate
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.training_data_quality import annotate_training_payload
+from services.training_data_quality import (
+    annotate_training_payload,
+    artifact_bound_governance_report,
+)
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+_LOCAL_AI_ROUND_TRIP_COST_PCT = (
+    DEFAULT_TRADING_PARAMS.execution_cost.local_ml_round_trip_cost_pct
+)
 _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "change_24h_pct",
     "spread_pct",
@@ -827,16 +833,24 @@ async def _load_sequence_samples(limit: int) -> list[dict[str, Any]]:
                 continue
             future = closes[idx + 1]
             move_pct = (future - base[-1]) / base[-1] * 100.0
+            feature_timestamp = ordered[idx].open_time
+            label_timestamp = ordered[idx + 1].open_time
             samples.append(
                 {
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "open_time": (
-                        ordered[idx].open_time.isoformat() if ordered[idx].open_time else None
+                    "open_time": feature_timestamp.isoformat() if feature_timestamp else None,
+                    "feature_timestamp": (
+                        feature_timestamp.isoformat() if feature_timestamp else None
                     ),
+                    "label_timestamp": label_timestamp.isoformat() if label_timestamp else None,
                     "close_sequence": base,
                     "volume_sequence": volumes[start : idx + 1],
                     "future_return_pct": move_pct,
+                    "long_return_pct": move_pct - _LOCAL_AI_ROUND_TRIP_COST_PCT,
+                    "short_return_pct": -move_pct - _LOCAL_AI_ROUND_TRIP_COST_PCT,
+                    "label_name": "net_return_after_cost_pct",
+                    "label_version": "2026-07-12.v1",
                 }
             )
     return samples[-max(int(limit), 1) :]
@@ -985,6 +999,10 @@ async def _main() -> None:
         trade_samples=trade_samples,
         sequence_samples=sequence_samples,
         text_sentiment_samples=text_sentiment_samples,
+    )
+    training_payload["governance_report"] = artifact_bound_governance_report(
+        training_payload["quality_report"],
+        persist_artifact=bool(args.persist_artifact),
     )
     label_consistency = training_payload["quality_report"].get(
         "training_label_consistency", {}

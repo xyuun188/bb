@@ -237,15 +237,21 @@ class EntryDirectionCompetitionPolicy:
         weight = self._source_weight(strategy, "ml_profit_model")
         for side in ("long", "short"):
             expected = _safe_float(primary.get(f"{side}_expected_return_pct"), 0.0)
-            win_rate = _safe_float(primary.get(f"{side}_win_rate"), 0.5)
-            score = (expected * 0.55 + (win_rate - 0.5) * 0.35) * weight
+            lower_quantile = _safe_float(
+                primary.get(f"{side}_lower_quantile_return_pct"), expected
+            )
+            tail_loss_probability = _safe_float(
+                primary.get(f"{side}_tail_loss_probability"), 0.5
+            )
+            score = (expected * 0.65 + lower_quantile * 0.35) * weight
             self._add(
                 sides,
                 side,
                 score,
-                f"ML {side}: expected={expected:.3f}%, win_rate={win_rate:.1%}, weight={weight:.2f}",
+                f"ML {side}: expected={expected:.3f}%, lower={lower_quantile:.3f}%, "
+                f"tail={tail_loss_probability:.1%}, weight={weight:.2f}",
                 expected=expected,
-                loss_probability=1.0 - win_rate,
+                loss_probability=tail_loss_probability,
             )
 
     def _add_server_profit_evidence(

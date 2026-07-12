@@ -20,7 +20,6 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.ml_readiness import build_ml_readiness_report
-from services.model_artifact_registry import ModelArtifactRegistry
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
@@ -31,13 +30,35 @@ from services.ml_signal_service import (
     shadow_training_quality_report,
     train_from_frame,
 )
+from services.model_artifact_registry import ModelArtifactRegistry
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+from services.return_objective import (
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_NAME,
+    RETURN_OBJECTIVE_VERSION,
+)
 from services.training_data_quality import DATA_QUALITY_VERSION, quality_report
+
+
+def _with_return_objective(metadata: dict) -> dict:
+    metadata = dict(metadata)
+    metadata.setdefault("objective_name", RETURN_OBJECTIVE_NAME)
+    metadata.setdefault("objective_version", RETURN_OBJECTIVE_VERSION)
+    metadata.setdefault("label_version", RETURN_LABEL_VERSION)
+    metrics = dict(metadata.get("metrics") or {})
+    for side in ("long", "short"):
+        top_return = float(metrics.get(f"top_{side}_avg_return_pct") or 0.0)
+        metrics.setdefault(f"top_{side}_return_lcb_pct", top_return - 0.01)
+        metrics.setdefault(f"top_{side}_profit_factor", 1.8 if top_return > 0 else 0.8)
+        metrics.setdefault(f"top_{side}_tail_loss_rate", 0.05)
+        metrics.setdefault(f"bottom_{side}_tail_loss_rate", 0.10)
+    metadata["metrics"] = metrics
+    return metadata
 
 
 def _service_with_metadata(metadata: dict) -> MLSignalService:
     service = MLSignalService()
-    service._bundle = {"metadata": metadata}
+    service._bundle = {"metadata": _with_return_objective(metadata)}
     service._ensure_loaded = lambda: None  # type: ignore[method-assign]
     return service
 
@@ -191,7 +212,7 @@ def _ml_training_metadata(
     top_return = 0.16 if ready else -0.08
     bottom_return = -0.03 if ready else -0.12
     now = datetime.now(UTC).isoformat()
-    return {
+    return _with_return_objective({
         "version": now,
         "trained_at": now,
         "sample_count": 1200,
@@ -224,7 +245,7 @@ def _ml_training_metadata(
             "top_short_win_rate": 0.71 if ready else 0.47,
             "bottom_short_win_rate": 0.40 if ready else 0.51,
         },
-    }
+    })
 
 
 def test_train_from_frame_can_evaluate_without_persisting_artifacts(
@@ -282,6 +303,10 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
     assert status["available"] is True
     assert status["artifact_registry"]["available"] is True
     assert status["artifact_registry"]["sha256"] == metadata["artifact_sha256"]
+    governance = status["governance_report"]
+    assert governance["artifact_quality_fingerprint"] == governance["quality_fingerprint"]
+    assert governance["artifact_matches_quality"] is True
+    assert governance["requires_artifact_refresh"] is False
 
 
 def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
@@ -840,11 +865,13 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert composition["effective_weight_ratio"] == pytest.approx((40 * 0.25 + 80) / 120)
     assert "top_long_tail_loss_rate" in metadata["metrics"]
     assert "top_short_tail_loss_rate" in metadata["metrics"]
-    assert (
-        metadata["expected_return_calibration"]["long"]["policy"]
-        == "classifier_probability_times_empirical_payoff_minus_excess_tail_loss"
-    )
-    assert "tail_loss_rate" in metadata["expected_return_calibration"]["short"]
+    assert metadata["objective_name"] == RETURN_OBJECTIVE_NAME
+    assert metadata["objective_version"] == RETURN_OBJECTIVE_VERSION
+    assert metadata["label_version"] == RETURN_LABEL_VERSION
+    assert metadata["prediction_distribution"]["lower_quantile"] == pytest.approx(0.20)
+    assert "expected_return_calibration" not in metadata
+    assert "top_long_return_lcb_pct" in metadata["metrics"]
+    assert "top_short_profit_factor" in metadata["metrics"]
 
 
 def test_quality_report_separates_missed_opportunity_downweight_from_contamination() -> None:
@@ -875,7 +902,7 @@ def test_quality_report_separates_missed_opportunity_downweight_from_contaminati
 
 
 def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights() -> None:
-    metadata = {
+    metadata = _with_return_objective({
         "version": "2026-07-03T00:00:00+00:00",
         "trained_at": "2026-07-03T00:00:00+00:00",
         "sample_count": 1000,
@@ -911,7 +938,7 @@ def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights(
             "top_short_win_rate": 0.7,
             "bottom_short_win_rate": 0.3,
         },
-    }
+    })
 
     readiness = build_ml_readiness_report(metadata, {"enabled": True})
 
@@ -924,8 +951,58 @@ def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights(
     }
 
 
-def test_ml_signal_predict_uses_calibrated_expected_return_before_raw_regressor() -> None:
-    metadata = {
+def test_ml_readiness_allows_low_win_rate_high_fee_after_return() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metrics = metadata["metrics"]
+    assert isinstance(metrics, dict)
+    for side in ("long", "short"):
+        metrics[f"{side}_auc"] = 0.20
+        metrics[f"{side}_pr_auc"] = 0.20
+        metrics[f"{side}_accuracy"] = 0.35
+        metrics[f"top_{side}_win_rate"] = 0.35
+        metrics[f"bottom_{side}_win_rate"] = 0.70
+        metrics[f"top_{side}_avg_return_pct"] = 0.75
+        metrics[f"bottom_{side}_avg_return_pct"] = -0.10
+        metrics[f"top_{side}_return_lcb_pct"] = 0.30
+        metrics[f"top_{side}_profit_factor"] = 2.15
+        metrics[f"top_{side}_tail_loss_rate"] = 0.05
+        metrics[f"bottom_{side}_tail_loss_rate"] = 0.10
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+
+    assert readiness["state"] == "ready"
+    assert readiness["allow_live_position_influence"] is True
+    assert readiness["blocking_reasons"] == []
+
+
+def test_ml_readiness_blocks_high_win_rate_negative_fee_after_return() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metrics = metadata["metrics"]
+    assert isinstance(metrics, dict)
+    for side in ("long", "short"):
+        metrics[f"{side}_auc"] = 0.95
+        metrics[f"{side}_pr_auc"] = 0.95
+        metrics[f"{side}_accuracy"] = 0.80
+        metrics[f"top_{side}_win_rate"] = 0.80
+        metrics[f"bottom_{side}_win_rate"] = 0.40
+        metrics[f"top_{side}_avg_return_pct"] = -0.32
+        metrics[f"bottom_{side}_avg_return_pct"] = -0.10
+        metrics[f"top_{side}_return_lcb_pct"] = -0.60
+        metrics[f"top_{side}_profit_factor"] = 0.20
+        metrics[f"top_{side}_tail_loss_rate"] = 0.20
+        metrics[f"bottom_{side}_tail_loss_rate"] = 0.10
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    codes = {item["code"] for item in readiness["blocking_reasons"]}
+
+    assert readiness["state"] == "degraded"
+    assert readiness["allow_live_position_influence"] is False
+    assert "long_top_return_below_threshold" in codes
+    assert "short_top_profit_factor_not_above_one" in codes
+
+
+def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration() -> None:
+    metadata = _with_return_objective({
         "version": datetime.now(UTC).isoformat(),
         "trained_at": datetime.now(UTC).isoformat(),
         "sample_count": 1200,
@@ -954,7 +1031,7 @@ def test_ml_signal_predict_uses_calibrated_expected_return_before_raw_regressor(
             "long": {"win_avg_return_pct": 1.0, "non_win_avg_return_pct": -0.5},
             "short": {"win_avg_return_pct": 0.8, "non_win_avg_return_pct": -0.4},
         },
-    }
+    })
     service = MLSignalService()
     service._bundle = {
         "metadata": metadata,
@@ -969,13 +1046,13 @@ def test_ml_signal_predict_uses_calibrated_expected_return_before_raw_regressor(
     prediction = service.predict({"current_price": 100.0, "spread_pct": 0.01}, horizons=(30,))
     primary = prediction["predictions"][0]
 
-    assert primary["best_side"] == "long"
-    assert primary["long_expected_return_pct"] == pytest.approx(0.7)
-    assert primary["short_expected_return_pct"] == pytest.approx(-0.16)
+    assert primary["best_side"] == "short"
+    assert primary["long_expected_return_pct"] == pytest.approx(-9.0)
+    assert primary["short_expected_return_pct"] == pytest.approx(9.0)
 
 
 def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
-    metadata = {
+    metadata = _with_return_objective({
         "version": datetime.now(UTC).isoformat(),
         "trained_at": datetime.now(UTC).isoformat(),
         "sample_count": 1200,
@@ -1014,7 +1091,7 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
                 "tail_loss_avg_return_pct": -2.0,
             },
         },
-    }
+    })
     service = MLSignalService()
     service._bundle = {
         "metadata": metadata,
@@ -1032,8 +1109,8 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
     primary = prediction["predictions"][0]
 
     assert primary["best_side"] == "long"
-    assert primary["long_expected_return_pct"] == pytest.approx(0.3)
-    assert primary["short_expected_return_pct"] == pytest.approx(-0.915)
+    assert primary["long_expected_return_pct"] == pytest.approx(0.282)
+    assert primary["short_expected_return_pct"] == pytest.approx(0.201)
     assert primary["short_tail_loss_probability"] == pytest.approx(0.55)
     assert primary["best_tail_loss_probability"] == pytest.approx(0.10)
 
@@ -1227,15 +1304,15 @@ def test_ml_signal_status_exposes_learning_only_readiness_reasons() -> None:
     assert status["readiness"]["metrics"]["required_training_data_version"] == DATA_QUALITY_VERSION
     assert "sample_count_below_threshold" in reason_codes
     assert "test_count_below_threshold" in reason_codes
-    assert "long_pr_auc_missing" in reason_codes
-    assert "short_pr_auc_missing" in reason_codes
+    assert "long_pr_auc_missing" not in reason_codes
+    assert "short_pr_auc_missing" not in reason_codes
     assert "training_data_version_stale" in reason_codes
     assert "model_stale" in reason_codes
     assert status["readiness"]["next_training_conditions"]["min_new_samples"] > 0
 
 
 def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> None:
-    metadata = {
+    metadata = _with_return_objective({
         "version": datetime.now(UTC).isoformat(),
         "trained_at": datetime.now(UTC).isoformat(),
         "sample_count": 1200,
@@ -1279,7 +1356,7 @@ def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> N
                 },
             }
         },
-    }
+    })
 
     readiness = build_ml_readiness_report(metadata, {"enabled": True})
     long_diag = readiness["profit_quality_diagnostics"]["long"]
@@ -1374,7 +1451,7 @@ def test_ml_signal_status_allows_directional_partial_live_influence() -> None:
     short_codes = {
         item["code"] for item in status["readiness"]["side_blocking_reasons"]["short"]
     }
-    assert "short_pr_auc_below_threshold" in short_codes
+    assert "short_pr_auc_below_threshold" not in short_codes
     assert "short_top_return_not_above_bottom" in short_codes
 
 

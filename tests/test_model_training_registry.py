@@ -78,6 +78,14 @@ def test_registry_marks_verified_finquant_specialization_as_trained() -> None:
                         "source_code_version": "commit-sha",
                         "base_model_repo": "Qwen/Qwen3-14B",
                         "trained_at": "2026-07-11T00:00:00+00:00",
+                        "objective_name": "maximize_expected_realized_net_return_after_cost",
+                        "objective_version": "2026-07-12.v1",
+                        "preference_contract_version": "bb_finquant_return_preference.v1",
+                        "preference_selection_accuracy": 1.0,
+                        "training_stages": [
+                            "sft_format_domain",
+                            "trl_dpo_return_preference",
+                        ],
                         "sample_count": 128,
                         "adapter_sha256": SHA256,
                         "manifest_sha256": SHA256,
@@ -213,6 +221,48 @@ def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() 
         assert rows[model_id]["fine_tune_available"] is False
     assert rows["finbert_tone"]["model_family"] == "yiyanghkust/finbert-tone"
     assert payload["summary"]["identity_failure_count"] == 0
+
+
+def test_registry_evaluates_inference_only_llms_by_fee_after_contribution() -> None:
+    payload = build_model_training_registry(
+        model_server_report={
+            "old_takeover_runtime": {
+                "required_endpoints": [
+                    {"served_model_name": "qwen3-14b-trade", "ready": True},
+                    {"served_model_name": "deepseek-r1-14b-risk", "ready": True},
+                ]
+            }
+        },
+        contribution_performance={
+            "decision_llm": {
+                "count": 71,
+                "pnl": -12.47,
+                "avg_pnl": -0.175,
+                "profit_factor": 0.77,
+                "state": "degrade",
+            },
+            "high_risk_review": {
+                "count": 67,
+                "pnl": -11.18,
+                "avg_pnl": -0.167,
+                "profit_factor": 0.79,
+                "state": "degrade",
+            },
+        },
+    )
+
+    rows = _by_id(payload)
+    qwen = rows["qwen3_14b_trade"]
+    risk = rows["deepseek_r1_14b_risk"]
+    decision = rows["deepseek_online_decision"]
+
+    assert qwen["evaluation_mode"] == "not_evaluated"
+    assert qwen["blocking_reasons"] == ["model_specific_fee_after_attribution_missing"]
+    assert risk["evaluation_sample_count"] == 67
+    assert risk["profit_factor"] == 0.79
+    assert "realized_net_pnl_non_positive" in risk["blocking_reasons"]
+    assert decision["evaluation_sample_count"] == 71
+    assert decision["quality_state"] == "promotion_blocked"
 
 
 def test_dashboard_renders_model_cards_from_canonical_registry() -> None:

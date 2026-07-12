@@ -309,14 +309,15 @@ class LocalMLTrainingParams:
     training_text_sample_limit: int = 8_000
     local_tools_learning_only_min_new_trade_samples: int = 15
     local_tools_min_new_trade_samples: int = 50
+    positive_net_return_threshold_pct: float = 0.05
+    prediction_lower_quantile: float = 0.20
+    mean_lcb_z_score: float = 1.645
+    # Deprecated read-only naming alias. Production consumers use the canonical
+    # positive-net-return field above; no win-rate/classification gates remain.
     win_return_threshold_pct: float = 0.05
     min_profit_edge_pct: float = 0.02
-    min_profit_signal_win_rate: float = 0.0
     influence_min_sample_count: int = 1_000
     influence_min_test_count: int = 200
-    influence_min_auc: float = 0.53
-    influence_min_pr_auc: float = 0.52
-    influence_min_accuracy: float = 0.52
     readiness_max_dirty_sample_ratio: float = 0.08
     readiness_max_model_age_seconds: int = 3 * 24 * 60 * 60
     train_split_ratio: float = 0.75
@@ -776,18 +777,14 @@ class EnsembleMLProbeParams:
 
     ml_min_expected_return_pct: float = 0.05
     ml_min_profit_edge_pct: float = 0.02
-    ml_min_support_win_rate: float = 0.0
-    ml_strong_support_win_rate: float = 0.0
     ml_support_confidence_bonus: float = 0.02
     ml_low_edge_confidence_bonus: float = 0.06
-    ml_low_win_confidence_bonus: float = 0.08
     ml_profit_first_score_relief: float = 0.08
     ml_profit_first_min_expected_return_pct: float = 0.12
     ml_profit_first_min_edge_pct: float = 0.08
     ml_quant_only_min_expected_return_pct: float = 0.10
     ml_quant_only_min_edge_pct: float = 0.18
     ml_quant_only_max_loss_probability: float = 0.60
-    ml_profit_first_low_win_rate_size_multiplier: float = 0.60
     local_tools_max_loss_probability: float = 0.62
     profit_first_probe_confidence: float = 0.72
     quant_validation_probe_confidence: float = 0.70

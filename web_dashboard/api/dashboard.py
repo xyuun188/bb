@@ -4940,11 +4940,17 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     model_server_report = _load_model_training_report(
         "phase3_model_server_readiness_reports/latest.json"
     )
+    from services.model_contribution_performance import ModelContributionPerformanceService
+
+    contribution_performance = await ModelContributionPerformanceService().recent(
+        mode_manager.mode.value
+    )
     registry = build_model_training_registry(
         local_ml_status=local_ml_status,
         local_tools_status=local_tools_status,
         specialist_report=specialist_report,
         model_server_report=model_server_report,
+        contribution_performance=contribution_performance,
     )
     registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
     return sanitize_payload(registry)
@@ -7579,8 +7585,30 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         )
 
     cumulative = cumulative_before
-    first_okx_equity = None
-    previous_okx_equity = None
+    sorted_equity_dates = sorted(equity_by_date)
+    first_okx_equity = (
+        float(equity_by_date[sorted_equity_dates[0]]["equity"])
+        if sorted_equity_dates
+        else None
+    )
+    completed_equity_days: dict[str, dict[str, float]] = {}
+    for index in range(len(sorted_equity_dates) - 1):
+        day_key = sorted_equity_dates[index]
+        next_day_key = sorted_equity_dates[index + 1]
+        day_value = datetime.fromisoformat(day_key).date()
+        next_day_value = datetime.fromisoformat(next_day_key).date()
+        if next_day_value != day_value + timedelta(days=1):
+            continue
+        opening_equity = float(equity_by_date[day_key]["equity"])
+        next_opening_equity = float(equity_by_date[next_day_key]["equity"])
+        completed_equity_days[day_key] = {
+            "pnl": next_opening_equity - opening_equity,
+            "cumulative_pnl": (
+                next_opening_equity - first_okx_equity
+                if first_okx_equity is not None
+                else 0.0
+            ),
+        }
     for date_key in sorted(records):
         row = records[date_key]
         cumulative += row["realized_pnl"]
@@ -7590,16 +7618,24 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         equity_row = equity_by_date.get(date_key)
         if equity_row:
             equity = float(equity_row["equity"])
-            if first_okx_equity is None:
-                first_okx_equity = equity
-            day_equity_pnl = 0.0 if previous_okx_equity is None else equity - previous_okx_equity
-            previous_okx_equity = equity
+            completed_day = completed_equity_days.get(date_key)
             row["okx_equity"] = round(equity, 8)
             row["okx_equity_snapshot_at"] = equity_row.get("snapshot_at")
             row["okx_equity_source"] = equity_row.get("source") or "okx_snapshot"
-            row["okx_equity_pnl"] = round(day_equity_pnl, 8)
+            row["okx_equity_pnl_source"] = (
+                "next_beijing_midnight_minus_day_baseline"
+                if completed_day is not None
+                else "next_day_baseline_missing"
+            )
+            row["okx_equity_pnl"] = (
+                round(completed_day["pnl"], 8) if completed_day is not None else None
+            )
             row["okx_equity_change"] = row["okx_equity_pnl"]
-            row["okx_cumulative_equity_pnl"] = round(equity - first_okx_equity, 8)
+            row["okx_cumulative_equity_pnl"] = (
+                round(completed_day["cumulative_pnl"], 8)
+                if completed_day is not None
+                else None
+            )
             row["okx_cumulative_equity_change"] = row["okx_cumulative_equity_pnl"]
         else:
             row["okx_equity"] = None

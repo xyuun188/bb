@@ -55,6 +55,73 @@ def _install_fake_sanitizer(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     return calls
 
 
+def test_memory_outcomes_merge_conflicting_evidence_by_fee_after_return() -> None:
+    positive = memory_repo_module._merge_memory_outcomes(
+        None,
+        {
+            "realized_pnl": 1.0,
+            "net_return_after_cost_pct": 4.0,
+            "source_position_id": 1,
+        },
+    )
+    merged = memory_repo_module._merge_memory_outcomes(
+        positive,
+        {
+            "realized_pnl": -5.0,
+            "net_return_after_cost_pct": -10.0,
+            "source_position_id": 2,
+        },
+    )
+
+    outcome = merged["outcome_aggregation"]
+    assert outcome["count"] == 2
+    assert outcome["conflict"] is True
+    assert outcome["total_realized_net_pnl_usdt"] == pytest.approx(-4.0)
+    assert outcome["avg_net_return_pct"] == pytest.approx(-3.0)
+    assert outcome["profit_factor"] == pytest.approx(0.2)
+    assert outcome["return_unit"] == "percentage_points"
+
+
+def test_memory_outcome_aggregation_is_idempotent_per_position() -> None:
+    first = memory_repo_module._merge_memory_outcomes(
+        None,
+        {
+            "realized_pnl": -5.0,
+            "net_return_after_cost_pct": -10.0,
+            "source_position_id": 2,
+        },
+    )
+    repeated = memory_repo_module._merge_memory_outcomes(
+        first,
+        {
+            "realized_pnl": -5.0,
+            "net_return_after_cost_pct": -10.0,
+            "source_position_id": 2,
+        },
+    )
+
+    assert repeated["outcome_aggregation"]["count"] == 1
+    assert repeated["outcome_aggregation"]["total_realized_net_pnl_usdt"] == -5.0
+    assert repeated["outcome_aggregation"]["source_position_ids"] == [2]
+
+
+def test_reflection_source_is_sanitized_to_database_contract() -> None:
+    normalized = memory_repo_module._normalize_reflection_payload(
+        {"source": "authoritative-settlement-backfill-source-name-that-is-too-long"}
+    )
+
+    assert len(normalized["source"]) == 40
+
+
+def test_memory_outcomes_do_not_fallback_to_legacy_pnl_ratio() -> None:
+    merged = memory_repo_module._merge_memory_outcomes(
+        None,
+        {"realized_pnl": -5.0, "pnl_pct": -0.10, "source_position_id": 2},
+    )
+
+    assert "outcome_aggregation" not in merged
+
+
 @pytest.mark.asyncio
 async def test_upsert_memory_uses_unified_runtime_text_boundary(
     monkeypatch: pytest.MonkeyPatch,

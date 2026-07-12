@@ -76,6 +76,9 @@ REMOTE_PLATFORM_EXPORT_WRAPPER = f"{REMOTE_PLATFORM_EXPORT_DIR}/export_wrapper.p
 MODEL_NAME = "BB-FinQuant-Expert-14B"
 BASE_MODEL_NAME = "qwen3-14b-trade"
 DATASET_SCHEMA_VERSION = "bb_finquant_expert_sft.v2"
+RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
+RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
+PREFERENCE_CONTRACT_VERSION = "bb_finquant_return_preference.v1"
 ADAPTER_REGISTRY_VERSION = "bb_finquant_lora.v2"
 DATASET_VERSION_PATTERN = re.compile(r"^bb-finquant-sft-v2-[0-9a-f]{12}-[0-9a-f]{8}$")
 ADAPTER_VERSION_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
@@ -95,6 +98,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -218,6 +222,10 @@ def main() -> None:
         raise SystemExit("dataset SHA-256 does not match its manifest")
     if dataset_manifest.get("dataset_schema_version") != "bb_finquant_expert_sft.v2":
         raise SystemExit("unsupported BB-FinQuant dataset schema")
+    if dataset_manifest.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
+        raise SystemExit("dataset return objective mismatch")
+    if dataset_manifest.get("objective_version") != "2026-07-12.v1":
+        raise SystemExit("dataset return objective version mismatch")
     base_identity = dataset_manifest.get("base_model_identity")
     if not isinstance(base_identity, dict) or base_identity.get("training_repo") != args.base_model_repo:
         raise SystemExit("dataset and trainer base-model identities do not match")
@@ -229,6 +237,22 @@ def main() -> None:
     if not rows:
         raise SystemExit("empty training dataset")
     train_rows, eval_rows = split_rows(rows)
+    preference_rows = []
+    for row in train_rows:
+        preference = row.get("preference")
+        if not isinstance(preference, dict):
+            continue
+        if preference.get("contract_version") != "bb_finquant_return_preference.v1":
+            raise SystemExit("unsupported return preference contract")
+        if preference.get("objective") != "maximize_expected_realized_net_return_after_cost":
+            raise SystemExit("return preference objective mismatch")
+        preference_rows.append({
+            "prompt": str(preference.get("prompt") or ""),
+            "chosen": str(preference.get("chosen") or ""),
+            "rejected": str(preference.get("rejected") or ""),
+        })
+    if not preference_rows:
+        raise SystemExit("no return-preference rows available for DPO")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -356,6 +380,48 @@ def main() -> None:
         if eval_losses:
             eval_loss = sum(eval_losses) / len(eval_losses)
 
+    try:
+        from datasets import Dataset
+        from trl import DPOConfig, DPOTrainer
+    except Exception as exc:
+        raise SystemExit(f"TRL DPO runtime unavailable: {type(exc).__name__}: {exc}") from exc
+
+    dpo_output_dir = output_dir.parent / f".{output_dir.name}.dpo-work"
+    dpo_config = DPOConfig(
+        output_dir=str(dpo_output_dir),
+        per_device_train_batch_size=max(int(args.batch_size), 1),
+        gradient_accumulation_steps=max(int(args.grad_accum), 1),
+        max_steps=max(min(max_steps // 2, 40), 10),
+        learning_rate=float(args.learning_rate) * 0.5,
+        beta=0.10,
+        logging_steps=1,
+        save_strategy="no",
+        report_to="none",
+        remove_unused_columns=False,
+    )
+    dpo_kwargs = {
+        "model": model,
+        "args": dpo_config,
+        "train_dataset": Dataset.from_list(preference_rows),
+        "processing_class": tokenizer,
+    }
+    try:
+        dpo_trainer = DPOTrainer(**dpo_kwargs)
+    except TypeError:
+        dpo_kwargs["tokenizer"] = dpo_kwargs.pop("processing_class")
+        dpo_trainer = DPOTrainer(**dpo_kwargs)
+    dpo_result = dpo_trainer.train()
+    dpo_train_loss = float(getattr(dpo_result, "training_loss", 0.0) or 0.0)
+    preference_selection_accuracy = None
+    for log_row in reversed(list(getattr(dpo_trainer.state, "log_history", []) or [])):
+        for key in ("rewards/accuracies", "eval_rewards/accuracies"):
+            if key in log_row:
+                preference_selection_accuracy = float(log_row[key])
+                break
+        if preference_selection_accuracy is not None:
+            break
+    shutil.rmtree(dpo_output_dir, ignore_errors=True)
+
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = output_dir.with_name(f".{output_dir.name}.staging.{os.getpid()}")
     if staging_dir.exists():
@@ -374,6 +440,13 @@ def main() -> None:
         "tokenized_eval_sample_count": len(eval_encoded),
         "last_train_loss": last_loss,
         "held_out_eval_loss": eval_loss,
+        "held_out_eval_loss_role": "format_and_language_fit_only_not_profit_evidence",
+        "preference_contract_version": "bb_finquant_return_preference.v1",
+        "preference_train_count": len(preference_rows),
+        "dpo_train_loss": dpo_train_loss,
+        "preference_selection_accuracy": preference_selection_accuracy,
+        "return_objective": "maximize_expected_realized_net_return_after_cost",
+        "training_stages": ["sft_format_domain", "trl_dpo_return_preference"],
     }
     evaluation_path.write_text(
         json.dumps(evaluation, ensure_ascii=False, indent=2),
@@ -433,6 +506,14 @@ def main() -> None:
         "trainable_parameters": int(trainable),
         "last_loss": last_loss,
         "held_out_eval_loss": eval_loss,
+        "held_out_eval_loss_role": "format_and_language_fit_only_not_profit_evidence",
+        "preference_contract_version": "bb_finquant_return_preference.v1",
+        "preference_train_count": len(preference_rows),
+        "dpo_train_loss": dpo_train_loss,
+        "preference_selection_accuracy": preference_selection_accuracy,
+        "objective_name": "maximize_expected_realized_net_return_after_cost",
+        "objective_version": "2026-07-12.v1",
+        "training_stages": ["sft_format_domain", "trl_dpo_return_preference"],
         "evaluation_report": str(output_dir / evaluation_path.name),
         "training_config": {
             "lora_r": 8,
@@ -489,6 +570,7 @@ ROOT = Path("/data/BB/models/finquant_lora")
 VERSIONS = ROOT / "versions"
 CURRENT = ROOT / "current.json"
 ROLLBACK = ROOT / "rollback.json"
+RETIRED = ROOT / "retired"
 LEGACY = ROOT / "BB-FinQuant-Expert-14B-v1"
 LEGACY_MANIFEST = LEGACY / "specialization_manifest.json"
 DOWNLOAD_MANIFEST = Path("/data/BB/manifests/phase3_model_download_manifest.json")
@@ -555,6 +637,12 @@ def validate_pointer(pointer: dict) -> tuple[dict, Path]:
         raise ValueError("FinQuant adapter version mismatch")
     if manifest.get("dataset_schema_version") != "bb_finquant_expert_sft.v2":
         raise ValueError("FinQuant adapter dataset schema mismatch")
+    if manifest.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
+        raise ValueError("FinQuant adapter return objective mismatch")
+    if manifest.get("objective_version") != "2026-07-12.v1":
+        raise ValueError("FinQuant adapter return objective version mismatch")
+    if manifest.get("preference_contract_version") != "bb_finquant_return_preference.v1":
+        raise ValueError("FinQuant adapter preference contract mismatch")
     if manifest.get("base_model_repo") != "Qwen/Qwen3-14B":
         raise ValueError("FinQuant adapter base-model identity mismatch")
     for key in (
@@ -645,13 +733,61 @@ def legacy_pointer() -> dict | None:
 
 def promote(manifest_path: Path) -> dict:
     new_pointer = pointer_for_manifest(manifest_path)
-    previous = validate_current(required=False)
-    if previous is None:
-        previous = legacy_pointer()
+    previous = None
+    retired_previous = None
+    retired_rollback = None
+    if CURRENT.exists():
+        candidate = read_json(CURRENT)
+        try:
+            validate_pointer(candidate)
+        except ValueError as exc:
+            retired_previous = {
+                "retired_at": datetime.now(timezone.utc).isoformat(),
+                "reason": str(exc),
+                "can_influence_live": False,
+                "pointer": candidate,
+            }
+            retired_path = RETIRED / (
+                "incompatible-current-"
+                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                + f"-{time.time_ns()}"
+                + ".json"
+            )
+            atomic_json(retired_path, retired_previous)
+            retired_previous["audit_path"] = str(retired_path)
+        else:
+            previous = candidate
+    if previous and previous.get("adapter_path") == new_pointer.get("adapter_path"):
+        previous = None
+    if ROLLBACK.exists():
+        rollback_candidate = read_json(ROLLBACK)
+        try:
+            validate_pointer(rollback_candidate)
+        except ValueError as exc:
+            retired_rollback = {
+                "retired_at": datetime.now(timezone.utc).isoformat(),
+                "reason": str(exc),
+                "can_influence_live": False,
+                "pointer": rollback_candidate,
+            }
+            retired_path = RETIRED / (
+                "incompatible-rollback-"
+                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                + f"-{time.time_ns()}"
+                + ".json"
+            )
+            atomic_json(retired_path, retired_rollback)
+            retired_rollback["audit_path"] = str(retired_path)
+            ROLLBACK.unlink()
     if previous and previous.get("adapter_path") != new_pointer.get("adapter_path"):
         atomic_json(ROLLBACK, previous)
     atomic_json(CURRENT, new_pointer)
-    return {"current": new_pointer, "rollback": previous}
+    return {
+        "current": new_pointer,
+        "rollback": previous,
+        "retired_incompatible_previous": retired_previous,
+        "retired_incompatible_rollback": retired_rollback,
+    }
 
 
 def validate_current(*, required: bool = True) -> dict | None:
@@ -918,6 +1054,11 @@ def _validate_dataset_contract(dataset_jsonl: str, manifest: dict[str, Any]) -> 
     expected_count = sum(1 for line in dataset_jsonl.splitlines() if line.strip())
     if int(manifest.get("example_count") or 0) != expected_count:
         raise ValueError("BB-FinQuant dataset example count mismatch")
+    if manifest.get("objective_name") != RETURN_OBJECTIVE_NAME:
+        raise ValueError("BB-FinQuant dataset return objective mismatch")
+    if manifest.get("objective_version") != RETURN_OBJECTIVE_VERSION:
+        raise ValueError("BB-FinQuant dataset return objective version mismatch")
+    preference_count = 0
     for line_number, line in enumerate(dataset_jsonl.splitlines(), start=1):
         if not line.strip():
             continue
@@ -943,6 +1084,28 @@ def _validate_dataset_contract(dataset_jsonl: str, manifest: dict[str, Any]) -> 
                 raise ValueError(
                     f"BB-FinQuant dataset row {line_number} JSON message must be an object"
                 )
+        preference = row.get("preference") if isinstance(row, dict) else None
+        if preference is not None:
+            if not isinstance(preference, dict):
+                raise ValueError(
+                    f"BB-FinQuant dataset row {line_number} has invalid preference"
+                )
+            if preference.get("contract_version") != PREFERENCE_CONTRACT_VERSION:
+                raise ValueError(
+                    f"BB-FinQuant dataset row {line_number} preference version mismatch"
+                )
+            if preference.get("objective") != RETURN_OBJECTIVE_NAME:
+                raise ValueError(
+                    f"BB-FinQuant dataset row {line_number} preference objective mismatch"
+                )
+            for key in ("prompt", "chosen", "rejected"):
+                if not str(preference.get(key) or "").strip():
+                    raise ValueError(
+                        f"BB-FinQuant dataset row {line_number} preference missing {key}"
+                    )
+            preference_count += 1
+    if preference_count <= 0 or int(manifest.get("preference_example_count") or 0) != preference_count:
+        raise ValueError("BB-FinQuant dataset has no valid return-preference examples")
     base_identity = _safe_dict(manifest.get("base_model_identity"))
     if base_identity.get("training_repo") != REMOTE_TRAIN_BASE_REPO:
         raise ValueError("BB-FinQuant training base-model identity mismatch")
@@ -1102,7 +1265,14 @@ def _shadow_response(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _messages(kind: str, payload: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+def _messages(
+    kind: str,
+    payload: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    rejected_response: dict[str, Any] | None = None,
+    preference_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     system = (
         "You are BB-FinQuant-Expert-14B, a cryptocurrency futures expert. "
         "Learn from audited after-fee outcomes. Reply only as compact JSON with "
@@ -1113,7 +1283,7 @@ def _messages(kind: str, payload: dict[str, Any], response: dict[str, Any]) -> d
         "sample_kind": kind,
         "payload": payload,
     }
-    return {
+    row = {
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": _json_compact(user)},
@@ -1129,6 +1299,101 @@ def _messages(kind: str, payload: dict[str, Any], response: dict[str, Any]) -> d
             "source_id": payload.get("id"),
         },
     }
+    if rejected_response is not None:
+        prompt = "\n".join(
+            (
+                f"<|system|>\n{system}",
+                f"<|user|>\n{_json_compact(user)}",
+                "<|assistant|>\n",
+            )
+        )
+        row["preference"] = {
+            "contract_version": PREFERENCE_CONTRACT_VERSION,
+            "objective": RETURN_OBJECTIVE_NAME,
+            "prompt": prompt,
+            "chosen": json.dumps(response, ensure_ascii=False, sort_keys=True),
+            "rejected": json.dumps(rejected_response, ensure_ascii=False, sort_keys=True),
+            "metrics": dict(preference_metrics or {}),
+        }
+    return row
+
+
+def _trade_rejected_response(response: dict[str, Any]) -> dict[str, Any]:
+    rejected = dict(response)
+    realized = _safe_float(response.get("net_pnl_after_all_costs_usdt"))
+    rejected["verdict"] = "good_trade" if realized <= 0 else "bad_trade"
+    rejected["lesson"] = (
+        "Repeat this setup and increase risk because outcome frequency matters more than payoff."
+        if realized <= 0
+        else "Avoid this setup even though its audited fee-after outcome was positive."
+    )
+    rejected["risk_guidance"] = {
+        "increase_size": bool(realized <= 0),
+        "avoid_tiny_fee_drag": False,
+        "requires_after_fee_positive_expectancy": False,
+    }
+    return rejected
+
+
+def _shadow_rejected_response(
+    sample: dict[str, Any],
+    response: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    long_return = _safe_float(sample.get("long_return_pct"))
+    short_return = _safe_float(sample.get("short_return_pct"))
+    chosen_side = str(response.get("best_side") or "long")
+    rejected_side = "short" if chosen_side == "long" else "long"
+    rejected = dict(response)
+    rejected["best_side"] = rejected_side
+    rejected["lesson"] = "Choose the lower fee-after return side because direction hit rate is enough."
+    chosen_return = long_return if chosen_side == "long" else short_return
+    rejected_return = short_return if chosen_side == "long" else long_return
+    return rejected, {
+        "chosen_net_return_after_cost_pct": round(chosen_return, 8),
+        "rejected_net_return_after_cost_pct": round(rejected_return, 8),
+        "return_uplift_pct": round(chosen_return - rejected_return, 8),
+    }
+
+
+def _return_objective_counterexample() -> dict[str, Any]:
+    payload = {
+        "scenario": "low_win_high_payoff_vs_high_win_negative_expectancy",
+        "candidate_a": {
+            "win_rate": 0.35,
+            "avg_win_pct": 4.0,
+            "avg_loss_pct": -1.0,
+            "expected_net_return_after_cost_pct": 0.75,
+        },
+        "candidate_b": {
+            "win_rate": 0.80,
+            "avg_win_pct": 0.10,
+            "avg_loss_pct": -2.0,
+            "expected_net_return_after_cost_pct": -0.32,
+        },
+    }
+    chosen = {
+        "verdict": "prefer_candidate_a",
+        "best_side": "candidate_a",
+        "lesson": "Lower win rate is acceptable when fee-after expectancy and payoff are superior.",
+        "risk_guidance": {"requires_after_fee_positive_expectancy": True},
+    }
+    rejected = {
+        "verdict": "prefer_candidate_b",
+        "best_side": "candidate_b",
+        "lesson": "Prefer the higher win rate despite negative fee-after expectancy.",
+        "risk_guidance": {"requires_after_fee_positive_expectancy": False},
+    }
+    return _messages(
+        "return_preference_counterexample",
+        payload,
+        chosen,
+        rejected_response=rejected,
+        preference_metrics={
+            "chosen_net_return_after_cost_pct": 0.75,
+            "rejected_net_return_after_cost_pct": -0.32,
+            "return_uplift_pct": 1.07,
+        },
+    )
 
 
 async def _load_expert_memory_examples(limit: int) -> list[dict[str, Any]]:
@@ -1270,7 +1535,22 @@ async def build_dataset(
             )
             if key in sample
         }
-        examples.append(_messages("closed_trade", payload, _trade_response(sample)))
+        response = _trade_response(sample)
+        examples.append(
+            _messages(
+                "closed_trade",
+                payload,
+                response,
+                rejected_response=_trade_rejected_response(response),
+                preference_metrics={
+                    "chosen_realized_net_pnl_usdt": response.get(
+                        "net_pnl_after_all_costs_usdt"
+                    ),
+                    "chosen_matches_audited_outcome": True,
+                    "rejected_matches_audited_outcome": False,
+                },
+            )
+        )
     for sample in quality["shadow_samples"]:
         payload = {
             key: sample.get(key)
@@ -1289,8 +1569,19 @@ async def build_dataset(
             )
             if key in sample
         }
-        examples.append(_messages("shadow_backtest", payload, _shadow_response(sample)))
+        response = _shadow_response(sample)
+        rejected, preference_metrics = _shadow_rejected_response(sample, response)
+        examples.append(
+            _messages(
+                "shadow_backtest",
+                payload,
+                response,
+                rejected_response=rejected,
+                preference_metrics=preference_metrics,
+            )
+        )
     examples.extend(await _load_expert_memory_examples(memory_limit))
+    examples.append(_return_objective_counterexample())
     manifest = {
         "created_at": datetime.now(UTC).isoformat(),
         "trade_limit": trade_limit,
@@ -1304,6 +1595,12 @@ async def build_dataset(
             for kind in ("closed_trade", "shadow_backtest", "expert_memory")
         },
         "quality_report": quality_report,
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "preference_contract_version": PREFERENCE_CONTRACT_VERSION,
+        "preference_example_count": sum(
+            1 for example in examples if isinstance(example.get("preference"), dict)
+        ),
         "source": "platform_db_clean_training_view",
     }
     return examples, manifest
@@ -1824,6 +2121,8 @@ def deploy_and_optionally_train(
                 f"mkdir -p {sh(REMOTE_TRAINING_DIR)} {sh(REMOTE_ADAPTER_VERSIONS_DIR)} "
                 f"{sh(REMOTE_TRAIN_LOG_DIR)}; "
                 f"{_remote_train_base_prepare_command()}; "
+                "/data/BB/envs/phase3-quant/bin/python -c "
+                "'import datasets, trl; print(trl.__version__)'; "
                 f"{pre}"
                 f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_TRAINER)} "
                 f"--dataset {sh(remote_dataset)} "

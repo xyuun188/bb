@@ -83,6 +83,8 @@ class DynamicPositionCapacityPolicy:
         open_group_count = self._open_group_count(rows)
         market_confidence = self._market_confidence(market_regime, strategy_context)
         recent_win_rate = self._recent_win_rate(strategy_context)
+        recent_profit_factor = self._recent_profit_factor(strategy_context)
+        recent_net_pnl = self._recent_net_pnl(strategy_context)
         drawdown_ratio = self._drawdown_ratio(strategy_context, account_equity)
         quality_rows = self._quality_rows(
             rows, active_strategy_profile_id=active_strategy_profile_id
@@ -139,6 +141,8 @@ class DynamicPositionCapacityPolicy:
             "policy_rotation_slots": policy_rotation_slots,
             "market_confidence": round(market_confidence, 6),
             "recent_win_rate": round(recent_win_rate, 6),
+            "recent_profit_factor": round(recent_profit_factor, 6),
+            "recent_net_pnl": round(recent_net_pnl, 6),
             "drawdown_ratio": round(drawdown_ratio, 6),
             "low_quality_ratio": round(low_quality_ratio, 6),
             "min_limit": min_limit,
@@ -177,14 +181,22 @@ class DynamicPositionCapacityPolicy:
             reasons.append(f"当日回撤观察 {drawdown_ratio:.1%}")
             reason_codes.append("drawdown_watch")
 
-        if recent_win_rate >= 0.58 and low_quality_count == 0 and drawdown_ratio < 0.01:
+        if (
+            recent_profit_factor > 1.0
+            and recent_net_pnl > 0
+            and low_quality_count == 0
+            and drawdown_ratio < 0.01
+        ):
             bonus = min(
                 max(1, round(target_limit * min(market_confidence, 0.85) * 0.12)),
                 max(max_limit - target_limit, 0),
             )
             effective_limit = min(target_limit + bonus, max_limit)
-            reasons.append(f"胜率和行情清晰，扩展 {bonus} 个机会槽")
-            reason_codes.append("trend_bonus")
+            reasons.append(
+                f"费后净收益为正且 Profit Factor {recent_profit_factor:.2f}，"
+                f"扩展 {bonus} 个机会槽"
+            )
+            reason_codes.append("positive_return_quality_bonus")
         elif market_confidence >= 0.72 and low_quality_count == 0 and drawdown_ratio < 0.015:
             bonus = min(
                 max(1, round(target_limit * (market_confidence - 0.65) * 0.10)),
@@ -432,6 +444,35 @@ class DynamicPositionCapacityPolicy:
             if isinstance(value, (int, float)):
                 return max(0.0, min(float(value), 1.0))
         return 0.5
+
+    @staticmethod
+    def _recent_profit_factor(strategy_context: dict[str, Any] | None) -> float:
+        if not isinstance(strategy_context, dict):
+            return 0.0
+        for source in (
+            strategy_context,
+            _safe_dict(strategy_context.get("daily_perf")),
+            _safe_dict(strategy_context.get("strategy_learning")),
+        ):
+            value = source.get("profit_factor")
+            if isinstance(value, (int, float)):
+                return max(float(value), 0.0)
+        return 0.0
+
+    @staticmethod
+    def _recent_net_pnl(strategy_context: dict[str, Any] | None) -> float:
+        if not isinstance(strategy_context, dict):
+            return 0.0
+        for source in (
+            strategy_context,
+            _safe_dict(strategy_context.get("daily_perf")),
+            _safe_dict(strategy_context.get("strategy_learning")),
+        ):
+            for key in ("net_pnl", "today_realized_pnl", "realized_pnl"):
+                value = source.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+        return 0.0
 
     @staticmethod
     def _drawdown_ratio(

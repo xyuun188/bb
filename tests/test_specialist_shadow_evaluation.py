@@ -7,6 +7,9 @@ from types import SimpleNamespace
 from scripts import run_specialist_shadow_evaluation as runner
 from services.specialist_shadow_evaluation import (
     ROUND_TRIP_COST_PCT,
+    _regime_stability_report,
+    _rolling_distribution_report,
+    _walk_forward_report,
     summarize_specialist_shadow_evaluation,
 )
 
@@ -25,6 +28,25 @@ def test_specialist_shadow_evaluation_script_imports_online_runtime_bootstrap() 
 
 def test_specialist_shadow_evaluation_default_report_dir_matches_phase3_readers() -> None:
     assert runner.DEFAULT_REPORT_DIR == "phase3"
+
+
+def test_specialist_reports_reject_legacy_return_label_fallback() -> None:
+    legacy_event = {
+        "return_after_cost_pct": 9.0,
+        "label_timestamp": "2026-07-12T00:00:00+00:00",
+        "market_regime": "trend",
+    }
+
+    walk_forward = _walk_forward_report([legacy_event])
+    regime = _regime_stability_report([legacy_event])
+    rolling = _rolling_distribution_report([legacy_event])
+
+    assert walk_forward["sample_count"] == 0
+    assert walk_forward["missing_canonical_return_count"] == 1
+    assert regime["regimes"] == []
+    assert regime["missing_canonical_return_count"] == 1
+    assert rolling["sample_count"] == 0
+    assert rolling["missing_canonical_return_count"] == 1
 
 
 def test_entry_decision_persists_market_regime_for_authoritative_evaluation() -> None:
@@ -208,7 +230,9 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
     assert model["direction_count"] == 34
     assert model["direction_hit_rate"] == 1.0
     assert model["avg_realized_return_pct"] > 0.2
+    assert model["profit_factor"] == 3.0
     assert model["authoritative_direction_aligned_count"] == 34
+    assert model["authoritative_profit_factor"] == 3.0
     assert model["walk_forward"]["status"] == "stable"
     assert model["market_regime_stability"]["status"] == "stable"
     assert model["rolling_distribution"]["status"] == "stable"

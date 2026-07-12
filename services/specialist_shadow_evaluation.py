@@ -12,6 +12,7 @@ DEFAULT_LIMIT = 2000
 MIN_PROMOTION_SHADOW_SAMPLES = 30
 MIN_DIRECTION_HIT_RATE = 0.48
 MIN_AVG_REALIZED_RETURN_PCT = 0.02
+MIN_PROFIT_FACTOR = 1.0
 MAX_FALSE_SIGNAL_LOSS_PCT = -0.18
 MIN_TIMESERIES_SEQUENCE_LENGTH = 30
 MAX_WORST_SAMPLE_COUNT = 8
@@ -364,6 +365,8 @@ def _empty_metric(tool_name: str, model_name: str) -> dict[str, Any]:
         "direction_hit_count": 0,
         "false_signal_count": 0,
         "realized_return_sum_pct": 0.0,
+        "realized_gross_profit_pct": 0.0,
+        "realized_gross_loss_pct": 0.0,
         "expected_return_sum_pct": 0.0,
         "expected_return_count": 0,
         "signal_score_sum": 0.0,
@@ -388,6 +391,8 @@ def _empty_metric(tool_name: str, model_name: str) -> dict[str, Any]:
         "authoritative_direction_aligned_count": 0,
         "authoritative_direction_mismatch_count": 0,
         "authoritative_return_sum_pct": 0.0,
+        "authoritative_gross_profit_pct": 0.0,
+        "authoritative_gross_loss_pct": 0.0,
         "authoritative_worst_return_pct": None,
         "authoritative_best_return_pct": None,
         "authoritative_tail_loss_count": 0,
@@ -441,22 +446,36 @@ def _event_timestamp(event: dict[str, Any]) -> str:
     return str(event.get("label_timestamp") or event.get("created_at") or "")
 
 
+def _canonical_net_return(event: dict[str, Any]) -> float | None:
+    """Return only the current fee-after objective label.
+
+    Legacy ``return_after_cost_pct`` data is deliberately not accepted here:
+    silently consuming it would let old objective data influence promotion.
+    """
+
+    return _safe_float(event.get("net_return_after_cost_pct"), None)
+
+
 def _walk_forward_report(events: list[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(events, key=lambda item: (_event_timestamp(item), str(item.get("id") or "")))
-    if not ordered:
+    canonical = [item for item in ordered if _canonical_net_return(item) is not None]
+    missing_canonical_count = len(ordered) - len(canonical)
+    if not canonical:
         return {
             "status": "insufficient_authoritative_evidence",
             "fold_count": 0,
             "positive_fold_count": 0,
+            "sample_count": 0,
+            "missing_canonical_return_count": missing_canonical_count,
             "folds": [],
         }
-    fold_count = min(WALK_FORWARD_FOLD_COUNT, len(ordered))
+    fold_count = min(WALK_FORWARD_FOLD_COUNT, len(canonical))
     folds = []
     for fold_index in range(fold_count):
-        start = len(ordered) * fold_index // fold_count
-        end = len(ordered) * (fold_index + 1) // fold_count
-        fold_events = ordered[start:end]
-        returns = [float(item.get("return_after_cost_pct") or 0.0) for item in fold_events]
+        start = len(canonical) * fold_index // fold_count
+        end = len(canonical) * (fold_index + 1) // fold_count
+        fold_events = canonical[start:end]
+        returns = [float(_canonical_net_return(item)) for item in fold_events]
         folds.append(
             {
                 "fold": fold_index + 1,
@@ -476,22 +495,28 @@ def _walk_forward_report(events: list[dict[str, Any]]) -> dict[str, Any]:
         if float(fold.get("avg_return_after_cost_pct") or 0.0)
         >= MIN_AVG_REALIZED_RETURN_PCT
     )
-    sufficient = len(ordered) >= MIN_AUTHORITATIVE_PROMOTION_SAMPLES and fold_count >= 3
+    sufficient = len(canonical) >= MIN_AUTHORITATIVE_PROMOTION_SAMPLES and fold_count >= 3
     stable = bool(sufficient and positive_folds == fold_count)
     return {
         "status": "stable" if stable else "unstable" if sufficient else "insufficient_authoritative_evidence",
         "fold_count": fold_count,
         "positive_fold_count": positive_folds,
-        "sample_count": len(ordered),
+        "sample_count": len(canonical),
+        "missing_canonical_return_count": missing_canonical_count,
         "folds": folds,
     }
 
 
 def _regime_stability_report(events: list[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[str, list[float]] = {}
+    missing_canonical_count = 0
     for event in events:
+        net_return = _canonical_net_return(event)
+        if net_return is None:
+            missing_canonical_count += 1
+            continue
         regime = _safe_str(event.get("market_regime")) or "unknown"
-        grouped.setdefault(regime, []).append(float(event.get("return_after_cost_pct") or 0.0))
+        grouped.setdefault(regime, []).append(float(net_return))
     rows = [
         {
             "regime": regime,
@@ -513,20 +538,20 @@ def _regime_stability_report(events: list[dict[str, Any]]) -> dict[str, Any]:
         "status": "stable" if stable else "unstable" if len(eligible) >= 2 else "insufficient_regime_evidence",
         "eligible_regime_count": len(eligible),
         "minimum_samples_per_regime": MIN_REGIME_SAMPLE_COUNT,
+        "missing_canonical_return_count": missing_canonical_count,
         "regimes": rows,
     }
 
 
 def _rolling_distribution_report(events: list[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(events, key=lambda item: (_event_timestamp(item), str(item.get("id") or "")))
+    canonical = [item for item in ordered if _canonical_net_return(item) is not None]
+    missing_canonical_count = len(ordered) - len(canonical)
     windows = []
     for window_size in ROLLING_DISTRIBUTION_WINDOWS:
-        if len(ordered) < window_size:
+        if len(canonical) < window_size:
             continue
-        values = [
-            float(item.get("return_after_cost_pct") or 0.0)
-            for item in ordered[-window_size:]
-        ]
+        values = [float(_canonical_net_return(item)) for item in canonical[-window_size:]]
         windows.append(
             {
                 "window_size": window_size,
@@ -536,7 +561,7 @@ def _rolling_distribution_report(events: list[dict[str, Any]]) -> dict[str, Any]
             }
         )
     stable = bool(
-        len(ordered) >= max(ROLLING_DISTRIBUTION_WINDOWS)
+        len(canonical) >= max(ROLLING_DISTRIBUTION_WINDOWS)
         and len(windows) == len(ROLLING_DISTRIBUTION_WINDOWS)
         and all(
             float(window["avg_return_after_cost_pct"]) >= MIN_AVG_REALIZED_RETURN_PCT
@@ -544,8 +569,9 @@ def _rolling_distribution_report(events: list[dict[str, Any]]) -> dict[str, Any]
         )
     )
     return {
-        "status": "stable" if stable else "insufficient_evidence" if len(ordered) < max(ROLLING_DISTRIBUTION_WINDOWS) else "unstable",
-        "sample_count": len(ordered),
+        "status": "stable" if stable else "insufficient_evidence" if len(canonical) < max(ROLLING_DISTRIBUTION_WINDOWS) else "unstable",
+        "sample_count": len(canonical),
+        "missing_canonical_return_count": missing_canonical_count,
         "required_windows": list(ROLLING_DISTRIBUTION_WINDOWS),
         "windows": windows,
     }
@@ -594,6 +620,20 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         signal_score_count, 1
     )
     avg_authoritative = authoritative_sum / max(authoritative_count, 1)
+    gross_profit = float(metric.get("realized_gross_profit_pct") or 0.0)
+    gross_loss = float(metric.get("realized_gross_loss_pct") or 0.0)
+    profit_factor = gross_profit / gross_loss if gross_loss > 1e-12 else (
+        3.0 if gross_profit > 0 else 0.0
+    )
+    authoritative_gross_profit = float(
+        metric.get("authoritative_gross_profit_pct") or 0.0
+    )
+    authoritative_gross_loss = float(metric.get("authoritative_gross_loss_pct") or 0.0)
+    authoritative_profit_factor = (
+        authoritative_gross_profit / authoritative_gross_loss
+        if authoritative_gross_loss > 1e-12
+        else (3.0 if authoritative_gross_profit > 0 else 0.0)
+    )
     authoritative_events = list(metric.get("authoritative_events") or [])
     walk_forward = _walk_forward_report(authoritative_events)
     regime_stability = _regime_stability_report(authoritative_events)
@@ -605,6 +645,8 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         blockers.append("direction_hit_rate_below_floor")
     if direction_count >= MIN_PROMOTION_SHADOW_SAMPLES and avg_realized < MIN_AVG_REALIZED_RETURN_PCT:
         blockers.append("shadow_avg_return_after_cost_below_floor")
+    if direction_count >= MIN_PROMOTION_SHADOW_SAMPLES and profit_factor < MIN_PROFIT_FACTOR:
+        blockers.append("shadow_profit_factor_below_unity")
     worst = metric.get("worst_realized_return_pct")
     if worst is not None and float(worst) <= MAX_FALSE_SIGNAL_LOSS_PCT:
         blockers.append("shadow_tail_loss_exceeds_floor")
@@ -616,6 +658,11 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         avg_authoritative < MIN_AVG_REALIZED_RETURN_PCT
     ):
         blockers.append("authoritative_avg_return_after_cost_below_floor")
+    if (
+        authoritative_count >= MIN_AUTHORITATIVE_PROMOTION_SAMPLES
+        and authoritative_profit_factor < MIN_PROFIT_FACTOR
+    ):
+        blockers.append("authoritative_profit_factor_below_unity")
     authoritative_worst = metric.get("authoritative_worst_return_pct")
     if authoritative_worst is not None and float(authoritative_worst) <= MAX_FALSE_SIGNAL_LOSS_PCT:
         blockers.append("authoritative_tail_loss_exceeds_floor")
@@ -641,6 +688,9 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         "false_signal_count": int(metric.get("false_signal_count") or 0),
         "avg_realized_return_pct": round(avg_realized, 6),
         "avg_shadow_return_after_cost_pct": round(avg_realized, 6),
+        "profit_factor": round(profit_factor, 6),
+        "gross_profit_return_pct": round(gross_profit, 6),
+        "gross_loss_return_pct": round(gross_loss, 6),
         "avg_expected_return_pct": round(avg_expected, 6),
         "avg_signal_score": round(avg_signal_score, 6),
         "worst_realized_return_pct": metric.get("worst_realized_return_pct"),
@@ -671,6 +721,9 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
             metric.get("authoritative_direction_mismatch_count") or 0
         ),
         "authoritative_avg_return_after_cost_pct": round(avg_authoritative, 6),
+        "authoritative_profit_factor": round(authoritative_profit_factor, 6),
+        "authoritative_gross_profit_return_pct": round(authoritative_gross_profit, 6),
+        "authoritative_gross_loss_return_pct": round(authoritative_gross_loss, 6),
         "authoritative_worst_return_after_cost_pct": authoritative_worst,
         "authoritative_best_return_after_cost_pct": metric.get(
             "authoritative_best_return_pct"
@@ -697,12 +750,15 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
             "minimum_authoritative_trade_samples": MIN_AUTHORITATIVE_PROMOTION_SAMPLES,
             "minimum_direction_hit_rate": MIN_DIRECTION_HIT_RATE,
             "minimum_avg_realized_return_pct": MIN_AVG_REALIZED_RETURN_PCT,
+            "minimum_profit_factor": MIN_PROFIT_FACTOR,
             "max_false_signal_loss_pct": MAX_FALSE_SIGNAL_LOSS_PCT,
             "actual_inference_count": int(metric.get("actual_inference_count") or 0),
             "direction_count": direction_count,
             "direction_hit_rate": round(hit_rate, 6),
             "avg_realized_return_pct": round(avg_realized, 6),
+            "profit_factor": round(profit_factor, 6),
             "authoritative_avg_return_after_cost_pct": round(avg_authoritative, 6),
+            "authoritative_profit_factor": round(authoritative_profit_factor, 6),
             "worst_realized_return_pct": metric.get("worst_realized_return_pct"),
             "tail_loss_count": int(metric.get("tail_loss_count") or 0),
             "minimum_timeseries_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
@@ -810,6 +866,10 @@ def summarize_specialist_shadow_evaluation(
                     actual_return = float(gross_return) - ROUND_TRIP_COST_PCT
                     metric["direction_count"] += 1
                     metric["realized_return_sum_pct"] += actual_return
+                    if actual_return > 0:
+                        metric["realized_gross_profit_pct"] += actual_return
+                    elif actual_return < 0:
+                        metric["realized_gross_loss_pct"] += abs(actual_return)
                     if actual_side == predicted_side:
                         metric["direction_hit_count"] += 1
                     elif actual_return < 0:
@@ -853,6 +913,8 @@ def summarize_specialist_shadow_evaluation(
                             "gross_return_pct": round(float(gross_return), 6),
                             "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
                             "return_after_cost_pct": round(actual_return, 6),
+                            "return_after_cost_pct_deprecated": True,
+                            "net_return_after_cost_pct": round(actual_return, 6),
                             "created_at": _iso_row_datetime(row, "created_at"),
                             "label_timestamp": _iso_row_datetime(row, "due_at"),
                             "market_regime": _market_regime(row),
@@ -935,6 +997,9 @@ def summarize_specialist_shadow_evaluation(
                     "observed_position_return_after_cost_pct": round(
                         float(authoritative_return), 6
                     ),
+                    "observed_position_net_return_after_cost_pct": round(
+                        float(authoritative_return), 6
+                    ),
                     "label_timestamp": _safe_str(_row_get(sample, "label_timestamp")),
                     "market_regime": regime,
                 }
@@ -957,6 +1022,12 @@ def summarize_specialist_shadow_evaluation(
                     continue
                 metric["authoritative_direction_aligned_count"] += 1
                 metric["authoritative_return_sum_pct"] += float(authoritative_return)
+                if float(authoritative_return) > 0:
+                    metric["authoritative_gross_profit_pct"] += float(authoritative_return)
+                elif float(authoritative_return) < 0:
+                    metric["authoritative_gross_loss_pct"] += abs(
+                        float(authoritative_return)
+                    )
                 _update_return_extrema(
                     metric,
                     float(authoritative_return),
@@ -968,6 +1039,8 @@ def summarize_specialist_shadow_evaluation(
                 evidence["label_usable"] = True
                 evidence["label_reason"] = "prediction_matches_observed_position_side"
                 evidence["return_after_cost_pct"] = round(float(authoritative_return), 6)
+                evidence["return_after_cost_pct_deprecated"] = True
+                evidence["net_return_after_cost_pct"] = round(float(authoritative_return), 6)
                 metric["authoritative_evidence"].append(evidence)
                 metric["authoritative_events"].append(evidence)
 

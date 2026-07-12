@@ -966,6 +966,27 @@ def test_local_ai_tools_generated_service_persists_phase3_artifact_policy() -> N
     assert 'evaluation_policy.setdefault("phase", "phase3_model_factory")' in SERVICE_CODE
 
 
+def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_targets() -> None:
+    assert 'RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"' in SERVICE_CODE
+    assert '"objective_name": RETURN_OBJECTIVE_NAME' in SERVICE_CODE
+    assert '"label_version": RETURN_LABEL_VERSION' in SERVICE_CODE
+    assert 'metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION' in SERVICE_CODE
+    assert 'max(r["long_return"], r["short_return"], key=abs)' not in SERVICE_CODE
+    assert (
+        'max(net_return_pct(f(sample, "long_return_pct")), '
+        'net_return_pct(f(sample, "short_return_pct")))'
+        not in SERVICE_CODE
+    )
+    assert '"long_model": long_model' in SERVICE_CODE
+    assert '"short_model": short_model' in SERVICE_CODE
+    assert '"long_expected_return_pct": round(long_return, 4)' in SERVICE_CODE
+    assert '"short_expected_return_pct": round(short_return, 4)' in SERVICE_CODE
+    assert '"training_data_sha256": training_data_sha256' in SERVICE_CODE
+    assert '"source_code_sha256": source_code_sha256' in SERVICE_CODE
+    assert '"time_split_policy": "chronological_features_before_labels"' in SERVICE_CODE
+    assert "write_json_atomic(METADATA_PATH, metadata)" in SERVICE_CODE
+
+
 def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
     module = ModuleType("local_ai_tools_api_training_test")
     sys.modules[module.__name__] = module

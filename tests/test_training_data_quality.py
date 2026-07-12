@@ -327,7 +327,7 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
 
     trade = payload["trade_samples"][0]
     labels = trade["profit_learning_labels"]
-    assert labels["version"] == "profit-first-training-v2"
+    assert labels["version"] == "fee-after-return-training-v3"
     assert labels["training_supervision_ready"] is True
     assert labels["losing_exit_attribution"] == "position_too_small_fee_drag"
     assert labels["trade_profit_class"] == "cost_drag_loss"
@@ -335,6 +335,9 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
     assert labels["cost_basis_label"] == "fee_plus_funding"
     assert labels["realized_net_pnl_usdt"] == -0.12
     assert labels["return_after_cost_pct"] == -1.0
+    assert labels["net_return_after_cost_pct"] == -1.0
+    assert labels["return_on_margin_pct"] == -1.0
+    assert labels["return_after_cost_pct_deprecated"] is True
     assert labels["strategy_context"]["decision_lane"] == "tiny_probe"
     assert trade["losing_exit_attribution"] == "position_too_small_fee_drag"
     report = payload["quality_report"]["by_kind"]["trade"]["profit_learning"]
@@ -756,6 +759,29 @@ def test_training_governance_marks_small_quarantined_slice_as_medium_risk() -> N
     assert refreshed["requires_artifact_refresh"] is False
 
 
+def test_artifact_bound_governance_report_marks_new_artifact_current() -> None:
+    quality = training_data_quality.quality_report(
+        {
+            "shadow": [
+                {
+                    "data_quality_status": "downweighted",
+                    "sample_weight": 0.5,
+                    "quality_reasons": ["wide_spread_feature"],
+                }
+            ]
+        }
+    )
+
+    report = training_data_quality.artifact_bound_governance_report(
+        quality,
+        persist_artifact=True,
+    )
+
+    assert report["artifact_quality_fingerprint"] == report["quality_fingerprint"]
+    assert report["artifact_matches_quality"] is True
+    assert report["requires_artifact_refresh"] is False
+
+
 def test_trade_return_uses_valid_derived_notional_over_tiny_placeholder() -> None:
     payload = annotate_training_payload(
         trade_samples=[
@@ -774,6 +800,7 @@ def test_trade_return_uses_valid_derived_notional_over_tiny_placeholder() -> Non
     labels = payload["trade_samples"][0]["profit_learning_labels"]
     assert labels["notional_usdt"] == 200.0
     assert labels["return_after_cost_pct"] == 2.0
+    assert labels["net_return_after_cost_pct"] == 2.0
 
 
 def test_trade_return_is_missing_for_zero_or_malformed_notional() -> None:

@@ -198,7 +198,7 @@ class EntryCandidateEvidencePolicy:
             ),
             "reward_risk_ratio": opportunity.get("reward_risk_ratio"),
             "ml_expected_return_pct": opportunity.get("expected_return_pct"),
-            "ml_win_rate": opportunity.get("win_rate"),
+            "ml_win_rate": opportunity.get("diagnostic_win_rate"),
             "server_profit_expected_return_pct": opportunity.get(
                 "server_profit_expected_return_pct"
             ),

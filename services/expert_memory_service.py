@@ -12,15 +12,55 @@ from ai_brain.base_model import DecisionOutput
 from config.settings import ENSEMBLE_TRADER_NAME, FIXED_AI_MODEL_SLOTS, settings
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
-from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.decision import AIDecision
+from models.learning import TradeReflection
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
 from services.memory_feedback import MemoryFeedbackPolicy
 from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
+
+
+def _exchange_order_ids(value: Any) -> tuple[str, ...]:
+    tokens = {
+        token.strip()
+        for token in str(value or "").replace(";", ",").split(",")
+        if token.strip()
+    }
+    return tuple(sorted(tokens))
+
+
+def _reflection_lifecycle_key(position: Any) -> str:
+    entry_ids = _exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+    close_ids = _exchange_order_ids(getattr(position, "close_exchange_order_id", None))
+    if entry_ids or close_ids:
+        return "|".join(
+            (
+                str(getattr(position, "execution_mode", "") or ""),
+                str(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "side", "") or ""),
+                ",".join(entry_ids),
+                ",".join(close_ids),
+            )
+        )
+    return f"position:{int(getattr(position, 'id', 0) or 0)}"
+
+
+def _reflection_position_rank(position: Any) -> tuple[int, int, int, int]:
+    settlement_source = str(getattr(position, "settlement_source", "") or "").lower()
+    settlement_status = str(getattr(position, "settlement_status", "") or "").lower()
+    source_rank = {
+        "okx_position_history": 4,
+        "okx_position_history_settlement": 3,
+        "okx_order_fact_sync": 2,
+        "system_execution": 1,
+    }.get(settlement_source, 0)
+    status_rank = int(settlement_status in {"okx_position_history", "reconciled", "settled"})
+    link_rank = int(bool(_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))))
+    link_rank += int(bool(_exchange_order_ids(getattr(position, "close_exchange_order_id", None))))
+    return source_rank, status_rank, link_rank, int(getattr(position, "id", 0) or 0)
 
 
 class ExpertMemoryService:
@@ -279,24 +319,25 @@ class ExpertMemoryService:
         gross_pnl: float,
         source: str,
         decision: DecisionOutput | None = None,
-    ) -> None:
+    ) -> bool:
         """Create a compact post-trade reflection and update expert memories."""
 
         if not self.memory_enabled_provider():
-            return
+            return False
         if not closed_position_trade_fact_trusted(pos):
             logger.warning(
                 "skip trade reflection for untrusted closed position fact",
                 position_id=getattr(pos, "id", None),
                 symbol=getattr(pos, "symbol", None),
             )
-            return
+            return False
         try:
             realized_pnl = float(pos.realized_pnl or 0.0)
             entry_price = float(pos.entry_price or 0.0)
             quantity = float(pos.quantity or 0.0)
             notional = abs(entry_price * quantity)
             pnl_pct = realized_pnl / notional if notional > 0 else 0.0
+            funding_fee = float(getattr(pos, "funding_fee", 0.0) or 0.0)
             hold_minutes = position_hold_minutes(pos)
             outcome = "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat"
             pattern = reflection_pattern(pos, pnl_pct, hold_minutes)
@@ -333,7 +374,9 @@ class ExpertMemoryService:
                 }
             )
             if reflection is None:
-                return
+                reflection = await repo.get_reflection_by_position_id(int(pos.id or 0))
+            if reflection is None:
+                return False
 
             for lesson in expert_lessons.values():
                 await repo.upsert_memory(
@@ -344,13 +387,20 @@ class ExpertMemoryService:
                             "reflection_id": reflection.id,
                             "realized_pnl": realized_pnl,
                             "pnl_pct": pnl_pct,
+                            "pnl_pct_deprecated_ratio": True,
+                            "net_return_after_cost_pct": pnl_pct * 100.0,
                             "hold_minutes": hold_minutes,
                             "gross_pnl": gross_pnl,
                             "entry_fee": entry_fee,
                             "close_fee": close_fee,
+                            "funding_fee": funding_fee,
+                            "source_position_id": int(pos.id or 0),
+                            "settlement_status": getattr(pos, "settlement_status", None),
+                            "settlement_source": getattr(pos, "settlement_source", None),
                         },
                     }
                 )
+            return True
         except Exception as exc:
             logger.warning(
                 "failed to record trade reflection",
@@ -358,27 +408,36 @@ class ExpertMemoryService:
                 symbol=getattr(pos, "symbol", None),
                 error=safe_error_text(exc),
             )
+            return False
 
-    async def backfill_trade_reflections(self, execution_mode: str) -> None:
+    async def backfill_trade_reflections(self, execution_mode: str) -> dict[str, Any]:
         """Create expert memories from already closed positions after restart."""
 
         if not self.memory_enabled_provider():
-            return
+            return {"status": "disabled", "processed": 0}
         try:
             async with self.session_factory() as session:
-                repo = TradeRepository(session)
-                rows = await repo.get_position_records(
-                    execution_mode=execution_mode,
-                    model_name=self.ensemble_model_name,
-                    is_open=False,
-                    limit=200,
+                rows = list(
+                    (
+                        await session.execute(
+                            select(Position)
+                            .where(
+                                Position.execution_mode == execution_mode,
+                                Position.is_open.is_(False),
+                                Position.closed_at.is_not(None),
+                            )
+                            .order_by(Position.closed_at.desc(), Position.id.desc())
+                            .limit(1000)
+                        )
+                    )
+                    .scalars()
+                    .all()
                 )
                 symbols = {pos.symbol for pos in rows if pos.symbol}
                 manual_close_orders = []
                 if symbols:
                     manual_close_result = await session.execute(
                         select(Order).where(
-                            Order.model_name == self.ensemble_model_name,
                             Order.execution_mode == execution_mode,
                             Order.status == "filled",
                             Order.symbol.in_(symbols),
@@ -386,25 +445,71 @@ class ExpertMemoryService:
                         )
                     )
                     manual_close_orders = list(manual_close_result.scalars().all())
-                for pos in rows:
-                    if not pos.closed_at:
-                        continue
-                    if position_has_manual_close_order(pos, manual_close_orders):
-                        continue
-                    if not closed_position_trade_fact_trusted(pos):
-                        continue
-                    await self.record_trade_reflection_in_session(
+                eligible = [
+                    pos
+                    for pos in rows
+                    if pos.closed_at
+                    and not position_has_manual_close_order(pos, manual_close_orders)
+                    and closed_position_trade_fact_trusted(pos)
+                ]
+                reflection_rows = list(
+                    (
+                        await session.execute(
+                            select(TradeReflection).where(
+                                TradeReflection.position_id.in_(
+                                    [int(pos.id) for pos in eligible if int(pos.id or 0) > 0]
+                                )
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                ) if eligible else []
+                reflected_position_ids = {
+                    int(row.position_id) for row in reflection_rows if int(row.position_id or 0) > 0
+                }
+                grouped: dict[str, list[Any]] = {}
+                for pos in eligible:
+                    grouped.setdefault(_reflection_lifecycle_key(pos), []).append(pos)
+
+                processed = 0
+                for group in grouped.values():
+                    pos = next(
+                        (
+                            row
+                            for row in group
+                            if int(row.id or 0) in reflected_position_ids
+                        ),
+                        max(group, key=_reflection_position_rank),
+                    )
+                    recorded = await self.record_trade_reflection_in_session(
                         session,
                         pos,
                         exit_price=float(pos.current_price or pos.entry_price or 0.0),
-                        entry_fee=0.0,
-                        close_fee=0.0,
-                        gross_pnl=float(pos.realized_pnl or 0.0),
-                        source="startup_backfill",
+                        entry_fee=float(getattr(pos, "entry_fee", 0.0) or 0.0),
+                        close_fee=float(getattr(pos, "close_fee", 0.0) or 0.0),
+                        gross_pnl=float(
+                            getattr(pos, "close_fill_pnl", 0.0)
+                            or getattr(pos, "realized_pnl", 0.0)
+                            or 0.0
+                        ),
+                        source="authoritative_settlement_backfill",
                         decision=None,
                     )
+                    processed += int(recorded)
+                report = {
+                    "status": "completed",
+                    "scanned": len(rows),
+                    "eligible": len(eligible),
+                    "unique_lifecycles": len(grouped),
+                    "duplicate_rows_skipped": len(eligible) - len(grouped),
+                    "processed": processed,
+                }
+                logger.info("trade reflection backfill completed", **report)
+                return report
         except Exception as exc:
             logger.warning("failed to backfill trade reflections", error=safe_error_text(exc))
+            return {"status": "error", "processed": 0, "error": safe_error_text(exc)}
 
 
 def serialize_memory(memory: Any) -> dict[str, Any]:
@@ -658,8 +763,7 @@ def _realized_weight_result(
         )
         expectancy_component = max(min(avg_pnl / 8.0, 0.24), -0.30)
         factor_component = max(min((profit_factor - 1.0) * 0.12, 0.14), -0.18)
-        win_component = max(min((win_rate - 0.5) * 0.06, 0.03), -0.03)
-        raw_multiplier = 1.0 + expectancy_component + factor_component + win_component
+        raw_multiplier = 1.0 + expectancy_component + factor_component
         multiplier = min(max(raw_multiplier, 0.65), 1.30)
         result[name] = {
             "base_weight": slot_weights.get(name, 1.0),
@@ -672,7 +776,8 @@ def _realized_weight_result(
             "profit_factor": round(profit_factor, 4),
             "reason": (
                 f"北京时间今日同向参与 {count} 笔，真实盈亏 {pnl:.2f}U，"
-                f"胜率 {win_rate:.0%}，权重调整到 {multiplier:.2f} 倍。"
+                f"单笔期望 {avg_pnl:.2f}U、Profit Factor {profit_factor:.2f}，"
+                f"权重调整到 {multiplier:.2f} 倍；胜率仅作诊断。"
             ),
         }
     return result

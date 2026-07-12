@@ -66,7 +66,8 @@ def test_dynamic_capacity_can_expand_when_market_is_clear_and_book_is_clean() ->
 
     assert decision.effective_limit > decision.base_limit
     assert decision.low_quality_count == 0
-    assert "trend_bonus" in decision.factors["reason_codes"]
+    assert "market_clear" in decision.factors["reason_codes"]
+    assert "positive_return_quality_bonus" not in decision.factors["reason_codes"]
 
 
 def test_position_quality_derives_unrealized_pnl_when_snapshot_is_stale_zero() -> None:
@@ -227,6 +228,37 @@ def test_dynamic_capacity_uses_learned_expansion_above_current_book() -> None:
     assert decision.effective_limit == 5
     assert "learned_target_expansion" in decision.factors["reason_codes"]
     assert "学习目标高于当前运行容量" in decision.reason
+
+
+def test_dynamic_capacity_bonus_uses_return_quality_not_win_rate() -> None:
+    policy = DynamicPositionCapacityPolicy(lambda: 20)
+    positive_return = policy.evaluate(
+        open_positions=[],
+        strategy_context={
+            "recent_win_rate": 0.35,
+            "profit_factor": 2.0,
+            "net_pnl": 10.0,
+            "today_risk_pnl": 0.0,
+        },
+        market_regime={"confidence": 0.70},
+        account_equity=1000.0,
+    )
+    high_win_negative_return = policy.evaluate(
+        open_positions=[],
+        strategy_context={
+            "recent_win_rate": 0.85,
+            "profit_factor": 0.40,
+            "net_pnl": -10.0,
+            "today_risk_pnl": 0.0,
+        },
+        market_regime={"confidence": 0.40},
+        account_equity=1000.0,
+    )
+
+    assert "positive_return_quality_bonus" in positive_return.factors["reason_codes"]
+    assert positive_return.effective_limit > positive_return.target_limit
+    assert "positive_return_quality_bonus" not in high_win_negative_return.factors["reason_codes"]
+    assert high_win_negative_return.effective_limit == high_win_negative_return.target_limit
 
 
 def test_dynamic_capacity_stops_new_entries_when_stale_config_book_is_crowded() -> None:

@@ -561,8 +561,7 @@ class ModelContributionPerformanceService:
         avg_pnl = pnl / count
         edge = max(min(avg_pnl / 5.0, 0.28), -0.34)
         factor_edge = max(min((profit_factor - 1.0) * 0.14, 0.22), -0.26)
-        win_edge = max(min((win_rate - 0.5) * 0.10, 0.05), -0.05)
-        multiplier = min(max(1.0 + edge + factor_edge + win_edge, 0.60), 1.38)
+        multiplier = min(max(1.0 + edge + factor_edge, 0.60), 1.38)
         state = "learning"
         reason = "样本不足，先学习不强干预。"
         if count >= 5:

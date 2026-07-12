@@ -56,8 +56,10 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["local_ml_training"]["training_trade_sample_limit"] == 8000
     assert snapshot["local_ml_training"]["training_sequence_sample_limit"] == 12000
     assert snapshot["local_ml_training"]["local_tools_min_new_trade_samples"] == 50
-    assert snapshot["local_ml_training"]["influence_min_auc"] == 0.53
-    assert snapshot["local_ml_training"]["influence_min_pr_auc"] == 0.52
+    assert "min_profit_signal_win_rate" not in snapshot["local_ml_training"]
+    assert "influence_min_auc" not in snapshot["local_ml_training"]
+    assert "influence_min_pr_auc" not in snapshot["local_ml_training"]
+    assert "influence_min_accuracy" not in snapshot["local_ml_training"]
     assert snapshot["local_ml_training"]["readiness_max_dirty_sample_ratio"] == 0.08
     assert snapshot["local_ml_training"]["readiness_max_model_age_seconds"] == 259200
     assert snapshot["auto_scan"]["rotation_pool_multiplier"] == 20
@@ -106,6 +108,10 @@ def test_default_trading_parameter_snapshot_is_serializable() -> None:
     assert snapshot["ensemble_exit_decision"]["profit_lock_fee_multiple"] == 4.0
     assert snapshot["ensemble_exit_decision"]["loss_repair_reduce_support_count"] == 2
     assert snapshot["ensemble_ml_probe"]["ml_profit_first_min_expected_return_pct"] == 0.12
+    assert "ml_min_support_win_rate" not in snapshot["ensemble_ml_probe"]
+    assert "ml_strong_support_win_rate" not in snapshot["ensemble_ml_probe"]
+    assert "ml_low_win_confidence_bonus" not in snapshot["ensemble_ml_probe"]
+    assert "ml_profit_first_low_win_rate_size_multiplier" not in snapshot["ensemble_ml_probe"]
     assert snapshot["ensemble_ml_probe"]["quant_validation_min_local_expected_return_pct"] == 0.03
     assert snapshot["entry_stop_loss_budget"]["normal_budget_usdt"] == 16.0
     assert snapshot["exit_fast_risk"]["fast_risk_fresh_review_min_hold_minutes"] == 12.0
@@ -171,7 +177,7 @@ def test_training_data_quality_uses_central_trading_params() -> None:
     params = DEFAULT_TRADING_PARAMS.training_data_quality
 
     assert training_data_quality._QUALITY_PARAMS == params
-    assert training_data_quality.DATA_QUALITY_VERSION == "2026-07-11.v5"
+    assert training_data_quality.DATA_QUALITY_VERSION == "2026-07-12.v1"
 
 
 def test_local_ml_training_uses_central_trading_params() -> None:
@@ -182,8 +188,13 @@ def test_local_ml_training_uses_central_trading_params() -> None:
     assert ml_signal_service.AUTO_TRAIN_MIN_NEW_SAMPLES == params.auto_train_min_new_samples
     assert ml_signal_service.MIN_TRAINING_SAMPLES == params.min_training_samples
     assert ml_signal_service.TRAINING_SHADOW_SAMPLE_LIMIT == params.training_shadow_sample_limit
-    assert ml_signal_service.ML_INFLUENCE_MIN_AUC == params.influence_min_auc
-    assert ml_signal_service.ML_INFLUENCE_MIN_PR_AUC == params.influence_min_pr_auc
+    assert (
+        ml_signal_service.POSITIVE_NET_RETURN_THRESHOLD_PCT
+        == params.positive_net_return_threshold_pct
+    )
+    assert ml_signal_service.PREDICTION_LOWER_QUANTILE == params.prediction_lower_quantile
+    assert not hasattr(ml_signal_service, "ML_INFLUENCE_MIN_AUC")
+    assert not hasattr(ml_signal_service, "ML_INFLUENCE_MIN_PR_AUC")
 
 
 def test_trading_service_local_tools_training_uses_central_params() -> None:
@@ -304,10 +315,7 @@ def test_sizing_and_probe_modules_use_central_params() -> None:
         == entry_params.winner_expand_score_threshold
     )
     assert ensemble_coordinator.MAX_PROBE_ENTRY_SIZE == risk_params.ensemble_max_probe_entry_size
-    assert (
-        ensemble_coordinator.ML_SOFT_CAUTION_MAX_ENTRY_SIZE
-        == risk_params.ensemble_ml_soft_caution_max_entry_size
-    )
+    assert not hasattr(ensemble_coordinator, "ML_SOFT_CAUTION_MAX_ENTRY_SIZE")
     assert (
         ensemble_coordinator.QUANT_VALIDATION_PROBE_SIZE
         == risk_params.ensemble_quant_validation_probe_size

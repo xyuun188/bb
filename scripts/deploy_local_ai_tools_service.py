@@ -33,6 +33,7 @@ PHASE3_POLICY_ID = "phase3_quant_api_shadow_contract_v2_2026_06_27"
 SERVICE_CODE = r'''
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -90,6 +91,11 @@ FEATURE_KEYS = [
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 ROUND_TRIP_COST_PCT = float(os.environ.get("LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT", "0.12"))
 TAIL_LOSS_THRESHOLD_PCT = float(os.environ.get("LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT", "0.18"))
+RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
+RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
+RETURN_LABEL_NAME = "net_return_after_cost_pct"
+RETURN_LABEL_VERSION = "2026-07-12.v1"
+COST_MODEL_VERSION = "okx_fee_slippage_funding_v1"
 MIN_TIMESERIES_SEQUENCE_LENGTH = int(
     os.environ.get("LOCAL_AI_TOOLS_MIN_TIMESERIES_SEQUENCE_LENGTH", "30")
 )
@@ -391,6 +397,28 @@ def dump_trusted_joblib_bundle(bundle: dict[str, Any], path: Path) -> Path:
             tmp_path.unlink()
 
 
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
 def load_bundle() -> dict[str, Any] | None:
     global _BUNDLE_CACHE, _BUNDLE_MTIME
     try:
@@ -399,7 +427,15 @@ def load_bundle() -> dict[str, Any] | None:
         mtime = BUNDLE_PATH.stat().st_mtime
         if _BUNDLE_CACHE is not None and _BUNDLE_MTIME == mtime:
             return _BUNDLE_CACHE
-        _BUNDLE_CACHE = load_trusted_joblib_bundle(BUNDLE_PATH)
+        candidate = load_trusted_joblib_bundle(BUNDLE_PATH)
+        metadata = candidate.get("metadata") if isinstance(candidate, dict) else {}
+        if not isinstance(metadata, dict) or (
+            metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
+            or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
+            or metadata.get("label_version") != RETURN_LABEL_VERSION
+        ):
+            raise ValueError("legacy local quant artifact objective rejected")
+        _BUNDLE_CACHE = candidate
         _BUNDLE_MTIME = mtime
         return _BUNDLE_CACHE
     except Exception:
@@ -654,18 +690,27 @@ def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | Non
         if bool(sample.get("exclude_from_training")):
             continue
         x = sequence_features(sample.get("close_sequence"), sample.get("volume_sequence"))
-        y = f(sample, "future_return_pct")
+        future_move = f(sample, "future_return_pct")
+        long_return = f(sample, "long_return_pct", net_return_pct(future_move))
+        short_return = f(sample, "short_return_pct", net_return_pct(-future_move))
         if not x:
             continue
-        rows.append((x, y, sample.get("timeframe") or "unknown"))
+        rows.append((x, long_return, short_return, sample.get("timeframe") or "unknown"))
     if len(rows) < 120:
         return None
-    model = _make_regressor()
-    model.fit([x for x, _, _ in rows], [y for _, y, _ in rows])
+    long_model = _make_regressor()
+    short_model = _make_regressor()
+    long_model.fit([x for x, _, _, _ in rows], [y for _, y, _, _ in rows])
+    short_model.fit([x for x, _, _, _ in rows], [y for _, _, y, _ in rows])
     timeframes: dict[str, int] = {}
-    for _, _, timeframe in rows:
+    for _, _, _, timeframe in rows:
         timeframes[str(timeframe)] = timeframes.get(str(timeframe), 0) + 1
-    return {"model": model, "samples": len(rows), "timeframes": timeframes}
+    return {
+        "long_model": long_model,
+        "short_model": short_model,
+        "samples": len(rows),
+        "timeframes": timeframes,
+    }
 
 
 def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -680,14 +725,16 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         if bool(sample.get("exclude_from_training")):
             continue
         x = sequence_deep_features(sample.get("close_sequence"), sample.get("volume_sequence"))
-        y = f(sample, "future_return_pct")
+        future_move = f(sample, "future_return_pct")
+        long_return = f(sample, "long_return_pct", net_return_pct(future_move))
+        short_return = f(sample, "short_return_pct", net_return_pct(-future_move))
         if x:
-            rows.append((x, y))
+            rows.append((x, long_return, short_return))
     if len(rows) < 180:
         return {"available": False, "reason": "not_enough_sequence_samples", "samples": len(rows)}
 
-    X = np.array([x for x, _ in rows], dtype=np.float32)
-    y = np.array([[target] for _, target in rows], dtype=np.float32)
+    X = np.array([x for x, _, _ in rows], dtype=np.float32)
+    y = np.array([[long_y, short_y] for _, long_y, short_y in rows], dtype=np.float32)
     mean = X.mean(axis=0, keepdims=True)
     std = X.std(axis=0, keepdims=True) + 1e-6
     X = (X - mean) / std
@@ -701,7 +748,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         nn.Dropout(0.05),
         nn.Linear(96, 48),
         nn.GELU(),
-        nn.Linear(48, 1),
+        nn.Linear(48, 2),
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=0.01)
     loss_fn = nn.SmoothL1Loss()
@@ -727,7 +774,11 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     }
 
 
-def _predict_torch_patch_model(model_info: dict[str, Any], close_sequence: Any, volume_sequence: Any | None = None) -> float | None:
+def _predict_torch_patch_model(
+    model_info: dict[str, Any],
+    close_sequence: Any,
+    volume_sequence: Any | None = None,
+) -> tuple[float, float] | None:
     if not model_info or model_info.get("available") is not True:
         return None
     try:
@@ -745,12 +796,13 @@ def _predict_torch_patch_model(model_info: dict[str, Any], close_sequence: Any, 
             nn.Dropout(0.05),
             nn.Linear(96, 48),
             nn.GELU(),
-            nn.Linear(48, 1),
+            nn.Linear(48, 2),
         )
         net.load_state_dict(model_info["state_dict"])
         net.eval()
         with torch.no_grad():
-            return float(net(torch.tensor(x, dtype=torch.float32))[0, 0].item())
+            prediction = net(torch.tensor(x, dtype=torch.float32))[0]
+            return float(prediction[0].item()), float(prediction[1].item())
     except Exception:
         return None
 
@@ -2048,11 +2100,18 @@ def train(req: TrainRequest) -> dict[str, Any]:
         if len(h_rows) < 80:
             continue
         hX = [r["x"] for r in h_rows]
-        net_y = [max(r["long_return"], r["short_return"], key=abs) for r in h_rows]
+        long_horizon_y = [r["long_return"] for r in h_rows]
+        short_horizon_y = [r["short_return"] for r in h_rows]
         h_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in h_rows]
-        model = _make_regressor()
-        model.fit(hX, net_y, model__sample_weight=h_weights)
-        horizon_models[horizon] = {"model": model, "samples": len(h_rows)}
+        long_model = _make_regressor()
+        short_model = _make_regressor()
+        long_model.fit(hX, long_horizon_y, model__sample_weight=h_weights)
+        short_model.fit(hX, short_horizon_y, model__sample_weight=h_weights)
+        horizon_models[horizon] = {
+            "long_model": long_model,
+            "short_model": short_model,
+            "samples": len(h_rows),
+        }
 
     deep_sequence_model = _train_sequence_model(req.sequence_samples or [])
     torch_patch_model = _train_torch_patch_model(req.sequence_samples or [])
@@ -2065,26 +2124,40 @@ def train(req: TrainRequest) -> dict[str, Any]:
         features = sample.get("features") or {}
         if not features:
             continue
-        sentiment_samples.append((
-            [feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS],
-            max(net_return_pct(f(sample, "long_return_pct")), net_return_pct(f(sample, "short_return_pct"))),
-            max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
-        ))
+        sentiment_samples.append(
+            (
+                [feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS],
+                net_return_pct(f(sample, "long_return_pct")),
+                net_return_pct(f(sample, "short_return_pct")),
+                max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
+            )
+        )
     if len(sentiment_samples) >= 200:
-        sentiment_model = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("model", RandomForestRegressor(
-                n_estimators=180,
-                max_depth=8,
-                min_samples_leaf=10,
-                random_state=43,
-                n_jobs=-1,
-            )),
-        ])
-        sentiment_model.fit(
-            [x for x, _, _ in sentiment_samples],
-            [y for _, y, _ in sentiment_samples],
-            model__sample_weight=[weight for _, _, weight in sentiment_samples],
+        def make_sentiment_regressor(random_state: int) -> Pipeline:
+            return Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", RandomForestRegressor(
+                    n_estimators=180,
+                    max_depth=8,
+                    min_samples_leaf=10,
+                    random_state=random_state,
+                    n_jobs=-1,
+                )),
+            ])
+
+        sentiment_model = {
+            "long_model": make_sentiment_regressor(43),
+            "short_model": make_sentiment_regressor(44),
+        }
+        sentiment_model["long_model"].fit(
+            [x for x, _, _, _ in sentiment_samples],
+            [long_y for _, long_y, _, _ in sentiment_samples],
+            model__sample_weight=[weight for _, _, _, weight in sentiment_samples],
+        )
+        sentiment_model["short_model"].fit(
+            [x for x, _, _, _ in sentiment_samples],
+            [short_y for _, _, short_y, _ in sentiment_samples],
+            model__sample_weight=[weight for _, _, _, weight in sentiment_samples],
         )
     text_sentiment_model = _train_text_sentiment_model(req.text_sentiment_samples or [])
     transformers_sentiment_backend = _probe_transformers_sentiment_backend()
@@ -2103,6 +2176,57 @@ def train(req: TrainRequest) -> dict[str, Any]:
     evaluation_policy.setdefault("live_mutation", False)
     evaluation_policy.setdefault("requires_walk_forward", True)
     evaluation_policy.setdefault("phase", "phase3_model_factory")
+    fingerprint_payload = {
+        "shadow": [
+            {
+                "id": sample.get("id"),
+                "symbol": sample.get("symbol"),
+                "long_return_pct": sample.get("long_return_pct"),
+                "short_return_pct": sample.get("short_return_pct"),
+                "label_timestamp": sample.get("label_timestamp"),
+            }
+            for sample in (req.shadow_samples or [])
+            if not bool(sample.get("exclude_from_training"))
+        ],
+        "trades": [
+            {
+                "id": sample.get("id"),
+                "position_id": sample.get("position_id"),
+                "realized_pnl": sample.get("realized_pnl"),
+                "net_return_after_cost_pct": sample.get("net_return_after_cost_pct"),
+            }
+            for sample in trainable_trade_samples
+        ],
+        "sequence": [
+            {
+                "symbol": sample.get("symbol"),
+                "feature_timestamp": sample.get("feature_timestamp"),
+                "label_timestamp": sample.get("label_timestamp"),
+                "long_return_pct": sample.get("long_return_pct"),
+                "short_return_pct": sample.get("short_return_pct"),
+            }
+            for sample in (req.sequence_samples or [])
+            if not bool(sample.get("exclude_from_training"))
+        ],
+    }
+    training_data_sha256 = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    source_digest = hashlib.sha256()
+    for function in (
+        train,
+        timeseries_predict,
+        deep_timeseries_predict,
+        sentiment_analyze,
+        profit_predict,
+    ):
+        source_digest.update(function.__code__.co_code)
+    source_code_sha256 = source_digest.hexdigest()
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "phase": "phase3_model_factory",
@@ -2130,6 +2254,14 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "profile_count": len(profiles),
         "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "cost_model_version": COST_MODEL_VERSION,
+        "training_data_sha256": training_data_sha256,
+        "source_code_sha256": source_code_sha256,
+        "time_split_policy": "chronological_features_before_labels",
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
         "profit_first_report": req.profit_first_report or {},
@@ -2143,17 +2275,20 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "persist_artifact_requested": bool(req.persist_artifact),
         "confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild),
         "promotion_recommendation": req.promotion_recommendation or {},
-        "training_objective": "Predict executable net return after estimated fees/slippage; win rate is auxiliary.",
+        "training_objective": (
+            "Directly predict side-specific fee-after net return and tail loss; "
+            "classification metrics are diagnostics only."
+        ),
         "models": {
             "profit": "ExtraTreesRegressor long/short expected return",
             "loss_filter": "ExtraTreesClassifier side-specific loss probability",
-            "timeseries": "Per-horizon ExtraTreesRegressor",
+            "timeseries": "Per-horizon long/short ExtraTreesRegressor return distributions",
             "deep_timeseries": (
                 "Torch PatchTST/TFT-style sequence model"
                 if (torch_patch_model or {}).get("available")
                 else ("Sequence ExtraTreesRegressor PatchTST/TFT-style input" if deep_sequence_model else "not enough kline sequences")
             ),
-            "sentiment": "RandomForest sentiment calibration" if sentiment_model else "heuristic fallback",
+            "sentiment": "Side-specific RandomForest sentiment return calibration" if sentiment_model else "heuristic fallback",
             "deep_sentiment": (
                 "Transformers-ready text sentiment + TF-IDF Ridge model"
                 if (transformers_sentiment_backend or {}).get("available") and text_sentiment_model
@@ -2161,7 +2296,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
             ),
             "exit": "trade-profile plus live pnl rules",
         },
-        "objective": "Maximize expected realized net profit; win rate is auxiliary only.",
+        "objective": RETURN_OBJECTIVE_NAME,
     }
     bundle = {
         "metadata": metadata,
@@ -2192,7 +2327,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         }
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     dump_trusted_joblib_bundle(bundle, BUNDLE_PATH)
-    METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(METADATA_PATH, metadata)
     global _BUNDLE_CACHE, _BUNDLE_MTIME
     _BUNDLE_CACHE = bundle
     _BUNDLE_MTIME = BUNDLE_PATH.stat().st_mtime
@@ -2295,17 +2430,29 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
         predictions = []
         try:
             for horizon, item in (bundle.get("horizon_models") or {}).items():
-                move = float(item["model"].predict([model_x(features, horizon_minutes=int(horizon))])[0])
+                x = [model_x(features, horizon_minutes=int(horizon))]
+                long_return = float(item["long_model"].predict(x)[0])
+                short_return = float(item["short_model"].predict(x)[0])
+                best_side = "long" if long_return >= short_return else "short"
+                best_return = long_return if best_side == "long" else short_return
                 predictions.append({
                     "horizon_minutes": int(horizon),
-                    "expected_move_pct": round(move, 4),
-                    "direction": "up" if move > 0 else "down" if move < 0 else "flat",
+                    "long_expected_return_pct": round(long_return, 4),
+                    "short_expected_return_pct": round(short_return, 4),
+                    "best_side": best_side,
+                    "expected_return_pct": round(best_return, 4),
+                    "expected_move_pct": round(best_return, 4),
+                    "direction": "up" if best_side == "long" else "down",
                     "samples": int(item.get("samples") or 0),
                 })
             if predictions:
-                primary = sorted(predictions, key=lambda r: abs(float(r["expected_move_pct"])), reverse=True)[0]
-                confidence = clamp(abs(float(primary["expected_move_pct"])) / 0.8, 0.0, 1.0)
-                best_side = "long" if primary["direction"] == "up" else "short" if primary["direction"] == "down" else "hold"
+                primary = max(predictions, key=lambda r: float(r["expected_return_pct"]))
+                best_side = str(primary["best_side"])
+                edge = abs(
+                    float(primary["long_expected_return_pct"])
+                    - float(primary["short_expected_return_pct"])
+                )
+                confidence = clamp(edge / 0.8, 0.0, 1.0)
                 return with_model_metadata("time_series_prediction", {
                     "available": True,
                     "trained": True,
@@ -2316,7 +2463,10 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "side": best_side,
                     "direction": primary["direction"],
                     "expected_move_pct": primary["expected_move_pct"],
-                    "expected_return_pct": primary["expected_move_pct"],
+                    "expected_return_pct": primary["expected_return_pct"],
+                    "long_expected_return_pct": primary["long_expected_return_pct"],
+                    "short_expected_return_pct": primary["short_expected_return_pct"],
+                    "profit_edge_pct": round(edge, 4),
                     "confidence": round(confidence, 4),
                     "predictions": predictions,
                 }, features=features)
@@ -2361,9 +2511,12 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
             else _predict_torch_patch_model(torch_patch_model, close_sequence, volume_sequence)
         )
         if torch_expected is not None:
-            confidence = clamp(abs(torch_expected) / 0.8, 0.0, 1.0)
-            direction = "up" if torch_expected > 0 else "down" if torch_expected < 0 else "flat"
-            best_side = "long" if direction == "up" else "short" if direction == "down" else "hold"
+            long_expected, short_expected = torch_expected
+            best_side = "long" if long_expected >= short_expected else "short"
+            best_expected = long_expected if best_side == "long" else short_expected
+            edge = abs(long_expected - short_expected)
+            confidence = clamp(edge / 0.8, 0.0, 1.0)
+            direction = "up" if best_side == "long" else "down"
             return _attach_timeseries_specialist_shadow({
                 "available": True,
                 "trained": True,
@@ -2373,8 +2526,11 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "best_side": best_side,
                 "side": best_side,
                 "direction": direction,
-                "expected_move_pct": round(torch_expected, 4),
-                "expected_return_pct": round(torch_expected, 4),
+                "expected_move_pct": round(best_expected, 4),
+                "expected_return_pct": round(best_expected, 4),
+                "long_expected_return_pct": round(long_expected, 4),
+                "short_expected_return_pct": round(short_expected, 4),
+                "profit_edge_pct": round(edge, 4),
                 "confidence": round(confidence, 4),
                 "sample_count": int(torch_patch_model.get("samples") or 0),
                 "train_mae_pct": torch_patch_model.get("train_mae_pct"),
@@ -2384,12 +2540,17 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "sequence_length": len(close_sequence),
                 "sequence_source": sequence_source,
             }, features=features)
-        model = sequence_model.get("model")
-        if model and not sequence_reason:
-            expected = float(model.predict([sequence_features(close_sequence, volume_sequence)])[0])
-            confidence = clamp(abs(expected) / 0.8, 0.0, 1.0)
-            direction = "up" if expected > 0 else "down" if expected < 0 else "flat"
-            best_side = "long" if direction == "up" else "short" if direction == "down" else "hold"
+        long_model = sequence_model.get("long_model")
+        short_model = sequence_model.get("short_model")
+        if long_model and short_model and not sequence_reason:
+            x = [sequence_features(close_sequence, volume_sequence)]
+            long_expected = float(long_model.predict(x)[0])
+            short_expected = float(short_model.predict(x)[0])
+            best_side = "long" if long_expected >= short_expected else "short"
+            expected = long_expected if best_side == "long" else short_expected
+            edge = abs(long_expected - short_expected)
+            confidence = clamp(edge / 0.8, 0.0, 1.0)
+            direction = "up" if best_side == "long" else "down"
             return _attach_timeseries_specialist_shadow({
                 "available": True,
                 "trained": True,
@@ -2401,6 +2562,9 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "direction": direction,
                 "expected_move_pct": round(expected, 4),
                 "expected_return_pct": round(expected, 4),
+                "long_expected_return_pct": round(long_expected, 4),
+                "short_expected_return_pct": round(short_expected, 4),
+                "profit_edge_pct": round(edge, 4),
                 "confidence": round(confidence, 4),
                 "sample_count": int(sequence_model.get("samples") or 0),
                 "timeframes": sequence_model.get("timeframes") or {},
@@ -2445,15 +2609,22 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
     articles = f(features, "news_article_count")
     score = news * 0.55 + social * 0.45
     trained_expected = None
+    trained_long_expected = None
+    trained_short_expected = None
     bundle = load_bundle()
     try:
         sentiment_model = bundle.get("sentiment_model") if bundle else None
-        if sentiment_model:
+        if isinstance(sentiment_model, dict):
             x = [[feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS]]
-            trained_expected = float(sentiment_model.predict(x)[0])
-            score = score * 0.55 + clamp(trained_expected / 1.5, -1.0, 1.0) * 0.45
+            trained_long_expected = float(sentiment_model["long_model"].predict(x)[0])
+            trained_short_expected = float(sentiment_model["short_model"].predict(x)[0])
+            trained_expected = max(trained_long_expected, trained_short_expected)
+            return_edge = trained_long_expected - trained_short_expected
+            score = score * 0.35 + clamp(return_edge / 1.5, -1.0, 1.0) * 0.65
     except Exception:
         trained_expected = None
+        trained_long_expected = None
+        trained_short_expected = None
     text_score = None
     try:
         text_model = (bundle or {}).get("text_sentiment_model") or {}
@@ -2478,7 +2649,14 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
     else:
         label = "neutral"
         risk = "normal"
-    best_side = "long" if label == "positive" else "short" if label == "negative" else "hold"
+    if trained_expected is not None:
+        best_side = (
+            "long"
+            if float(trained_long_expected or 0.0) >= float(trained_short_expected or 0.0)
+            else "short"
+        )
+    else:
+        best_side = "long" if label == "positive" else "short" if label == "negative" else "hold"
     expected_from_sentiment = round(trained_expected, 4) if trained_expected is not None else None
     return with_model_metadata("sentiment_analysis", {
         "available": True,
@@ -2492,6 +2670,16 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
         "score": round(score, 4),
         "expected_return_pct": expected_from_sentiment,
         "expected_return_from_sentiment_pct": expected_from_sentiment,
+        "long_expected_return_pct": (
+            round(float(trained_long_expected), 4)
+            if trained_long_expected is not None
+            else None
+        ),
+        "short_expected_return_pct": (
+            round(float(trained_short_expected), 4)
+            if trained_short_expected is not None
+            else None
+        ),
         "text_sentiment_score": round(text_score, 4) if text_score is not None else None,
         "risk_level": risk,
         "mentions": int(mentions),

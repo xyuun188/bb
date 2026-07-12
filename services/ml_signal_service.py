@@ -44,10 +44,20 @@ from services.model_training_state import (
     ModelTrainingStateStore,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+from services.return_objective import (
+    COST_MODEL_VERSION,
+    RETURN_LABEL_NAME,
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_NAME,
+    RETURN_OBJECTIVE_VERSION,
+    return_distribution_summary,
+    risk_adjusted_expected_return,
+)
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import (
     annotate_samples,
+    artifact_bound_governance_report,
     assess_shadow_sample,
     governance_report,
     quality_report,
@@ -56,8 +66,8 @@ from services.training_data_quality import (
 logger = structlog.get_logger(__name__)
 
 MODEL_DIR = Path("data/ml_signal")
-MODEL_PATH = MODEL_DIR / "winrate_model.joblib"
-METADATA_PATH = MODEL_DIR / "winrate_model_metadata.json"
+MODEL_PATH = MODEL_DIR / "net_return_model.joblib"
+METADATA_PATH = MODEL_DIR / "net_return_model_metadata.json"
 ML_SIGNAL_ARTIFACT_REGISTRY = ModelArtifactRegistry(
     root=Path(settings.data_dir) / "model_artifacts",
     model_id="local_ml_profit_quality",
@@ -76,6 +86,7 @@ def _training_source_code_version() -> str:
         Path(__file__),
         Path(__file__).with_name("training_data_quality.py"),
         Path(__file__).with_name("ml_readiness.py"),
+        Path(__file__).with_name("return_objective.py"),
         Path(__file__).with_name("model_artifact_registry.py"),
     )
     for path in source_paths:
@@ -149,22 +160,18 @@ FEATURE_KEYS = [
     "horizon_minutes",
 ]
 
-WIN_RETURN_THRESHOLD_PCT = _LOCAL_ML_PARAMS.win_return_threshold_pct
+POSITIVE_NET_RETURN_THRESHOLD_PCT = _LOCAL_ML_PARAMS.positive_net_return_threshold_pct
+PREDICTION_LOWER_QUANTILE = _LOCAL_ML_PARAMS.prediction_lower_quantile
 _EXECUTION_COST_PARAMS = DEFAULT_TRADING_PARAMS.execution_cost
 ROUND_TRIP_COST_PCT = _EXECUTION_COST_PARAMS.local_ml_round_trip_cost_pct
 TAIL_LOSS_THRESHOLD_PCT = _EXECUTION_COST_PARAMS.local_ml_tail_loss_threshold_pct
 MIN_PROFIT_EDGE_PCT = _LOCAL_ML_PARAMS.min_profit_edge_pct
-MIN_PROFIT_SIGNAL_WIN_RATE = _LOCAL_ML_PARAMS.min_profit_signal_win_rate
 MIN_TRAINING_SAMPLES = _LOCAL_ML_PARAMS.min_training_samples
-TAIL_LOSS_EXPECTED_RETURN_PENALTY_MULTIPLIER = 1.35
 ML_INFLUENCE_MIN_SAMPLE_COUNT = _LOCAL_ML_PARAMS.influence_min_sample_count
 ML_INFLUENCE_MIN_TEST_COUNT = _LOCAL_ML_PARAMS.influence_min_test_count
-ML_INFLUENCE_MIN_AUC = _LOCAL_ML_PARAMS.influence_min_auc
-ML_INFLUENCE_MIN_PR_AUC = _LOCAL_ML_PARAMS.influence_min_pr_auc
-ML_INFLUENCE_MIN_ACCURACY = _LOCAL_ML_PARAMS.influence_min_accuracy
 READINESS_MAX_DIRTY_SAMPLE_RATIO = _LOCAL_ML_PARAMS.readiness_max_dirty_sample_ratio
 READINESS_MAX_MODEL_AGE_SECONDS = _LOCAL_ML_PARAMS.readiness_max_model_age_seconds
-ML_INFLUENCE_MIN_TOP_RETURN_PCT = WIN_RETURN_THRESHOLD_PCT
+ML_INFLUENCE_MIN_TOP_RETURN_PCT = POSITIVE_NET_RETURN_THRESHOLD_PCT
 
 
 def _parse_json(value: Any) -> dict[str, Any]:
@@ -368,13 +375,21 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(min(float(value), high), low)
 
 
-def _bucket_return(y_return: pd.Series, scores: np.ndarray, top: bool) -> float | None:
+def _bucket_return_summary(
+    y_return: pd.Series,
+    scores: np.ndarray,
+    *,
+    top: bool,
+) -> dict[str, Any]:
     if len(scores) < 10:
-        return None
+        return return_distribution_summary([], tail_loss_threshold_pct=TAIL_LOSS_THRESHOLD_PCT)
     count = max(int(len(scores) * 0.20), 1)
     order = np.argsort(scores)
     idx = order[-count:] if top else order[:count]
-    return float(pd.Series(y_return).iloc[idx].mean())
+    return return_distribution_summary(
+        pd.Series(y_return).iloc[idx].astype(float).tolist(),
+        tail_loss_threshold_pct=TAIL_LOSS_THRESHOLD_PCT,
+    )
 
 
 def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float | None:
@@ -386,129 +401,68 @@ def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float |
     return float(pd.Series(y_win).iloc[idx].mean())
 
 
-def _weighted_mean(values: pd.Series, weights: pd.Series | None = None) -> float | None:
-    series = pd.Series(values).astype(float)
-    if series.empty:
-        return None
-    if weights is None:
-        return float(series.mean())
-    weight_series = pd.Series(weights).astype(float).reindex(series.index).fillna(0.0)
-    total_weight = float(weight_series.sum())
-    if total_weight <= 0:
-        return float(series.mean())
-    return float((series * weight_series).sum() / total_weight)
-
-
-def _side_return_calibration(train: pd.DataFrame, side: str) -> dict[str, Any]:
-    return_col = f"{side}_return_pct"
-    win_col = f"{side}_win"
-    tail_col = f"{side}_tail_loss"
-    returns = train[return_col].astype(float)
-    wins = train[win_col].astype(int) == 1
-    tail_losses = (
-        train[tail_col].astype(int) == 1
-        if tail_col in train.columns
-        else pd.Series(False, index=train.index)
-    )
-    weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
-    total_weight = float(weights.sum())
-    unconditional = _weighted_mean(returns, weights) or 0.0
-    win_avg = _weighted_mean(returns[wins], weights[wins]) if bool(wins.any()) else None
-    non_win_avg = (
-        _weighted_mean(returns[~wins], weights[~wins]) if bool((~wins).any()) else None
-    )
-    tail_loss_avg = (
-        _weighted_mean(returns[tail_losses], weights[tail_losses])
-        if bool(tail_losses.any())
-        else None
-    )
-    tail_loss_rate = (
-        float(weights[tail_losses].sum()) / total_weight if total_weight > 0 else 0.0
-    )
-    if win_avg is None:
-        win_avg = max(unconditional, WIN_RETURN_THRESHOLD_PCT)
-    if non_win_avg is None:
-        non_win_avg = min(unconditional, 0.0)
-    if tail_loss_avg is None:
-        tail_loss_avg = min(non_win_avg, -TAIL_LOSS_THRESHOLD_PCT)
+def _regression_prediction_distribution(
+    model: Pipeline,
+    x: pd.DataFrame,
+) -> dict[str, np.ndarray]:
+    expected = np.asarray(model.predict(x), dtype=float)
+    named_steps = getattr(model, "named_steps", {})
+    getter = getattr(named_steps, "get", None)
+    estimator = getter("model") if callable(getter) else None
+    imputer = getter("imputer") if callable(getter) else None
+    trees = list(getattr(estimator, "estimators_", []) or [])
+    if not trees or imputer is None:
+        return {
+            "expected": expected,
+            "median": expected.copy(),
+            "lower_quantile": expected.copy(),
+            "std": np.zeros(len(expected), dtype=float),
+        }
+    transformed = imputer.transform(x)
+    tree_predictions = np.asarray([tree.predict(transformed) for tree in trees], dtype=float)
     return {
-        "side": side,
-        "win_avg_return_pct": round(float(win_avg), 8),
-        "non_win_avg_return_pct": round(float(non_win_avg), 8),
-        "tail_loss_avg_return_pct": round(float(tail_loss_avg), 8),
-        "tail_loss_rate": round(tail_loss_rate, 8),
-        "tail_loss_threshold_pct": round(float(TAIL_LOSS_THRESHOLD_PCT), 8),
-        "tail_loss_penalty_multiplier": round(
-            float(TAIL_LOSS_EXPECTED_RETURN_PENALTY_MULTIPLIER), 8
+        "expected": expected,
+        "median": np.median(tree_predictions, axis=0),
+        "lower_quantile": np.quantile(
+            tree_predictions,
+            PREDICTION_LOWER_QUANTILE,
+            axis=0,
         ),
-        "unconditional_avg_return_pct": round(float(unconditional), 8),
-        "win_sample_count": int(wins.sum()),
-        "non_win_sample_count": int((~wins).sum()),
-        "tail_loss_sample_count": int(tail_losses.sum()),
-        "policy": "classifier_probability_times_empirical_payoff_minus_excess_tail_loss",
+        "std": np.std(tree_predictions, axis=0),
     }
 
 
-def _expected_return_from_win_probability(
-    win_probability: float,
-    calibration: dict[str, Any] | None,
-    *,
-    fallback: float = 0.0,
-    tail_loss_probability: float | None = None,
-) -> float:
-    if not isinstance(calibration, dict):
-        return float(fallback)
-    win_avg = _safe_float(calibration.get("win_avg_return_pct"), None)
-    non_win_avg = _safe_float(calibration.get("non_win_avg_return_pct"), None)
-    if win_avg is None or non_win_avg is None:
-        return float(fallback)
-    probability = _clamp(float(win_probability))
-    expected = float(probability * win_avg + (1.0 - probability) * non_win_avg)
-    if tail_loss_probability is None:
-        return expected
-    tail_prob = _clamp(float(tail_loss_probability))
-    baseline_tail_prob = _clamp(_safe_float(calibration.get("tail_loss_rate"), 0.0))
-    tail_avg_loss = abs(_safe_float(calibration.get("tail_loss_avg_return_pct"), 0.0))
-    excess_tail_probability = max(tail_prob - baseline_tail_prob, 0.0)
-    if excess_tail_probability <= 0 or tail_avg_loss <= 0:
-        return expected
-    return float(
-        expected
-        - excess_tail_probability
-        * tail_avg_loss
-        * TAIL_LOSS_EXPECTED_RETURN_PENALTY_MULTIPLIER
-    )
-
-
-def _calibrated_expected_scores(
-    win_scores: np.ndarray,
-    raw_expected_scores: np.ndarray,
-    calibration: dict[str, Any] | None,
-    *,
-    tail_loss_scores: np.ndarray | None = None,
+def _risk_adjusted_expected_scores(
+    distribution: dict[str, np.ndarray],
+    tail_loss_scores: np.ndarray,
 ) -> np.ndarray:
-    return np.array(
+    return np.asarray(
         [
-            _expected_return_from_win_probability(
-                float(score),
-                calibration,
-                fallback=float(raw_expected_scores[index]),
-                tail_loss_probability=(
-                    None if tail_loss_scores is None else float(tail_loss_scores[index])
-                ),
-            )
-            for index, score in enumerate(win_scores)
+            risk_adjusted_expected_return(
+                expected_return_pct=float(distribution["expected"][index]),
+                lower_quantile_return_pct=float(distribution["lower_quantile"][index]),
+                tail_loss_probability=float(tail_loss_scores[index]),
+                tail_loss_scale_pct=TAIL_LOSS_THRESHOLD_PCT,
+            )["objective_net_return_pct"]
+            for index in range(len(distribution["expected"]))
         ],
         dtype=float,
     )
 
 
-def _profit_quality_score(expected_return_pct: float, win_rate: float, edge_pct: float) -> float:
-    """Score signal quality by expected PnL first, using win rate only as a sanity check."""
-    expected_component = max(expected_return_pct, 0.0)
+def _profit_quality_score(
+    objective_return_pct: float,
+    lower_quantile_return_pct: float,
+    edge_pct: float,
+    tail_loss_probability: float,
+) -> float:
+    """Score fee-after return quality without win-rate input."""
+
+    expected_component = max(objective_return_pct, 0.0)
+    lower_bound_component = max(lower_quantile_return_pct, 0.0) * 0.35
     edge_component = max(edge_pct, 0.0) * 0.5
-    win_penalty = max(0.45 - win_rate, 0.0) * 0.05
-    return expected_component + edge_component - win_penalty
+    tail_penalty = _clamp(tail_loss_probability) * TAIL_LOSS_THRESHOLD_PCT * 0.25
+    return expected_component + lower_bound_component + edge_component - tail_penalty
 
 
 def _net_return_pct(raw_return_pct: float) -> float:
@@ -520,13 +474,12 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     metrics = _safe_dict(metadata.get("metrics"))
     sample_count = int(metadata.get("sample_count") or 0)
     test_count = int(metadata.get("test_count") or 0)
-    auc = _safe_float(metrics.get(f"{side}_auc"), 0.0)
-    pr_auc = _safe_float(metrics.get(f"{side}_pr_auc"), None)
-    accuracy = _safe_float(metrics.get(f"{side}_accuracy"), 0.0)
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0)
     bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), 0.0)
-    top_win = _safe_float(metrics.get(f"top_{side}_win_rate"), 0.0)
-    bottom_win = _safe_float(metrics.get(f"bottom_{side}_win_rate"), 0.0)
+    top_return_lcb = _safe_float(metrics.get(f"top_{side}_return_lcb_pct"), None)
+    top_profit_factor = _safe_float(metrics.get(f"top_{side}_profit_factor"), None)
+    top_tail_loss = _safe_float(metrics.get(f"top_{side}_tail_loss_rate"), None)
+    bottom_tail_loss = _safe_float(metrics.get(f"bottom_{side}_tail_loss_rate"), None)
 
     hard_reasons: list[str] = []
     maturity_reasons: list[str] = []
@@ -534,14 +487,12 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         maturity_reasons.append(f"样本数 {sample_count} < {ML_INFLUENCE_MIN_SAMPLE_COUNT}")
     if test_count < ML_INFLUENCE_MIN_TEST_COUNT:
         maturity_reasons.append(f"测试样本 {test_count} < {ML_INFLUENCE_MIN_TEST_COUNT}")
-    if auc < ML_INFLUENCE_MIN_AUC:
-        hard_reasons.append(f"AUC {auc:.3f} < {ML_INFLUENCE_MIN_AUC:.2f}")
-    if pr_auc is None:
-        hard_reasons.append("PR-AUC missing")
-    elif pr_auc < ML_INFLUENCE_MIN_PR_AUC:
-        hard_reasons.append(f"PR-AUC {pr_auc:.3f} < {ML_INFLUENCE_MIN_PR_AUC:.2f}")
-    if accuracy < ML_INFLUENCE_MIN_ACCURACY:
-        hard_reasons.append(f"准确率 {accuracy:.3f} < {ML_INFLUENCE_MIN_ACCURACY:.2f}")
+    if (
+        metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
+        or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
+        or metadata.get("label_version") != RETURN_LABEL_VERSION
+    ):
+        hard_reasons.append("artifact objective/label version is not fee-after-return v1")
     if top_return <= ML_INFLUENCE_MIN_TOP_RETURN_PCT:
         hard_reasons.append(
             f"高分组平均收益 {top_return:.3f}% <= {ML_INFLUENCE_MIN_TOP_RETURN_PCT:.2f}%"
@@ -550,8 +501,16 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         hard_reasons.append(
             f"高分组平均收益 {top_return:.3f}% 未优于低分组 {bottom_return:.3f}%"
         )
-    if top_win <= bottom_win:
-        hard_reasons.append(f"高分组胜率 {top_win:.3f} 未优于低分组 {bottom_win:.3f}")
+    if top_return_lcb is None or top_return_lcb <= 0:
+        hard_reasons.append("高分组费后收益置信下界未大于 0")
+    if top_profit_factor is None or top_profit_factor <= 1.0:
+        hard_reasons.append("高分组 Profit Factor 未大于 1")
+    if (
+        top_tail_loss is None
+        or bottom_tail_loss is None
+        or top_tail_loss > bottom_tail_loss
+    ):
+        hard_reasons.append("高分组尾部损失率缺失或劣于低分组")
 
     reliable = not hard_reasons and not maturity_reasons
     advisory = not hard_reasons and sample_count >= MIN_TRAINING_SAMPLES and test_count >= 40
@@ -564,13 +523,23 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         "influence_weight": round(influence_weight, 4),
         "status": status,
         "side": side,
-        "auc": round(auc, 4),
-        "pr_auc": None if pr_auc is None else round(pr_auc, 4),
-        "accuracy": round(accuracy, 4),
         "top_avg_return_pct": round(top_return, 4),
         "bottom_avg_return_pct": round(bottom_return, 4),
-        "top_win_rate": round(top_win, 4),
-        "bottom_win_rate": round(bottom_win, 4),
+        "top_return_lcb_pct": None if top_return_lcb is None else round(top_return_lcb, 4),
+        "top_profit_factor": (
+            None if top_profit_factor is None else round(top_profit_factor, 4)
+        ),
+        "top_tail_loss_rate": None if top_tail_loss is None else round(top_tail_loss, 4),
+        "bottom_tail_loss_rate": (
+            None if bottom_tail_loss is None else round(bottom_tail_loss, 4)
+        ),
+        "diagnostics": {
+            "auc": _safe_float(metrics.get(f"{side}_auc"), None),
+            "pr_auc": _safe_float(metrics.get(f"{side}_pr_auc"), None),
+            "accuracy": _safe_float(metrics.get(f"{side}_accuracy"), None),
+            "top_win_rate": _safe_float(metrics.get(f"top_{side}_win_rate"), None),
+            "bottom_win_rate": _safe_float(metrics.get(f"bottom_{side}_win_rate"), None),
+        },
         "reasons": reasons,
     }
 
@@ -600,8 +569,8 @@ def _influence_policy(metadata: dict[str, Any]) -> dict[str, Any]:
         "short": short_status,
         "disabled_reason": "；".join(disabled_reasons) if disabled_reasons else "",
         "rule": (
-            "ML 指标完全达标时按完整权重参与；样本成熟度不足但 AUC/收益分层有效时，"
-            "只按小权重参与 expected_net 和证据解释，不作为硬否决；硬指标不达标时继续学习观察。"
+            "只有费后收益、收益置信下界、Profit Factor、尾部损失、样本成熟度和数据质量"
+            "可以控制生产影响；胜率、AUC、PR-AUC 和 Accuracy 仅作诊断。"
         ),
     }
 
@@ -961,8 +930,8 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "short_return_pct": short_return,
                 "long_tail_loss": int(long_return < -TAIL_LOSS_THRESHOLD_PCT),
                 "short_tail_loss": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
-                "long_win": int(long_return > WIN_RETURN_THRESHOLD_PCT),
-                "short_win": int(short_return > WIN_RETURN_THRESHOLD_PCT),
+                "long_win": int(long_return > POSITIVE_NET_RETURN_THRESHOLD_PCT),
+                "short_win": int(short_return > POSITIVE_NET_RETURN_THRESHOLD_PCT),
                 "sample_weight": assessment.weight,
                 "data_quality_status": assessment.status,
                 "data_quality_score": assessment.score,
@@ -1055,26 +1024,37 @@ def train_from_frame(
     short_scores = _positive_proba(short_classifier, x_test)
     long_tail_scores = _positive_proba(long_tail_classifier, x_test)
     short_tail_scores = _positive_proba(short_tail_classifier, x_test)
-    raw_long_expected_scores = long_regressor.predict(x_test)
-    raw_short_expected_scores = short_regressor.predict(x_test)
-    expected_return_calibration = {
-        "long": _side_return_calibration(train, "long"),
-        "short": _side_return_calibration(train, "short"),
-    }
-    long_expected_scores = _calibrated_expected_scores(
-        long_scores,
-        raw_long_expected_scores,
-        _safe_dict(expected_return_calibration.get("long")),
-        tail_loss_scores=long_tail_scores,
+    long_distribution = _regression_prediction_distribution(long_regressor, x_test)
+    short_distribution = _regression_prediction_distribution(short_regressor, x_test)
+    long_expected_scores = _risk_adjusted_expected_scores(
+        long_distribution,
+        long_tail_scores,
     )
-    short_expected_scores = _calibrated_expected_scores(
-        short_scores,
-        raw_short_expected_scores,
-        _safe_dict(expected_return_calibration.get("short")),
-        tail_loss_scores=short_tail_scores,
+    short_expected_scores = _risk_adjusted_expected_scores(
+        short_distribution,
+        short_tail_scores,
     )
     long_pred = (long_scores >= 0.50).astype(int)
     short_pred = (short_scores >= 0.50).astype(int)
+
+    return_buckets = {
+        "long": {
+            "top": _bucket_return_summary(
+                test["long_return_pct"], long_expected_scores, top=True
+            ),
+            "bottom": _bucket_return_summary(
+                test["long_return_pct"], long_expected_scores, top=False
+            ),
+        },
+        "short": {
+            "top": _bucket_return_summary(
+                test["short_return_pct"], short_expected_scores, top=True
+            ),
+            "bottom": _bucket_return_summary(
+                test["short_return_pct"], short_expected_scores, top=False
+            ),
+        },
+    }
 
     now = datetime.now(UTC).isoformat()
     completed_count = int(completed_sample_count or len(frame))
@@ -1101,7 +1081,10 @@ def train_from_frame(
         "training_shadow_sample_count": int(len(frame)),
         "training_window_composition": _training_window_composition(frame),
         "quality_report": frame_quality_report,
-        "governance_report": governance_report(frame_quality_report),
+        "governance_report": artifact_bound_governance_report(
+            frame_quality_report,
+            persist_artifact=persist_artifact,
+        ),
         "training_shadow_sample_limit": TRAINING_SHADOW_SAMPLE_LIMIT,
         "training_sample_note": "sample_count is the latest training window, not the all-time total.",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
@@ -1109,15 +1092,24 @@ def train_from_frame(
         "test_count": int(len(test)),
         "feature_count": len(FEATURE_KEYS),
         "horizons": sorted(int(v) for v in frame["horizon_minutes"].dropna().unique().tolist()),
-        "win_return_threshold_pct": WIN_RETURN_THRESHOLD_PCT,
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "cost_model_version": COST_MODEL_VERSION,
+        "positive_net_return_threshold_pct": POSITIVE_NET_RETURN_THRESHOLD_PCT,
+        "win_return_threshold_pct": POSITIVE_NET_RETURN_THRESHOLD_PCT,
         "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
-        "expected_return_calibration": expected_return_calibration,
+        "prediction_distribution": {
+            "lower_quantile": PREDICTION_LOWER_QUANTILE,
+            "uncertainty_source": "random_forest_tree_prediction_distribution",
+            "tail_risk_source": "tail_loss_classifier_diagnostic_risk_penalty",
+        },
         "training_objective": (
-            "Predict executable net return after round-trip fee/slippage cost. "
-            "Expected return is calibrated from classifier win probability and "
-            "the training window's empirical win/non-win payoff; tail-loss samples "
-            "are tracked for risk."
+            "Directly regress executable fee-after net return by side. Rank with the "
+            "conditional expected return minus model-disagreement and tail-loss "
+            "penalties. Classification metrics are diagnostics only."
         ),
         "metrics": {
             "long_auc": _safe_auc(test["long_win"], long_scores),
@@ -1130,34 +1122,26 @@ def train_from_frame(
             "short_accuracy": (
                 float(accuracy_score(test["short_win"], short_pred)) if len(test) else None
             ),
-            "top_long_avg_return_pct": _bucket_return(
-                test["long_return_pct"], long_expected_scores, top=True
-            ),
-            "bottom_long_avg_return_pct": _bucket_return(
-                test["long_return_pct"], long_expected_scores, top=False
-            ),
+            "top_long_avg_return_pct": return_buckets["long"]["top"]["avg_return_pct"],
+            "bottom_long_avg_return_pct": return_buckets["long"]["bottom"]["avg_return_pct"],
+            "top_long_median_return_pct": return_buckets["long"]["top"]["median_return_pct"],
+            "top_long_return_lcb_pct": return_buckets["long"]["top"]["return_lcb_pct"],
+            "top_long_profit_factor": return_buckets["long"]["top"]["profit_factor"],
+            "top_long_cvar_10_pct": return_buckets["long"]["top"]["cvar_10_pct"],
             "top_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=True),
             "bottom_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=False),
-            "top_long_tail_loss_rate": _bucket_win_rate(
-                test["long_tail_loss"], long_expected_scores, top=True
-            ),
-            "bottom_long_tail_loss_rate": _bucket_win_rate(
-                test["long_tail_loss"], long_expected_scores, top=False
-            ),
-            "top_short_avg_return_pct": _bucket_return(
-                test["short_return_pct"], short_expected_scores, top=True
-            ),
-            "bottom_short_avg_return_pct": _bucket_return(
-                test["short_return_pct"], short_expected_scores, top=False
-            ),
+            "top_long_tail_loss_rate": return_buckets["long"]["top"]["tail_loss_rate"],
+            "bottom_long_tail_loss_rate": return_buckets["long"]["bottom"]["tail_loss_rate"],
+            "top_short_avg_return_pct": return_buckets["short"]["top"]["avg_return_pct"],
+            "bottom_short_avg_return_pct": return_buckets["short"]["bottom"]["avg_return_pct"],
+            "top_short_median_return_pct": return_buckets["short"]["top"]["median_return_pct"],
+            "top_short_return_lcb_pct": return_buckets["short"]["top"]["return_lcb_pct"],
+            "top_short_profit_factor": return_buckets["short"]["top"]["profit_factor"],
+            "top_short_cvar_10_pct": return_buckets["short"]["top"]["cvar_10_pct"],
             "top_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=True),
             "bottom_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=False),
-            "top_short_tail_loss_rate": _bucket_win_rate(
-                test["short_tail_loss"], short_expected_scores, top=True
-            ),
-            "bottom_short_tail_loss_rate": _bucket_win_rate(
-                test["short_tail_loss"], short_expected_scores, top=False
-            ),
+            "top_short_tail_loss_rate": return_buckets["short"]["top"]["tail_loss_rate"],
+            "bottom_short_tail_loss_rate": return_buckets["short"]["bottom"]["tail_loss_rate"],
         },
         "score_bucket_diagnostics": _score_bucket_diagnostics(
             test,
@@ -1178,7 +1162,7 @@ def train_from_frame(
         },
         "training_run_mode": "persist" if persist_artifact else "dry_run",
         "artifact_persisted": bool(persist_artifact),
-        "note": "本地 ML 以预期盈亏和收益质量为主，胜率仅作为辅助过滤；用于开仓门槛/否决，不直接决定交易方向。",
+        "note": "本地 ML 直接优化费后预期收益及左尾风险；胜率仅作为诊断，不参与开仓、评分、权重或晋升。",
     }
 
     bundle = {
@@ -1192,8 +1176,8 @@ def train_from_frame(
         "feature_keys": FEATURE_KEYS,
     }
     if persist_artifact:
-        if MODEL_PATH != MODEL_DIR / "winrate_model.joblib" or METADATA_PATH != (
-            MODEL_DIR / "winrate_model_metadata.json"
+        if MODEL_PATH != MODEL_DIR / "net_return_model.joblib" or METADATA_PATH != (
+            MODEL_DIR / "net_return_model_metadata.json"
         ):
             dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
             METADATA_PATH.write_text(
@@ -1714,16 +1698,21 @@ class MLSignalService:
         )
 
         predictions = []
-        expected_return_calibration = _safe_dict(metadata.get("expected_return_calibration"))
         for horizon in horizons:
             row = _feature_row_from_feature_vector(features, horizon_minutes=horizon)
             x = pd.DataFrame([row], columns=FEATURE_KEYS)
             long_win_rate = float(_positive_proba(self._bundle["long_classifier"], x)[0])
             short_win_rate = float(_positive_proba(self._bundle["short_classifier"], x)[0])
-            raw_long_expected = float(self._bundle["long_regressor"].predict(x)[0])
-            raw_short_expected = float(self._bundle["short_regressor"].predict(x)[0])
-            long_calibration = _safe_dict(expected_return_calibration.get("long"))
-            short_calibration = _safe_dict(expected_return_calibration.get("short"))
+            long_distribution = _regression_prediction_distribution(
+                self._bundle["long_regressor"], x
+            )
+            short_distribution = _regression_prediction_distribution(
+                self._bundle["short_regressor"], x
+            )
+            raw_long_expected = float(long_distribution["expected"][0])
+            raw_short_expected = float(short_distribution["expected"][0])
+            long_lower_quantile = float(long_distribution["lower_quantile"][0])
+            short_lower_quantile = float(short_distribution["lower_quantile"][0])
             long_tail_model = self._bundle.get("long_tail_classifier")
             short_tail_model = self._bundle.get("short_tail_classifier")
             long_tail_loss_probability = (
@@ -1731,7 +1720,7 @@ class MLSignalService:
                     _optional_positive_proba(
                         long_tail_model,
                         x,
-                        default=_safe_float(long_calibration.get("tail_loss_rate"), 0.0),
+                        default=0.0,
                     )[0]
                 )
                 if long_tail_model is not None
@@ -1742,24 +1731,26 @@ class MLSignalService:
                     _optional_positive_proba(
                         short_tail_model,
                         x,
-                        default=_safe_float(short_calibration.get("tail_loss_rate"), 0.0),
+                        default=0.0,
                     )[0]
                 )
                 if short_tail_model is not None
                 else None
             )
-            long_expected = _expected_return_from_win_probability(
-                long_win_rate,
-                long_calibration,
-                fallback=raw_long_expected,
+            long_objective = risk_adjusted_expected_return(
+                expected_return_pct=raw_long_expected,
+                lower_quantile_return_pct=long_lower_quantile,
                 tail_loss_probability=long_tail_loss_probability,
+                tail_loss_scale_pct=TAIL_LOSS_THRESHOLD_PCT,
             )
-            short_expected = _expected_return_from_win_probability(
-                short_win_rate,
-                short_calibration,
-                fallback=raw_short_expected,
+            short_objective = risk_adjusted_expected_return(
+                expected_return_pct=raw_short_expected,
+                lower_quantile_return_pct=short_lower_quantile,
                 tail_loss_probability=short_tail_loss_probability,
+                tail_loss_scale_pct=TAIL_LOSS_THRESHOLD_PCT,
             )
+            long_expected = long_objective["objective_net_return_pct"]
+            short_expected = short_objective["objective_net_return_pct"]
             best_side = "long" if long_expected >= short_expected else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
             best_expected = long_expected if best_side == "long" else short_expected
@@ -1768,19 +1759,22 @@ class MLSignalService:
                 if best_side == "long"
                 else short_tail_loss_probability
             )
-            best_tail_loss_baseline = _safe_float(
-                (long_calibration if best_side == "long" else short_calibration).get(
-                    "tail_loss_rate"
-                ),
-                0.0,
+            best_lower_quantile = (
+                long_lower_quantile if best_side == "long" else short_lower_quantile
             )
             profit_edge = abs(long_expected - short_expected)
-            profit_quality = _profit_quality_score(best_expected, best_win, profit_edge)
+            profit_quality = _profit_quality_score(
+                best_expected,
+                best_lower_quantile,
+                profit_edge,
+                float(best_tail_loss_probability or 0.0),
+            )
             side_influence = _safe_dict(influence.get(best_side))
             risk_score = _clamp(
-                max(-best_expected, 0.0) / max(WIN_RETURN_THRESHOLD_PCT, 1e-9)
-                + max(MIN_PROFIT_SIGNAL_WIN_RATE - best_win, 0.0)
-                + max((best_tail_loss_probability or 0.0) - best_tail_loss_baseline, 0.0)
+                max(-best_expected, 0.0) / max(POSITIVE_NET_RETURN_THRESHOLD_PCT, 1e-9)
+                + max(-best_lower_quantile, 0.0)
+                / max(POSITIVE_NET_RETURN_THRESHOLD_PCT, 1e-9)
+                + float(best_tail_loss_probability or 0.0)
             )
             predictions.append(
                 {
@@ -1798,6 +1792,22 @@ class MLSignalService:
                         else round(short_tail_loss_probability, 4)
                     ),
                     "tail_loss_threshold_pct": round(float(TAIL_LOSS_THRESHOLD_PCT), 4),
+                    "long_raw_expected_return_pct": round(raw_long_expected, 4),
+                    "short_raw_expected_return_pct": round(raw_short_expected, 4),
+                    "long_lower_quantile_return_pct": round(long_lower_quantile, 4),
+                    "short_lower_quantile_return_pct": round(short_lower_quantile, 4),
+                    "long_uncertainty_penalty_pct": round(
+                        long_objective["uncertainty_penalty_pct"], 4
+                    ),
+                    "short_uncertainty_penalty_pct": round(
+                        short_objective["uncertainty_penalty_pct"], 4
+                    ),
+                    "long_tail_loss_penalty_pct": round(
+                        long_objective["tail_loss_penalty_pct"], 4
+                    ),
+                    "short_tail_loss_penalty_pct": round(
+                        short_objective["tail_loss_penalty_pct"], 4
+                    ),
                     "long_expected_return_pct": round(long_expected, 4),
                     "short_expected_return_pct": round(short_expected, 4),
                     "best_side": best_side,
@@ -1813,9 +1823,8 @@ class MLSignalService:
                     "profit_signal": bool(
                         allow_live_position_influence
                         and side_influence.get("enabled")
-                        and best_expected > WIN_RETURN_THRESHOLD_PCT
+                        and best_expected > POSITIVE_NET_RETURN_THRESHOLD_PCT
                         and profit_edge >= MIN_PROFIT_EDGE_PCT
-                        and best_win >= MIN_PROFIT_SIGNAL_WIN_RATE
                     ),
                     "risk_score": round(risk_score, 4),
                     "ml_influence_enabled": bool(
@@ -1915,6 +1924,15 @@ class MLSignalService:
                 trusted_root=trusted_root,
                 expected_type=dict,
             )
+            metadata = _safe_dict(self._bundle.get("metadata"))
+            if (
+                metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
+                or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
+                or metadata.get("label_version") != RETURN_LABEL_VERSION
+            ):
+                raise ValueError(
+                    "refusing local ML artifact with legacy or unknown return objective"
+                )
             self._loaded_mtime = mtime
         except Exception as exc:
             logger.warning(
@@ -2021,24 +2039,27 @@ class MLSignalService:
             if influence.get("advisory_enabled"):
                 return "ML 样本成熟度不足但排序有效，当前仅按小权重辅助收益解释。"
             return "ML 当前评估未达标，自动降级为学习观察；继续训练，暂不介入交易决策。"
-        win = float(primary.get("best_win_rate") or 0.0)
         expected = float(primary.get("best_expected_return_pct") or 0.0)
         edge = float(primary.get("profit_edge_pct") or 0.0)
+        lower_quantile = float(
+            primary.get(f"{primary.get('best_side')}_lower_quantile_return_pct") or 0.0
+        )
+        tail_probability = float(primary.get("best_tail_loss_probability") or 0.0)
         side = "做多" if primary.get("best_side") == "long" else "做空"
         if (
-            expected > WIN_RETURN_THRESHOLD_PCT
+            expected > POSITIVE_NET_RETURN_THRESHOLD_PCT
             and edge >= MIN_PROFIT_EDGE_PCT
-            and win >= MIN_PROFIT_SIGNAL_WIN_RATE
+            and lower_quantile > 0
         ):
-            return f"ML 盈亏期望支持{side}，胜率仅作辅助；可作为开仓质量加分。"
+            return f"ML 费后收益分布支持{side}，可作为开仓收益质量证据。"
         if expected <= 0:
-            return "ML 预期盈亏为负，后续可用于提高入场门槛。"
-        if win >= 0.62 and expected <= WIN_RETURN_THRESHOLD_PCT:
-            return "ML 胜率不低但预期收益不足，不应仅因胜率高而加分。"
+            return "ML 风险调整后的费后预期收益为负，应阻止该方向获得模型加分。"
+        if lower_quantile <= 0:
+            return "ML 平均费后收益为正但置信下界未转正，继续 shadow 验证。"
+        if tail_probability >= 0.50:
+            return "ML 费后收益为正但左尾风险偏高，不能晋升或放大风险。"
         if edge < MIN_PROFIT_EDGE_PCT:
             return "ML 多空预期收益差距不明显，信号中性。"
-        if win < MIN_PROFIT_SIGNAL_WIN_RATE:
-            return "ML 预期收益尚可但胜率过低，需更强单币种确认。"
         return "ML 盈亏质量信号中性，暂不改变 AI 决策。"
 
 

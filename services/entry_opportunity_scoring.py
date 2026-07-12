@@ -455,13 +455,17 @@ class EntryOpportunityScoringPolicy:
             -ML_EXPECTED_RETURN_SCORE_CAP_PCT,
         )
         edge_pct = expected_pct - opposite_expected_pct
-        win_rate = self._safe_float(primary.get(f"{side}_win_rate"), 0.50)
+        lower_quantile_pct = self._safe_float(
+            primary.get(f"{side}_lower_quantile_return_pct"),
+            raw_expected_pct,
+        )
+        diagnostic_win_rate = self._safe_float(primary.get(f"{side}_win_rate"), 0.50)
         ml_quality = self._safe_float(primary.get("profit_quality_score"), 0.0)
         if not side_influence_enabled:
             expected_pct = 0.0
             opposite_expected_pct = 0.0
             edge_pct = 0.0
-            win_rate = 0.50
+            lower_quantile_pct = 0.0
             ml_quality = 0.0
 
         confidence = max(min(float(decision.confidence or 0.0), 1.0), 0.0)
@@ -1063,10 +1067,13 @@ class EntryOpportunityScoringPolicy:
             max(local_loss_probability - 0.50, 0.0) * stop_loss_pct * 100 * 2.0,
             fee_pct + slippage_pct,
         )
-        success_probability = min(
+        expected_return_confidence = min(
             max(
-                win_rate * 0.45
-                + confidence * 0.30
+                max(expected_pct, 0.0) / max(ML_EXPECTED_RETURN_SCORE_CAP_PCT, 1e-9) * 0.20
+                + max(lower_quantile_pct, 0.0)
+                / max(ML_EXPECTED_RETURN_SCORE_CAP_PCT, 1e-9)
+                * 0.30
+                + confidence * 0.25
                 + (1.0 - min(max(local_loss_probability, 0.0), 1.0)) * 0.20
                 + (0.05 if local_aligned or ts_aligned else 0.0),
                 0.0,
@@ -1188,7 +1195,7 @@ class EntryOpportunityScoringPolicy:
         score = (
             expected_net_return_pct * 2.35
             + profit_quality_ratio * 1.20
-            + success_probability * 0.25
+            + expected_return_confidence * 0.25
             + edge_pct * 0.25
             + local_quality * 0.18
             + confidence * 0.10
@@ -1228,7 +1235,7 @@ class EntryOpportunityScoringPolicy:
             "raw_opposite_expected_return_pct": round(raw_opposite_expected_pct, 6),
             "ml_expected_return_score_cap_pct": ML_EXPECTED_RETURN_SCORE_CAP_PCT,
             "profit_edge_pct": round(edge_pct, 6),
-            "win_rate": round(win_rate, 6),
+            "diagnostic_win_rate": round(diagnostic_win_rate, 6),
             "ml_profit_quality_score": round(ml_quality, 6),
             "server_profit_expected_return_pct": round(local_expected, 6),
             "server_profit_best_side": local_best_side,
@@ -1268,7 +1275,11 @@ class EntryOpportunityScoringPolicy:
             "abnormal_wick_count_72h": int(abnormal_wick_count),
             "abnormal_wick_max_pct": round(abnormal_wick_max_pct, 6),
             "abnormal_wick_recent_hours": round(abnormal_wick_recent_hours, 6),
-            "success_probability": round(success_probability, 6),
+            "expected_return_confidence": round(expected_return_confidence, 6),
+            "success_probability": round(expected_return_confidence, 6),
+            "deprecated_fields": {
+                "success_probability": "alias of expected_return_confidence; not a win-rate input"
+            },
             "profit_quality_ratio": round(profit_quality_ratio, 6),
             "min_profit_quality_ratio_required": round(min_profit_quality_ratio_required, 6),
             "strong_aligned_profit_evidence": bool(strong_aligned_profit_evidence),

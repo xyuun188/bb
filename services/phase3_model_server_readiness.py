@@ -85,6 +85,11 @@ LLM_SPECIALIZATION_KEYS = (
     "specialization_id",
     "fine_tune_id",
     "training_artifact",
+    "objective_name",
+    "objective_version",
+    "preference_contract_version",
+    "preference_selection_accuracy",
+    "training_stages",
 )
 
 MODEL_RUNTIME_PORTS = tuple(range(8000, 8011))
@@ -256,6 +261,19 @@ def _finquant_specialization_evidence_verified(evidence: dict[str, str]) -> bool
         return False
     if evidence.get("legacy_read_only", "").lower() == "true":
         return False
+    if evidence.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
+        return False
+    if evidence.get("objective_version") != "2026-07-12.v1":
+        return False
+    if evidence.get("preference_contract_version") != "bb_finquant_return_preference.v1":
+        return False
+    if "trl_dpo_return_preference" not in evidence.get("training_stages", ""):
+        return False
+    try:
+        if float(evidence.get("preference_selection_accuracy") or 0.0) < 0.5:
+            return False
+    except (TypeError, ValueError):
+        return False
     required_text = (
         "adapter_version",
         "adapter_path",
@@ -265,6 +283,11 @@ def _finquant_specialization_evidence_verified(evidence: dict[str, str]) -> bool
         "source_code_version",
         "base_model_repo",
         "trained_at",
+        "objective_name",
+        "objective_version",
+        "preference_contract_version",
+        "preference_selection_accuracy",
+        "training_stages",
     )
     if any(not evidence.get(key) for key in required_text):
         return False

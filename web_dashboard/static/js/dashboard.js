@@ -2171,7 +2171,7 @@ function opportunityScoreBlock(score, decision = null) {
     const formulaHtml = opportunityScoreFormulaHtml(score);
     const confidence = Number(decision?.confidence ?? score.confidence);
     const feeAndSlippage = Number(score.fee_pct || 0) + Number(score.slippage_pct || 0);
-    const winRate = Number(score.win_rate || 0) * 100;
+    const winRate = Number(score.diagnostic_win_rate || 0) * 100;
     return `
         <div class="reason-block decision-score-block">
             <div class="reason-label">盈利机会评分</div>
@@ -2186,7 +2186,7 @@ function opportunityScoreBlock(score, decision = null) {
                 ${decisionMetricItem('分析信心', evidencePercentLabel(confidence), 'AI/专家最终置信度，不等于动态证据分')}
                 ${decisionMetricItem(primaryReturn.label, `${opportunityScoreValue(primaryReturn.value, 4)}%`, returnDetail || '综合收益估计', Number(primaryReturn.value) >= 0 ? 'good' : 'bad')}
                 ${decisionMetricItem('相对反向优势', `${opportunityScoreValue(score.profit_edge_pct, 4)}%`)}
-                ${decisionMetricItem('ML 胜率', `${opportunityScoreValue(winRate, 1)}%`)}
+                ${decisionMetricItem('ML 胜率（诊断）', `${opportunityScoreValue(winRate, 1)}%`, '不参与评分、放行、仓位或杠杆')}
                 ${decisionMetricItem('仓位 x 杠杆', opportunityScoreValue(score.size_x_leverage, 4))}
                 ${decisionMetricItem('手续费+滑点', `${opportunityScoreValue(feeAndSlippage, 4)}%`)}
             </div>
@@ -2591,7 +2591,7 @@ function analysisOpportunityScoreHtml(score, record = null) {
         ['方向', actionLabel(score.side || '-')],
         [primaryReturn.label, `${opportunityScoreValue(primaryReturn.value, 4)}%`],
         ['反向优势', `${opportunityScoreValue(score.profit_edge_pct, 4)}%`],
-        ['ML胜率', `${opportunityScoreValue(Number(score.win_rate || 0) * 100, 1)}%`],
+        ['ML胜率（诊断）', `${opportunityScoreValue(Number(score.diagnostic_win_rate || 0) * 100, 1)}%`],
         ['执行状态', executionState.label],
     ].map(([label, value]) => `
         <div class="analysis-opportunity-metric">
@@ -4353,10 +4353,10 @@ function renderMLSignalMetrics() {
 
     container.innerHTML = `
         <div class="ml-metrics-grid">
-            ${mlMetricCard('做多 AUC', Number(metrics.long_auc || 0).toFixed(3), '越接近 1 越能区分好坏机会', mlMetricTone(metrics.long_auc))}
-            ${mlMetricCard('做空 AUC', Number(metrics.short_auc || 0).toFixed(3), '当前做空信号略强于做多', mlMetricTone(metrics.short_auc))}
-            ${mlMetricCard('做多准确率', pctLabel(metrics.long_accuracy, 1), '测试集表现', mlMetricTone(metrics.long_accuracy))}
-            ${mlMetricCard('做空准确率', pctLabel(metrics.short_accuracy, 1), '测试集表现', mlMetricTone(metrics.short_accuracy))}
+            ${mlMetricCard('做多费后收益下界', signedPctValueLabel(metrics.top_long_return_lcb_pct), '置信下界必须大于 0 才能进入 ready', Number(metrics.top_long_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
+            ${mlMetricCard('做空费后收益下界', signedPctValueLabel(metrics.top_short_return_lcb_pct), '置信下界必须大于 0 才能进入 ready', Number(metrics.top_short_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
+            ${mlMetricCard('做多 Profit Factor', Number(metrics.top_long_profit_factor || 0).toFixed(2), '必须大于 1，且结合回撤和尾部损失验收', Number(metrics.top_long_profit_factor || 0) > 1 ? 'good' : 'warn')}
+            ${mlMetricCard('做空 Profit Factor', Number(metrics.top_short_profit_factor || 0).toFixed(2), '必须大于 1，且结合回撤和尾部损失验收', Number(metrics.top_short_profit_factor || 0) > 1 ? 'good' : 'warn')}
         </div>
         <div class="ml-panel">
             <div class="ml-panel-title">分层收益质量</div>
@@ -4366,6 +4366,12 @@ function renderMLSignalMetrics() {
             ${mlWinBar('做多低分组胜率', metrics.bottom_long_win_rate, 'muted')}
             ${mlWinBar('做空高分组胜率', metrics.top_short_win_rate, mlSignalToneByRate(metrics.top_short_win_rate))}
             ${mlWinBar('做空低分组胜率', metrics.bottom_short_win_rate, 'muted')}
+            <div class="ml-metrics-grid">
+                ${mlMetricCard('做多 AUC（诊断）', Number(metrics.long_auc || 0).toFixed(3), '仅用于观察分类器，不影响 ready 或生产权重', 'muted')}
+                ${mlMetricCard('做空 AUC（诊断）', Number(metrics.short_auc || 0).toFixed(3), '仅用于观察分类器，不影响 ready 或生产权重', 'muted')}
+                ${mlMetricCard('做多准确率（诊断）', pctLabel(metrics.long_accuracy, 1), '不能代表收益能力', 'muted')}
+                ${mlMetricCard('做空准确率（诊断）', pctLabel(metrics.short_accuracy, 1), '不能代表收益能力', 'muted')}
+            </div>
         </div>
         `;
 }
@@ -9442,7 +9448,7 @@ function renderMLSignalOverview() {
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">3</div>
-                <div><strong>训练目标</strong><span>以预期收益和盈亏质量为主，胜率只做辅助指标</span></div>
+                <div><strong>训练目标</strong><span>直接最大化费后预期收益，并惩罚不确定性、尾部损失和成本；胜率只做诊断</span></div>
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">4</div>
@@ -9456,7 +9462,7 @@ function renderMLSignalOverview() {
             ${mlMetricCard('三期完成样本', String(samples.completedMl), '只统计三期干净影子复盘', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
             ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}
             ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, Number(readinessMetrics.dirty_sample_ratio || 0) > 0.08 ? 'bad' : 'good')}
-            ${mlMetricCard('PR-AUC 多/空', prAucText, '缺失时必须重训后才能进入 ready', (Number(readinessMetrics.long_pr_auc || 0) > 0 && Number(readinessMetrics.short_pr_auc || 0) > 0) ? 'good' : 'warn')}
+            ${mlMetricCard('PR-AUC 多/空（诊断）', prAucText, '仅观察分类器，不参与 ready、评分或晋升', 'muted')}
             ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
             ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近记录里预期收益为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}

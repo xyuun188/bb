@@ -1,6 +1,6 @@
 """
 Competition service — manages the multi-model competition in paper trading.
-Ranks models by profitability, Sharpe ratio, win rate, and selects the best.
+Ranks models by fee-after profitability and downside-adjusted return quality.
 """
 
 from __future__ import annotations
@@ -25,11 +25,8 @@ logger = structlog.get_logger(__name__)
 class CompetitionService:
     """Evaluates and ranks AI models based on paper trading performance.
 
-    Metrics (weighted composite score):
-    - Total PnL % (40%)
-    - Sharpe ratio (25%)
-    - Win rate (20%)
-    - Decision accuracy (15%)
+    Win rate and decision accuracy are reported as diagnostics only. They do
+    not affect model ranking or selection.
     """
 
     def __init__(self) -> None:
@@ -86,9 +83,31 @@ class CompetitionService:
                         trade_repo, model_name, account.initial_balance
                     )
 
-                    # Composite score
+                    closed_positions = await trade_repo.get_position_records(
+                        model_name=model_name,
+                        is_open=False,
+                        limit=500,
+                    )
+                    realized_values = [
+                        float(getattr(row, "realized_pnl", 0.0) or 0.0)
+                        for row in closed_positions
+                    ]
+                    gross_profit = sum(value for value in realized_values if value > 0)
+                    gross_loss = abs(sum(value for value in realized_values if value < 0))
+                    profit_factor = (
+                        gross_profit / gross_loss
+                        if gross_loss > 1e-12
+                        else (3.0 if gross_profit > 0 else 0.0)
+                    )
+                    profit_factor_edge = max(min((profit_factor - 1.0) / 2.0, 1.0), -1.0)
+
+                    # Fee-after return composite. Classification diagnostics
+                    # intentionally have zero ranking weight.
                     score = (
-                        pnl_pct * 0.40 + sharpe * 0.25 + win_rate * 0.20 + decision_accuracy * 0.15
+                        pnl_pct * 0.50
+                        + sharpe * 0.20
+                        + profit_factor_edge * 0.20
+                        - max_dd * 0.10
                     )
 
                     rankings.append(
@@ -98,9 +117,11 @@ class CompetitionService:
                             "pnl_pct": round(pnl_pct * 100, 2),
                             "sharpe_ratio": round(sharpe, 2),
                             "max_drawdown": round(max_dd * 100, 2),
+                            "profit_factor": round(profit_factor, 4),
                             "win_rate": round(win_rate * 100, 2),
                             "total_trades": total_trades,
                             "decision_accuracy": round(decision_accuracy * 100, 2),
+                            "ranking_objective": "fee_after_return_profit_factor_drawdown",
                             "composite_score": round(score, 4),
                         }
                     )

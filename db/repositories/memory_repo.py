@@ -118,13 +118,32 @@ class MemoryRepository(BaseRepository):
             existing.source_position_id = (
                 data.get("source_position_id") or existing.source_position_id
             )
-            existing.extra = data.get("extra") or existing.extra
+            existing.extra = _merge_memory_outcomes(existing.extra, data.get("extra"))
+            outcome = _memory_outcome_aggregation(existing.extra)
+            if outcome:
+                avg_return = float(outcome.get("avg_net_return_pct") or 0.0)
+                profit_factor = float(outcome.get("profit_factor") or 0.0)
+                if avg_return <= 0 or profit_factor < 1.0:
+                    existing.confidence_adjustment = min(
+                        float(existing.confidence_adjustment or 0.0),
+                        -0.05,
+                    )
+                    existing.position_size_multiplier = min(
+                        float(existing.position_size_multiplier or 1.0),
+                        0.75,
+                    )
+                    existing.recommended_action = "avoid_or_reduce"
+                    existing.lesson = (
+                        f"同方向聚合费后期望 {avg_return:.4f}%、Profit Factor "
+                        f"{profit_factor:.2f}，真实负收益证据优先，禁止沿用旧的无条件支持。"
+                    )
             if data.get("is_active") is False:
                 existing.is_active = False
             existing.updated_at = datetime.now(UTC)
             await self.session.flush()
             return existing
 
+        data["extra"] = _merge_memory_outcomes(None, data.get("extra"))
         memory = ExpertMemory(**data)
         self.session.add(memory)
         await self.session.flush()
@@ -144,6 +163,18 @@ class MemoryRepository(BaseRepository):
         self.session.add(reflection)
         await self.session.flush()
         return reflection
+
+    async def get_reflection_by_position_id(
+        self, position_id: int
+    ) -> TradeReflection | None:
+        if int(position_id or 0) <= 0:
+            return None
+        result = await self.session.execute(
+            select(TradeReflection)
+            .where(TradeReflection.position_id == int(position_id))
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def create_shadow_backtest(self, data: dict[str, Any]) -> ShadowBacktest:
         data = _normalize_shadow_backtest_payload(dict(data or {}))
@@ -345,6 +376,8 @@ def _normalize_reflection_payload(data: dict[str, Any]) -> dict[str, Any]:
     for key in ("mistake_summary", "improvement_summary", "expert_lessons"):
         if key in data:
             data[key] = sanitize_runtime_text(data.get(key))
+    if "source" in data:
+        data["source"] = str(sanitize_runtime_text(data.get("source")) or "")[:40]
     return data
 
 
@@ -359,6 +392,88 @@ def _memory_row_usable(row: ExpertMemory) -> bool:
     return _memory_text_usable(getattr(row, "lesson", None)) and _memory_text_usable(
         getattr(row, "market_pattern", None)
     )
+
+
+def _memory_outcome_aggregation(extra: Any) -> dict[str, Any]:
+    source = extra if isinstance(extra, dict) else {}
+    value = source.get("outcome_aggregation")
+    return value if isinstance(value, dict) else {}
+
+
+def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any]:
+    existing = dict(existing_extra) if isinstance(existing_extra, dict) else {}
+    incoming = dict(new_extra) if isinstance(new_extra, dict) else {}
+    previous = _memory_outcome_aggregation(existing)
+    if previous.get("return_unit") != "percentage_points":
+        previous = {}
+    realized_pnl = _finite_float(incoming.get("realized_pnl"), None)
+    net_return = _finite_float(incoming.get("net_return_after_cost_pct"), None)
+    if realized_pnl is None or net_return is None:
+        return {**existing, **incoming}
+
+    source_position_id = int(_finite_float(incoming.get("source_position_id"), 0.0) or 0)
+    source_position_ids = [
+        int(value)
+        for value in previous.get("source_position_ids", [])
+        if int(_finite_float(value, 0.0) or 0) > 0
+    ]
+    if source_position_id > 0 and source_position_id in source_position_ids:
+        return {**existing, **incoming, "outcome_aggregation": previous}
+
+    count = int(previous.get("count") or 0) + 1
+    total_pnl = float(previous.get("total_realized_net_pnl_usdt") or 0.0) + float(
+        realized_pnl or 0.0
+    )
+    total_return = float(previous.get("total_net_return_pct") or 0.0) + float(
+        net_return or 0.0
+    )
+    positive_count = int(previous.get("positive_count") or 0) + int(
+        (realized_pnl or 0.0) > 0
+    )
+    negative_count = int(previous.get("negative_count") or 0) + int(
+        (realized_pnl or 0.0) < 0
+    )
+    gross_profit = float(previous.get("gross_profit_usdt") or 0.0) + max(
+        float(realized_pnl or 0.0), 0.0
+    )
+    gross_loss = float(previous.get("gross_loss_usdt") or 0.0) + max(
+        -float(realized_pnl or 0.0), 0.0
+    )
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 1e-12
+        else (3.0 if gross_profit > 0 else 0.0)
+    )
+    aggregation = {
+        "objective": "maximize_expected_realized_net_return_after_cost",
+        "objective_version": "2026-07-12.v1",
+        "return_unit": "percentage_points",
+        "count": count,
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "conflict": positive_count > 0 and negative_count > 0,
+        "total_realized_net_pnl_usdt": round(total_pnl, 8),
+        "avg_realized_net_pnl_usdt": round(total_pnl / count, 8),
+        "total_net_return_pct": round(total_return, 8),
+        "avg_net_return_pct": round(total_return / count, 8),
+        "gross_profit_usdt": round(gross_profit, 8),
+        "gross_loss_usdt": round(gross_loss, 8),
+        "profit_factor": round(profit_factor, 8),
+        "latest_source_position_id": incoming.get("source_position_id"),
+        "source_position_ids": [
+            *source_position_ids,
+            *([source_position_id] if source_position_id > 0 else []),
+        ][-2000:],
+    }
+    return {**existing, **incoming, "outcome_aggregation": aggregation}
+
+
+def _finite_float(value: Any, default: float | None = 0.0) -> float | None:
+    try:
+        parsed = float(value)
+        return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _memory_text_usable(value: Any) -> bool:
