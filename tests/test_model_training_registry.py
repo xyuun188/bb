@@ -130,13 +130,13 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
             "generated_at": "2026-07-11T00:00:00+00:00",
             "models": [
                 {
-                    "model": "timesfm-2.5-primary",
+                    "model": "google/timesfm-2.5-200m-pytorch",
                     "actual_inference_count": 31,
                     "promotion_ready": False,
                     "promotion_blockers": ["tail_loss"],
                 },
                 {
-                    "model": "chronos-2-shadow-challenger",
+                    "model": "amazon/chronos-2",
                     "actual_inference_count": 31,
                     "promotion_ready": False,
                 },
@@ -149,9 +149,70 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
     assert rows["local_ml_profit_quality"]["trainable"] is True
     assert rows["local_ml_profit_quality"]["lifecycle"] == "promotion_blocked"
     assert rows["timesfm_2_5"]["trainable"] is False
-    assert rows["timesfm_2_5"]["lifecycle"] == "shadow_evaluating"
+    assert rows["timesfm_2_5"]["lifecycle"] == "inference_only"
+    assert rows["timesfm_2_5"]["training_mode"] == "inference_only"
+    assert rows["timesfm_2_5"]["evaluation_mode"] == "shadow_evaluating"
+    assert rows["timesfm_2_5"]["fine_tune_available"] is False
     assert rows["chronos_2"]["trainable"] is False
+    assert rows["chronos_2"]["model_family"] == "amazon/chronos-2"
     assert rows["finbert"]["lifecycle"] == "inference_only"
+    assert rows["finbert"]["model_family"] == "ProsusAI/finbert"
+    assert rows["finbert"]["model_family"] != "local-sentiment-trained-v2"
+
+
+def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() -> None:
+    payload = build_model_training_registry(
+        local_ml_status={},
+        local_tools_status={
+            "available": True,
+            "service_available": True,
+            "model_bundle_available": True,
+            "models": {
+                key: key
+                for key in (
+                    "profit",
+                    "loss_filter",
+                    "timeseries",
+                    "deep_timeseries",
+                    "deep_sentiment",
+                    "exit",
+                )
+            },
+            "transformers_sentiment_backend": {"available": False},
+        },
+        specialist_report={
+            "generated_at": "2026-07-11T23:37:16+00:00",
+            "models": [
+                {
+                    "model": "ProsusAI/finbert",
+                    "actual_inference_count": 24,
+                    "fallback_count": 1840,
+                    "promotion_ready": False,
+                    "promotion_blockers": ["specialist_shadow_sample_floor_not_met"],
+                },
+                {
+                    "model": "yiyanghkust/finbert-tone",
+                    "actual_inference_count": 24,
+                    "fallback_count": 1840,
+                    "promotion_ready": False,
+                    "promotion_blockers": ["specialist_shadow_sample_floor_not_met"],
+                },
+            ],
+        },
+    )
+
+    rows = _by_id(payload)
+    for model_id in ("finbert", "finbert_tone"):
+        assert rows[model_id]["runtime_available"] is False
+        assert rows[model_id]["lifecycle"] == "service_unavailable"
+        assert rows[model_id]["identity_verified"] is True
+        assert rows[model_id]["training_mode"] == "inference_only"
+        assert rows[model_id]["evaluation_mode"] == "shadow_evaluating"
+        assert rows[model_id]["quality_state"] == "promotion_blocked"
+        assert rows[model_id]["live_influence"] is False
+        assert rows[model_id]["fine_tune_available"] is False
+    assert rows["finbert_tone"]["model_family"] == "yiyanghkust/finbert-tone"
+    assert payload["summary"]["identity_failure_count"] == 0
 
 
 def test_dashboard_renders_model_cards_from_canonical_registry() -> None:

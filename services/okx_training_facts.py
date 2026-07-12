@@ -95,12 +95,14 @@ def build_okx_history_training_sample(
     positions_by_id: dict[int, Any] | None = None,
     orders_by_exchange_id: dict[str, Any] | None = None,
     decision_raw_by_position_id: dict[int, dict[str, Any]] | None = None,
+    decision_raw_by_order_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Convert one mirrored OKX positions-history lifecycle into one sample."""
 
     positions_by_id = positions_by_id or {}
     orders_by_exchange_id = orders_by_exchange_id or {}
     decision_raw_by_position_id = decision_raw_by_position_id or {}
+    decision_raw_by_order_id = decision_raw_by_order_id or {}
     raw = dict(_value(history, "raw_row", {}) or {})
     position_ids = [int(value) for value in _list(_value(history, "position_ids")) if value.isdigit()]
     entry_order_ids = _list(_value(history, "entry_order_ids"))
@@ -175,14 +177,24 @@ def build_okx_history_training_sample(
     gaps = list(dict.fromkeys(gaps))
 
     position_id = position_ids[0] if position_ids else 0
-    raw_llm_response = next(
-        (
-            decision_raw_by_position_id[value]
-            for value in position_ids
-            if value in decision_raw_by_position_id
-        ),
-        {},
-    )
+    raw_llm_response: dict[str, Any] = {}
+    decision_id = 0
+    for order_id in entry_order_ids:
+        candidate = decision_raw_by_order_id.get(order_id)
+        if isinstance(candidate, dict) and candidate:
+            raw_llm_response = candidate
+            order = orders_by_exchange_id.get(order_id)
+            decision_id = int(_value(order, "decision_id", 0) or 0)
+            break
+    if not raw_llm_response:
+        raw_llm_response = next(
+            (
+                decision_raw_by_position_id[value]
+                for value in position_ids
+                if value in decision_raw_by_position_id
+            ),
+            {},
+        )
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
     official_ratio_pct = _official_ratio_pct(raw, _value(history, "pnl_ratio"))
     lifecycle_key = _text(_value(history, "row_identity"))
@@ -191,6 +203,7 @@ def build_okx_history_training_sample(
         "id": int(_value(history, "id", 0) or 0),
         "lifecycle_key": lifecycle_key,
         "position_id": position_id,
+        "decision_id": decision_id,
         "position_ids": position_ids,
         "okx_pos_id": _text(_value(history, "pos_id")),
         "entry_order_ids": entry_order_ids,

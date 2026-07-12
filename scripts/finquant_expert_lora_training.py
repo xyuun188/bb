@@ -131,6 +131,23 @@ def load_rows(path: Path, limit: int) -> list[dict]:
                 continue
             row = json.loads(line)
             if isinstance(row, dict):
+                messages = row.get("messages")
+                if not isinstance(messages, list) or len(messages) < 3:
+                    raise SystemExit("invalid SFT message contract")
+                for message in messages:
+                    if not isinstance(message, dict):
+                        raise SystemExit("invalid SFT message row")
+                    if message.get("role") in {"user", "assistant"}:
+                        try:
+                            parsed_content = json.loads(str(message.get("content") or ""))
+                        except json.JSONDecodeError as exc:
+                            raise SystemExit(
+                                "SFT user/assistant content is not valid JSON"
+                            ) from exc
+                        if not isinstance(parsed_content, dict):
+                            raise SystemExit(
+                                "SFT user/assistant JSON content must be an object"
+                            )
                 rows.append(row)
             if limit > 0 and len(rows) >= limit:
                 break
@@ -901,6 +918,31 @@ def _validate_dataset_contract(dataset_jsonl: str, manifest: dict[str, Any]) -> 
     expected_count = sum(1 for line in dataset_jsonl.splitlines() if line.strip())
     if int(manifest.get("example_count") or 0) != expected_count:
         raise ValueError("BB-FinQuant dataset example count mismatch")
+    for line_number, line in enumerate(dataset_jsonl.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"BB-FinQuant dataset row {line_number} is not valid JSON") from exc
+        messages = row.get("messages") if isinstance(row, dict) else None
+        if not isinstance(messages, list) or len(messages) < 3:
+            raise ValueError(f"BB-FinQuant dataset row {line_number} has invalid messages")
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(f"BB-FinQuant dataset row {line_number} has invalid message")
+            if message.get("role") not in {"user", "assistant"}:
+                continue
+            try:
+                content = json.loads(str(message.get("content") or ""))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"BB-FinQuant dataset row {line_number} has invalid JSON message content"
+                ) from exc
+            if not isinstance(content, dict):
+                raise ValueError(
+                    f"BB-FinQuant dataset row {line_number} JSON message must be an object"
+                )
     base_identity = _safe_dict(manifest.get("base_model_identity"))
     if base_identity.get("training_repo") != REMOTE_TRAIN_BASE_REPO:
         raise ValueError("BB-FinQuant training base-model identity mismatch")
@@ -944,9 +986,50 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temp.replace(path)
 
 
-def _json_compact(value: Any, limit: int = 1800) -> str:
-    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    return text[:limit]
+def _bounded_json_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 4:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        return {
+            "truncated": True,
+            "sha256": _sha256_bytes(serialized),
+            "type": type(value).__name__,
+        }
+    if isinstance(value, dict):
+        items = list(value.items())
+        bounded = {str(key): _bounded_json_value(item, depth=depth + 1) for key, item in items[:24]}
+        if len(items) > 24:
+            bounded["_truncated_keys"] = len(items) - 24
+        return bounded
+    if isinstance(value, (list, tuple)):
+        bounded_list = [_bounded_json_value(item, depth=depth + 1) for item in value[:8]]
+        if len(value) > 8:
+            bounded_list.append({"_truncated_items": len(value) - 8})
+        return bounded_list
+    if isinstance(value, str) and len(value) > 240:
+        return {
+            "truncated": True,
+            "sha256": _sha256_bytes(value),
+            "preview": value[:160],
+            "original_length": len(value),
+        }
+    return value
+
+
+def _json_compact(value: Any, limit: int = 2200) -> str:
+    original = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    if len(original) <= limit:
+        return original
+    bounded = _bounded_json_value(value)
+    compacted = json.dumps(bounded, ensure_ascii=False, sort_keys=True, default=str)
+    if len(compacted) <= limit:
+        return compacted
+    fallback = {
+        "truncated": True,
+        "sha256": _sha256_bytes(original),
+        "top_level_keys": sorted(str(key) for key in value) if isinstance(value, dict) else [],
+        "preview": compacted[: min(800, max(limit - 300, 0))],
+    }
+    return json.dumps(fallback, ensure_ascii=False, sort_keys=True)
 
 
 def _json_object_from_remote_output(raw: str) -> dict[str, Any]:

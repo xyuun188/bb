@@ -659,15 +659,36 @@ async def _load_authoritative_trade_samples(limit: int | None) -> list[dict[str,
                 int(position.id): position for position in position_rows.scalars().all()
             }
         orders_by_exchange_id: dict[str, Order] = {}
+        decision_raw_by_order_id: dict[str, dict[str, Any]] = {}
         if order_ids:
             order_rows = await session.execute(
                 select(Order).where(Order.exchange_order_id.in_(sorted(order_ids)))
             )
+            loaded_orders = list(order_rows.scalars().all())
             orders_by_exchange_id = {
                 str(order.exchange_order_id): order
-                for order in order_rows.scalars().all()
+                for order in loaded_orders
                 if str(order.exchange_order_id or "").strip()
             }
+            decision_ids = {
+                int(order.decision_id or 0)
+                for order in loaded_orders
+                if int(order.decision_id or 0) > 0
+            }
+            decisions_by_id: dict[int, AIDecision] = {}
+            if decision_ids:
+                decision_rows = await session.execute(
+                    select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
+                )
+                decisions_by_id = {
+                    int(decision.id): decision for decision in decision_rows.scalars().all()
+                }
+            for order in loaded_orders:
+                exchange_id = str(order.exchange_order_id or "").strip()
+                decision = decisions_by_id.get(int(order.decision_id or 0))
+                raw = getattr(decision, "raw_llm_response", None)
+                if exchange_id and isinstance(raw, dict) and raw:
+                    decision_raw_by_order_id[exchange_id] = dict(raw)
 
     decision_raw_by_position_id = await _decision_raw_by_position_id(position_ids)
     samples = [
@@ -676,6 +697,7 @@ async def _load_authoritative_trade_samples(limit: int | None) -> list[dict[str,
             positions_by_id=positions_by_id,
             orders_by_exchange_id=orders_by_exchange_id,
             decision_raw_by_position_id=decision_raw_by_position_id,
+            decision_raw_by_order_id=decision_raw_by_order_id,
         )
         for record in records
     ]

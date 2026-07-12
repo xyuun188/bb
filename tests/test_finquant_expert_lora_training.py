@@ -15,8 +15,9 @@ def _dataset_contract(monkeypatch: pytest.MonkeyPatch) -> tuple[str, dict]:
         json.dumps(
             {
                 "messages": [
-                    {"role": "user", "content": "trade"},
-                    {"role": "assistant", "content": "result"},
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": '{"task":"trade"}'},
+                    {"role": "assistant", "content": '{"result":"ok"}'},
                 ]
             },
             separators=(",", ":"),
@@ -52,6 +53,45 @@ def test_dataset_bytes_round_trip_without_platform_newline_translation(tmp_path)
 
     assert training._sha256_file(path) == training._sha256_bytes(dataset)
     assert b"\r\n" not in path.read_bytes()
+
+
+def test_compact_json_never_slices_invalid_json() -> None:
+    value = {
+        "task": "trade",
+        "payload": {
+            "symbol": "BTC/USDT",
+            "raw_llm_response": {"reasoning": "x" * 6000},
+        },
+    }
+
+    compacted = training._json_compact(value, limit=900)
+
+    assert len(compacted) <= 900
+    parsed = json.loads(compacted)
+    assert isinstance(parsed, dict)
+
+
+def test_dataset_contract_rejects_invalid_json_message_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(training, "_source_code_version", lambda: "commit-123")
+    monkeypatch.setattr(training, "_sha256_file", lambda _path: "f" * 64)
+    dataset = (
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": '{"truncated":'},
+                    {"role": "assistant", "content": "{}"},
+                ]
+            }
+        )
+        + "\n"
+    )
+    manifest = training._finalize_dataset_contract(dataset, {"source": "test"})
+
+    with pytest.raises(ValueError, match="invalid JSON message content"):
+        training._validate_dataset_contract(dataset, manifest)
 
 
 def test_adapter_version_and_paths_never_target_legacy_v1(

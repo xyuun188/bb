@@ -126,6 +126,18 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
                 "actual_inference": True,
                 "baseline_response": False,
                 "live_mutation": False,
+                "predictions": {
+                    "sentiment_primary": {
+                        "available": True,
+                        "score": 0.61,
+                        "label": "positive",
+                        "text_count": 3,
+                    },
+                    "sentiment_challenger": {
+                        "available": False,
+                        "reason": "no_text_inputs",
+                    },
+                },
             },
         },
     }
@@ -154,6 +166,18 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
         "confidence": 0.73,
     }
     assert sentiment["professional_model_shadow"]["kind"] == "sentiment"
+    assert sentiment["professional_model_shadow"]["predictions"] == {
+        "sentiment_primary": {
+            "available": True,
+            "score": 0.61,
+            "label": "positive",
+            "text_count": 3,
+        },
+        "sentiment_challenger": {
+            "available": False,
+            "reason": "no_text_inputs",
+        },
+    }
     assert "raw_huge_payload" not in timeseries
     assert "raw_predictions" not in timeseries["professional_model_shadow"]["shadow_result"]
 

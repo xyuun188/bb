@@ -369,6 +369,8 @@ class EnsembleCoordinator:
             raw["local_ai_tools"] = context.get("local_ai_tools")
         if isinstance(context.get("direction_competition"), dict):
             raw["direction_competition"] = context.get("direction_competition")
+        if isinstance(context.get("market_regime"), dict):
+            raw["market_regime"] = dict(context["market_regime"])
         news_items = getattr(features, "recent_news_items", None)
         if isinstance(news_items, list):
             raw["news_context"] = {

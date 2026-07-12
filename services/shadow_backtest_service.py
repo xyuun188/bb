@@ -121,7 +121,9 @@ def _compact_professional_shadow(value: Any) -> dict[str, Any]:
         compact_result = {}
         for key in (
             "model",
+            "available",
             "actual_inference",
+            "reason",
             "expected_return_pct",
             "expected_move_pct",
             "best_side",
@@ -145,6 +147,21 @@ def _compact_professional_shadow(value: Any) -> dict[str, Any]:
     challenger_shadow_result = compact_result_payload(value.get("challenger_shadow_result"))
     if challenger_shadow_result:
         compact["challenger_shadow_result"] = challenger_shadow_result
+    predictions = value.get("predictions")
+    if isinstance(predictions, dict):
+        compact_predictions = {}
+        for slot, prediction in list(predictions.items())[:4]:
+            if not isinstance(prediction, dict):
+                continue
+            compact_prediction = {}
+            for key in ("available", "reason", "score", "label", "text_count"):
+                item = _compact_shadow_value(prediction.get(key))
+                if item is not None:
+                    compact_prediction[key] = item
+            if compact_prediction:
+                compact_predictions[str(slot)[:80]] = compact_prediction
+        if compact_predictions:
+            compact["predictions"] = compact_predictions
     return compact
 
 

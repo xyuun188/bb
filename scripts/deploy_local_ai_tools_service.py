@@ -100,10 +100,6 @@ TIMESERIES_PRIMARY_REPO_ID = os.environ.get(
 TIMESERIES_LEGACY_TIMESFM_REPO_ID = "google/timesfm-2.5-200m-transformers"
 TIMESERIES_CHRONOS_REPO_ID = "amazon/chronos-2"
 TIMESERIES_FALLBACK_REPO_ID = "ibm-granite/granite-timeseries-ttm-r2"
-TIMESERIES_PRIMARY_MUTATES_RESPONSE = os.environ.get(
-    "LOCAL_AI_TOOLS_TIMESERIES_PRIMARY_MUTATES_RESPONSE",
-    "true",
-).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
 ERROR_TEXT_LIMIT = 180
 SECRET_TEXT_RE = re.compile(
@@ -1275,33 +1271,8 @@ def _attach_timeseries_specialist_shadow(
     challenger_shadow = _run_chronos2_shadow(features)
     active = bool(primary_shadow.get("available") or challenger_shadow.get("available"))
     specialist_shadow = primary_shadow if primary_shadow.get("available") else challenger_shadow
-    if TIMESERIES_PRIMARY_MUTATES_RESPONSE and specialist_shadow.get("available"):
-        payload.setdefault(
-            "baseline_timeseries_response",
-            {
-                "model": payload.get("model"),
-                "best_side": payload.get("best_side"),
-                "side": payload.get("side"),
-                "direction": payload.get("direction"),
-                "expected_move_pct": payload.get("expected_move_pct"),
-                "expected_return_pct": payload.get("expected_return_pct"),
-                "confidence": payload.get("confidence"),
-                "status": payload.get("status"),
-            },
-        )
-        payload["model"] = specialist_shadow.get("model") or payload.get("model")
-        payload["architecture"] = specialist_shadow.get("adapter") or "timeseries_specialist_adapter"
-        payload["best_side"] = specialist_shadow.get("best_side") or payload.get("best_side")
-        payload["side"] = payload.get("best_side")
-        payload["direction"] = specialist_shadow.get("direction") or payload.get("direction")
-        payload["forecast_price"] = specialist_shadow.get("forecast_price")
-        payload["last_close"] = specialist_shadow.get("last_close")
-        payload["expected_move_pct"] = specialist_shadow.get("expected_move_pct")
-        payload["expected_return_pct"] = specialist_shadow.get("expected_return_pct")
-        payload["confidence"] = specialist_shadow.get("confidence")
-        payload["specialist_response_applied"] = True
-        payload["specialist_applied_model"] = specialist_shadow.get("model")
-        payload["status"] = "timesfm_primary_applied" if primary_shadow.get("available") else "timeseries_challenger_applied"
+    payload["specialist_response_applied"] = False
+    payload["specialist_applied_model"] = None
     chain = dict(chain)
     chain["actual_inference"] = active
     payload["specialist_primary_model"] = chain.get("primary_model")
@@ -1335,11 +1306,7 @@ def _attach_timeseries_specialist_shadow(
         "live_mutation": False,
     }
     payload["fallback_reason"] = (
-        "timesfm_primary_applied"
-        if payload.get("specialist_response_applied") and primary_shadow.get("available")
-        else "timeseries_challenger_applied"
-        if payload.get("specialist_response_applied")
-        else "specialist_timeseries_shadow_only"
+        "specialist_timeseries_shadow_only"
         if active
         else "specialist_timeseries_adapter_not_promoted"
     )
@@ -2824,6 +2791,12 @@ def _remote_smoke_command() -> str:
         "        pass\n"
         "    return ''\n"
         "\n"
+        "def read_json(response):\n"
+        "    payload = response.read(4 * 1024 * 1024 + 1)\n"
+        "    if len(payload) > 4 * 1024 * 1024:\n"
+        "        raise RuntimeError('phase3_quant_api_response_exceeds_4mb')\n"
+        "    return json.loads(payload.decode('utf-8'))\n"
+        "\n"
         "def get(path):\n"
         "    headers = {}\n"
         "    key = api_key()\n"
@@ -2831,7 +2804,7 @@ def _remote_smoke_command() -> str:
         "        headers['Authorization'] = 'Bearer ' + key\n"
         "    request = urllib.request.Request(BASE + path, headers=headers)\n"
         "    with urllib.request.urlopen(request, timeout=8) as response:\n"
-        "        return json.loads(response.read(256000).decode('utf-8'))\n"
+        "        return read_json(response)\n"
         "\n"
         "def post(path, payload):\n"
         "    data = json.dumps(payload).encode('utf-8')\n"
@@ -2846,7 +2819,7 @@ def _remote_smoke_command() -> str:
         "        method='POST',\n"
         "    )\n"
         "    with urllib.request.urlopen(request, timeout=8) as response:\n"
-        "        return json.loads(response.read(256000).decode('utf-8'))\n"
+        "        return read_json(response)\n"
         "\n"
         "features = {\n"
         "    'current_price': 100.0,\n"

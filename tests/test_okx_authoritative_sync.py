@@ -10,7 +10,11 @@ from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Order, Position
-from services.okx_authoritative_sync import OkxAuthoritativeSyncService, OkxFillGroup
+from services.okx_authoritative_sync import (
+    MAX_AUTHORITATIVE_FILL_PAGES,
+    OkxAuthoritativeSyncService,
+    OkxFillGroup,
+)
 
 
 class _FakeCcxt:
@@ -92,6 +96,36 @@ class _AgedUnlinkedFillExecutor(_FakeExecutor):
 class _FreshUnlinkedFillExecutor(_FakeExecutor):
     async def get_positions_strict(self) -> list[dict[str, Any]]:
         return []
+
+
+class _LimitBackfillFillCcxt(_FakeCcxt):
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        assert params["instType"] == "SWAP"
+        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=10)).timestamp() * 1000)
+        return {
+            "data": [
+                {
+                    "ordId": "older-matched-order",
+                    "tradeId": "older-matched-trade",
+                    "instId": "BTC-USDT-SWAP",
+                    "side": "buy",
+                    "posSide": "net",
+                    "fillSz": "2",
+                    "fillPx": "100",
+                    "fee": "-0.01",
+                    "fillPnl": "0",
+                    "ts": str(timestamp_ms),
+                }
+            ]
+        }
+
+
+class _LimitBackfillFillExecutor(_FakeExecutor):
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return []
+
+    async def _get_ccxt(self) -> _LimitBackfillFillCcxt:
+        return _LimitBackfillFillCcxt()
 
 
 class _RetryOnceExecutor(_FakeExecutor):
@@ -1836,3 +1870,127 @@ async def test_okx_authoritative_sync_loads_old_open_position_for_recent_entry_o
         assert report["status"] == "ok"
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_backfills_local_facts_beyond_primary_limit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-limit-backfill.db').as_posix()}",
+    )
+    await init_db()
+    now = datetime.now(UTC)
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ETH/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=1.0,
+                        price=90.0,
+                        status="filled",
+                        exchange_order_id="newer-local-order",
+                        filled_at=now - timedelta(minutes=1),
+                        created_at=now - timedelta(minutes=1),
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="BTC/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=0.02,
+                        price=100.0,
+                        status="filled",
+                        exchange_order_id="older-matched-order",
+                        filled_at=now - timedelta(minutes=10),
+                        created_at=now - timedelta(minutes=10),
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ETH/USDT",
+                        side="short",
+                        quantity=1.0,
+                        entry_price=90.0,
+                        current_price=90.0,
+                        is_open=False,
+                        entry_exchange_order_id="newer-local-order",
+                        created_at=now - timedelta(minutes=2),
+                        closed_at=now - timedelta(minutes=1),
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="BTC/USDT",
+                        side="long",
+                        quantity=0.02,
+                        entry_price=100.0,
+                        current_price=100.0,
+                        is_open=False,
+                        okx_inst_id="BTC-USDT-SWAP",
+                        entry_exchange_order_id="older-matched-order",
+                        created_at=now - timedelta(minutes=20),
+                        closed_at=now - timedelta(minutes=5),
+                    ),
+                ]
+            )
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            limit=1,
+            executor_factory=_LimitBackfillFillExecutor,
+        ).collect()
+
+        kinds = {issue["kind"] for issue in report["issues"]}
+        assert "okx_fill_missing_local_order" not in kinds
+        assert "okx_fill_not_linked_to_position" not in kinds
+        assert report["local_order_count"] == 2
+        assert report["local_position_count"] == 2
+        assert report["supplemental_local_order_count"] == 1
+        assert report["supplemental_local_position_count"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_fill_page_cap_does_not_follow_row_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _CapturingNativeFactsClient:
+        def __init__(self, _executor: Any) -> None:
+            pass
+
+        async def fetch_fill_groups(self, **kwargs: Any) -> list[Any]:
+            captured.update(kwargs)
+            return []
+
+    monkeypatch.setattr(
+        "services.okx_authoritative_sync.OkxNativeFactsClient",
+        _CapturingNativeFactsClient,
+    )
+    service = OkxAuthoritativeSyncService(limit=1)
+
+    groups = await service._fetch_fills(
+        object(),
+        symbols=set(),
+        since=datetime.now(UTC) - timedelta(hours=24),
+        target_order_ids=set(),
+    )
+
+    assert groups == []
+    assert captured["limit"] == 100
+    assert captured["max_pages"] == MAX_AUTHORITATIVE_FILL_PAGES == 10
+    assert captured["account_wide_only"] is True

@@ -75,6 +75,25 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["training_evidence_gaps"] == []
 
 
+def test_authoritative_sample_uses_exact_entry_order_decision_evidence() -> None:
+    entry = SimpleNamespace(
+        okx_fill_contracts=2.0,
+        okx_trade_ids="trade-entry",
+        decision_id=91,
+    )
+    raw = {"local_ai_tools": {"time_series_prediction": {"model": "timesfm"}}}
+
+    sample = build_okx_history_training_sample(
+        _history(position_ids=[7]),
+        orders_by_exchange_id={"entry-1": entry},
+        decision_raw_by_position_id={7: {"local_ai_tools": {"wrong": True}}},
+        decision_raw_by_order_id={"entry-1": raw},
+    )
+
+    assert sample["decision_id"] == 91
+    assert sample["raw_llm_response"] == raw
+
+
 def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons() -> None:
     history = _history()
     history.raw_row = {

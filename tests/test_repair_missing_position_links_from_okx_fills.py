@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
@@ -13,6 +14,92 @@ from models.learning import TradeReflection
 from models.trade import Order, Position
 from scripts import repair_missing_position_links_from_okx_fills as repair_script
 from services.okx_order_fact_sync import OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+
+
+def test_additional_entry_link_requires_one_exact_open_lifecycle() -> None:
+    filled_at = datetime(2026, 7, 11, 18, 48, tzinfo=UTC)
+    order = SimpleNamespace(
+        exchange_order_id="entry-add-1",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_inst_id="CELO-USDT-SWAP",
+        symbol="CELO/USDT",
+        side="buy",
+        execution_mode="paper",
+        quantity=605.0,
+        okx_fill_contracts=605.0,
+        price=0.0708,
+        fee=-0.01,
+        pnl=0.0,
+        okx_raw_fills={"contract_size": 1.0},
+    )
+    decision = SimpleNamespace(action="long")
+    open_position = SimpleNamespace(
+        id=4373,
+        symbol="CELO/USDT",
+        okx_inst_id="CELO-USDT-SWAP",
+        side="long",
+        execution_mode="paper",
+        quantity=713.0,
+        entry_exchange_order_id="entry-1,entry-2",
+        close_exchange_order_id="close-1",
+        created_at=datetime(2026, 7, 11, 0, 21, tzinfo=UTC),
+        closed_at=None,
+    )
+    closed_before_fill = SimpleNamespace(
+        **{
+            **open_position.__dict__,
+            "id": 4674,
+            "closed_at": datetime(2026, 7, 11, 11, 39, tzinfo=UTC),
+        }
+    )
+
+    plan = repair_script._additional_entry_link_plan(
+        order,
+        decision,
+        [open_position, closed_before_fill],
+    )
+
+    assert plan is not None
+    assert plan.position_id == 4373
+    assert plan.link_kind == "entry_add"
+    assert plan.okx_order_id == "entry-add-1"
+    assert plan.source == repair_script.ADDITIONAL_ENTRY_LINK_REPAIR_SOURCE
+
+
+def test_additional_entry_link_rejects_ambiguous_lifecycles() -> None:
+    filled_at = datetime(2026, 7, 11, 18, 48, tzinfo=UTC)
+    order = SimpleNamespace(
+        exchange_order_id="entry-add-1",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_inst_id="CELO-USDT-SWAP",
+        symbol="CELO/USDT",
+        side="buy",
+        execution_mode="paper",
+    )
+    position = SimpleNamespace(
+        id=1,
+        symbol="CELO/USDT",
+        okx_inst_id="CELO-USDT-SWAP",
+        side="long",
+        execution_mode="paper",
+        quantity=1.0,
+        entry_exchange_order_id="entry-1",
+        close_exchange_order_id=None,
+        created_at=datetime(2026, 7, 11, 0, 0, tzinfo=UTC),
+        closed_at=None,
+    )
+    other = SimpleNamespace(**{**position.__dict__, "id": 2})
+
+    assert (
+        repair_script._additional_entry_link_plan(
+            order,
+            SimpleNamespace(action="long"),
+            [position, other],
+        )
+        is None
+    )
 
 
 def test_missing_position_link_repair_imports_online_runtime_bootstrap() -> None:
@@ -223,6 +310,88 @@ async def test_missing_position_link_apply_marks_training_quarantine(
     assert len(reflection_rows) == 1
     assert reflection_rows[0]["source"] == repair_script.REPAIR_REFLECTION_SOURCE
     assert reflection_rows[0]["expert_lessons"]["training_policy"] == "exclude_until_manual_trust"
+
+
+def test_exchange_order_id_split_preserves_first_seen_order() -> None:
+    assert repair_script._split_exchange_order_ids(
+        "entry-1,entry-2;entry-1|entry-3"
+    ) == ["entry-1", "entry-2", "entry-3"]
+
+
+@pytest.mark.asyncio
+async def test_additional_entry_apply_appends_without_overwriting_existing_links(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'additional-entry-link.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        filled_at = datetime(2026, 7, 11, 18, 48, tzinfo=UTC)
+        async with get_session_ctx() as session:
+            position = Position(
+                model_name="okx_authoritative_sync",
+                execution_mode="paper",
+                symbol="CELO/USDT",
+                side="long",
+                quantity=713.0,
+                entry_price=0.0688,
+                current_price=0.0708,
+                leverage=1.0,
+                is_open=True,
+                created_at=datetime(2026, 7, 11, 0, 21, tzinfo=UTC),
+                entry_exchange_order_id="entry-1,entry-2",
+                close_exchange_order_id="close-1",
+                okx_inst_id="CELO-USDT-SWAP",
+            )
+            session.add(position)
+            await session.flush()
+            position_id = int(position.id)
+
+        plan = repair_script.FillLinkPlan(
+            position_id=position_id,
+            link_kind="entry_add",
+            symbol="CELO/USDT",
+            side="long",
+            quantity=713.0,
+            okx_order_id="entry-add-1",
+            old_entry_exchange_order_id="entry-1,entry-2",
+            old_close_exchange_order_id="close-1",
+            old_okx_inst_id="CELO-USDT-SWAP",
+            fill_timestamp=filled_at,
+            position_reference_time=datetime(2026, 7, 11, 0, 21, tzinfo=UTC),
+            time_delta_seconds=66_420.0,
+            fill_quantity=605.0,
+            fill_contracts=605.0,
+            fill_price=0.0708,
+            source=repair_script.ADDITIONAL_ENTRY_LINK_REPAIR_SOURCE,
+            okx_inst_id="CELO-USDT-SWAP",
+        )
+        monkeypatch.setattr(repair_script, "_backup", lambda _plans: _async_path(tmp_path))
+
+        result = await repair_script.apply_plans([plan])
+
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            reflections = (
+                await session.execute(
+                    select(func.count(TradeReflection.id)).where(
+                        TradeReflection.position_id == position_id
+                    )
+                )
+            ).scalar_one()
+    finally:
+        await close_db()
+
+    assert result["applied"] == 1
+    assert result["created_order_rows"] == 0
+    assert position.entry_exchange_order_id == "entry-1,entry-2,entry-add-1"
+    assert position.close_exchange_order_id == "close-1"
+    assert reflections == 1
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,22 @@ from web_dashboard.api import system_audit
 AuditFactory = Callable[[], Awaitable[dict[str, Any]]]
 
 
+@pytest.fixture(autouse=True)
+def _stable_model_training_scheduler_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        system_audit.MODEL_TRAINING_STATE_STORE,
+        "read",
+        lambda: {
+            "status": "ok",
+            "state_file_available": True,
+            "heartbeat_stale": False,
+            "training_timeout_exceeded": False,
+            "models": {},
+            "schedulers": {},
+        },
+    )
+
+
 def _trade_contract_details_ok() -> dict[str, Any]:
     return {
         "audit_only": True,

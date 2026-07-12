@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 from scripts import run_specialist_shadow_evaluation as runner
-from services.specialist_shadow_evaluation import summarize_specialist_shadow_evaluation
+from services.specialist_shadow_evaluation import (
+    ROUND_TRIP_COST_PCT,
+    summarize_specialist_shadow_evaluation,
+)
 
 
 def test_specialist_shadow_evaluation_script_imports_online_runtime_bootstrap() -> None:
@@ -15,10 +19,18 @@ def test_specialist_shadow_evaluation_script_imports_online_runtime_bootstrap() 
     assert "from scripts.runtime_env_bootstrap import" in source
     assert "load_runtime_env_files(project_root=ROOT)" in source
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
+    assert "_load_authoritative_trade_samples" in source
+    assert "authoritative_trade_samples=authoritative_trade_samples" in source
 
 
 def test_specialist_shadow_evaluation_default_report_dir_matches_phase3_readers() -> None:
     assert runner.DEFAULT_REPORT_DIR == "phase3"
+
+
+def test_entry_decision_persists_market_regime_for_authoritative_evaluation() -> None:
+    source = Path("ai_brain/ensemble_coordinator.py").read_text(encoding="utf-8")
+
+    assert 'raw["market_regime"] = dict(context["market_regime"])' in source
 
 
 def _row(
@@ -43,6 +55,8 @@ def _row(
             "specialist_inference_active": actual_inference,
             "professional_model_shadow": {
                 "actual_inference": actual_inference,
+                "primary_model": "google/timesfm-2.5-200m-pytorch",
+                "challenger_model": "amazon/chronos-2",
                 "shadow_result": {
                     "model": "timesfm-2.5-shadow-challenger",
                     "actual_inference": actual_inference,
@@ -58,6 +72,8 @@ def _row(
         local_shadow[tool]["timesfm_shadow_expected_return_pct"] = expected
         local_shadow[tool]["professional_model_shadow"] = {
             "actual_inference": actual_inference,
+            "primary_model": "google/timesfm-2.5-200m-pytorch",
+            "challenger_model": "amazon/chronos-2",
             "primary_shadow_result": {
                 "model": "chronos-2-shadow-primary",
                 "actual_inference": actual_inference,
@@ -75,6 +91,7 @@ def _row(
         }
     return SimpleNamespace(
         id=index,
+        decision_id=10_000 + index,
         status="completed",
         symbol=symbol,
         best_action=best_action,
@@ -82,11 +99,57 @@ def _row(
         short_return_pct=short_return,
         feature_snapshot={
             "symbol": symbol,
+            "market_regime": "trend" if index % 2 else "range",
             "local_ai_tools_shadow": local_shadow,
         },
         due_at=now,
         created_at=now,
     )
+
+
+def _authoritative_sample(
+    index: int,
+    *,
+    pnl_ratio_pct: float = 0.25,
+    predicted_side: str = "long",
+    position_side: str = "long",
+    actual_inference: bool = True,
+) -> dict:
+    professional = {
+        "actual_inference": actual_inference,
+        "primary_model": "google/timesfm-2.5-200m-pytorch",
+        "challenger_model": "amazon/chronos-2",
+        "primary_shadow_result": {
+            "actual_inference": actual_inference,
+            "best_side": predicted_side,
+            "sequence_length": 60,
+        },
+        "challenger_shadow_result": {
+            "actual_inference": actual_inference,
+            "best_side": predicted_side,
+            "sequence_length": 60,
+        },
+    }
+    return {
+        "source": "okx_position_history",
+        "id": index,
+        "lifecycle_key": f"okx-lifecycle-{index}",
+        "decision_id": 20_000 + index,
+        "trade_fact_trusted": True,
+        "side": position_side,
+        "symbol": "BTC/USDT",
+        "authoritative_pnl_ratio_pct": pnl_ratio_pct,
+        "label_timestamp": (datetime(2026, 7, 1, tzinfo=UTC) + timedelta(hours=index)).isoformat(),
+        "raw_llm_response": {
+            "market_regime": "trend" if index % 2 else "range",
+            "local_ai_tools": {
+                "time_series_prediction": {
+                    "specialist_inference_active": actual_inference,
+                    "professional_model_shadow": professional,
+                }
+            },
+        },
+    }
 
 
 def test_specialist_shadow_evaluation_skips_baseline_only_profit_shadow() -> None:
@@ -131,25 +194,31 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
         [
             _row(index=index, realized=0.20 + index / 100)
             for index in range(1, 35)
-        ]
+        ],
+        authoritative_trade_samples=[_authoritative_sample(index) for index in range(1, 35)],
     )
 
     assert report["ok"] is True
     assert report["completed_count"] == 34
     assert report["eligible_shadow_count"] == 34
     models = {row["model"]: row for row in report["models"]}
-    assert set(models) == {"chronos-2-shadow-primary", "timesfm-2.5-shadow-challenger"}
-    model = models["timesfm-2.5-shadow-challenger"]
+    assert set(models) == {"google/timesfm-2.5-200m-pytorch", "amazon/chronos-2"}
+    model = models["google/timesfm-2.5-200m-pytorch"]
     assert model["actual_inference_count"] == 34
     assert model["direction_count"] == 34
     assert model["direction_hit_rate"] == 1.0
     assert model["avg_realized_return_pct"] > 0.2
+    assert model["authoritative_direction_aligned_count"] == 34
+    assert model["walk_forward"]["status"] == "stable"
+    assert model["market_regime_stability"]["status"] == "stable"
+    assert model["rolling_distribution"]["status"] == "stable"
     assert model["promotion_ready"] is True
     assert model["promotion_blockers"] == []
     assert model["blockers"] == []
     assert model["blocked_reasons"] == []
     assert model["promotion_gate"]["minimum_actual_inference_samples"] == 30
     assert report["summary"]["promotion_ready_count"] == 2
+    assert report["authoritative_eligible_count"] == 34
     assert report["promotion_gate"]["requires_at_least_one_promotion_ready_model"] is True
 
 
@@ -175,20 +244,20 @@ def test_specialist_shadow_evaluation_blocks_false_signal_losses() -> None:
     assert model["worst_samples"][0]["symbol"] == "BTC/USDT"
     assert model["worst_samples"][0]["predicted_side"] == "long"
     assert model["worst_samples"][0]["actual_best_side"] == "short"
-    assert model["worst_samples"][0]["actual_return_pct"] == -0.25
+    assert model["worst_samples"][0]["actual_return_pct"] == -0.37
     assert model["promotion_gate"]["tail_loss_count"] == 34
     assert "direction_hit_rate_below_floor" in model["promotion_blockers"]
-    assert "avg_realized_return_below_floor" in model["promotion_blockers"]
-    assert "false_signal_loss_exceeds_floor" in model["promotion_blockers"]
+    assert "shadow_avg_return_after_cost_below_floor" in model["promotion_blockers"]
+    assert "shadow_tail_loss_exceeds_floor" in model["promotion_blockers"]
     assert model["blocked_reasons"] == model["promotion_blockers"]
-    assert model["blocked_reason_counts"]["false_signal_loss_exceeds_floor"] == 1
+    assert model["blocked_reason_counts"]["shadow_tail_loss_exceeds_floor"] == 1
     assert report["summary"]["blocked_count"] == 2
     assert {
         item["reason"] for item in report["summary"]["top_blocked_reasons"]
     } >= {
         "direction_hit_rate_below_floor",
-        "avg_realized_return_below_floor",
-        "false_signal_loss_exceeds_floor",
+        "shadow_avg_return_after_cost_below_floor",
+        "shadow_tail_loss_exceeds_floor",
     }
 
 
@@ -217,7 +286,8 @@ def test_specialist_shadow_evaluation_quarantines_legacy_mixed_timeseries() -> N
     assert model["actual_inference_count"] == 0
     assert model["direction_count"] == 0
     assert model["tail_loss_count"] == 0
-    assert model["promotion_blockers"] == ["specialist_shadow_sample_floor_not_met"]
+    assert "specialist_shadow_sample_floor_not_met" in model["promotion_blockers"]
+    assert "authoritative_trade_sample_floor_not_met" in model["promotion_blockers"]
     assert "legacy_mixed_shadow_result_not_promotable" not in model["promotion_blockers"]
     assert "timeseries_sequence_too_short_for_promotion" not in model["promotion_blockers"]
 
@@ -253,3 +323,83 @@ def test_specialist_shadow_evaluation_skips_rows_without_shadow_evidence() -> No
     assert report["model_count"] == 0
     assert report["skipped_reasons"]["missing_local_ai_tools_shadow"] == 1
     assert report["skipped_reasons"]["not_completed"] == 1
+
+
+def test_specialist_shadow_evaluation_deducts_round_trip_cost_from_shadow_return() -> None:
+    report = summarize_specialist_shadow_evaluation([_row(realized=0.10)])
+    model = next(
+        row
+        for row in report["models"]
+        if row["model"] == "google/timesfm-2.5-200m-pytorch"
+    )
+
+    assert model["avg_shadow_return_after_cost_pct"] == round(0.10 - ROUND_TRIP_COST_PCT, 6)
+    assert model["shadow_events"][0]["gross_return_pct"] == 0.10
+    assert model["shadow_events"][0]["round_trip_cost_pct"] == ROUND_TRIP_COST_PCT
+
+
+def test_specialist_shadow_evaluation_records_per_model_fallbacks() -> None:
+    report = summarize_specialist_shadow_evaluation([_row(actual_inference=False)])
+    models = {row["model"]: row for row in report["models"]}
+
+    assert report["eligible_shadow_count"] == 1
+    assert models["google/timesfm-2.5-200m-pytorch"]["fallback_count"] == 1
+    assert models["google/timesfm-2.5-200m-pytorch"]["shadow_fallback_count"] == 1
+    assert models["amazon/chronos-2"]["fallback_count"] == 1
+    assert models["google/timesfm-2.5-200m-pytorch"]["actual_inference_count"] == 0
+
+
+def test_sentiment_without_per_model_predictions_never_uses_calibrator_identity() -> None:
+    row = _row(tool="sentiment_analysis", actual_inference=True)
+    tool = row.feature_snapshot["local_ai_tools_shadow"]["sentiment_analysis"]
+    tool["model"] = "local-sentiment-trained-v2"
+    tool["professional_model_shadow"] = {
+        "actual_inference": True,
+        "primary_model": "ProsusAI/finbert",
+        "challenger_model": "yiyanghkust/finbert-tone",
+    }
+
+    report = summarize_specialist_shadow_evaluation([row])
+    models = {item["model"]: item for item in report["models"]}
+
+    assert set(models) == {"ProsusAI/finbert", "yiyanghkust/finbert-tone"}
+    assert all(item["fallback_count"] == 1 for item in models.values())
+    assert "local-sentiment-trained-v2" not in models
+
+
+def test_specialist_shadow_only_evidence_can_never_promote() -> None:
+    report = summarize_specialist_shadow_evaluation(
+        [_row(index=index, realized=0.4) for index in range(1, 35)]
+    )
+    model = report["models"][0]
+
+    assert model["promotion_ready"] is False
+    assert "authoritative_trade_sample_floor_not_met" in model["promotion_blockers"]
+    assert "walk_forward_not_stable" in model["promotion_blockers"]
+    assert "market_regime_not_stable" in model["promotion_blockers"]
+    assert "rolling_distribution_not_stable" in model["promotion_blockers"]
+
+
+def test_authoritative_return_is_not_assigned_to_opposite_prediction() -> None:
+    report = summarize_specialist_shadow_evaluation(
+        [_row(index=index, realized=0.4) for index in range(1, 35)],
+        authoritative_trade_samples=[
+            _authoritative_sample(index, predicted_side="short", position_side="long")
+            for index in range(1, 35)
+        ],
+    )
+    model = next(
+        row
+        for row in report["models"]
+        if row["model"] == "google/timesfm-2.5-200m-pytorch"
+    )
+
+    assert model["authoritative_actual_inference_count"] == 34
+    assert model["authoritative_direction_aligned_count"] == 0
+    assert model["authoritative_direction_mismatch_count"] == 34
+    assert model["authoritative_events"] == []
+    assert all(
+        evidence["label_reason"] == "prediction_not_aligned_with_observed_position"
+        for evidence in model["authoritative_evidence"]
+    )
+    assert model["promotion_ready"] is False

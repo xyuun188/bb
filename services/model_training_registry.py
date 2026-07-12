@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-MODEL_TRAINING_REGISTRY_VERSION = "2026-07-11.v1"
+MODEL_TRAINING_REGISTRY_VERSION = "2026-07-12.v2"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -200,57 +200,78 @@ def _specialist_rows(
     local_tools_status: dict[str, Any],
     specialist_report: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    by_model = {
-        str(row.get("model") or ""): row
+    report_rows = [
+        row
         for row in _safe_list(specialist_report.get("models"))
         if isinstance(row, dict)
-    }
+    ]
+
+    def report_for(*names: str) -> dict[str, Any]:
+        expected = {name.lower() for name in names}
+        for row in report_rows:
+            if str(row.get("model") or "").strip().lower() in expected:
+                return row
+        return {}
+
     transformer = _safe_dict(local_tools_status.get("transformers_sentiment_backend"))
     specs = (
         (
             "timesfm_2_5",
             "TimesFM 2.5",
-            "timesfm-2.5-primary",
+            "google/timesfm-2.5-200m-pytorch",
+            ("google/timesfm-2.5-200m-pytorch", "timesfm-2.5-primary"),
             "pretrained_timeseries_forecast",
             True,
         ),
         (
             "chronos_2",
             "Chronos-2",
-            "chronos-2-shadow-challenger",
+            "amazon/chronos-2",
+            ("amazon/chronos-2", "chronos-2-shadow-challenger"),
             "pretrained_timeseries_challenger",
             True,
         ),
         (
             "finbert",
             "FinBERT",
-            "local-sentiment-trained-v2",
+            "ProsusAI/finbert",
+            ("ProsusAI/finbert",),
             "pretrained_sentiment_inference",
+            bool(transformer.get("available")),
+        ),
+        (
+            "finbert_tone",
+            "FinBERT Tone",
+            "yiyanghkust/finbert-tone",
+            ("yiyanghkust/finbert-tone",),
+            "pretrained_sentiment_challenger",
             bool(transformer.get("available")),
         ),
     )
     rows: list[dict[str, Any]] = []
-    for model_id, display_name, report_name, task, runtime_hint in specs:
-        report = _safe_dict(by_model.get(report_name))
+    for model_id, display_name, model_family, report_names, task, runtime_hint in specs:
+        report = report_for(*report_names)
         inference_count = _safe_int(report.get("actual_inference_count"))
         promotion_ready = bool(report.get("promotion_ready"))
         runtime_available = bool(runtime_hint and (report or model_id == "finbert"))
-        lifecycle = (
-            "canary"
-            if promotion_ready
-            else (
-                "shadow_evaluating"
-                if inference_count > 0
-                else "inference_only" if runtime_available else "service_unavailable"
-            )
+        identity_verified = bool(runtime_available or inference_count > 0)
+        lifecycle = "inference_only" if runtime_available else "service_unavailable"
+        evaluation_mode = (
+            "shadow_evaluating"
+            if report
+            else "not_evaluated" if runtime_available else "unavailable"
         )
         rows.append(
             {
                 "model_id": model_id,
                 "display_name": display_name,
-                "model_family": report_name,
+                "model_family": model_family,
                 "task": task,
                 "trainable": False,
+                "training_mode": "inference_only",
+                "evaluation_mode": evaluation_mode,
+                "fine_tune_available": False,
+                "project_adapter_available": False,
                 "training_owner": None,
                 "runtime_role": "specialist_evidence",
                 "lifecycle": lifecycle,
@@ -259,11 +280,22 @@ def _specialist_rows(
                 "trained_at": None,
                 "sample_count": inference_count,
                 "live_influence": False,
-                "quality_state": "promotion_ready" if promotion_ready else "shadow",
+                "quality_state": (
+                    "promotion_ready_for_canary_review"
+                    if promotion_ready
+                    else "promotion_blocked"
+                    if report
+                    else "not_evaluated"
+                ),
                 "blocking_reasons": _safe_list(report.get("promotion_blockers")),
-                "identity_verified": runtime_available,
+                "identity_verified": identity_verified,
                 "alias_only": False,
                 "actual_inference_count": inference_count,
+                "fallback_count": _safe_int(report.get("fallback_count")),
+                "authoritative_sample_count": _safe_int(
+                    report.get("authoritative_direction_aligned_count")
+                ),
+                "promotion_ready": promotion_ready,
                 "evaluation_generated_at": specialist_report.get("generated_at"),
             }
         )

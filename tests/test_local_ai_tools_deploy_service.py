@@ -32,6 +32,14 @@ def test_local_ai_tools_training_costs_are_runtime_configurable() -> None:
     assert "TAIL_LOSS_THRESHOLD_PCT = 0.18" not in SERVICE_CODE
 
 
+def test_remote_smoke_probe_rejects_oversized_responses_without_truncating_json() -> None:
+    command = deploy._remote_smoke_command()
+
+    assert "response.read(256000)" not in command
+    assert "response.read(4 * 1024 * 1024 + 1)" in command
+    assert "phase3_quant_api_response_exceeds_4mb" in command
+
+
 def test_local_ai_tools_generated_service_disables_local_high_risk_review() -> None:
     assert "openai-compatible-risk-review" not in SERVICE_CODE
     assert "SERVED_REVIEW_MODEL" not in SERVICE_CODE
@@ -405,17 +413,17 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
     )
 
     assert result["specialist_inference_active"] is True
-    assert result["fallback_reason"] == "timesfm_primary_applied"
+    assert result["fallback_reason"] == "specialist_timeseries_shadow_only"
     assert result["professional_model_shadow"]["actual_inference"] is True
     assert result["professional_model_shadow"]["baseline_response"] is True
     assert result["professional_model_shadow"]["shadow_result"]["model"] == (
         "timesfm-2.5-primary"
     )
-    assert result["specialist_response_applied"] is True
-    assert result["specialist_applied_model"] == "timesfm-2.5-primary"
+    assert result["specialist_response_applied"] is False
+    assert result["specialist_applied_model"] is None
     assert result["timesfm_shadow_expected_return_pct"] == pytest.approx(0.790514)
     assert result["timesfm_shadow_side"] == "long"
-    assert result["expected_return_pct"] == result["timesfm_shadow_expected_return_pct"]
+    assert result["model"] != "timesfm-2.5-primary"
     assert result["live_mutation"] is False
     assert result["shadow_payload"]["specialist_inference_active"] is True
 
@@ -526,7 +534,7 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
     assert shadow["challenger_shadow_result"]["model"] == "chronos-2-shadow-challenger"
     assert shadow["challenger_shadow_result"]["actual_inference"] is True
     assert shadow["activation_blocker"] == "walk_forward_required"
-    assert result["fallback_reason"] == "timesfm_primary_applied"
+    assert result["fallback_reason"] == "specialist_timeseries_shadow_only"
     assert result["live_mutation"] is False
 
 

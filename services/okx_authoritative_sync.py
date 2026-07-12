@@ -40,6 +40,7 @@ DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 200
 DEFAULT_TIMEOUT_SECONDS = 6.0
 DEFAULT_MAX_PULL_ATTEMPTS = 2
+MAX_AUTHORITATIVE_FILL_PAGES = 10
 LOCAL_ORDER_SYNC_GRACE_SECONDS = 120.0
 QUANTITY_TOLERANCE_RATIO = 0.02
 ROOT = Path(__file__).resolve().parent.parent
@@ -219,6 +220,31 @@ class OkxAuthoritativeSyncService:
         pull_attempts = pull_report["pull_attempts"]
         pull_success_attempt = pull_report["pull_success_attempt"]
         pull_stages = pull_report["pull_stages"]
+        exchange_fill_order_ids = {
+            str(fill.order_id or "").strip()
+            for fill in exchange_fills
+            if str(fill.order_id or "").strip()
+        }
+        supplemental_orders, supplemental_decisions = (
+            await self._load_filled_local_orders_by_exchange_ids(
+                exchange_fill_order_ids,
+                known_exchange_order_ids=target_order_ids,
+            )
+        )
+        if supplemental_orders:
+            local_orders = [*local_orders, *supplemental_orders]
+            local_decisions.update(supplemental_decisions)
+            target_order_ids.update(
+                token
+                for order in supplemental_orders
+                for token in _split_exchange_order_ids(order.exchange_order_id)
+            )
+        supplemental_positions = await self._load_local_positions_by_exchange_ids(
+            exchange_fill_order_ids,
+            known_position_order_ids=_linked_position_order_ids(local_positions),
+        )
+        if supplemental_positions:
+            local_positions = [*local_positions, *supplemental_positions]
         context_orders, context_decisions = await self._load_context_local_orders(
             _order_ids_from_order_history_contexts(exchange_order_contexts),
             known_exchange_order_ids=target_order_ids,
@@ -273,7 +299,10 @@ class OkxAuthoritativeSyncService:
             "local_position_count": len(local_positions),
             "okx_position_count": len(exchange_positions),
             "okx_fill_order_count": len(exchange_fills),
+            "okx_fill_max_pages": MAX_AUTHORITATIVE_FILL_PAGES,
             "okx_order_history_context_count": len(exchange_order_contexts),
+            "supplemental_local_order_count": len(supplemental_orders),
+            "supplemental_local_position_count": len(supplemental_positions),
             "context_local_order_count": len(context_orders),
             "okx_pull_available": not fetch_errors,
             "pull_attempts": pull_attempts,
@@ -610,6 +639,96 @@ class OkxAuthoritativeSyncService:
                 }
         return context_orders, context_decisions
 
+    async def _load_filled_local_orders_by_exchange_ids(
+        self,
+        exchange_order_ids: set[str],
+        *,
+        known_exchange_order_ids: set[str],
+    ) -> tuple[list[Order], dict[int, AIDecision]]:
+        target_ids = {
+            str(item or "").strip()
+            for item in exchange_order_ids
+            if str(item or "").strip()
+            and str(item or "").strip() not in known_exchange_order_ids
+        }
+        if not target_ids:
+            return [], {}
+
+        orders_by_id: dict[int, Order] = {}
+        ordered_target_ids = sorted(target_ids)
+        async with get_read_session_ctx() as session:
+            for offset in range(0, len(ordered_target_ids), 100):
+                batch = ordered_target_ids[offset : offset + 100]
+                clauses = [Order.exchange_order_id.contains(order_id) for order_id in batch]
+                order_rows = await session.execute(
+                    select(Order).where(
+                        Order.execution_mode == self.mode,
+                        Order.status == "filled",
+                        or_(*clauses),
+                    )
+                )
+                for order in order_rows.scalars().all():
+                    if _split_exchange_order_ids(order.exchange_order_id) & target_ids:
+                        orders_by_id[int(order.id)] = order
+
+            context_orders = list(orders_by_id.values())
+            decision_ids = {
+                int(order.decision_id)
+                for order in context_orders
+                if getattr(order, "decision_id", None)
+            }
+            context_decisions: dict[int, AIDecision] = {}
+            if decision_ids:
+                decision_rows = await session.execute(
+                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                )
+                context_decisions = {
+                    int(decision.id): decision for decision in decision_rows.scalars().all()
+                }
+        return context_orders, context_decisions
+
+    async def _load_local_positions_by_exchange_ids(
+        self,
+        exchange_order_ids: set[str],
+        *,
+        known_position_order_ids: set[str],
+    ) -> list[Position]:
+        target_ids = {
+            str(item or "").strip()
+            for item in exchange_order_ids
+            if str(item or "").strip()
+            and str(item or "").strip() not in known_position_order_ids
+        }
+        if not target_ids:
+            return []
+
+        positions_by_id: dict[int, Position] = {}
+        ordered_target_ids = sorted(target_ids)
+        async with get_read_session_ctx() as session:
+            for offset in range(0, len(ordered_target_ids), 100):
+                batch = ordered_target_ids[offset : offset + 100]
+                clauses = [
+                    column.contains(order_id)
+                    for order_id in batch
+                    for column in (
+                        Position.entry_exchange_order_id,
+                        Position.close_exchange_order_id,
+                    )
+                ]
+                position_rows = await session.execute(
+                    select(Position).where(
+                        Position.execution_mode == self.mode,
+                        or_(*clauses),
+                    )
+                )
+                for position in position_rows.scalars().all():
+                    linked_ids = _split_exchange_order_ids(
+                        position.entry_exchange_order_id
+                    ) | _split_exchange_order_ids(position.close_exchange_order_id)
+                    if linked_ids & target_ids:
+                        positions_by_id[int(position.id)] = position
+        return list(positions_by_id.values())
+
     async def _fetch_positions(self, executor: Any) -> list[dict[str, Any]]:
         fetch = getattr(executor, "get_positions_strict", None)
         if not callable(fetch):
@@ -630,7 +749,7 @@ class OkxAuthoritativeSyncService:
             order_ids=target_order_ids,
             since=since,
             limit=100,
-            max_pages=max(3, min(10, (self.limit // 100) + 2)),
+            max_pages=MAX_AUTHORITATIVE_FILL_PAGES,
             account_wide_only=True,
             strict=True,
         )

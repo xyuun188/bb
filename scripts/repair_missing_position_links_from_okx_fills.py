@@ -57,6 +57,7 @@ DEFAULT_LIMIT = 100
 QUANTITY_TOLERANCE_RATIO = 0.05
 BACKUP_DIR = Path("data/codex_backups/missing-position-links-from-okx-fills")
 REPAIR_REFLECTION_SOURCE = "okx_position_link_repair"
+ADDITIONAL_ENTRY_LINK_REPAIR_SOURCE = "okx_additional_entry_link_repair"
 ORDER_DECISION_LINEAGE_REPAIR_SOURCE = "okx_order_decision_lineage_repair"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
@@ -292,15 +293,21 @@ def _position_fill_symbol(position: Position) -> str:
 
 
 def _split_exchange_order_ids(value: Any) -> list[str]:
-    tokens = {str(value or "").strip()}
-    if not next(iter(tokens), ""):
+    text = str(value or "").strip()
+    if not text:
         return []
+    tokens = [text]
     for separator in (",", ";", "|", "\n", "\t", " "):
-        pieces: set[str] = set()
+        pieces: list[str] = []
+        seen: set[str] = set()
         for token in tokens:
-            pieces.update(part.strip() for part in token.split(separator) if part.strip())
+            for part in token.split(separator):
+                normalized = part.strip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    pieces.append(normalized)
         tokens = pieces
-    return [token for token in tokens if token]
+    return tokens
 
 
 def _position_entry_action(position: Position) -> str:
@@ -422,6 +429,153 @@ async def collect_plans(
             if plan is not None:
                 if not requested_exchange_ids or plan.okx_order_id in requested_exchange_ids:
                     plans.append(plan)
+    return plans
+
+
+def _additional_entry_link_plan(
+    order: Order,
+    decision: AIDecision | None,
+    positions: list[Position],
+) -> FillLinkPlan | None:
+    exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    filled_at = _aware(getattr(order, "filled_at", None) or getattr(order, "created_at", None))
+    action = str(getattr(decision, "action", "") or "").strip().lower()
+    if not exchange_order_id or filled_at is None or action not in {"long", "short"}:
+        return None
+    order_symbol = normalize_trading_symbol(
+        getattr(order, "okx_inst_id", None) or getattr(order, "symbol", None)
+    )
+    order_side = str(getattr(order, "side", "") or "").strip().lower()
+    execution_mode = str(getattr(order, "execution_mode", "") or "paper").strip().lower()
+    candidates = []
+    for position in positions:
+        if normalize_trading_symbol(
+            _position_okx_inst_id(position) or getattr(position, "symbol", None)
+        ) != order_symbol:
+            continue
+        if str(getattr(position, "execution_mode", "") or "paper").strip().lower() != execution_mode:
+            continue
+        if _position_entry_action(position) != action or _entry_side(position) != order_side:
+            continue
+        created_at = _aware(getattr(position, "created_at", None))
+        closed_at = _aware(getattr(position, "closed_at", None))
+        if created_at is None or created_at > filled_at:
+            continue
+        if closed_at is not None and closed_at < filled_at:
+            continue
+        linked_ids = {
+            *_split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None)),
+            *_split_exchange_order_ids(getattr(position, "close_exchange_order_id", None)),
+        }
+        if exchange_order_id in linked_ids:
+            return None
+        candidates.append(position)
+    if len(candidates) != 1:
+        return None
+    position = candidates[0]
+    raw_fills = getattr(order, "okx_raw_fills", None)
+    raw_fills = raw_fills if isinstance(raw_fills, dict) else {}
+    contract_size = _safe_float(raw_fills.get("contract_size"))
+    return FillLinkPlan(
+        position_id=int(position.id),
+        link_kind="entry_add",
+        symbol=order_symbol,
+        side=str(position.side or ""),
+        quantity=_safe_float(position.quantity),
+        okx_order_id=exchange_order_id,
+        old_entry_exchange_order_id=getattr(position, "entry_exchange_order_id", None),
+        old_close_exchange_order_id=getattr(position, "close_exchange_order_id", None),
+        old_okx_inst_id=getattr(position, "okx_inst_id", None),
+        fill_timestamp=filled_at,
+        position_reference_time=created_at,
+        time_delta_seconds=max((filled_at - created_at).total_seconds(), 0.0),
+        fill_quantity=_safe_float(getattr(order, "quantity", None)),
+        fill_contracts=_safe_float(getattr(order, "okx_fill_contracts", None)),
+        fill_price=_safe_float(getattr(order, "price", None)),
+        source=ADDITIONAL_ENTRY_LINK_REPAIR_SOURCE,
+        okx_inst_id=str(getattr(order, "okx_inst_id", "") or "").strip().upper(),
+        fill_fee=_safe_float(getattr(order, "fee", None)),
+        fill_pnl=_safe_float(getattr(order, "pnl", None)),
+        contract_size=contract_size,
+        contract_size_source=("order.okx_raw_fills.contract_size" if contract_size > 0 else ""),
+    )
+
+
+async def collect_additional_entry_link_plans(
+    *,
+    days: int = DEFAULT_DAYS,
+    limit: int = DEFAULT_LIMIT,
+    position_ids: tuple[int, ...] = (),
+    exchange_order_ids: tuple[str, ...] = (),
+) -> list[FillLinkPlan]:
+    since = datetime.now(UTC) - timedelta(days=max(int(days or DEFAULT_DAYS), 1))
+    capped_limit = max(1, min(int(limit or DEFAULT_LIMIT), 1000))
+    requested_exchange_ids = {
+        str(item or "").strip() for item in exchange_order_ids if str(item or "").strip()
+    }
+    async with get_session_ctx() as session:
+        order_stmt = select(Order).where(
+            Order.status == "filled",
+            Order.exchange_order_id.is_not(None),
+            Order.exchange_order_id != "",
+            Order.okx_sync_status.in_(TRUSTED_CLOSE_ORDER_SYNC_STATUSES),
+        )
+        if requested_exchange_ids:
+            order_stmt = order_stmt.where(Order.exchange_order_id.in_(requested_exchange_ids))
+        else:
+            order_stmt = order_stmt.where(
+                or_(
+                    Order.filled_at >= since.replace(tzinfo=None),
+                    Order.created_at >= since.replace(tzinfo=None),
+                )
+            )
+        orders = list(
+            (
+                await session.execute(
+                    order_stmt.order_by(Order.filled_at.desc(), Order.id.desc()).limit(capped_limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        decision_ids = {
+            int(order.decision_id)
+            for order in orders
+            if getattr(order, "decision_id", None) is not None
+        }
+        decisions = {
+            int(decision.id): decision
+            for decision in (
+                (
+                    await session.execute(
+                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                    )
+                )
+                .scalars()
+                .all()
+                if decision_ids
+                else []
+            )
+        }
+        position_stmt = select(Position).where(
+            or_(
+                Position.created_at >= since.replace(tzinfo=None),
+                Position.closed_at >= since.replace(tzinfo=None),
+                Position.closed_at.is_(None),
+            )
+        )
+        if position_ids:
+            position_stmt = position_stmt.where(Position.id.in_(position_ids))
+        positions = list((await session.execute(position_stmt)).scalars().all())
+    plans = []
+    for order in orders:
+        plan = _additional_entry_link_plan(
+            order,
+            decisions.get(int(getattr(order, "decision_id", 0) or 0)),
+            positions,
+        )
+        if plan is not None:
+            plans.append(plan)
     return plans
 
 
@@ -1904,13 +2058,22 @@ async def apply_plans(plans: list[FillLinkPlan]) -> dict[str, Any]:
                 if str(getattr(position, "entry_exchange_order_id", "") or "").strip():
                     continue
                 position.entry_exchange_order_id = plan.okx_order_id
+            elif plan.link_kind == "entry_add":
+                existing_entry_ids = _split_exchange_order_ids(
+                    getattr(position, "entry_exchange_order_id", None)
+                )
+                if plan.okx_order_id in existing_entry_ids:
+                    continue
+                position.entry_exchange_order_id = ",".join(
+                    [*existing_entry_ids, plan.okx_order_id]
+                )
             elif plan.link_kind == "close":
                 if str(getattr(position, "close_exchange_order_id", "") or "").strip():
                     continue
                 position.close_exchange_order_id = plan.okx_order_id
             else:
                 continue
-            if await _ensure_missing_order_row_for_fill_link(
+            if plan.link_kind != "entry_add" and await _ensure_missing_order_row_for_fill_link(
                 session,
                 position=position,
                 plan=plan,
@@ -2827,6 +2990,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--position-id", action="append", type=int, default=[])
     parser.add_argument("--create-missing-order-rows", action="store_true")
     parser.add_argument("--link-existing-order-decisions", action="store_true")
+    parser.add_argument("--link-additional-entry-orders", action="store_true")
     parser.add_argument("--create-linked-protection-fill-orders", action="store_true")
     parser.add_argument("--close-missing-exchange-open-position", action="store_true")
     parser.add_argument("--quarantine-missing-exchange-open-position", action="store_true")
@@ -2887,6 +3051,16 @@ async def main() -> int:
             if args.link_existing_order_decisions
             else []
         )
+        additional_entry_link_plans = (
+            await collect_additional_entry_link_plans(
+                days=args.days,
+                limit=args.limit,
+                position_ids=tuple(args.position_id or ()),
+                exchange_order_ids=tuple(args.exchange_order_id or ()),
+            )
+            if args.link_additional_entry_orders
+            else []
+        )
         open_position_close_plans = (
             await collect_open_position_close_plans(
                 days=args.days,
@@ -2941,6 +3115,9 @@ async def main() -> int:
         "existing_order_decision_link_plans": [
             _json_safe(asdict(plan)) for plan in existing_order_decision_link_plans
         ],
+        "additional_entry_link_plans": [
+            _json_safe(asdict(plan)) for plan in additional_entry_link_plans
+        ],
         "linked_protection_fill_order_plans": [
             _json_safe(asdict(plan)) for plan in linked_protection_fill_order_plans
         ],
@@ -2975,6 +3152,10 @@ async def main() -> int:
                     await apply_existing_order_decision_link_plans(
                         existing_order_decision_link_plans
                     )
+                )
+            if args.link_additional_entry_orders:
+                result["apply_additional_entry_link_result"] = await apply_plans(
+                    additional_entry_link_plans
                 )
             if args.create_linked_protection_fill_orders:
                 result["apply_linked_protection_fill_order_result"] = (
