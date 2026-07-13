@@ -547,12 +547,9 @@ class StrategyLearningEngine:
                 == current_regime
             )
         ]
-        active = (applicable or governed or candidates or [None])[0]
-        influence_enabled = bool(
-            active
-            and _safe_dict(active.get("promotion")).get("production_influence_eligible")
-            is True
-        )
+        leading = (candidates or [None])[0]
+        active = (applicable or [None])[0]
+        influence_enabled = bool(governed)
         scheduler_mode = (
             "governed_dynamic_return"
             if influence_enabled
@@ -561,7 +558,7 @@ class StrategyLearningEngine:
             else "insufficient_authoritative_evidence"
         )
         reason = (
-            "Highest fee-after return LCB candidate is active as a historical prior; "
+            "Governed fee-after return candidates are available as matching historical priors; "
             "the current live return and dynamic risk contracts still own execution."
             if influence_enabled
             else "Candidates remain in shadow because walk-forward or cost-complete shadow evidence is incomplete."
@@ -612,6 +609,7 @@ class StrategyLearningEngine:
         }
         schedule = {
             "active_profile": active,
+            "leading_candidate": leading,
             "reason": reason,
             "runtime": runtime,
             "candidates": candidates,
@@ -641,6 +639,7 @@ class StrategyLearningEngine:
         schedule = _safe_dict(payload.get("schedule"))
         runtime = _safe_dict(schedule.get("runtime"))
         active = _safe_dict(schedule.get("active_profile"))
+        leading = _safe_dict(schedule.get("leading_candidate"))
         result["strategy_profile_id"] = active.get("id")
         result["strategy_profile_version"] = active.get("version")
         result["scheduler_reason"] = schedule.get("reason")
@@ -650,6 +649,7 @@ class StrategyLearningEngine:
             "governed_candidate_count": schedule.get("governed_candidate_count"),
             "rejected_candidate_count": schedule.get("rejected_candidate_count"),
             "active_profile": active,
+            "leading_candidate": leading,
             "runtime": runtime,
             "advisory_prior_only": True,
             "production_permission": False,

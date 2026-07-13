@@ -105,6 +105,7 @@ def test_scheduler_uses_walk_forward_and_cost_complete_shadow_governance() -> No
     assert schedule["runtime"]["can_authorize_entry"] is False
     assert schedule["runtime"]["can_change_size_or_leverage"] is False
     assert schedule["active_profile"]["promotion"]["production_permission"] is False
+    assert schedule["active_profile"]["params"]["selector"]["scope"] != "symbol_side"
     assert all(row["partition_policy"] == "sqrt_cardinality_expanding_walk_forward" for row in schedule["backtest"]["rows"])
     assert schedule["shadow_validation"]["cost_complete_required"] is True
     assert all(row["rows"] == [] for row in schedule["shadow_validation"]["rows"])
@@ -158,6 +159,8 @@ def test_missing_shadow_evidence_fails_closed_without_numeric_fallback() -> None
     assert payload["schedule"]["scheduler_mode"] == "shadow_validation"
     assert payload["schedule"]["governed_candidate_count"] == 0
     assert payload["schedule"]["runtime"]["production_influence_enabled"] is False
+    assert payload["schedule"]["active_profile"] is None
+    assert payload["schedule"]["leading_candidate"] == payload["schedule"]["candidates"][0]
     assert all(
         "no_cost_complete_shadow_samples" in row["promotion"]["rejection_reasons"]
         for row in payload["schedule"]["candidates"]
@@ -166,6 +169,24 @@ def test_missing_shadow_evidence_fails_closed_without_numeric_fallback() -> None
         row["shadow_validation"]["metrics"]["return_lcb_pct"] is None
         for row in payload["schedule"]["candidates"]
     )
+
+
+def test_blocked_leading_candidate_is_not_attached_as_active_strategy() -> None:
+    feedback = _feedback()
+    feedback.shadow_return_samples.clear()
+    engine = StrategyLearningEngine()
+    payload = engine.build_from_feedback(feedback)
+
+    result = engine.apply_to_context({}, payload)
+
+    assert result["strategy_profile_id"] is None
+    assert result["strategy_profile_version"] is None
+    assert result["strategy_learning"]["active_profile"] == {}
+    assert (
+        result["strategy_learning"]["leading_candidate"]["id"]
+        == payload["schedule"]["leading_candidate"]["id"]
+    )
+    assert result["strategy_learning"]["production_permission"] is False
 
 
 def test_external_profile_cannot_reenter_scheduler() -> None:
