@@ -551,6 +551,18 @@ class OkxPerpetualSdkExchange:
             ccy=str((params or {}).get("ccy") or ""),
         )
 
+    async def privateGetAccountFeeRates(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.account_api,
+            "get_fee_rates",
+            instType=OKX_SWAP_INST_TYPE,
+            instId="",
+            uly=str(params.get("uly") or ""),
+            category=str(params.get("category") or ""),
+            instFamily=str(params.get("instFamily") or ""),
+        )
+
     async def privateGetAccountPositions(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
         return await self._call_sdk(

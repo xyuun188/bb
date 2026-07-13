@@ -3107,6 +3107,32 @@ async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> No
     await task
 
 
+def test_decision_snapshot_keeps_governed_strategy_attribution_without_permission() -> None:
+    service = TradingService.__new__(TradingService)
+    decision = _decision(Action.LONG)
+    strategy_context = {
+        "strategy_profile_id": "fee_after_return_side_abc",
+        "strategy_profile_version": 42,
+        "scheduler_reason": "highest governed fee-after return LCB",
+        "market_regime": {"mode": "trend"},
+        "strategy_learning": {
+            "scheduler_mode": "governed_dynamic_return",
+            "active_profile": {"id": "fee_after_return_side_abc", "version": 42},
+            "runtime": {"production_influence_enabled": True},
+        },
+    }
+
+    service._attach_strategy_learning_context(decision, strategy_context)
+
+    snapshot = decision.raw_response["strategy_learning_context"]
+    assert snapshot["strategy_profile_id"] == "fee_after_return_side_abc"
+    assert snapshot["strategy_profile_version"] == 42
+    assert snapshot["scheduler_reason"] == "highest governed fee-after return LCB"
+    assert snapshot["production_influence_enabled"] is True
+    assert snapshot["production_permission"] is False
+    assert snapshot["advisory_prior_only"] is True
+
+
 @pytest.mark.asyncio
 async def test_strategy_context_io_gate_bounds_shared_history_query_fanout() -> None:
     service = TradingService.__new__(TradingService)

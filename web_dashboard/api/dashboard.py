@@ -6492,6 +6492,10 @@ async def get_strategy_learning(
         capped_hours,
         capped_limit,
         selected_detail,
+        await _strategy_learning_watermark_for_request(
+            selected_mode=selected_mode,
+            since=datetime.now(UTC) - timedelta(hours=capped_hours),
+        ),
     )
     cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
     if cached is not None:
@@ -6506,6 +6510,72 @@ async def get_strategy_learning(
         detail=selected_detail,
     )
     return sanitize_payload(_dashboard_heavy_cache_set(cache_key, payload))
+
+
+async def _strategy_learning_watermark_for_request(
+    *,
+    selected_mode: str,
+    since: datetime,
+) -> tuple[Any, ...]:
+    from sqlalchemy import func, select
+
+    from db.session import get_read_session_ctx
+    from models.learning import ShadowBacktest, StrategyLearningEvent
+    from models.trade import Position
+
+    closed_filters = (
+        Position.execution_mode == selected_mode,
+        Position.is_open.is_(False),
+        Position.closed_at >= since.replace(tzinfo=None),
+    )
+    open_filters = (
+        Position.execution_mode == selected_mode,
+        Position.is_open.is_(True),
+    )
+    shadow_filters = (
+        ShadowBacktest.execution_mode == selected_mode,
+        ShadowBacktest.status == "completed",
+        ShadowBacktest.created_at >= since.replace(tzinfo=None),
+    )
+    event_filters = (
+        StrategyLearningEvent.execution_mode == selected_mode,
+        StrategyLearningEvent.created_at >= since.replace(tzinfo=None),
+    )
+    async with get_read_session_ctx() as session:
+        row = (
+            await session.execute(
+                select(
+                    select(func.count(Position.id)).where(*closed_filters).scalar_subquery(),
+                    select(func.max(Position.id)).where(*closed_filters).scalar_subquery(),
+                    select(func.max(Position.updated_at))
+                    .where(*closed_filters)
+                    .scalar_subquery(),
+                    select(func.count(Position.id)).where(*open_filters).scalar_subquery(),
+                    select(func.max(Position.updated_at))
+                    .where(*open_filters)
+                    .scalar_subquery(),
+                    select(func.count(ShadowBacktest.id))
+                    .where(*shadow_filters)
+                    .scalar_subquery(),
+                    select(func.max(ShadowBacktest.id))
+                    .where(*shadow_filters)
+                    .scalar_subquery(),
+                    select(func.max(ShadowBacktest.updated_at))
+                    .where(*shadow_filters)
+                    .scalar_subquery(),
+                    select(func.count(StrategyLearningEvent.id))
+                    .where(*event_filters)
+                    .scalar_subquery(),
+                    select(func.max(StrategyLearningEvent.id))
+                    .where(*event_filters)
+                    .scalar_subquery(),
+                    select(func.max(StrategyLearningEvent.updated_at))
+                    .where(*event_filters)
+                    .scalar_subquery(),
+                )
+            )
+        ).one()
+    return tuple(value.isoformat() if isinstance(value, datetime) else value for value in row)
 
 
 async def _profit_attribution_watermark(

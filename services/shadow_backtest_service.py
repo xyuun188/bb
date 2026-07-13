@@ -27,6 +27,7 @@ SymbolNormalizer = Callable[[str | None], str]
 FloatParser = Callable[[Any, float], float]
 SessionFactory = Callable[[], Any]
 RepositoryFactory = Callable[[Any], Any]
+ExecutionCostFactsProvider = Callable[[str], Awaitable[dict[str, Any]]]
 
 _SHADOW_TOOL_NAMES = (
     "profit_prediction",
@@ -193,7 +194,7 @@ def compact_local_ai_tools_shadow(local_ai_tools_context: dict[str, Any] | None)
     return compact if any(key in compact for key in _SHADOW_TOOL_NAMES) else {}
 
 
-def _shadow_fee_after_outcome(
+def shadow_fee_after_outcome(
     row: Any,
     *,
     long_return: float,
@@ -202,7 +203,7 @@ def _shadow_fee_after_outcome(
     snapshot = getattr(row, "feature_snapshot", None)
     features = snapshot if isinstance(snapshot, dict) else {}
     execution_cost = execution_cost_estimate(features)
-    funding_present = "funding_rate" in features
+    funding_present = features.get("funding_data_available") is True
     funding_rate = _safe_shadow_number(features.get("funding_rate")) if funding_present else None
     funding_interval_minutes = _safe_shadow_number(features.get("funding_interval_minutes"))
     if funding_interval_minutes is None:
@@ -211,8 +212,9 @@ def _shadow_fee_after_outcome(
             funding_interval_hours * 60.0 if funding_interval_hours is not None else None
         )
     cost_complete = bool(
-        execution_cost.spread_source != "missing"
+        execution_cost.production_eligible
         and funding_rate is not None
+        and funding_present
         and funding_interval_minutes is not None
         and funding_interval_minutes > 0
     )
@@ -247,6 +249,19 @@ def _shadow_fee_after_outcome(
         "objective": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "cost_complete": cost_complete,
+        "incomplete_reasons": [
+            reason
+            for condition, reason in (
+                (execution_cost.production_eligible, execution_cost.reason),
+                (funding_present, "funding_observation_missing"),
+                (
+                    funding_interval_minutes is not None
+                    and funding_interval_minutes > 0,
+                    "funding_interval_missing",
+                ),
+            )
+            if not condition
+        ],
         "cost_source": "dynamic_execution_estimate_from_shadow_snapshot",
         "fee_return_pct": execution_cost.fee_pct,
         "slippage_return_pct": execution_cost.slippage_pct,
@@ -268,6 +283,7 @@ class ShadowBacktestService:
     float_parser: FloatParser
     session_factory: SessionFactory = get_session_ctx
     repository_factory: RepositoryFactory = MemoryRepository
+    execution_cost_facts_provider: ExecutionCostFactsProvider | None = None
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
     fixed_model_slots: list[dict[str, Any]] = field(
         default_factory=lambda: list(FIXED_AI_MODEL_SLOTS)
@@ -346,6 +362,30 @@ class ShadowBacktestService:
             if not rows:
                 return 0
 
+            execution_cost_facts: dict[str, dict[str, Any]] = {}
+            if self.execution_cost_facts_provider is not None:
+                execution_modes = sorted(
+                    {
+                        "live"
+                        if str(getattr(row, "execution_mode", "paper")).lower() == "live"
+                        else "paper"
+                        for row in rows
+                    }
+                )
+                for execution_mode in execution_modes:
+                    try:
+                        facts = await self.execution_cost_facts_provider(execution_mode)
+                    except Exception as exc:
+                        logger.warning(
+                            "shadow execution cost fact refresh failed",
+                            mode=execution_mode,
+                            error=safe_error_text(exc),
+                        )
+                        facts = {}
+                    execution_cost_facts[execution_mode] = (
+                        dict(facts) if isinstance(facts, dict) else {}
+                    )
+
             # Price collection can wait on an exchange request.  Keep it outside the
             # ORM context so low-priority shadow maintenance cannot exhaust the pool.
             price_cache: dict[str, float] = {}
@@ -362,9 +402,23 @@ class ShadowBacktestService:
                 if actual_price <= 0 or entry_price <= 0:
                     continue
 
+                execution_mode = (
+                    "live"
+                    if str(getattr(row, "execution_mode", "paper")).lower() == "live"
+                    else "paper"
+                )
+                feature_snapshot = getattr(row, "feature_snapshot", None)
+                feature_snapshot = (
+                    dict(feature_snapshot) if isinstance(feature_snapshot, dict) else {}
+                )
+                current_cost_facts = execution_cost_facts.get(execution_mode, {})
+                if _safe_shadow_number(current_cost_facts.get("taker_fee_rate")):
+                    feature_snapshot.update(current_cost_facts)
+                row.feature_snapshot = feature_snapshot
+
                 long_return = (actual_price - entry_price) / entry_price
                 short_return = (entry_price - actual_price) / entry_price
-                fee_after_outcome = _shadow_fee_after_outcome(
+                fee_after_outcome = shadow_fee_after_outcome(
                     row,
                     long_return=long_return,
                     short_return=short_return,
@@ -387,6 +441,7 @@ class ShadowBacktestService:
                     "best_action": best_action,
                     "missed": missed,
                     "fee_after_outcome": fee_after_outcome,
+                    "feature_snapshot": feature_snapshot,
                     "note": self._completion_note(
                         decision_action,
                         best_action,
@@ -413,6 +468,7 @@ class ShadowBacktestService:
                     completion = completions.get(int(getattr(row, "id", 0) or 0))
                     if completion is None:
                         continue
+                    row.feature_snapshot = completion["feature_snapshot"]
                     await repo.complete_shadow_backtest(
                         row,
                         actual_price=completion["actual_price"],

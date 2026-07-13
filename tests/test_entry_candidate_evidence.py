@@ -78,6 +78,45 @@ def test_memory_feedback_is_observation_only_and_cannot_change_side_scores() -> 
     assert "memory_score_adjustment" not in evidence["policy_provenance"]
 
 
+def test_governed_schedule_is_exposed_as_prior_without_changing_current_score() -> None:
+    strategy = {
+        "strategy_learning": {
+            "runtime": {
+                "current_market_regime": "trend",
+                "governed_profiles": [
+                    {
+                        "id": "portfolio_long",
+                        "rank": 1,
+                        "selector": {"scope": "side", "side": "long"},
+                        "historical_return_distribution": {"return_lcb_pct": 0.3},
+                    },
+                    {
+                        "id": "btc_long",
+                        "rank": 2,
+                        "selector": {
+                            "scope": "symbol_side",
+                            "symbol": "BTC/USDT",
+                            "side": "long",
+                        },
+                        "historical_return_distribution": {"return_lcb_pct": 0.8},
+                        "walk_forward": {"return_lcb_pct": 0.6},
+                        "shadow_validation": {"return_lcb_pct": 0.4},
+                    },
+                ],
+            }
+        }
+    }
+
+    evidence = _policy().build(_Feature(), strategy, {}, {}, {}, {})
+
+    prior = evidence["long"]["scheduled_return_prior"]
+    assert prior["available"] is True
+    assert prior["profile_id"] == "btc_long"
+    assert prior["role"] == "historical_prior_only"
+    assert prior["can_authorize_entry"] is False
+    assert evidence["long"]["score"] == pytest.approx(0.45)
+
+
 def test_candidate_evidence_has_no_legacy_probe_contract() -> None:
     evidence = _policy().build(_Feature(), {}, {}, {}, {}, {})
 

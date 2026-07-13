@@ -8,6 +8,21 @@ from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
 
 
+class _FeeSnapshotExchange:
+    async def privateGetAccountFeeRates(self, params):
+        assert params == {"instType": "SWAP"}
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "taker": "-0.0005",
+                    "takerU": "-0.0005",
+                    "ts": "1783931709453",
+                }
+            ],
+        }
+
+
 class _MissingLabMarketExchange:
     def __init__(self) -> None:
         self.markets = {"BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT"}}
@@ -90,6 +105,20 @@ class _MissingLabMarketExchange:
 
     def set_markets(self, markets):
         self.markets = {market["symbol"]: market for market in markets}
+
+
+@pytest.mark.asyncio
+async def test_executor_reads_dynamic_account_swap_fee_snapshot() -> None:
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    executor._exchange = _FeeSnapshotExchange()
+
+    snapshot = await executor.fetch_account_fee_snapshot()
+
+    assert snapshot["taker_fee_rate"] == pytest.approx(0.0005)
+    assert snapshot["entry_fee_rate"] == pytest.approx(0.0005)
+    assert snapshot["exit_fee_rate"] == pytest.approx(0.0005)
+    assert snapshot["fee_rate_source"] == "okx_account_trade_fee.takerU"
+    assert snapshot["policy_provenance"]["fallback_reason"] == ""
 
 
 class _ContractDeliveryLabExchange(_MissingLabMarketExchange):

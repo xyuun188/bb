@@ -634,6 +634,7 @@ class TradingService:
             latest_price_provider=self._latest_price_for_symbol,
             symbol_normalizer=self._normalize_position_symbol,
             float_parser=self._safe_float,
+            execution_cost_facts_provider=self._shadow_execution_cost_facts,
         )
         self.stale_entry_candidate_expirer = StaleEntryCandidateExpirer(self._safe_float)
         self.decision_final_state_ensurer = DecisionFinalStateEnsurer(
@@ -4106,11 +4107,19 @@ class TradingService:
         if not isinstance(strategy_mode_context, dict):
             return
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        learning = self._safe_dict(strategy_mode_context.get("strategy_learning"))
+        runtime = self._safe_dict(learning.get("runtime"))
         raw["strategy_learning_context"] = {
-            "observation_only": True,
+            "advisory_prior_only": True,
             "production_permission": False,
-            "optimization_target": "realized_fee_after_return",
-            "strategy_learning": strategy_mode_context.get("strategy_learning"),
+            "optimization_target": "maximize_authoritative_fee_after_return_rate",
+            "strategy_profile_id": strategy_mode_context.get("strategy_profile_id"),
+            "strategy_profile_version": strategy_mode_context.get("strategy_profile_version"),
+            "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
+            "market_regime": strategy_mode_context.get("market_regime"),
+            "production_influence_enabled": runtime.get("production_influence_enabled")
+            is True,
+            "strategy_learning": learning,
         }
         decision.raw_response = raw
 
@@ -8602,6 +8611,12 @@ class TradingService:
             )
             await self._okx_live.initialize()
         return self._okx_live
+
+    async def _shadow_execution_cost_facts(self, mode: str) -> dict[str, Any]:
+        """Read current account fee facts once for each due-shadow mode batch."""
+
+        executor = await self._get_okx_executor_for_mode(mode)
+        return await executor.fetch_account_fee_snapshot()
 
     async def _get_okx_available_balance_for_mode(self, mode: str) -> float | None:
         """Return the actual OKX free USDT balance used to cap new entries."""

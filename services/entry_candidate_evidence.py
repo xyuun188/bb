@@ -32,6 +32,61 @@ def _feature_snapshot(feature_vector: Any) -> dict[str, Any]:
     return snapshot if isinstance(snapshot, dict) else {}
 
 
+def _scheduled_return_prior(
+    strategy: dict[str, Any] | None,
+    *,
+    symbol: str,
+    side: str,
+) -> dict[str, Any]:
+    strategy_context = _safe_dict(strategy)
+    learning = _safe_dict(strategy_context.get("strategy_learning"))
+    runtime = _safe_dict(learning.get("runtime"))
+    current_regime = str(runtime.get("current_market_regime") or "").lower()
+    applicable: list[dict[str, Any]] = []
+    for profile in runtime.get("governed_profiles") or []:
+        item = _safe_dict(profile)
+        selector = _safe_dict(item.get("selector"))
+        if str(selector.get("side") or "").lower() != side:
+            continue
+        selected_symbol = str(selector.get("symbol") or "").upper()
+        selected_regime = str(selector.get("market_regime") or "").lower()
+        if selected_symbol and selected_symbol != symbol.upper():
+            continue
+        if selected_regime and selected_regime != current_regime:
+            continue
+        applicable.append(item)
+    if not applicable:
+        return {
+            "available": False,
+            "role": "historical_prior_only",
+            "can_authorize_entry": False,
+        }
+    applicable.sort(
+        key=lambda item: (
+            bool(_safe_dict(item.get("selector")).get("symbol")),
+            bool(_safe_dict(item.get("selector")).get("market_regime")),
+            -int(_safe_float(item.get("rank"), 0.0)),
+        ),
+        reverse=True,
+    )
+    selected = applicable[0]
+    return {
+        "available": True,
+        "profile_id": selected.get("id"),
+        "profile_version": selected.get("version"),
+        "rank": selected.get("rank"),
+        "selector": _safe_dict(selected.get("selector")),
+        "historical_return_distribution": _safe_dict(
+            selected.get("historical_return_distribution")
+        ),
+        "walk_forward": _safe_dict(selected.get("walk_forward")),
+        "shadow_validation": _safe_dict(selected.get("shadow_validation")),
+        "role": "historical_prior_only",
+        "current_return_contract_required": True,
+        "can_authorize_entry": False,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class EntryCandidateEvidencePolicy:
     """Compare both sides without granting execution or probe permission."""
@@ -168,6 +223,11 @@ class EntryCandidateEvidencePolicy:
                 8,
             ),
             "execution_cost": _safe_dict(opportunity.get("execution_cost")),
+            "scheduled_return_prior": _scheduled_return_prior(
+                strategy,
+                symbol=symbol,
+                side=side,
+            ),
             "production_source_count": source_count,
             "production_eligible": production_eligible,
             "recommendation": (

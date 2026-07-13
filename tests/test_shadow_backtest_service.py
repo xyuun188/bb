@@ -47,7 +47,11 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _service(repo: _FakeRepo, latest_price: float = 101.0) -> ShadowBacktestService:
+def _service(
+    repo: _FakeRepo,
+    latest_price: float = 101.0,
+    execution_cost_facts_provider=None,
+) -> ShadowBacktestService:
     async def latest(_symbol: str) -> float:
         return latest_price
 
@@ -57,6 +61,7 @@ def _service(repo: _FakeRepo, latest_price: float = 101.0) -> ShadowBacktestServ
         float_parser=_float,
         session_factory=_SessionCtx,
         repository_factory=lambda _session: repo,
+        execution_cost_facts_provider=execution_cost_facts_provider,
         horizons_minutes=(10, 30),
     )
 
@@ -251,7 +256,9 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
             "ask": 100.01,
             "orderbook_bid_depth": 100_000.0,
             "orderbook_ask_depth": 100_000.0,
+            "taker_fee_rate": 0.0005,
             "funding_rate": 0.0,
+            "funding_data_available": True,
             "funding_interval_minutes": 480.0,
         },
     )
@@ -293,7 +300,9 @@ async def test_shadow_horizons_share_one_correlated_memory_key_per_expert(
         "ask": 100.01,
         "orderbook_bid_depth": 100_000.0,
         "orderbook_ask_depth": 100_000.0,
+        "taker_fee_rate": 0.0005,
         "funding_rate": 0.0,
+        "funding_data_available": True,
         "funding_interval_minutes": 480.0,
     }
     repo.due_rows = [
@@ -319,6 +328,64 @@ async def test_shadow_horizons_share_one_correlated_memory_key_per_expert(
     assert {
         item["extra"]["correlation_group"] for item in repo.memories
     } == {"shadow_decision:456"}
+
+
+@pytest.mark.asyncio
+async def test_due_shadow_fetches_current_account_fee_once_per_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+    repo = _FakeRepo()
+    repo.due_rows = [
+        SimpleNamespace(
+            id=81,
+            decision_id=987,
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            decision_action="hold",
+            entry_price=100.0,
+            horizon_minutes=10,
+            status="pending",
+            note="",
+            feature_snapshot={
+                "bid": 99.99,
+                "ask": 100.01,
+                "orderbook_bid_depth": 100_000.0,
+                "orderbook_ask_depth": 100_000.0,
+                "funding_rate": 0.0,
+                "funding_data_available": True,
+                "funding_interval_minutes": 480.0,
+            },
+        )
+    ]
+    calls: list[str] = []
+
+    async def fee_facts(mode: str) -> dict[str, Any]:
+        calls.append(mode)
+        return {
+            "taker_fee_rate": 0.0005,
+            "entry_fee_rate": 0.0005,
+            "exit_fee_rate": 0.0005,
+            "fee_rate_source": "okx_account_trade_fee.takerU",
+            "fee_rate_observed_at": "2026-07-13T08:00:00+00:00",
+        }
+
+    await _service(
+        repo,
+        latest_price=101.0,
+        execution_cost_facts_provider=fee_facts,
+    ).update_due()
+
+    assert calls == ["paper"]
+    assert repo.due_rows[0].feature_snapshot["taker_fee_rate"] == pytest.approx(0.0005)
+    assert repo.due_rows[0].feature_snapshot["fee_rate_source"] == (
+        "okx_account_trade_fee.takerU"
+    )
+    assert len(repo.memories) == 4
+    assert all(item["extra"]["cost_complete"] is True for item in repo.memories)
 
 
 @pytest.mark.asyncio

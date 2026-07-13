@@ -179,19 +179,39 @@ class OKXRestClient:
             data = await self._ccxt_call("fetch_funding_rate", self._to_swap_symbol(symbol))
         except Exception as exc:
             logger.debug("fetch funding rate failed", symbol=symbol, error=safe_error_text(exc))
-            return {"funding_rate": 0.0, "next_funding_time": None}
+            return {
+                "funding_rate": 0.0,
+                "funding_data_available": False,
+                "funding_interval_minutes": None,
+                "funding_time": None,
+                "next_funding_time": None,
+            }
 
         info = data.get("info") or {}
+        funding_time = data.get("fundingDatetime") or info.get("fundingTime")
+        next_funding_time = data.get("nextFundingDatetime") or info.get("nextFundingTime")
+        funding_time_ms = self._safe_float(funding_time)
+        next_funding_time_ms = self._safe_float(next_funding_time)
+        funding_interval_minutes = (
+            (next_funding_time_ms - funding_time_ms) / 60_000.0
+            if funding_time_ms > 0 and next_funding_time_ms > funding_time_ms
+            else None
+        )
+        funding_rate_present = any(
+            key in data or key in info
+            for key in ("fundingRate", "funding_rate")
+        )
         return {
             "funding_rate": self._safe_float(
                 data.get("fundingRate") or data.get("funding_rate") or info.get("fundingRate")
             ),
-            "next_funding_time": (
-                data.get("nextFundingDatetime")
-                or data.get("fundingDatetime")
-                or info.get("nextFundingTime")
-                or info.get("fundingTime")
+            "funding_data_available": bool(
+                funding_rate_present and funding_interval_minutes is not None
             ),
+            "funding_interval_minutes": funding_interval_minutes,
+            "funding_time": funding_time,
+            "next_funding_time": next_funding_time,
+            "funding_rate_observed_at": info.get("ts"),
         }
 
     async def fetch_open_interest(self, symbol: str) -> dict[str, Any]:

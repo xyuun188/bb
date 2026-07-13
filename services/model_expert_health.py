@@ -9,7 +9,23 @@ from typing import Any
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ExpertMemory, ShadowBacktest, StrategyLearningEvent
-from services.strategy_learning import REQUIRED_ENTRY_EXPERTS, UNTRUSTED_EXPERT_STATUSES
+
+UNTRUSTED_EXPERT_STATUSES = {
+    "batch_fallback",
+    "partial_batch_fallback",
+    "circuit_breaker_fallback",
+    "failed",
+    "invalid",
+    "timeout",
+    "timeout_fallback",
+}
+REQUIRED_ENTRY_EXPERTS = {
+    "trend_expert",
+    "momentum_expert",
+    "sentiment_expert",
+    "position_expert",
+    "risk_expert",
+}
 
 MODEL_COMPONENTS = {
     "decision_maker",

@@ -4344,6 +4344,49 @@ class OKXExecutor(AbstractExecutor):
             inst_ids=inst_ids,
         )
 
+    async def fetch_account_fee_snapshot(self) -> dict[str, Any]:
+        """Read the current account-level SWAP taker fee from OKX."""
+
+        exchange = await self._get_ccxt()
+        response = await exchange.privateGetAccountFeeRates({"instType": "SWAP"})
+        rows = response.get("data") if isinstance(response, dict) else []
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        row = row if isinstance(row, dict) else {}
+        taker_rate = 0.0
+        taker_field = ""
+        for field_name in ("takerU", "taker", "takerUSDC"):
+            value = abs(self._safe_float(row.get(field_name), 0.0))
+            if value > 0:
+                taker_rate = value
+                taker_field = field_name
+                break
+        observed_at_ms = self._safe_float(row.get("ts"), 0.0)
+        observed_at = (
+            datetime.fromtimestamp(observed_at_ms / 1000.0, tz=UTC).isoformat()
+            if observed_at_ms > 0
+            else datetime.now(UTC).isoformat()
+        )
+        fallback_reason = "" if taker_rate > 0 else "okx_swap_taker_fee_missing"
+        return {
+            "taker_fee_rate": taker_rate if taker_rate > 0 else None,
+            "entry_fee_rate": taker_rate if taker_rate > 0 else None,
+            "exit_fee_rate": taker_rate if taker_rate > 0 else None,
+            "fee_rate_source": (
+                f"okx_account_trade_fee.{taker_field}"
+                if taker_field
+                else "okx_account_trade_fee.missing"
+            ),
+            "fee_rate_observed_at": observed_at,
+            "policy_provenance": {
+                "source": "okx_account_trade_fee_swap",
+                "observation_window": "current_account_fee_tier",
+                "sample_count": int(taker_rate > 0),
+                "generated_at": observed_at,
+                "strategy_version": "2026-07-13.okx-account-fee-snapshot.v1",
+                "fallback_reason": fallback_reason,
+            },
+        }
+
     async def _get_ccxt(self):
         if self._exchange is None:
             await self.initialize()

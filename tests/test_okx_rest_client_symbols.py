@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from data_feed.feature_vector import build_feature_vector
 from data_feed.okx_rest_client import OKXRestClient
 
 
@@ -134,6 +135,37 @@ async def test_fetch_ticker_uses_okx_native_inst_id(monkeypatch) -> None:
     assert ticker["bid"] == pytest.approx(0.0122)
     assert ticker["ask"] == pytest.approx(0.0124)
     assert ticker["volume_24h_base"] == pytest.approx(100000.0)
+
+
+@pytest.mark.asyncio
+async def test_funding_snapshot_derives_interval_from_okx_times(monkeypatch) -> None:
+    client = OKXRestClient()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "fetch_funding_rate"
+        assert args == ("BTC/USDT:USDT",)
+        return {
+            "fundingRate": -0.00001,
+            "fundingDatetime": "1783958400000",
+            "nextFundingDatetime": "1783987200000",
+            "info": {
+                "fundingRate": "-0.00001",
+                "fundingTime": "1783958400000",
+                "nextFundingTime": "1783987200000",
+                "ts": "1783931769300",
+            },
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    funding = await client.fetch_funding_rate("BTC/USDT")
+    vector = build_feature_vector("BTC/USDT", derivatives=funding)
+
+    assert funding["funding_data_available"] is True
+    assert funding["funding_interval_minutes"] == pytest.approx(480.0)
+    assert vector.funding_interval_minutes == pytest.approx(480.0)
+    assert vector.funding_data_available is True
+    assert vector.to_dict()["funding_rate_observed_at"] == "1783931769300"
 
 
 @pytest.mark.asyncio

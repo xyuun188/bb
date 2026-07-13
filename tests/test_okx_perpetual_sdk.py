@@ -69,6 +69,10 @@ class _AccountApi:
         self.calls.append(("set_leverage", dict(kwargs)))
         return {"code": "0", "data": [{"sCode": "0"}]}
 
+    def get_fee_rates(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_fee_rates", dict(kwargs)))
+        return {"code": "0", "data": [{"taker": "-0.0005", "ts": "1783931709453"}]}
+
 
 class _ServerTimeResponse:
     def __init__(self, server_ms: int) -> None:
@@ -198,6 +202,29 @@ async def test_sdk_adapter_set_leverage_uses_swap_inst_id() -> None:
                 "mgnMode": "cross",
                 "instId": "ETH-USDT-SWAP",
                 "posSide": "",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_reads_account_level_swap_fee_rate() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    account_api = _AccountApi()
+    exchange._account_api = account_api
+
+    response = await exchange.privateGetAccountFeeRates({"instType": "SWAP"})
+
+    assert response["data"][0]["taker"] == "-0.0005"
+    assert account_api.calls == [
+        (
+            "get_fee_rates",
+            {
+                "instType": "SWAP",
+                "instId": "",
+                "uly": "",
+                "category": "",
+                "instFamily": "",
             },
         )
     ]

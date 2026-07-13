@@ -109,7 +109,11 @@ class FeatureVector:
 
     # --- Perpetual swap microstructure ---
     funding_rate: float = 0.0
+    funding_data_available: bool = False
+    funding_interval_minutes: float | None = None
+    funding_time: str | None = None
     next_funding_time: str | None = None
+    funding_rate_observed_at: str | None = None
     open_interest_contracts: float = 0.0
     open_interest_value: float = 0.0
     orderbook_bid_depth: float = 0.0

@@ -522,10 +522,48 @@ def build_batch_experts_user_prompt(
         if isinstance(context.get("production_return_policy"), dict)
         else {}
     )
+    strategy_learning = (
+        strategy_mode.get("strategy_learning")
+        if isinstance(strategy_mode.get("strategy_learning"), dict)
+        else {}
+    )
+    active_return_profile = (
+        strategy_learning.get("active_profile")
+        if isinstance(strategy_learning.get("active_profile"), dict)
+        else {}
+    )
+    strategy_learning_runtime = (
+        strategy_learning.get("runtime")
+        if isinstance(strategy_learning.get("runtime"), dict)
+        else {}
+    )
     strategy_summary = {
         "strategy": strategy_mode.get("strategy"),
         "posture": strategy_mode.get("posture"),
         "profile": strategy_mode.get("strategy_profile_id") or strategy_mode.get("profile_id"),
+        "return_schedule": {
+            "mode": strategy_learning.get("scheduler_mode"),
+            "candidate_count": strategy_learning.get("candidate_count"),
+            "governed_candidate_count": strategy_learning.get("governed_candidate_count"),
+            "active_selector": compact_value(
+                active_return_profile.get("params", {}).get("selector", {})
+                if isinstance(active_return_profile.get("params"), dict)
+                else {},
+                depth=1,
+            ),
+            "historical_return_distribution": compact_value(
+                active_return_profile.get("params", {}).get(
+                    "historical_return_distribution", {}
+                )
+                if isinstance(active_return_profile.get("params"), dict)
+                else {},
+                depth=1,
+            ),
+            "production_influence_enabled": strategy_learning_runtime.get(
+                "production_influence_enabled"
+            ),
+            "can_authorize_entry": False,
+        },
         "production_return_policy": compact_value(
             production_return_policy,
             depth=1,
@@ -573,6 +611,7 @@ def build_batch_experts_user_prompt(
         "rules": (
             "Judge EV after fee/slippage, payoff quality, loss probability, liquidity, tail risk. "
             "If the chosen side lacks a positive fee-after return LCB or complete provenance, return hold or an eligible opposite side. "
+            "Use a governed scheduled return profile only as a historical prior; it never replaces current symbol return evidence. "
             "Memory and expert history are observation-only; current return, costs and account risk own execution. "
             "position_expert holds when no matching position. Missing governed return evidence holds."
         ),
@@ -585,7 +624,7 @@ Schema: {{"experts":{{{requested_schema}}}}}
 Required experts: {requested_list}. {omitted_rule.rstrip()}
 Each expert value must contain exactly:
 {{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-28字，写方向/收益/风险要点","position_size_pct":0-1,"suggested_leverage":"positive number, account-capped later","stop_loss_pct":"0-1 dynamic market risk distance","take_profit_pct":"0-1 dynamic fee-after expected move","cross_check_for":null}}
-Rules: incomplete fee-after return or provenance=hold; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
+Rules: Missing governed return evidence holds; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
 Payload JSON, truncated to {max_payload_chars} chars:
 {text[:max_payload_chars]}
 JSON:"""
