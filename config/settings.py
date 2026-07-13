@@ -13,6 +13,7 @@ import time
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 from pydantic import Field, field_validator
@@ -25,6 +26,16 @@ DECISION_MAKER_NAME = "decision_maker"
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
 RUNTIME_ENV_REFRESH_MIN_SECONDS = 2.0
+
+
+def _keyless_loopback_model_configured(api_base: str, model: str) -> bool:
+    """Allow local model tunnels without inventing or persisting a fake secret."""
+
+    try:
+        hostname = str(urlparse(api_base).hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(model and hostname in {"127.0.0.1", "localhost", "::1"})
 
 FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     {
@@ -582,7 +593,14 @@ class Settings(BaseSettings):
             }
             if "balance" in cfg:
                 merged["balance"] = cfg["balance"]
-            if include_empty or merged.get("api_key"):
+            configured = bool(
+                merged.get("api_key")
+                or _keyless_loopback_model_configured(
+                    str(merged.get("api_base") or ""),
+                    str(merged.get("model") or ""),
+                )
+            )
+            if include_empty or configured:
                 result.append(merged)
         return result
 

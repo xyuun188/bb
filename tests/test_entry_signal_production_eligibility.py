@@ -3,6 +3,7 @@ from services.entry_signal_extraction import (
     signal_available,
     signal_production_eligibility,
     signal_production_eligible,
+    signal_runtime_recovery_eligibility,
 )
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 
@@ -61,6 +62,10 @@ def test_live_fee_after_objective_signal_is_production_eligible() -> None:
         "promotion_ready": True,
         "artifact_objective": RETURN_OBJECTIVE_NAME,
         "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
+        "artifact_persisted": True,
+        "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+        "label_name": "net_return_after_cost_pct",
+        "label_version": RETURN_OBJECTIVE_VERSION,
         "prediction_quality": {
             "production_eligible": True,
             "anomalous": False,
@@ -87,6 +92,53 @@ def test_dynamic_prediction_quality_block_overrides_live_route() -> None:
 
     assert signal_production_eligibility(payload)["reason"] == (
         "outside_dynamic_rolling_forecast_interval"
+    )
+
+
+def test_runtime_recovery_keeps_prediction_quality_and_objective_contracts() -> None:
+    payload = {
+        "available": True,
+        "trained": True,
+        "route_mode": "shadow_candidate",
+        "live_mutation": False,
+        "promotion_ready": False,
+        "artifact_objective": RETURN_OBJECTIVE_NAME,
+        "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
+        "artifact_persisted": True,
+        "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+        "label_name": "net_return_after_cost_pct",
+        "label_version": RETURN_OBJECTIVE_VERSION,
+        "prediction_quality": {
+            "production_eligible": True,
+            "anomalous": False,
+        },
+    }
+
+    assert signal_runtime_recovery_eligibility(payload) == {
+        "eligible": True,
+        "reason": "trained_shadow_return_contract_intact",
+    }
+
+    anomalous = dict(payload)
+    anomalous["prediction_quality"] = {
+        "production_eligible": False,
+        "anomalous": True,
+        "reason": "outside_dynamic_rolling_forecast_interval",
+    }
+    assert signal_runtime_recovery_eligibility(anomalous)["reason"] == (
+        "outside_dynamic_rolling_forecast_interval"
+    )
+
+    wrong_objective = dict(payload)
+    wrong_objective["artifact_objective_version"] = "legacy-win-rate-objective"
+    assert signal_runtime_recovery_eligibility(wrong_objective)["reason"] == (
+        "artifact_objective_version_mismatch"
+    )
+
+    missing_artifact = dict(payload)
+    missing_artifact["artifact_persisted"] = False
+    assert signal_runtime_recovery_eligibility(missing_artifact)["reason"] == (
+        "runtime_recovery_contract_incomplete"
     )
 
 

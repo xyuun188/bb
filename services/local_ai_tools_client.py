@@ -119,7 +119,7 @@ class LocalAIToolsClient:
         started = datetime.now(UTC)
         tool_specs = [
             ("profit_prediction", "/profit/predict"),
-            ("time_series_prediction", "/timeseries/deep/predict"),
+            ("time_series_prediction", "/timeseries/predict"),
             ("sentiment_analysis", "/sentiment/deep/analyze"),
         ]
         if include_exit_advice and open_positions:
@@ -476,7 +476,7 @@ class LocalAIToolsClient:
         )
         specs = {
             "profit_prediction": "/profit/predict",
-            "time_series_prediction": "/timeseries/deep/predict",
+            "time_series_prediction": "/timeseries/predict",
             "sentiment_analysis": "/sentiment/deep/analyze",
             "exit_advice": "/exit/advise",
         }
@@ -711,8 +711,19 @@ class LocalAIToolsClient:
         request_timeout: float | None = None,
     ) -> dict[str, Any]:
         base = self._api_base()
+        timeout_seconds = request_timeout or self._timeout
+        timeout: float | httpx.Timeout = timeout_seconds
+        if path == "/train":
+            # The scheduler/lease owns the overall training deadline. Large clean
+            # datasets must not fail while the request body is still streaming.
+            timeout = httpx.Timeout(
+                connect=timeout_seconds,
+                read=None,
+                write=None,
+                pool=timeout_seconds,
+            )
         try:
-            async with httpx.AsyncClient(timeout=request_timeout or self._timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
                     f"{base}{path}",
                     json=payload,

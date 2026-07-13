@@ -275,8 +275,8 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     }
     assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
     assert repo.memories[0]["extra"]["actual_price"] == 101.0
-    assert all("confidence_adjustment" not in item for item in repo.memories)
-    assert all("position_size_multiplier" not in item for item in repo.memories)
+    assert all(item["confidence_adjustment"] == 0.0 for item in repo.memories)
+    assert all(item["position_size_multiplier"] == 1.0 for item in repo.memories)
     assert all(item["success_count"] == 0 for item in repo.memories)
     assert all(item["failure_count"] == 0 for item in repo.memories)
     assert all(item["extra"]["cost_complete"] is True for item in repo.memories)
@@ -285,6 +285,69 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     )
     assert all(item["recommended_action"] == "shadow_observation_only" for item in repo.memories)
     assert repo.memories[0]["extra"]["net_return_after_cost_pct"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_shadow_completion_commits_before_best_effort_memory_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+
+    class CommitTrackingSessionCtx:
+        completed_contexts = 0
+
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            type(self).completed_contexts += 1
+
+    class FailingMemoryRepo(_FakeRepo):
+        async def upsert_memory(self, _data: dict[str, Any]) -> None:
+            assert CommitTrackingSessionCtx.completed_contexts >= 2
+            raise RuntimeError("memory storage unavailable")
+
+    repo = FailingMemoryRepo()
+    repo.due_rows = [
+        SimpleNamespace(
+            id=9,
+            decision_id=124,
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            decision_action="hold",
+            entry_price=100.0,
+            horizon_minutes=10,
+            status="pending",
+            note="",
+            feature_snapshot={
+                "bid": 99.99,
+                "ask": 100.01,
+                "orderbook_bid_depth": 100_000.0,
+                "orderbook_ask_depth": 100_000.0,
+                "taker_fee_rate": 0.0005,
+                "funding_rate": 0.0,
+                "funding_data_available": True,
+                "funding_interval_minutes": 480.0,
+            },
+        )
+    ]
+
+    async def latest_price(_symbol: str) -> float:
+        return 101.0
+
+    service = ShadowBacktestService(
+        latest_price_provider=latest_price,
+        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
+        float_parser=_float,
+        session_factory=CommitTrackingSessionCtx,
+        repository_factory=lambda _session: repo,
+    )
+
+    assert await service.update_due() == 1
+    assert len(repo.completed) == 1
 
 
 @pytest.mark.asyncio
@@ -462,6 +525,9 @@ async def test_shadow_backtest_service_does_not_apply_fixed_price_range_toleranc
             "low_24h": 0.5491,
             "high_24h": 0.5707,
             "spread_pct": 0.03,
+            "round_trip_fee_pct": 0.08,
+            "funding_rate": 0.0,
+            "funding_interval_minutes": 480.0,
         },
     )
     repo.due_rows = [row]

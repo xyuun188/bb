@@ -142,7 +142,13 @@ def _db_shadow_row(
         decision_action=action,
         decision_confidence=0.7,
         entry_price=100.0,
-        feature_snapshot={"current_price": 100.0},
+        feature_snapshot={
+            "current_price": 100.0,
+            "spread_pct": 0.01,
+            "round_trip_fee_pct": 0.08,
+            "funding_rate": 0.0,
+            "funding_interval_minutes": 480.0,
+        },
         status=status,
         due_at=created_at + timedelta(minutes=30),
         horizon_minutes=30,
@@ -184,6 +190,14 @@ def _shadow_row(
     created_at: datetime | None = None,
 ) -> SimpleNamespace:
     row_created_at = created_at or datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC)
+    cost_complete_features: dict[str, object] = {
+        "current_price": 100.0,
+        "spread_pct": 0.01,
+        "round_trip_fee_pct": 0.08,
+        "funding_rate": 0.0,
+        "funding_interval_minutes": 480.0,
+    }
+    cost_complete_features.update(feature_snapshot or {})
     return SimpleNamespace(
         id=row_id,
         created_at=row_created_at,
@@ -192,7 +206,7 @@ def _shadow_row(
         decision_action=action,
         decision_confidence=confidence,
         horizon_minutes=30,
-        feature_snapshot=feature_snapshot or {"current_price": 100.0, "spread_pct": 0.01},
+        feature_snapshot=cost_complete_features,
         long_return_pct=0.16 if best_action == "long" else -0.06,
         short_return_pct=0.14 if best_action == "short" else -0.05,
         best_action=best_action,
@@ -1221,6 +1235,9 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
     row.feature_snapshot = {
         "current_price": 100.0,
         "spread_pct": 0.01,
+        "round_trip_fee_pct": 0.08,
+        "funding_rate": 0.0,
+        "funding_interval_minutes": 480.0,
         "feature_timestamp": created_at.isoformat(),
         "market_data_quality": {"code": ""},
         "unused_llm_context": {"transcript": "x" * 100_000},

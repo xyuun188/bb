@@ -53,7 +53,13 @@ def _production_source_count(opportunity: dict[str, Any]) -> int:
     return sum(
         1
         for component in _safe_list(breakdown.get("components"))
-        if _safe_dict(component).get("production_eligible") is True
+        if (
+            _safe_dict(component).get("included_in_return_distribution") is True
+            or (
+                "included_in_return_distribution" not in _safe_dict(component)
+                and _safe_dict(component).get("production_eligible") is True
+            )
+        )
     )
 
 

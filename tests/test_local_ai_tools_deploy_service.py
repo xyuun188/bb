@@ -31,6 +31,38 @@ def test_local_ai_tools_training_uses_per_sample_costs_and_empirical_tail_policy
     assert "def cost_complete_net_returns(" in SERVICE_CODE
     assert "def empirical_lower_hinge(" in SERVICE_CODE
     assert "legacy_fixed_training_thresholds_enabled" not in SERVICE_CODE
+    assert "def _dynamic_min_samples_leaf(sample_count: int)" in SERVICE_CODE
+    assert "min_samples_leaf=8" not in SERVICE_CODE
+    assert "min_samples_leaf=10" not in SERVICE_CODE
+    assert "sentiment_leaf_size = _dynamic_min_samples_leaf(len(sentiment_samples))" in (
+        SERVICE_CODE
+    )
+    assert "if len(rows) < 80:" not in SERVICE_CODE
+
+
+def test_text_sentiment_training_uses_available_distribution_without_fixed_sample_gate() -> None:
+    module = ModuleType("local_ai_tools_text_training_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    result = module._train_text_sentiment_model(
+        [
+            {"text": "fee after return improves", "sentiment_score": 0.4},
+            {"text": "cost pressure increases", "sentiment_score": -0.3},
+        ]
+    )
+
+    assert result is not None
+    assert result["samples"] == 2
+
+
+def test_training_upload_uses_scheduler_deadline_instead_of_http_write_timeout() -> None:
+    source = (ROOT / "scripts" / "train_local_ai_tools_models.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "write=None" in source
+    assert "read=None" in source
 
 
 def test_remote_smoke_probe_rejects_oversized_responses_without_truncating_json() -> None:
@@ -79,6 +111,11 @@ def test_local_ai_tools_generated_service_adds_phase3_model_metadata() -> None:
     assert 'with_model_metadata("time_series_prediction"' in SERVICE_CODE
     assert 'with_model_metadata("sentiment_analysis"' in SERVICE_CODE
     assert 'with_model_metadata("exit_advice"' in SERVICE_CODE
+    assert "def regression_prediction_distribution(" in SERVICE_CODE
+    assert '"long_lower_bound_return_pct"' in SERVICE_CODE
+    assert '"short_lower_bound_return_pct"' in SERVICE_CODE
+    assert '"prediction_quality"' in SERVICE_CODE
+    assert '"training_cost_policy"' in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> None:
@@ -121,6 +158,49 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert payload["shadow_payload"]["loss_probability"] == 0.18
 
 
+def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -> None:
+    module = ModuleType("local_ai_tools_api_return_contract_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(
+        module,
+        "load_bundle",
+        lambda: {
+            "metadata": {
+                "objective_name": module.RETURN_OBJECTIVE_NAME,
+                "objective_version": module.RETURN_OBJECTIVE_VERSION,
+                "label_name": module.RETURN_LABEL_NAME,
+                "label_version": module.RETURN_LABEL_VERSION,
+                "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+                "artifact_persisted": True,
+                "model_stage": "shadow",
+                "training_mode": "shadow",
+            }
+        },
+    )
+
+    payload = module.with_model_metadata(
+        "profit_prediction",
+        {
+            "available": True,
+            "trained": True,
+            "model": "trained-test-model",
+            "prediction_quality": {
+                "production_eligible": True,
+                "anomalous": False,
+                "reason": "current_tree_prediction_distribution_ready",
+            },
+        },
+    )
+
+    assert payload["artifact_persisted"] is True
+    assert payload["objective_name"] == module.RETURN_OBJECTIVE_NAME
+    assert payload["label_name"] == module.RETURN_LABEL_NAME
+    assert payload["training_cost_policy"] == (
+        "per_sample_live_spread_fee_and_funding_complete"
+    )
+    assert payload["prediction_quality"]["production_eligible"] is True
+
+
 def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Path) -> None:
     module = ModuleType("local_ai_tools_api_metadata_status_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
@@ -158,6 +238,26 @@ def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Pat
     assert status["profile_count"] == 7
     assert status["metadata_loaded"] is True
     assert status["status_endpoint_uses_metadata_only"] is True
+
+
+def test_rejected_legacy_bundle_is_not_reloaded_until_file_changes(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_rejected_bundle_cache_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.BUNDLE_PATH = tmp_path / "local_quant_models.joblib"
+    module.BUNDLE_PATH.write_bytes(b"legacy-bundle")
+    load_count = 0
+
+    def load_legacy_bundle(_path: Path) -> dict:
+        nonlocal load_count
+        load_count += 1
+        return {"metadata": {}}
+
+    module.load_trusted_joblib_bundle = load_legacy_bundle
+
+    assert module.load_bundle() is None
+    assert module.load_bundle() is None
+    assert load_count == 1
+    assert module._BUNDLE_MTIME == module.BUNDLE_PATH.stat().st_mtime
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -913,6 +1013,88 @@ def test_local_ai_tools_generated_profit_contract_has_phase3_targets() -> None:
     assert '"long_loss_probability"' in SERVICE_CODE
     assert '"short_loss_probability"' in SERVICE_CODE
     assert '"expected_return_pct": round(best_expected, 4)' in SERVICE_CODE
+    assert "long_loss_prob * 0.22" not in SERVICE_CODE
+    assert "short_loss_prob * 0.22" not in SERVICE_CODE
+    assert "long_profile_penalty" not in SERVICE_CODE
+    assert "short_profile_penalty" not in SERVICE_CODE
+    assert "quality = best_lower_bound" in SERVICE_CODE
+
+
+def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penalties() -> None:
+    module = ModuleType("local_ai_tools_api_direct_return_distribution_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.FeatureRequest.model_rebuild()
+    long_model = object()
+    short_model = object()
+    long_loss_model = object()
+    short_loss_model = object()
+    bundle = {
+        "metadata": {
+            "objective_name": module.RETURN_OBJECTIVE_NAME,
+            "objective_version": module.RETURN_OBJECTIVE_VERSION,
+            "label_name": module.RETURN_LABEL_NAME,
+            "label_version": module.RETURN_LABEL_VERSION,
+            "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+            "artifact_persisted": True,
+        },
+        "long_return_model": long_model,
+        "short_return_model": short_model,
+        "long_loss_model": long_loss_model,
+        "short_loss_model": short_loss_model,
+        "profiles": {
+            "BTC/USDT|long": {"loss_pressure": 100.0},
+            "BTC/USDT|short": {"loss_pressure": 100.0},
+        },
+    }
+    module.load_bundle = lambda: bundle
+    module.regression_prediction_distribution = lambda model, _x: {
+        "expected": 0.4 if model is long_model else 0.2,
+        "median": 0.4 if model is long_model else 0.2,
+        "lower_bound": 0.1 if model is long_model else 0.05,
+        "std": 0.03,
+        "spread": 0.08,
+        "sample_count": 260,
+        "distribution_ready": True,
+    }
+    module.predict_proba_positive = lambda model, _x: (
+        0.95 if model is long_loss_model else 0.85
+    )
+
+    payload = module.profit_predict(
+        module.FeatureRequest(
+            symbol="BTC/USDT",
+            features={"symbol": "BTC/USDT", "current_price": 100.0},
+        )
+    )
+
+    assert payload["long_expected_return_pct"] == 0.4
+    assert payload["adjusted_long_return_pct"] == 0.4
+    assert payload["long_lower_bound_return_pct"] == 0.1
+    assert payload["profit_quality_score"] == 0.1
+    assert payload["long_loss_probability"] == 0.95
+
+    module.regression_prediction_distribution = lambda model, _x: {
+        "expected": 0.4 if model is long_model else 0.2,
+        "median": 0.4 if model is long_model else 0.2,
+        "lower_bound": 0.4 if model is long_model else 0.2,
+        "std": 0.0,
+        "spread": 0.0,
+        "sample_count": 260,
+        "distribution_ready": False,
+    }
+    degenerate = module.profit_predict(
+        module.FeatureRequest(
+            symbol="BTC/USDT",
+            features={"symbol": "BTC/USDT", "current_price": 100.0},
+        )
+    )
+
+    assert degenerate["prediction_quality"]["production_eligible"] is False
+    assert degenerate["prediction_quality"]["anomalous"] is True
+    assert degenerate["prediction_quality"]["reason"] == (
+        "current_tree_prediction_distribution_degenerate"
+    )
 
 
 def test_local_ai_tools_generated_exit_contract_uses_only_phase3_actions() -> None:
@@ -1020,7 +1202,7 @@ def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
         def fit(self, *_args: object, **_kwargs: object) -> DummyModel:
             return self
 
-    module._make_regressor = DummyModel
+    module._make_regressor = lambda _sample_count: DummyModel()
     module._make_classifier = lambda _y: DummyModel()
     module._train_sequence_model = lambda _samples: None
     module._train_torch_patch_model = lambda _samples: {"available": False, "reason": "test"}
@@ -1083,6 +1265,18 @@ def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
     assert result["confirm_phase3_rebuild"] is False
     assert not module.BUNDLE_PATH.exists()
     assert not module.METADATA_PATH.exists()
+
+
+def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+
+    result = module.train(
+        module.TrainRequest(shadow_samples=_training_shadow_samples(count=2))
+    )
+
+    assert result["horizons"] == [10]
 
 
 def test_local_ai_tools_generated_service_requires_confirmed_phase3_rebuild(

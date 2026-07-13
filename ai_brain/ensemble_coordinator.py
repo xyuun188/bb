@@ -604,7 +604,7 @@ class EnsembleCoordinator:
         self._set_strategy_context(context)
         cross_validations = cross_validations or []
         valid = {name: d for name, d in opinions.items() if isinstance(d, DecisionOutput)}
-        if not valid:
+        if not valid and context.get("review_positions"):
             return self._hold(features, "没有可用专家模型输出，保持观望。", {})
 
         review_positions = bool(context.get("review_positions"))
@@ -712,6 +712,12 @@ class EnsembleCoordinator:
             raw_opinions_by_name["risk_expert"]["risk_expert_policy"] = risk_expert_policy
         resolution_brief = self._conflict_resolution_brief(cross_validations, consultation)
         raw = self._raw(raw_opinions, decision_score, disagreement, cross_validations, consultation)
+        raw["expert_availability"] = {
+            "available_count": len(valid),
+            "available": bool(valid),
+            "role": "observation_only",
+            "can_block_authoritative_return_candidate": False,
+        }
         self._attach_expert_diversity_policy(raw, context)
         raw["base_weighted_score"] = round(normalized_score, 4)
         raw["memory_feedback"] = self._memory_feedback(context)

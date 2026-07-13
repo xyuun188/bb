@@ -455,6 +455,7 @@ class ShadowBacktestService:
             if not completions:
                 return 0
 
+            memory_requests: list[tuple[Any, dict[str, Any]]] = []
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
                 reload_rows = getattr(repo, "get_pending_shadow_backtests_by_ids", None)
@@ -489,18 +490,32 @@ class ShadowBacktestService:
                         )
                         continue
                     if settings.shadow_memory_enabled:
+                        memory_requests.append((row, completion))
+
+            # Shadow outcomes are authoritative training facts. Observation-only
+            # memory enrichment must never roll their completed transaction back.
+            for row, completion in memory_requests:
+                try:
+                    async with self.session_factory() as memory_session:
+                        memory_repo = self.repository_factory(memory_session)
                         await self._record_memory_in_session(
-                            repo,
+                            memory_repo,
                             row,
                             long_return=completion["long_return"],
                             short_return=completion["short_return"],
                             best_action=completion["best_action"],
                             fee_after_outcome=completion["fee_after_outcome"],
                         )
+                except Exception as exc:
+                    logger.warning(
+                        "failed to record shadow observation memory",
+                        shadow_backtest_id=getattr(row, "id", None),
+                        error=safe_error_text(exc),
+                    )
             logger.info("shadow backtests updated", count=completed_count)
             return completed_count
         except Exception as exc:
-            logger.debug("failed to update shadow backtests", error=safe_error_text(exc))
+            logger.warning("failed to update shadow backtests", error=safe_error_text(exc))
             return 0
 
     def _completion_note(
@@ -615,6 +630,8 @@ class ShadowBacktestService:
                     "market_pattern": pattern,
                     "lesson": lesson,
                     "recommended_action": recommended,
+                    "confidence_adjustment": 0.0,
+                    "position_size_multiplier": 1.0,
                     "evidence_count": 1,
                     "success_count": success_count,
                     "failure_count": failure_count,

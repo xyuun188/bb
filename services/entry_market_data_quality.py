@@ -118,57 +118,20 @@ class EntryMarketDataQualityPolicy:
         _price: float,
         stage_label: str,
     ) -> MarketDataQualityIssue | None:
-        reference_prices = [
-            float(value)
-            for value in (
-                snapshot["current_price"],
-                snapshot["close_price"],
-                snapshot["bid"],
-                snapshot["ask"],
-            )
-            if float(value) > 0
-        ]
-        if len(reference_prices) < 2:
-            return None
         bid = float(snapshot["bid"])
         ask = float(snapshot["ask"])
-        if bid > 0 and ask > 0:
-            if bid > ask:
-                return self._issue(
-                    "crossed_bid_ask",
-                    stage_label,
-                    f"盘口结构无效：买一 {bid:g} 高于卖一 {ask:g}，本次不执行新开仓。",
-                    snapshot,
-                )
-            spread_width = ask - bid
-            lower_bound = bid - spread_width
-            upper_bound = ask + spread_width
-            outliers = [
-                value
-                for value in (float(snapshot["current_price"]), float(snapshot["close_price"]))
-                if value > 0 and not lower_bound <= value <= upper_bound
-            ]
-            if not outliers:
-                return None
-            mid = max((ask + bid) / 2.0, 1e-12)
-            split = max(abs(value - mid) / mid for value in outliers)
-        else:
-            min_ref = min(reference_prices)
-            max_ref = max(reference_prices)
-            if min_ref == max_ref:
-                return None
-            split = (max_ref - min_ref) / max(min_ref, 1e-12)
-        return self._issue(
-            "price_source_split",
-            stage_label,
-            (
-                f"行情价格源分裂：current={snapshot['current_price']:g}、"
-                f"close={snapshot['close_price']:g}、bid={snapshot['bid']:g}、"
-                f"ask={snapshot['ask']:g}，最大差异约 {split * 100:.2f}%。"
-                "这会导致止盈止损价格和交易所主订单价格不匹配，本次不执行新开仓。"
-            ),
-            {**snapshot, "split_pct": round(split * 100, 6)},
-        )
+        if bid > 0 and ask > 0 and bid > ask:
+            return self._issue(
+                "crossed_bid_ask",
+                stage_label,
+                f"盘口结构无效：买一 {bid:g} 高于卖一 {ask:g}，本次不执行新开仓。",
+                snapshot,
+            )
+
+        # The indicator close belongs to a completed candle while current/bid/ask
+        # belong to the live quote. Their ordinary time-basis difference is priced
+        # by the live spread and pre-order refresh, not treated as corrupted data.
+        return None
 
     def _outside_24h_range_issue(
         self,

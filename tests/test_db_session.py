@@ -119,6 +119,66 @@ async def test_sqlite_schema_init_does_not_use_advisory_lock(
 
 
 @pytest.mark.asyncio
+async def test_postgres_expert_memory_storage_contract_neutralizes_legacy_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._ensure_expert_memory_storage_contract(fake_conn)
+
+    assert any(
+        "confidence_adjustment DOUBLE PRECISION NOT NULL DEFAULT 0.0" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "position_size_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0" in statement
+        for statement in fake_conn.statements
+    )
+    update = next(
+        statement
+        for statement in fake_conn.statements
+        if statement.lstrip().startswith("UPDATE expert_memories")
+    )
+    assert "confidence_adjustment = 0.0" in update
+    assert "position_size_multiplier = 1.0" in update
+    assert "updated_at" not in update
+
+
+@pytest.mark.asyncio
+async def test_sqlite_expert_memory_storage_contract_adds_neutral_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "sqlite+aiosqlite:///tmp/test.db",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._ensure_expert_memory_storage_contract(fake_conn)
+
+    assert any(
+        statement
+        == "ALTER TABLE expert_memories ADD COLUMN confidence_adjustment FLOAT NOT NULL DEFAULT 0.0"
+        for statement in fake_conn.statements
+    )
+    assert any(
+        statement
+        == "ALTER TABLE expert_memories ADD COLUMN position_size_multiplier FLOAT NOT NULL DEFAULT 1.0"
+        for statement in fake_conn.statements
+    )
+    assert any(
+        statement.lstrip().startswith("UPDATE expert_memories")
+        for statement in fake_conn.statements
+    )
+
+
+@pytest.mark.asyncio
 async def test_postgres_trade_fact_columns_skip_existing_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

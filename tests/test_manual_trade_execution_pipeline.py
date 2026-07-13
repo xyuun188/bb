@@ -134,6 +134,29 @@ def _manual_service(
             return None
         return execution_result or _execution_result()
 
+    def score_candidate(
+        decision_arg: DecisionOutput,
+        _strategy_context: dict[str, Any] | None,
+    ) -> float:
+        calls.append(("opportunity", decision_arg.action.value))
+        return 0.2
+
+    async def prepare_entry_risk(
+        decision_arg: DecisionOutput,
+        model_mode: str,
+        open_positions: list[dict[str, Any]],
+        decision_db_id: int | None = None,
+    ) -> None:
+        calls.append(
+            (
+                "dynamic_prepare",
+                decision_arg.action.value,
+                model_mode,
+                len(open_positions),
+                decision_db_id,
+            )
+        )
+
     service.data_service = FakeDataService()
     service.okx_sync_service = FakeOkxSync()
     service.expert_memory_service = FakeExpertMemory()
@@ -149,6 +172,8 @@ def _manual_service(
     service.get_account_balance = lambda model_name: _async_value(100.0)
     service._log_decision = log_decision
     service._execute_candidate = execute_candidate
+    service._candidate_opportunity_score = score_candidate
+    service._prepare_entry_for_hard_risk = prepare_entry_risk
     service._decision_count = 0
     return service, calls
 
@@ -180,6 +205,17 @@ async def test_manual_trade_uses_unified_execution_pipeline() -> None:
     risk_call = next(call for call in calls if call[0] == "risk")
     assert risk_call[1]["current_positions"] == [
         {"model_name": ENSEMBLE_TRADER_NAME, "symbol": "BTC/USDT"}
+    ]
+    ordered_stages = [
+        call[0]
+        for call in calls
+        if call[0] in {"opportunity", "dynamic_prepare", "risk", "execute_candidate"}
+    ]
+    assert ordered_stages == [
+        "opportunity",
+        "dynamic_prepare",
+        "risk",
+        "execute_candidate",
     ]
 
 

@@ -116,6 +116,13 @@ def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote(
     assert "legacy_expert_vote_permission_enabled" not in candidate
 
 
+def test_authoritative_return_candidate_does_not_depend_on_expert_availability() -> None:
+    decision = _coordinator().combine(_features(), _return_context(), {})
+
+    assert decision.action == Action.LONG
+    assert decision.raw_response["authoritative_return_candidate"]["production_eligible"] is True
+
+
 def test_expert_diversity_policy_is_carried_into_ensemble_raw() -> None:
     context = _return_context(
         _expert_diversity_policy={

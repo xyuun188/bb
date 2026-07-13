@@ -1,6 +1,7 @@
 import pytest
 
-from services.execution_cost_model import execution_cost_estimate
+from data_feed.feature_vector import FeatureVector
+from services.execution_cost_model import attach_execution_cost_facts, execution_cost_estimate
 
 
 def test_execution_cost_uses_dynamic_spread() -> None:
@@ -70,3 +71,29 @@ def test_exchange_fee_rate_contract_does_not_guess_percent_units() -> None:
     )
 
     assert estimate.fee_pct == pytest.approx(40.0)
+
+
+def test_account_fee_facts_are_attached_to_live_feature_snapshot() -> None:
+    feature = FeatureVector(
+        symbol="BTC/USDT",
+        spread_pct=0.01,
+        orderbook_bid_depth=10_000.0,
+        orderbook_ask_depth=9_000.0,
+    )
+
+    attach_execution_cost_facts(
+        feature,
+        {
+            "taker_fee_rate": 0.0004,
+            "entry_fee_rate": 0.0004,
+            "exit_fee_rate": 0.0004,
+            "fee_rate_source": "okx_account_trade_fee.takerU",
+            "fee_rate_observed_at": "2026-07-13T12:00:00+00:00",
+            "policy_provenance": {"source": "okx_account_trade_fee_swap"},
+        },
+    )
+
+    snapshot = feature.to_dict()
+    assert snapshot["taker_fee_rate"] == pytest.approx(0.0004)
+    assert snapshot["fee_policy_provenance"]["source"] == "okx_account_trade_fee_swap"
+    assert execution_cost_estimate(snapshot).production_eligible is True

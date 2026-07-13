@@ -47,7 +47,6 @@ def test_market_value_reader_supports_dicts_and_objects():
             "没有有效价格",
             "missing_valid_price",
         ),
-        (_valid_snapshot(close=130.0), "行情价格源分裂", "price_source_split"),
         (
             _valid_snapshot(current_price=80.0, close=0.0, bid=0.0, ask=0.0),
             "24小时区间",
@@ -90,6 +89,10 @@ def test_entry_market_data_quality_policy_allows_consistent_market_data():
 
 def test_wide_spread_is_priced_by_execution_cost_instead_of_fixed_data_gate():
     assert EntryMarketDataQualityPolicy().reason(_valid_snapshot(bid=100.0, ask=104.0)) is None
+
+
+def test_completed_indicator_close_is_not_compared_to_live_spread_as_corruption():
+    assert EntryMarketDataQualityPolicy().reason(_valid_snapshot(close=130.0)) is None
 
 
 def test_entry_market_data_quality_policy_handles_reader_failures():

@@ -86,6 +86,58 @@ def test_cost_incomplete_returns_are_excluded_and_fail_closed() -> None:
     assert report["policy_provenance"]["fallback_reason"]
 
 
+def test_return_objective_reads_unified_profit_learning_labels() -> None:
+    report = build_return_objective_report(
+        trade_samples=[
+            {
+                "data_quality_status": "included",
+                "exclude_from_training": False,
+                "profit_learning_labels": {
+                    "sample_kind": "trade",
+                    "cost_basis_label": "fee_plus_funding",
+                    "net_return_after_cost_pct": -1.25,
+                    "training_supervision_ready": True,
+                    "realized_net_pnl_usdt": -1.25,
+                    "fee_estimate_usdt": 0.08,
+                    "funding_fee_usdt": 0.0,
+                    "notional_usdt": 100.0,
+                },
+            }
+        ]
+    )
+
+    assert report["available"] is True
+    assert report["sample_count"] == 1
+    assert report["average_net_return_after_cost_pct"] == -1.25
+    assert "cost_complete_return_distribution_missing" not in report["blocking_reasons"]
+    assert "average_fee_after_return_not_positive" in report["blocking_reasons"]
+
+
+def test_unified_profit_learning_labels_fail_closed_without_funding_cost() -> None:
+    report = build_return_objective_report(
+        trade_samples=[
+            {
+                "data_quality_status": "included",
+                "exclude_from_training": False,
+                "profit_learning_labels": {
+                    "sample_kind": "trade",
+                    "cost_basis_label": "fee_only",
+                    "net_return_after_cost_pct": 1.25,
+                    "training_supervision_ready": True,
+                    "realized_net_pnl_usdt": 1.25,
+                    "fee_estimate_usdt": 0.08,
+                    "funding_fee_usdt": None,
+                    "notional_usdt": 100.0,
+                },
+            }
+        ]
+    )
+
+    assert report["available"] is False
+    assert report["sample_count"] == 0
+    assert "cost_complete_return_distribution_missing" in report["blocking_reasons"]
+
+
 def test_phase3_promotion_uses_return_report_not_sample_count_or_win_rate() -> None:
     report = build_return_objective_report(
         trade_samples=[_cost_complete_sample(value) for value in (0.8, 0.7, 0.6, 0.5)]

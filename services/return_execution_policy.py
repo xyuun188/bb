@@ -69,11 +69,23 @@ class ReturnExecutionAssessment:
 
 def _production_return_observations(opportunity: dict[str, Any]) -> list[float]:
     breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
+    distribution_mode = str(opportunity.get("return_distribution_mode") or "").strip()
     observations: list[float] = []
     for component in _safe_list(breakdown.get("components")):
         item = _safe_dict(component)
-        explicitly_eligible = item.get("production_eligible") is True
-        if not explicitly_eligible:
+        included = item.get("included_in_return_distribution")
+        if included is not True and not (
+            included is None and item.get("production_eligible") is True
+        ):
+            continue
+        if distribution_mode == "governed_models" and item.get("production_eligible") is not True:
+            continue
+        if (
+            distribution_mode == "runtime_recovery"
+            and item.get("recovery_observation_eligible") is not True
+        ):
+            continue
+        if distribution_mode not in {"", "governed_models", "runtime_recovery"}:
             continue
         value = _safe_float(item.get("raw_return_pct"), float("nan"))
         if isfinite(value):
@@ -129,23 +141,27 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     return_quality = min(max(return_lcb / denominator, 0.0), 1.0)
     position_size = min(max(risk_budget_size * return_quality, 0.0), 1.0)
 
-    generated_at = datetime.now(UTC).isoformat()
+    opportunity_provenance = _safe_dict(opportunity.get("policy_provenance"))
+    generated_at = str(opportunity_provenance.get("generated_at") or "").strip()
+    if not generated_at:
+        generated_at = datetime.now(UTC).isoformat()
     opportunity_provenance_complete = _complete_provenance(
-        opportunity.get("policy_provenance")
+        opportunity_provenance
     )
     cost_provenance_complete = _complete_provenance(
         execution_cost.get("policy_provenance")
     )
     sizing_provenance_complete = _complete_provenance(sizing.get("policy_provenance"))
     provenance = {
-        "source": "production_model_return_distribution_and_account_stop_budget",
+        "source": "selected_runtime_return_distribution_and_account_stop_budget",
         "observation_window": "current_decision_plus_active_model_return_observations",
         "sample_count": len(observations),
         "generated_at": generated_at,
         "strategy_version": RETURN_EXECUTION_POLICY_VERSION,
         "fallback_reason": "",
         "upstream_provenance": {
-            "opportunity": opportunity.get("policy_provenance"),
+            "return_distribution_mode": opportunity.get("return_distribution_mode"),
+            "opportunity": opportunity_provenance,
             "execution_cost": execution_cost.get("policy_provenance"),
             "sizing": sizing.get("policy_provenance"),
         },

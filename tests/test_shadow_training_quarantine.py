@@ -25,6 +25,9 @@ def _row(**overrides):
             "low_24h": 0.5491,
             "high_24h": 0.5707,
             "spread_pct": 0.03,
+            "round_trip_fee_pct": 0.08,
+            "funding_rate": 0.0,
+            "funding_interval_minutes": 480.0,
         },
         long_return_pct=0.4,
         short_return_pct=-0.4,
@@ -98,6 +101,9 @@ def test_clean_shadow_row_is_not_quarantined() -> None:
             "low_24h": 0.5491,
             "high_24h": 0.5707,
             "spread_pct": 0.03,
+            "round_trip_fee_pct": 0.08,
+            "funding_rate": 0.0,
+            "funding_interval_minutes": 480.0,
         },
     )
 

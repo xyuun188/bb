@@ -62,6 +62,13 @@ def _processor(calls: list[tuple[str, Any]]) -> PositionReviewDecisionProcessor:
         calls.append(("balance", model_name))
         return 1000.0
 
+    async def prepare_entry_risk(
+        decision: DecisionOutput,
+        model_mode: str,
+        open_positions: list[dict[str, Any]],
+    ) -> None:
+        calls.append(("prepare", decision.action.value, model_mode, len(open_positions)))
+
     recorder = PositionReviewResultRecorder(
         outcome_policy=PositionReviewOutcomePolicy(),
         decision_reason_marker=mark_reason,
@@ -76,6 +83,7 @@ def _processor(calls: list[tuple[str, Any]]) -> PositionReviewDecisionProcessor:
         candidate_executor=execute_candidate,
         final_state_ensurer=ensure_final,
         account_balance_provider=account_balance,
+        entry_risk_contract_preparer=prepare_entry_risk,
     )
 
 
@@ -112,6 +120,32 @@ async def test_hold_is_recorded_without_risk_assessment() -> None:
 
     assert result.handled is True
     assert not any(call[0] == "assess" for call in calls)
+    assert not any(call[0] == "prepare" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_entry_dynamic_contract_is_prepared_before_hard_risk() -> None:
+    calls: list[tuple[str, Any]] = []
+
+    result = await _processor(calls).process(
+        decision=_decision(Action.LONG),
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        model_mode="paper",
+        decision_db_id=11,
+        open_positions=[],
+        feature_vector=SimpleNamespace(),
+        position_entry_pause_reason=None,
+        risk_alert=None,
+        results={"decisions": []},
+    )
+
+    assert result.handled is False
+    assert result.candidate is not None
+    assert [call[0] for call in calls if call[0] in {"prepare", "assess"}] == [
+        "prepare",
+        "assess",
+    ]
 
 
 @pytest.mark.asyncio

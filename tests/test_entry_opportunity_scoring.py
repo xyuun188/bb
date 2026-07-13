@@ -194,6 +194,81 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
     assert opportunity["expected_gross_return_pct"] == pytest.approx(0.8)
 
 
+def test_trained_runtime_predictions_form_recovery_distribution_when_live_sources_absent() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"].update(
+        {
+            "allow_live_position_influence": False,
+            "influence_enabled": False,
+            "trained_sample_count": 100,
+            "model_version": "2026-07-13T12:00:00+00:00",
+            "readiness": {
+                "allow_live_position_influence": False,
+                "blocking_reasons": [
+                    {"code": "long_top_return_lcb_not_positive"},
+                ],
+                "policy_provenance": {
+                    "sample_count": 100,
+                    "test_sample_count": 20,
+                    "fallback_reason": "",
+                },
+            },
+        }
+    )
+    for payload in decision.raw_response["local_ai_tools"].values():
+        payload.update(
+            {
+                "route_mode": "shadow_candidate",
+                "live_influence": False,
+                "trained": True,
+                "artifact_persisted": True,
+                "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+                "label_name": "net_return_after_cost_pct",
+                "label_version": RETURN_OBJECTIVE_VERSION,
+            }
+        )
+
+    _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    components = opportunity["expected_net_breakdown"]["components"]
+    assert opportunity["return_distribution_mode"] == "runtime_recovery"
+    assert opportunity["production_eligible"] is True
+    assert opportunity["return_lcb_pct"] > 0
+    assert all(component["production_eligible"] is False for component in components)
+    assert all(component["included_in_return_distribution"] is True for component in components)
+    assert opportunity["policy_provenance"]["fallback_reason"] == ""
+
+
+def test_runtime_recovery_excludes_anomalous_trained_server_prediction() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    for payload in decision.raw_response["local_ai_tools"].values():
+        payload.update(
+            {
+                "route_mode": "shadow_candidate",
+                "live_influence": False,
+                "promotion_ready": False,
+                "trained": True,
+                "prediction_quality": {
+                    "production_eligible": False,
+                    "anomalous": True,
+                    "reason": "outside_dynamic_rolling_forecast_interval",
+                },
+            }
+        )
+
+    _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["return_distribution_mode"] == "unavailable"
+    assert opportunity["production_eligible"] is False
+    assert all(
+        component["included_in_return_distribution"] is False
+        for component in opportunity["expected_net_breakdown"]["components"]
+    )
+
+
 def test_missing_live_spread_fails_closed_without_cost_fallback() -> None:
     decision = _decision()
     decision.feature_snapshot = {"current_price": 100.0}

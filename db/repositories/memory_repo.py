@@ -83,6 +83,8 @@ class MemoryRepository(BaseRepository):
             existing = result.scalar_one_or_none()
 
         if existing:
+            existing.confidence_adjustment = 0.0
+            existing.position_size_multiplier = 1.0
             existing.evidence_count = int(existing.evidence_count or 0) + int(
                 data.get("evidence_count", 1) or 1
             )
@@ -325,8 +327,10 @@ def _norm_symbol(symbol: str | None) -> str:
 
 
 def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
-    data.pop("confidence_adjustment", None)
-    data.pop("position_size_multiplier", None)
+    # The production database still has NOT NULL legacy columns. Persist only
+    # neutral compatibility values so old callers cannot restore policy influence.
+    data["confidence_adjustment"] = 0.0
+    data["position_size_multiplier"] = 1.0
     for key in ("lesson", "market_pattern"):
         value = data.get(key)
         if value is not None:

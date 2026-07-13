@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from ai_brain.base_model import DecisionOutput
+from core.safe_output import safe_error_text
 from services.dynamic_exit_policy import apply_dynamic_exit
 from services.entry_capacity import EntryCapacityPolicy
 from services.position_review_entry_guard import PositionReviewEntryGuardPolicy
@@ -18,6 +19,10 @@ from services.position_review_risk_assessment import PositionReviewRiskAssessmen
 logger = structlog.get_logger(__name__)
 
 AccountBalanceProvider = Callable[[str], Awaitable[float]]
+EntryRiskContractPreparer = Callable[
+    [DecisionOutput, str, list[dict[str, Any]]],
+    Awaitable[None],
+]
 CandidateExecutor = Callable[..., Awaitable[None]]
 FinalStateEnsurer = Callable[
     [int, str, str, DecisionOutput, dict[str, Any] | None], Awaitable[None]
@@ -45,6 +50,7 @@ class PositionReviewDecisionProcessor:
     candidate_executor: CandidateExecutor
     final_state_ensurer: FinalStateEnsurer
     account_balance_provider: AccountBalanceProvider
+    entry_risk_contract_preparer: EntryRiskContractPreparer | None = None
 
     async def process(
         self,
@@ -81,6 +87,43 @@ class PositionReviewDecisionProcessor:
             results=results,
         ):
             return PositionReviewProcessResult(handled=True)
+
+        if decision.is_entry:
+            if self.entry_risk_contract_preparer is None:
+                reason = "动态费后收益风险预算准备器不可用，本次持仓复盘 entry 失败关闭。"
+                await self.result_recorder.record_skip(
+                    decision=decision,
+                    model_name=model_name,
+                    symbol=symbol,
+                    model_mode=model_mode,
+                    reason=reason,
+                    decision_db_id=decision_db_id,
+                    results=results,
+                    risk_alert=risk_alert,
+                )
+                return PositionReviewProcessResult(handled=True)
+            try:
+                await self.entry_risk_contract_preparer(
+                    decision,
+                    model_mode,
+                    open_positions,
+                )
+            except Exception as exc:
+                reason = (
+                    "动态费后收益风险预算生成失败，本次持仓复盘 entry 失败关闭："
+                    f"{safe_error_text(exc, limit=160)}"
+                )
+                await self.result_recorder.record_skip(
+                    decision=decision,
+                    model_name=model_name,
+                    symbol=symbol,
+                    model_mode=model_mode,
+                    reason=reason,
+                    decision_db_id=decision_db_id,
+                    results=results,
+                    risk_alert=risk_alert,
+                )
+                return PositionReviewProcessResult(handled=True)
 
         assessment = await self.risk_assessment.assess(
             decision=decision,

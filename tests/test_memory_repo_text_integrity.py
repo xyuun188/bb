@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -153,8 +154,76 @@ async def test_upsert_memory_uses_unified_runtime_text_boundary(
     assert memory.market_pattern == "unified:raw pattern"
     assert memory.recommended_action == "unified:reduce_risk"
     assert memory.extra == {"unified": {"note": "raw extra"}}
+    assert memory.confidence_adjustment == 0.0
+    assert memory.position_size_multiplier == 1.0
     assert "raw lesson" in calls
     assert session.flush_count == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_memory_forces_legacy_policy_fields_to_neutral_storage_values() -> None:
+    session = FakeSession()
+    repo = MemoryRepository(session)  # type: ignore[arg-type]
+
+    memory = await repo.upsert_memory(
+        {
+            "expert_name": "risk_expert",
+            "expert_label": "Risk",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "memory_type": "lesson",
+            "market_pattern": "complete evidence",
+            "lesson": "observation only",
+            "recommended_action": "shadow_observation_only",
+            "memory_key": "risk:BTC:long",
+            "confidence_adjustment": 0.9,
+            "position_size_multiplier": 2.5,
+        }
+    )
+
+    assert memory.confidence_adjustment == 0.0
+    assert memory.position_size_multiplier == 1.0
+
+
+@pytest.mark.asyncio
+async def test_upsert_memory_neutralizes_existing_legacy_policy_values() -> None:
+    existing = SimpleNamespace(
+        evidence_count=1,
+        success_count=0,
+        failure_count=0,
+        confidence_adjustment=0.75,
+        position_size_multiplier=2.0,
+        confidence_score=0.5,
+        lesson="old lesson",
+        market_pattern="old pattern",
+        recommended_action="old action",
+        source_position_id=None,
+        extra={},
+        is_active=True,
+        updated_at=None,
+    )
+
+    class ExistingScalarResult(FakeScalarResult):
+        def scalar_one_or_none(self) -> Any:
+            return existing
+
+    class ExistingSession(FakeSession):
+        async def execute(self, _stmt: Any) -> ExistingScalarResult:
+            return ExistingScalarResult()
+
+    repo = MemoryRepository(ExistingSession())  # type: ignore[arg-type]
+    updated = await repo.upsert_memory(
+        {
+            "expert_name": "risk_expert",
+            "memory_key": "risk:BTC:long",
+            "lesson": "new observation",
+            "market_pattern": "new pattern",
+        }
+    )
+
+    assert updated is existing
+    assert existing.confidence_adjustment == 0.0
+    assert existing.position_size_multiplier == 1.0
 
 
 @pytest.mark.asyncio

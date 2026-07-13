@@ -90,6 +90,40 @@ def test_return_policy_rejects_shadow_only_or_missing_production_observations() 
     assert decision.position_size_pct == 0.0
 
 
+def test_return_policy_accepts_audited_runtime_recovery_distribution() -> None:
+    decision = _decision()
+    components = decision.raw_response["opportunity_score"]["expected_net_breakdown"]["components"]
+    for component in components:
+        component["production_eligible"] = False
+        component["recovery_observation_eligible"] = True
+        component["included_in_return_distribution"] = True
+    decision.raw_response["opportunity_score"]["return_distribution_mode"] = (
+        "runtime_recovery"
+    )
+
+    result = apply_production_entry_policy(decision)
+
+    assert result.eligible is True
+    assert result.production_source_count == 2
+
+
+def test_return_policy_rejects_unverified_recovery_inclusion_flag() -> None:
+    decision = _decision()
+    components = decision.raw_response["opportunity_score"]["expected_net_breakdown"]["components"]
+    for component in components:
+        component["production_eligible"] = False
+        component["recovery_observation_eligible"] = False
+        component["included_in_return_distribution"] = True
+    decision.raw_response["opportunity_score"]["return_distribution_mode"] = (
+        "runtime_recovery"
+    )
+
+    result = apply_production_entry_policy(decision)
+
+    assert result.eligible is False
+    assert "production_return_observations_missing" in result.reason
+
+
 def test_return_policy_rejects_missing_live_spread_instead_of_using_cost_fallback() -> None:
     decision = _decision()
     decision.raw_response["opportunity_score"]["execution_cost"]["spread_source"] = "missing"

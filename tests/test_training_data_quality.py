@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from services import training_data_quality
+from services.model_promotion_policy import build_return_objective_report
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
     annotate_training_payload,
@@ -24,6 +25,9 @@ def _shadow_sample(**overrides):
             "symbol": "BTC/USDT",
             "current_price": 100.0,
             "spread_pct": 0.03,
+            "round_trip_fee_pct": 0.08,
+            "funding_rate": 0.0,
+            "funding_interval_minutes": 480.0,
         },
         "long_return_pct": 0.42,
         "short_return_pct": -0.31,
@@ -72,6 +76,17 @@ def test_shadow_missing_features_are_excluded() -> None:
     assert assessment.status == "excluded"
     assert assessment.weight == 0.0
     assert "missing_features" in assessment.reasons
+
+
+def test_shadow_missing_funding_interval_is_excluded_from_training() -> None:
+    sample = _shadow_sample()
+    sample["features"] = dict(sample["features"])
+    sample["features"].pop("funding_interval_minutes")
+
+    assessment = assess_shadow_sample(sample)
+
+    assert assessment.status == "excluded"
+    assert assessment.reasons == ("cost_incomplete:funding_interval_missing",)
 
 
 def test_shadow_mojibake_payload_is_excluded() -> None:
@@ -364,6 +379,22 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
     assert report["label_counts"]["losing_exit_attribution"][0]["value"] == (
         "position_too_small_fee_drag"
     )
+
+
+def test_training_payload_trade_contract_feeds_return_objective_report() -> None:
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[_trade_sample()],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    report = build_return_objective_report(trade_samples=payload["trade_samples"])
+
+    assert report["available"] is True
+    assert report["sample_count"] == 1
+    assert report["average_net_return_after_cost_pct"] == 10.0
+    assert "cost_complete_return_distribution_missing" not in report["blocking_reasons"]
 
 
 def test_training_payload_enriches_shadow_missed_opportunity_labels() -> None:
@@ -688,6 +719,9 @@ def test_shadow_price_range_does_not_apply_fixed_tolerance() -> None:
                 "low_24h": 0.5491,
                 "high_24h": 0.5707,
                 "spread_pct": 0.03,
+                "round_trip_fee_pct": 0.08,
+                "funding_rate": 0.0,
+                "funding_interval_minutes": 480.0,
             }
         )
     )

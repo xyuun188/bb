@@ -562,7 +562,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     assert get_calls == ["/models/status", "/health"]
     assert set(post_calls) == {
         "/profit/predict",
-        "/timeseries/deep/predict",
+        "/timeseries/predict",
         "/sentiment/deep/analyze",
         "/exit/advise",
     }
@@ -756,7 +756,7 @@ async def test_local_ai_tools_status_uses_short_cache(
     assert get_calls == ["/models/status", "/health"]
     assert set(post_calls) == {
         "/profit/predict",
-        "/timeseries/deep/predict",
+        "/timeseries/predict",
         "/sentiment/deep/analyze",
         "/exit/advise",
     }

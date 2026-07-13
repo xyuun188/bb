@@ -12,6 +12,7 @@ import asyncio
 import json
 import re
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -766,9 +767,19 @@ class LLMAgent(AbstractAIModel):
             floor=96 if fast_expert else 180,
             model=model,
         )
+        client_api_key = self._api_key
+        if not client_api_key:
+            try:
+                hostname = str(urlparse(self._base_url).hostname or "").lower()
+            except ValueError as exc:
+                raise RuntimeError(f"{self.name} has an invalid model API base") from exc
+            if hostname not in {"127.0.0.1", "localhost", "::1"}:
+                raise RuntimeError(f"{self.name} requires an API key for a non-loopback endpoint")
+            client_api_key = "local-loopback"
+
         kwargs: dict[str, Any] = {
             "base_url": self._base_url,
-            "api_key": self._api_key,
+            "api_key": client_api_key,
             "model": model,
             "timeout": request_timeout,
             "max_retries": 1,

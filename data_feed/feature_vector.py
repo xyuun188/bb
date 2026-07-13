@@ -114,6 +114,12 @@ class FeatureVector:
     funding_time: str | None = None
     next_funding_time: str | None = None
     funding_rate_observed_at: str | None = None
+    taker_fee_rate: float | None = None
+    entry_fee_rate: float | None = None
+    exit_fee_rate: float | None = None
+    fee_rate_source: str = ""
+    fee_rate_observed_at: str | None = None
+    fee_policy_provenance: dict[str, Any] = field(default_factory=dict)
     open_interest_contracts: float = 0.0
     open_interest_value: float = 0.0
     orderbook_bid_depth: float = 0.0

@@ -11,6 +11,36 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+EXECUTION_COST_FACT_FIELDS = (
+    "taker_fee_rate",
+    "entry_fee_rate",
+    "exit_fee_rate",
+    "round_trip_fee_pct",
+    "fee_rate_source",
+    "fee_rate_observed_at",
+)
+
+
+def attach_execution_cost_facts(feature_vector: Any, facts: dict[str, Any] | None) -> Any:
+    """Attach account fee facts to one live market snapshot without guessing values."""
+
+    payload = facts if isinstance(facts, dict) else {}
+    for key in EXECUTION_COST_FACT_FIELDS:
+        value = payload.get(key)
+        if value in {None, ""}:
+            continue
+        if isinstance(feature_vector, dict):
+            feature_vector[key] = value
+        else:
+            setattr(feature_vector, key, value)
+    provenance = payload.get("policy_provenance")
+    if isinstance(provenance, dict):
+        if isinstance(feature_vector, dict):
+            feature_vector["fee_policy_provenance"] = dict(provenance)
+        else:
+            feature_vector.fee_policy_provenance = dict(provenance)
+    return feature_vector
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionCostEstimate:

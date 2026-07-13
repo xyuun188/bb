@@ -10,11 +10,14 @@ import asyncio
 import inspect
 import json
 import math
+import os
+import sys
 from collections import Counter
 from collections.abc import Awaitable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -91,6 +94,7 @@ from services.exchange_position_state import (
     ExchangeProtectionMapProvider,
 )
 from services.execution_allocation_service import ExecutionAllocationService
+from services.execution_cost_model import attach_execution_cost_facts
 from services.execution_pipelines import EntryExecutionPipeline, ExitExecutionPipeline
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.execution_result_factory import ExecutionResultFactory
@@ -177,6 +181,8 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.text_sanitize import sanitize_text
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 logger = structlog.get_logger(__name__)
 
@@ -734,6 +740,7 @@ class TradingService:
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
             account_balance_provider=self.get_account_balance,
+            entry_risk_contract_preparer=self._prepare_entry_for_hard_risk,
         )
 
         # Executors: paper routes to OKX demo, live routes to OKX real.
@@ -4276,6 +4283,28 @@ class TradingService:
             )
         return scorer.score_candidate(decision, strategy)
 
+    async def _prepare_entry_for_hard_risk(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+        open_positions: list[dict[str, Any]] | None = None,
+        decision_db_id: int | None = None,
+    ) -> None:
+        """Generate dynamic return sizing before invoking the hard risk engine."""
+
+        if not decision.is_entry:
+            return
+        await self.entry_policy.prepare_dynamic_risk_contract(
+            decision,
+            model_mode,
+            open_positions=open_positions or [],
+        )
+        if decision_db_id is not None:
+            await self._mark_decision_raw_response(
+                decision_db_id,
+                decision.raw_response if isinstance(decision.raw_response, dict) else {},
+            )
+
     def _annotate_decision_source(self, decision: DecisionOutput) -> dict[str, Any]:
         raw = self._safe_dict(decision.raw_response)
         side = (
@@ -5400,6 +5429,7 @@ class TradingService:
                 )
 
             market_feature_items = list(market_feature_vectors.items())
+            market_execution_cost_facts: dict[str, dict[str, Any]] = {}
             market_ai_started_at = datetime.now(UTC)
             market_ai_budget_seconds = self.market_round_time_budget_seconds(
                 strategy_context=strategy_mode_context,
@@ -5480,6 +5510,16 @@ class TradingService:
                 if not self._is_valid_feature_vector(fv):
                     logger.warning("skip symbol after fresh feature check failed", symbol=symbol)
                     continue
+                model_name = ENSEMBLE_TRADER_NAME
+                model_mode = self._get_model_execution_mode(model_name)
+                if model_mode not in market_execution_cost_facts:
+                    market_execution_cost_facts[model_mode] = (
+                        await self._market_execution_cost_facts(model_mode)
+                    )
+                attach_execution_cost_facts(
+                    fv,
+                    market_execution_cost_facts.get(model_mode),
+                )
                 feature_vectors[symbol] = fv
                 market_analysis_progress = self._market_analysis_progress_snapshot(
                     symbol=symbol,
@@ -5489,8 +5529,6 @@ class TradingService:
                     market_ai_started_at=market_ai_started_at,
                     strategy_context=strategy_mode_context,
                 )
-                model_name = ENSEMBLE_TRADER_NAME
-                model_mode = self._get_model_execution_mode(model_name)
                 memory_context = await self._memory_context_with_vector_feedback(symbol)
                 ml_signal_context = self.ml_signal_service.predict(fv)
                 local_ai_tools_context = await self._local_ai_tools_context(
@@ -5680,6 +5718,51 @@ class TradingService:
                     )
                     continue
 
+                try:
+                    await self._prepare_entry_for_hard_risk(
+                        decision,
+                        model_mode,
+                        open_positions,
+                        decision_db_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    reason = (
+                        "动态费后收益风险预算生成失败，本次 entry 失败关闭："
+                        f"{safe_error_text(exc, limit=160)}"
+                    )
+                    raw_response = self._annotate_candidate_selection(
+                        decision,
+                        selected=False,
+                        reason=reason,
+                    )
+                    if decision_db_id is not None:
+                        await self._mark_decision_raw_response(decision_db_id, raw_response)
+                        await self._record_and_persist_decision_stage(
+                            decision_db_id,
+                            decision,
+                            DecisionStage.RISK_CHECK,
+                            DecisionStageStatus.FAILED,
+                            reason,
+                            {
+                                "blocker": "dynamic_entry_risk_contract_preparation",
+                                "selected_for_execution": False,
+                            },
+                        )
+                        await self._mark_decision_reason(decision_db_id, reason)
+                    self.market_decision_result_recorder.append_result(
+                        results=results,
+                        model_name=model_name,
+                        symbol=symbol,
+                        decision_or_action=decision,
+                        model_mode=model_mode,
+                        approved=False,
+                        execution_status="error",
+                        reason=reason,
+                    )
+                    continue
+
                 assessment = await self.market_decision_risk_assessment.assess(
                     decision=decision,
                     model_name=model_name,
@@ -5708,6 +5791,25 @@ class TradingService:
                         execution_status="rejected",
                         reason=reason,
                     )
+                    if decision_db_id is not None:
+                        raw_response = self._annotate_candidate_selection(
+                            decision,
+                            selected=False,
+                            reason=reason,
+                        )
+                        await self._mark_decision_raw_response(decision_db_id, raw_response)
+                        await self._record_and_persist_decision_stage(
+                            decision_db_id,
+                            decision,
+                            DecisionStage.RISK_CHECK,
+                            DecisionStageStatus.BLOCKED,
+                            reason,
+                            {
+                                "blocker": "hard_risk_engine",
+                                "selected_for_execution": False,
+                            },
+                        )
+                        await self._mark_decision_reason(decision_db_id, reason)
                     continue
 
                 executed = assessment.decision if assessment.decision else decision
@@ -6370,6 +6472,108 @@ class TradingService:
             or 0
         )
 
+        if not force:
+            from scripts.train_local_ai_tools_models import _completed_trade_sample_count
+
+            completed_trade_total = await _completed_trade_sample_count()
+            previous_completed_trade_total = int(
+                (status or {}).get("last_trained_completed_trade_sample_count")
+                or (status or {}).get("completed_trade_sample_count")
+                or server_trade_count
+                or 0
+            )
+            new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
+            new_trade = max(completed_trade_total - previous_completed_trade_total, 0)
+            shadow_training_view_rebased = (
+                completed_shadow_total < previous_completed_shadow_total
+            )
+            learning_only = not bool(
+                (status or {}).get("model_bundle_available", (status or {}).get("available"))
+            )
+            training_policy = {
+                "learning_only": learning_only,
+                "trigger": "new_clean_cost_complete_sample_or_training_view_rebase",
+                "distribution_requirement": "non_empty_train_and_holdout",
+                "training_window_policy": "all_current_clean_cost_complete_samples",
+                "cursor_source": "last_trained_completed_shadow_sample_count",
+                "trade_cursor_source": "last_trained_completed_trade_sample_count",
+                "trade_cursor_policy": "clean_training_view_only",
+                "process_boundary": "dedicated_training_subprocess",
+                "shadow_training_view_rebased": shadow_training_view_rebased,
+            }
+            if status_probe_error:
+                training_policy["status_probe_error"] = status_probe_error
+                training_policy["status_probe_fallback"] = "train_when_due_from_local_counts"
+            if not (
+                learning_only
+                or shadow_training_view_rebased
+                or new_shadow > 0
+                or new_trade > 0
+            ):
+                return {
+                    "trained": False,
+                    "reason": "not_due",
+                    "server_shadow_sample_count": server_shadow_count,
+                    "completed_shadow_sample_count": completed_shadow_total,
+                    "last_trained_completed_shadow_sample_count": (
+                        previous_completed_shadow_total
+                    ),
+                    "completed_trade_sample_count": completed_trade_total,
+                    "last_trained_completed_trade_sample_count": previous_completed_trade_total,
+                    "new_shadow_sample_count": new_shadow,
+                    "new_trade_sample_count": new_trade,
+                    "training_policy": training_policy,
+                }
+
+            active_run_id = getattr(self, "_local_tools_active_training_run_id", None)
+            if active_run_id:
+                self._model_training_state().start_run(
+                    scheduler_id="local_ai_tools_auto_train",
+                    model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                    run_id=active_run_id,
+                    trigger_reason="training_due",
+                    sample_cursor={
+                        "shadow": completed_shadow_total,
+                        "trade": completed_trade_total,
+                    },
+                    timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+                )
+
+            result = await self._run_local_ai_tools_training_subprocess()
+            reported_shadow_total = result.get(
+                "last_trained_completed_shadow_sample_count"
+            )
+            if reported_shadow_total is None:
+                reported_shadow_total = result.get("completed_shadow_sample_count")
+            reported_trade_total = result.get(
+                "last_trained_completed_trade_sample_count"
+            )
+            if reported_trade_total is None:
+                reported_trade_total = result.get("completed_trade_sample_count")
+            authoritative_shadow_total = self._safe_int(
+                reported_shadow_total,
+                completed_shadow_total,
+            )
+            authoritative_trade_total = self._safe_int(
+                reported_trade_total,
+                completed_trade_total,
+            )
+            result["completed_shadow_sample_count"] = authoritative_shadow_total
+            result["completed_trade_sample_count"] = authoritative_trade_total
+            result["new_shadow_sample_count"] = new_shadow
+            result["new_trade_sample_count"] = new_trade
+            result["training_policy"] = training_policy
+            result["training_process_isolated"] = True
+            if result.get("trained"):
+                result["last_trained_completed_shadow_sample_count"] = (
+                    authoritative_shadow_total
+                )
+                result["last_trained_completed_trade_sample_count"] = (
+                    authoritative_trade_total
+                )
+                self._local_tools_last_completed_shadow_count = authoritative_shadow_total
+            return result
+
         try:
             from scripts.train_local_ai_tools_models import (
                 _completed_trade_sample_count,
@@ -6410,6 +6614,7 @@ class TradingService:
         trainable_trade_count = len(training_payload["trade_samples"])
         quarantined_trade_count = max(raw_trade_sample_count - trainable_trade_count, 0)
         new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
+        shadow_training_view_rebased = completed_shadow_total < previous_completed_shadow_total
         previous_completed_trade_total = int(
             (status or {}).get("last_trained_completed_trade_sample_count")
             or (status or {}).get("completed_trade_sample_count")
@@ -6422,12 +6627,13 @@ class TradingService:
         )
         training_policy = {
             "learning_only": learning_only,
-            "trigger": "new_clean_cost_complete_sample_or_forced_rebuild",
+            "trigger": "new_clean_cost_complete_sample_or_training_view_rebase",
             "distribution_requirement": "non_empty_train_and_holdout",
             "training_window_policy": "all_current_clean_cost_complete_samples",
             "cursor_source": "last_trained_completed_shadow_sample_count",
             "trade_cursor_source": "last_trained_completed_trade_sample_count",
             "trade_cursor_policy": "clean_training_view_only",
+            "shadow_training_view_rebased": shadow_training_view_rebased,
         }
         if status_probe_error:
             training_policy["status_probe_error"] = status_probe_error
@@ -6453,7 +6659,13 @@ class TradingService:
                 "new_trade_sample_count": new_trade,
                 "training_policy": training_policy,
             }
-        should_train = force or learning_only or new_shadow > 0 or new_trade > 0
+        should_train = (
+            force
+            or learning_only
+            or shadow_training_view_rebased
+            or new_shadow > 0
+            or new_trade > 0
+        )
         if not should_train:
             return {
                 "trained": False,
@@ -6548,6 +6760,56 @@ class TradingService:
                 failure_count=result.get("failure_count"),
             )
         return result
+
+    async def _run_local_ai_tools_training_subprocess(self) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "train_local_ai_tools_models.py"),
+            "--training-mode",
+            "shadow",
+            "--model-stage",
+            "shadow",
+            "--persist-artifact",
+            "--confirm-phase3-rebuild",
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(PROJECT_ROOT),
+            env=os.environ.copy(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
+            )
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return {
+                "trained": False,
+                "reason": "timeout",
+                "error": "isolated local AI tools training exceeded its scheduler lease",
+            }
+        if process.returncode != 0:
+            return {
+                "trained": False,
+                "reason": "error",
+                "error": safe_error_text(stderr.decode("utf-8", errors="replace"), limit=180),
+            }
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return {
+                "trained": False,
+                "reason": "invalid_training_response",
+                "error": safe_error_text(exc, limit=180),
+            }
+        return dict(payload) if isinstance(payload, dict) else {
+            "trained": False,
+            "reason": "invalid_training_response",
+        }
 
     async def _completed_shadow_backtest_total(self) -> int:
         async with get_session_ctx() as session:
@@ -6863,6 +7125,29 @@ class TradingService:
             "reasoning": decision.reasoning,
             "position_size_pct": decision.position_size_pct,
         }
+
+        if decision.is_entry:
+            self._candidate_opportunity_score(decision, strategy_mode_context)
+            try:
+                await self._prepare_entry_for_hard_risk(
+                    decision,
+                    self._get_model_execution_mode(result_model),
+                    open_positions,
+                )
+                result["decision"].update(
+                    {
+                        "position_size_pct": decision.position_size_pct,
+                        "suggested_leverage": decision.suggested_leverage,
+                        "stop_loss_pct": decision.stop_loss_pct,
+                        "take_profit_pct": decision.take_profit_pct,
+                    }
+                )
+            except Exception as exc:
+                result["rejection_reason"] = (
+                    "动态费后收益风险预算生成失败，本次手动 entry 失败关闭："
+                    f"{safe_error_text(exc, limit=160)}"
+                )
+                return result
 
         # Risk assessment: only this model's positions.
         assessment = await self.manual_trade_risk_assessment.assess(
@@ -8617,6 +8902,19 @@ class TradingService:
 
         executor = await self._get_okx_executor_for_mode(mode)
         return await executor.fetch_account_fee_snapshot()
+
+    async def _market_execution_cost_facts(self, mode: str) -> dict[str, Any]:
+        """Read the same authoritative fee facts used by shadow evaluation."""
+
+        try:
+            return await self._shadow_execution_cost_facts(mode)
+        except Exception as exc:
+            logger.warning(
+                "fetch market execution cost facts failed",
+                mode=mode,
+                error=safe_error_text(exc),
+            )
+            return {}
 
     async def _get_okx_available_balance_for_mode(self, mode: str) -> float | None:
         """Return the actual OKX free USDT balance used to cap new entries."""

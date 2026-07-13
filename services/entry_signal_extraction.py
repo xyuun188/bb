@@ -53,6 +53,10 @@ _WRAPPER_METADATA_KEYS = (
     "objective_version",
     "artifact_objective",
     "artifact_objective_version",
+    "artifact_persisted",
+    "training_cost_policy",
+    "label_name",
+    "label_version",
     "prediction_quality",
     "fallback_reason",
     "feature_coverage",
@@ -353,6 +357,105 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
             "missing_governance": missing,
         }
     return {"eligible": True, "reason": "governance_allows_live_influence"}
+
+
+def signal_runtime_recovery_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
+    """Allow trained shadow output only when its return-quality contract is intact."""
+
+    if not signal_available(payload):
+        return {"eligible": False, "reason": "signal_unavailable"}
+
+    trained = False
+    quality_approved = False
+    objective_approved = False
+    objective_version_approved = False
+    label_approved = False
+    label_version_approved = False
+    cost_policy_approved = False
+    artifact_persisted = False
+    for node in _signal_governance_nodes(payload):
+        trained = trained or node.get("trained") is True
+        artifact_persisted = artifact_persisted or node.get("artifact_persisted") is True
+
+        training_cost_policy = str(node.get("training_cost_policy") or "").strip()
+        if training_cost_policy:
+            if training_cost_policy != "per_sample_live_spread_fee_and_funding_complete":
+                return {"eligible": False, "reason": "artifact_cost_policy_incomplete"}
+            cost_policy_approved = True
+
+        prediction_quality = safe_dict(node.get("prediction_quality"))
+        if prediction_quality:
+            if prediction_quality.get("production_eligible") is not True:
+                return {
+                    "eligible": False,
+                    "reason": str(
+                        prediction_quality.get("reason") or "prediction_quality_blocked"
+                    ),
+                }
+            if prediction_quality.get("anomalous") is True:
+                return {
+                    "eligible": False,
+                    "reason": str(
+                        prediction_quality.get("reason") or "prediction_quality_anomalous"
+                    ),
+                }
+            quality_approved = True
+
+        objective_name = str(
+            node.get("artifact_objective")
+            or node.get("objective_name")
+            or node.get("objective")
+            or ""
+        ).strip()
+        if objective_name:
+            if objective_name != RETURN_OBJECTIVE_NAME:
+                return {"eligible": False, "reason": "artifact_objective_mismatch"}
+            objective_approved = True
+
+        objective_version = str(
+            node.get("artifact_objective_version") or node.get("objective_version") or ""
+        ).strip()
+        if objective_version:
+            if objective_version != RETURN_OBJECTIVE_VERSION:
+                return {
+                    "eligible": False,
+                    "reason": "artifact_objective_version_mismatch",
+                }
+            objective_version_approved = True
+
+        label_name = str(node.get("label_name") or "").strip()
+        if label_name:
+            if label_name != "net_return_after_cost_pct":
+                return {"eligible": False, "reason": "artifact_return_label_mismatch"}
+            label_approved = True
+
+        label_version = str(node.get("label_version") or "").strip()
+        if label_version:
+            if label_version != RETURN_OBJECTIVE_VERSION:
+                return {
+                    "eligible": False,
+                    "reason": "artifact_return_label_version_mismatch",
+                }
+            label_version_approved = True
+
+    required = {
+        "trained_model": trained,
+        "prediction_quality": quality_approved,
+        "return_objective": objective_approved,
+        "return_objective_version": objective_version_approved,
+        "return_label": label_approved,
+        "return_label_version": label_version_approved,
+        "cost_policy": cost_policy_approved,
+        "persisted_artifact": artifact_persisted,
+    }
+    missing = [name for name, present in required.items() if not present]
+    if missing:
+        return {
+            "eligible": False,
+            "reason": "runtime_recovery_contract_incomplete",
+            "missing_governance": missing,
+        }
+    return {"eligible": True, "reason": "trained_shadow_return_contract_intact"}
 
 
 def signal_production_eligible(payload: dict[str, Any]) -> bool:

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from services.dynamic_policy_values import empirical_policy_value
+from services.execution_cost_model import execution_cost_estimate
 from services.return_loss_attribution import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -310,6 +311,28 @@ def _final_assessment(
     )
 
 
+def _shadow_cost_completeness_reasons(features: dict[str, Any]) -> list[str]:
+    execution_cost = execution_cost_estimate(features)
+    reasons: list[str] = []
+    if execution_cost.fee_pct <= 0:
+        reasons.append("cost_incomplete:fee_rate_missing")
+    if execution_cost.spread_source == "missing" or execution_cost.spread_pct <= 0:
+        reasons.append("cost_incomplete:live_spread_missing")
+
+    funding_rate = _safe_float(features.get("funding_rate"), None)
+    if funding_rate is None:
+        reasons.append("cost_incomplete:funding_rate_missing")
+    funding_interval_minutes = _safe_float(features.get("funding_interval_minutes"), None)
+    if funding_interval_minutes is None:
+        funding_interval_hours = _safe_float(features.get("funding_interval_hours"), None)
+        funding_interval_minutes = (
+            funding_interval_hours * 60.0 if funding_interval_hours is not None else None
+        )
+    if funding_interval_minutes is None or funding_interval_minutes <= 0:
+        reasons.append("cost_incomplete:funding_interval_missing")
+    return reasons
+
+
 def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     features = _features(sample)
     reasons: list[str] = []
@@ -349,6 +372,10 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     horizon = int(_safe_float(sample.get("horizon_minutes"), 0.0) or 0)
     if horizon <= 0:
         return _final_assessment(0.0, ["invalid_horizon_minutes"], exclude=True)
+
+    cost_reasons = _shadow_cost_completeness_reasons(features)
+    if cost_reasons:
+        return _final_assessment(0.0, cost_reasons, exclude=True)
 
     return _final_assessment(score, reasons, exclude=exclude)
 

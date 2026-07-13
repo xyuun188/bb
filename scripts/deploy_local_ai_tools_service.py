@@ -367,13 +367,18 @@ def model_x(features: dict[str, Any], *, horizon_minutes: int | None = None) -> 
     return [row[key] for key in FEATURE_KEYS]
 
 
-def _make_regressor() -> Pipeline:
+def _dynamic_min_samples_leaf(sample_count: int) -> int:
+    observed_count = max(int(sample_count or 0), 1)
+    return max(int(math.log2(max(observed_count, 2))), 1)
+
+
+def _make_regressor(sample_count: int) -> Pipeline:
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", ExtraTreesRegressor(
             n_estimators=260,
             max_depth=12,
-            min_samples_leaf=8,
+            min_samples_leaf=_dynamic_min_samples_leaf(sample_count),
             random_state=42,
             n_jobs=-1,
         )),
@@ -389,7 +394,7 @@ def _make_classifier(y: list[int]) -> Pipeline:
         estimator = ExtraTreesClassifier(
             n_estimators=240,
             max_depth=12,
-            min_samples_leaf=8,
+            min_samples_leaf=_dynamic_min_samples_leaf(len(y)),
             class_weight="balanced",
             random_state=42,
             n_jobs=-1,
@@ -466,11 +471,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def load_bundle() -> dict[str, Any] | None:
     global _BUNDLE_CACHE, _BUNDLE_MTIME
+    mtime: float | None = None
     try:
         if not BUNDLE_PATH.exists():
+            _BUNDLE_CACHE = None
+            _BUNDLE_MTIME = None
             return None
         mtime = BUNDLE_PATH.stat().st_mtime
-        if _BUNDLE_CACHE is not None and _BUNDLE_MTIME == mtime:
+        if _BUNDLE_MTIME == mtime:
             return _BUNDLE_CACHE
         candidate = load_trusted_joblib_bundle(BUNDLE_PATH)
         metadata = candidate.get("metadata") if isinstance(candidate, dict) else {}
@@ -485,7 +493,9 @@ def load_bundle() -> dict[str, Any] | None:
         return _BUNDLE_CACHE
     except Exception:
         _BUNDLE_CACHE = None
-        _BUNDLE_MTIME = None
+        # Remember the inspected file version so a rejected legacy bundle is
+        # not deserialized again on every live prediction request.
+        _BUNDLE_MTIME = mtime
         return None
 
 
@@ -563,6 +573,56 @@ def predict_proba_positive(model: Pipeline, x: list[list[float]]) -> float:
         return 0.0
     except Exception:
         return 0.0
+
+
+def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
+    """Return a current tree-prediction distribution without a fixed cutoff."""
+
+    expected = float(model.predict(x)[0])
+    named_steps = getattr(model, "named_steps", {})
+    estimator = named_steps.get("model") if hasattr(named_steps, "get") else None
+    imputer = named_steps.get("imputer") if hasattr(named_steps, "get") else None
+    trees = list(getattr(estimator, "estimators_", []) or [])
+    if not trees or imputer is None:
+        return {
+            "expected": expected,
+            "median": expected,
+            "lower_bound": expected,
+            "std": 0.0,
+            "spread": 0.0,
+            "sample_count": 0,
+            "distribution_ready": False,
+        }
+    transformed = imputer.transform(x)
+    values = np.asarray([float(tree.predict(transformed)[0]) for tree in trees], dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            "expected": expected,
+            "median": expected,
+            "lower_bound": expected,
+            "std": 0.0,
+            "spread": 0.0,
+            "sample_count": 0,
+            "distribution_ready": False,
+        }
+    ordered = np.sort(values)
+    lower_tail_count = max(int(math.sqrt(ordered.size)), 1)
+    spread = float(ordered[-1] - ordered[0])
+    numerical_resolution = float(np.finfo(float).eps) * max(
+        abs(float(ordered[0])),
+        abs(float(ordered[-1])),
+        1.0,
+    )
+    return {
+        "expected": expected,
+        "median": float(np.median(values)),
+        "lower_bound": float(np.median(ordered[:lower_tail_count])),
+        "std": float(np.std(values)),
+        "spread": spread,
+        "sample_count": int(values.size),
+        "distribution_ready": spread > numerical_resolution,
+    }
 
 
 def symbol_key(symbol: str | None) -> str:
@@ -743,8 +803,8 @@ def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | Non
         rows.append((x, long_return, short_return, sample.get("timeframe") or "unknown"))
     if len(rows) <= 1:
         return None
-    long_model = _make_regressor()
-    short_model = _make_regressor()
+    long_model = _make_regressor(len(rows))
+    short_model = _make_regressor(len(rows))
     long_model.fit([x for x, _, _, _ in rows], [y for _, y, _, _ in rows])
     short_model.fit([x for x, _, _, _ in rows], [y for _, _, y, _ in rows])
     timeframes: dict[str, int] = {}
@@ -1513,7 +1573,7 @@ def _train_text_sentiment_model(samples: list[dict[str, Any]]) -> dict[str, Any]
         if not bool(sample.get("exclude_from_training"))
     ]
     rows = [(text, score) for text, score in rows if text]
-    if len(rows) < 80:
+    if len(rows) <= 1:
         return None
     model = Pipeline([
         ("tfidf", TfidfVectorizer(max_features=6000, ngram_range=(1, 2), min_df=1)),
@@ -1574,6 +1634,14 @@ def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
         "challenger_model",
         "model_version",
         "route_mode",
+        "horizon_minutes",
+        "objective_name",
+        "objective_version",
+        "label_name",
+        "label_version",
+        "training_cost_policy",
+        "artifact_persisted",
+        "prediction_quality",
         "fallback_reason",
         "best_side",
         "side",
@@ -1632,6 +1700,43 @@ def with_model_metadata(
     payload.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
     payload.setdefault("live_mutation", False)
     payload.setdefault("production_permission", False)
+    if payload.get("trained") is True:
+        bundle = load_bundle()
+        metadata = bundle.get("metadata") if isinstance(bundle, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        for key in (
+            "objective_name",
+            "objective_version",
+            "label_name",
+            "label_version",
+            "training_cost_policy",
+            "artifact_persisted",
+            "model_stage",
+            "training_mode",
+        ):
+            if key in metadata:
+                payload.setdefault(key, metadata.get(key))
+        contract_ready = bool(
+            payload.get("objective_name") == RETURN_OBJECTIVE_NAME
+            and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
+            and payload.get("label_name") == RETURN_LABEL_NAME
+            and payload.get("label_version") == RETURN_LABEL_VERSION
+            and payload.get("training_cost_policy")
+            == "per_sample_live_spread_fee_and_funding_complete"
+            and payload.get("artifact_persisted") is True
+        )
+        prediction_quality = payload.get("prediction_quality")
+        if not isinstance(prediction_quality, dict):
+            prediction_quality = {
+                "production_eligible": False,
+                "anomalous": True,
+                "reason": "current_prediction_distribution_missing",
+            }
+            payload["prediction_quality"] = prediction_quality
+        if not contract_ready:
+            prediction_quality["production_eligible"] = False
+            prediction_quality["anomalous"] = True
+            prediction_quality["reason"] = "runtime_return_artifact_contract_incomplete"
     if not isinstance(payload.get("shadow_payload"), dict):
         payload["shadow_payload"] = _shadow_payload(tool, payload)
     return payload
@@ -2225,8 +2330,8 @@ def train(req: TrainRequest) -> dict[str, Any]:
     short_loss_y = [r["lossy_short"] for r in rows]
     sample_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in rows]
 
-    long_return_model = _make_regressor()
-    short_return_model = _make_regressor()
+    long_return_model = _make_regressor(len(rows))
+    short_return_model = _make_regressor(len(rows))
     long_loss_model = _make_classifier(long_loss_y)
     short_loss_model = _make_classifier(short_loss_y)
     long_return_model.fit(X, long_y, model__sample_weight=sample_weights)
@@ -2237,14 +2342,12 @@ def train(req: TrainRequest) -> dict[str, Any]:
     horizon_models: dict[int, dict[str, Any]] = {}
     for horizon in sorted({int(r["horizon"]) for r in rows}):
         h_rows = [r for r in rows if int(r["horizon"]) == horizon]
-        if len(h_rows) < 80:
-            continue
         hX = [r["x"] for r in h_rows]
         long_horizon_y = [r["long_return"] for r in h_rows]
         short_horizon_y = [r["short_return"] for r in h_rows]
         h_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in h_rows]
-        long_model = _make_regressor()
-        short_model = _make_regressor()
+        long_model = _make_regressor(len(h_rows))
+        short_model = _make_regressor(len(h_rows))
         long_model.fit(hX, long_horizon_y, model__sample_weight=h_weights)
         short_model.fit(hX, short_horizon_y, model__sample_weight=h_weights)
         horizon_models[horizon] = {
@@ -2269,13 +2372,15 @@ def train(req: TrainRequest) -> dict[str, Any]:
             )
         )
     if len(sentiment_samples) > 1:
+        sentiment_leaf_size = _dynamic_min_samples_leaf(len(sentiment_samples))
+
         def make_sentiment_regressor(random_state: int) -> Pipeline:
             return Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("model", RandomForestRegressor(
                     n_estimators=180,
                     max_depth=8,
-                    min_samples_leaf=10,
+                    min_samples_leaf=sentiment_leaf_size,
                     random_state=random_state,
                     n_jobs=-1,
                 )),
@@ -2482,22 +2587,25 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
     if bundle:
         try:
             x = [model_x(features)]
-            long_expected = float(bundle["long_return_model"].predict(x)[0])
-            short_expected = float(bundle["short_return_model"].predict(x)[0])
+            long_distribution = regression_prediction_distribution(bundle["long_return_model"], x)
+            short_distribution = regression_prediction_distribution(bundle["short_return_model"], x)
+            long_expected = float(long_distribution["expected"])
+            short_expected = float(short_distribution["expected"])
             long_loss_prob = predict_proba_positive(bundle["long_loss_model"], x)
             short_loss_prob = predict_proba_positive(bundle["short_loss_model"], x)
             profiles = bundle.get("profiles") or {}
             long_profile = profiles.get(profile_key_long, {})
             short_profile = profiles.get(profile_key_short, {})
-            long_profile_penalty = float(long_profile.get("loss_pressure") or 0.0) * 0.18
-            short_profile_penalty = float(short_profile.get("loss_pressure") or 0.0) * 0.18
-            adjusted_long = long_expected - long_loss_prob * 0.22 - long_profile_penalty
-            adjusted_short = short_expected - short_loss_prob * 0.22 - short_profile_penalty
-            best_side = "long" if adjusted_long >= adjusted_short else "short"
-            best_expected = adjusted_long if best_side == "long" else adjusted_short
-            edge = abs(adjusted_long - adjusted_short)
+            long_lower_bound = float(long_distribution["lower_bound"])
+            short_lower_bound = float(short_distribution["lower_bound"])
+            best_side = "long" if long_expected >= short_expected else "short"
+            best_expected = long_expected if best_side == "long" else short_expected
+            edge = abs(long_expected - short_expected)
             loss_prob = long_loss_prob if best_side == "long" else short_loss_prob
-            quality = max(best_expected, 0.0) + edge * 0.45 - loss_prob * 0.18
+            best_lower_bound = (
+                long_lower_bound if best_side == "long" else short_lower_bound
+            )
+            quality = best_lower_bound
             return _attach_baseline_only_shadow("profit_prediction", {
                 "available": True,
                 "trained": True,
@@ -2506,8 +2614,11 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "best_side": best_side,
                 "long_expected_return_pct": round(long_expected, 4),
                 "short_expected_return_pct": round(short_expected, 4),
-                "adjusted_long_return_pct": round(adjusted_long, 4),
-                "adjusted_short_return_pct": round(adjusted_short, 4),
+                "adjusted_long_return_pct": round(long_expected, 4),
+                "adjusted_short_return_pct": round(short_expected, 4),
+                "long_lower_bound_return_pct": round(long_lower_bound, 4),
+                "short_lower_bound_return_pct": round(short_lower_bound, 4),
+                "horizon_minutes": int(feature_row(features)["horizon_minutes"]),
                 "expected_return_pct": round(best_expected, 4),
                 "adjusted_expected_return_pct": round(best_expected, 4),
                 "profit_edge_pct": round(edge, 4),
@@ -2515,11 +2626,53 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "long_loss_probability": round(long_loss_prob, 4),
                 "short_loss_probability": round(short_loss_prob, 4),
                 "loss_probability": round(loss_prob, 4),
+                "prediction_quality": {
+                    "production_eligible": bool(
+                        long_distribution["distribution_ready"]
+                        and short_distribution["distribution_ready"]
+                        and all(
+                            math.isfinite(value)
+                            for value in (
+                                long_expected,
+                                short_expected,
+                                long_lower_bound,
+                                short_lower_bound,
+                            )
+                        )
+                    ),
+                    "anomalous": not bool(
+                        long_distribution["distribution_ready"]
+                        and short_distribution["distribution_ready"]
+                        and all(
+                            math.isfinite(value)
+                            for value in (
+                                long_expected,
+                                short_expected,
+                                long_lower_bound,
+                                short_lower_bound,
+                            )
+                        )
+                    ),
+                    "reason": (
+                        "current_tree_prediction_distribution_ready"
+                        if long_distribution["distribution_ready"]
+                        and short_distribution["distribution_ready"]
+                        else (
+                            "current_tree_prediction_distribution_degenerate"
+                            if long_distribution["sample_count"] > 0
+                            and short_distribution["sample_count"] > 0
+                            else "current_tree_prediction_distribution_missing"
+                        )
+                    ),
+                    "source": "current_extra_trees_prediction_distribution",
+                    "long": long_distribution,
+                    "short": short_distribution,
+                },
                 "symbol_side_profile": {
                     "long": long_profile,
                     "short": short_profile,
                 },
-                "note": "Trained fee-after-return model: expected return and loss probability drive the score; win rate is diagnostic only.",
+                "note": "Trained fee-after-return distribution is authoritative; loss probability, profiles, and win rate are diagnostics only.",
             }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
         except Exception as exc:
             fallback_error = safe_error(exc)
@@ -2570,14 +2723,32 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
         try:
             for horizon, item in (bundle.get("horizon_models") or {}).items():
                 x = [model_x(features, horizon_minutes=int(horizon))]
-                long_return = float(item["long_model"].predict(x)[0])
-                short_return = float(item["short_model"].predict(x)[0])
+                long_distribution = regression_prediction_distribution(item["long_model"], x)
+                short_distribution = regression_prediction_distribution(item["short_model"], x)
+                long_return = float(long_distribution["expected"])
+                short_return = float(short_distribution["expected"])
                 best_side = "long" if long_return >= short_return else "short"
                 best_return = long_return if best_side == "long" else short_return
                 predictions.append({
                     "horizon_minutes": int(horizon),
                     "long_expected_return_pct": round(long_return, 4),
                     "short_expected_return_pct": round(short_return, 4),
+                    "long_lower_bound_return_pct": round(
+                        float(long_distribution["lower_bound"]), 4
+                    ),
+                    "short_lower_bound_return_pct": round(
+                        float(short_distribution["lower_bound"]), 4
+                    ),
+                    "long_uncertainty_pct": round(float(long_distribution["std"]), 4),
+                    "short_uncertainty_pct": round(float(short_distribution["std"]), 4),
+                    "prediction_sample_count": min(
+                        int(long_distribution["sample_count"]),
+                        int(short_distribution["sample_count"]),
+                    ),
+                    "prediction_distribution_ready": bool(
+                        long_distribution["distribution_ready"]
+                        and short_distribution["distribution_ready"]
+                    ),
                     "best_side": best_side,
                     "expected_return_pct": round(best_return, 4),
                     "expected_move_pct": round(best_return, 4),
@@ -2585,14 +2756,20 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "samples": int(item.get("samples") or 0),
                 })
             if predictions:
-                primary = max(predictions, key=lambda r: float(r["expected_return_pct"]))
+                primary = max(
+                    predictions,
+                    key=lambda r: max(
+                        float(r["long_lower_bound_return_pct"]),
+                        float(r["short_lower_bound_return_pct"]),
+                    ),
+                )
                 best_side = str(primary["best_side"])
                 edge = abs(
                     float(primary["long_expected_return_pct"])
                     - float(primary["short_expected_return_pct"])
                 )
                 confidence = clamp(edge / 0.8, 0.0, 1.0)
-                return with_model_metadata("time_series_prediction", {
+                payload = with_model_metadata("time_series_prediction", {
                     "available": True,
                     "trained": True,
                     "model": "local-timeseries-trained-v2",
@@ -2605,10 +2782,35 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "expected_return_pct": primary["expected_return_pct"],
                     "long_expected_return_pct": primary["long_expected_return_pct"],
                     "short_expected_return_pct": primary["short_expected_return_pct"],
+                    "long_lower_bound_return_pct": primary[
+                        "long_lower_bound_return_pct"
+                    ],
+                    "short_lower_bound_return_pct": primary[
+                        "short_lower_bound_return_pct"
+                    ],
+                    "horizon_minutes": primary["horizon_minutes"],
                     "profit_edge_pct": round(edge, 4),
                     "confidence": round(confidence, 4),
                     "predictions": predictions,
+                    "prediction_quality": {
+                        "production_eligible": primary[
+                            "prediction_distribution_ready"
+                        ],
+                        "anomalous": not primary["prediction_distribution_ready"],
+                        "reason": (
+                            "current_tree_prediction_distribution_ready"
+                            if primary["prediction_distribution_ready"]
+                            else (
+                                "current_tree_prediction_distribution_degenerate"
+                                if primary["prediction_sample_count"] > 0
+                                else "current_tree_prediction_distribution_missing"
+                            )
+                        ),
+                        "source": "current_horizon_extra_trees_prediction_distribution",
+                        "sample_count": primary["prediction_sample_count"],
+                    },
                 }, features=features)
+                return _attach_timeseries_specialist_shadow(payload, features=features)
         except Exception:
             pass
 

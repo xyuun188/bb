@@ -11,6 +11,33 @@ from data_feed.feature_vector import FeatureVector
 
 
 @pytest.mark.asyncio
+async def test_keyless_loopback_model_uses_process_local_client_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": "http://127.0.0.1:18003/v1",
+            "api_key": "",
+            "model": "BB-FinQuant-Expert-14B",
+            "role": "trend_direction",
+        },
+    )
+
+    await agent.initialize()
+
+    assert captured["api_key"] == "local-loopback"
+    assert agent._api_key == ""
+
+
+@pytest.mark.asyncio
 async def test_backup_qwen3_model_gets_model_specific_no_think_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

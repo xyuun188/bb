@@ -13,6 +13,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
 from core.trading_mode import mode_manager
 from executor.base_executor import ExecutionResult, OrderStatus
+from risk_manager.engine import RiskEngine
 from services.account_accounting_service import AccountAccountingService
 from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
@@ -1671,6 +1672,175 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_auto_train_checks_cursors_before_loading_training_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import train_local_ai_tools_models as train_script
+
+    service = TradingService.__new__(TradingService)
+    service._local_tools_last_completed_shadow_count = 0
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "model_bundle_available": True,
+                "last_trained_completed_shadow_sample_count": 10,
+                "last_trained_completed_trade_sample_count": 3,
+            }
+
+    async def fail_heavy_load(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError("not-due checks must not load the full training payload")
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate",
+        lambda: {"allowed": True},
+    )
+    monkeypatch.setattr(
+        train_script,
+        "_completed_trade_sample_count",
+        lambda: _async_value(3),
+    )
+    monkeypatch.setattr(train_script, "_load_sequence_samples", fail_heavy_load)
+    service.local_ai_tools = FakeLocalAITools()
+    service._completed_shadow_backtest_total = lambda: _async_value(10)  # type: ignore[method-assign]
+
+    result = await service._maybe_train_local_ai_tools_process(force=False)
+
+    assert result["trained"] is False
+    assert result["reason"] == "not_due"
+    assert result["training_policy"]["process_boundary"] == (
+        "dedicated_training_subprocess"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_auto_train_runs_due_training_outside_trading_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import train_local_ai_tools_models as train_script
+
+    service = TradingService.__new__(TradingService)
+    service._local_tools_last_completed_shadow_count = 0
+    service._local_tools_active_training_run_id = "isolated-training-run"
+    started_runs: list[dict[str, Any]] = []
+
+    class FakeTrainingState:
+        def start_run(self, **kwargs: Any) -> None:
+            started_runs.append(kwargs)
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "model_bundle_available": True,
+                "last_trained_completed_shadow_sample_count": 10,
+                "last_trained_completed_trade_sample_count": 3,
+            }
+
+    async def fail_heavy_load(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError("due auto-training must not load payload in the trading process")
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate",
+        lambda: {"allowed": True},
+    )
+    monkeypatch.setattr(
+        train_script,
+        "_completed_trade_sample_count",
+        lambda: _async_value(3),
+    )
+    monkeypatch.setattr(train_script, "_load_sequence_samples", fail_heavy_load)
+    service.local_ai_tools = FakeLocalAITools()
+    service.model_training_state_store = FakeTrainingState()
+    service._completed_shadow_backtest_total = lambda: _async_value(11)  # type: ignore[method-assign]
+    service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "trained": True,
+            "shadow_sample_count": 12,
+            "completed_shadow_sample_count": 12,
+            "last_trained_completed_shadow_sample_count": 12,
+            "completed_trade_sample_count": 4,
+            "last_trained_completed_trade_sample_count": 4,
+        }
+    )
+
+    result = await service._maybe_train_local_ai_tools_process(force=False)
+
+    assert result["trained"] is True
+    assert result["training_process_isolated"] is True
+    assert result["new_shadow_sample_count"] == 1
+    assert result["last_trained_completed_shadow_sample_count"] == 12
+    assert result["last_trained_completed_trade_sample_count"] == 4
+    assert service._local_tools_last_completed_shadow_count == 12
+    assert started_runs == [
+        {
+            "scheduler_id": "local_ai_tools_auto_train",
+            "model_ids": trading_service.LOCAL_AI_TOOL_MODEL_IDS,
+            "run_id": "isolated-training-run",
+            "trigger_reason": "training_due",
+            "sample_cursor": {"shadow": 11, "trade": 3},
+            "timeout_seconds": trading_service.AUTO_TRAIN_LEASE_STALE_SECONDS,
+        }
+    ]
+    assert result["training_policy"]["process_boundary"] == (
+        "dedicated_training_subprocess"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_auto_train_rebuilds_when_clean_view_rebases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import train_local_ai_tools_models as train_script
+
+    service = TradingService.__new__(TradingService)
+    service._local_tools_last_completed_shadow_count = 0
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "model_bundle_available": True,
+                "last_trained_completed_shadow_sample_count": 11,
+                "last_trained_completed_trade_sample_count": 3,
+            }
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate",
+        lambda: {"allowed": True},
+    )
+    monkeypatch.setattr(
+        train_script,
+        "_completed_trade_sample_count",
+        lambda: _async_value(3),
+    )
+    service.local_ai_tools = FakeLocalAITools()
+    service._completed_shadow_backtest_total = lambda: _async_value(10)  # type: ignore[method-assign]
+    service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {"trained": True, "shadow_sample_count": 4}
+    )
+
+    result = await service._maybe_train_local_ai_tools_process(force=False)
+
+    assert result["trained"] is True
+    assert result["new_shadow_sample_count"] == 0
+    assert result["training_process_isolated"] is True
+    assert result["last_trained_completed_shadow_sample_count"] == 10
+    assert result["last_trained_completed_trade_sample_count"] == 3
+    assert result["training_policy"]["shadow_training_view_rebased"] is True
+
+
+@pytest.mark.asyncio
 async def test_entry_execution_policy_blocks_entries_when_okx_sync_is_unhealthy() -> None:
     service = TradingService.__new__(TradingService)
     service._refresh_entry_symbol_blocks_if_stale = lambda **_kwargs: _async_value(None)
@@ -2160,6 +2330,67 @@ async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
     )
 
     assert calls == [("BTC/USDT", "paper", 1)]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None:
+    service = TradingService.__new__(TradingService)
+    events: list[str] = []
+
+    async def allocated_balance(_mode: str, _decision: DecisionOutput | None) -> float:
+        events.append("sizing")
+        return 1000.0
+
+    async def persist_raw(_decision_id: int, _raw: dict[str, Any]) -> None:
+        events.append("persist")
+
+    service.entry_policy = EntryPolicy(
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(
+            allocated_order_balance=allocated_balance,
+        ),
+    )
+    service._mark_decision_raw_response = persist_raw  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.feature_snapshot = {"current_price": 100.0, "atr_pct": 0.01}
+    decision.raw_response = {
+        "opportunity_score": {
+            "score": 0.2,
+            "expected_net_return_pct": 0.5,
+            "expected_loss_pct": 0.1,
+            "server_profit_loss_probability": 0.2,
+            "tail_risk_score": 0.2,
+            "profit_quality_ratio": 2.0,
+            "execution_cost": {"production_eligible": True, "total_pct": 0.1},
+            "expected_net_breakdown": {
+                "components": [
+                    {
+                        "production_eligible": True,
+                        "included_in_return_distribution": True,
+                    }
+                ]
+            },
+        }
+    }
+
+    await service._prepare_entry_for_hard_risk(
+        decision,
+        "paper",
+        [],
+        decision_db_id=17,
+    )
+    events.append("risk")
+    assessment = RiskEngine().assess(
+        decision,
+        current_positions=[],
+        account_balance=1000.0,
+    )
+
+    assert events == ["sizing", "persist", "risk"]
+    assert decision.raw_response["profit_risk_sizing"]["production_eligible"] is True
+    assert decision.position_size_pct > 0
+    assert assessment.approved is True
 
 
 

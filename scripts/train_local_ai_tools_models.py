@@ -403,8 +403,14 @@ async def _post_training_payload(
 ) -> dict[str, Any]:
     normalized_base_url = _normalize_base_url(base_url)
     headers = _build_auth_headers(auth_token)
+    timeout = httpx.Timeout(
+        connect=request_timeout,
+        read=None,
+        write=None,
+        pool=request_timeout,
+    )
     try:
-        async with httpx.AsyncClient(timeout=request_timeout, transport=transport) as client:
+        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
             response = await client.post(
                 f"{normalized_base_url}/train",
                 json=payload,
@@ -490,9 +496,8 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
             features.setdefault("decision_confidence", _as_float(row.get("decision_confidence")))
             features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
             fee_pct, _fee_source = round_trip_fee_pct(features)
-            if fee_pct <= 0:
-                continue
-            features["round_trip_fee_pct"] = fee_pct
+            if fee_pct > 0:
+                features["round_trip_fee_pct"] = fee_pct
             compact_features = _compact_local_ai_tools_features(features)
             if not compact_features:
                 continue

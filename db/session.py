@@ -170,6 +170,7 @@ async def init_db() -> None:
                       AND position_id IS NOT NULL
                     """))
         await _ensure_trade_fact_columns(conn)
+        await _ensure_expert_memory_storage_contract(conn)
         await _ensure_ai_decision_model_health_columns(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
         await _ensure_trade_fact_indexes(conn)
@@ -216,6 +217,59 @@ async def _lock_schema_migration_if_needed(conn: Any) -> None:
     if "postgresql" not in settings.database_url:
         return
     await conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('bb:init_db_schema'))"))
+
+
+async def _ensure_expert_memory_storage_contract(conn: Any) -> None:
+    """Keep removed memory controls as neutral database compatibility fields."""
+
+    if "postgresql" in settings.database_url:
+        for ddl in (
+            "ALTER TABLE expert_memories ADD COLUMN IF NOT EXISTS "
+            "confidence_adjustment DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ALTER TABLE expert_memories ADD COLUMN IF NOT EXISTS "
+            "position_size_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0",
+            "ALTER TABLE expert_memories ALTER COLUMN confidence_adjustment SET DEFAULT 0.0",
+            "ALTER TABLE expert_memories ALTER COLUMN position_size_multiplier SET DEFAULT 1.0",
+        ):
+            await conn.execute(text(ddl))
+        await conn.execute(
+            text(
+                """
+                UPDATE expert_memories
+                SET confidence_adjustment = 0.0,
+                    position_size_multiplier = 1.0
+                WHERE confidence_adjustment IS DISTINCT FROM 0.0
+                   OR position_size_multiplier IS DISTINCT FROM 1.0
+                """
+            )
+        )
+        return
+
+    if "sqlite" not in settings.database_url:
+        return
+    result = await conn.execute(text("PRAGMA table_info(expert_memories)"))
+    existing = {str(row[1]) for row in result.fetchall()}
+    for name, column_type in (
+        ("confidence_adjustment", "FLOAT NOT NULL DEFAULT 0.0"),
+        ("position_size_multiplier", "FLOAT NOT NULL DEFAULT 1.0"),
+    ):
+        if name not in existing:
+            await conn.execute(
+                text(f"ALTER TABLE expert_memories ADD COLUMN {name} {column_type}")
+            )
+    await conn.execute(
+        text(
+            """
+            UPDATE expert_memories
+            SET confidence_adjustment = 0.0,
+                position_size_multiplier = 1.0
+            WHERE confidence_adjustment IS NULL
+               OR confidence_adjustment <> 0.0
+               OR position_size_multiplier IS NULL
+               OR position_size_multiplier <> 1.0
+            """
+        )
+    )
 
 
 async def _ensure_trade_fact_columns(conn: Any) -> None:

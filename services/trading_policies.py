@@ -152,6 +152,26 @@ class EntryPolicy:
             return
         raise RuntimeError("EntryPolicy requires entry_profit_risk_sizing dependency")
 
+    async def prepare_dynamic_risk_contract(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+        open_positions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Build the dynamic sizing contract before the hard risk engine runs."""
+
+        if not decision.is_entry:
+            return
+        self.ensure_opportunity_score(
+            decision,
+            self.strategy_context_from_decision(decision),
+        )
+        await self.apply_profit_risk_sizing(
+            decision,
+            model_mode,
+            open_positions=open_positions or [],
+        )
+
     async def high_risk_review_gate(
         self,
         decision: DecisionOutput,
@@ -200,8 +220,6 @@ class EntryPolicy:
                 {"pipeline_context": context.public_data()},
             )
 
-        self.ensure_opportunity_score(decision, self.strategy_context_from_decision(decision))
-
         stale_reason = self.stale_decision_reason(decision)
         if stale_reason:
             return PolicyGateResult.block(
@@ -210,7 +228,7 @@ class EntryPolicy:
                 {"pipeline_context": context.public_data()},
             )
 
-        await self.apply_profit_risk_sizing(
+        await self.prepare_dynamic_risk_contract(
             decision,
             model_mode,
             open_positions=open_positions or [],

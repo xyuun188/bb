@@ -133,7 +133,7 @@ def test_settings_defaults_do_not_hardcode_remote_model_endpoints() -> None:
     assert cfg.high_risk_review_api_key == ""
 
 
-def test_fixed_ai_models_require_explicit_per_slot_api_key() -> None:
+def test_fixed_ai_models_allow_keyless_loopback_tunnels() -> None:
     cfg = Settings(  # type: ignore[call-arg]
         _env_file=None,
         ai_models=[
@@ -155,6 +155,25 @@ def test_fixed_ai_models_require_explicit_per_slot_api_key() -> None:
     assert trend["api_key"] == ""
     assert trend["api_base"] == "http://127.0.0.1:8000/v1"
     assert trend["model"] == "qwen3-14b-trade"
+    assert [
+        item["name"] for item in cfg.get_fixed_ai_models(include_empty=False)
+    ] == ["trend_expert"]
+
+
+def test_fixed_ai_models_still_require_keys_for_non_loopback_endpoints() -> None:
+    cfg = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        ai_models=[
+            {
+                "name": "trend_expert",
+                "api_base": "https://models.example.invalid/v1",
+                "api_key": "",
+                "model": "remote-model",
+            }
+        ],
+    )
+
+    assert cfg.get_fixed_ai_models(include_empty=False) == []
 
 
 def test_dual_14b_config_script_generates_fixed_slot_routing(

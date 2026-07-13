@@ -71,16 +71,18 @@ def load_latest_paper_observation_report(root: Path | None = None) -> dict[str, 
 
 
 def _canonical_return(sample: dict[str, Any]) -> float | None:
-    for key in (
+    keys = (
         "net_return_after_cost_pct",
         "realized_net_return_after_cost_pct",
         "realized_net_return_pct",
         "label_net_return_after_cost_pct",
         "target_net_return_after_cost_pct",
-    ):
-        value = _safe_float(sample.get(key), None)
-        if value is not None:
-            return value
+    )
+    for source in (sample, _safe_dict(sample.get("profit_learning_labels"))):
+        for key in keys:
+            value = _safe_float(source.get(key), None)
+            if value is not None:
+                return value
     return None
 
 
@@ -90,6 +92,36 @@ def _cost_complete(sample: dict[str, Any]) -> bool:
         explicit = sample.get("training_cost_complete")
     if explicit is not None:
         return explicit is True
+
+    labels = _safe_dict(sample.get("profit_learning_labels"))
+    label_explicit = labels.get("cost_complete")
+    if label_explicit is None:
+        label_explicit = labels.get("training_cost_complete")
+    if label_explicit is not None:
+        return label_explicit is True
+
+    # Authoritative closed-trade labels carry their cost evidence inside the
+    # unified profit-learning contract. Realized execution prices already
+    # incorporate fill quality; fee and funding remain separately attested.
+    if (
+        str(labels.get("sample_kind") or "").strip().lower() == "trade"
+        and labels.get("training_supervision_ready") is True
+        and str(labels.get("cost_basis_label") or "").strip().lower()
+        == "fee_plus_funding"
+        and sample.get("exclude_from_training") is not True
+    ):
+        notional = _safe_float(labels.get("notional_usdt"), None)
+        required_cost_values = (
+            labels.get("realized_net_pnl_usdt"),
+            labels.get("fee_estimate_usdt"),
+            labels.get("funding_fee_usdt"),
+        )
+        return bool(
+            notional is not None
+            and notional > 0
+            and all(_safe_float(value, None) is not None for value in required_cost_values)
+        )
+
     components = (
         sample.get("fee_return_pct"),
         sample.get("slippage_return_pct"),
