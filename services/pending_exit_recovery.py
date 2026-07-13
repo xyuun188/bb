@@ -179,8 +179,8 @@ class PendingExitDecisionRecoveryProcessor:
             reasoning=str(item.get("reasoning") or ""),
             position_size_pct=float(item.get("position_size_pct") or 1.0),
             suggested_leverage=float(item.get("suggested_leverage") or 1.0),
-            stop_loss_pct=float(item.get("stop_loss_pct") or 0.05),
-            take_profit_pct=float(item.get("take_profit_pct") or 0.10),
+            stop_loss_pct=float(item.get("stop_loss_pct") or 0.0),
+            take_profit_pct=float(item.get("take_profit_pct") or 0.0),
             timestamp=timestamp,
             raw_response=(
                 item["raw_response"] if isinstance(item.get("raw_response"), dict) else {}

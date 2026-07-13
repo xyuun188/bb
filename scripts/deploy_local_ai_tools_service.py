@@ -89,15 +89,13 @@ FEATURE_KEYS = [
     "news_article_count", "decision_confidence", "horizon_minutes",
 ]
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
-ROUND_TRIP_COST_PCT = float(os.environ.get("LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT", "0.12"))
-TAIL_LOSS_THRESHOLD_PCT = float(os.environ.get("LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT", "0.18"))
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
 RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
 RETURN_LABEL_NAME = "net_return_after_cost_pct"
 RETURN_LABEL_VERSION = "2026-07-12.v1"
 COST_MODEL_VERSION = "okx_fee_slippage_funding_v1"
-MIN_TIMESERIES_SEQUENCE_LENGTH = int(
-    os.environ.get("LOCAL_AI_TOOLS_MIN_TIMESERIES_SEQUENCE_LENGTH", "30")
+TIMESERIES_MODEL_INPUT_ROWS = int(
+    os.environ.get("LOCAL_AI_TOOLS_TIMESERIES_MODEL_INPUT_ROWS", "30")
 )
 TIMESERIES_PRIMARY_REPO_ID = os.environ.get(
     "LOCAL_AI_TOOLS_TIMESERIES_PRIMARY_MODEL",
@@ -153,7 +151,7 @@ _STATUS_METADATA_KEYS = (
     "tail_loss_threshold_pct",
     "quality_report",
     "governance_report",
-    "profit_first_report",
+    "return_objective_report",
     "training_policy",
     "trade_sample_cursor_policy",
     "training_mode",
@@ -249,7 +247,7 @@ class TrainRequest(BaseModel):
     completed_trade_sample_count: int | None = None
     quality_report: dict[str, Any] = {}
     governance_report: dict[str, Any] = {}
-    profit_first_report: dict[str, Any] = {}
+    return_objective_report: dict[str, Any] = {}
     training_mode: str = "shadow"
     model_stage: str = "shadow"
     evaluation_policy: dict[str, Any] = {}
@@ -270,8 +268,55 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def net_return_pct(value: float) -> float:
-    return f({"value": value}, "value") - ROUND_TRIP_COST_PCT
+def cost_complete_net_returns(
+    sample: dict[str, Any],
+    features: dict[str, Any],
+    *,
+    horizon_minutes: int,
+    long_gross_return_pct: float,
+    short_gross_return_pct: float,
+) -> tuple[float, float, dict[str, float]] | None:
+    spread_pct = f(features, "spread_pct", float("nan"))
+    fee_pct = f(sample, "round_trip_fee_pct", f(features, "round_trip_fee_pct", float("nan")))
+    funding_rate = f(features, "funding_rate", float("nan"))
+    funding_interval_minutes = f(features, "funding_interval_minutes", float("nan"))
+    if not math.isfinite(funding_interval_minutes):
+        funding_interval_hours = f(features, "funding_interval_hours", float("nan"))
+        if math.isfinite(funding_interval_hours):
+            funding_interval_minutes = funding_interval_hours * 60.0
+    if (
+        not math.isfinite(spread_pct)
+        or spread_pct <= 0
+        or not math.isfinite(fee_pct)
+        or fee_pct <= 0
+        or not math.isfinite(funding_rate)
+        or not math.isfinite(funding_interval_minutes)
+        or funding_interval_minutes <= 0
+    ):
+        return None
+    slippage_pct = spread_pct / 2.0
+    funding_drag_pct = funding_rate * 100.0 * horizon_minutes / funding_interval_minutes
+    return (
+        long_gross_return_pct - fee_pct - slippage_pct - funding_drag_pct,
+        short_gross_return_pct - fee_pct - slippage_pct + funding_drag_pct,
+        {
+            "spread_pct": spread_pct,
+            "fee_pct": fee_pct,
+            "slippage_pct": slippage_pct,
+            "funding_drag_pct": funding_drag_pct,
+        },
+    )
+
+
+def empirical_lower_hinge(values: list[float]) -> float:
+    ordered = sorted(value for value in values if math.isfinite(value))
+    if not ordered:
+        return 0.0
+    lower = ordered[: len(ordered) // 2 + (len(ordered) % 2)]
+    middle = len(lower) // 2
+    if len(lower) % 2:
+        return lower[middle]
+    return (lower[middle - 1] + lower[middle]) / 2.0
 
 
 def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None) -> dict[str, float]:
@@ -691,12 +736,12 @@ def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | Non
             continue
         x = sequence_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         future_move = f(sample, "future_return_pct")
-        long_return = f(sample, "long_return_pct", net_return_pct(future_move))
-        short_return = f(sample, "short_return_pct", net_return_pct(-future_move))
+        long_return = f(sample, "long_return_pct", future_move)
+        short_return = f(sample, "short_return_pct", -future_move)
         if not x:
             continue
         rows.append((x, long_return, short_return, sample.get("timeframe") or "unknown"))
-    if len(rows) < 120:
+    if len(rows) <= 1:
         return None
     long_model = _make_regressor()
     short_model = _make_regressor()
@@ -726,12 +771,12 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
             continue
         x = sequence_deep_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         future_move = f(sample, "future_return_pct")
-        long_return = f(sample, "long_return_pct", net_return_pct(future_move))
-        short_return = f(sample, "short_return_pct", net_return_pct(-future_move))
+        long_return = f(sample, "long_return_pct", future_move)
+        short_return = f(sample, "short_return_pct", -future_move)
         if x:
             rows.append((x, long_return, short_return))
-    if len(rows) < 180:
-        return {"available": False, "reason": "not_enough_sequence_samples", "samples": len(rows)}
+    if len(rows) <= 1:
+        return {"available": False, "reason": "sequence_distribution_unavailable", "samples": len(rows)}
 
     X = np.array([x for x, _, _ in rows], dtype=np.float32)
     y = np.array([[long_y, short_y] for _, long_y, short_y in rows], dtype=np.float32)
@@ -817,7 +862,7 @@ def _timeseries_close_sequence(features: dict[str, Any]) -> tuple[list[float], s
             source = key
             break
     closes = _safe_sequence(raw, limit=512)
-    if len(closes) < MIN_TIMESERIES_SEQUENCE_LENGTH:
+    if len(closes) < TIMESERIES_MODEL_INPUT_ROWS:
         return closes, "not_enough_real_close_sequence", source or "missing"
     return closes, "", source
 
@@ -1151,7 +1196,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "reason": reason,
             "sequence_length": len(closes),
             "sequence_source": sequence_source,
-            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
             "live_mutation": False,
         }
@@ -1246,7 +1291,7 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "actual_inference": True,
             "sequence_length": len(closes),
             "sequence_source": sequence_source,
-            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
             "horizon_step": horizon_step,
             "forecast_price": round(forecast_price, 8),
             "last_close": round(float(last_close), 8),
@@ -1291,7 +1336,7 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "reason": reason,
             "sequence_length": len(closes),
             "sequence_source": sequence_source,
-            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
             "live_mutation": False,
         }
@@ -1354,7 +1399,7 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "actual_inference": True,
             "sequence_length": len(closes),
             "sequence_source": sequence_source,
-            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
             "horizon_step": horizon_step,
             "forecast_price": round(forecast_price, 8),
             "last_close": round(float(last_close), 8),
@@ -1572,7 +1617,7 @@ def with_model_metadata(
         "profit_prediction": "profit_v1_baseline",
         "time_series_prediction": "timeseries_v1_baseline",
         "sentiment_analysis": "sentiment_v1_baseline",
-        "exit_advice": "exit_v1_rules",
+        "exit_advice": "exit_profile_observer_v2",
     }
     model_name = str(payload.get("model") or defaults.get(tool) or "local_ai_tools")
     payload.setdefault("primary_model", model_name)
@@ -1586,6 +1631,7 @@ def with_model_metadata(
     payload.setdefault("feature_coverage", _feature_coverage(features or {}))
     payload.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
     payload.setdefault("live_mutation", False)
+    payload.setdefault("production_permission", False)
     if not isinstance(payload.get("shadow_payload"), dict):
         payload["shadow_payload"] = _shadow_payload(tool, payload)
     return payload
@@ -2088,7 +2134,7 @@ def health() -> dict[str, Any]:
     payload.setdefault("completed_trade_sample_count", 0)
     payload.setdefault("quality_report", {})
     payload.setdefault("governance_report", {})
-    payload.setdefault("profit_first_report", {})
+    payload.setdefault("return_objective_report", {})
     payload.update(_phase3_inventory_status())
     payload["specialist_model_chains"] = {
         "timeseries": _specialist_model_chain("timeseries"),
@@ -2129,10 +2175,18 @@ def train(req: TrainRequest) -> dict[str, Any]:
         horizon = int(sample.get("horizon_minutes") or features.get("horizon_minutes") or 10)
         raw_long_return = f(sample, "long_return_pct")
         raw_short_return = f(sample, "short_return_pct")
-        long_return = net_return_pct(raw_long_return)
-        short_return = net_return_pct(raw_short_return)
         if not features:
             continue
+        cost_complete = cost_complete_net_returns(
+            sample,
+            features,
+            horizon_minutes=horizon,
+            long_gross_return_pct=raw_long_return,
+            short_gross_return_pct=raw_short_return,
+        )
+        if cost_complete is None:
+            continue
+        long_return, short_return, execution_cost = cost_complete
         rows.append({
             "x": model_x(features, horizon_minutes=horizon),
             "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
@@ -2142,17 +2196,27 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "long_return": long_return,
             "short_return": short_return,
             "best_side": "long" if long_return >= short_return else "short",
-            "lossy_long": int(long_return < -TAIL_LOSS_THRESHOLD_PCT),
-            "lossy_short": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
+            "execution_cost": execution_cost,
+            "features": features,
             "sample_weight": max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
         })
-    if len(rows) < 200:
+    if len(rows) <= 1:
         return {
             "trained": False,
-            "reason": "not_enough_shadow_samples",
+            "reason": "cost_complete_training_distribution_unavailable",
             "shadow_sample_count": len(rows),
-            "message": "Need at least 200 completed shadow samples to train.",
+            "message": "Need non-empty train and holdout distributions from cost-complete samples.",
         }
+
+    long_tail_boundary = empirical_lower_hinge(
+        [row["long_return"] for row in rows if row["long_return"] < 0]
+    )
+    short_tail_boundary = empirical_lower_hinge(
+        [row["short_return"] for row in rows if row["short_return"] < 0]
+    )
+    for row in rows:
+        row["lossy_long"] = int(row["long_return"] < long_tail_boundary)
+        row["lossy_short"] = int(row["short_return"] < short_tail_boundary)
 
     X = [r["x"] for r in rows]
     long_y = [r["long_return"] for r in rows]
@@ -2194,21 +2258,17 @@ def train(req: TrainRequest) -> dict[str, Any]:
 
     sentiment_model = None
     sentiment_samples = []
-    for sample in req.shadow_samples or []:
-        if bool(sample.get("exclude_from_training")):
-            continue
-        features = sample.get("features") or {}
-        if not features:
-            continue
+    for row in rows:
+        features = row["features"]
         sentiment_samples.append(
             (
                 [feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS],
-                net_return_pct(f(sample, "long_return_pct")),
-                net_return_pct(f(sample, "short_return_pct")),
-                max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
+                row["long_return"],
+                row["short_return"],
+                row["sample_weight"],
             )
         )
-    if len(sentiment_samples) >= 200:
+    if len(sentiment_samples) > 1:
         def make_sentiment_regressor(random_state: int) -> Pipeline:
             return Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
@@ -2328,8 +2388,11 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "feature_count": len(FEATURE_KEYS),
         "horizons": sorted(horizon_models),
         "profile_count": len(profiles),
-        "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
-        "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
+        "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+        "tail_loss_policy": {
+            "long": {"source": "cost_complete_training_negative_return_lower_hinge", "value": long_tail_boundary},
+            "short": {"source": "cost_complete_training_negative_return_lower_hinge", "value": short_tail_boundary},
+        },
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "label_name": RETURN_LABEL_NAME,
@@ -2340,7 +2403,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "time_split_policy": "chronological_features_before_labels",
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
-        "profit_first_report": req.profit_first_report or {},
+        "return_objective_report": req.return_objective_report or {},
         "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": str(req.training_mode or "shadow"),
@@ -2456,7 +2519,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "long": long_profile,
                     "short": short_profile,
                 },
-                "note": "Trained profit-first model: expected return and loss probability drive the score; win rate is not the objective.",
+                "note": "Trained fee-after-return model: expected return and loss probability drive the score; win rate is diagnostic only.",
             }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
         except Exception as exc:
             fallback_error = safe_error(exc)
@@ -2494,7 +2557,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
         "short_loss_probability": round(clamp((risk_penalty + max(-short_expected, 0.0)) / 2.0, 0.0, 1.0), 4),
         "risk_penalty": round(risk_penalty, 4),
         "fallback_error": fallback_error,
-        "note": "Profit-first local signal; win rate is not used as the primary objective.",
+        "note": "Fee-after-return local signal; win rate is diagnostic only.",
     }, kind="profit", features=features, fallback_reason=fallback_error or "trained_profit_model_unavailable")
 
 
@@ -2667,7 +2730,7 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
             "sequence_input_status": sequence_reason or "real_sequence_ready",
             "sequence_length": len(close_sequence),
             "sequence_source": sequence_source,
-            "minimum_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
         }
     )
     return _attach_timeseries_specialist_shadow(
@@ -2832,66 +2895,33 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
             "no_matching_position": True,
             "reason": "本轮没有传入与该币种匹配的当前持仓，平仓建议模型不参与。",
         }, features=features, fallback_reason="no_matching_open_position")
-    advices = []
+    observations = []
     for pos in positions:
         side = str(pos.get("side") or "").lower()
         pnl_pct = f(pos, "unrealized_pnl_pct", f(pos, "pnl_pct"))
         unrealized = f(pos, "unrealized_pnl")
         hold = f(pos, "hold_minutes")
         profile = profiles.get(f"{symbol}|{side}", {})
-        loss_pressure = float(profile.get("loss_pressure") or 0.0)
-        profit_factor = float(profile.get("profit_factor") or 0.0)
-        payoff_ratio = float(profile.get("payoff_ratio") or 0.0)
-        small_win_big_loss_risk = float(profile.get("small_win_big_loss_risk") or 0.0)
-        avg_loss = float(profile.get("avg_loss") or 0.0)
-        action = "hold"
-        urgency = 0.25
-        reason = "平仓建议模型未识别到明确的主动平仓压力，本轮倾向继续持有。"
-        if unrealized < 0 and (loss_pressure >= 0.55 or profit_factor < 0.8 or small_win_big_loss_risk >= 0.45):
-            action = "reduce_or_close"
-            urgency = 0.82 if abs(unrealized) >= max(avg_loss * 0.35, 3.0) else 0.74
-            reason = (
-                "当前仓位处于亏损，且该币种/方向历史真实交易存在亏损压力或小赚大亏结构；"
-                "若短线修复证据不足，建议减仓或平仓压缩亏损。"
-            )
-        elif pnl_pct >= 0.006 and (loss_pressure >= 0.45 or small_win_big_loss_risk >= 0.40):
-            action = "protect_profit"
-            urgency = 0.72
-            reason = (
-                "当前已有浮盈，但历史画像显示回吐/亏损压力偏高；"
-                "建议优先保护利润，避免盈利仓拖成亏损仓。"
-            )
-        elif pnl_pct <= -0.012:
-            action = "reduce_or_close"
-            urgency = 0.72
-            reason = "亏损扩大到本地平仓模型容忍线之外，建议减仓或平仓压缩尾部亏损。"
-        elif pnl_pct >= 0.012 and profit_factor >= 1.2:
-            action = "trail_profit"
-            urgency = 0.52
-            reason = "当前持仓盈利且历史盈亏质量尚可，建议移动保护利润，不急于完全限制上行空间。"
-        advices.append({
+        observations.append({
             "side": side,
             "unrealized_pnl": round(unrealized, 4),
             "pnl_pct": round(pnl_pct, 5),
             "hold_minutes": round(hold, 2),
-            "action": action,
-            "urgency": round(urgency, 3),
-            "reason": reason,
             "profile": profile,
-            "payoff_ratio": round(payoff_ratio, 4),
-            "small_win_big_loss_risk": round(small_win_big_loss_risk, 4),
+            "production_permission": False,
         })
-    top = sorted(advices, key=lambda r: float(r["urgency"]), reverse=True)[0]
     return with_model_metadata("exit_advice", {
         "available": True,
         "trained": bool(bundle),
-        "model": "local-exit-advisor-v1",
+        "model": "local-exit-profile-observer-v2",
         "symbol": req.symbol,
-        "action": top["action"],
-        "urgency": top["urgency"],
-        "reason": top["reason"],
-        "advices": advices,
-    }, features=features)
+        "action": "hold",
+        "reason": "本地退出画像只提供观察事实；生产平仓由动态退出契约独占。",
+        "observations": observations,
+        "production_permission": False,
+        "live_mutation": False,
+        "production_permission": False,
+    }, features=features, fallback_reason="dynamic_exit_policy_owns_production_exit")
 
 
 @app.get("/v1/models")
@@ -2936,8 +2966,6 @@ def render_phase3_quant_api_service() -> str:
             Environment=LOCAL_AI_TOOLS_MODEL_DIR={PHASE3_MODEL_DIR}
             Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:18001
-            Environment=LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT=0.12
-            Environment=LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT=0.18
             EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
             ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 5

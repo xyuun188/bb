@@ -6,7 +6,7 @@ from data_feed.feature_vector import FeatureVector
 from services.model_dynamic_routing import plan_dynamic_model_route, summarize_dynamic_model_routing
 
 
-def test_dynamic_route_shadow_only_reduces_noncore_experts_without_baseline() -> None:
+def test_dynamic_route_preserves_all_experts_without_baseline() -> None:
     route = plan_dynamic_model_route(
         FeatureVector(symbol="BTC/USDT", sentiment_data_available=False),
         {
@@ -27,16 +27,24 @@ def test_dynamic_route_shadow_only_reduces_noncore_experts_without_baseline() ->
     assert route["applied_to_live_calls"] is False
     assert route["live_route_mutation"] is False
     assert route["can_apply_live_route"] is False
-    assert route["selected_experts"] == ["trend_expert", "momentum_expert", "risk_expert"]
-    assert route["skipped_experts"] == ["sentiment_expert", "position_expert"]
+    assert route["selected_experts"] == [
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    ]
+    assert route["skipped_experts"] == []
     assert "competition_baseline_missing" in route["blocking_reasons"]
     assert "ml_readiness_blocks_live_route" in route["blocking_reasons"]
     assert route["canary_ready"] is False
     assert route["live_ready"] is False
     assert "walk_forward_required" in route["live_blocking_reasons"]
     assert "live_mutation_not_enabled" in route["live_blocking_reasons"]
-    assert route["estimated_call_reduction"] == 2
-    assert route["expert_reasons"]["risk_expert"] == ["mandatory_safety_expert"]
+    assert route["estimated_call_reduction"] == 0
+    assert route["expert_reasons"]["risk_expert"] == [
+        "full_governed_expert_set_preserved"
+    ]
 
 
 def test_dynamic_route_keeps_sentiment_for_news_events_even_if_health_is_weak() -> None:
@@ -58,8 +66,9 @@ def test_dynamic_route_keeps_sentiment_for_news_events_even_if_health_is_weak() 
     )
 
     assert "sentiment_expert" in route["selected_experts"]
-    assert "event_or_sentiment_evidence" in route["expert_reasons"]["sentiment_expert"]
-    assert "health_weak_but_event_required" in route["expert_reasons"]["sentiment_expert"]
+    assert route["expert_reasons"]["sentiment_expert"] == [
+        "full_governed_expert_set_preserved"
+    ]
     assert "sentiment_expert" not in route["skipped_experts"]
     assert route["applied_to_live_calls"] is False
     assert route["mode"] == "canary_ready"
@@ -72,7 +81,7 @@ def test_dynamic_route_keeps_sentiment_for_news_events_even_if_health_is_weak() 
     ]
 
 
-def test_dynamic_route_keeps_risk_expert_for_high_risk_market() -> None:
+def test_dynamic_route_does_not_use_fixed_market_thresholds_to_change_experts() -> None:
     features = FeatureVector(
         symbol="SOL/USDT",
         abnormal_wick_count_72h=1,
@@ -89,8 +98,9 @@ def test_dynamic_route_keeps_risk_expert_for_high_risk_market() -> None:
     )
 
     assert "risk_expert" in route["selected_experts"]
-    assert "high_risk_market" in route["expert_reasons"]["risk_expert"]
-    assert "mandatory_safety_kept_despite_health" in route["expert_reasons"]["risk_expert"]
+    assert route["expert_reasons"]["risk_expert"] == [
+        "full_governed_expert_set_preserved"
+    ]
     assert route["mandatory_safety_experts"] == ["risk_expert"]
 
 
@@ -195,7 +205,6 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
                     "applied_to_live_calls": False,
                     "live_route_mutation": False,
                 },
-                "opportunity_score": {"evidence_score": {"tier": "normal"}},
             },
         },
         {
@@ -215,7 +224,10 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
                     "applied_to_live_calls": True,
                     "live_route_mutation": True,
                 },
-                "opportunity_score": {"evidence_score": {"tier": "weak_conflict_probe"}},
+                "production_return_policy": {
+                    "eligible": False,
+                    "return_lcb_pct": -0.2,
+                },
             },
         },
     ]
@@ -231,6 +243,8 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
     assert report["summary"]["unsafe_live_mutation_attempts"] == 1
     assert report["summary"]["live_ready_count"] == 0
     assert report["summary"]["live_blocked_count"] == 2
-    assert report["safety_observations"]["weak_evidence_executed_count"] == 1
+    assert (
+        report["safety_observations"]["ineligible_return_contract_executed_count"] == 1
+    )
     assert report["blocking_reason_counts"]["competition_baseline_missing"] == 1
     assert report["blocking_reason_counts"]["feature_coverage_missing"] == 1

@@ -15,9 +15,6 @@ from services.model_expert_health import (
     _safe_float,
 )
 
-MIN_BASELINE_SAMPLES = 3
-MIN_COMPETITOR_SAMPLES = 2
-
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -64,24 +61,17 @@ def _metric_block(pnls: list[float]) -> dict[str, Any]:
         "sample_count": sample_count,
         "net_pnl_pct": round(sum(pnls), 6),
         "win_rate": round(wins / sample_count, 4) if sample_count else 0.0,
-        "profit_factor": round(profit / loss, 6) if loss > 0 else (999.0 if profit > 0 else 0.0),
+        "profit_factor": round(profit / loss, 6) if loss > 0 else None,
         "avg_profit_pct": round(avg_profit, 6),
         "avg_loss_pct": round(avg_loss, 6),
         "profit_loss_ratio": round(avg_profit / avg_loss, 6) if avg_loss > 0 else 0.0,
         "max_drawdown_pct": round(max_drawdown, 6),
-        "fast_loss_rate": 0.0,
-        "small_position_rate": 0.0,
     }
 
 
 def _baseline_metrics(decisions: list[Any], now: datetime, window_hours: int) -> dict[str, Any]:
     rows = _executed_outcome_rows(decisions, now, window_hours)
     block = _metric_block([_safe_float(getattr(row, "outcome_pnl_pct", None), 0.0) for row in rows])
-    if rows:
-        small_positions = [
-            row for row in rows if _safe_float(getattr(row, "position_size_pct", 0.0)) <= 0.02
-        ]
-        block["small_position_rate"] = round(len(small_positions) / len(rows), 4)
     return block
 
 
@@ -128,28 +118,8 @@ def _component_metrics(
 
 
 def _weight_action(metrics: dict[str, Any], baseline: dict[str, Any]) -> tuple[str, list[str]]:
-    reasons: list[str] = []
-    if int(metrics.get("sample_count") or 0) < MIN_COMPETITOR_SAMPLES:
-        reasons.append("insufficient_competitor_samples")
-        return "observe_only", reasons
-    delta = _safe_float(metrics.get("net_pnl_pct"), 0.0) - _safe_float(
-        baseline.get("net_pnl_pct"), 0.0
-    )
-    profit_factor = _safe_float(metrics.get("profit_factor"), 0.0)
-    if (
-        _safe_float(metrics.get("json_error_rate"), 0.0) >= 0.25
-        or _safe_float(metrics.get("no_return_rate"), 0.0) >= 0.25
-    ):
-        reasons.append("unstable_runtime")
-        return "pause_shadow", reasons
-    if delta > 0 and profit_factor >= 1.15:
-        reasons.append("beats_baseline")
-        return "increase_shadow_weight", reasons
-    if delta < 0 or profit_factor < 0.85:
-        reasons.append("lags_baseline")
-        return "reduce_shadow_weight", reasons
-    reasons.append("near_baseline")
-    return "keep_shadow_weight", reasons
+    del metrics, baseline
+    return "observation_only", ["production_permission_false"]
 
 
 def summarize_model_expert_competition(
@@ -161,7 +131,7 @@ def summarize_model_expert_competition(
 ) -> dict[str, Any]:
     current = now or datetime.now(UTC)
     baseline = _baseline_metrics(decisions, current, window_hours)
-    baseline_available = int(baseline.get("sample_count") or 0) >= MIN_BASELINE_SAMPLES
+    baseline_available = int(baseline.get("sample_count") or 0) > 0
     competitors: dict[str, Any] = {}
     if baseline_available:
         for name, metrics in sorted(_component_metrics(decisions, current, window_hours).items()):

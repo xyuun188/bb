@@ -125,18 +125,17 @@ def test_secret_fingerprint_is_stable_and_non_revealing() -> None:
 def test_settings_defaults_do_not_hardcode_remote_model_endpoints() -> None:
     cfg = Settings(_env_file=None)  # type: ignore[call-arg]
 
-    assert cfg.ai_api_base == ""
-    assert cfg.ai_api_key == ""
+    assert not hasattr(cfg, "ai_api_base")
+    assert not hasattr(cfg, "ai_api_key")
     assert cfg.local_ai_tools_enabled is False
     assert cfg.local_ai_tools_api_base == ""
     assert cfg.high_risk_review_api_base == ""
     assert cfg.high_risk_review_api_key == ""
 
 
-def test_fixed_ai_models_fall_back_to_global_api_key_for_slot_routing() -> None:
+def test_fixed_ai_models_require_explicit_per_slot_api_key() -> None:
     cfg = Settings(  # type: ignore[call-arg]
         _env_file=None,
-        ai_api_key="shared-secret-key",
         ai_models=[
             {
                 "name": "trend_expert",
@@ -149,11 +148,11 @@ def test_fixed_ai_models_fall_back_to_global_api_key_for_slot_routing() -> None:
 
     trend = next(
         item
-        for item in cfg.get_fixed_ai_models(include_empty=False)
+        for item in cfg.get_fixed_ai_models(include_empty=True)
         if item["name"] == "trend_expert"
     )
 
-    assert trend["api_key"] == "shared-secret-key"
+    assert trend["api_key"] == ""
     assert trend["api_base"] == "http://127.0.0.1:8000/v1"
     assert trend["model"] == "qwen3-14b-trade"
 
@@ -214,7 +213,6 @@ def test_settings_parse_legacy_complex_env_values(tmp_path: Path) -> None:
         "\n".join(
             [
                 "SYMBOLS=[BTC/USDT, ETH/USDT]",
-                "EXECUTION_ACCOUNT_MAX_LOSS_PCT={paper: 0.5, live: 0.25}",
                 "EXECUTION_ACCOUNT_COOLDOWN_LOSS_PCT={'paper': 0.6, 'live': 0.7}",
                 "AI_MODELS=[{name: trend_expert, api_base: http://127.0.0.1:8000/v1, api_key: key, model: qwen3}]",
             ]
@@ -226,8 +224,8 @@ def test_settings_parse_legacy_complex_env_values(tmp_path: Path) -> None:
     cfg = Settings(_env_file=env_path)  # type: ignore[call-arg]
 
     assert cfg.symbols == ["BTC/USDT", "ETH/USDT"]
-    assert cfg.execution_account_max_loss_pct == {"paper": 0.5, "live": 0.25}
-    assert cfg.execution_account_cooldown_loss_pct == {"paper": 0.6, "live": 0.7}
+    assert not hasattr(cfg, "execution_account_max_loss_pct")
+    assert not hasattr(cfg, "execution_account_cooldown_loss_pct")
     assert cfg.ai_models == [
         {
             "name": "trend_expert",
@@ -317,20 +315,17 @@ def test_update_env_file_quotes_complex_values_for_dotenv_round_trip(
 
     settings.update_env_file(
         {
-            "AI_MODEL": 'qwen3 32b "trade"#safe',
             "DASHBOARD_CORS_ORIGINS": '["https://dash.example.invalid/path#frag"]',
-            "EXECUTION_ACCOUNT_MAX_LOSS_PCT": {"paper": 0.5, "live": 0.25},
+            "MODEL_INITIAL_BALANCES": {"ensemble_trader": 1000.0},
             "DASHBOARD_HOST": "127.0.0.1",
         }
     )
 
     text = env_path.read_text(encoding="utf-8")
-    assert 'AI_MODEL="qwen3 32b \\"trade\\"#safe"' in text
     assert "DASHBOARD_CORS_ORIGINS=" in text
-    assert 'EXECUTION_ACCOUNT_MAX_LOSS_PCT="{\\"paper\\": 0.5, \\"live\\": 0.25}"' in text
+    assert 'MODEL_INITIAL_BALANCES="{\\"ensemble_trader\\": 1000.0}"' in text
     assert "DASHBOARD_HOST=127.0.0.1" in text
 
     loaded = TmpSettings(_env_file=env_path)  # type: ignore[call-arg]
-    assert loaded.ai_model == 'qwen3 32b "trade"#safe'
     assert loaded.dashboard_allowed_origins() == ["https://dash.example.invalid/path#frag"]
-    assert loaded.execution_account_max_loss_pct == {"paper": 0.5, "live": 0.25}
+    assert loaded.model_initial_balances == {"ensemble_trader": 1000.0}

@@ -68,8 +68,6 @@ async def test_stale_entry_candidate_expirer_marks_waiting_rows() -> None:
         _row(
             raw={
                 "opportunity_score": {
-                    "score": 0.7,
-                    "min_score_required": 0.8,
                     "expected_net_return_pct": 0.2,
                 }
             }
@@ -93,7 +91,7 @@ async def test_stale_entry_candidate_expirer_marks_waiting_rows() -> None:
 
     assert expired == 1
     assert flushed
-    assert "机会评分 0.7000 低于执行门槛 0.80" in waiting[0].execution_reason
+    assert "缺少收益模型动态有效期" in waiting[0].execution_reason
     assert waiting[0].raw_llm_response["opportunity_score"]["selected_for_execution"] is False
     state = decision_state_from_raw(waiting[0].raw_llm_response)["summary"]
     assert state["final_stage"] == DecisionStage.RISK_CHECK

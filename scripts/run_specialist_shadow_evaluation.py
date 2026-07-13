@@ -26,7 +26,6 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
     _load_authoritative_trade_samples,
 )
 from services.specialist_shadow_evaluation import (  # noqa: E402
-    DEFAULT_LIMIT,
     DEFAULT_WINDOW_HOURS,
     SpecialistShadowEvaluationService,
 )
@@ -53,19 +52,14 @@ async def _main() -> None:
         )
     )
     parser.add_argument("--hours", type=int, default=DEFAULT_WINDOW_HOURS)
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--authoritative-limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--print-json", action="store_true")
     parser.add_argument("--json-indent", type=int, default=2)
     args = parser.parse_args()
 
-    authoritative_trade_samples = await _load_authoritative_trade_samples(
-        max(1, int(args.authoritative_limit or DEFAULT_LIMIT))
-    )
+    authoritative_trade_samples = await _load_authoritative_trade_samples()
     report = await SpecialistShadowEvaluationService().report(
         hours=args.hours,
-        limit=args.limit,
         authoritative_trade_samples=authoritative_trade_samples,
     )
     generated_at = str(report.get("generated_at") or datetime.now(UTC).isoformat())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export BB-FinQuant SFT data and run old-server LoRA specialization.
+"""Export BB-FinQuant SFT data and run model-server LoRA specialization.
 
 This script deliberately treats BB-FinQuant-Expert-14B specialization as a real
 artifact-producing training job. A renamed Qwen endpoint is not considered
@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings  # noqa: E402
-from core.remote_server_info import DEFAULT_ACCOUNT_INFO_DIR, parse_remote_server_info  # noqa: E402
+from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text, safe_print  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
@@ -43,7 +43,6 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
 )
 from services.training_data_quality import annotate_training_payload  # noqa: E402
 
-OLD_PROFILE_FILENAME = "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt"
 REMOTE_ROOT = "/data/BB"
 REMOTE_TRAINING_DIR = f"{REMOTE_ROOT}/training/finquant_expert"
 REMOTE_SERVICE_DIR = f"{REMOTE_ROOT}/services/finquant_expert_training"
@@ -126,7 +125,7 @@ def canonical_row_hash(row: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def load_rows(path: Path, limit: int) -> list[dict]:
+def load_rows(path: Path) -> list[dict]:
     rows = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -153,8 +152,6 @@ def load_rows(path: Path, limit: int) -> list[dict]:
                                 "SFT user/assistant JSON content must be an object"
                             )
                 rows.append(row)
-            if limit > 0 and len(rows) >= limit:
-                break
     return rows
 
 
@@ -200,7 +197,6 @@ def main() -> None:
     parser.add_argument("--inference-base-model", default="")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--version-id", required=True)
-    parser.add_argument("--max-samples", type=int, default=512)
     parser.add_argument("--max-steps", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
@@ -233,7 +229,7 @@ def main() -> None:
         value = str(dataset_manifest.get(key) or "")
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
             raise SystemExit(f"dataset manifest has no valid {key}")
-    rows = load_rows(dataset_path, args.max_samples)
+    rows = load_rows(dataset_path)
     if not rows:
         raise SystemExit("empty training dataset")
     train_rows, eval_rows = split_rows(rows)
@@ -870,6 +866,11 @@ def sync_evidence() -> dict:
         "inference_base_model_config_sha256": manifest.get("inference_base_model_config_sha256"),
         "evaluation_report": manifest.get("evaluation_report"),
         "held_out_eval_loss": manifest.get("held_out_eval_loss"),
+        "objective_name": manifest.get("objective_name"),
+        "objective_version": manifest.get("objective_version"),
+        "preference_contract_version": manifest.get("preference_contract_version"),
+        "preference_selection_accuracy": manifest.get("preference_selection_accuracy"),
+        "training_stages": manifest.get("training_stages"),
         "trained_at": manifest.get("trained_at"),
         "sample_count": manifest.get("sample_count"),
         "max_steps": manifest.get("max_steps"),
@@ -1396,17 +1397,22 @@ def _return_objective_counterexample() -> dict[str, Any]:
     )
 
 
-async def _load_expert_memory_examples(limit: int) -> list[dict[str, Any]]:
+async def _load_expert_memory_examples() -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
         result = await session.execute(
             select(ExpertMemory)
             .where(ExpertMemory.is_active.is_(True))
             .order_by(ExpertMemory.confidence_score.desc(), ExpertMemory.id.desc())
-            .limit(max(int(limit), 1))
         )
         rows = list(result.scalars().all())
     examples: list[dict[str, Any]] = []
     for row in rows:
+        extra = row.extra if isinstance(row.extra, dict) else {}
+        if not (
+            extra.get("production_evidence_eligible") is True
+            and extra.get("cost_complete") is True
+        ):
+            continue
         payload = {
             "id": int(row.id or 0),
             "expert_name": row.expert_name,
@@ -1416,16 +1422,17 @@ async def _load_expert_memory_examples(limit: int) -> list[dict[str, Any]]:
             "confidence_score": _safe_float(row.confidence_score),
             "success_count": int(row.success_count or 0),
             "failure_count": int(row.failure_count or 0),
+            "net_return_after_cost_pct": _safe_float(
+                extra.get("net_return_after_cost_pct")
+            ),
+            "objective": extra.get("objective"),
+            "objective_version": extra.get("objective_version"),
         }
         response = {
             "verdict": "expert_memory_lesson",
             "side": row.side,
             "lesson": row.lesson,
-            "risk_guidance": {
-                "recommended_action": row.recommended_action,
-                "confidence_adjustment": _safe_float(row.confidence_adjustment),
-                "position_size_multiplier": _safe_float(row.position_size_multiplier, 1.0),
-            },
+            "observation_policy": "fee_after_outcome_only_no_live_risk_authority",
         }
         examples.append(_messages("expert_memory", payload, response))
     return examples
@@ -1479,17 +1486,12 @@ async def _assert_training_data_source_ready() -> None:
     )
 
 
-async def build_dataset(
-    *,
-    trade_limit: int,
-    shadow_limit: int,
-    memory_limit: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+async def build_dataset() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     await _assert_training_data_source_ready()
-    reflections = await _load_trade_reflection_samples(trade_limit)
-    authoritative = await _load_authoritative_trade_samples(trade_limit)
+    reflections = await _load_trade_reflection_samples()
+    authoritative = await _load_authoritative_trade_samples()
     trade_samples = _merge_trade_samples(reflections, authoritative)
-    shadow_samples = await _load_shadow_samples(shadow_limit)
+    shadow_samples = await _load_shadow_samples()
     quality = annotate_training_payload(
         shadow_samples=shadow_samples,
         trade_samples=trade_samples,
@@ -1580,13 +1582,10 @@ async def build_dataset(
                 preference_metrics=preference_metrics,
             )
         )
-    examples.extend(await _load_expert_memory_examples(memory_limit))
+    examples.extend(await _load_expert_memory_examples())
     examples.append(_return_objective_counterexample())
     manifest = {
         "created_at": datetime.now(UTC).isoformat(),
-        "trade_limit": trade_limit,
-        "shadow_limit": shadow_limit,
-        "memory_limit": memory_limit,
         "example_count": len(examples),
         "example_counts_by_kind": {
             kind: sum(
@@ -1604,15 +1603,6 @@ async def build_dataset(
         "source": "platform_db_clean_training_view",
     }
     return examples, manifest
-
-
-def _load_old_server_info(account_dir: Path):
-    path = account_dir / OLD_PROFILE_FILENAME
-    if not path.exists():
-        raise FileNotFoundError(f"old model-server file not found: {path}")
-    return parse_remote_server_info(
-        path.read_text(encoding="utf-8", errors="replace"), source_path=path
-    )
 
 
 def _upload_text(ssh, remote_path: str, content: str, *, mode: int = 0o644) -> None:
@@ -1664,12 +1654,7 @@ def _download_text(ssh, remote_path: str) -> str:
     return str(data)
 
 
-def export_dataset_from_platform(
-    *,
-    trade_limit: int,
-    shadow_limit: int,
-    memory_limit: int,
-) -> tuple[str, str, dict[str, Any]]:
+def export_dataset_from_platform() -> tuple[str, str, dict[str, Any]]:
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
         _upload_text(
@@ -1707,12 +1692,6 @@ sys.argv = [
     "--source",
     "local",
     "--export-only",
-    "--trade-limit",
-    {str(int(trade_limit))!r},
-    "--shadow-limit",
-    {str(int(shadow_limit))!r},
-    "--memory-limit",
-    {str(int(memory_limit))!r},
 ]
 runpy.run_path("scripts/finquant_expert_lora_training.py", run_name="__main__")
 """
@@ -2010,8 +1989,8 @@ def _switch_verified_adapter(ssh, *, rollback_service: bool) -> dict[str, Any]:
     return result
 
 
-def rollback_and_switch_service(*, account_dir: Path) -> dict[str, Any]:
-    info = _load_old_server_info(account_dir)
+def rollback_and_switch_service() -> dict[str, Any]:
+    info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
         return _switch_verified_adapter(ssh, rollback_service=True)
@@ -2019,8 +1998,8 @@ def rollback_and_switch_service(*, account_dir: Path) -> dict[str, Any]:
         ssh.close()
 
 
-def remote_registry_status(*, account_dir: Path) -> dict[str, Any]:
-    info = _load_old_server_info(account_dir)
+def remote_registry_status() -> dict[str, Any]:
+    info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
         _upload_text(ssh, REMOTE_REGISTRY_TOOL, REMOTE_REGISTRY_TOOL_CODE, mode=0o755)
@@ -2035,16 +2014,30 @@ def remote_registry_status(*, account_dir: Path) -> dict[str, Any]:
         ssh.close()
 
 
+def sync_remote_registry_evidence() -> dict[str, Any]:
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
+    try:
+        _upload_text(ssh, REMOTE_REGISTRY_TOOL, REMOTE_REGISTRY_TOOL_CODE, mode=0o755)
+        raw = run_remote_text(
+            ssh,
+            f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_REGISTRY_TOOL)} sync-evidence",
+            timeout=180,
+            check=True,
+        )
+        return _json_object_from_remote_output(raw)
+    finally:
+        ssh.close()
+
+
 def deploy_and_optionally_train(
     *,
-    account_dir: Path,
     dataset_jsonl: str,
     manifest_json: str,
     train: bool,
     switch_service: bool,
     stop_inference_for_training: bool,
     max_steps: int,
-    max_samples: int,
     adapter_version: str | None = None,
 ) -> dict[str, Any]:
     try:
@@ -2058,7 +2051,7 @@ def deploy_and_optionally_train(
     remote_dataset, remote_dataset_manifest = _remote_dataset_paths(dataset_version)
     if train and not stop_inference_for_training:
         raise ValueError("LoRA training requires stopping all conflicting 14B services")
-    info = _load_old_server_info(account_dir)
+    info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
         if not _remote_immutable_file_exists(
@@ -2133,7 +2126,7 @@ def deploy_and_optionally_train(
                 f"--inference-base-model {sh(REMOTE_INFERENCE_BASE_MODEL)} "
                 f"--manifest {sh(specialization_manifest)} "
                 f"--version-id {sh(selected_version)} "
-                f"--max-steps {int(max_steps)} --max-samples {int(max_samples)} "
+                f"--max-steps {int(max_steps)} "
                 f"> {sh(train_log)} 2>&1; "
                 f"{post}"
                 f"cat {sh(specialization_manifest)}"
@@ -2202,7 +2195,6 @@ PY
 
 async def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--account-dir", type=Path, default=DEFAULT_ACCOUNT_INFO_DIR)
     parser.add_argument(
         "--source",
         choices=("auto", "local", "platform"),
@@ -2212,11 +2204,7 @@ async def _main() -> None:
             "training tables, otherwise exports from the online platform server."
         ),
     )
-    parser.add_argument("--trade-limit", type=int, default=900)
-    parser.add_argument("--shadow-limit", type=int, default=1200)
-    parser.add_argument("--memory-limit", type=int, default=300)
     parser.add_argument("--max-steps", type=int, default=80)
-    parser.add_argument("--max-samples", type=int, default=512)
     parser.add_argument(
         "--dataset-version",
         default="",
@@ -2227,13 +2215,27 @@ async def _main() -> None:
     parser.add_argument("--switch-service", action="store_true")
     parser.add_argument("--rollback-service", action="store_true")
     parser.add_argument("--registry-status", action="store_true")
+    parser.add_argument("--sync-registry-evidence", action="store_true")
     parser.add_argument("--stop-inference-for-training", action="store_true")
     args = parser.parse_args()
 
     if args.registry_status:
-        if args.train or args.switch_service or args.rollback_service or args.export_only:
+        if (
+            args.train
+            or args.switch_service
+            or args.rollback_service
+            or args.export_only
+            or args.sync_registry_evidence
+        ):
             raise SystemExit("--registry-status cannot be combined with mutating operations")
-        result = remote_registry_status(account_dir=args.account_dir)
+        result = remote_registry_status()
+        safe_print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.sync_registry_evidence:
+        if args.train or args.switch_service or args.rollback_service or args.export_only:
+            raise SystemExit("--sync-registry-evidence cannot be combined with other operations")
+        result = sync_remote_registry_evidence()
         safe_print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
@@ -2242,7 +2244,7 @@ async def _main() -> None:
             raise SystemExit("--rollback-service requires --switch-service")
         if args.train or args.export_only:
             raise SystemExit("rollback cannot be combined with training or dataset export")
-        result = rollback_and_switch_service(account_dir=args.account_dir)
+        result = rollback_and_switch_service()
         result["source"] = "existing_verified_remote_artifact"
         safe_print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -2276,11 +2278,7 @@ async def _main() -> None:
             source = "local" if local_ready else "platform"
 
     if not requested_dataset_version and source == "platform":
-        dataset_jsonl, manifest_json, platform_export = export_dataset_from_platform(
-            trade_limit=args.trade_limit,
-            shadow_limit=args.shadow_limit,
-            memory_limit=args.memory_limit,
-        )
+        dataset_jsonl, manifest_json, platform_export = export_dataset_from_platform()
         try:
             manifest = json.loads(manifest_json)
         except json.JSONDecodeError:
@@ -2291,11 +2289,7 @@ async def _main() -> None:
         manifest["source_transport"] = "online_platform_export"
         manifest["platform_export"] = platform_export
     elif not requested_dataset_version:
-        examples, manifest = await build_dataset(
-            trade_limit=args.trade_limit,
-            shadow_limit=args.shadow_limit,
-            memory_limit=args.memory_limit,
-        )
+        examples, manifest = await build_dataset()
         if not examples:
             raise SystemExit("No BB-FinQuant SFT examples were generated.")
         dataset_jsonl = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in examples)
@@ -2354,14 +2348,12 @@ async def _main() -> None:
         )
         return
     result = deploy_and_optionally_train(
-        account_dir=args.account_dir,
         dataset_jsonl=dataset_jsonl,
         manifest_json=manifest_json,
         train=args.train,
         switch_service=args.switch_service,
         stop_inference_for_training=args.stop_inference_for_training,
         max_steps=args.max_steps,
-        max_samples=args.max_samples,
     )
     result["source"] = source
     result["example_count"] = example_count

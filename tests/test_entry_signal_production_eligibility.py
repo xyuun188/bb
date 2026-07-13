@@ -58,6 +58,7 @@ def test_live_fee_after_objective_signal_is_production_eligible() -> None:
         "available": True,
         "route_mode": "live",
         "live_mutation": True,
+        "promotion_ready": True,
         "artifact_objective": RETURN_OBJECTIVE_NAME,
         "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
         "prediction_quality": {
@@ -87,3 +88,47 @@ def test_dynamic_prediction_quality_block_overrides_live_route() -> None:
     assert signal_production_eligibility(payload)["reason"] == (
         "outside_dynamic_rolling_forecast_interval"
     )
+
+
+def test_signal_without_governance_metadata_is_observation_only() -> None:
+    payload = {
+        "available": True,
+        "best_side": "short",
+        "expected_return_pct": 99.0,
+    }
+
+    result = signal_production_eligibility(payload)
+
+    assert result["eligible"] is False
+    assert result["reason"] == "production_governance_incomplete"
+    assert "governance_metadata" in result["missing_governance"]
+
+
+def test_each_required_live_governance_field_is_fail_closed() -> None:
+    complete = {
+        "available": True,
+        "route_mode": "live",
+        "live_mutation": True,
+        "promotion_ready": True,
+        "artifact_objective": RETURN_OBJECTIVE_NAME,
+        "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
+        "prediction_quality": {
+            "production_eligible": True,
+            "anomalous": False,
+        },
+    }
+    removals = {
+        "route_mode": "live_route",
+        "live_mutation": "live_influence",
+        "promotion_ready": "promotion_ready",
+        "artifact_objective": "return_objective",
+        "artifact_objective_version": "return_objective_version",
+        "prediction_quality": "prediction_quality",
+    }
+
+    for key, missing_name in removals.items():
+        payload = dict(complete)
+        payload.pop(key)
+        result = signal_production_eligibility(payload)
+        assert result["eligible"] is False
+        assert missing_name in result["missing_governance"]

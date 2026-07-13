@@ -13,16 +13,18 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.runtime_env_bootstrap import (
+from scripts.runtime_env_bootstrap import (  # noqa: E402
     drop_privileges_to_runtime_user_if_needed,
     load_runtime_env_files,
 )
 
 load_runtime_env_files(project_root=ROOT)
 
-from config.settings import settings
-from core.safe_output import safe_error_text
-from services.phase3_paper_resume_observation import Phase3PaperResumeObservationService
+from config.settings import settings  # noqa: E402
+from core.safe_output import safe_error_text  # noqa: E402
+from services.phase3_paper_resume_observation import (  # noqa: E402
+    Phase3PaperResumeObservationService,
+)
 
 DEFAULT_REPORT_DIR = "phase3_paper_resume_observation_reports"
 
@@ -57,14 +59,10 @@ def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None
 async def collect_phase3_paper_resume_observation(
     *,
     observation_hours: int = 2,
-    min_created_shadow_samples: int = 5,
-    min_completed_shadow_samples: int = 1,
     report_max_age_seconds: int = 7200,
 ) -> dict[str, Any]:
     return await Phase3PaperResumeObservationService(
         observation_hours=observation_hours,
-        min_created_shadow_samples=min_created_shadow_samples,
-        min_completed_shadow_samples=min_completed_shadow_samples,
         report_max_age_seconds=report_max_age_seconds,
     ).report()
 
@@ -72,8 +70,6 @@ async def collect_phase3_paper_resume_observation(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--observation-hours", type=int, default=2)
-    parser.add_argument("--min-created-shadow-samples", type=int, default=5)
-    parser.add_argument("--min-completed-shadow-samples", type=int, default=1)
     parser.add_argument("--report-max-age-seconds", type=int, default=7200)
     parser.add_argument("--json-indent", type=int, default=2)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -87,8 +83,6 @@ async def _main() -> int:
     drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
     report = await collect_phase3_paper_resume_observation(
         observation_hours=max(int(args.observation_hours or 1), 1),
-        min_created_shadow_samples=max(int(args.min_created_shadow_samples or 0), 0),
-        min_completed_shadow_samples=max(int(args.min_completed_shadow_samples or 0), 0),
         report_max_age_seconds=max(int(args.report_max_age_seconds or 60), 60),
     )
     indent = None if int(args.json_indent or 0) <= 0 else int(args.json_indent)

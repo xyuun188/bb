@@ -29,7 +29,7 @@ def _trade_memory(
     }
 
 
-def test_shadow_missed_opportunities_never_authorize_production_probe() -> None:
+def test_shadow_missed_opportunities_remain_observation_only() -> None:
     feedback = MemoryFeedbackPolicy().build(
         [
             {
@@ -51,10 +51,10 @@ def test_shadow_missed_opportunities_never_authorize_production_probe() -> None:
     short = feedback["by_side"]["short"]
     assert short["shadow_evidence_count"] == 164
     assert short["canonical_outcome_count"] == 0
-    assert short["allow_probe"] is False
     assert short["candidate_score_bonus"] == 0.0
     assert short["score_adjustment"] == 0.0
-    assert feedback["decision_habit"]["active_probe_sides"] == []
+    assert feedback["preferred_side_by_memory"] == "neutral"
+    assert feedback["decision_habit"]["posture"] == "observation_only"
 
 
 def test_authoritative_fee_after_loss_overrides_any_shadow_count() -> None:
@@ -79,10 +79,11 @@ def test_authoritative_fee_after_loss_overrides_any_shadow_count() -> None:
     assert short["canonical_outcome_count"] == 1
     assert short["return_lcb_pct"] == pytest.approx(-61.38)
     assert short["total_realized_net_pnl_usdt"] == pytest.approx(-21.2562)
-    assert short["score_adjustment"] < 0.0
-    assert short["allow_probe"] is False
-    assert short["action_bias"] == "require_stronger_confirmation"
-    assert feedback["decision_habit"]["by_side"]["short"]["stance"] == "strict_confirm"
+    assert short["score_adjustment"] == 0.0
+    assert short["action_bias"] == "fee_after_observation_only"
+    assert feedback["decision_habit"]["by_side"]["short"]["stance"] == (
+        "fee_after_observation_only"
+    )
 
 
 def test_positive_authoritative_memory_is_observation_not_probe_permission() -> None:
@@ -98,10 +99,9 @@ def test_positive_authoritative_memory_is_observation_not_probe_permission() -> 
     )
 
     long_side = feedback["by_side"]["long"]
-    assert feedback["preferred_side_by_memory"] == "long"
+    assert feedback["preferred_side_by_memory"] == "neutral"
     assert long_side["canonical_outcome_count"] == 1
     assert long_side["score_adjustment"] == 0.0
-    assert long_side["allow_probe"] is False
     assert long_side["action_bias"] == "fee_after_observation_only"
 
 
@@ -120,5 +120,4 @@ def test_cost_incomplete_trade_memory_is_observation_only() -> None:
 
     long_side = feedback["by_side"]["long"]
     assert long_side["canonical_outcome_count"] == 0
-    assert long_side["allow_probe"] is False
     assert feedback["preferred_side_by_memory"] == "neutral"

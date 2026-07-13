@@ -9,11 +9,6 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_PROMOTION_FLOW,
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
-from services.trading_params import DEFAULT_TRADING_PARAMS
-
-_LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
-MIN_SHADOW_SAMPLES_FOR_REBUILD = _LOCAL_ML_TRAINING_PARAMS.min_training_samples
-MIN_TRADE_SAMPLES_FOR_REBUILD = _LOCAL_ML_TRAINING_PARAMS.local_tools_learning_only_min_new_trade_samples
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -51,9 +46,6 @@ def _append_unique(items: list[str], value: str) -> None:
 class Phase3RebuildReadinessService:
     """Read-only gate before any confirmed Phase 3 artifact rebuild can write files."""
 
-    min_shadow_samples: int = MIN_SHADOW_SAMPLES_FOR_REBUILD
-    min_trade_samples: int = MIN_TRADE_SAMPLES_FOR_REBUILD
-
     def report(
         self,
         *,
@@ -90,14 +82,14 @@ class Phase3RebuildReadinessService:
         excluded_total = _safe_int(totals.get("excluded"))
         effective_weight_ratio = _safe_float(totals.get("effective_weight_ratio"))
 
-        if shadow_count < int(self.min_shadow_samples):
-            blockers.append("shadow_sample_floor_not_met")
+        if shadow_count <= 1:
+            blockers.append("shadow_training_distribution_unavailable")
         else:
-            passed.append("shadow_sample_floor_met")
-        if trade_count < int(self.min_trade_samples):
-            blockers.append("trade_sample_floor_not_met")
+            passed.append("shadow_train_and_holdout_available")
+        if trade_count <= 0:
+            blockers.append("authoritative_trade_distribution_unavailable")
         else:
-            passed.append("trade_sample_floor_met")
+            passed.append("authoritative_trade_distribution_available")
 
         governance_status = _status(governance_report.get("status"))
         contamination_risk = _status(governance_report.get("contamination_risk"))
@@ -163,8 +155,8 @@ class Phase3RebuildReadinessService:
         elif confirm_phase3_rebuild:
             passed.append("explicit_rebuild_confirmation_present")
 
-        if effective_weight_ratio and effective_weight_ratio < 0.5:
-            blockers.append("low_effective_training_weight")
+        if totals and effective_weight_ratio <= 0.0:
+            blockers.append("effective_training_weight_zero")
 
         can_persist = not blockers and bool(requested_persist_artifact and confirm_phase3_rebuild)
         can_run_confirmed_rebuild = not blockers
@@ -214,10 +206,9 @@ class Phase3RebuildReadinessService:
             "passed_checks": list(dict.fromkeys(passed)),
             "sample_floor": {
                 "shadow_sample_count": shadow_count,
-                "minimum_shadow_samples": int(self.min_shadow_samples),
                 "trade_sample_count": trade_count,
-                "minimum_trade_samples": int(self.min_trade_samples),
                 "effective_weight_ratio": round(effective_weight_ratio, 4),
+                "distribution_requirement": "non_empty_train_holdout_and_authoritative_trade",
             },
             "source_status": {
                 "governance_status": governance_status or "unknown",

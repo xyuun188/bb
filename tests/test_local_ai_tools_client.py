@@ -192,7 +192,9 @@ async def test_local_ai_tools_train_sends_training_cursors(
     assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
     assert captured["payload"]["persist_artifact"] is False
     assert captured["payload"]["confirm_phase3_rebuild"] is False
-    assert captured["payload"]["profit_first_report"]["evidence_source"] == "phase3_training_samples"
+    assert captured["payload"]["return_objective_report"]["objective_name"] == (
+        "maximize_expected_realized_net_return_after_cost"
+    )
     assert captured["payload"]["promotion_recommendation"]["recommended_stage"] == "shadow"
     assert captured["request_timeout"] == 180.0
 
@@ -260,13 +262,18 @@ async def test_local_ai_tools_train_builds_default_promotion_recommendation(
     )
 
     recommendation = captured["payload"]["promotion_recommendation"]
-    profit_first_report = captured["payload"]["profit_first_report"]
-    assert recommendation["policy"] == "phase3_shadow_to_canary_to_live"
-    assert recommendation["canary_ready"] is True
+    return_objective_report = captured["payload"]["return_objective_report"]
+    assert recommendation["policy"] == "2026-07-12.return-distribution-promotion.v1"
+    assert recommendation["canary_ready"] is False
+    assert "cost_complete_return_distribution_missing" in recommendation[
+        "canary_blocking_reasons"
+    ]
     assert recommendation["live_ready"] is False
     assert "walk_forward_required" in recommendation["live_blocking_reasons"]
     assert captured["payload"]["paper_observation_report"]["status"] == "healthy"
-    assert profit_first_report["evidence_source"] == "phase3_training_samples"
+    assert return_objective_report["objective_name"] == (
+        "maximize_expected_realized_net_return_after_cost"
+    )
 
 
 @pytest.mark.asyncio
@@ -437,12 +444,15 @@ def test_local_ai_tools_exit_advice_uses_clean_chinese_labels(
         },
     )
 
-    assert hold["action_label"] == "继续持有"
-    assert hold["reason"] == "平仓建议模型未识别到明确的主动平仓压力，本轮倾向继续持有。"
-    assert reduce["action_label"] == "减仓"
-    assert reduce["reason"] == "当前已有浮盈，但历史回吐或亏损压力偏高，建议优先保护利润。"
+    assert hold["action"] == "hold"
+    assert hold["reported_action"] == "hold"
+    assert hold["production_permission"] is False
+    assert reduce["action"] == "hold"
+    assert reduce["reported_action"] == "reduce"
+    assert reduce["production_permission"] is False
     assert unknown["action_label"] == "继续观察"
-    assert unknown["reason"] == "本轮没有传入与该币种匹配的当前持仓，平仓建议模型不参与。"
+    assert unknown["reported_action"] == "unexpected_model_token"
+    assert unknown["production_permission"] is False
 
 
 @pytest.mark.asyncio

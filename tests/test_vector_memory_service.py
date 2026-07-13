@@ -362,7 +362,7 @@ def test_zvec_store_read_only_opens_existing_collection_and_rejects_writes(tmp_p
         )
 
 
-def test_vector_memory_influence_is_explainable_soft_score() -> None:
+def test_vector_memory_influence_is_observation_only() -> None:
     influence = _influence_payload(
         [
             {"score": 0.72, "action": "long", "pnl_pct": -0.8},
@@ -372,11 +372,12 @@ def test_vector_memory_influence_is_explainable_soft_score() -> None:
         action="long",
     )
 
-    assert influence["level"] == "negative"
-    assert influence["score_delta"] < 0
-    assert influence["same_action_loss_count"] == 2
+    assert influence["level"] == "observation_only"
+    assert influence["score_delta"] == 0.0
+    assert influence["realized_outcome_count"] == 3
+    assert influence["loss_count"] == 2
     assert influence["is_hard_gate"] is False
-    assert "硬拦截" in influence["reason"] or "不作为硬拦截" in influence["reason"]
+    assert influence["production_permission"] is False
 
 
 def test_vector_memory_influence_ignores_missing_pnl_hits() -> None:
@@ -388,10 +389,12 @@ def test_vector_memory_influence_ignores_missing_pnl_hits() -> None:
         action="long",
     )
 
-    assert influence["level"] == "neutral"
+    assert influence["level"] == "observation_only"
     assert influence["score_delta"] == 0.0
     assert influence["loss_count"] == 0
     assert influence["profit_count"] == 0
+    assert influence["realized_outcome_count"] == 0
+    assert influence["production_permission"] is False
 
 
 def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(

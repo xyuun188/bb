@@ -17,16 +17,10 @@ from services.account_accounting_service import AccountAccountingService
 from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
-from services.entry_existing_winner import EntryExistingWinnerContextPolicy
 from services.entry_fee_provider import EntryFeeProvider
 from services.entry_market_data_quality import EntryMarketDataQualityPolicy, MarketValueReader
-from services.entry_opportunity_gate import EntryOpportunityGatePolicy
 from services.entry_opportunity_score import EntryOpportunityScorePolicy
-from services.entry_payoff_quality import EntryLowPayoffQualityPolicy
 from services.entry_profit_risk_sizing import EntryProfitRiskSizingPolicy
-from services.entry_stop_loss_budget import EntryStopLossBudgetPolicy
-from services.entry_stress_stop import EntryStressStopPolicy
-from services.entry_symbol_blocklist import EntrySymbolBlocklistPolicy
 from services.exchange_backed_position_provider import ExchangeBackedPositionProvider
 from services.exchange_close_fill_finder import ExchangeCloseFillFinder
 from services.exchange_position_state import (
@@ -34,13 +28,10 @@ from services.exchange_position_state import (
     ExchangeProtectionMapProvider,
 )
 from services.execution_allocation_service import ExecutionAllocationService
-from services.execution_pipelines import EntryExecutionPipeline, ExitExecutionPipeline
 from services.execution_service import ExecutionService
-from services.exit_cooldown import ExitCooldownPolicy
 from services.expert_memory_service import ExpertMemoryService
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
-from services.new_pair_loss_pause import NewPairLossPausePolicy
 from services.position_margin import PositionMarginCalculator
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
@@ -278,7 +269,6 @@ async def test_stop_writes_inactive_runtime_heartbeat(
     service._okx_authoritative_sync_task = None
     service._ml_auto_train_task = None
     service.paper_executor = None
-    service.okx_executor = None
     service._okx_paper = None
     service._okx_live = None
     service._okx_authoritative_sync_started_at = None
@@ -998,67 +988,6 @@ async def test_stale_entry_maintenance_reuses_running_background_task() -> None:
     await asyncio.wait_for(service._stale_entry_expire_task, timeout=1.0)
 
 
-def test_ai_entry_candidate_evidence_exposes_profile_recency_to_model() -> None:
-    service = TradingService.__new__(TradingService)
-    profile = {
-        "count": 3,
-        "pnl": 12.5,
-        "today_pnl": 2.0,
-        "wins": 2,
-        "losses": 1,
-        "profit_factor": 2.4,
-        "largest_loss": -1.2,
-        "first_closed_at": "2026-06-08T10:00:00+00:00",
-        "last_closed_at": "2026-06-09T10:00:00+00:00",
-        "last_loss_at": "2026-06-08T11:00:00+00:00",
-        "last_loss_age_hours": 23.5,
-        "lookback_days": 14,
-        "cooldown": False,
-    }
-
-    class FakeEntryPolicy:
-        def score_candidate(
-            self,
-            decision: DecisionOutput,
-            _strategy: dict[str, Any] | None,
-        ) -> float:
-            decision.raw_response["opportunity_score"] = {
-                "expected_net_return_pct": 0.8,
-                "tail_risk_score": 0.2,
-                "server_profit_loss_probability": 0.3,
-                "profit_quality_ratio": 1.1,
-                "min_score_required": 0.7,
-                "symbol_profile": profile,
-                "symbol_side_profile": profile,
-            }
-            return 0.9 if decision.action == Action.LONG else 0.8
-
-    service.entry_policy = FakeEntryPolicy()
-    fv = SimpleNamespace(
-        symbol="BTC/USDT",
-        volume_24h=10_000,
-        volume_ratio=1.0,
-        adx_14=20.0,
-        returns_1=0.001,
-        returns_5=0.002,
-        returns_20=0.003,
-        volatility_20=0.02,
-        change_24h_pct=1.0,
-        bb_pct=0.5,
-        price_vs_sma20=0.01,
-        price_vs_sma50=0.02,
-        current_price=100.0,
-    )
-    fv.to_dict = lambda: {"current_price": 100.0}
-
-    evidence = service._ai_entry_candidate_evidence(fv, {}, {}, {}, {})
-
-    side_profile = evidence["long"]["symbol_side_profile"]
-    assert side_profile["last_closed_at"] == "2026-06-09T10:00:00+00:00"
-    assert side_profile["first_closed_at"] == "2026-06-08T10:00:00+00:00"
-    assert side_profile["last_loss_at"] == "2026-06-08T11:00:00+00:00"
-    assert side_profile["last_loss_age_hours"] == 23.5
-    assert side_profile["lookback_days"] == 14
 
 
 @pytest.mark.asyncio
@@ -1075,7 +1004,7 @@ async def test_memory_context_merges_vector_memory_soft_feedback(monkeypatch) ->
             }
 
     class FakeVectorMemoryService:
-        async def search(self, query, *, top_k=8, symbol="", kind="", min_score=None):
+        async def search(self, query, *, top_k=8, symbol="", kind=""):
             assert "BTC/USDT" in query
             assert symbol == "BTC/USDT"
             return {
@@ -1405,7 +1334,7 @@ def test_position_snapshot_syncer_is_not_a_trading_service_private_rule():
     assert not hasattr(TradingService, "_sync_local_open_position_snapshot")
 
 
-def test_position_review_decision_normalizer_is_not_a_trading_service_private_rule():
+def test_opposite_entry_has_no_private_full_close_conversion():
     assert not hasattr(TradingService, "_normalize_review_decision_for_positions")
 
 
@@ -1544,51 +1473,6 @@ def test_entry_market_data_quality_is_not_a_trading_service_private_rule():
     assert not hasattr(TradingService, "_entry_market_data_quality_reason")
 
 
-def test_new_pair_loss_pause_is_not_a_trading_service_private_rule():
-    service = TradingService.__new__(TradingService)
-
-    assert callable(NewPairLossPausePolicy(lambda _mode: None).cooldown_loss_pause_reason)
-    assert not hasattr(TradingService, "_cooldown_loss_pause_reason")
-    assert not hasattr(TradingService, "_recent_loss_streak_pause_reason")
-    assert not hasattr(service, "_cooldown_loss_pause_reason")
-
-
-@pytest.mark.asyncio
-async def test_new_pair_loss_cooldown_is_advisory_not_global_scan_pause():
-    service = TradingService.__new__(TradingService)
-    service._model_execution_modes = {}
-    service.risk_engine = SimpleNamespace(
-        circuit_breaker=SimpleNamespace(
-            is_open=False,
-            get_state=lambda: {},
-        ),
-        position_checker=SimpleNamespace(
-            entry_capacity_reason=lambda **_kwargs: None,
-        ),
-    )
-    service.execution_allocation_state = lambda _mode: _async_value({"total_pnl": -20.0})
-    service._get_okx_balance_snapshot_for_mode = lambda _mode: _async_value(
-        {
-            "free": 1000.0,
-            "allocatable": 1000.0,
-            "equity": 1000.0,
-        }
-    )
-
-    class FakeLossPause:
-        async def cooldown_loss_pause_reason(self, *_args):
-            return "日内亏损冷却，仅降速"
-
-        async def recent_loss_streak_pause_reason(self, *_args):
-            return "连续亏损冷却，仅降速"
-
-    service.new_pair_loss_pause = FakeLossPause()
-
-    reason = await service._new_pair_analysis_pause_reason("ensemble_trader", open_positions=[])
-
-    assert reason is None
-
-
 @pytest.mark.asyncio
 async def test_okx_authoritative_sync_warning_pauses_new_pair_analysis() -> None:
     service = TradingService.__new__(TradingService)
@@ -1691,13 +1575,19 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
                 "trained_at": "2026-06-30T08:00:00+00:00",
             }
 
-    async def load_shadow_samples(_limit: int) -> list[dict[str, Any]]:
-        return [{"id": 1, "features": {"symbol": "BTC/USDT"}}]
+    async def load_shadow_samples(_limit: int | None = None) -> list[dict[str, Any]]:
+        assert _limit is None
+        return [
+            {"id": 1, "features": {"symbol": "BTC/USDT"}},
+            {"id": 2, "features": {"symbol": "ETH/USDT"}},
+        ]
 
-    async def load_trade_reflections(_limit: int) -> list[dict[str, Any]]:
+    async def load_trade_reflections(_limit: int | None = None) -> list[dict[str, Any]]:
+        assert _limit is None
         return [{"id": 2, "symbol": "BTC/USDT", "side": "long", "pnl": 1.2}]
 
-    async def load_empty(_limit: int) -> list[dict[str, Any]]:
+    async def load_empty(_limit: int | None = None) -> list[dict[str, Any]]:
+        assert _limit is None
         return []
 
     async def completed_trade_count() -> int:
@@ -1717,13 +1607,13 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
             "text_sentiment_samples": text_sentiment_samples,
             "quality_report": {
                 "totals": {
-                    "total": 1,
+                    "total": 2,
                     "excluded": 0,
                     "effective_weight_ratio": 1.0,
                 }
             },
             "governance_report": {
-                "trainable_sample_count": 1,
+                "trainable_sample_count": 2,
                 "contamination_risk": "low",
             },
         }
@@ -2053,7 +1943,7 @@ async def test_trading_service_sl_tp_boundary_forwards_round_positions_when_supp
 
 
 @pytest.mark.asyncio
-async def test_fast_sl_tp_delegates_execution_to_execution_service_boundary():
+async def test_fixed_take_profit_crossing_cannot_authorize_dynamic_exit():
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []
     service._decision_count = 0
@@ -2089,14 +1979,6 @@ async def test_fast_sl_tp_delegates_execution_to_execution_service_boundary():
 
         def remember_profit_exit(self, model_name, symbol, side):
             calls.append(("remember_profit_exit", model_name, symbol, side))
-
-    class FakePredictiveReversal:
-        def evidence(self, **_kwargs):
-            return {"score": 0.0}
-
-    class FakeFastRisk:
-        def profit_drawdown_exit_plan(self, **_kwargs):
-            return {"should_exit": False}
 
     async def log_decision(decision, is_paper):
         calls.append(("log_decision", decision.action.value, is_paper))
@@ -2144,8 +2026,6 @@ async def test_fast_sl_tp_delegates_execution_to_execution_service_boundary():
     service.okx_sync_service = FakeSyncService()
     service.position_time = FakePositionTime()
     service.position_profit_peaks = FakeProfitPeaks()
-    service.exit_predictive_reversal = FakePredictiveReversal()
-    service.exit_fast_risk = FakeFastRisk()
     service._normalize_position_symbol = lambda symbol: str(symbol)
     service._get_model_execution_mode = lambda _model_name: "paper"
     service._log_decision = log_decision
@@ -2172,62 +2052,13 @@ async def test_fast_sl_tp_delegates_execution_to_execution_service_boundary():
 
     auto_closes = await service._enforce_sl_tp(feature_vectors)
 
-    assert service._decision_count == 1
-    assert auto_closes == [
-        {
-            "model_name": "ensemble_trader",
-            "symbol": "BTC/USDT",
-            "side": "long",
-            "quantity": 2.0,
-            "entry_price": 100.0,
-            "exit_price": 110.0,
-            "pnl": 20.0,
-            "trigger": "take_profit",
-            "close_fraction": 1.0,
-            "status": "filled",
-        }
-    ]
-    assert (
-        "execute_candidate",
-        "BTC/USDT",
-        "ensemble_trader",
-        "close_long",
-        [],
-        321,
-        1,
-        False,
-    ) in calls
-    assert ("risk_event", "info", "BTC/USDT", "ensemble_trader", True) in calls
+    assert service._decision_count == 0
+    assert auto_closes == []
+    assert not any(call[0] == "execute_candidate" for call in calls)
 
 
-def test_exit_policy_uses_injected_exit_cooldown_boundary():
-    calls: list[tuple[str, str]] = []
-
-    class FakeCooldown:
-        def recent_exit_cooldown_reason(self, model_name, decision):
-            calls.append((model_name, decision.symbol))
-            return "cooldown-blocked"
-
-    policy = ExitPolicy(exit_cooldown=FakeCooldown())
-
-    assert (
-        policy.recent_exit_cooldown_reason(
-            "ensemble_trader",
-            _decision(Action.CLOSE_LONG),
-        )
-        == "cooldown-blocked"
-    )
-    assert calls == [("ensemble_trader", "BTC/USDT")]
 
 
-def test_exit_policy_fails_fast_without_exit_cooldown_dependency():
-    policy = ExitPolicy()
-
-    with pytest.raises(RuntimeError, match="exit_cooldown"):
-        policy.recent_exit_cooldown_reason(
-            "ensemble_trader",
-            _decision(Action.CLOSE_LONG),
-        )
 
 
 def test_entry_policy_uses_injected_decision_freshness_boundary():
@@ -2295,331 +2126,20 @@ def test_entry_policy_fails_fast_without_opportunity_score_dependency():
         policy.score_candidate(_decision(Action.LONG), {})
 
 
-def test_entry_policy_uses_injected_opportunity_gate_boundary():
-    calls: list[str] = []
-
-    class FakeGate:
-        def gate_reason(self, decision):
-            calls.append(decision.symbol)
-            return "gate-blocked"
-
-    policy = EntryPolicy(entry_opportunity_gate=FakeGate())
-
-    assert policy.gate_reason(_decision(Action.LONG)) == "gate-blocked"
-    assert calls == ["BTC/USDT"]
 
 
-def test_entry_policy_fails_fast_without_opportunity_gate_dependency():
-    policy = EntryPolicy()
-
-    with pytest.raises(RuntimeError, match="entry_opportunity_gate"):
-        policy.gate_reason(_decision(Action.LONG))
 
 
-def test_entry_opportunity_gate_checks_suspicious_symbol_before_legacy_evaluator():
-    calls: list[str] = []
-
-    class FakeSuspicious:
-        def reason(self, symbol):
-            calls.append(symbol)
-            return "suspicious-blocked"
-
-    policy = EntryPolicy(
-        entry_opportunity_gate=EntryOpportunityGatePolicy(
-            lambda decision: "legacy-blocked",
-            FakeSuspicious(),
-        ),
-    )
-
-    assert policy.gate_reason(_decision(Action.LONG)) == "suspicious-blocked"
-    assert calls == ["BTC/USDT"]
 
 
-def test_entry_opportunity_gate_blocks_known_untradable_symbol_before_execution():
-    calls: list[str] = []
-
-    def blocked_symbol_reason(symbol):
-        calls.append(symbol)
-        return "OKX 51155 local compliance restrictions"
-
-    policy = EntryPolicy(
-        entry_opportunity_gate=EntryOpportunityGatePolicy(
-            blocked_symbol_reason=blocked_symbol_reason,
-        ),
-    )
-
-    assert policy.gate_reason(_decision(Action.LONG)) == ("OKX 51155 local compliance restrictions")
-    assert calls == ["BTC/USDT"]
 
 
-@pytest.mark.asyncio
-async def test_trading_service_restores_untradable_symbol_from_raw_execution_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = datetime.now(UTC)
-    rows = [
-        SimpleNamespace(
-            model_name="ensemble_trader",
-            symbol="RESOLV/USDT",
-            action="long",
-            confidence=0.8,
-            position_size_pct=0.05,
-            suggested_leverage=3.0,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.1,
-            reasoning="test",
-            feature_snapshot={"current_price": 1.0},
-            execution_reason="OKX returned a generic translated rejection.",
-            raw_llm_response={
-                "execution_result": {
-                    "status": "rejected",
-                    "raw_response": {
-                        "error": "OKX rejected entry order",
-                        "raw_error": (
-                            '{"code":"1","data":[{"sCode":"51155","sMsg":'
-                            '"Due to local compliance restrictions, you currently cannot trade this pair."}]}'
-                        ),
-                    },
-                }
-            },
-            created_at=now,
-        )
-    ]
-
-    class FakeResult:
-        def all(self):
-            return rows
-
-    class FakeSession:
-        async def execute(self, _statement):
-            return FakeResult()
-
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield FakeSession()
-
-    service = TradingService.__new__(TradingService)
-    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
-        lambda symbol: str(symbol or "").replace("-", "/")
-    )
-    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
-
-    await service._load_untradable_symbol_blocks()
-
-    reason = service.blocked_symbol_reason("RESOLV-USDT")
-    assert reason is not None
-    assert "51155" in reason
 
 
-@pytest.mark.asyncio
-async def test_entry_execution_policy_refreshes_untradable_symbol_blocks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = datetime.now(UTC)
-    rows = [
-        SimpleNamespace(
-            model_name="ensemble_trader",
-            symbol="RESOLV/USDT",
-            action="long",
-            confidence=0.8,
-            position_size_pct=0.05,
-            suggested_leverage=3.0,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.1,
-            reasoning="test",
-            feature_snapshot={"current_price": 1.0},
-            execution_reason=None,
-            raw_llm_response={
-                "execution_result": {
-                    "status": "rejected",
-                    "raw_response": {
-                        "raw_error": (
-                            '{"code":"1","data":[{"sCode":"51155","sMsg":'
-                            '"Due to local compliance restrictions, you currently cannot trade this pair."}]}'
-                        ),
-                    },
-                }
-            },
-            created_at=now,
-        )
-    ]
-
-    class FakeResult:
-        def all(self):
-            return rows
-
-    class FakeSession:
-        async def execute(self, _statement):
-            return FakeResult()
-
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield FakeSession()
-
-    class FakeSizing:
-        async def apply(self, decision, model_mode, open_positions=None):
-            decision.position_size_pct = 0.04
-
-    service = TradingService.__new__(TradingService)
-    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
-        lambda symbol: str(symbol or "").replace("-", "/")
-    )
-    service._entry_symbol_blocks_refreshed_at = None
-    service.entry_policy = EntryPolicy(
-        entry_profit_risk_sizing=FakeSizing(),
-        entry_opportunity_gate=EntryOpportunityGatePolicy(
-            blocked_symbol_reason=service.blocked_symbol_reason,
-        ),
-    )
-    service.entry_execution_pipeline = EntryExecutionPipeline(lambda: service.entry_policy)
-    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
-
-    decision = _decision(Action.LONG)
-    decision.symbol = "RESOLV/USDT"
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 1.4,
-            "expected_net_return_pct": 0.8,
-            "profit_quality_ratio": 1.2,
-            "success_probability": 0.62,
-            "tail_risk_score": 0.2,
-        }
-    }
-
-    result = await service.evaluate_entry_execution_policy(
-        decision,
-        "ensemble_trader",
-        "paper",
-        [],
-    )
-
-    assert result.passed is False
-    assert result.blocker == "entry_opportunity_gate"
-    assert "51155" in result.reason
-    assert service.blocked_symbol_reason("RESOLV-USDT") is not None
-    assert service._entry_symbol_blocks_refreshed_at is not None
 
 
-@pytest.mark.asyncio
-async def test_trading_service_restores_untradable_exit_cooldown_from_contract_delivery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = datetime.now(UTC)
-    rows = [
-        SimpleNamespace(
-            model_name="ensemble_trader",
-            symbol="LAB/USDT",
-            action="close_long",
-            confidence=0.7,
-            position_size_pct=1.0,
-            suggested_leverage=3.0,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.1,
-            reasoning="test",
-            feature_snapshot={"current_price": 18.7},
-            execution_reason=(
-                'okx {"code":"1","data":[{"sCode":"51028",'
-                '"sMsg":"Contract under delivery."}],"msg":"All operations failed"}'
-            ),
-            raw_llm_response={},
-            created_at=now,
-        )
-    ]
-
-    class FakeResult:
-        def all(self):
-            return rows
-
-    class FakeSession:
-        async def execute(self, _statement):
-            return FakeResult()
-
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield FakeSession()
-
-    service = TradingService.__new__(TradingService)
-    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
-        lambda symbol: str(symbol or "").replace("-", "/")
-    )
-    service.exit_cooldown = ExitCooldownPolicy(
-        normalize_symbol=lambda value: str(value or "").replace("/", "-")
-    )
-    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
-
-    await service._load_untradable_symbol_blocks()
-
-    retry = DecisionOutput(
-        model_name="ensemble_trader",
-        symbol="LAB/USDT",
-        action=Action.CLOSE_LONG,
-        confidence=0.7,
-        reasoning="retry",
-        position_size_pct=1.0,
-        raw_response={"fast_risk_trigger": "stop_loss"},
-    )
-    reason = service.exit_cooldown.recent_exit_cooldown_reason(
-        "ensemble_trader",
-        retry,
-    )
-
-    assert service.blocked_symbol_reason("LAB-USDT") is not None
-    assert reason is not None
-    assert "51028" in retry.raw_response["untradable_exit_cooldown"]["last_error"]
-    assert retry.raw_response["untradable_exit_cooldown"]["symbol"] == "LAB-USDT"
 
 
-@pytest.mark.asyncio
-async def test_trading_service_does_not_restore_untradable_block_from_generic_raw_reject(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rows = [
-        SimpleNamespace(
-            model_name="ensemble_trader",
-            symbol="MAGIC/USDT",
-            action="long",
-            confidence=0.8,
-            position_size_pct=0.05,
-            suggested_leverage=3.0,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.1,
-            reasoning="test",
-            feature_snapshot={"current_price": 1.0},
-            execution_reason="OKX rejected entry order.",
-            raw_llm_response={
-                "execution_result": {
-                    "status": "rejected",
-                    "raw_response": {
-                        "error": "OKX rejected entry order",
-                        "raw_error": "51008 Insufficient USDT margin",
-                    },
-                }
-            },
-            created_at=datetime.now(UTC),
-        )
-    ]
-
-    class FakeResult:
-        def all(self):
-            return rows
-
-    class FakeSession:
-        async def execute(self, _statement):
-            return FakeResult()
-
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield FakeSession()
-
-    service = TradingService.__new__(TradingService)
-    service.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(
-        lambda symbol: str(symbol or "").replace("-", "/")
-    )
-    monkeypatch.setattr(trading_service, "get_session_ctx", fake_session_ctx)
-
-    await service._load_untradable_symbol_blocks()
-
-    assert service.blocked_symbol_reason("MAGIC-USDT") is None
 
 
 @pytest.mark.asyncio
@@ -2642,1017 +2162,38 @@ async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
     assert calls == [("BTC/USDT", "paper", 1)]
 
 
-@pytest.mark.asyncio
-async def test_entry_policy_blocks_tiny_probe_after_recent_probe_loss_loop():
-    class FakeSizing:
-        async def apply(self, decision, _model_mode, open_positions):
-            assert open_positions == []
-            decision.raw_response["profit_risk_sizing"] = {
-                "quality_tier": "probe",
-                "position_size_pct": decision.position_size_pct,
-                "final_notional_usdt": 20.0,
-                "planned_stop_loss_usdt": 0.8,
-                "max_stop_loss_usdt": 1.5,
-                "expected_profit_usdt": 0.04,
-            }
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.01
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
-    decision.feature_snapshot = {"close": 100.0}
-    decision.raw_response = {
-        "analysis_type": "entry_candidate",
-        "current_price": 100.0,
-        "strategy_learning_context": {"strategy_profile_id": "balanced_probe"},
-        "probe_loop_health": {
-            "all_recent_probes_losing": True,
-            "probe_closed_count": 3,
-            "probe_loss_count": 3,
-        },
-        "opportunity_score": {
-            "score": 1.2,
-            "min_score_required": 0.95,
-            "side": "long",
-            "expected_return_pct": 0.31,
-            "expected_net_return_pct": 0.2,
-            "fee_pct": 0.04,
-            "slippage_pct": 0.05,
-            "expected_loss_pct": 0.18,
-            "profit_quality_ratio": 0.3,
-            "reward_risk_ratio": 0.7,
-            "server_profit_loss_probability": 0.55,
-            "tail_risk_score": 0.82,
-            "side_realized_pnl_usdt": 0.0,
-            "ml_aligned": True,
-            "local_profit_aligned": False,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "small",
-                "effective_score": 70.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    result = await EntryPolicy(entry_profit_risk_sizing=FakeSizing()).evaluate(
-        decision,
-        "ensemble_trader",
-        "paper",
-        [],
-    )
-
-    assert result.passed is False
-    assert result.blocker == "profit_first_probe_loss_brake"
-    assert result.data["skip_kind"] == "profit_first_probe_loss_brake"
-    assert decision.raw_response["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_policy_owns_runtime_sizing_without_private_callback():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.8,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 0.8,
-            "profit_quality_ratio": 1.0,
-            "server_profit_loss_probability": 0.40,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        }
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    assert policy.evaluator is None
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["risk_mode"] == "normal"
-    assert sizing["quality_tier"] == "base"
-    assert sizing["planned_stop_loss_usdt"] > 0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_uses_dynamic_integer_leverage_without_tier_cap():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.02
-    decision.suggested_leverage = 3.0
-    decision.stop_loss_pct = 0.02
-    decision.feature_snapshot = {"current_price": 100.0, "atr_14": 0.6}
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 1.2,
-            "expected_loss_pct": 0.08,
-            "tail_risk_score": 0.30,
-            "raw_expected_return_pct": 1.2,
-            "profit_quality_ratio": 1.2,
-            "reward_risk_ratio": 2.8,
-            "server_profit_loss_probability": 0.38,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": True,
-            "evidence_score": {
-                "tier": "exploration",
-                "effective_score": 62.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        }
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 20.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    dynamic = sizing["dynamic_leverage_decision"]
-    assert dynamic["version"] == "dynamic_leverage_allocator_v1"
-    assert dynamic["final_integer_leverage"] > 3
-    assert decision.suggested_leverage == dynamic["final_integer_leverage"]
-    assert isinstance(dynamic["final_integer_leverage"], int)
-    assert not any("杠杆上限降到" in cap for cap in sizing["quality_caps"])
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_does_not_lock_roster_fill_to_one_x_on_model_noise():
-    async def allocated_balance(_model_mode, _decision):
-        return 5000.0
-
-    decision = _decision(Action.SHORT)
-    decision.position_size_pct = 0.05
-    decision.suggested_leverage = 10.0
-    decision.stop_loss_pct = 0.012
-    decision.feature_snapshot = {"current_price": 100.0, "atr_14": 1.6}
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_sizing": {
-                "profile_id": "candidate_1",
-                "position_size_multiplier": 0.62,
-                "probe_fraction": 0.05,
-                "max_probe_size_pct": 0.02,
-            }
-        },
-        "opportunity_score": {
-            "score": 0.55,
-            "min_score_required": 0.435,
-            "expected_net_return_pct": 0.31,
-            "expected_loss_pct": 0.20,
-            "tail_risk_score": 0.35,
-            "raw_expected_return_pct": 0.31,
-            "profit_quality_ratio": 0.40,
-            "server_profit_expected_return_pct": -0.02,
-            "server_profit_loss_probability": 0.48,
-            "portfolio_roster": {"underfilled": True},
-            "portfolio_roster_fill_relief": {"applied": True},
-            "evidence_score": {
-                "tier": "exploration",
-                "effective_score": 45.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-                "aligned_support_sources": ["ai", "timeseries", "shadow_memory"],
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 20.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    dynamic = sizing["dynamic_leverage_decision"]
-    assert sizing["quality_tier"] == "roster_fill"
-    assert sizing["low_payoff_quality"] is False
-    assert sizing["notional_floor_blocked"] == ""
-    assert "tempered_by_risk_flags" not in dynamic["reasons"]
-    assert dynamic["limiting_factor"] in {"risk_budget", "volatility"}
-    assert dynamic["final_integer_leverage"] > 1
-    assert decision.suggested_leverage == dynamic["final_integer_leverage"]
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_applies_profit_first_meaningful_ladder():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.02
-    decision.suggested_leverage = 3.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.08
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 3.4,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 6.0,
-            "expected_loss_pct": 0.08,
-            "tail_risk_score": 0.62,
-            "raw_expected_return_pct": 6.2,
-            "profit_quality_ratio": 1.25,
-            "reward_risk_ratio": 2.4,
-            "server_profit_loss_probability": 0.38,
-            "side_realized_pnl_usdt": 1.0,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": True,
-            "expert_aligned": True,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 88.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        }
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    ladder = sizing["profit_first_position_ladder"]
-    assert ladder["lane"] == "meaningful_entry"
-    assert ladder["target_min_pct"] == pytest.approx(0.05)
-    assert ladder["target_max_pct"] == pytest.approx(0.08)
-    assert sizing["position_size_pct"] >= 0.05
-    assert decision.position_size_pct >= 0.05
-    assert sizing["final_notional_usdt"] >= 150.0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_records_low_payoff_reason_codes():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 0.80,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.20,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.55,
-            "raw_expected_return_pct": -0.05,
-            "profit_quality_ratio": 0.40,
-            "server_profit_loss_probability": 0.55,
-            "small_win_big_loss_penalty": 0.70,
-            "model_contribution_adjustment": {"hard_caution": True},
-            "ml_aligned": False,
-            "local_profit_aligned": False,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "small",
-                "effective_score": 59.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        }
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["low_payoff_quality"] is True
-    assert sizing["low_payoff_reasons"] == [
-        "score_below_required",
-        "expected_net_below_min",
-        "profit_quality_below_min",
-        "raw_expected_return_negative",
-        "small_win_big_loss_penalty_high",
-        "hard_contribution_caution",
-        "evidence_low_payoff_quality",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_roster_fill_relief_survives_low_payoff_soft_reasons():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.08
-    decision.suggested_leverage = 6.0
-    decision.stop_loss_pct = 0.012
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 0.74,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.31,
-            "expected_loss_pct": 0.55,
-            "tail_risk_score": 0.39,
-            "raw_expected_return_pct": 0.31,
-            "profit_quality_ratio": 0.39,
-            "server_profit_loss_probability": 0.48,
-            "model_contribution_adjustment": {"hard_caution": True},
-            "portfolio_roster": {
-                "underfilled": True,
-                "gap": 8,
-                "target_position_groups": 10,
-                "current_position_groups": 2,
-            },
-            "portfolio_roster_fill_relief": {
-                "applied": True,
-                "expected_net_return_pct": 0.31,
-                "profit_quality_ratio": 0.39,
-                "loss_probability": 0.48,
-            },
-            "evidence_score": {
-                "tier": "small",
-                "effective_score": 58.0,
-                "size_multiplier": 0.18,
-                "max_size_pct": 0.025,
-                "aligned_support_sources": [
-                    "ai",
-                    "timeseries",
-                    "sentiment",
-                    "shadow_memory",
-                ],
-                "tradeable_probe": True,
-            },
-        }
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["quality_tier"] == "roster_fill"
-    assert sizing["low_payoff_quality"] is False
-    assert sizing["low_payoff_reasons"] == []
-    assert sizing["low_payoff_relief"]["applied"] is True
-    assert sizing["low_payoff_relief"]["relieved_reasons"] == [
-        "score_below_required",
-        "expected_net_below_min",
-        "profit_quality_below_min",
-        "hard_contribution_caution",
-        "evidence_low_payoff_quality",
-    ]
-    assert sizing["notional_floor_applied"] is False
-    assert sizing["target_min_notional_balance_ratio"] == pytest.approx(0.18)
-    assert sizing["profit_first_position_ladder"]["lane"] == "tiny_probe"
-    assert sizing["profit_first_position_ladder"]["adjusted_size_pct"] > 0
-    assert sizing["position_size_pct"] > 0
-    assert decision.position_size_pct > 0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_reclassifies_stale_shadow_profit_first_plan():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.suggested_leverage = 3.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.06
-    decision.raw_response = {
-        "profit_first_trade_plan": {
-            "decision_lane": "shadow_only",
-            "is_complete_for_real_trade": False,
-            "missing_required_fields": ["profit_risk_sizing", "position_size_pct"],
-            "position_size_pct": None,
-        },
-        "opportunity_score": {
-            "score": 2.2,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.6,
-            "expected_loss_pct": 0.4,
-            "tail_risk_score": 0.45,
-            "raw_expected_return_pct": 0.65,
-            "profit_quality_ratio": 0.7,
-            "reward_risk_ratio": 1.0,
-            "server_profit_loss_probability": 0.46,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": True,
-            "evidence_score": {
-                "tier": "small",
-                "effective_score": 66.0,
-                "size_multiplier": 0.4,
-                "max_size_pct": 0.03,
-                "aligned_support_sources": ["ml", "server_profit", "timeseries"],
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    ladder = sizing["profit_first_position_ladder"]
-    assert ladder["lane"] != "shadow_only"
-    assert ladder["adjusted_size_pct"] > 0
-    assert ladder["classifier"]["source"] == "sizing_profit_first_classifier"
-    assert ladder["classifier"]["ignored_persisted_plan"]["lane"] == "shadow_only"
-    assert decision.position_size_pct > 0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_stale_shadow_plan_keeps_low_payoff_entry_real():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.08
-    decision.suggested_leverage = 6.0
-    decision.stop_loss_pct = 0.012
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "profit_first_trade_plan": {
-            "decision_lane": "shadow_only",
-            "is_complete_for_real_trade": False,
-            "missing_required_fields": ["profit_risk_sizing", "position_size_pct"],
-            "position_size_pct": None,
-        },
-        "strategy_learning_context": {
-            "strategy_learning_sizing": {
-                "profile_id": "long_side_recovery",
-                "position_size_multiplier": 0.62,
-                "probe_fraction": 0.05,
-                "max_probe_size_pct": 0.02,
-            }
-        },
-        "opportunity_score": {
-            "score": 0.07,
-            "min_score_required": 0.645,
-            "expected_net_return_pct": 0.38,
-            "expected_loss_pct": 0.55,
-            "tail_risk_score": 0.35,
-            "raw_expected_return_pct": -0.01,
-            "profit_quality_ratio": 0.51,
-            "server_profit_loss_probability": 0.46,
-            "model_contribution_adjustment": {"hard_caution": True},
-            "evidence_score": {
-                "tier": "small",
-                "effective_score": 64.3,
-                "size_multiplier": 0.18,
-                "max_size_pct": 0.025,
-                "aligned_support_sources": [
-                    "ai",
-                    "timeseries",
-                    "sentiment",
-                    "shadow_memory",
-                ],
-                "tradeable_probe": True,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    ladder = sizing["profit_first_position_ladder"]
-    assert sizing["low_payoff_quality"] is True
-    assert ladder["lane"] == "validated_probe"
-    assert ladder["capped_by_low_payoff"] is True
-    assert ladder["adjusted_size_pct"] > 0
-    assert ladder["adjusted_size_pct"] <= 0.02
-    assert ladder["classifier"]["ignored_persisted_plan"]["lane"] == "shadow_only"
-    assert 0 < sizing["position_size_pct"] <= 0.02
-    assert decision.position_size_pct > 0
-
-
-def test_entry_opportunity_gate_treats_strategy_learning_pause_as_advisory():
-    decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_entry_pause": True,
-            "strategy_learning_entry_pause_reason": "策略护栏已触发回滚且持仓压力仍在，暂停新开仓探针。",
-        },
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.8,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 0.8,
-            "profit_quality_ratio": 1.0,
-            "server_profit_loss_probability": 0.40,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-
-    reason = EntryOpportunityGatePolicy().gate_reason(decision)
-
-    assert reason is None
-    opportunity = decision.raw_response["opportunity_score"]
-    assert opportunity["strategy_learning_pause_is_hard_gate"] is False
-    assert opportunity["execution_advisory_warnings"][0]["blocks_entry"] is False
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_converts_strategy_learning_pause_to_probe():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_entry_pause": True,
-            "strategy_learning_entry_pause_reason": "策略护栏暂停新探针",
-            "strategy_learning": {
-                "runtime": {
-                    "profile_id": "candidate_1",
-                    "position_size_multiplier": 0.62,
-                    "probe_fraction": 0.05,
-                    "max_probe_size_pct": 0.018,
-                }
-            },
-        },
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 4.0,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 4.0,
-            "profit_quality_ratio": 1.0,
-            "server_profit_loss_probability": 0.35,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": True,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
-    assert sizing["applied"] is True
-    assert sizing["entry_paused"] is False
-    assert sizing["strategy_learning_pause_is_hard_gate"] is False
-    assert sizing["recovery_probe_allowed"] is True
-    assert sizing["reason"] == "策略护栏暂停新探针"
-    assert sizing["adaptive_recovery_lift_applied"] is True
-    assert sizing["adaptive_recovery_cap_pct"] > 0.012
-    assert decision.position_size_pct >= 0.018
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_allows_recovery_probe_when_not_paused():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_entry_pause": False,
-            "strategy_learning_health_guard_active": True,
-            "strategy_learning_recovery_probe_allowed": True,
-            "strategy_learning_recovery_probe_reason": "fallback 依赖偏高，改为极小仓恢复探针",
-            "strategy_learning_sizing": {
-                "profile_id": "balanced_probe",
-                "position_size_multiplier": 0.8,
-                "probe_fraction": 0.05,
-                "max_probe_size_pct": 0.02,
-            },
-        },
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 4.0,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 4.0,
-            "profit_quality_ratio": 1.0,
-            "server_profit_loss_probability": 0.35,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": True,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
-    assert sizing["applied"] is True
-    assert not sizing.get("entry_paused", False)
-    assert sizing["health_guard_active"] is True
-    assert sizing["recovery_probe_allowed"] is True
-    assert sizing["quality_override"] is True
-    assert sizing["probe_cap_applied"] is False
-    assert sizing["adaptive_recovery_lift_applied"] is True
-    assert sizing["adaptive_recovery_cap_pct"] > 0.012
-    assert decision.position_size_pct >= 0.018
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_clears_probe_cap_for_tradeable_evidence_probe():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.raw_response = {
-        "strategy_mode": {
-            "strategy_learning_sizing": {
-                "profile_id": "balanced_probe",
-                "position_size_multiplier": 0.8,
-                "probe_fraction": 0.08,
-                "max_probe_size_pct": 0.018,
-                "side_overrides": {"long": {"size_multiplier": 0.9, "reason": "long probe"}},
-            }
-        },
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.8,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 0.8,
-            "profit_quality_ratio": 0.74,
-            "server_profit_loss_probability": 0.40,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
-    assert sizing["applied"] is True
-    assert sizing["profile_id"] == "balanced_probe"
-    assert sizing["max_probe_size_pct"] == 0.018
-    assert sizing["quality_override"] is True
-    assert "tradeable_evidence_probe" in decision.raw_response["profit_risk_sizing"][
-        "strategy_quality_override_reasons"
-    ]
-    assert sizing["probe_cap_applied"] is False
-    assert decision.position_size_pct > 0.018
-    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_unlocks_strong_recovery_probe():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_health_guard_active": True,
-            "strategy_learning_recovery_probe_allowed": True,
-            "strategy_learning_sizing": {
-                "profile_id": "balanced_probe",
-                "position_size_multiplier": 0.6,
-                "probe_fraction": 0.08,
-                "max_probe_size_pct": 0.012,
-            },
-        },
-        "opportunity_score": {
-            "score": 2.4,
-            "min_score_required": 1.0,
-            "expected_net_return_pct": 1.35,
-            "expected_loss_pct": 0.8,
-            "tail_risk_score": 0.30,
-            "raw_expected_return_pct": 1.35,
-            "profit_quality_ratio": 1.05,
-            "server_profit_loss_probability": 0.38,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
-    assert sizing["quality_override"] is True
-    assert sizing["probe_cap_applied"] is False
-    assert decision.position_size_pct > 0.012
-    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_reads_context_and_clears_probe_cap_for_tradeable_probe():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.06
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_release_pressure_active": True,
-            "strategy_learning_release_pressure_reason": "低质量仓位压力，先释放并只做小仓探针",
-            "strategy_learning_sizing": {
-                "profile_id": "loss_release",
-                "position_size_multiplier": 0.9,
-                "probe_fraction": 0.03,
-                "max_probe_size_pct": 0.014,
-                "side_overrides": {"long": {"size_multiplier": 0.8}},
-            },
-        },
-        "opportunity_score": {
-            "score": 3.0,
-            "min_score_required": 0.95,
-            "expected_net_return_pct": 0.8,
-            "expected_loss_pct": 1.0,
-            "tail_risk_score": 0.15,
-            "raw_expected_return_pct": 0.8,
-            "profit_quality_ratio": 0.74,
-            "server_profit_loss_probability": 0.40,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]["strategy_learning_sizing"]
-    assert sizing["applied"] is True
-    assert sizing["profile_id"] == "loss_release"
-    assert sizing["max_probe_size_pct"] == 0.014
-    assert sizing["quality_override"] is True
-    assert "tradeable_evidence_probe" in decision.raw_response["profit_risk_sizing"][
-        "strategy_quality_override_reasons"
-    ]
-    assert sizing["probe_cap_applied"] is False
-    assert sizing["release_pressure_active"] is True
-    assert decision.position_size_pct > 0.014
-    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] >= 30.0
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_quality_entry_recovery_clears_probe_caps():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.suggested_leverage = 5.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.08
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_release_pressure_active": True,
-            "strategy_learning_recovery_probe_allowed": True,
-            "strategy_learning_sizing": {
-                "profile_id": "quality_entry_recovery",
-                "position_size_multiplier": 0.45,
-                "probe_fraction": 0.08,
-                "max_probe_size_pct": 0.012,
-                "side_overrides": {"long": {"size_multiplier": 0.62}},
-            },
-        },
-        "opportunity_score": {
-            "score": 2.4,
-            "min_score_required": 1.0,
-            "expected_net_return_pct": 1.2,
-            "expected_loss_pct": 0.55,
-            "tail_risk_score": 0.28,
-            "raw_expected_return_pct": 1.2,
-            "profit_quality_ratio": 0.96,
-            "server_profit_loss_probability": 0.40,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    strategy_sizing = sizing["strategy_learning_sizing"]
-    assert strategy_sizing["quality_entry_recovery_active"] is True
-    assert strategy_sizing["probe_fraction"] == 0.0
-    assert strategy_sizing["max_probe_size_pct"] == 0.0
-    assert strategy_sizing["probe_cap_applied"] is False
-    assert sizing["strategy_quality_override"] is True
-    assert "quality_entry_recovery_profile" in sizing["strategy_quality_override_reasons"]
-    assert sizing["dynamic_leverage_decision"]["final_integer_leverage"] > 1
-    assert decision.position_size_pct > 0.012
-
-
-@pytest.mark.asyncio
-async def test_entry_profit_risk_sizing_does_not_trap_strong_quality_in_release_probe():
-    async def allocated_balance(_model_mode, _decision):
-        return 1000.0
-
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.05
-    decision.suggested_leverage = 5.0
-    decision.raw_response = {
-        "strategy_learning_context": {
-            "strategy_learning_release_pressure_active": True,
-            "strategy_learning_release_pressure_reason": "release old low quality slots",
-            "strategy_learning_sizing": {
-                "profile_id": "loss_release",
-                "position_size_multiplier": 0.45,
-                "probe_fraction": 0.08,
-                "max_probe_size_pct": 0.012,
-                "side_overrides": {"long": {"size_multiplier": 0.62}},
-            },
-        },
-        "opportunity_score": {
-            "score": 2.2,
-            "min_score_required": 1.0,
-            "expected_net_return_pct": 0.95,
-            "expected_loss_pct": 0.55,
-            "tail_risk_score": 0.32,
-            "raw_expected_return_pct": 0.95,
-            "profit_quality_ratio": 0.92,
-            "server_profit_loss_probability": 0.44,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 82.0,
-                "size_multiplier": 1.0,
-                "max_size_pct": None,
-            },
-        },
-    }
-    policy = EntryProfitRiskSizingPolicy(
-        allocated_order_balance=allocated_balance,
-        entry_low_payoff_quality=EntryLowPayoffQualityPolicy(),
-        entry_stop_loss_budget=EntryStopLossBudgetPolicy(),
-        entry_stress_stop=EntryStressStopPolicy(),
-        entry_existing_winner_context=EntryExistingWinnerContextPolicy(lambda symbol: str(symbol)),
-        max_leverage_provider=lambda: 10.0,
-    )
-
-    await policy.apply(decision, "paper", [])
-
-    sizing = decision.raw_response["profit_risk_sizing"]
-    strategy_sizing = sizing["strategy_learning_sizing"]
-    assert sizing["strategy_quality_override"] is True
-    assert "strong_positive_strategy_signal" in sizing["strategy_quality_override_reasons"]
-    assert strategy_sizing["quality_override"] is True
-    assert strategy_sizing["probe_cap_applied"] is False
-    assert decision.position_size_pct > 0.012
-    assert sizing["final_notional_usdt"] >= 45.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @pytest.mark.asyncio
@@ -3663,690 +2204,30 @@ async def test_entry_policy_fails_fast_without_profit_risk_sizing_dependency():
         await policy.apply_profit_risk_sizing(_decision(Action.LONG), "paper", [])
 
 
-@pytest.mark.asyncio
-async def test_entry_policy_scores_missing_opportunity_before_sizing_and_gate() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "strategy_mode": {"min_opportunity_score": 0.7},
-        "strategy_learning_context": {"strategy_profile_id": "unit-profile"},
-    }
 
-    def fake_score(scored_decision, strategy):
-        calls.append("score")
-        assert strategy["min_opportunity_score"] == 0.7
-        assert strategy["strategy_profile_id"] == "unit-profile"
-        raw = scored_decision.raw_response
-        raw["opportunity_score"] = {
-            "score": 1.35,
-            "min_score_required": 0.7,
-            "expected_net_return_pct": 0.8,
-            "profit_quality_ratio": 1.8,
-            "tail_risk_score": 0.2,
-            "success_probability": 0.62,
-        }
-        scored_decision.raw_response = raw
-        return 1.35
 
-    async def fake_sizing(sized_decision, model_mode, open_positions):
-        calls.append("sizing")
-        assert model_mode == "paper"
-        assert len(open_positions) == 1
-        assert sized_decision.raw_response["opportunity_score"]["score"] == 1.35
 
-    class FakeGate:
-        def gate_reason(self, gated_decision):
-            calls.append("gate")
-            assert gated_decision.raw_response["opportunity_score"]["score"] == 1.35
-            return None
 
-    policy = EntryPolicy(
-        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
 
-    result = await policy.evaluate(
-        decision,
-        "ensemble_trader",
-        "paper",
-        [{"symbol": "ETH/USDT"}],
-    )
 
-    assert result.passed is True
-    assert calls == ["score", "sizing", "gate"]
-    assert decision.raw_response["opportunity_score"]["score"] == 1.35
 
 
-@pytest.mark.asyncio
-async def test_entry_policy_keeps_weak_evidence_as_advisory_even_with_size() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.018
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 0.75,
-            "min_score_required": 0.7,
-            "expected_net_return_pct": 0.18,
-            "profit_quality_ratio": 0.2,
-            "tail_risk_score": 0.7,
-            "success_probability": 0.47,
-            "evidence_score": {
-                "tier": "weak_conflict_probe",
-                "effective_score": 38.0,
-                "size_multiplier": 0.05,
-            },
-        }
-    }
 
-    async def fake_sizing(sized_decision, model_mode, open_positions):
-        calls.append("sizing")
-        assert model_mode == "paper"
-        assert open_positions == []
-        assert sized_decision.position_size_pct > 0
 
-    class FakeGate:
-        def gate_reason(self, _decision):
-            calls.append("gate")
-            return None
 
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
 
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
 
-    assert result.passed is True
-    advisory = decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
-    assert advisory["applied"] is True
-    assert advisory["evidence_tier"] == "weak_conflict_probe"
-    assert advisory["shadow_only"] is False
-    assert calls == ["sizing", "gate"]
 
 
-@pytest.mark.asyncio
-async def test_entry_policy_allows_positive_net_tradeable_probe_to_continue() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.018
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 1.1,
-            "min_score_required": 0.7,
-            "expected_net_return_pct": 0.72,
-            "profit_quality_ratio": 0.55,
-            "tail_risk_score": 0.45,
-            "success_probability": 0.58,
-            "evidence_score": {
-                "tier": "weak_conflict_probe",
-                "effective_score": 38.0,
-                "size_multiplier": 0.05,
-                "tradeable_probe": True,
-                "shadow_only": False,
-            },
-        }
-    }
 
-    async def fake_sizing(sized_decision, model_mode, open_positions):
-        calls.append("sizing")
-        assert model_mode == "paper"
-        assert open_positions == []
-        assert sized_decision.position_size_pct > 0
 
-    class FakeGate:
-        def gate_reason(self, _decision):
-            calls.append("gate")
-            return None
 
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
 
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
 
-    assert result.passed is True
-    advisory = decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
-    assert advisory["applied"] is True
-    assert advisory["tradeable_probe"] is True
-    assert calls == ["sizing", "gate"]
 
 
-@pytest.mark.asyncio
-async def test_entry_policy_blocks_shadow_only_evidence_before_gate() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.018
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 1.1,
-            "min_score_required": 0.7,
-            "expected_net_return_pct": 0.72,
-            "profit_quality_ratio": 0.55,
-            "tail_risk_score": 0.45,
-            "success_probability": 0.58,
-            "evidence_score": {
-                "tier": "weak_conflict_probe",
-                "effective_score": 35.0,
-                "size_multiplier": 0.03,
-                "tradeable_probe": False,
-                "shadow_only": True,
-            },
-        }
-    }
 
-    async def fake_sizing(sized_decision, model_mode, open_positions):
-        calls.append("sizing")
-        assert model_mode == "paper"
-        assert open_positions == []
-        assert sized_decision.position_size_pct > 0
 
-    class FakeGate:
-        def gate_reason(self, _decision):
-            calls.append("gate")
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is False
-    assert result.blocker == "entry_evidence_wait"
-    assert result.data["skip_kind"] == "entry_evidence_wait"
-    assert result.data["evidence_tier"] == "weak_conflict_probe"
-    assert result.data["evidence_shadow_only"] is True
-    assert calls == ["sizing"]
-
-
-@pytest.mark.asyncio
-async def test_entry_policy_blocks_blocked_evidence_without_tradeable_probe() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.018
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 0.92,
-            "min_score_required": 0.7,
-            "expected_net_return_pct": 0.24,
-            "profit_quality_ratio": 0.3,
-            "tail_risk_score": 0.62,
-            "success_probability": 0.46,
-            "evidence_score": {
-                "tier": "blocked",
-                "effective_score": 34.0,
-                "size_multiplier": 0.0,
-                "tradeable_probe": False,
-            },
-        }
-    }
-
-    async def fake_sizing(sized_decision, model_mode, open_positions):
-        calls.append("sizing")
-        assert model_mode == "paper"
-        assert open_positions == []
-        assert sized_decision.position_size_pct > 0
-
-    class FakeGate:
-        def gate_reason(self, _decision):
-            calls.append("gate")
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is False
-    assert result.blocker == "entry_evidence_wait"
-    assert result.data["skip_kind"] == "entry_evidence_wait"
-    assert result.data["evidence_tier"] == "blocked"
-    assert "动态证据仍未达到可执行状态" in (result.reason or "")
-    assert calls == ["sizing"]
-
-
-@pytest.mark.asyncio
-async def test_entry_policy_keeps_low_payoff_risk_budget_probe_shadow_only() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.SHORT)
-    decision.position_size_pct = 0.02
-    decision.suggested_leverage = 1.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "analysis_type": "entry_candidate",
-        "current_price": 100.0,
-        "strategy_learning_context": {"strategy_profile_id": "profile_1"},
-        "opportunity_score": {
-            "score": 1.4,
-            "min_score_required": 0.7,
-            "side": "short",
-            "expected_net_return_pct": 0.2,
-            "fee_pct": 0.05,
-            "slippage_pct": 0.04,
-            "expected_loss_pct": 0.2,
-            "profit_quality_ratio": 0.5,
-            "reward_risk_ratio": 0.9,
-            "server_profit_loss_probability": 0.48,
-            "tail_risk_score": 0.7,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "server_profit_expected_return_pct": 0.4,
-            "evidence_score": {"tier": "normal", "effective_score": 72.0},
-        },
-        "profit_risk_sizing": {
-            "low_payoff_quality": True,
-            "quality_tier": "base",
-            "high_quality_entry": False,
-            "position_size_pct": 0.006,
-            "final_notional_usdt": 30.0,
-            "planned_stop_loss_usdt": 1.5,
-            "max_stop_loss_usdt": 1.5,
-            "expected_profit_usdt": 0.12,
-            "dynamic_leverage_decision": {
-                "final_integer_leverage": 1,
-                "limiting_factor": "risk_budget",
-                "reasons": ["limited_by_risk_budget"],
-            },
-            "profit_first_position_ladder": {"lane": "tiny_probe", "adjusted_size_pct": 0.006},
-        },
-    }
-
-    async def fake_sizing(sized_decision, _model_mode, _open_positions):
-        calls.append("sizing")
-        assert sized_decision is decision
-
-    class FakeGate:
-        def gate_reason(self, _decision):
-            calls.append("gate")
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is False
-    assert result.blocker == "profit_first_defensive_probe_shadow"
-    assert result.reason is not None
-    assert "Profit-First 防御探针拦截" in result.reason
-    assert "low-payoff" not in result.reason
-    assert result.data["shadow_only"] is True
-    assert result.data["skip_kind"] == "profit_first_defensive_probe_shadow"
-    assert result.data["dynamic_leverage_limiting_factor"] == "risk_budget"
-    assert calls == ["sizing"]
-
-
-@pytest.mark.asyncio
-async def test_entry_policy_allows_validated_probe_upgrade_past_evidence_wait(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    decision = _decision(Action.SHORT)
-    decision.position_size_pct = 0.02
-    decision.suggested_leverage = 1.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "analysis_type": "entry_candidate",
-        "current_price": 100.0,
-        "opportunity_score": {
-            "score": 1.2,
-            "min_score_required": 0.7,
-            "side": "short",
-            "expected_net_return_pct": 0.28,
-            "profit_quality_ratio": 0.58,
-            "tail_risk_score": 0.42,
-            "server_profit_loss_probability": 0.36,
-            "evidence_score": {
-                "tier": "blocked",
-                "effective_score": 30.0,
-                "size_multiplier": 0.0,
-                "tradeable_probe": False,
-            },
-        },
-        "profit_first_trade_plan": {
-            "decision_lane": "validated_probe",
-            "is_complete_for_real_trade": True,
-            "expected_net_return_pct": 0.28,
-        },
-        "profit_risk_sizing": {
-            "position_size_pct": 0.01,
-        },
-    }
-    monkeypatch.setattr(
-        "services.trading_policies.attach_profit_first_trade_plan",
-        lambda current_decision, **_kwargs: current_decision.raw_response,
-    )
-
-    async def fake_sizing(_sized_decision, _model_mode, _open_positions):
-        return None
-
-    class FakeGate:
-        def gate_reason(self, _decision):
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is True
-
-
-@pytest.mark.asyncio
-async def test_entry_policy_allows_validated_probe_upgrade_past_defensive_shadow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    decision = _decision(Action.SHORT)
-    decision.position_size_pct = 0.02
-    decision.suggested_leverage = 1.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "analysis_type": "entry_candidate",
-        "current_price": 100.0,
-        "opportunity_score": {
-            "score": 1.4,
-            "min_score_required": 0.7,
-            "side": "short",
-            "expected_net_return_pct": 0.22,
-            "fee_pct": 0.05,
-            "slippage_pct": 0.04,
-            "expected_loss_pct": 0.18,
-            "profit_quality_ratio": 0.55,
-            "reward_risk_ratio": 0.95,
-            "server_profit_loss_probability": 0.4,
-            "tail_risk_score": 0.44,
-            "evidence_score": {"tier": "blocked", "effective_score": 34.0, "tradeable_probe": False},
-        },
-        "profit_first_trade_plan": {
-            "decision_lane": "validated_probe",
-            "is_complete_for_real_trade": True,
-            "expected_net_return_pct": 0.22,
-        },
-        "profit_risk_sizing": {
-            "low_payoff_quality": True,
-            "quality_tier": "base",
-            "high_quality_entry": False,
-            "position_size_pct": 0.006,
-            "final_notional_usdt": 30.0,
-            "planned_stop_loss_usdt": 1.5,
-            "max_stop_loss_usdt": 1.5,
-            "expected_profit_usdt": 0.12,
-            "dynamic_leverage_decision": {
-                "final_integer_leverage": 1,
-                "limiting_factor": "risk_budget",
-                "reasons": ["limited_by_risk_budget"],
-            },
-            "profit_first_position_ladder": {
-                "lane": "validated_probe",
-                "adjusted_size_pct": 0.006,
-            },
-        },
-    }
-    monkeypatch.setattr(
-        "services.trading_policies.attach_profit_first_trade_plan",
-        lambda current_decision, **_kwargs: current_decision.raw_response,
-    )
-
-    async def fake_sizing(_sized_decision, _model_mode, _open_positions):
-        return None
-
-    class FakeGate:
-        def gate_reason(self, _decision):
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is True
-
-
-@pytest.mark.asyncio
-async def test_entry_policy_allows_sizing_upgraded_probe_past_blocked_evidence_and_shadow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    decision = _decision(Action.SHORT)
-    decision.position_size_pct = 0.01
-    decision.suggested_leverage = 1.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "analysis_type": "entry_candidate",
-        "current_price": 100.0,
-        "opportunity_score": {
-            "score": 1.0,
-            "min_score_required": 0.7,
-            "side": "short",
-            "expected_net_return_pct": 0.32,
-            "profit_quality_ratio": 0.42,
-            "tail_risk_score": 0.28,
-            "server_profit_loss_probability": 0.44,
-            "evidence_score": {
-                "tier": "blocked",
-                "effective_score": 31.0,
-                "tradeable_probe": False,
-            },
-        },
-        "profit_first_trade_plan": {
-            "decision_lane": "tiny_probe",
-            "is_complete_for_real_trade": True,
-            "expected_net_return_pct": 0.32,
-            "expected_profit_usdt": 0.18,
-        },
-        "profit_risk_sizing": {
-            "low_payoff_quality": True,
-            "quality_tier": "base",
-            "high_quality_entry": False,
-            "position_size_pct": 0.01,
-            "final_notional_usdt": 45.0,
-            "expected_profit_usdt": 0.18,
-            "strategy_quality_override": False,
-            "dynamic_leverage_decision": {
-                "final_integer_leverage": 1,
-                "limiting_factor": "risk_budget",
-                "reasons": ["limited_by_risk_budget"],
-            },
-            "profit_first_position_ladder": {
-                "lane": "validated_probe",
-                "adjusted_size_pct": 0.01,
-            },
-        },
-    }
-    monkeypatch.setattr(
-        "services.trading_policies.attach_profit_first_trade_plan",
-        lambda current_decision, **_kwargs: current_decision.raw_response,
-    )
-
-    async def fake_sizing(_sized_decision, _model_mode, _open_positions):
-        return None
-
-    class FakeGate:
-        def gate_reason(self, _decision):
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is True
-
-
-@pytest.mark.asyncio
-async def test_entry_policy_allows_non_shadow_exploration_probe_past_defensive_shadow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    decision = _decision(Action.LONG)
-    decision.position_size_pct = 0.01
-    decision.suggested_leverage = 1.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
-    decision.raw_response = {
-        "analysis_type": "market",
-        "current_price": 100.0,
-        "opportunity_score": {
-            "score": -0.2,
-            "min_score_required": 0.7,
-            "side": "long",
-            "expected_net_return_pct": 0.20,
-            "profit_quality_ratio": 0.24,
-            "tail_risk_score": 0.31,
-            "server_profit_loss_probability": 0.51,
-            "evidence_score": {
-                "tier": "exploration",
-                "effective_score": 56.0,
-                "size_multiplier": 0.10,
-                "tradeable_probe": False,
-                "shadow_only": False,
-            },
-        },
-        "profit_first_trade_plan": {
-            "decision_lane": "tiny_probe",
-            "is_complete_for_real_trade": True,
-            "expected_net_return_pct": 0.20,
-            "expected_profit_usdt": 0.06,
-        },
-        "profit_risk_sizing": {
-            "low_payoff_quality": True,
-            "quality_tier": "base",
-            "high_quality_entry": False,
-            "position_size_pct": 0.01,
-            "final_notional_usdt": 30.0,
-            "expected_profit_usdt": 0.06,
-            "dynamic_leverage_decision": {
-                "final_integer_leverage": 1,
-                "limiting_factor": "risk_budget",
-                "reasons": ["limited_by_risk_budget"],
-            },
-            "profit_first_position_ladder": {
-                "lane": "tiny_probe",
-                "adjusted_size_pct": 0.01,
-            },
-        },
-    }
-    monkeypatch.setattr(
-        "services.trading_policies.attach_profit_first_trade_plan",
-        lambda current_decision, **_kwargs: current_decision.raw_response,
-    )
-
-    async def fake_sizing(_sized_decision, _model_mode, _open_positions):
-        return None
-
-    class FakeGate:
-        def gate_reason(self, _decision):
-            return None
-
-    policy = EntryPolicy(
-        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    result = await policy.evaluate(decision, "ensemble_trader", "paper", [])
-
-    assert result.passed is True
-
-
-def test_entry_policy_gate_reason_scores_missing_opportunity_for_all_gate_callers() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.SHORT)
-    decision.raw_response = {"strategy_mode": {"min_opportunity_score": 0.8}}
-
-    def fake_score(scored_decision, strategy):
-        calls.append("score")
-        assert strategy == {"min_opportunity_score": 0.8}
-        raw = scored_decision.raw_response
-        raw["opportunity_score"] = {
-            "score": 1.1,
-            "min_score_required": 0.8,
-            "expected_net_return_pct": 0.3,
-            "profit_quality_ratio": 1.1,
-            "tail_risk_score": 0.3,
-            "success_probability": 0.55,
-        }
-        scored_decision.raw_response = raw
-        return 1.1
-
-    class FakeGate:
-        def gate_reason(self, gated_decision):
-            calls.append("gate")
-            assert gated_decision.raw_response["opportunity_score"]["score"] == 1.1
-            return None
-
-    policy = EntryPolicy(
-        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
-        entry_opportunity_gate=FakeGate(),
-    )
-
-    assert policy.gate_reason(decision) is None
-    assert calls == ["score", "gate"]
-
-
-def test_entry_policy_gate_reason_attaches_weak_evidence_advisory_for_prefilter_callers() -> None:
-    calls: list[str] = []
-    decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "opportunity_score": {
-            "score": 0.88,
-            "min_score_required": 0.7,
-            "expected_net_return_pct": 0.24,
-            "profit_quality_ratio": 0.42,
-            "tail_risk_score": 0.52,
-            "success_probability": 0.49,
-            "evidence_score": {
-                "tier": "weak_conflict_probe",
-                "effective_score": 39.0,
-                "tradeable_probe": False,
-                "shadow_only": True,
-                "advisory_wait_reasons": ["waiting for more aligned evidence"],
-            },
-        }
-    }
-
-    class FakeGate:
-        def gate_reason(self, gated_decision):
-            calls.append("gate")
-            advisory = gated_decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
-            assert advisory["applied"] is True
-            assert advisory["evidence_tier"] == "weak_conflict_probe"
-            return None
-
-    policy = EntryPolicy(entry_opportunity_gate=FakeGate())
-
-    assert policy.gate_reason(decision) is None
-    advisory = decision.raw_response["opportunity_score"]["entry_evidence_advisory"]
-    assert advisory["shadow_only"] is True
-    assert advisory["advisory_wait_reasons"] == ["waiting for more aligned evidence"]
-    assert calls == ["gate"]
-
-
-def test_entry_policy_uses_injected_abnormal_wick_guard_boundary():
-    calls: list[str] = []
-
-    class FakeGuard:
-        def guard_reason(self, decision):
-            calls.append(decision.symbol)
-            return "wick-blocked"
-
-    policy = EntryPolicy(abnormal_wick_guard=FakeGuard())
-
-    assert policy.abnormal_wick_guard_reason(_decision(Action.LONG)) == "wick-blocked"
-    assert calls == ["BTC/USDT"]
 
 
 @pytest.mark.asyncio
@@ -4366,11 +2247,6 @@ async def test_entry_policy_uses_injected_price_guard_boundary():
     assert calls == ["BTC/USDT"]
 
 
-def test_entry_symbol_blocklist_recognizes_chinese_entry_price_guard_skip_reason():
-    policy = EntrySymbolBlocklistPolicy(lambda symbol: str(symbol or ""))
-
-    assert policy.is_entry_price_guard_skip("下单前没有重新拿到最新价格，系统本次跳过。")
-    assert policy.is_entry_price_guard_skip("下单前行情质量复核未通过：盘口数据异常。")
 
 
 def test_trading_service_dashboard_runtime_boundaries_expose_public_state():
@@ -4586,9 +2462,6 @@ async def test_paper_new_pair_pause_treats_missing_okx_balance_snapshot_as_advis
     service._okx_live = None
     service._okx_balance_snapshot_cache = {}
     service._get_okx_executor_for_mode = lambda _mode: _async_value(None)
-    service.new_pair_loss_pause = NewPairLossPausePolicy(
-        balance_snapshot_provider=service._get_okx_balance_snapshot_for_mode
-    )
     service.risk_engine = SimpleNamespace(
         circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
         position_checker=SimpleNamespace(entry_capacity_reason=lambda **_kwargs: None),
@@ -4630,15 +2503,7 @@ async def test_new_pair_pause_context_reuses_short_lived_cached_balance_checks()
         allocation_calls += 1
         return {"total_pnl": 0.0}
 
-    class LossPause:
-        async def cooldown_loss_pause_reason(self, *_args):
-            return None
-
-        async def recent_loss_streak_pause_reason(self, *_args):
-            return None
-
     service.execution_allocation_state = allocation_state  # type: ignore[method-assign]
-    service.new_pair_loss_pause = LossPause()
     service.risk_engine = SimpleNamespace(
         circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
         position_checker=SimpleNamespace(entry_capacity_reason=lambda **_kwargs: None),
@@ -4655,7 +2520,7 @@ async def test_new_pair_pause_context_reuses_short_lived_cached_balance_checks()
 
     assert first is None
     assert second == ""
-    assert allocation_calls == 1
+    assert allocation_calls == 0
 
 
 @pytest.mark.asyncio
@@ -4897,7 +2762,6 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
 
     funnel = service._market_candidate_funnel_snapshot(
         scan_symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
-        blocked_filter=empty_filter,
         open_position_filter=empty_filter,
         unclaimed_filter=skipped,
         fetch_symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
@@ -4943,10 +2807,8 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
     )
     assert funnel["rank_underfilled"] is False
     assert funnel["rank_underfill_reason"] == ""
-    assert funnel["rank_fallback_filtered_fill_count"] == 1
-    assert funnel["rank_fallback_filtered_fill_policy"]["read_only"] is True
-    assert funnel["rank_fallback_filtered_fill_policy"]["is_entry_gate"] is False
-    assert funnel["rank_fallback_filtered_fill_policy"]["symbols"] == ["NEAR/USDT"]
+    assert "rank_fallback_filtered_fill_count" not in funnel
+    assert "rank_fallback_filtered_fill_policy" not in funnel
     assert funnel["ranked_symbol_sample"][1]["non_selected_reason"] == (
         "outside_market_symbol_budget"
     )
@@ -5021,37 +2883,6 @@ def test_market_budget_deferred_rotation_keeps_order_when_no_match() -> None:
     assert rotation["reason"] == "deferred symbols no longer match current shortlist"
 
 
-def test_market_budget_rotation_uses_recent_analysis_coverage_when_deferred_no_match() -> None:
-    service = TradingService.__new__(TradingService)
-    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
-        service,
-        TradingService,
-    )
-    service._market_budget_deferred_symbols = ["DOGE/USDT"]
-    service._recent_market_analysis_penalty = lambda symbol: {
-        "BTC/USDT": 12.0,
-        "ETH/USDT": 0.0,
-        "SOL/USDT": 8.0,
-    }.get(symbol, 0.0)
-    analysis_budget = {}
-
-    rotated = service._rotate_market_feature_vectors_for_budget_coverage(
-        {
-            "BTC/USDT": "btc",
-            "ETH/USDT": "eth",
-            "SOL/USDT": "sol",
-        },
-        analysis_budget_context=analysis_budget,
-    )
-
-    assert list(rotated) == ["ETH/USDT", "SOL/USDT", "BTC/USDT"]
-    rotation = analysis_budget["market_budget_rotation"]
-    assert rotation["read_only"] is True
-    assert rotation["is_entry_gate"] is False
-    assert rotation["applied"] is True
-    assert rotation["start_symbol"] == "ETH/USDT"
-    assert rotation["rotation_source"] == "recent_analysis_coverage"
-    assert "entry thresholds" in rotation["reason"]
 
 
 def test_market_budget_deferred_symbols_are_deduped_and_clearable() -> None:
@@ -5070,51 +2901,6 @@ def test_market_budget_deferred_symbols_are_deduped_and_clearable() -> None:
     assert service._market_budget_deferred_symbols == []
 
 
-def test_market_analysis_progress_snapshot_is_read_only_and_attached(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = TradingService.__new__(TradingService)
-    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
-    monkeypatch.setattr(
-        trading_service.settings.__class__,
-        "refresh_runtime_env",
-        lambda _self, force=False: True,
-    )
-    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
-    started_at = datetime.now(UTC) - timedelta(seconds=3)
-    market_ai_started_at = datetime.now(UTC) - timedelta(seconds=1)
-
-    progress = service._market_analysis_progress_snapshot(
-        symbol="BTC/USDT",
-        market_index=1,
-        market_total=8,
-        round_start=started_at,
-        market_ai_started_at=market_ai_started_at,
-    )
-    decision = _decision(Action.HOLD)
-    service._attach_market_candidate_funnel(
-        decision,
-        {"read_only": True},
-        progress,
-    )
-
-    assert progress["read_only"] is True
-    assert progress["is_entry_gate"] is False
-    assert progress["processed_index"] == 2
-    assert progress["ranked_market_symbol_count"] == 8
-    assert progress["remaining_after_this_symbol"] == 6
-    assert progress["market_round_time_budget_seconds"] == 27.0
-    assert progress["budget_clock_scope"] == "market_ai_phase"
-    assert progress["full_round_elapsed_seconds_before_ai"] >= 3.0
-    assert progress["market_ai_elapsed_seconds_before_symbol"] < 2.0
-    assert progress["budget_used_ratio_before_ai"] < 0.1
-    assert (
-        progress["market_ai_budget_used_ratio_before_symbol"]
-        == progress["budget_used_ratio_before_ai"]
-    )
-    assert "not entry permission" in progress["diagnostic_boundary"]
-    assert decision.raw_response["market_candidate_funnel"]["read_only"] is True
-    assert decision.raw_response["market_analysis_progress"] == progress
 
 
 def test_market_ai_budget_clock_ignores_pre_ai_round_work(
@@ -5167,110 +2953,8 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
     assert service.market_round_watchdog_seconds() >= 180.0
 
 
-def test_market_round_time_budget_expands_when_roster_underfilled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = TradingService.__new__(TradingService)
-    monkeypatch.setattr(
-        trading_service.settings.__class__,
-        "refresh_runtime_env",
-        lambda _self, force=False: True,
-    )
-    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
-    strategy_context = {
-        "risk_mode": "normal",
-        "portfolio_roster": {
-            "underfilled": True,
-            "gap": 8,
-            "market_symbol_min": 6,
-        },
-    }
-
-    assert service.market_round_time_budget_seconds() == 27.0
-    assert (
-        service.market_round_time_budget_seconds(
-            strategy_context=strategy_context,
-            market_symbol_count=8,
-        )
-        == pytest.approx(63.0)
-    )
-
-    assert (
-        service.market_symbol_start_reserve_seconds(
-            strategy_context=strategy_context,
-            market_symbol_count=8,
-        )
-        == pytest.approx(24.0)
-    )
-
-    started_at = datetime.now(UTC) - timedelta(seconds=38)
-    assert service._market_ai_budget_exhausted(started_at) is True
-    assert (
-        service._market_ai_budget_exhausted(
-            started_at,
-            strategy_context=strategy_context,
-            market_symbol_count=8,
-        )
-        is False
-    )
-
-    started_at = datetime.now(UTC) - timedelta(seconds=40)
-    assert service._market_ai_budget_exhausted(started_at) is True
-    assert (
-        service._market_ai_budget_exhausted(
-            started_at,
-            strategy_context=strategy_context,
-            market_symbol_count=8,
-        )
-        is True
-    )
-
-    progress = service._market_analysis_progress_snapshot(
-        symbol="BTC/USDT",
-        market_index=1,
-        market_total=8,
-        round_start=started_at,
-        market_ai_started_at=started_at,
-        strategy_context=strategy_context,
-    )
-
-    assert progress["market_round_time_budget_seconds"] == 63.0
-    assert progress["base_market_round_time_budget_seconds"] == 27.0
-    assert progress["market_symbol_start_reserve_seconds"] == pytest.approx(24.0)
-    assert progress["remaining_market_ai_budget_seconds"] < 24.0
-    assert progress["can_start_another_market_symbol"] is False
-    assert (
-        progress["market_round_time_budget_policy"]
-        == "portfolio_roster_underfilled_extension"
-    )
 
 
-def test_market_round_time_budget_does_not_expand_in_hard_recovery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = TradingService.__new__(TradingService)
-    monkeypatch.setattr(
-        trading_service.settings.__class__,
-        "refresh_runtime_env",
-        lambda _self, force=False: True,
-    )
-    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
-    strategy_context = {
-        "risk_mode": "hard_recovery",
-        "portfolio_roster": {
-            "underfilled": True,
-            "gap": 8,
-            "market_symbol_min": 6,
-        },
-    }
-
-    assert (
-        service.market_round_time_budget_seconds(
-            strategy_context=strategy_context,
-            market_symbol_count=8,
-        )
-        == 27.0
-    )
 
 
 def test_market_round_time_budget_expands_for_profit_first_quality_pressure(
@@ -5497,44 +3181,6 @@ def test_position_round_watchdog_follows_position_review_cadence(
     assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
 
 
-def test_position_review_stage_timeout_expands_for_profit_first_and_release_pressure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = TradingService.__new__(TradingService)
-    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
-    service._safe_list = TradingService._safe_list.__get__(service, TradingService)
-    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
-    service._safe_int = TradingService._safe_int.__get__(service, TradingService)
-    monkeypatch.setattr(
-        trading_service.settings.__class__,
-        "refresh_runtime_env",
-        lambda _self, force=False: True,
-    )
-    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
-    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
-    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
-    monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
-
-    base_timeout = service.position_review_stage_timeout_seconds()
-    expanded = service._position_review_stage_timeout_seconds(
-        None,
-        strategy_context={
-            "strategy_learning_release_pressure_active": True,
-            "rotation_slots": 2,
-            "profit_first_runtime_feedback": {
-                "missed_opportunity_feedback": {
-                    "entry_bias": "expand_quality_entries",
-                },
-                "size_feedback": [
-                    {"sizing_bias": "quality_entries_can_expand_after_validation"}
-                ],
-            },
-        },
-        stage="position_review_decision",
-        symbol="BTC/USDT",
-    )
-
-    assert expanded > base_timeout
 
 
 @pytest.mark.asyncio
@@ -5620,479 +3266,6 @@ async def test_trading_service_stage_boundary_passes_duration() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_trading_service_execution_boundaries_call_internal_owners():
-    service = TradingService.__new__(TradingService)
-    calls: list[tuple[Any, ...]] = []
-    decision = _decision(Action.LONG)
-
-    def model_mode(model_name):
-        calls.append(("mode", model_name))
-        return "paper"
-
-    async def log_risk(event_type, symbol, details, model_name, severity="warn"):
-        calls.append(("risk", event_type, symbol, details, model_name, severity))
-
-    async def record_stage(decision_id, decision_arg, stage, status, reason, data=None):
-        calls.append(("stage", decision_id, decision_arg.symbol, stage, status, reason, data))
-        return {"stage": stage}
-
-    async def mark_reason(decision_id, reason):
-        calls.append(("reason", decision_id, reason))
-
-    async def mark_raw(decision_id, raw_response):
-        calls.append(("raw", decision_id, raw_response))
-
-    class FakePositionReviewRiskAlertPolicy:
-        def alert_context(self, decision_arg):
-            calls.append(("alert_context", decision_arg.symbol))
-            return {"message": "risk"}
-
-        def execution_result_text(
-            self,
-            decision_arg,
-            execution_result,
-            execution_reason_provider,
-        ):
-            calls.append(("position_review_result_text", decision_arg.symbol))
-            return execution_reason_provider(execution_result)
-
-        def risk_event_detail(self, decision_arg, alert, result_text):
-            calls.append(("position_review_detail", decision_arg.symbol, alert, result_text))
-            return "position review detail"
-
-    async def duplicate_order_reason(decision_id, decision_arg):
-        calls.append(("duplicate", decision_id, decision_arg.symbol))
-        return None
-
-    async def okx_executor(mode):
-        calls.append(("executor", mode))
-        return "okx-executor"
-
-    async def allocated_balance(model_mode, decision_arg):
-        calls.append(("allocated", model_mode, decision_arg.symbol))
-        return 123.0
-
-    def rejected_result(decision_arg, reason):
-        calls.append(("rejected", decision_arg.symbol, reason))
-        return ExecutionResult(
-            order_id=None,
-            exchange_order_id=None,
-            symbol=decision_arg.symbol,
-            side=decision_arg.action.value,
-            order_type="market",
-            quantity=0.0,
-            price=0.0,
-            status=OrderStatus.REJECTED,
-            raw_response={"reason": reason},
-        )
-
-    def leverage_summary(decision_arg, execution_result, requested):
-        calls.append(("leverage", decision_arg.symbol, execution_result.symbol, requested))
-
-    def execution_reason(execution_result):
-        calls.append(("execution_reason", execution_result.status.value))
-        return execution_result.status.value
-
-    async def mark_pending(decision_id, reason):
-        calls.append(("pending", decision_id, reason))
-
-    def is_untradable_error(result_text):
-        calls.append(("untradable", result_text))
-        return True
-
-    def remember_untradable(symbol, result_text):
-        calls.append(("remember_untradable", symbol, result_text))
-
-    def is_transient_error(result_text):
-        calls.append(("transient", result_text))
-        return True
-
-    def remember_temporary_block(symbol, reason, minutes):
-        calls.append(("temporary_block", symbol, reason, minutes))
-
-    def transient_minutes(result_text):
-        calls.append(("transient_minutes", result_text))
-        return 7.0
-
-    class FakeEntrySymbolBlocklist:
-        def is_untradable_exchange_error(self, result_text):
-            return is_untradable_error(result_text)
-
-        def remember_untradable_symbol(self, symbol, result_text):
-            remember_untradable(symbol, result_text)
-
-        def is_transient_entry_exchange_error(self, result_text):
-            return is_transient_error(result_text)
-
-        def remember_temporary_entry_block(self, symbol, reason, minutes):
-            remember_temporary_block(symbol, reason, minutes)
-
-        def transient_entry_block_minutes(self, result_text):
-            return transient_minutes(result_text)
-
-    async def log_trade(execution_result, model_name, decision_arg, decision_id=None):
-        calls.append(
-            (
-                "trade",
-                execution_result.symbol,
-                model_name,
-                decision_arg.symbol,
-                decision_id,
-            )
-        )
-
-    def is_exchange_confirmed(execution_result):
-        calls.append(("confirmed", execution_result.status.value))
-        return execution_result.status == OrderStatus.FILLED
-
-    def is_exit_progress(execution_result):
-        calls.append(("exit_progress", execution_result.status.value))
-        return False
-
-    def result_has_no_position(execution_result):
-        calls.append(("no_position", execution_result.status.value))
-        return True
-
-    async def persist_position(model_name, decision_arg, execution_result, model_mode):
-        calls.append(
-            (
-                "persist_position",
-                model_name,
-                decision_arg.symbol,
-                execution_result.symbol,
-                model_mode,
-            )
-        )
-
-    def apply_execution(open_positions, model_name, decision_arg, execution_result):
-        calls.append(
-            (
-                "apply_execution",
-                len(open_positions),
-                model_name,
-                decision_arg.symbol,
-                execution_result.symbol,
-            )
-        )
-
-    async def mark_executed(decision_id, price):
-        calls.append(("executed", decision_id, price))
-
-    def clear_symbol(symbol):
-        calls.append(("clear_symbol", symbol))
-
-    async def persist_account(model_name, decision_model_name, execution_result):
-        calls.append(("account_update", model_name, decision_model_name, execution_result.symbol))
-
-    async def account_balance(model_name):
-        calls.append(("account_balance", model_name))
-        return 456.0
-
-    async def mark_outcome(decision_id, outcome, pnl_pct):
-        calls.append(("outcome", decision_id, outcome, pnl_pct))
-
-    class FakeEntryPolicy:
-        async def evaluate(self, decision_arg, model_name, model_mode, open_positions):
-            calls.append(
-                (
-                    "entry_policy",
-                    decision_arg.symbol,
-                    model_name,
-                    model_mode,
-                    len(open_positions or []),
-                )
-            )
-            return PolicyGateResult.allow({"intent": "entry"})
-
-    class FakeExitPolicy:
-        async def evaluate(
-            self,
-            decision_arg,
-            model_name,
-            open_positions,
-            *,
-            refresh_positions=True,
-        ):
-            calls.append(
-                (
-                    "exit_policy",
-                    decision_arg.symbol,
-                    model_name,
-                    len(open_positions or []),
-                    refresh_positions,
-                )
-            )
-            return PolicyGateResult.allow({"intent": "exit"})
-
-        def has_matching_position(self, positions, model_name, decision_arg):
-            calls.append(
-                (
-                    "local_exit_position",
-                    decision_arg.symbol,
-                    model_name,
-                    len(positions),
-                )
-            )
-            return True
-
-    class FakeAgentSkills:
-        def execution_skills(self, **kwargs):
-            calls.append(
-                (
-                    "agent_skills",
-                    kwargs["decision"].symbol,
-                    kwargs["model_mode"],
-                    kwargs["override_balance"],
-                )
-            )
-            return ["guard"]
-
-        def attach(self, decision_arg, *, phase, skills, note):
-            calls.append(("attach_agent_skills", decision_arg.symbol, phase, skills, note))
-
-        def block_reason(self, skills, *, for_entry):
-            calls.append(("agent_skill_block", skills, for_entry))
-            return "skill-block"
-
-    class FakeOkxSyncService:
-        async def reconcile_positions(
-            self,
-            reason,
-            timeout_seconds=None,
-            lock_wait_seconds=None,
-            record_timeout_error=True,
-        ):
-            calls.append(
-                (
-                    "reconcile",
-                    reason,
-                    timeout_seconds,
-                    lock_wait_seconds,
-                    record_timeout_error,
-                )
-            )
-
-        async def get_open_positions_context(self):
-            calls.append(("open_positions_context",))
-            return [{"symbol": "BTC/USDT"}]
-
-        async def has_matching_exchange_exit_position(self, model_name, decision_arg):
-            calls.append(("exchange_exit_position", decision_arg.symbol, model_name))
-            return True
-
-    class FakeExitCooldown:
-        def remember_exit(self, model_name, decision_arg):
-            calls.append(("exit_cooldown", decision_arg.symbol, model_name))
-
-    class FakeCircuitBreaker:
-        def record_trade(self, amount):
-            calls.append(("record_trade", amount))
-
-    class FakeAccounting:
-        async def allocated_order_balance(self, model_mode, decision_arg=None):
-            return await allocated_balance(model_mode, decision_arg)
-
-        async def persist_account_update(
-            self,
-            model_name,
-            decision_model_name,
-            execution_result,
-        ):
-            await persist_account(model_name, decision_model_name, execution_result)
-
-        async def account_balance(self, model_name):
-            return await account_balance(model_name)
-
-    service.entry_policy = FakeEntryPolicy()
-    service.exit_policy = FakeExitPolicy()
-    service.agent_skills = FakeAgentSkills()
-    service.okx_sync_service = FakeOkxSyncService()
-    service.exit_cooldown = FakeExitCooldown()
-    service.account_accounting_service = FakeAccounting()
-    service.risk_engine = SimpleNamespace(circuit_breaker=FakeCircuitBreaker())
-    service.position_review_risk_alert_policy = FakePositionReviewRiskAlertPolicy()
-    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
-
-    service._get_model_execution_mode = model_mode  # type: ignore[method-assign]
-    service._log_risk_event = log_risk  # type: ignore[method-assign]
-    service._record_and_persist_decision_stage = record_stage  # type: ignore[method-assign]
-    service._mark_decision_reason = mark_reason  # type: ignore[method-assign]
-    service._mark_decision_raw_response = mark_raw  # type: ignore[method-assign]
-    service._duplicate_decision_order_reason = duplicate_order_reason  # type: ignore[method-assign]
-    service._get_okx_executor_for_mode = okx_executor  # type: ignore[method-assign]
-    service._rejected_execution_result = rejected_result  # type: ignore[method-assign]
-    service._attach_execution_leverage_summary = leverage_summary  # type: ignore[method-assign]
-    service._execution_reason_from_result = execution_reason  # type: ignore[method-assign]
-    service._mark_decision_pending_execution = mark_pending  # type: ignore[method-assign]
-    service.entry_symbol_blocklist = FakeEntrySymbolBlocklist()
-    service._log_trade = log_trade  # type: ignore[method-assign]
-    service._is_exchange_confirmed_execution = is_exchange_confirmed  # type: ignore[method-assign]
-    service._is_exit_progress_execution = is_exit_progress  # type: ignore[method-assign]
-    service._result_has_no_exchange_position = result_has_no_position  # type: ignore[method-assign]
-    service._trade_count = 3
-    service._persist_position_from_execution = persist_position  # type: ignore[method-assign]
-    service._apply_execution_to_open_positions = apply_execution  # type: ignore[method-assign]
-    service._mark_decision_executed = mark_executed  # type: ignore[method-assign]
-    service._clear_market_no_opportunity_symbol = clear_symbol  # type: ignore[method-assign]
-    service._mark_decision_outcome = mark_outcome  # type: ignore[method-assign]
-
-    assert service.get_model_execution_mode("ensemble_trader") == "paper"
-    await service.log_risk_event("warning", "BTC/USDT", "detail", "ensemble_trader")
-    assert await service.record_and_persist_decision_stage(
-        12,
-        decision,
-        "risk_check",
-        "passed",
-        "ok",
-        {"x": 1},
-    ) == {"stage": "risk_check"}
-    await service.mark_decision_reason(12, "ok")
-    await service.mark_decision_raw_response(12, {"a": 1})
-    assert service.position_review_alert_context(decision) == {"message": "risk"}
-    await service.log_position_review_risk_result(decision, "ensemble_trader", "done")
-    assert await service.duplicate_decision_order_reason(12, decision) is None
-    assert await service.get_okx_executor_for_mode("paper") == "okx-executor"
-    assert await service.allocated_order_balance("paper", decision) == 123.0
-    rejected = service.rejected_execution_result(decision, "blocked")
-    service.attach_execution_leverage_summary(decision, rejected, 3.0)
-    assert service.execution_reason_from_result(rejected) == "rejected"
-    await service.mark_decision_pending_execution(12, "pending")
-    assert service.is_untradable_exchange_error("bad symbol")
-    service.remember_untradable_symbol("BTC/USDT", "bad symbol")
-    assert service.is_transient_entry_exchange_error("retry later")
-    service.remember_temporary_entry_block("BTC/USDT", "retry later", 7.0)
-    assert service.transient_entry_block_minutes("retry later") == 7.0
-    await service.log_trade(rejected, "ensemble_trader", decision, 12)
-    assert service.is_exchange_confirmed_execution(rejected) is False
-    assert service.is_exit_progress_execution(rejected) is False
-    assert service.result_has_no_exchange_position(rejected) is True
-    service.increment_trade_count()
-    assert service._trade_count == 4
-    await service.persist_position_from_execution(
-        "ensemble_trader",
-        decision,
-        rejected,
-        "paper",
-    )
-    open_positions: list[dict[str, Any]] = []
-    service.apply_execution_to_open_positions(
-        open_positions,
-        "ensemble_trader",
-        decision,
-        rejected,
-    )
-    await service.mark_decision_executed(12, 100.0)
-    service.clear_market_no_opportunity_symbol("BTC/USDT")
-    await service.persist_account_update("ensemble_trader", decision.model_name, rejected)
-    assert await service.get_account_balance("ensemble_trader") == 456.0
-    await service.mark_decision_outcome(12, "loss", -0.01)
-    service.entry_execution_pipeline = EntryExecutionPipeline(lambda: service.entry_policy)
-    service.exit_execution_pipeline = ExitExecutionPipeline(lambda: service.exit_policy)
-    entry_result = await service.entry_execution_pipeline.evaluate(
-        decision,
-        "ensemble_trader",
-        "paper",
-        [{"symbol": "BTC/USDT"}],
-    )
-    exit_result = await service.exit_execution_pipeline.evaluate(
-        decision,
-        "ensemble_trader",
-        [{"symbol": "BTC/USDT"}],
-    )
-    assert entry_result.passed is True
-    assert exit_result.passed is True
-    assert entry_result.data["strategy_parameters"]["scope"] == "entry_execution"
-    assert exit_result.data["strategy_parameters"]["scope"] == "exit_execution"
-    assert decision.raw_response["strategy_parameters"]["snapshot"]["version"]
-    assert service.execution_agent_skills(
-        decision=decision,
-        model_mode="paper",
-        override_balance=123.0,
-    ) == ["guard"]
-    service.attach_execution_agent_skills(
-        decision,
-        phase="execution_precheck",
-        skills=["guard"],
-        note="note",
-    )
-    assert service.execution_agent_skill_block_reason(["guard"], for_entry=True) == "skill-block"
-    await service.reconcile_positions_for_execution("manual")
-    assert await service.open_positions_context_for_execution() == [{"symbol": "BTC/USDT"}]
-    assert service.has_matching_local_exit_position(
-        [{"symbol": "BTC/USDT"}],
-        "ensemble_trader",
-        decision,
-    )
-    assert (
-        await service.has_matching_exchange_exit_position_for_execution(
-            "ensemble_trader",
-            decision,
-        )
-        is True
-    )
-    service.remember_exit_cooldown("ensemble_trader", decision)
-    service.record_executed_trade_notional(200.0)
-
-    assert calls == [
-        ("mode", "ensemble_trader"),
-        ("risk", "warning", "BTC/USDT", "detail", "ensemble_trader", "warn"),
-        ("stage", 12, "BTC/USDT", "risk_check", "passed", "ok", {"x": 1}),
-        ("reason", 12, "ok"),
-        ("raw", 12, {"a": 1}),
-        ("alert_context", "BTC/USDT"),
-        ("alert_context", "BTC/USDT"),
-        ("position_review_detail", "BTC/USDT", {"message": "risk"}, "done"),
-        (
-            "risk",
-            "position_review_warning",
-            "BTC/USDT",
-            "position review detail",
-            "ensemble_trader",
-            "warn",
-        ),
-        ("duplicate", 12, "BTC/USDT"),
-        ("executor", "paper"),
-        ("allocated", "paper", "BTC/USDT"),
-        ("rejected", "BTC/USDT", "blocked"),
-        ("leverage", "BTC/USDT", "BTC/USDT", 3.0),
-        ("execution_reason", "rejected"),
-        ("pending", 12, "pending"),
-        ("untradable", "bad symbol"),
-        ("remember_untradable", "BTC/USDT", "bad symbol"),
-        ("transient", "retry later"),
-        ("temporary_block", "BTC/USDT", "retry later", 7.0),
-        ("transient_minutes", "retry later"),
-        ("trade", "BTC/USDT", "ensemble_trader", "BTC/USDT", 12),
-        ("confirmed", "rejected"),
-        ("exit_progress", "rejected"),
-        ("no_position", "rejected"),
-        ("persist_position", "ensemble_trader", "BTC/USDT", "BTC/USDT", "paper"),
-        ("apply_execution", 0, "ensemble_trader", "BTC/USDT", "BTC/USDT"),
-        ("executed", 12, 100.0),
-        ("clear_symbol", "BTC/USDT"),
-        ("account_update", "ensemble_trader", "ensemble_trader", "BTC/USDT"),
-        ("account_balance", "ensemble_trader"),
-        ("outcome", 12, "loss", -0.01),
-        ("entry_policy", "BTC/USDT", "ensemble_trader", "paper", 1),
-        ("exit_policy", "BTC/USDT", "ensemble_trader", 1, True),
-        ("agent_skills", "BTC/USDT", "paper", 123.0),
-        ("attach_agent_skills", "BTC/USDT", "execution_precheck", ["guard"], "note"),
-        ("agent_skill_block", ["guard"], True),
-        ("reconcile", "manual", None, None, True),
-        (
-            "reconcile",
-            "execution open positions context refresh",
-            8.0,
-            0.1,
-            False,
-        ),
-        ("open_positions_context",),
-        ("local_exit_position", "BTC/USDT", "ensemble_trader", 1),
-        ("exchange_exit_position", "BTC/USDT", "ensemble_trader"),
-        ("exit_cooldown", "BTC/USDT", "ensemble_trader"),
-        ("record_trade", 200.0),
-    ]
 
 
 @pytest.mark.asyncio
@@ -6111,11 +3284,11 @@ async def test_ml_signal_service_completed_shadow_sample_boundary_calls_internal
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_auto_train_uses_completed_cursor_for_new_samples() -> None:
+async def test_ml_signal_auto_train_skips_when_authoritative_cursor_has_no_new_samples() -> None:
     service = MLSignalService()
 
     async def completed_shadow_sample_count() -> int:
-        return 1120
+        return 1050
 
     def current_metadata() -> dict[str, Any]:
         return {
@@ -6143,49 +3316,11 @@ async def test_ml_signal_auto_train_uses_completed_cursor_for_new_samples() -> N
     result = await service.maybe_auto_train()
 
     assert result["reason"] == "not_due"
-    assert result["new_sample_count"] == 70
+    assert result["new_sample_count"] == 0
     assert result["last_trained_completed_sample_count"] == 1050
     assert result["training_policy"]["learning_only"] is True
-    assert result["training_policy"]["min_new_samples"] == 120
 
 
-@pytest.mark.asyncio
-async def test_ml_signal_auto_train_ignores_legacy_cursor_outside_phase3_view() -> None:
-    service = MLSignalService()
-
-    async def completed_shadow_sample_count() -> int:
-        return 12795
-
-    def current_metadata() -> dict[str, Any]:
-        return {
-            "sample_count": 12720,
-            "last_trained_completed_shadow_sample_count": 150810,
-            "trained_at": datetime.now(UTC).isoformat(),
-            "test_count": 250,
-            "metrics": {
-                "long_auc": 0.40,
-                "short_auc": 0.41,
-                "long_accuracy": 0.48,
-                "short_accuracy": 0.49,
-                "top_long_avg_return_pct": -0.10,
-                "top_short_avg_return_pct": -0.08,
-                "top_long_win_rate": 0.40,
-                "bottom_long_win_rate": 0.45,
-                "top_short_win_rate": 0.42,
-                "bottom_short_win_rate": 0.46,
-            },
-        }
-
-    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
-    service._current_metadata = current_metadata  # type: ignore[method-assign]
-
-    result = await service.maybe_auto_train()
-
-    assert result["reason"] == "not_due"
-    assert result["last_trained_completed_sample_count"] == 12720
-    assert result["new_sample_count"] == 75
-    assert result["training_policy"]["cursor_source"] == "phase3_clean_training_view"
-    assert result["training_policy"]["legacy_cursor_ignored_when_outside_phase3_view"] is True
 
 
 @pytest.mark.asyncio
@@ -6206,8 +3341,8 @@ async def test_ml_signal_auto_train_quarantines_before_training(
     def current_metadata() -> dict[str, Any]:
         return {"sample_count": 200, "last_trained_completed_shadow_sample_count": 200}
 
-    async def load_rows(limit: int) -> list[Any]:
-        assert limit > 0
+    async def load_rows(limit: int | None = None) -> list[Any]:
+        assert limit is None
         calls.append("load_rows")
         return [object()]
 
@@ -6217,7 +3352,7 @@ async def test_ml_signal_auto_train_quarantines_before_training(
 
     def build_frame(_rows: list[Any]) -> list[Any]:
         calls.append("build_frame")
-        return [object()]
+        return [object(), object()]
 
     def train_frame(_frame: list[Any], **kwargs: Any) -> dict[str, Any]:
         calls.append(f"train_frame:{bool(kwargs['persist_artifact'])}")
@@ -6320,63 +3455,10 @@ def test_exit_policy_allows_non_exit_without_exit_position_matcher_dependency():
     assert policy.has_matching_position([], "ensemble_trader", _decision(Action.LONG))
 
 
-def test_exit_policy_uses_injected_partial_guard_boundary():
-    calls: list[tuple[str, str]] = []
-
-    class FakeGuard:
-        def guard_reason(self, model_name, decision, open_positions):
-            calls.append((model_name, decision.symbol))
-            return "partial-blocked"
-
-    policy = ExitPolicy(exit_partial_guard=FakeGuard())
-    reason = policy.loss_partial_guard_reason(
-        "ensemble_trader",
-        _decision(Action.CLOSE_LONG),
-        [],
-    )
-
-    assert reason == "partial-blocked"
-    assert calls == [("ensemble_trader", "BTC/USDT")]
 
 
-@pytest.mark.asyncio
-async def test_exit_policy_uses_injected_profit_precheck_boundary():
-    calls: list[tuple[str, int]] = []
-
-    class FakeProfitPrecheck:
-        async def guard_reason(self, decision, open_positions):
-            calls.append((decision.symbol, len(open_positions or [])))
-            return "profit-precheck-blocked"
-
-    policy = ExitPolicy(exit_profit_precheck=FakeProfitPrecheck())
-
-    reason = await policy.pre_execution_profit_guard_reason(
-        _decision(Action.CLOSE_LONG),
-        [{"symbol": "BTC/USDT"}],
-    )
-
-    assert reason == "profit-precheck-blocked"
-    assert calls == [("BTC/USDT", 1)]
 
 
-@pytest.mark.asyncio
-async def test_exit_policy_uses_injected_fee_churn_guard_boundary():
-    calls: list[tuple[str, str]] = []
-
-    class FakeFeeChurnGuard:
-        async def guard_reason(self, model_name, decision):
-            calls.append((model_name, decision.symbol))
-            return "fee-churn-blocked"
-
-    policy = ExitPolicy(exit_fee_churn_guard=FakeFeeChurnGuard())
-
-    reason = await policy.fee_churn_guard_reason(
-        "ensemble_trader",
-        _decision(Action.CLOSE_LONG),
-    )
-
-    assert reason == "fee-churn-blocked"
-    assert calls == [("ensemble_trader", "BTC/USDT")]
 
 
 @pytest.mark.asyncio
@@ -6416,499 +3498,6 @@ async def test_exit_policy_uses_injected_exit_position_snapshot_boundary():
     assert calls == [("refresh", "1"), ("ensemble_trader", "BTC/USDT")]
 
 
-@pytest.mark.asyncio
-async def test_execution_service_serializes_candidate_execution():
-    lock = asyncio.Lock()
-    calls: list[tuple[Any, ...]] = []
-    stages: list[tuple[Any, ...]] = []
-    raw_updates: list[dict[str, Any] | None] = []
-
-    class FakeExecutor:
-        async def place_order(self, decision, account_id=None, override_balance=None):
-            assert lock.locked()
-            calls.append(("place_order", account_id, decision.action.value, override_balance))
-            return ExecutionResult(
-                order_id="order-1",
-                exchange_order_id="exchange-1",
-                symbol=decision.symbol,
-                side=decision.action.value,
-                order_type="market",
-                quantity=2.0,
-                price=100.0,
-                status=OrderStatus.FILLED,
-                raw_response={},
-            )
-
-    async def log_risk_event(*args, **_kwargs):
-        calls.append(("risk", *args))
-
-    def get_model_execution_mode(model_name):
-        calls.append(("mode", model_name))
-        return "paper"
-
-    async def record_decision_stage(
-        decision_db_id,
-        decision,
-        stage,
-        status,
-        reason,
-        data=None,
-    ):
-        assert lock.locked()
-        stages.append((stage, status, reason))
-        return decision.raw_response
-
-    async def mark_decision_reason(decision_db_id, reason):
-        calls.append(("reason", decision_db_id, reason))
-
-    async def mark_decision_raw_response(decision_db_id, raw_response):
-        calls.append(("raw", decision_db_id))
-        raw_updates.append(raw_response)
-
-    async def log_position_review_risk_result(*args, **kwargs):
-        calls.append(("position_review_risk", args, kwargs))
-
-    async def duplicate_decision_order_reason(decision_db_id, decision):
-        calls.append(("duplicate", decision_db_id, decision.symbol))
-        return None
-
-    async def get_okx_executor(mode):
-        calls.append(("executor", mode))
-        return FakeExecutor()
-
-    async def allocated_order_balance(model_mode, decision):
-        calls.append(("balance", model_mode, decision.symbol))
-        return 123.0
-
-    def rejected_execution_result(decision, reason):
-        calls.append(("rejected", decision.symbol, reason))
-        return ExecutionResult(
-            order_id=None,
-            exchange_order_id=None,
-            symbol=decision.symbol,
-            side=decision.action.value,
-            order_type="market",
-            quantity=0.0,
-            price=0.0,
-            status=OrderStatus.REJECTED,
-            raw_response={"reason": reason},
-        )
-
-    def attach_leverage_summary(decision, execution_result, ai_requested_leverage):
-        calls.append(("leverage", ai_requested_leverage))
-
-    def execution_reason(execution_result):
-        return execution_result.status.value if execution_result else "missing"
-
-    async def mark_pending(decision_db_id, reason):
-        calls.append(("pending", decision_db_id, reason))
-
-    def is_untradable_exchange_error(text):
-        calls.append(("untradable_check", bool(text)))
-        return False
-
-    def remember_untradable_symbol(symbol, text):
-        calls.append(("remember_untradable", symbol, text))
-
-    def is_transient_entry_exchange_error(text):
-        calls.append(("transient_check", bool(text)))
-        return False
-
-    def remember_temporary_entry_block(symbol, reason, minutes):
-        calls.append(("temporary_block", symbol, reason, minutes))
-
-    def transient_entry_block_minutes(text):
-        calls.append(("transient_minutes", text))
-        return 5.0
-
-    async def log_trade(execution_result, model_name, decision, decision_db_id):
-        calls.append(("log_trade", execution_result.order_id, model_name, decision_db_id))
-
-    def is_exchange_confirmed_execution(execution_result):
-        status = execution_result.status if execution_result is not None else None
-        calls.append(("confirmed", status.value if status else None))
-        return bool(execution_result and execution_result.status == OrderStatus.FILLED)
-
-    def is_exit_progress_execution(execution_result):
-        status = execution_result.status if execution_result is not None else None
-        calls.append(("exit_progress", status.value if status else None))
-        return False
-
-    def result_has_no_exchange_position(execution_result):
-        calls.append(("no_position", execution_result.status.value))
-        return False
-
-    def increment_trade_count():
-        calls.append(("increment_trade_count",))
-
-    async def persist_position_from_execution(
-        model_name,
-        decision,
-        execution_result,
-        model_mode,
-    ):
-        calls.append(("persist_position", model_name, model_mode))
-
-    def apply_execution_to_open_positions(
-        open_positions,
-        model_name,
-        decision,
-        execution_result,
-    ):
-        calls.append(("apply_open_positions", len(open_positions)))
-
-    async def mark_decision_executed(decision_db_id, price):
-        calls.append(("executed", decision_db_id, price))
-
-    def clear_market_no_opportunity_symbol(symbol):
-        calls.append(("clear_symbol", symbol))
-
-    async def persist_account_update(model_name, decision_model_name, execution_result):
-        calls.append(("account_update", model_name, decision_model_name))
-
-    async def get_account_balance(model_name):
-        calls.append(("account_balance", model_name))
-        return 1000.0
-
-    async def mark_decision_outcome(decision_db_id, outcome, pnl_pct):
-        calls.append(("outcome", decision_db_id, outcome, pnl_pct))
-
-    async def evaluate_entry_policy(decision, model_name, model_mode, open_positions):
-        calls.append(("entry_policy", model_name, model_mode, len(open_positions or [])))
-        decision.position_size_pct = 0.01
-        decision.suggested_leverage = 2.0
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        raw["analysis_type"] = "entry_candidate"
-        raw["current_price"] = 100.0
-        raw["strategy_learning_context"] = {"strategy_profile_id": "balanced_probe"}
-        raw["opportunity_score"] = {
-            "score": 2.2,
-            "side": "long" if decision.action == Action.LONG else "short",
-            "expected_return_pct": 0.55,
-            "expected_net_return_pct": 0.32,
-            "fee_pct": 0.05,
-            "slippage_pct": 0.04,
-            "expected_loss_pct": 0.18,
-            "profit_quality_ratio": 0.85,
-            "reward_risk_ratio": 1.6,
-            "server_profit_loss_probability": 0.42,
-            "tail_risk_score": 0.55,
-            "side_realized_pnl_usdt": 0.4,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "timeseries_aligned": False,
-            "evidence_score": {
-                "tier": "normal",
-                "effective_score": 74.0,
-                "components": [
-                    {"source": "local_ml", "status": "aligned"},
-                    {"source": "server_profit", "status": "aligned"},
-                ],
-            },
-        }
-        raw["profit_risk_sizing"] = {
-            "quality_tier": "base",
-            "position_size_pct": decision.position_size_pct,
-            "final_notional_usdt": 20.0,
-            "planned_stop_loss_usdt": 0.4,
-            "max_stop_loss_usdt": 1.0,
-            "expected_profit_usdt": 0.064,
-        }
-        decision.raw_response = raw
-        return PolicyGateResult.allow({"intent": "entry"})
-
-    async def evaluate_exit_policy(
-        decision,
-        model_name,
-        open_positions,
-        *,
-        refresh_positions=True,
-    ):
-        calls.append(("exit_policy", model_name, len(open_positions or []), refresh_positions))
-        return PolicyGateResult.allow({"intent": "exit"})
-
-    def execution_skills(**kwargs):
-        calls.append(
-            (
-                "execution_skills",
-                kwargs["model_mode"],
-                kwargs["override_balance"],
-            )
-        )
-        return []
-
-    def attach_execution_skills(*args, **kwargs):
-        calls.append(("attach_skills", args, kwargs))
-
-    def execution_skill_block_reason(skills, *, for_entry):
-        calls.append(("skill_block", len(skills), for_entry))
-        return None
-
-    async def reconcile_positions(reason):
-        calls.append(("reconcile", reason))
-
-    async def open_positions_context():
-        calls.append(("open_positions_context",))
-        return []
-
-    def has_matching_local_exit_position(positions, model_name, decision):
-        calls.append(("local_exit_position", model_name, decision.symbol, len(positions)))
-        return True
-
-    async def has_matching_exchange_exit_position(model_name, decision):
-        calls.append(("exchange_exit_position", model_name, decision.symbol))
-        return True
-
-    def remember_exit_cooldown(model_name, decision):
-        calls.append(("exit_cooldown", model_name, decision.symbol))
-
-    def record_trade_notional(amount):
-        calls.append(("record_trade", amount))
-
-    service = ExecutionService(
-        execution_lock=lock,
-        risk_event_logger=log_risk_event,
-        model_execution_mode_provider=get_model_execution_mode,
-        decision_stage_recorder=record_decision_stage,
-        decision_reason_marker=mark_decision_reason,
-        decision_raw_response_marker=mark_decision_raw_response,
-        position_review_alert_context_provider=lambda _decision_arg: None,
-        position_review_risk_result_logger=log_position_review_risk_result,
-        duplicate_decision_order_reason_provider=duplicate_decision_order_reason,
-        okx_executor_provider=get_okx_executor,
-        allocated_order_balance_provider=allocated_order_balance,
-        rejected_execution_result_factory=rejected_execution_result,
-        execution_leverage_summary_attacher=attach_leverage_summary,
-        execution_reason_provider=execution_reason,
-        pending_execution_marker=mark_pending,
-        untradable_exchange_error_checker=is_untradable_exchange_error,
-        untradable_symbol_rememberer=remember_untradable_symbol,
-        transient_entry_exchange_error_checker=is_transient_entry_exchange_error,
-        temporary_entry_block_rememberer=remember_temporary_entry_block,
-        transient_entry_block_minutes_provider=transient_entry_block_minutes,
-        trade_logger=log_trade,
-        exchange_confirmed_checker=is_exchange_confirmed_execution,
-        exit_progress_checker=is_exit_progress_execution,
-        no_exchange_position_result_checker=result_has_no_exchange_position,
-        trade_count_incrementer=increment_trade_count,
-        position_execution_persister=persist_position_from_execution,
-        open_positions_execution_applier=apply_execution_to_open_positions,
-        decision_executed_marker=mark_decision_executed,
-        market_no_opportunity_symbol_clearer=clear_market_no_opportunity_symbol,
-        account_update_persister=persist_account_update,
-        account_balance_provider=get_account_balance,
-        decision_outcome_marker=mark_decision_outcome,
-        entry_policy_evaluator=evaluate_entry_policy,
-        exit_policy_evaluator=evaluate_exit_policy,
-        execution_skills_provider=execution_skills,
-        execution_skills_attacher=attach_execution_skills,
-        execution_skills_block_reason_provider=execution_skill_block_reason,
-        position_reconciler=reconcile_positions,
-        open_positions_context_provider=open_positions_context,
-        matching_exit_local_position_checker=has_matching_local_exit_position,
-        matching_exit_exchange_position_checker=has_matching_exchange_exit_position,
-        exit_cooldown_recorder=remember_exit_cooldown,
-        trade_notional_recorder=record_trade_notional,
-    )
-    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
-    result = await service.execute_candidate(
-        "BTC/USDT",
-        "ensemble_trader",
-        _decision(Action.LONG),
-        SimpleNamespace(warnings=[]),
-        123,
-        results,
-        open_positions=[],
-    )
-
-    assert result is not None
-    assert result.order_id == "order-1"
-    assert ("mode", "ensemble_trader") in calls
-    assert ("duplicate", 123, "BTC/USDT") in calls
-    assert ("entry_policy", "ensemble_trader", "paper", 0) in calls
-    assert ("executor", "paper") in calls
-    assert ("balance", "paper", "BTC/USDT") in calls
-    assert ("execution_skills", "paper", 123.0) in calls
-    assert ("skill_block", 0, True) in calls
-    assert (
-        "pending",
-        123,
-        "风控复核已通过，系统正在向 OKX 提交订单并等待交易所回报。",
-    ) in calls
-    assert ("place_order", "ensemble_trader", "long", 123.0) in calls
-    assert ("increment_trade_count",) in calls
-    assert ("persist_position", "ensemble_trader", "paper") in calls
-    assert ("executed", 123, 100.0) in calls
-    assert ("reason", 123, "filled") in calls
-    assert ("clear_symbol", "BTC/USDT") in calls
-    assert ("record_trade", 200.0) in calls
-    assert raw_updates[-1] is not None
-    assert raw_updates[-1]["execution_parameters"]["position_size_pct"] == 0.01
-    assert raw_updates[-1]["execution_parameters"]["suggested_leverage"] == 2.0
-    assert results["executions"][0]["order_id"] == "order-1"
-    assert results["decisions"][0]["executed"] is True
-    assert [stage for stage, _status, _reason in stages] == [
-        "strategy_arbitration",
-        "risk_check",
-        "risk_check",
-        "exchange_submit",
-        "exchange_submit",
-        "exchange_confirm",
-        "local_sync",
-    ]
-
-    calls.clear()
-    stages.clear()
-    exit_results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
-    exit_result = await service.execute_candidate(
-        "BTC/USDT",
-        "ensemble_trader",
-        _decision(Action.CLOSE_LONG),
-        SimpleNamespace(warnings=[]),
-        124,
-        exit_results,
-        open_positions=[{"symbol": "BTC/USDT", "side": "long"}],
-        refresh_exit_positions=False,
-    )
-
-    assert exit_result is not None
-    assert ("exit_policy", "ensemble_trader", 1, False) in calls
-    assert ("exit_cooldown", "ensemble_trader", "BTC/USDT") in calls
-    assert ("reason", 124, "filled") in calls
-    assert exit_results["executions"][0]["order_id"] == "order-1"
-
-    calls.clear()
-    stages.clear()
-    blocked_reason = "动态证据仍处于弱证据学习档，本轮只记录影子样本。"
-
-    async def evaluate_entry_policy_blocked(decision, model_name, model_mode, open_positions):
-        calls.append(("entry_policy_blocked", model_name, model_mode, len(open_positions or [])))
-        return PolicyGateResult.block(
-            "entry_evidence_shadow_only",
-            blocked_reason,
-            {
-                "stage_status": "skipped",
-                "skip_kind": "entry_evidence_shadow_only",
-                "shadow_only": True,
-            },
-        )
-
-    service.entry_policy_evaluator = evaluate_entry_policy_blocked
-    blocked_results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
-    blocked_result = await service.execute_candidate(
-        "BTC/USDT",
-        "ensemble_trader",
-        _decision(Action.LONG),
-        SimpleNamespace(warnings=[]),
-        125,
-        blocked_results,
-        open_positions=[],
-    )
-
-    assert blocked_result is not None
-    assert blocked_result.status == OrderStatus.REJECTED
-    assert blocked_result.raw_response["execution_skipped"] is True
-    assert blocked_result.raw_response["skip_kind"] == "entry_evidence_shadow_only"
-    assert blocked_result.raw_response["opportunity_score"]["selected_for_execution"] is False
-    assert blocked_result.raw_response["opportunity_score"]["selection_reason"] == blocked_reason
-    assert blocked_result.raw_response["opportunity_score"]["execution_final_state"] == "skipped"
-    assert blocked_results["decisions"][0]["execution_status"] == "skipped"
-    assert ("entry_policy_blocked", "ensemble_trader", "paper", 0) in calls
-    assert not any(call[0] in {"executor", "place_order"} for call in calls)
-    assert ("risk_check", "skipped", blocked_reason) in stages
-
-    class RejectingExecutor:
-        async def place_order(self, decision, account_id=None, override_balance=None):
-            assert lock.locked()
-            calls.append(
-                (
-                    "place_rejected_order",
-                    account_id,
-                    decision.action.value,
-                    override_balance,
-                )
-            )
-            return ExecutionResult(
-                order_id="okx_rejected",
-                exchange_order_id=None,
-                symbol=decision.symbol,
-                side=decision.action.value,
-                order_type="market",
-                quantity=0.0,
-                price=0.01764,
-                status=OrderStatus.REJECTED,
-                raw_response={
-                    "error": "OKX rejected entry order",
-                    "raw_error": "51008 Insufficient USDT margin",
-                    "execution_blocker": "okx_exchange_rejection",
-                    "okx_rejection": True,
-                    "system_pre_submit_rejection": False,
-                    "okx_order_rules": {"final_contracts": 1.0},
-                    "okx_exit_position_mismatch": {
-                        "source": "pre_submit_position_lookup",
-                        "decision_symbol": decision.symbol,
-                        "expected_okx_inst_id": "BTC-USDT-SWAP",
-                        "okx_symbol": "BTC/USDT:USDT",
-                        "target_position_side": "long",
-                        "exit_order_side": "sell",
-                        "positions_returned": 2,
-                        "matching_position_count": 0,
-                        "matching_contracts_total": 0.0,
-                        "nonzero_same_symbol_sides": ["short"],
-                        "candidates": [
-                            {
-                                "symbol": "BTC/USDT",
-                                "raw_symbol": "BTC-USDT-SWAP",
-                                "side": "short",
-                                "contracts": 3.0,
-                                "reason": "side_mismatch",
-                            }
-                        ],
-                    },
-                },
-            )
-
-    async def get_rejecting_okx_executor(mode):
-        calls.append(("rejecting_executor", mode))
-        return RejectingExecutor()
-
-    calls.clear()
-    stages.clear()
-    raw_updates.clear()
-    service.entry_policy_evaluator = evaluate_entry_policy
-    service.okx_executor_provider = get_rejecting_okx_executor
-    rejected_results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
-    rejected_result = await service.execute_candidate(
-        "BTC/USDT",
-        "ensemble_trader",
-        _decision(Action.LONG),
-        SimpleNamespace(warnings=[]),
-        126,
-        rejected_results,
-        open_positions=[],
-    )
-
-    assert rejected_result is not None
-    assert rejected_result.status == OrderStatus.REJECTED
-    assert raw_updates[-1] is not None
-    execution_result = raw_updates[-1]["execution_result"]
-    assert execution_result["status"] == "rejected"
-    assert execution_result["exchange_confirmed"] is False
-    assert execution_result["raw_response"]["raw_error"] == "51008 Insufficient USDT margin"
-    assert execution_result["raw_response"]["execution_blocker"] == "okx_exchange_rejection"
-    mismatch_summary = execution_result["okx_exit_position_mismatch_summary"]
-    assert mismatch_summary["source"] == "pre_submit_position_lookup"
-    assert mismatch_summary["expected_okx_inst_id"] == "BTC-USDT-SWAP"
-    assert mismatch_summary["matching_position_count"] == 0
-    assert mismatch_summary["candidate_reasons"] == [
-        {
-            "symbol": "BTC/USDT",
-            "raw_symbol": "BTC-USDT-SWAP",
-            "side": "short",
-            "contracts": 3.0,
-            "reason": "side_mismatch",
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -6952,8 +3541,10 @@ async def test_entry_policy_blocks_stale_signal_before_okx_submit():
         def stale_decision_reason(self, decision):
             return stale_reason
 
+    decision = _decision(Action.LONG)
+    decision.raw_response = {"opportunity_score": {"score": 0.0}}
     result = await EntryPolicy(decision_freshness=FakeFreshness()).evaluate(
-        _decision(Action.LONG),
+        decision,
         "ensemble_trader",
         "paper",
         [],
@@ -9454,7 +6045,6 @@ async def test_local_open_positions_context_returns_db_positions_without_okx(
         float_parser=lambda value, default=0.0: default if value is None else float(value),
     ).get_local_open_positions_context(
         strict=True,
-        include_profit_first_metadata=False,
     )
 
     assert len(result) == 1
@@ -9547,11 +6137,9 @@ async def test_market_round_uses_local_positions_after_fresh_okx_sync() -> None:
     async def load_local(
         *,
         strict: bool = False,
-        include_profit_first_metadata: bool = True,
     ):
         nonlocal local_calls
         assert strict is True
-        assert include_profit_first_metadata is False
         local_calls += 1
         return [{"symbol": "LOCAL/USDT", "side": "short", "is_open": True}]
 

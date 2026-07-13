@@ -9,14 +9,11 @@ from web_dashboard.app import create_app
 
 
 @pytest.mark.asyncio
-async def test_live_mode_switch_rejects_legacy_unified_okx_credentials(
+async def test_live_mode_switch_requires_explicit_live_okx_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configured = "unit-" + "dashboard-write-token"
     monkeypatch.setattr(settings, "dashboard_admin_api_key", configured)
-    monkeypatch.setattr(settings, "okx_api_key", "legacy-key")
-    monkeypatch.setattr(settings, "okx_api_secret", "legacy-secret")
-    monkeypatch.setattr(settings, "okx_passphrase", "legacy-pass")
     monkeypatch.setattr(settings, "okx_live_api_key", "")
     monkeypatch.setattr(settings, "okx_live_api_secret", "")
     monkeypatch.setattr(settings, "okx_live_passphrase", "")
@@ -38,12 +35,9 @@ async def test_live_mode_switch_rejects_legacy_unified_okx_credentials(
 
 
 @pytest.mark.asyncio
-async def test_okx_settings_live_does_not_mask_legacy_unified_credentials(
+async def test_okx_settings_do_not_expose_removed_unified_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "okx_api_key", "legacy-key")
-    monkeypatch.setattr(settings, "okx_api_secret", "legacy-secret")
-    monkeypatch.setattr(settings, "okx_passphrase", "legacy-pass")
     monkeypatch.setattr(settings, "okx_paper_api_key", "")
     monkeypatch.setattr(settings, "okx_paper_api_secret", "")
     monkeypatch.setattr(settings, "okx_paper_passphrase", "")
@@ -53,26 +47,26 @@ async def test_okx_settings_live_does_not_mask_legacy_unified_credentials(
 
     response = await settings_api_module.get_okx_settings()
 
-    assert response["paper"]["api_key"]
-    assert response["paper"]["has_secret"] is True
-    assert response["paper"]["has_passphrase"] is True
+    assert response["paper"]["api_key"] == ""
+    assert response["paper"]["has_secret"] is False
+    assert response["paper"]["has_passphrase"] is False
     assert response["live"]["api_key"] == ""
     assert response["live"]["has_secret"] is False
     assert response["live"]["has_passphrase"] is False
 
 
-def test_live_okx_credentials_do_not_fallback_to_legacy_unified_fields(
+def test_unified_okx_credential_fields_are_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "okx_api_key", "legacy-key")
-    monkeypatch.setattr(settings, "okx_api_secret", "legacy-secret")
-    monkeypatch.setattr(settings, "okx_passphrase", "legacy-pass")
     monkeypatch.setattr(settings, "okx_live_api_key", "")
     monkeypatch.setattr(settings, "okx_live_api_secret", "")
     monkeypatch.setattr(settings, "okx_live_passphrase", "")
 
     credentials = settings.get_okx_credentials("live")
 
+    assert not hasattr(settings, "okx_api_key")
+    assert not hasattr(settings, "okx_api_secret")
+    assert not hasattr(settings, "okx_passphrase")
     assert credentials["api_key"] == ""
     assert credentials["api_secret"] == ""
     assert "passphrase" not in credentials

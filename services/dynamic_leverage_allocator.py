@@ -1,14 +1,14 @@
 """Dynamic entry leverage allocation.
 
 The allocator keeps OKX-facing leverage executable as an integer while using
-continuous risk and signal inputs to decide the target.  It deliberately avoids
-evidence-tier hard caps such as "exploration is always 3x"; tiers and warnings
-are only risk factors in the calculation.
+only continuous fee-after-return, cost, volatility, exposure, and account-risk
+inputs to decide the target.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from math import floor
 from typing import Any
 
@@ -41,21 +41,9 @@ class DynamicLeverageInput:
     profit_quality_ratio: float
     loss_probability: float
     tail_risk_score: float
-    score: float
-    min_score_required: float
-    confidence: float
     aligned_source_count: int
-    evidence_tier: str = ""
-    evidence_effective_score: float = 0.0
-    low_payoff_quality: bool = False
-    weak_history: bool = False
-    negative_local_expected: bool = False
-    symbol_profit_tier: str = "neutral"
-    quality_tier: str = "base"
-    high_quality_entry: bool = False
     atr_pct: float = 0.0
     execution_cost: dict[str, Any] = field(default_factory=dict)
-    open_positions_count: int = 0
     portfolio_exposure_pct: float = 0.0
 
 
@@ -75,6 +63,7 @@ class DynamicLeverageDecision:
     limiting_factor: str
     reasons: list[str]
     adjustments: list[dict[str, Any]]
+    policy_provenance: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +82,7 @@ class DynamicLeverageDecision:
             "limiting_factor": self.limiting_factor,
             "reasons": list(self.reasons),
             "adjustments": list(self.adjustments),
+            "policy_provenance": dict(self.policy_provenance),
         }
 
 
@@ -104,6 +94,41 @@ class DynamicLeverageAllocator:
         requested = _clamp(_safe_float(data.requested_leverage, 1.0), 1.0, float(system_max))
         reasons: list[str] = []
         adjustments: list[dict[str, Any]] = []
+        cost = data.execution_cost if isinstance(data.execution_cost, dict) else {}
+        missing_inputs: list[str] = []
+        if int(data.aligned_source_count) <= 0:
+            missing_inputs.append("authoritative_return_samples_missing")
+        if _safe_float(data.expected_net_return_pct, 0.0) <= 0:
+            missing_inputs.append("positive_fee_after_return_missing")
+        if cost.get("production_eligible") is not True:
+            missing_inputs.append("live_execution_cost_incomplete")
+        if missing_inputs:
+            fallback_reason = ",".join(missing_inputs)
+            return DynamicLeverageDecision(
+                requested_leverage=requested,
+                theoretical_leverage=1.0,
+                final_integer_leverage=1,
+                rounding_policy="floor_to_exchange_integer",
+                system_max_leverage=float(system_max),
+                risk_budget_leverage=1.0,
+                volatility_leverage=1.0,
+                liquidity_leverage=1.0,
+                signal_quality_leverage=1.0,
+                history_leverage=1.0,
+                portfolio_leverage=1.0,
+                limiting_factor="production_inputs",
+                reasons=missing_inputs,
+                adjustments=[{"factor": "fail_closed", "reasons": missing_inputs}],
+                policy_provenance={
+                    "source": "current_decision_return_cost_volatility_exposure_and_account_budget",
+                    "observation_window": "current_decision_with_active_account_state",
+                    "sample_count": max(int(data.aligned_source_count), 0),
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "strategy_version": "2026-07-12.dynamic-leverage.v2",
+                    "fallback_reason": fallback_reason,
+                    "production_eligible": False,
+                },
+            )
 
         signal_quality = self._signal_quality_leverage(data, float(system_max), adjustments)
         risk_budget = self._risk_budget_leverage(data, float(system_max), adjustments)
@@ -123,32 +148,15 @@ class DynamicLeverageAllocator:
         }
         limiting_factor, candidate_limit = min(candidates.items(), key=lambda item: item[1])
 
-        risk_tempered = (
-            data.low_payoff_quality
-            or data.negative_local_expected
-            or (data.weak_history and not data.high_quality_entry)
-            or data.tail_risk_score >= 0.82
-            or data.loss_probability >= 0.58
-        )
-        if risk_tempered:
-            theoretical = min(requested, signal_quality, candidate_limit)
-        else:
-            theoretical = min(max(requested, signal_quality), candidate_limit)
+        theoretical = min(signal_quality, candidate_limit)
         theoretical = _clamp(theoretical, 1.0, float(system_max))
-        if risk_tempered:
-            reasons.append("tempered_by_risk_flags")
         if candidate_limit < requested:
             reasons.append(f"limited_by_{limiting_factor}")
-        elif signal_quality > requested + 0.25:
-            reasons.append("lifted_by_signal_quality")
         else:
-            reasons.append("kept_near_requested_leverage")
+            reasons.append("derived_from_return_quality_and_risk_budget")
 
         rounding_policy = self._rounding_policy(data)
-        if rounding_policy == "floor_for_risk":
-            final_integer = floor(theoretical)
-        else:
-            final_integer = int(round(theoretical))
+        final_integer = floor(theoretical)
 
         integer_cap = max(1, floor(min(candidate_limit, float(system_max))))
         final_integer = max(1, min(final_integer, integer_cap, system_max))
@@ -168,6 +176,15 @@ class DynamicLeverageAllocator:
             limiting_factor=limiting_factor,
             reasons=reasons,
             adjustments=adjustments,
+            policy_provenance={
+                "source": "current_decision_return_cost_volatility_exposure_and_account_budget",
+                "observation_window": "current_decision_with_active_account_state",
+                "sample_count": max(int(data.aligned_source_count), 0),
+                "generated_at": datetime.now(UTC).isoformat(),
+                "strategy_version": "2026-07-12.dynamic-leverage.v2",
+                "fallback_reason": "",
+                "production_eligible": True,
+            },
         )
 
     def _signal_quality_leverage(
@@ -176,44 +193,30 @@ class DynamicLeverageAllocator:
         system_max: float,
         adjustments: list[dict[str, Any]],
     ) -> float:
-        score_ratio = data.score / max(data.min_score_required, 1e-9)
-        expected_component = _clamp(max(data.expected_net_return_pct, 0.0) / 2.4, 0.0, 1.0)
-        quality_component = _clamp(data.profit_quality_ratio / 1.5, 0.0, 1.0)
-        score_component = _clamp((score_ratio - 0.75) / 2.5, 0.0, 1.0)
-        probability_component = _clamp((0.68 - data.loss_probability) / 0.38, 0.0, 1.0)
-        tail_component = _clamp((0.92 - data.tail_risk_score) / 0.62, 0.0, 1.0)
-        alignment_component = _clamp(data.aligned_source_count / 4.0, 0.0, 1.0)
-        confidence_component = _clamp((data.confidence - 0.55) / 0.35, 0.0, 1.0)
-
-        quality_index = (
-            expected_component * 0.22
-            + quality_component * 0.20
-            + score_component * 0.18
-            + probability_component * 0.16
-            + tail_component * 0.12
-            + alignment_component * 0.08
-            + confidence_component * 0.04
+        positive_edge = max(data.expected_net_return_pct, 0.0)
+        expected_component = positive_edge / (positive_edge + 1.0)
+        quality = max(data.profit_quality_ratio, 0.0)
+        quality_component = quality / (quality + 1.0)
+        survival_component = (1.0 - _clamp(data.loss_probability, 0.0, 1.0)) * (
+            1.0 - _clamp(data.tail_risk_score, 0.0, 1.0)
         )
-        if data.low_payoff_quality:
-            quality_index *= 0.52
-            adjustments.append({"factor": "low_payoff_quality", "multiplier": 0.52})
-        if data.negative_local_expected:
-            quality_index *= 0.68
-            adjustments.append({"factor": "negative_local_expected", "multiplier": 0.68})
-        if data.weak_history and not data.high_quality_entry:
-            quality_index *= 0.78
-            adjustments.append({"factor": "weak_history", "multiplier": 0.78})
-        if data.evidence_tier in {"weak_conflict_probe", "degraded_missing_probe", "blocked"}:
-            quality_index *= 0.62
-            adjustments.append({"factor": f"evidence_tier:{data.evidence_tier}", "multiplier": 0.62})
-
+        components = [
+            expected_component,
+            quality_component,
+            survival_component,
+        ]
+        quality_index = 1.0
+        for component in components:
+            quality_index *= max(component, 0.0)
+        quality_index = quality_index ** (1.0 / len(components))
         leverage = 1.0 + (system_max - 1.0) * _clamp(quality_index, 0.0, 1.0)
-        if data.quality_tier in {"elite", "winner_add", "high_profit"}:
-            leverage *= 1.08
-            adjustments.append({"factor": f"quality_tier:{data.quality_tier}", "multiplier": 1.08})
-        elif data.quality_tier in {"strong_probe", "quality_override"}:
-            leverage *= 1.04
-            adjustments.append({"factor": f"quality_tier:{data.quality_tier}", "multiplier": 1.04})
+        adjustments.append(
+            {
+                "factor": "continuous_signal_quality",
+                "quality_index": round(quality_index, 6),
+                "components": [round(component, 6) for component in components],
+            }
+        )
         return _clamp(leverage, 1.0, system_max)
 
     def _risk_budget_leverage(
@@ -238,11 +241,14 @@ class DynamicLeverageAllocator:
     ) -> float:
         atr_pct = max(data.atr_pct, 0.0)
         if atr_pct <= 0:
-            adjustments.append({"factor": "volatility_missing", "leverage": system_max})
-            return system_max
-        leverage = 0.075 / max(atr_pct, 0.0025)
-        if data.tail_risk_score > 0:
-            leverage *= _clamp(1.15 - data.tail_risk_score * 0.35, 0.60, 1.10)
+            adjustments.append({"factor": "volatility_missing", "leverage": 1.0})
+            return 1.0
+        risk_distance = max(data.stress_stop_loss_pct, 0.0)
+        if risk_distance <= 0:
+            adjustments.append({"factor": "risk_distance_missing", "leverage": 1.0})
+            return 1.0
+        volatility_share = risk_distance / (risk_distance + atr_pct)
+        leverage = 1.0 + (system_max - 1.0) * volatility_share
         adjustments.append(
             {
                 "factor": "atr_volatility",
@@ -262,7 +268,6 @@ class DynamicLeverageAllocator:
         slippage = max(
             _safe_float(cost.get("slippage_pct"), 0.0),
             _safe_float(cost.get("estimated_slippage_pct"), 0.0),
-            _safe_float(cost.get("max_slippage_pct"), 0.0),
         )
         spread = max(
             _safe_float(cost.get("spread_pct"), 0.0),
@@ -274,9 +279,11 @@ class DynamicLeverageAllocator:
         )
         cost_pressure = slippage + spread + penalty
         if cost_pressure <= 0:
-            adjustments.append({"factor": "liquidity_cost_missing", "leverage": system_max})
-            return system_max
-        leverage = system_max / (1.0 + cost_pressure * 18.0)
+            adjustments.append({"factor": "liquidity_cost_missing", "leverage": 1.0})
+            return 1.0
+        positive_edge = max(data.expected_net_return_pct, 0.0)
+        cost_share = positive_edge / max(positive_edge + cost_pressure, 1e-9)
+        leverage = 1.0 + (system_max - 1.0) * cost_share
         adjustments.append(
             {
                 "factor": "liquidity_cost",
@@ -292,20 +299,14 @@ class DynamicLeverageAllocator:
         system_max: float,
         adjustments: list[dict[str, Any]],
     ) -> float:
-        multiplier = 1.0
-        if data.symbol_profit_tier in {"symbol_winner", "side_winner"}:
-            multiplier += 0.12 if data.high_quality_entry else 0.04
-        elif data.symbol_profit_tier == "side_loser":
-            multiplier -= 0.28 if not data.high_quality_entry else 0.10
-        if data.weak_history:
-            multiplier -= 0.18 if not data.high_quality_entry else 0.06
-        leverage = system_max * _clamp(multiplier, 0.45, 1.15)
+        return_quality = max(data.profit_quality_ratio, 0.0)
+        history_share = return_quality / (return_quality + 1.0)
+        leverage = 1.0 + (system_max - 1.0) * history_share
         adjustments.append(
             {
                 "factor": "symbol_history",
-                "symbol_profit_tier": data.symbol_profit_tier,
-                "weak_history": data.weak_history,
-                "multiplier": round(multiplier, 6),
+                "return_quality": round(return_quality, 6),
+                "history_share": round(history_share, 6),
                 "leverage": round(leverage, 6),
             }
         )
@@ -317,26 +318,17 @@ class DynamicLeverageAllocator:
         system_max: float,
         adjustments: list[dict[str, Any]],
     ) -> float:
-        position_pressure = max(data.open_positions_count - 4, 0) * 0.18
-        exposure_pressure = _clamp(data.portfolio_exposure_pct, 0.0, 1.5) * 0.35
-        leverage = system_max / (1.0 + position_pressure + exposure_pressure)
+        available_exposure = 1.0 - _clamp(data.portfolio_exposure_pct, 0.0, 1.0)
+        leverage = 1.0 + (system_max - 1.0) * available_exposure
         adjustments.append(
             {
                 "factor": "portfolio_pressure",
-                "open_positions_count": data.open_positions_count,
                 "portfolio_exposure_pct": round(data.portfolio_exposure_pct, 6),
+                "available_exposure": round(available_exposure, 6),
                 "leverage": round(leverage, 6),
             }
         )
         return _clamp(leverage, 1.0, system_max)
 
     def _rounding_policy(self, data: DynamicLeverageInput) -> str:
-        if (
-            data.low_payoff_quality
-            or data.negative_local_expected
-            or (data.weak_history and not data.high_quality_entry)
-            or data.tail_risk_score >= 0.82
-            or data.loss_probability >= 0.58
-        ):
-            return "floor_for_risk"
-        return "nearest_integer"
+        return "floor_to_exchange_integer"

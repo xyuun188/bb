@@ -3,21 +3,6 @@ from __future__ import annotations
 from services.execution_reason_localizer import localize_execution_reason
 
 
-def test_localize_profit_first_defensive_probe_reason() -> None:
-    reason = (
-        "Profit-First defensive probe guard: low-payoff tiny/probe entry was capped to "
-        "1x by risk budget and has too little expected profit; keep it shadow-only until "
-        "quality upgrades."
-    )
-
-    localized = localize_execution_reason(reason)
-
-    assert localized is not None
-    assert "Profit-First 防御探针拦截" in localized
-    assert "low-payoff" not in localized
-    assert "shadow-only" not in localized
-
-
 def test_localize_unknown_reason_preserves_text() -> None:
     assert localize_execution_reason("自定义中文原因") == "自定义中文原因"
 

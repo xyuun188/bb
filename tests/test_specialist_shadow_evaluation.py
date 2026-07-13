@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 from scripts import run_specialist_shadow_evaluation as runner
 from services.specialist_shadow_evaluation import (
-    ROUND_TRIP_COST_PCT,
     _regime_stability_report,
     _rolling_distribution_report,
     _walk_forward_report,
@@ -119,9 +118,14 @@ def _row(
         best_action=best_action,
         long_return_pct=long_return,
         short_return_pct=short_return,
+        horizon_minutes=10,
         feature_snapshot={
             "symbol": symbol,
             "market_regime": "trend" if index % 2 else "range",
+            "spread_pct": 0.02,
+            "taker_fee_rate": 0.0004,
+            "funding_rate": 0.0001,
+            "funding_interval_hours": 8.0,
             "local_ai_tools_shadow": local_shadow,
         },
         due_at=now,
@@ -230,9 +234,9 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
     assert model["direction_count"] == 34
     assert model["direction_hit_rate"] == 1.0
     assert model["avg_realized_return_pct"] > 0.2
-    assert model["profit_factor"] == 3.0
+    assert model["profit_factor"] is None
     assert model["authoritative_direction_aligned_count"] == 34
-    assert model["authoritative_profit_factor"] == 3.0
+    assert model["authoritative_profit_factor"] is None
     assert model["walk_forward"]["status"] == "stable"
     assert model["market_regime_stability"]["status"] == "stable"
     assert model["rolling_distribution"]["status"] == "stable"
@@ -240,7 +244,7 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
     assert model["promotion_blockers"] == []
     assert model["blockers"] == []
     assert model["blocked_reasons"] == []
-    assert model["promotion_gate"]["minimum_actual_inference_samples"] == 30
+    assert model["authoritative_return_lcb_pct"] > 0.0
     assert report["summary"]["promotion_ready_count"] == 2
     assert report["authoritative_eligible_count"] == 34
     assert report["promotion_gate"]["requires_at_least_one_promotion_ready_model"] is True
@@ -263,25 +267,23 @@ def test_specialist_shadow_evaluation_blocks_false_signal_losses() -> None:
 
     assert model["promotion_ready"] is False
     assert model["false_signal_count"] == 34
-    assert model["tail_loss_count"] == 34
-    assert model["tail_loss_symbols"] == [{"symbol": "BTC/USDT", "count": 34}]
+    assert model["tail_loss_count"] == 0
+    assert model["tail_loss_symbols"] == []
     assert model["worst_samples"][0]["symbol"] == "BTC/USDT"
     assert model["worst_samples"][0]["predicted_side"] == "long"
     assert model["worst_samples"][0]["actual_best_side"] == "short"
-    assert model["worst_samples"][0]["actual_return_pct"] == -0.37
-    assert model["promotion_gate"]["tail_loss_count"] == 34
-    assert "direction_hit_rate_below_floor" in model["promotion_blockers"]
-    assert "shadow_avg_return_after_cost_below_floor" in model["promotion_blockers"]
-    assert "shadow_tail_loss_exceeds_floor" in model["promotion_blockers"]
+    assert model["worst_samples"][0]["actual_return_pct"] < -0.25
+    assert model["shadow_return_lcb_pct"] < 0.0
+    assert "authoritative_return_distribution_missing" in model["promotion_blockers"]
+    assert "authoritative_fee_after_return_lcb_not_positive" in model["promotion_blockers"]
     assert model["blocked_reasons"] == model["promotion_blockers"]
-    assert model["blocked_reason_counts"]["shadow_tail_loss_exceeds_floor"] == 1
+    assert model["blocked_reason_counts"]["authoritative_return_distribution_missing"] == 1
     assert report["summary"]["blocked_count"] == 2
     assert {
         item["reason"] for item in report["summary"]["top_blocked_reasons"]
     } >= {
-        "direction_hit_rate_below_floor",
-        "shadow_avg_return_after_cost_below_floor",
-        "shadow_tail_loss_exceeds_floor",
+        "authoritative_return_distribution_missing",
+        "authoritative_fee_after_return_lcb_not_positive",
     }
 
 
@@ -305,15 +307,33 @@ def test_specialist_shadow_evaluation_quarantines_legacy_mixed_timeseries() -> N
     assert model["model"] == "chronos-2-shadow-primary"
     assert model["legacy_mixed_shadow_count"] == 1
     assert model["legacy_quarantined_count"] == 1
-    assert model["legacy_sequence_too_short_count"] == 1
-    assert model["sequence_too_short_count"] == 0
     assert model["actual_inference_count"] == 0
     assert model["direction_count"] == 0
     assert model["tail_loss_count"] == 0
-    assert "specialist_shadow_sample_floor_not_met" in model["promotion_blockers"]
-    assert "authoritative_trade_sample_floor_not_met" in model["promotion_blockers"]
+    assert "authoritative_return_distribution_missing" in model["promotion_blockers"]
+    assert "authoritative_fee_after_return_lcb_not_positive" in model["promotion_blockers"]
     assert "legacy_mixed_shadow_result_not_promotable" not in model["promotion_blockers"]
-    assert "timeseries_sequence_too_short_for_promotion" not in model["promotion_blockers"]
+
+
+def test_timeseries_sequence_length_is_not_a_fixed_promotion_gate() -> None:
+    row = _row(index=2)
+    tool = row.feature_snapshot["local_ai_tools_shadow"]["time_series_prediction"]
+    tool["professional_model_shadow"] = {
+        "actual_inference": True,
+        "primary_shadow_result": {
+            "model": "chronos-2-shadow-primary",
+            "actual_inference": True,
+            "expected_return_pct": 0.22,
+            "best_side": "long",
+            "sequence_length": 4,
+        },
+    }
+
+    model = summarize_specialist_shadow_evaluation([row])["models"][0]
+
+    assert model["actual_inference_count"] == 1
+    assert model["legacy_quarantined_count"] == 0
+    assert all("sequence" not in reason for reason in model["promotion_blockers"])
 
 
 def test_specialist_shadow_evaluation_skips_rows_without_shadow_evidence() -> None:
@@ -349,7 +369,7 @@ def test_specialist_shadow_evaluation_skips_rows_without_shadow_evidence() -> No
     assert report["skipped_reasons"]["not_completed"] == 1
 
 
-def test_specialist_shadow_evaluation_deducts_round_trip_cost_from_shadow_return() -> None:
+def test_specialist_shadow_evaluation_uses_per_event_execution_cost() -> None:
     report = summarize_specialist_shadow_evaluation([_row(realized=0.10)])
     model = next(
         row
@@ -357,9 +377,17 @@ def test_specialist_shadow_evaluation_deducts_round_trip_cost_from_shadow_return
         if row["model"] == "google/timesfm-2.5-200m-pytorch"
     )
 
-    assert model["avg_shadow_return_after_cost_pct"] == round(0.10 - ROUND_TRIP_COST_PCT, 6)
-    assert model["shadow_events"][0]["gross_return_pct"] == 0.10
-    assert model["shadow_events"][0]["round_trip_cost_pct"] == ROUND_TRIP_COST_PCT
+    event = model["shadow_events"][0]
+    cost = event["execution_cost"]
+    expected = (
+        0.10
+        - cost["fee_pct"]
+        - cost["slippage_pct"]
+        - cost["funding_drag_pct"]
+    )
+    assert model["avg_shadow_return_after_cost_pct"] == round(expected, 6)
+    assert event["gross_return_pct"] == 0.10
+    assert cost["production_eligible"] is True
 
 
 def test_specialist_shadow_evaluation_records_per_model_fallbacks() -> None:
@@ -398,10 +426,8 @@ def test_specialist_shadow_only_evidence_can_never_promote() -> None:
     model = report["models"][0]
 
     assert model["promotion_ready"] is False
-    assert "authoritative_trade_sample_floor_not_met" in model["promotion_blockers"]
-    assert "walk_forward_not_stable" in model["promotion_blockers"]
-    assert "market_regime_not_stable" in model["promotion_blockers"]
-    assert "rolling_distribution_not_stable" in model["promotion_blockers"]
+    assert "authoritative_return_distribution_missing" in model["promotion_blockers"]
+    assert "authoritative_fee_after_return_lcb_not_positive" in model["promotion_blockers"]
 
 
 def test_authoritative_return_is_not_assigned_to_opposite_prediction() -> None:

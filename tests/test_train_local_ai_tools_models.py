@@ -68,11 +68,12 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
                     analysis_type="market",
                     decision_action="long",
                     decision_confidence=0.7,
-                    feature_snapshot={
-                        "current_price": 100.0,
-                        "rsi_14": 53.0,
-                        "returns_1": 0.01,
-                        "unused_llm_context": {"transcript": "x" * 100_000},
+                        feature_snapshot={
+                            "current_price": 100.0,
+                            "rsi_14": 53.0,
+                            "returns_1": 0.01,
+                            "taker_fee_rate": 0.0004,
+                            "unused_llm_context": {"transcript": "x" * 100_000},
                     },
                     raw_llm_response={"unused_full_response": "x" * 100_000},
                     status="completed",
@@ -90,7 +91,11 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
                     analysis_type="market",
                     decision_action="short",
                     decision_confidence=0.6,
-                    feature_snapshot={"current_price": 10.0, "rsi_14": 47.0},
+                        feature_snapshot={
+                            "current_price": 10.0,
+                            "rsi_14": 47.0,
+                            "taker_fee_rate": 0.0004,
+                        },
                     status="completed",
                     due_at=created_at + timedelta(minutes=11),
                     horizon_minutes=10,
@@ -103,7 +108,7 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
         )
 
     try:
-        samples = await train_script._load_shadow_samples(limit=10)
+        samples = await train_script._load_shadow_samples()
     finally:
         await close_db()
 
@@ -437,7 +442,7 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
 ) -> None:
     captured: dict[str, object] = {}
 
-    async def load_shadow_samples(_limit: int) -> list[dict[str, object]]:
+    async def load_shadow_samples() -> list[dict[str, object]]:
         return [
             {
                 "id": 1,
@@ -454,7 +459,7 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
             }
         ]
 
-    async def empty_samples(_limit: int | None = None) -> list[dict[str, object]]:
+    async def empty_samples() -> list[dict[str, object]]:
         return []
 
     async def completed_shadow_count() -> int:
@@ -484,14 +489,6 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
             "train_local_ai_tools_models.py",
             "--base-url",
             "http://127.0.0.1:8001",
-            "--shadow-limit",
-            "1",
-            "--trade-limit",
-            "1",
-            "--sequence-limit",
-            "1",
-            "--text-limit",
-            "1",
         ],
     )
     monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)

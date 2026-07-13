@@ -23,7 +23,6 @@ CapacityReleaser = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], No
 CandidateSelectionAnnotator = Callable[..., dict[str, Any]]
 DecisionRawResponseMarker = Callable[[int, dict[str, Any]], Awaitable[None]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
-MarketNoOpportunityClearer = Callable[[str], None]
 CandidateExecutor = Callable[..., Awaitable[Any]]
 
 
@@ -47,7 +46,6 @@ class MarketDirectEntryProcessor:
     mark_decision_raw_response: DecisionRawResponseMarker
     mark_decision_reason: DecisionReasonMarker
     result_recorder: MarketDecisionResultRecorder
-    clear_market_no_opportunity_symbol: MarketNoOpportunityClearer
     candidate_executor: CandidateExecutor
     capacity_releaser: CapacityReleaser | None = None
     execution_confirmed_checker: Callable[[Any], bool] | None = None
@@ -108,7 +106,6 @@ class MarketDirectEntryProcessor:
             )
 
         self.capacity_reserver(model_name, executed, staged_entry_counts)
-        self.clear_market_no_opportunity_symbol(symbol)
         execution_result = await self.candidate_executor(
             symbol,
             model_name,

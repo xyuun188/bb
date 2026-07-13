@@ -45,7 +45,7 @@ def test_portfolio_profit_context_groups_and_focuses_winners() -> None:
     )
 
     assert context["active"] is True
-    assert context["threshold_usdt"] == 3.0
+    assert "threshold_usdt" not in context
     assert context["total_unrealized_pnl"] == 3.0
     assert context["total_positive_unrealized_pnl"] == 3.2
     assert context["top_groups"][0]["symbol"] == "BTC/USDT"
@@ -111,7 +111,6 @@ def test_symbol_context_falls_back_to_passed_positions_for_non_top_group() -> No
     symbol_context = _policy().symbol_context(
         {
             "active": True,
-            "threshold_usdt": 3.0,
             "total_unrealized_pnl": 5.0,
             "total_positive_unrealized_pnl": 5.0,
             "focus_groups": [],

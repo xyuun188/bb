@@ -53,7 +53,7 @@ def test_market_value_reader_supports_dicts_and_objects():
             "24小时区间",
             "price_outside_24h_range",
         ),
-        (_valid_snapshot(bid=100.0, ask=104.0), "盘口价差过大", "spread_too_wide"),
+        (_valid_snapshot(bid=101.0, ask=100.0), "盘口结构无效", "crossed_bid_ask"),
         (
             _valid_snapshot(orderbook_bid_depth=0.0, orderbook_imbalance=1.0),
             "盘口深度异常",
@@ -69,11 +69,6 @@ def test_market_value_reader_supports_dicts_and_objects():
             ),
             "短周期行情特征疑似缺失",
             "short_cycle_features_missing",
-        ),
-        (
-            _valid_snapshot(abnormal_wick_count_72h=1, abnormal_wick_max_pct=88.0),
-            "异常插针",
-            "abnormal_wick_entry_block",
         ),
     ],
 )
@@ -91,6 +86,10 @@ def test_entry_market_data_quality_policy_blocks_unusable_market_data(snapshot, 
 
 def test_entry_market_data_quality_policy_allows_consistent_market_data():
     assert EntryMarketDataQualityPolicy().reason(_valid_snapshot()) is None
+
+
+def test_wide_spread_is_priced_by_execution_cost_instead_of_fixed_data_gate():
+    assert EntryMarketDataQualityPolicy().reason(_valid_snapshot(bid=100.0, ask=104.0)) is None
 
 
 def test_entry_market_data_quality_policy_handles_reader_failures():

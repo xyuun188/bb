@@ -48,7 +48,7 @@ def test_execution_account_settings_no_allocated_balance_control() -> None:
     assert "\u5206\u914d\u8d44\u91d1 USDT" not in html
     assert "body.allocated_balance" not in script
     assert "readNumberInput(`exec-${mode}-allocated-balance`)" not in script
-    assert "\u81ea\u52a8\u4f7f\u7528 OKX" in html
+    assert "账户权益和组合敞口连续生成" in html
 
 
 def test_execution_account_ui_uses_okx_equity_pnl_not_local_trade_fallback() -> None:
@@ -234,7 +234,7 @@ def test_system_audit_model_training_distinguishes_optional_sources() -> None:
     assert "学习观察" in script
 
 
-def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
+def test_decision_detail_explains_fee_after_return_formula() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
@@ -247,12 +247,12 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     opportunity_end = script.index("function showDecisionReason", opportunity_start)
     opportunity_block = script[opportunity_start:opportunity_end]
     assert "<br>" not in opportunity_block
-    assert "function dynamicEvidenceBlock" in script
-    assert "动态证据评分" in script
-    assert "decisionMetricItem('分析信心', evidencePercentLabel(confidence)" in script
-    assert "不等于动态证据分" in script
-    assert "弱证据不是单看分析信心" in script
-    assert "AI、ML、时序、情绪、服务器盈利、影子记忆和币种历史" in script
+    assert "function opportunityScorePrimaryReturn" in script
+    assert "function opportunityScoreFormulaItems" in script
+    assert "function opportunityScoreFormulaHtml" in script
+    assert "opportunityScorePrimaryReturn(score)" in opportunity_block
+    assert "observed_not_in_formula" in script
+    assert "dynamicEvidenceBlock" not in script
     assert ".decision-score-grid" in style
     assert ".decision-score-metric" in style
     assert ".decision-score-formula" in style
@@ -271,14 +271,8 @@ def test_decision_detail_explains_dynamic_evidence_and_confidence() -> None:
     assert "width: min(1480px, calc(100vw - 28px));" in style
     assert ".modal.modal-wide .decision-score-grid" in style
     assert ".decision-score-formula-item:nth-child(4)" in style
-    assert "decision-evidence-summary" in script
-    assert "short_evidence_adjustment" in script
-    assert "做空强证据放开" in script
-    assert "做空保守修正" in script
-    assert "decision-evidence-adjustment" in script
-    assert ".decision-evidence-summary" in style
-    assert ".decision-evidence-adjustment" in style
-    assert ".decision-evidence-components" in style
+    assert "净收益拆解" in script
+    assert "只参与证据评分" in script
 
 
 def test_opening_funnel_profit_expectancy_is_not_exchange_error() -> None:
@@ -535,9 +529,9 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "renderSystemAuditNodes(data.nodes)" in script
     assert "system-audit-node-flow" in script
     assert "system-audit-node-checks" in script
-    assert "做空保守修正样本" in script
-    assert "short_conservative_adjustment_samples" in script
-    assert "short_released_adjustment_samples" in script
+    assert "做空保守修正样本" not in script
+    assert "short_conservative_adjustment_samples" not in script
+    assert "short_released_adjustment_samples" not in script
     assert "function systemAuditShadowMissedOpportunityDetails" in script
     assert (
         script.index("function systemAuditGenericDetailsHtml")
@@ -552,7 +546,9 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "Object.entries(details)" in generic_body
     assert "systemAuditShadowMissedOpportunityDetails" not in generic_body
     assert "shadow_missed_opportunity" in script
-    assert "Adopted missed opportunities" in script
+    assert "Fee-after return observations" in script
+    assert "Observed groups" in script
+    assert "cannot authorize entry" in script
     assert "Blocked reason counts" in script
     assert "系统巡检接口请求失败" in script
     assert "补历史仓位、重启服务、批量训练等动作必须人工确认" in script
@@ -609,13 +605,13 @@ def test_trading_settings_show_threshold_governance_catalog() -> None:
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
     assert "阈值治理与手动配置说明" in html
-    assert "手动硬风控上限" in html
-    assert 'id="cfg-max-position-pct"' in html
-    assert 'id="cfg-max-leverage"' in html
-    assert 'id="cfg-max-daily-loss-pct"' in html
-    assert 'id="cfg-hard-stop-loss-pct"' in html
-    assert 'id="cfg-max-open-positions-per-model"' in html
-    assert 'id="cfg-max-same-symbol-positions-per-side"' in html
+    assert "手动硬风控上限" not in html
+    assert 'id="cfg-max-position-pct"' not in html
+    assert 'id="cfg-max-leverage"' not in html
+    assert 'id="cfg-max-daily-loss-pct"' not in html
+    assert 'id="cfg-hard-stop-loss-pct"' not in html
+    assert 'id="cfg-max-open-positions-per-model"' not in html
+    assert 'id="cfg-max-same-symbol-positions-per-side"' not in html
     assert 'id="threshold-governance-summary"' in html
     assert 'id="threshold-governance-strip"' in html
     assert 'id="threshold-governance-strip-text"' in html
@@ -638,12 +634,12 @@ def test_trading_settings_show_threshold_governance_catalog() -> None:
     assert "threshold-governance-strip-text" in script
     assert "setCount('threshold-manual-count'" in script
     assert "setCount('threshold-hard-count'" in script
-    assert "body.max_position_pct = pct / 100;" in script
-    assert "body.max_leverage = leverage;" in script
-    assert "body.max_daily_loss_pct = pct / 100;" in script
-    assert "body.hard_stop_loss_pct = pct / 100;" in script
-    assert "body.max_open_positions_per_model = value;" in script
-    assert "body.max_same_symbol_positions_per_side = value;" in script
+    assert "body.max_position_pct = pct / 100;" not in script
+    assert "body.max_leverage = leverage;" not in script
+    assert "body.max_daily_loss_pct = pct / 100;" not in script
+    assert "body.hard_stop_loss_pct = pct / 100;" not in script
+    assert "body.max_open_positions_per_model = value;" not in script
+    assert "body.max_same_symbol_positions_per_side = value;" not in script
     assert "硬风险上限不会自动放松" in script
     assert "自动调度项不放进手动输入框" in script
 

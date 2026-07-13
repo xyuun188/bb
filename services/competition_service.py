@@ -18,6 +18,7 @@ from db.repositories.decision_repo import DecisionRepository
 from db.repositories.risk_repo import RiskRepository
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
+from services.return_objective import mean_confidence_lower_bound, profit_factor
 
 logger = structlog.get_logger(__name__)
 
@@ -88,27 +89,28 @@ class CompetitionService:
                         is_open=False,
                         limit=500,
                     )
-                    realized_values = [
+                    fee_after_values = [
                         float(getattr(row, "realized_pnl", 0.0) or 0.0)
+                        - max(float(getattr(row, "entry_fee", 0.0) or 0.0), 0.0)
+                        - max(float(getattr(row, "close_fee", 0.0) or 0.0), 0.0)
+                        + float(getattr(row, "funding_fee", 0.0) or 0.0)
                         for row in closed_positions
+                        if all(
+                            getattr(row, field, None) is not None
+                            for field in ("entry_fee", "close_fee", "funding_fee")
+                        )
                     ]
-                    gross_profit = sum(value for value in realized_values if value > 0)
-                    gross_loss = abs(sum(value for value in realized_values if value < 0))
-                    profit_factor = (
-                        gross_profit / gross_loss
-                        if gross_loss > 1e-12
-                        else (3.0 if gross_profit > 0 else 0.0)
+                    account_base = float(account.initial_balance or 0.0)
+                    fee_after_returns_pct = [
+                        value / account_base * 100.0
+                        for value in fee_after_values
+                        if account_base > 0.0
+                    ]
+                    return_lcb_pct = mean_confidence_lower_bound(fee_after_returns_pct)
+                    fee_after_pnl_pct = (
+                        sum(fee_after_values) / account_base if account_base > 0.0 else None
                     )
-                    profit_factor_edge = max(min((profit_factor - 1.0) / 2.0, 1.0), -1.0)
-
-                    # Fee-after return composite. Classification diagnostics
-                    # intentionally have zero ranking weight.
-                    score = (
-                        pnl_pct * 0.50
-                        + sharpe * 0.20
-                        + profit_factor_edge * 0.20
-                        - max_dd * 0.10
-                    )
+                    fee_after_profit_factor = profit_factor(fee_after_values)
 
                     rankings.append(
                         {
@@ -117,17 +119,47 @@ class CompetitionService:
                             "pnl_pct": round(pnl_pct * 100, 2),
                             "sharpe_ratio": round(sharpe, 2),
                             "max_drawdown": round(max_dd * 100, 2),
-                            "profit_factor": round(profit_factor, 4),
+                            "fee_after_realized_pnl_pct": (
+                                round(fee_after_pnl_pct * 100.0, 6)
+                                if fee_after_pnl_pct is not None
+                                else None
+                            ),
+                            "return_lcb_pct": (
+                                round(return_lcb_pct, 8)
+                                if return_lcb_pct is not None
+                                else None
+                            ),
+                            "profit_factor": (
+                                round(fee_after_profit_factor, 6)
+                                if fee_after_profit_factor is not None
+                                else None
+                            ),
+                            "cost_complete_sample_count": len(fee_after_values),
+                            "production_evidence_eligible": bool(fee_after_values),
                             "win_rate": round(win_rate * 100, 2),
                             "total_trades": total_trades,
                             "decision_accuracy": round(decision_accuracy * 100, 2),
-                            "ranking_objective": "fee_after_return_profit_factor_drawdown",
-                            "composite_score": round(score, 4),
+                            "ranking_objective": "fee_after_return_lcb_lexicographic",
                         }
                     )
 
-                # Sort by composite score descending
-                rankings.sort(key=lambda r: float(r["composite_score"]), reverse=True)
+                # Lexicographic ordering avoids policy-changing fixed blend weights.
+                # Missing cost-complete evidence sorts last instead of receiving a fallback score.
+                rankings.sort(
+                    key=lambda row: (
+                        float(row["return_lcb_pct"])
+                        if row.get("return_lcb_pct") is not None
+                        else float("-inf"),
+                        float(row["fee_after_realized_pnl_pct"])
+                        if row.get("fee_after_realized_pnl_pct") is not None
+                        else float("-inf"),
+                        float(row["profit_factor"])
+                        if row.get("profit_factor") is not None
+                        else float("-inf"),
+                        -float(row["max_drawdown"]),
+                    ),
+                    reverse=True,
+                )
                 for i, r in enumerate(rankings):
                     r["rank"] = i + 1
 
@@ -137,7 +169,11 @@ class CompetitionService:
                         {
                             "model_name": r["model_name"],
                             "total_pnl": r["total_pnl"],
-                            "pnl_pct": float(r["pnl_pct"]) / 100,
+                            "pnl_pct": (
+                                float(r["fee_after_realized_pnl_pct"]) / 100
+                                if r.get("fee_after_realized_pnl_pct") is not None
+                                else 0.0
+                            ),
                             "sharpe_ratio": r["sharpe_ratio"],
                             "max_drawdown": float(r["max_drawdown"]) / 100,
                             "win_rate": float(r["win_rate"]) / 100,

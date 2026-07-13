@@ -150,7 +150,8 @@ async def main():
     rankings = await competition_service.evaluate_all_models()
     if rankings:
         print(
-            f"  Top model: {rankings[0]['model_name']} (score: {rankings[0].get('composite_score', 0):.4f})"
+            f"  Top fee-after model observation: {rankings[0]['model_name']} "
+            f"(return LCB: {rankings[0].get('return_lcb_pct')})"
         )
 
     # Wire services to API

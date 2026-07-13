@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -292,39 +291,28 @@ async def test_dashboard_settings_threshold_catalog_governs_manual_auto_and_remo
     removed_keys = {item["key"] for item in data["removed_or_deprecated"]}
 
     assert "decision_interval_seconds" in manual_keys
-    assert "confidence_threshold" in manual_keys
+    assert "confidence_threshold" not in manual_keys
     assert "min_entry_volume_ratio" not in manual_keys
-    assert "min_entry_volume_ratio" in auto_keys
-    assert "min_entry_adx" in auto_keys
-    assert "max_leverage" in hard_keys
-    assert "max_daily_loss_pct" in hard_keys
-    assert "max_auto_trades_per_round" in removed_keys
-    assert "daily_profit_target_usdt_cny" in removed_keys
-    assert "fee.estimated_taker_fee_pct" in removed_keys
-    assert "entry_opportunity_gate.selected_side_positive_net_hard_gate" in removed_keys
-
-    confidence_item = next(
-        item for item in data["manual_editable"] if item["key"] == "confidence_threshold"
-    )
-    assert (
-        confidence_item["effective"] >= data["risk_references"]["min_entry_confidence_after_fees"]
-    )
-    assert "不会被手动调低" in confidence_item["effect"]
+    assert "min_entry_volume_ratio" not in auto_keys
+    assert "min_entry_adx" not in auto_keys
+    assert "fee_after_return_execution" in auto_keys
+    assert "dynamic_position_sizing" in auto_keys
+    assert "dynamic_leverage" in auto_keys
+    assert "dynamic_exit" in auto_keys
+    assert hard_keys == set()
+    assert removed_keys == set()
+    assert data["risk_references"] == {
+        "positive_fee_after_return_lcb": 0.0,
+        "profit_factor_unity": 1.0,
+    }
 
 
 @pytest.mark.asyncio
-async def test_dashboard_settings_updates_manual_hard_risk_thresholds(
+async def test_dashboard_settings_cannot_restore_removed_fixed_risk_thresholds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_updates: list[dict[str, Any]] = []
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
-    monkeypatch.setattr(settings, "max_position_pct", 0.25)
-    monkeypatch.setattr(settings, "max_leverage", 20.0)
-    monkeypatch.setattr(settings, "max_daily_loss_pct", 0.05)
-    monkeypatch.setattr(settings, "hard_stop_loss_pct", 0.05)
-    monkeypatch.setattr(settings, "max_open_positions_per_model", 20)
-    monkeypatch.setattr(settings, "max_same_symbol_positions_per_side", 2)
-
     def capture_update_env_file(self: object, updates: dict[str, Any]) -> None:
         captured_updates.append(updates)
 
@@ -347,58 +335,42 @@ async def test_dashboard_settings_updates_manual_hard_risk_thresholds(
 
     assert response.status_code == 200
     data = response.json()
-    assert data["max_position_pct"] == 0.12
-    assert data["max_leverage"] == 7.5
-    assert data["max_daily_loss_pct"] == 0.03
-    assert data["hard_stop_loss_pct"] == 0.04
-    assert data["max_open_positions_per_model"] == 12
-    assert data["max_same_symbol_positions_per_side"] == 3
-    assert settings.max_position_pct == 0.12
-    assert settings.max_leverage == 7.5
-    assert settings.max_daily_loss_pct == 0.03
-    assert settings.hard_stop_loss_pct == 0.04
-    assert settings.max_open_positions_per_model == 12
-    assert settings.max_same_symbol_positions_per_side == 3
-    assert captured_updates
-    assert captured_updates[-1]["MAX_POSITION_PCT"] == "0.12"
-    assert captured_updates[-1]["MAX_LEVERAGE"] == "7.5"
-    assert captured_updates[-1]["MAX_DAILY_LOSS_PCT"] == "0.03"
-    assert captured_updates[-1]["HARD_STOP_LOSS_PCT"] == "0.04"
-    assert captured_updates[-1]["MAX_OPEN_POSITIONS_PER_MODEL"] == "12"
-    assert captured_updates[-1]["MAX_SAME_SYMBOL_POSITIONS_PER_SIDE"] == "3"
+    for key in (
+        "max_position_pct",
+        "max_leverage",
+        "max_daily_loss_pct",
+        "hard_stop_loss_pct",
+        "max_open_positions_per_model",
+        "max_same_symbol_positions_per_side",
+    ):
+        assert key not in data
+        assert not hasattr(settings, key)
+    assert captured_updates == []
 
 
 @pytest.mark.asyncio
-async def test_execution_account_update_ignores_legacy_allocated_balance(
+async def test_execution_account_update_only_persists_display_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_updates: list[dict[str, Any]] = []
-    original_balances = dict(settings.execution_account_balances)
-
     async def fake_status(mode: str) -> dict[str, Any]:
         return settings.get_execution_account_config(mode)
 
     def capture_update_env_file(self: object, updates: dict[str, Any]) -> None:
         captured_updates.append(updates)
 
-    monkeypatch.setattr(settings, "execution_account_balances", original_balances)
     monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
     monkeypatch.setattr(settings_api_module, "_execution_account_status", fake_status)
 
     response = await settings_api_module.update_execution_account_settings(
         settings_api_module.ExecutionAccountRequest(
-            mode="paper",
-            allocated_balance=321.5,
-            max_loss_pct=0.25,
+            account_name="return account",
         )
     )
 
     assert response["status"] == "ok"
-    assert settings.execution_account_balances == original_balances
     assert captured_updates
-    assert "EXECUTION_ACCOUNT_BALANCES" not in captured_updates[-1]
-    persisted = json.loads(captured_updates[-1]["EXECUTION_ACCOUNT_MAX_LOSS_PCT"])
-    assert persisted["paper"] == 0.25
+    assert captured_updates[-1] == {"EXECUTION_ACCOUNT_NAME": "return account"}
 
 
 @pytest.mark.asyncio
@@ -906,9 +878,6 @@ async def test_dashboard_mode_switch_requires_configured_okx_account(
         "okx_live_api_key",
         "okx_live_api_secret",
         "okx_live_passphrase",
-        "okx_api_key",
-        "okx_api_secret",
-        "okx_passphrase",
     ):
         monkeypatch.setattr(settings, field, "")
     app = create_app()

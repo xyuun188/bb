@@ -22,7 +22,6 @@ STATIC_SECRET_KEYS: dict[str, str] = {
     "okx.live.api_key": "okx_live_api_key",
     "okx.live.api_secret": "okx_live_api_secret",
     "okx.live.passphrase": "okx_live_passphrase",
-    "ai.api_key": "ai_api_key",
     "local_ai_tools.api_key": "local_ai_tools_api_key",
     "high_risk_review.api_key": "high_risk_review_api_key",
     "data_collection.cryptopanic_api_key": "cryptopanic_api_key",

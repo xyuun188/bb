@@ -31,7 +31,6 @@ from core.model_runtime import (
 )
 from core.safe_output import safe_error_text
 from core.secret_utils import secret_fingerprint
-from services.runtime_entry_filters import entry_filters_from_context
 
 logger = structlog.get_logger(__name__)
 
@@ -157,7 +156,7 @@ class CrossValidator:
                         "expert_pair": [source_name, target_name],
                         "question": question,
                         "consistency": "neutral",
-                        "confidence_adjustment": -10,
+                        "production_permission": False,
                         "conflict_note": f"{self._expert_label(target_name)} 本轮没有返回，无法完成这次交叉验证。",
                         "validation_note": f"{self._expert_label(target_name)} 本轮没有返回，无法回答这个核实问题。",
                         "checked_evidence": [],
@@ -258,60 +257,32 @@ class CrossValidator:
 
         if source_dir and target_dir and source_dir == target_dir:
             consistency = "aligned"
-            adjustment = 10
             note = None
         elif source_dir and target_dir and source_dir != target_dir:
             consistency = "divergent"
-            high_conflict = source.confidence >= 0.60 and target.confidence >= 0.60
-            adjustment = -40 if high_conflict else -25
             note = validation_note
         elif question_result == "supports" and source_dir:
             consistency = "aligned"
-            adjustment = 6
             note = None
         elif question_result == "challenges" and source_dir:
             consistency = "divergent"
-            adjustment = -25 if target.confidence >= 0.55 else -15
             note = validation_note
         else:
             consistency = "neutral"
-            # Neutral means the target expert did not provide enough evidence
-            # to confirm or refute the request. It should be displayed and
-            # handled as information only, not as a hidden penalty.
-            adjustment = 0
             note = None
 
         return {
             "expert_pair": [source_name, target_name],
             "question": question,
             "consistency": consistency,
-            "confidence_adjustment": max(min(adjustment, 50), -50),
+            "production_permission": False,
             "conflict_note": note,
             "validation_note": validation_note,
             "checked_evidence": checked_evidence,
             "needs_resolution": consistency == "divergent",
-            "major_conflict": self._is_major_conflict(source, target, consistency, adjustment),
+            "major_conflict": consistency == "divergent",
             "validation_status": "completed",
         }
-
-    def _is_major_conflict(
-        self,
-        source: DecisionOutput,
-        target: DecisionOutput,
-        consistency: str,
-        adjustment: int,
-    ) -> bool:
-        if consistency != "divergent":
-            return False
-        if adjustment <= -40:
-            return True
-        source_dir = ACTION_DIRECTION.get(source.action, 0)
-        target_dir = ACTION_DIRECTION.get(target.action, 0)
-        return (
-            bool(source_dir and target_dir and source_dir != target_dir)
-            and source.confidence >= 0.62
-            and target.confidence >= 0.62
-        )
 
     def _question_result(
         self,
@@ -320,78 +291,14 @@ class CrossValidator:
         target_name: str,
         question: str,
     ) -> str:
-        """Return whether target evidence supports or challenges the source concern."""
-        q = str(question or "")
-        snapshot = target.feature_snapshot or source.feature_snapshot or {}
+        """Describe expert agreement without creating a rule-based authorization path."""
+
+        del target_name, question
         source_dir = ACTION_DIRECTION.get(source.action, 0)
         target_dir = ACTION_DIRECTION.get(target.action, 0)
-        entry_filters = entry_filters_from_context(snapshot)
-
-        if source_dir and target_dir:
-            return "supports" if source_dir == target_dir else "challenges"
-
-        if target_name == "sentiment_expert":
-            news = float(snapshot.get("news_sentiment_avg") or 0.0)
-            social = float(snapshot.get("social_sentiment_avg") or 0.0)
-            mentions = int(float(snapshot.get("social_mention_count") or 0.0))
-            if abs(news) < 0.05 and abs(social) < 0.05 and mentions <= 0:
-                return "neutral"
-            if source_dir > 0 and news + social > 0.25:
-                return "supports"
-            if source_dir < 0 and news + social < -0.25:
-                return "supports"
-            return "challenges"
-
-        if any(word in q for word in ("成交量", "量能", "放量", "流动性", "假突破")):
-            volume_ratio = float(snapshot.get("volume_ratio") or 0.0)
-            if volume_ratio >= 1.2:
-                return "supports"
-            if volume_ratio < entry_filters.min_entry_volume_ratio:
-                return "challenges"
+        if not source_dir or not target_dir:
             return "neutral"
-
-        if any(word in q for word in ("趋势", "破位", "突破", "支撑", "压力", "均线", "MACD")):
-            adx = float(snapshot.get("adx_14") or 0.0)
-            macd = float(snapshot.get("macd_diff") or 0.0)
-            sma20 = float(snapshot.get("price_vs_sma20") or 0.0)
-            sma50 = float(snapshot.get("price_vs_sma50") or 0.0)
-            if source_dir > 0:
-                if adx >= entry_filters.min_entry_adx and macd >= 0 and sma20 > 0 and sma50 > 0:
-                    return "supports"
-                if sma20 <= 0 or sma50 <= 0:
-                    return "challenges"
-            if source_dir < 0:
-                if adx >= entry_filters.min_entry_adx and macd <= 0 and sma20 < 0 and sma50 < 0:
-                    return "supports"
-                if sma20 >= 0 or sma50 >= 0:
-                    return "challenges"
-            return "neutral"
-
-        if any(
-            word in q for word in ("风险", "止损", "波动", "回撤", "滑点", "过热", "插针", "尾部")
-        ):
-            volume_ratio = float(snapshot.get("volume_ratio") or 0.0)
-            volatility = float(snapshot.get("volatility_20") or 0.0)
-            day_change = abs(float(snapshot.get("change_24h_pct") or 0.0))
-            abnormal_wick_count = int(float(snapshot.get("abnormal_wick_count_72h") or 0.0))
-            abnormal_wick_max = float(snapshot.get("abnormal_wick_max_pct") or 0.0)
-            abnormal_wick_recent = float(snapshot.get("abnormal_wick_recent_hours") or 9999.0)
-            if (
-                volume_ratio < entry_filters.min_entry_volume_ratio
-                or volatility > 0.08
-                or day_change > 18
-                or (
-                    abnormal_wick_count > 0
-                    and abnormal_wick_max >= 80
-                    and abnormal_wick_recent <= 96
-                )
-            ):
-                return "challenges"
-            return "neutral"
-
-        if target.action == Action.HOLD:
-            return "neutral"
-        return "supports" if target_dir == source_dir else "neutral"
+        return "supports" if source_dir == target_dir else "challenges"
 
     def _validation_note(
         self,
@@ -488,9 +395,9 @@ class CrossValidator:
             retries: int = 1,
             source: str = "primary",
         ) -> None:
-            api_base = (api_base or settings.ai_api_base or "").strip()
+            api_base = (api_base or "").strip()
             api_key = (api_key or "").strip()
-            model = (model or settings.ai_model or "").strip()
+            model = (model or "").strip()
             if not api_key or not model:
                 return
             identity = (api_base, model, secret_fingerprint(api_key))
@@ -513,9 +420,9 @@ class CrossValidator:
         add_candidate(
             name="trend_expert",
             label="行情方向专家",
-            api_base=trend_cfg.get("api_base") or settings.ai_api_base,
-            api_key=trend_cfg.get("api_key") or settings.ai_api_key,
-            model=trend_cfg.get("model") or settings.ai_model,
+            api_base=trend_cfg.get("api_base") or "",
+            api_key=trend_cfg.get("api_key") or "",
+            model=trend_cfg.get("model") or "",
             retries=1,
             source="primary",
         )
@@ -525,7 +432,7 @@ class CrossValidator:
                 name="high_risk_review",
                 label="High-risk review model",
                 api_base=settings.high_risk_review_api_base,
-                api_key=settings.high_risk_review_api_key or settings.ai_api_key,
+                api_key=settings.high_risk_review_api_key,
                 model=settings.high_risk_review_model,
                 retries=1,
                 source="high_risk_review",
@@ -535,16 +442,16 @@ class CrossValidator:
         add_candidate(
             name=DECISION_MAKER_NAME,
             label=decision_cfg.get("label") or "最终交易员",
-            api_base=decision_cfg.get("api_base") or settings.ai_api_base,
-            api_key=decision_cfg.get("api_key") or settings.ai_api_key,
-            model=decision_cfg.get("model") or settings.ai_model,
+            api_base=decision_cfg.get("api_base") or "",
+            api_key=decision_cfg.get("api_key") or "",
+            model=decision_cfg.get("model") or "",
             retries=1,
             source="decision_maker",
         )
 
-        primary_api_base = trend_cfg.get("api_base") or settings.ai_api_base
-        primary_api_key = trend_cfg.get("api_key") or settings.ai_api_key
-        primary_model = str(trend_cfg.get("model") or settings.ai_model or "").strip()
+        primary_api_base = trend_cfg.get("api_base") or ""
+        primary_api_key = trend_cfg.get("api_key") or ""
+        primary_model = str(trend_cfg.get("model") or "").strip()
         if _is_local_qwen3_trade_model(primary_model):
             for candidate in candidates:
                 candidate.pop("_identity", None)
@@ -670,7 +577,7 @@ class CrossValidator:
 
         trend_cfg = self._fixed_model_cfg("trend_expert")
         candidates = self._consultation_candidates(trend_cfg)
-        primary_model = str(trend_cfg.get("model") or settings.ai_model or "").strip()
+        primary_model = str(trend_cfg.get("model") or "").strip()
         if not candidates:
             return {
                 "model": primary_model,
@@ -698,9 +605,8 @@ class CrossValidator:
                 content=(
                     "你是行情方向专家，也是本轮加密合约交易会诊主持人。"
                     "只处理 listed major_conflicts 中的专家矛盾，结论必须简洁中文。"
-                    "只返回严格 JSON，字段为："
-                    "recommended_action, confidence_adjustment (-50..50), conflict_note, should_trade。"
-                    "conflict_note 必须用中文说明是否继续交易以及原因。"
+                    "只返回严格 JSON，字段为 conflict_note, observation_summary。"
+                    "结论仅用于解释专家分歧，不得给出交易许可、仓位或杠杆调整。"
                 )
             ),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
@@ -775,21 +681,13 @@ class CrossValidator:
                     parsed["major_conflicts"] = major
                     parsed["consultation_attempts"] = attempts
                     parsed["fallback_used"] = candidate.get("source") != "primary" or attempt_no > 1
-                    parsed["should_trade"] = self._as_bool(parsed.get("should_trade"))
-                    if parsed["should_trade"] is None:
-                        action = str(parsed.get("recommended_action") or "").strip().lower()
-                        parsed["should_trade"] = action not in {
-                            "hold",
-                            "no_trade",
-                            "skip",
-                            "观望",
-                            "不交易",
-                        }
-                    try:
-                        adjustment = float(parsed.get("confidence_adjustment", 0) or 0)
-                        parsed["confidence_adjustment"] = max(min(adjustment, 50), -50)
-                    except (TypeError, ValueError):
-                        parsed["confidence_adjustment"] = 0
+                    for forbidden in (
+                        "recommended_action",
+                        "confidence_adjustment",
+                        "should_trade",
+                    ):
+                        parsed.pop(forbidden, None)
+                    parsed["production_permission"] = False
                     return parsed
                 except Exception as exc:
                     error_text = safe_error_text(exc)
@@ -839,18 +737,16 @@ class CrossValidator:
         raw_content: str | None = None,
         attempts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Use a conservative structured result when the LLM cannot return JSON."""
-        note = f"{reason}，系统已按保守规则处理：重大矛盾未解除，本轮不新增开仓。"
+        """Return an observation-only failure record."""
+        note = f"{reason}，重大分歧未能完成观察性复核。"
         result = {
             "model": model,
             "consultation_expert": "trend_expert",
             "consultation_expert_label": "行情方向专家",
             "status": "failed",
             "fallback": True,
-            "recommended_action": "hold",
-            "confidence_adjustment": -25,
             "conflict_note": note,
-            "should_trade": False,
+            "production_permission": False,
             "major_conflicts": major,
             "consultation_attempts": attempts or [],
         }
@@ -861,17 +757,6 @@ class CrossValidator:
     def _shorten(self, text: str, limit: int = 220) -> str:
         clean = " ".join(str(text or "").split())
         return clean[:limit]
-
-    def _as_bool(self, value: Any) -> bool | None:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"true", "yes", "1", "trade"}:
-                return True
-            if normalized in {"false", "no", "0", "hold", "skip"}:
-                return False
-        return None
 
     def _expert_label(self, name: str) -> str:
         labels = {

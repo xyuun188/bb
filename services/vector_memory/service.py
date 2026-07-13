@@ -188,7 +188,6 @@ class VectorMemoryService:
                 "status": "disabled",
                 "document_count": 0,
                 "configured_backend": settings.vector_memory_backend,
-                "min_score": float(settings.vector_memory_min_score),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
                 "phase3_policy": "old_vector_index_excluded_from_clean_training",
@@ -209,7 +208,6 @@ class VectorMemoryService:
                 "status": "ready",
                 "document_count": document_count,
                 "configured_backend": settings.vector_memory_backend,
-                "min_score": float(settings.vector_memory_min_score),
                 "path": stats.get("path"),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
@@ -231,7 +229,6 @@ class VectorMemoryService:
                         "status": "ready",
                         "document_count": document_count,
                         "configured_backend": settings.vector_memory_backend,
-                        "min_score": float(settings.vector_memory_min_score),
                         "path": stats.get("path"),
                         "last_reindex_at": _iso(self._last_reindex_at),
                         "last_error": "",
@@ -250,7 +247,6 @@ class VectorMemoryService:
                 "status": "error",
                 "document_count": 0,
                 "configured_backend": settings.vector_memory_backend,
-                "min_score": float(settings.vector_memory_min_score),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
                 "phase3_policy": "old_vector_index_excluded_from_clean_training",
@@ -328,7 +324,6 @@ class VectorMemoryService:
         top_k: int = 8,
         symbol: str = "",
         kind: str = "",
-        min_score: float | None = None,
     ) -> dict[str, Any]:
         """Search vector memory for similar records."""
 
@@ -356,36 +351,26 @@ class VectorMemoryService:
                     exc = retry_exc
                 else:
                     self._last_error = ""
-                    threshold = (
-                        float(settings.vector_memory_min_score)
-                        if min_score is None
-                        else float(min_score)
-                    )
-                    filtered = [hit for hit in hits if hit.score >= threshold]
                     return {
                         "enabled": True,
                         "status": "ok",
                         "backend": self._get_store().backend_name,
                         "hits": [
                             _hit_payload(hit)
-                            for hit in filtered[: max(int(top_k or 8), 1)]
+                            for hit in hits[: max(int(top_k or 8), 1)]
                         ],
-                        "min_score": threshold,
+                        "selection_policy": "similarity_ranked_top_k_without_fixed_score_gate",
                         "store_recovered": True,
                     }
             self._last_error = safe_error_text(exc, limit=180)
             logger.warning("vector memory search failed", error=self._last_error)
             return {"enabled": True, "status": "error", "error": self._last_error, "hits": []}
-        threshold = (
-            float(settings.vector_memory_min_score) if min_score is None else float(min_score)
-        )
-        filtered = [hit for hit in hits if hit.score >= threshold]
         return {
             "enabled": True,
             "status": "ok",
             "backend": self._get_store().backend_name,
-            "hits": [_hit_payload(hit) for hit in filtered[: max(int(top_k or 8), 1)]],
-            "min_score": threshold,
+            "hits": [_hit_payload(hit) for hit in hits[: max(int(top_k or 8), 1)]],
+            "selection_policy": "similarity_ranked_top_k_without_fixed_score_gate",
         }
 
     def ensure_fresh_index(self, *, reason: str = "") -> None:
@@ -497,7 +482,6 @@ class VectorMemoryService:
             query,
             top_k=6,
             symbol=_normalize_symbol(decision.symbol),
-            min_score=float(settings.vector_memory_min_score),
         )
         result["query_summary"] = query[:320]
         result["influence"] = _influence_payload(
@@ -711,66 +695,38 @@ def _hit_payload(hit: VectorMemoryHit) -> dict[str, Any]:
 
 
 def _influence_payload(hits: list[dict[str, Any]], *, action: str) -> dict[str, Any]:
-    """Explain how Phase 3 similar samples should influence this decision."""
+    """Return similar-outcome facts without changing production scores."""
 
-    if not hits:
-        return {
-            "score_delta": 0.0,
-            "level": "neutral",
-            "label": "未命中三期相似样本",
-            "reason": "没有足够相似的三期新样本，本次不调整策略评分。",
-            "matched_count": 0,
-            "loss_count": 0,
-            "profit_count": 0,
-        }
-    normalized_action = str(action or "").lower()
-    weighted = 0.0
-    weight_total = 0.0
+    del action
     loss_count = 0
     profit_count = 0
-    same_action_loss_count = 0
+    realized_values: list[float] = []
     for hit in hits:
-        score = max(float(hit.get("score") or 0.0), 0.0)
         pnl = hit.get("pnl_pct")
         try:
             pnl_value = float(pnl)
         except (TypeError, ValueError):
             continue
+        realized_values.append(pnl_value)
         if pnl_value < 0:
             loss_count += 1
         elif pnl_value > 0:
             profit_count += 1
-        same_action = (
-            normalized_action and str(hit.get("action") or "").lower() == normalized_action
-        )
-        if same_action and pnl_value < 0:
-            same_action_loss_count += 1
-        direction = 1.0 if pnl_value > 0 else -1.0 if pnl_value < 0 else 0.0
-        action_multiplier = 1.25 if same_action else 0.75
-        weighted += direction * score * action_multiplier
-        weight_total += score * action_multiplier
-    ratio = weighted / weight_total if weight_total > 0 else 0.0
-    score_delta = round(max(min(ratio * 8.0, 6.0), -6.0), 2)
-    if same_action_loss_count >= 2 or score_delta <= -2.5:
-        level = "negative"
-        label = "三期相似样本偏负向"
-        reason = "三期相似样本亏损较多，建议降低仓位或要求更强证据，不作为硬拦截。"
-    elif score_delta >= 2.5:
-        level = "positive"
-        label = "三期相似样本偏正向"
-        reason = "三期相似样本盈利占优，可作为轻量加分，但仍需服从实时风控和收益评估。"
-    else:
-        level = "neutral"
-        label = "三期相似样本中性"
-        reason = "三期相似样本结果分化，本次仅作解释参考，不明显调整评分。"
     return {
-        "score_delta": score_delta,
-        "level": level,
-        "label": label,
-        "reason": reason,
+        "score_delta": 0.0,
+        "level": "observation_only",
+        "label": "三期相似结果观察",
+        "reason": "相似记忆仅展示已实现结果，不改变方向、评分、仓位或执行权限。",
         "matched_count": len(hits),
+        "realized_outcome_count": len(realized_values),
+        "realized_pnl_pct_sum": round(sum(realized_values), 8),
+        "realized_pnl_pct_mean": (
+            round(sum(realized_values) / len(realized_values), 8)
+            if realized_values
+            else None
+        ),
         "loss_count": loss_count,
         "profit_count": profit_count,
-        "same_action_loss_count": same_action_loss_count,
         "is_hard_gate": False,
+        "production_permission": False,
     }

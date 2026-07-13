@@ -40,8 +40,6 @@ def render_service(
     remote_app_dir: str = REMOTE_APP_DIR,
     owner: str = REMOTE_OWNER,
     observation_hours: int = 2,
-    min_created_shadow_samples: int = 5,
-    min_completed_shadow_samples: int = 1,
     report_max_age_seconds: int = 7200,
 ) -> str:
     user, group = _owner_parts(owner)
@@ -57,7 +55,7 @@ Group={group}
 WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
-ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_paper_resume_observation.py --observation-hours {int(observation_hours)} --min-created-shadow-samples {int(min_created_shadow_samples)} --min-completed-shadow-samples {int(min_completed_shadow_samples)} --report-max-age-seconds {int(report_max_age_seconds)} --json-indent 0'
+ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_paper_resume_observation.py --observation-hours {int(observation_hours)} --report-max-age-seconds {int(report_max_age_seconds)} --json-indent 0'
 """
 
 
@@ -82,8 +80,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--owner", default=REMOTE_OWNER)
     parser.add_argument("--on-calendar", default=DEFAULT_ON_CALENDAR)
     parser.add_argument("--observation-hours", type=int, default=2)
-    parser.add_argument("--min-created-shadow-samples", type=int, default=5)
-    parser.add_argument("--min-completed-shadow-samples", type=int, default=1)
     parser.add_argument("--report-max-age-seconds", type=int, default=7200)
     parser.add_argument("--run-now", action="store_true", help="Start the oneshot once after install.")
     parser.add_argument("--dry-run", action="store_true")
@@ -106,8 +102,6 @@ def install_timer(
     owner: str = REMOTE_OWNER,
     on_calendar: str = DEFAULT_ON_CALENDAR,
     observation_hours: int = 2,
-    min_created_shadow_samples: int = 5,
-    min_completed_shadow_samples: int = 1,
     report_max_age_seconds: int = 7200,
     run_now: bool = False,
     dry_run: bool = False,
@@ -116,8 +110,6 @@ def install_timer(
         remote_app_dir=remote_app_dir,
         owner=owner,
         observation_hours=observation_hours,
-        min_created_shadow_samples=min_created_shadow_samples,
-        min_completed_shadow_samples=min_completed_shadow_samples,
         report_max_age_seconds=report_max_age_seconds,
     )
     timer = render_timer(on_calendar=on_calendar)
@@ -152,8 +144,8 @@ def install_timer(
             timeout=60,
             check=True,
         )
-        staged_service = f"/tmp/{SERVICE_NAME}"
-        staged_timer = f"/tmp/{TIMER_NAME}"
+        staged_service = f"/tmp/{SERVICE_NAME}"  # noqa: S108
+        staged_timer = f"/tmp/{TIMER_NAME}"  # noqa: S108
         _upload_text(ssh, staged_service, service)
         _upload_text(ssh, staged_timer, timer)
         commands = [
@@ -180,8 +172,6 @@ def main(argv: list[str] | None = None) -> int:
         owner=args.owner,
         on_calendar=args.on_calendar,
         observation_hours=max(int(args.observation_hours or 1), 1),
-        min_created_shadow_samples=max(int(args.min_created_shadow_samples or 0), 0),
-        min_completed_shadow_samples=max(int(args.min_completed_shadow_samples or 0), 0),
         report_max_age_seconds=max(int(args.report_max_age_seconds or 60), 60),
         run_now=bool(args.run_now),
         dry_run=bool(args.dry_run),

@@ -327,7 +327,7 @@ class TradingAgentSkillBook:
             name="server_profit_model",
             label="服务器盈利预测",
             status=status,
-            decision=side if side in {"long", "short"} else "neutral",
+            decision=side if available and side in {"long", "short"} else "neutral",
             confidence=self._first_number(profit, "confidence", "score"),
             reason=reason,
             data=self._compact(
@@ -384,7 +384,7 @@ class TradingAgentSkillBook:
                 if available and expected is not None and expected > 0
                 else ("warning" if available else "unavailable")
             ),
-            decision=side if side in {"long", "short"} else "neutral",
+            decision=side if available and side in {"long", "short"} else "neutral",
             confidence=self._first_number(series, "confidence", "score"),
             reason=(
                 f"时序模型倾向 {side or '中性'}，预期变化 {expected:.4f}%."
@@ -436,12 +436,9 @@ class TradingAgentSkillBook:
             name="sentiment_model",
             label="情绪预测",
             status=(
-                "supported"
-                if available
-                and (score is not None and abs(score) >= 0.05 or side in {"long", "short"})
-                else ("warning" if available else "unavailable")
+                "supported" if available else "unavailable"
             ),
-            decision=side if side in {"long", "short"} else "neutral",
+            decision="neutral",
             confidence=self._first_number(sentiment, "confidence"),
             reason=(
                 f"情绪模型倾向 {side or '中性'}，情绪分 {score:.3f}."
@@ -597,7 +594,6 @@ class TradingAgentSkillBook:
     ) -> SkillResult:
         regime = market_regime if isinstance(market_regime, dict) else {}
         strategy = strategy_mode if isinstance(strategy_mode, dict) else {}
-        blocked = strategy.get("blocked_directions") or []
         return SkillResult(
             name="market_regime_filter",
             label="整体行情方向过滤",
@@ -612,20 +608,16 @@ class TradingAgentSkillBook:
             )[:260],
             data={
                 "regime": self._compact(
-                    regime, ["mode", "confidence", "avoid_long", "avoid_short", "reason"]
+                    regime, ["mode", "confidence", "reason"]
                 ),
                 "strategy": self._compact(
                     strategy,
                     [
                         "strategy",
                         "posture",
-                        "allow_long",
-                        "allow_short",
-                        "blocked_directions",
                         "reason",
                     ],
                 ),
-                "blocked_directions": blocked,
             },
         )
 

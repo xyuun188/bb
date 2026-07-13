@@ -25,7 +25,6 @@ from core.trading_mode import mode_manager
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
-from models.decision import AIDecision
 from models.learning import TradeReflection
 from models.trade import Order, Position
 from services.exchange_position_state import parse_exchange_position_snapshot
@@ -122,79 +121,6 @@ def _merge_exchange_order_ids(*values: Any, max_length: int = 500) -> str:
     return ",".join(merged)
 
 
-def _decision_profit_first_metadata(decision: AIDecision | None) -> dict[str, Any]:
-    if decision is None:
-        return {}
-    raw = _dict_value(getattr(decision, "raw_llm_response", None))
-    trade_plan = _dict_value(raw.get("profit_first_trade_plan"))
-    exit_plan = _dict_value(raw.get("profit_first_exit_plan"))
-    binding = _dict_value(raw.get("profit_first_entry_exit_binding"))
-    exit_plan_id = ""
-    for value in (
-        raw.get("profit_first_exit_plan_id"),
-        exit_plan.get("exit_plan_id"),
-        trade_plan.get("exit_plan_id"),
-        binding.get("exit_plan_id"),
-        raw.get("exit_plan_id"),
-    ):
-        text = str(value or "").strip()
-        if text:
-            exit_plan_id = text
-            break
-    if not exit_plan_id and not trade_plan and not exit_plan:
-        return {}
-    return {
-        "profit_first_trade_plan": trade_plan,
-        "profit_first_exit_plan": exit_plan,
-        "profit_first_exit_plan_id": exit_plan_id,
-    }
-
-
-def _build_local_position_profit_first_metadata(
-    positions: list[Position],
-    *,
-    orders_by_exchange_id: dict[str, Order],
-    decisions_by_id: dict[int, AIDecision],
-) -> dict[int, dict[str, Any]]:
-    metadata_by_position_id: dict[int, dict[str, Any]] = {}
-    for position in positions:
-        position_id = getattr(position, "id", None)
-        if position_id is None:
-            continue
-        entry_order_ids = _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
-        if not entry_order_ids:
-            continue
-
-        entry_legs: list[dict[str, Any]] = []
-        plan_ids: dict[str, dict[str, Any]] = {}
-        for entry_order_id in entry_order_ids:
-            leg: dict[str, Any] = {"exchange_order_id": entry_order_id}
-            order = orders_by_exchange_id.get(entry_order_id)
-            decision_id = int(getattr(order, "decision_id", 0) or 0) if order is not None else 0
-            metadata = _decision_profit_first_metadata(decisions_by_id.get(decision_id))
-            exit_plan_id = str(metadata.get("profit_first_exit_plan_id") or "").strip()
-            if exit_plan_id:
-                leg["profit_first_exit_plan_id"] = exit_plan_id
-                plan_ids.setdefault(exit_plan_id, metadata)
-            entry_legs.append(leg)
-
-        position_metadata: dict[str, Any] = {
-            "entry_exchange_order_id": _merge_exchange_order_ids(*entry_order_ids),
-            "entry_legs": entry_legs,
-        }
-        if len(plan_ids) == 1:
-            only_exit_plan_id, only_metadata = next(iter(plan_ids.items()))
-            position_metadata["profit_first_exit_plan_id"] = only_exit_plan_id
-            position_metadata["profit_first_trade_plan"] = _dict_value(
-                only_metadata.get("profit_first_trade_plan")
-            )
-            position_metadata["profit_first_exit_plan"] = _dict_value(
-                only_metadata.get("profit_first_exit_plan")
-            )
-        metadata_by_position_id[int(position_id)] = position_metadata
-    return metadata_by_position_id
-
-
 def _merge_entry_legs(*values: Any) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen_order_ids: set[str] = set()
@@ -208,20 +134,6 @@ def _merge_entry_legs(*values: Any) -> list[dict[str, Any]]:
                 seen_order_ids.add(order_id)
             merged.append(dict(leg))
     return merged
-
-
-def _position_unique_exit_plan_ids(position: dict[str, Any]) -> set[str]:
-    plan_ids: set[str] = set()
-    top_level = str(position.get("profit_first_exit_plan_id") or "").strip()
-    if top_level:
-        plan_ids.add(top_level)
-    for leg in _list_of_dicts(position.get("entry_legs")):
-        leg_plan_id = str(
-            leg.get("profit_first_exit_plan_id") or leg.get("exit_plan_id") or ""
-        ).strip()
-        if leg_plan_id:
-            plan_ids.add(leg_plan_id)
-    return plan_ids
 
 
 def _merge_created_at(left: Any, right: Any) -> Any:
@@ -273,38 +185,6 @@ def _merge_local_position_candidates(
             candidate.get("entry_legs"),
         )
 
-    unique_exit_plan_ids = set()
-    for candidate in scoped_candidates:
-        unique_exit_plan_ids.update(_position_unique_exit_plan_ids(candidate))
-    if len(unique_exit_plan_ids) == 1:
-        only_exit_plan_id = next(iter(unique_exit_plan_ids))
-        merged["profit_first_exit_plan_id"] = only_exit_plan_id
-        if not _dict_value(merged.get("profit_first_trade_plan")):
-            merged["profit_first_trade_plan"] = next(
-                (
-                    _dict_value(candidate.get("profit_first_trade_plan"))
-                    for candidate in scoped_candidates
-                    if str(candidate.get("profit_first_exit_plan_id") or "").strip()
-                    == only_exit_plan_id
-                    and _dict_value(candidate.get("profit_first_trade_plan"))
-                ),
-                {},
-            )
-        if not _dict_value(merged.get("profit_first_exit_plan")):
-            merged["profit_first_exit_plan"] = next(
-                (
-                    _dict_value(candidate.get("profit_first_exit_plan"))
-                    for candidate in scoped_candidates
-                    if str(candidate.get("profit_first_exit_plan_id") or "").strip()
-                    == only_exit_plan_id
-                    and _dict_value(candidate.get("profit_first_exit_plan"))
-                ),
-                {},
-            )
-    elif unique_exit_plan_ids:
-        merged["profit_first_exit_plan_id"] = ""
-        merged["profit_first_trade_plan"] = {}
-        merged["profit_first_exit_plan"] = {}
     return merged
 
 
@@ -631,16 +511,6 @@ def normalized_open_position_context(
     okx_pos_id = _okx_pos_id_from_position_payload(position_payload)
     entry_exchange_order_id = str(position_payload.get("entry_exchange_order_id") or "").strip()
     entry_legs = _list_of_dicts(position_payload.get("entry_legs"))
-    profit_first_trade_plan = _dict_value(position_payload.get("profit_first_trade_plan"))
-    profit_first_exit_plan = _dict_value(position_payload.get("profit_first_exit_plan"))
-    profit_first_exit_plan_id = str(
-        _first_value(
-            position_payload.get("profit_first_exit_plan_id"),
-            profit_first_exit_plan.get("exit_plan_id"),
-            profit_first_trade_plan.get("exit_plan_id"),
-        )
-        or ""
-    ).strip()
     snapshot = parse_exchange_position_snapshot(
         position_payload,
         symbol_normalizer=symbol_normalizer,
@@ -717,9 +587,6 @@ def normalized_open_position_context(
             "okx_pos_id": okx_pos_id,
             "entry_exchange_order_id": entry_exchange_order_id,
             "entry_legs": entry_legs,
-            "profit_first_trade_plan": profit_first_trade_plan,
-            "profit_first_exit_plan": profit_first_exit_plan,
-            "profit_first_exit_plan_id": profit_first_exit_plan_id,
             "info": info,
         }
 
@@ -822,9 +689,6 @@ def normalized_open_position_context(
         "okx_pos_id": okx_pos_id,
         "entry_exchange_order_id": entry_exchange_order_id,
         "entry_legs": entry_legs,
-        "profit_first_trade_plan": profit_first_trade_plan,
-        "profit_first_exit_plan": profit_first_exit_plan,
-        "profit_first_exit_plan_id": profit_first_exit_plan_id,
         "info": info,
     }
 
@@ -2800,7 +2664,6 @@ class OkxSyncService:
         self,
         *,
         strict: bool = False,
-        include_profit_first_metadata: bool = True,
     ) -> list[dict]:
         """Get locally known open positions without waiting for OKX current state."""
         normalize_symbol = self._required_symbol_normalizer()
@@ -2816,55 +2679,7 @@ class OkxSyncService:
                     limit=1000,
                 )
                 open_db_positions = [position for position in db_positions if position.is_open]
-                profit_first_metadata_by_position_id: dict[int, dict[str, Any]] = {}
-                if include_profit_first_metadata:
-                    entry_order_ids = sorted(
-                        {
-                            exchange_order_id
-                            for position in open_db_positions
-                            for exchange_order_id in _split_exchange_order_ids(
-                                getattr(position, "entry_exchange_order_id", None)
-                            )
-                        }
-                    )
-                else:
-                    entry_order_ids = []
-                if include_profit_first_metadata and entry_order_ids:
-                    order_result = await session.execute(
-                        select(Order)
-                        .where(
-                            Order.execution_mode == mode_manager.mode.value,
-                            Order.exchange_order_id.in_(entry_order_ids),
-                        )
-                        .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
-                    )
-                    orders = list(order_result.scalars().all())
-                    orders_by_exchange_id: dict[str, Order] = {}
-                    decision_ids: set[int] = set()
-                    for order in orders:
-                        exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
-                        if not exchange_order_id or exchange_order_id in orders_by_exchange_id:
-                            continue
-                        orders_by_exchange_id[exchange_order_id] = order
-                        decision_id = int(getattr(order, "decision_id", 0) or 0)
-                        if decision_id:
-                            decision_ids.add(decision_id)
-                    decisions_by_id: dict[int, AIDecision] = {}
-                    if decision_ids:
-                        decision_result = await session.execute(
-                            select(AIDecision).where(AIDecision.id.in_(decision_ids))
-                        )
-                        decisions_by_id = {
-                            int(decision.id): decision
-                            for decision in decision_result.scalars().all()
-                        }
-                    profit_first_metadata_by_position_id = _build_local_position_profit_first_metadata(
-                        open_db_positions,
-                        orders_by_exchange_id=orders_by_exchange_id,
-                        decisions_by_id=decisions_by_id,
-                    )
                 for p in open_db_positions:
-                    metadata = profit_first_metadata_by_position_id.get(int(getattr(p, "id", 0) or 0), {})
                     local_positions.append(
                         {
                             "model_name": p.model_name,
@@ -2882,7 +2697,6 @@ class OkxSyncService:
                             "okx_inst_id": getattr(p, "okx_inst_id", None),
                             "okx_pos_id": getattr(p, "okx_pos_id", None),
                             "entry_exchange_order_id": getattr(p, "entry_exchange_order_id", None),
-                            **metadata,
                         }
                     )
         except Exception as e:
@@ -2962,9 +2776,6 @@ class OkxSyncService:
                 ("created_at", "created_at"),
                 ("entry_exchange_order_id", "entry_exchange_order_id"),
                 ("entry_legs", "entry_legs"),
-                ("profit_first_trade_plan", "profit_first_trade_plan"),
-                ("profit_first_exit_plan", "profit_first_exit_plan"),
-                ("profit_first_exit_plan_id", "profit_first_exit_plan_id"),
             ):
                 value = local_position.get(source_key)
                 if value not in (None, "") and payload.get(target_key) in (None, ""):

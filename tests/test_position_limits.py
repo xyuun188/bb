@@ -1,21 +1,23 @@
 from risk_manager.position_limits import PositionLimitChecker
 
 
-def test_position_limit_checker_reads_runtime_settings(monkeypatch):
+def test_position_limit_checker_uses_physical_account_margin_only():
     checker = PositionLimitChecker()
-    monkeypatch.setattr("risk_manager.position_limits.settings.max_position_pct", 0.10)
-    monkeypatch.setattr("risk_manager.position_limits.settings.max_leverage", 4.0)
+    result = checker.check_contract_entry_limits(
+        proposed_margin_pct=0.25,
+        proposed_leverage=25.0,
+        proposed_stop_loss_pct=0.02,
+        current_positions=[],
+        account_balance=1000.0,
+        symbol="BTC/USDT",
+    )
 
-    assert checker.max_position_pct == 0.10
-    assert checker.max_leverage == 4.0
-    result = checker.check_leverage(6.0)
-
-    assert result.adjusted_size_pct == 4.0
+    assert result.passed is True
+    assert result.adjusted_size_pct is None
 
 
-def test_contract_exposure_snapshot_reads_runtime_hard_stop(monkeypatch):
+def test_missing_dynamic_stop_does_not_restore_fixed_stop():
     checker = PositionLimitChecker()
-    monkeypatch.setattr("risk_manager.position_limits.settings.hard_stop_loss_pct", 0.02)
 
     snapshot = checker.contract_exposure_snapshot(
         proposed_margin_pct=0.10,
@@ -25,7 +27,7 @@ def test_contract_exposure_snapshot_reads_runtime_hard_stop(monkeypatch):
         account_balance=1000,
     )
 
-    assert snapshot.proposed_stop_risk_pct == 0.01
+    assert snapshot.proposed_stop_risk_pct == 0.0
 
 
 def test_contract_exposure_uses_okx_contract_size_for_swap_positions():

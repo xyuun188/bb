@@ -1,7 +1,4 @@
-"""
-Circuit breaker — halts all trading when risk thresholds are breached.
-Protects against cascading losses from runaway algorithms.
-"""
+"""Operational circuit breaker for explicit system faults or manual intervention."""
 
 from __future__ import annotations
 
@@ -10,8 +7,6 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 import structlog
-
-from config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
@@ -46,13 +41,8 @@ class CircuitBreaker:
     """
 
     def __init__(self, cooldown_minutes: int = 60) -> None:
-        self.max_consecutive_losses = 5
         self.cooldown = timedelta(minutes=cooldown_minutes)
         self._state = CircuitBreakerState()
-
-    @property
-    def max_daily_loss_pct(self) -> float:
-        return float(settings.max_daily_loss_pct or 0.05)
 
     @property
     def is_open(self) -> bool:
@@ -104,30 +94,6 @@ class CircuitBreaker:
                 self._state.tripped_at = None
                 self._state.tripped_reason = ""
                 logger.info("circuit breaker reset to closed")
-
-        self._evaluate()
-
-    def _evaluate(self) -> None:
-        """Check if breaker should be tripped."""
-        if self._state.state != BreakerState.CLOSED:
-            return
-
-        # Check consecutive losses
-        if self._state.consecutive_losses >= self.max_consecutive_losses:
-            self._trip(f"Consecutive losses: {self._state.consecutive_losses}")
-
-    def evaluate_daily_loss(self, account_balance: float) -> None:
-        """Check if daily loss limit is breached."""
-        self._check_daily_reset()
-        if self._state.state != BreakerState.CLOSED:
-            return
-
-        loss_pct = abs(self._state.daily_pnl) / account_balance if account_balance > 0 else 0
-        if self._state.daily_pnl < 0 and loss_pct > self.max_daily_loss_pct:
-            self._trip(
-                f"Daily loss limit reached: {self._state.daily_pnl:.2f} USD "
-                f"({loss_pct*100:.1f}% > {self.max_daily_loss_pct*100:.1f}%)"
-            )
 
     def _trip(self, reason: str) -> None:
         self._state.state = BreakerState.OPEN

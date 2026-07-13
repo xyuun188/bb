@@ -1,9 +1,8 @@
 """
 Model factory — creates AI model instances from settings.ai_models config.
 
-Supports the multi-model configuration pattern: each entry in
-settings.ai_models becomes an independently-configured LLMAgent.
-Falls back to the legacy 3-model set when ai_models is empty.
+Supports the multi-model configuration pattern: each configured fixed slot
+becomes an independently configured LLMAgent.
 """
 
 from __future__ import annotations
@@ -17,8 +16,7 @@ def create_models_from_config() -> list[AbstractAIModel]:
     """Build model instances from settings.ai_models configuration.
 
     Each config entry creates an LLMAgent with its own name, api_base,
-    api_key, and model. When settings.ai_models is empty, falls back to
-    the legacy default set (LLM Agent + FinBERT + XGBoost).
+    api_key, and model. Missing fixed-slot configuration fails closed.
     """
     fixed_models = settings.get_fixed_ai_models(include_empty=False)
     if fixed_models:
@@ -40,7 +38,4 @@ def create_models_from_config() -> list[AbstractAIModel]:
 
         return models
 
-    # Legacy fallback: only create model when legacy api_key is configured
-    if settings.ai_api_key:
-        return [LLMAgent()]
     return []

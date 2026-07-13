@@ -25,9 +25,10 @@ from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
 from models.trade import OkxPositionHistory, Order, Position
+from services.execution_cost_model import round_trip_fee_pct
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
-    build_profit_first_promotion_report,
+    build_return_objective_report,
     load_latest_paper_observation_report,
 )
 from services.okx_training_facts import build_okx_history_training_sample
@@ -43,9 +44,6 @@ from services.training_data_quality import (
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
-_LOCAL_AI_ROUND_TRIP_COST_PCT = (
-    DEFAULT_TRADING_PARAMS.execution_cost.local_ml_round_trip_cost_pct
-)
 _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "change_24h_pct",
     "spread_pct",
@@ -70,6 +68,9 @@ _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "price_vs_sma20",
     "price_vs_sma50",
     "funding_rate",
+    "funding_interval_minutes",
+    "funding_interval_hours",
+    "round_trip_fee_pct",
     "volume_24h",
     "open_interest_value",
     "orderbook_imbalance",
@@ -458,12 +459,11 @@ def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
-    remaining = max(int(limit), 1)
+async def _load_shadow_samples() -> list[dict[str, Any]]:
     before_id: int | None = None
     samples: list[dict[str, Any]] = []
-    while remaining > 0:
-        page_limit = min(_LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE, remaining)
+    while True:
+        page_limit = _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE
         async with get_read_session_ctx() as session:
             stmt = (
                 select(*_shadow_sample_columns())
@@ -481,7 +481,6 @@ async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
             rows = [_shadow_sample_from_mapping(row) for row in (await session.execute(stmt)).mappings().all()]
         if not rows:
             break
-        remaining -= len(rows)
         before_id = int(rows[-1].get("id") or 0) or before_id
         for row in rows:
             features = _snapshot(row.get("features"))
@@ -490,6 +489,10 @@ async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
             features.setdefault("symbol", row.get("symbol"))
             features.setdefault("decision_confidence", _as_float(row.get("decision_confidence")))
             features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
+            fee_pct, _fee_source = round_trip_fee_pct(features)
+            if fee_pct <= 0:
+                continue
+            features["round_trip_fee_pct"] = fee_pct
             compact_features = _compact_local_ai_tools_features(features)
             if not compact_features:
                 continue
@@ -515,11 +518,9 @@ async def _load_shadow_samples(limit: int) -> list[dict[str, Any]]:
     return samples
 
 
-async def _load_trade_reflection_samples(limit: int | None) -> list[dict[str, Any]]:
+async def _load_trade_reflection_samples() -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
         stmt = select(TradeReflection).order_by(TradeReflection.id.desc())
-        if limit is not None:
-            stmt = stmt.limit(max(int(limit), 1))
         result = await session.execute(stmt)
         rows = list(result.scalars().all())
 
@@ -626,7 +627,7 @@ def _match_entry_decision_for_training(
     return best
 
 
-async def _load_authoritative_trade_samples(limit: int | None) -> list[dict[str, Any]]:
+async def _load_authoritative_trade_samples() -> list[dict[str, Any]]:
     """Load one training sample per mirrored OKX positions-history lifecycle."""
 
     async with get_session_ctx() as session:
@@ -637,8 +638,6 @@ async def _load_authoritative_trade_samples(limit: int | None) -> list[dict[str,
                 OkxPositionHistory.id.desc(),
             )
         )
-        if limit is not None:
-            stmt = stmt.limit(max(int(limit), 1))
         records = list((await session.execute(stmt)).scalars().all())
         position_ids = {
             int(value)
@@ -793,8 +792,8 @@ async def _completed_trade_sample_count() -> int:
     computed from the same clean view that is sent to the model server.
     """
 
-    reflection_samples = await _load_trade_reflection_samples(None)
-    authoritative_samples = await _load_authoritative_trade_samples(None)
+    reflection_samples = await _load_trade_reflection_samples()
+    authoritative_samples = await _load_authoritative_trade_samples()
     payload = annotate_training_payload(
         shadow_samples=[],
         trade_samples=_merge_trade_samples(reflection_samples, authoritative_samples),
@@ -804,15 +803,12 @@ async def _completed_trade_sample_count() -> int:
     return len(payload["trade_samples"])
 
 
-async def _load_sequence_samples(limit: int) -> list[dict[str, Any]]:
-    row_limit = max(int(limit), 1)
+async def _load_sequence_samples() -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
-        result = await session.execute(
-            select(Kline)
-            .where(Kline.timeframe.in_(("1m", "5m", "15m", "1h")))
-            .order_by(Kline.symbol.asc(), Kline.timeframe.asc(), Kline.open_time.desc())
-            .limit(row_limit)
-        )
+        stmt = select(Kline).where(
+            Kline.timeframe.in_(("1m", "5m", "15m", "1h"))
+        ).order_by(Kline.symbol.asc(), Kline.timeframe.asc(), Kline.open_time.desc())
+        result = await session.execute(stmt)
         rows = list(result.scalars().all())
 
     grouped: dict[tuple[str, str], list[Kline]] = {}
@@ -847,13 +843,14 @@ async def _load_sequence_samples(limit: int) -> list[dict[str, Any]]:
                     "close_sequence": base,
                     "volume_sequence": volumes[start : idx + 1],
                     "future_return_pct": move_pct,
-                    "long_return_pct": move_pct - _LOCAL_AI_ROUND_TRIP_COST_PCT,
-                    "short_return_pct": -move_pct - _LOCAL_AI_ROUND_TRIP_COST_PCT,
-                    "label_name": "net_return_after_cost_pct",
-                    "label_version": "2026-07-12.v1",
+                    "long_return_pct": move_pct,
+                    "short_return_pct": -move_pct,
+                    "label_name": "gross_market_move_pct",
+                    "label_version": "2026-07-12.observation-only.v1",
+                    "production_eligible": False,
                 }
             )
-    return samples[-max(int(limit), 1) :]
+    return samples
 
 
 def _symbols_from_json(value: Any) -> list[str]:
@@ -867,19 +864,16 @@ def _symbols_from_json(value: Any) -> list[str]:
     return []
 
 
-async def _load_text_sentiment_samples(limit: int) -> list[dict[str, Any]]:
-    row_limit = max(int(limit), 1)
+async def _load_text_sentiment_samples() -> list[dict[str, Any]]:
     async with get_session_ctx() as session:
-        news_result = await session.execute(
-            select(NewsArticle)
-            .order_by(NewsArticle.published_at.desc().nullslast(), NewsArticle.id.desc())
-            .limit(row_limit)
+        news_stmt = select(NewsArticle).order_by(
+            NewsArticle.published_at.desc().nullslast(), NewsArticle.id.desc()
         )
-        social_result = await session.execute(
-            select(SocialPost)
-            .order_by(SocialPost.posted_at.desc().nullslast(), SocialPost.id.desc())
-            .limit(row_limit)
+        social_stmt = select(SocialPost).order_by(
+            SocialPost.posted_at.desc().nullslast(), SocialPost.id.desc()
         )
+        news_result = await session.execute(news_stmt)
+        social_result = await session.execute(social_stmt)
         news_rows = list(news_result.scalars().all())
         social_rows = list(social_result.scalars().all())
 
@@ -913,32 +907,12 @@ async def _load_text_sentiment_samples(limit: int) -> list[dict[str, Any]]:
                 "created_at": social_row.posted_at.isoformat() if social_row.posted_at else None,
             }
         )
-    return samples[-row_limit:]
+    return samples
 
 
 async def _main() -> None:
     parser = argparse.ArgumentParser(description="Train server-side local AI quant tools")
     parser.add_argument("--base-url", default=settings.local_ai_tools_api_base)
-    parser.add_argument(
-        "--shadow-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
-    )
-    parser.add_argument(
-        "--trade-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
-    )
-    parser.add_argument(
-        "--sequence-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit,
-    )
-    parser.add_argument(
-        "--text-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
-    )
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--skip-quarantine", action="store_true")
     parser.add_argument(
@@ -983,17 +957,14 @@ async def _main() -> None:
             "reason": "phase3_preflight_no_quarantine_writes",
         }
     elif not args.skip_quarantine:
-        quarantine_result = await quarantine_dirty_shadow_samples(
-            batch_size=min(args.shadow_limit, 1000),
-            max_batches=max((int(args.shadow_limit) + 999) // 1000, 1),
-        )
+        quarantine_result = await quarantine_dirty_shadow_samples()
 
-    shadow_samples = await _load_shadow_samples(args.shadow_limit)
-    trade_reflection_samples = await _load_trade_reflection_samples(args.trade_limit)
-    authoritative_samples = await _load_authoritative_trade_samples(args.trade_limit)
+    shadow_samples = await _load_shadow_samples()
+    trade_reflection_samples = await _load_trade_reflection_samples()
+    authoritative_samples = await _load_authoritative_trade_samples()
     trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
-    sequence_samples = await _load_sequence_samples(args.sequence_limit)
-    text_sentiment_samples = await _load_text_sentiment_samples(args.text_limit)
+    sequence_samples = await _load_sequence_samples()
+    text_sentiment_samples = await _load_text_sentiment_samples()
     training_payload = annotate_training_payload(
         shadow_samples=shadow_samples,
         trade_samples=trade_samples,
@@ -1018,7 +989,7 @@ async def _main() -> None:
     trainable_trade_sample_count = len(training_payload["trade_samples"])
     quarantined_trade_sample_count = max(raw_trade_sample_count - trainable_trade_sample_count, 0)
     paper_observation_report = load_latest_paper_observation_report()
-    profit_first_report = build_profit_first_promotion_report(
+    return_objective_report = build_return_objective_report(
         trade_samples=training_payload["trade_samples"],
         shadow_samples=training_payload["shadow_samples"],
     )
@@ -1051,7 +1022,7 @@ async def _main() -> None:
             "phase": "phase3_model_factory",
         },
         "paper_observation_report": paper_observation_report,
-        "profit_first_report": profit_first_report,
+        "return_objective_report": return_objective_report,
     }
     payload["promotion_recommendation"] = build_phase3_promotion_recommendation(
         training_mode=args.training_mode,
@@ -1062,7 +1033,7 @@ async def _main() -> None:
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=completed_shadow_count,
         completed_trade_sample_count=completed_trade_count,
-        profit_first_report=profit_first_report,
+        return_objective_report=return_objective_report,
     )
     result = await _post_training_payload(
         args.base_url,

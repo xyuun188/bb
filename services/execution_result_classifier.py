@@ -24,6 +24,22 @@ from services.okx_error_classifier import (
 )
 from web_dashboard.api.text_sanitize import sanitize_text
 
+UNTRADABLE_EXCHANGE_ERROR_MARKERS = (
+    "51155",
+    "51028",
+    "contract under delivery",
+    "can't trade this pair",
+    "cannot trade this pair",
+    "local compliance restrictions",
+    "not currently tradable",
+    "not available for trading",
+    "instrument suspended",
+    "market suspended",
+    "当前不可交易",
+    "当前不支持交易",
+    "暂停交易",
+)
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -310,6 +326,7 @@ class ExecutionResultClassifier:
         return message or None
 
     def _is_untradable_exchange_error(self, message: str) -> bool:
-        if self._untradable_exchange_error_checker is None:
-            return False
-        return bool(self._untradable_exchange_error_checker(message))
+        if self._untradable_exchange_error_checker is not None:
+            return bool(self._untradable_exchange_error_checker(message))
+        text = str(message or "").lower()
+        return any(marker in text for marker in UNTRADABLE_EXCHANGE_ERROR_MARKERS)

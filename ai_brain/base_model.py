@@ -62,8 +62,8 @@ class DecisionOutput:
     reasoning: str  # human-readable explanation
     position_size_pct: float = 0.0  # fraction of available capital
     suggested_leverage: float = 1.0
-    stop_loss_pct: float = 0.05
-    take_profit_pct: float = 0.10
+    stop_loss_pct: float = 0.0
+    take_profit_pct: float = 0.0
     cross_check_for: dict[str, Any] | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     raw_response: dict | None = None  # for debugging LLM models
@@ -105,7 +105,7 @@ class AbstractAIModel(ABC):
     3. Register with ModelRegistry
     """
 
-    name: str  # Set in subclass, e.g., "llm_agent", "finbert", "xgboost"
+    name: str  # Set in subclass, e.g., "trend_expert" or "risk_expert"
 
     @abstractmethod
     async def initialize(self) -> None:

@@ -72,7 +72,6 @@ from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_ord
 from services.model_training_registry import build_model_training_registry
 from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTrainingStateStore
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
-from services.runtime_entry_filters import entry_filters_from_context
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.vector_memory import get_vector_memory_service
@@ -1235,43 +1234,6 @@ async def _trading_stats_with_runtime_heartbeat(mode: str | None = None) -> dict
     return await _split_process_trading_stats(mode)
 
 
-def _execution_risk_floor(allocated: float, max_loss_pct: float, max_loss_usdt: float) -> float:
-    if allocated <= 0:
-        return 0.0
-    loss_limit = max_loss_usdt if max_loss_usdt > 0 else allocated * max_loss_pct
-    return max(allocated - loss_limit, 0.0)
-
-
-def _cooldown_pause_reason_from_summary(pnl_summary: dict, cfg: dict, source: str) -> str | None:
-    max_loss_usdt = _safe_float(cfg.get("max_loss_usdt"), 0.0) or 0.0
-    cooldown_loss_pct = _safe_float(cfg.get("cooldown_loss_pct"), 0.0) or 0.0
-    trigger_loss = max_loss_usdt * cooldown_loss_pct
-    if trigger_loss <= 0:
-        return None
-
-    today_risk_pnl = _safe_float(pnl_summary.get("today_risk_pnl"), 0.0) or 0.0
-    if today_risk_pnl > -trigger_loss:
-        return None
-
-    today_equity = (
-        _safe_float(
-            pnl_summary.get("today_equity_pnl"),
-            pnl_summary.get("today_total_pnl", 0.0),
-        )
-        or 0.0
-    )
-    today_realized = _safe_float(pnl_summary.get("today_realized_pnl"), 0.0) or 0.0
-    unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0) or 0.0
-    return (
-        "冷静期触发比例已达到，暂停分析新的交易对。"
-        f"{source} 今日权益盈亏 {today_equity:.2f} USDT，"
-        f"其中今日已平仓盈亏 {today_realized:.2f} USDT，"
-        f"当前持仓浮动盈亏 {unrealized:.2f} USDT；触发线为最高亏损金额 "
-        f"{max_loss_usdt:.2f} USDT 的 {cooldown_loss_pct * 100:.0f}%"
-        f"（{trigger_loss:.2f} USDT）。已有持仓仍会继续复盘、止盈止损和平仓。"
-    )
-
-
 def _okx_equity_pnl_from_snapshot(
     *,
     current_equity: float | None,
@@ -1682,7 +1644,6 @@ def _build_execution_account_status(
     mode = "live" if mode == "live" else "paper"
     cfg = settings.get_execution_account_config(mode)
     pnl_summary = pnl_summary or {}
-    max_loss_pct = float(cfg.get("max_loss_pct") or 0.0)
     okx_error = str(okx_account.get("error")) if okx_account and okx_account.get("error") else None
     raw_okx_available = _safe_float(okx_account.get("free"), None) if okx_account else None
     raw_okx_used = _safe_float(okx_account.get("used"), 0.0) if okx_account else None
@@ -1734,10 +1695,6 @@ def _build_execution_account_status(
         current_equity=account_equity if okx_balance_available else None,
         pnl_summary=pnl_summary,
     )
-    max_loss_usdt = (
-        account_equity * max_loss_pct if account_equity > 0 and max_loss_pct > 0 else 0.0
-    )
-    risk_floor = _execution_risk_floor(account_equity, max_loss_pct, max_loss_usdt)
     pause_reason = None
     if _trading_service:
         pause_reason = getattr(_trading_service, "_new_pair_pause_reasons", {}).get(
@@ -1749,38 +1706,12 @@ def _build_execution_account_status(
     if okx_error and not pause_reason and not okx_balance_available:
         source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
         pause_reason = f"{source} 余额同步失败，系统不会分析新的交易对。原因：{okx_error}"
-    total_pnl_for_risk = 0.0
-    if (
-        account_equity > 0
-        and max_loss_usdt > 0
-        and total_pnl_for_risk <= -max_loss_usdt
-        and not pause_reason
-    ):
-        source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
-        pause_reason = (
-            f"{source} AI 执行账户累计盈亏 {total_pnl_for_risk:.2f} USDT 已达到最高亏损限制 "
-            f"{max_loss_pct * 100:.1f}%（{max_loss_usdt:.2f} USDT），系统不会分析新的交易对。"
-        )
-    if not pause_reason and okx_pnl["today_equity_pnl"] is not None:
-        source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
-        pause_reason = _cooldown_pause_reason_from_summary(
-            {
-                "today_risk_pnl": okx_pnl["today_equity_pnl"],
-                "today_equity_pnl": okx_pnl["today_equity_pnl"],
-                "today_total_pnl": okx_pnl["today_total_pnl"],
-            },
-            {**cfg, "max_loss_usdt": max_loss_usdt},
-            source,
-        )
-
     payload = {
         **cfg,
         "model_name": ENSEMBLE_TRADER_NAME,
         "allocated_balance": None,
         "account_balance_source_value": account_equity,
         "account_equity": account_equity,
-        "max_loss_usdt": max_loss_usdt,
-        "risk_floor": risk_floor,
         "risk_paused": bool(pause_reason),
         "risk_pause_reason": pause_reason,
         "balance_error": okx_error,
@@ -1936,8 +1867,6 @@ def _build_execution_account_status(
             {
                 "allocated_balance": None,
                 "account_equity": None,
-                "max_loss_usdt": None,
-                "risk_floor": None,
                 "available_balance": None,
                 "current_balance": None,
                 "tradeable_balance": None,
@@ -2028,43 +1957,18 @@ def _fallback_execution_reason_clean(decision, order=None) -> str | None:
     if action not in ("long", "short", "close_long", "close_short"):
         return "未保存具体未执行原因。"
 
-    snapshot = decision.feature_snapshot or {}
     raw = _decision_raw_payload(decision)
-    entry_filters = entry_filters_from_context(
-        raw or {"entry_filters": snapshot.get("entry_filters")}
-    )
-    confidence = float(decision.confidence or 0.0)
-    volume_ratio = float(snapshot.get("volume_ratio") or 0.0)
-    adx_14 = float(snapshot.get("adx_14") or 0.0)
-    price_vs_sma20 = float(snapshot.get("price_vs_sma20") or 0.0)
-    price_vs_sma50 = float(snapshot.get("price_vs_sma50") or 0.0)
-
-    if confidence < settings.confidence_threshold:
-        return (
-            f"分析信心偏低：当前 {confidence:.2f}，系统会降低排序或仓位；"
-            "这不是固定开仓门槛，最终仍由收益质量、风险、OKX规则和动态调度共同决定。"
-        )
 
     if action in ("long", "short"):
-        if volume_ratio < entry_filters.min_entry_volume_ratio:
-            return (
-                f"量能低于本轮运行时参考：当前量能倍数 {volume_ratio:.2f}，"
-                f"动态参考 {entry_filters.min_entry_volume_ratio:.2f}。"
-                "该参考只影响排序/仓位，不是固定硬门槛。"
-            )
-
-        if adx_14 < entry_filters.min_entry_adx:
-            return (
-                f"趋势强度低于本轮运行时参考：当前 ADX {adx_14:.1f}，"
-                f"动态参考 {entry_filters.min_entry_adx:.1f}。"
-                "该参考只影响排序/仓位，不是固定硬门槛。"
-            )
-
-        if action == "long" and (price_vs_sma20 <= 0 or price_vs_sma50 <= 0):
-            return "做多趋势未完全对齐：价格没有同时站上 SMA20 和 SMA50，本轮未提交订单。"
-        if action == "short" and (price_vs_sma20 >= 0 or price_vs_sma50 >= 0):
-            return "做空趋势未完全对齐：价格没有同时跌破 SMA20 和 SMA50，本轮未提交订单。"
-
+        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else None
+        provenance = (
+            opportunity.get("policy_provenance")
+            if isinstance(opportunity, dict)
+            and isinstance(opportunity.get("policy_provenance"), dict)
+            else {}
+        )
+        if provenance.get("fallback_reason"):
+            return "费后收益、实时成本、有效期或来源契约不完整，本轮未提交新开仓订单。"
         return (
             "未找到关联订单记录：这通常表示信号仍在候选排序、下单前检查、"
             "OKX规则校验或订单回写阶段被跳过；请查看本条执行步骤时间线定位具体节点。"
@@ -4768,14 +4672,7 @@ async def get_ml_signal_status():
     status["training_shadow_sample_count"] = training_count
     status["raw_shadow_sample_count"] = raw_training_count
     status["legacy_shadow_sample_count"] = max(raw_training_count - training_count, 0)
-    status.setdefault(
-        "training_shadow_sample_limit",
-        LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
-    )
-    status.setdefault(
-        "training_sample_note",
-        "sample_count is the latest training window, not the all-time total.",
-    )
+    status.setdefault("training_window_policy", "all_current_clean_cost_complete_samples")
 
     try:
         completed_total = _explicit_phase3_count(
@@ -4901,10 +4798,7 @@ async def get_local_ai_tools_status():
             status["service_model_window_shadow_sample_count"] = service_shadow_count
             status["service_model_window_trade_sample_count"] = service_trade_count
             status["training_sample_source"] = "phase3_clean_completed_shadow_backtests"
-            status.setdefault(
-                "training_shadow_sample_limit",
-                LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
-            )
+            status.setdefault("training_window_policy", "all_current_clean_cost_complete_samples")
         except Exception as exc:
             _log_dashboard_fallback("local ai tools shadow count fallback", exc)
         scheduler_state = MODEL_TRAINING_STATE_STORE.read()
@@ -6511,7 +6405,6 @@ async def get_analysis_records(
             "consultation_status": (
                 consultation.get("status") if isinstance(consultation, dict) else None
             ),
-            "validation_adjustment": raw.get("validation_adjustment"),
             "final_action": d.action,
             "final_confidence": display_confidence,
             "trade_confidence": trade_confidence,
@@ -6593,13 +6486,11 @@ async def get_strategy_learning(
         strategy_params.min_dashboard_limit,
         min(int(limit or strategy_params.dashboard_default_limit), max_limit),
     )
-    max_open_positions = int(settings.max_open_positions_per_model or 20)
     cache_key = (
         "strategy-learning",
         selected_mode,
         capped_hours,
         capped_limit,
-        max_open_positions,
         selected_detail,
     )
     cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
@@ -6612,57 +6503,9 @@ async def get_strategy_learning(
         mode=selected_mode,
         hours=capped_hours,
         limit=capped_limit,
-        max_open_positions=max_open_positions,
         detail=selected_detail,
     )
     return sanitize_payload(_dashboard_heavy_cache_set(cache_key, payload))
-
-
-@router.post("/strategy-learning/profiles/{profile_id}/disabled")
-async def set_strategy_learning_profile_disabled(
-    profile_id: str,
-    disabled: bool = True,
-    reason: str | None = None,
-):
-    """Disable or re-enable one strategy profile."""
-    from services.strategy_learning import StrategyLearningService
-
-    service = getattr(_trading_service, "strategy_learning_service", None)
-    if service is None:
-        service = StrategyLearningService()
-    state = service.set_profile_disabled(
-        profile_id,
-        disabled=bool(disabled),
-        reason=reason or "dashboard_manual_control",
-    )
-    _clear_dashboard_heavy_cache("strategy-learning")
-    return sanitize_payload({"profile_id": profile_id, "disabled": bool(disabled), "state": state})
-
-
-@router.post("/strategy-learning/profiles/{profile_id}/activate")
-async def activate_strategy_learning_profile(profile_id: str):
-    """Manually select a strategy profile until rollback or another selection."""
-    from services.strategy_learning import StrategyLearningService
-
-    service = getattr(_trading_service, "strategy_learning_service", None)
-    if service is None:
-        service = StrategyLearningService()
-    state = service.set_manual_active_profile(profile_id)
-    _clear_dashboard_heavy_cache("strategy-learning")
-    return sanitize_payload({"profile_id": profile_id, "state": state})
-
-
-@router.post("/strategy-learning/rollback")
-async def rollback_strategy_learning_profile():
-    """Clear manual profile selection so the scheduler resumes automatic switching."""
-    from services.strategy_learning import StrategyLearningService
-
-    service = getattr(_trading_service, "strategy_learning_service", None)
-    if service is None:
-        service = StrategyLearningService()
-    state = service.rollback_to_baseline()
-    _clear_dashboard_heavy_cache("strategy-learning")
-    return sanitize_payload({"profile_id": "auto", "state": state})
 
 
 async def _profit_attribution_watermark(
@@ -7094,8 +6937,6 @@ async def get_expert_memories(
             "market_pattern": sanitize_text(m.market_pattern),
             "lesson": sanitize_text(m.lesson),
             "recommended_action": m.recommended_action,
-            "confidence_adjustment": m.confidence_adjustment,
-            "position_size_multiplier": m.position_size_multiplier,
             "evidence_count": m.evidence_count,
             "hit_count": m.hit_count,
             "success_count": m.success_count,

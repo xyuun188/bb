@@ -268,8 +268,8 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     }
     assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
     assert repo.memories[0]["extra"]["actual_price"] == 101.0
-    assert all(item["confidence_adjustment"] == 0.0 for item in repo.memories)
-    assert all(item["position_size_multiplier"] == 1.0 for item in repo.memories)
+    assert all("confidence_adjustment" not in item for item in repo.memories)
+    assert all("position_size_multiplier" not in item for item in repo.memories)
     assert all(item["success_count"] == 0 for item in repo.memories)
     assert all(item["failure_count"] == 0 for item in repo.memories)
     assert all(item["extra"]["cost_complete"] is True for item in repo.memories)
@@ -373,7 +373,7 @@ async def test_shadow_backtest_price_collection_does_not_hold_database_session(
 
 
 @pytest.mark.asyncio
-async def test_shadow_backtest_service_quarantines_dirty_completed_rows(
+async def test_shadow_backtest_service_does_not_apply_fixed_price_range_tolerance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from config.settings import settings
@@ -401,8 +401,8 @@ async def test_shadow_backtest_service_quarantines_dirty_completed_rows(
 
     await _service(repo, latest_price=0.3910).update_due()
 
-    assert row.status == "quarantined"
-    assert "[training_quarantine] price_outside_24h_range" in row.note
+    assert row.status != "quarantined"
+    assert "price_outside_24h_range" not in row.note
     assert repo.memories == []
     assert repo.completed[0]["actual_price"] == pytest.approx(0.3910)
 

@@ -12,7 +12,7 @@ def _by_id(payload: dict) -> dict[str, dict]:
     return {row["model_id"]: row for row in payload["models"]}
 
 
-def test_registry_never_treats_old_takeover_alias_as_trained_finquant() -> None:
+def test_registry_ignores_legacy_endpoint_alias_without_current_slot_runtime() -> None:
     payload = build_model_training_registry(
         local_ml_status={"available": True, "status": "degraded"},
         local_tools_status={
@@ -46,11 +46,11 @@ def test_registry_never_treats_old_takeover_alias_as_trained_finquant() -> None:
 
     finquant = _by_id(payload)["bb_finquant_expert_14b"]
 
-    assert finquant["runtime_available"] is True
+    assert finquant["runtime_available"] is False
     assert finquant["artifact_available"] is False
-    assert finquant["alias_only"] is True
+    assert finquant["alias_only"] is False
     assert finquant["lifecycle"] == "promotion_blocked"
-    assert payload["summary"]["alias_only_models"] == ["bb_finquant_expert_14b"]
+    assert payload["summary"]["alias_only_models"] == []
 
 
 def test_registry_marks_verified_finquant_specialization_as_trained() -> None:

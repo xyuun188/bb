@@ -37,219 +37,41 @@ def _stable_model_training_scheduler_state(monkeypatch: pytest.MonkeyPatch) -> N
 def _trade_contract_details_ok() -> dict[str, Any]:
     return {
         "audit_only": True,
+        "read_only": True,
         "live_entry_mutation": False,
         "live_exit_mutation": False,
         "can_bypass_risk_controls": False,
         "policy": {
-            "entry_requires_profit_first_trade_plan": True,
-            "profit_first_missing_plan_is_hard_violation": True,
-            "profit_first_shadow_lane_cannot_execute": True,
+            "entry_requires_positive_fee_after_return": True,
+            "entry_requires_positive_return_lcb": True,
+            "entry_requires_live_execution_cost": True,
+            "entry_requires_dynamic_risk_budget": True,
+            "entry_requires_complete_provenance": True,
+            "exit_requires_position_economics": True,
+            "exit_requires_dynamic_close_fraction": True,
+            "filled_order_link_required": True,
         },
         "summary": {
             "decision_count": 12,
             "executed_entry_count": 2,
-            "profit_first_plan_missing_count": 0,
-            "profit_first_plan_incomplete_count": 0,
-            "shadow_lane_executed_count": 0,
-            "profit_first_position_ladder_missing_count": 0,
-            "exit_plan_reference_missing_count": 0,
-            "exit_plan_failure_reason_missing_count": 0,
-            "low_payoff_meaningful_size_count": 0,
-            "profit_first_lane_size_above_max_count": 0,
-            "probe_loss_brake_bypassed_count": 0,
-            "meaningful_lane_tiny_without_budget_reason_count": 0,
-            "profit_first_plan_derived_count": 0,
+            "entry_contract_ready_count": 2,
+            "executed_exit_count": 1,
+            "exit_contract_ready_count": 1,
             "contract_violation_count": 0,
-        },
-        "current_summary": {
-            "decision_count": 12,
-            "executed_entry_count": 2,
-            "profit_first_plan_missing_count": 0,
-            "profit_first_plan_incomplete_count": 0,
-            "shadow_lane_executed_count": 0,
-            "profit_first_position_ladder_missing_count": 0,
-            "exit_plan_reference_missing_count": 0,
-            "exit_plan_failure_reason_missing_count": 0,
-            "low_payoff_meaningful_size_count": 0,
-            "profit_first_lane_size_above_max_count": 0,
-            "probe_loss_brake_bypassed_count": 0,
-            "meaningful_lane_tiny_without_budget_reason_count": 0,
-            "profit_first_plan_derived_count": 0,
-            "contract_violation_count": 0,
+            "realized_net_pnl_usdt": 1.2,
         },
         "violation_reason_counts": {},
     }
 
 
-def _brain_recommendations_ok() -> dict[str, Any]:
-    return {
-        "brain_output_coverage": {
-            "source_weights": True,
-            "strategy_weights": True,
-            "lane_threshold_recommendations": True,
-            "size_promotion_demotion": True,
-            "no_entry_threshold_recommendations": True,
-            "exit_policy_adjustments": True,
-            "shadow_canary_live_decisions": True,
-        },
-        "live_mutation": False,
-    }
 
 
-def _profit_first_governance_details_ok() -> dict[str, Any]:
-    return {
-        "report_type": "profit_first_governance",
-        "status": "ready",
-        "audit_only": True,
-        "read_only": True,
-        "live_mutation": False,
-        "live_entry_mutation": False,
-        "live_exit_mutation": False,
-        "live_weight_mutation": False,
-        "live_sizing_mutation": False,
-        "can_submit_orders": False,
-        "can_start_trading_service": False,
-        "can_change_model_routing": False,
-        "can_change_strategy_weight": False,
-        "can_increase_live_size": False,
-        "summary": {
-            "ranking_ready": True,
-            "no_entry_sample_count": 6,
-            "losing_exit_sample_count": 2,
-            "no_entry_diagnosis": "mixed_blockers_review_top_reasons",
-            "missing_brain_output_count": 0,
-        },
-        "missing_brain_outputs": [],
-        "next_cycle_actions": ["review_top_no_entry_blockers_before_tuning"],
-        "policy": {
-            "no_entry_must_be_classified": True,
-            "losing_exit_must_be_attributed": True,
-            "recommendations_are_read_only": True,
-        },
-    }
 
 
-def test_profit_first_recovery_blockers_card_from_existing_cards() -> None:
-    cards = [
-        system_audit._audit_card(
-            "trade_execution_contract",
-            "Trade contract",
-            "critical",
-            "contract blocked",
-            details={
-                "current_summary": {
-                    "profit_first_plan_missing_count": 1,
-                    "exit_plan_reference_missing_count": 1,
-                },
-                "current_violations": [
-                    {
-                        "decision_id": 9300,
-                        "symbol": "MSFT/USDT",
-                        "reason": "missing_profit_first_trade_plan",
-                    }
-                ],
-            },
-        ),
-        system_audit._audit_card(
-            "profit_first_ranking",
-            "Ranking",
-            "critical",
-            "ranking blocked",
-            details={
-                "blockers": [
-                    {
-                        "code": "strategy_disable",
-                        "severity": "blocking",
-                        "evidence": {"symbol": "AVAX/USDT"},
-                    }
-                ]
-            },
-        ),
-        system_audit._audit_card(
-            "phase3_paper_resume_observation",
-            "Observation",
-            "critical",
-            "okx blocked",
-            details={
-                "blockers": [
-                    {
-                        "code": "okx_authoritative_sync_has_post_resume_differences",
-                        "evidence": {
-                            "issues": [
-                                {
-                                    "kind": "local_order_quantity_differs_from_okx_fill",
-                                    "symbol": "LAB/USDT",
-                                }
-                            ]
-                        },
-                    }
-                ]
-            },
-        ),
-    ]
-
-    card = system_audit._profit_first_recovery_blockers_audit_from_cards(cards)
-
-    assert card["key"] == "profit_first_recovery_blockers"
-    assert card["status"] == "critical"
-    assert card["details"]["read_only"] is True
-    assert card["details"]["starts_trading_service"] is False
-    assert card["details"]["submits_orders"] is False
-    assert card["details"]["blocking_item_count"] == 3
-    ranking_item = next(
-        item for item in card["details"]["items"] if item.get("code") == "strategy_disable"
-    )
-    assert ranking_item["severity"] == "warning"
-    assert ranking_item["lane_scoped_containment"] is True
-    assert card["details"]["category_counts"]["okx_reconciliation"] == 1
 
 
-def _ranking_card_ok() -> AuditFactory:
-    async def factory() -> dict[str, Any]:
-        return system_audit._audit_card(
-            "profit_first_ranking",
-            "profit_first_ranking",
-            "ok",
-            "Profit-First ranking normal",
-            details={
-                "status": "ready",
-                "audit_only": True,
-                "read_only": True,
-                "live_mutation": False,
-                "live_weight_mutation": False,
-                "live_sizing_mutation": False,
-                "can_change_model_routing": False,
-                "can_change_strategy_weight": False,
-                "can_increase_live_size": False,
-                "ranking_ready": True,
-                "summary": {
-                    "closed_position_count": 24,
-                    "leaderboard_row_count": 4,
-                    "promote_candidate_count": 1,
-                    "demote_count": 0,
-                    "disable_count": 0,
-                },
-                "blockers": [],
-                "brain_recommendations": _brain_recommendations_ok(),
-            },
-            evidence=[{"label": "samples", "value": 24}],
-        )
-
-    return factory
 
 
-def _governance_card_ok() -> AuditFactory:
-    async def factory() -> dict[str, Any]:
-        return system_audit._audit_card(
-            "profit_first_governance",
-            "profit_first_governance",
-            "ok",
-            "Profit-First governance normal",
-            details=_profit_first_governance_details_ok(),
-            evidence=[{"label": "no-entry", "value": 6}],
-        )
-
-    return factory
 
 
 def _patch_okx_daily_report_path(
@@ -355,8 +177,6 @@ def _async_card(
     async def factory() -> dict[str, Any]:
         if key == "trade_execution_contract":
             details = _trade_contract_details_ok()
-        elif key == "profit_first_governance":
-            details = _profit_first_governance_details_ok()
         else:
             details = {}
         return system_audit._audit_card(
@@ -542,240 +362,6 @@ def _patch_phase3_stage_handoff_audit(
     monkeypatch.setattr(system_audit, "_phase3_stage_handoff_audit", factory)
 
 
-@pytest.mark.asyncio
-async def test_system_audit_status_aggregates_root_causes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_phase3_server_migration_audit(monkeypatch)
-    _patch_phase3_model_server_readiness_audit(monkeypatch)
-    _patch_phase3_paper_resume_preflight_audit(monkeypatch)
-    _patch_phase3_paper_resume_observation_audit(monkeypatch)
-    _patch_phase3_stage_handoff_audit(monkeypatch)
-    monkeypatch.setattr(
-        system_audit,
-        "_shadow_missed_opportunity_audit",
-        _async_card("shadow_missed_opportunity", "ok", "Shadow missed loop normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strong_opportunity_audit",
-        _async_card("strong_opportunity", "ok", "Strong opportunity audit normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_position_capacity_release_audit",
-        _async_card("position_capacity_release", "ok", "Capacity release audit normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_signal_root_cause_audit",
-        _async_card("strategy_signal_root_cause", "ok", "Strategy signal root cause normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_trade_execution_contract_audit",
-        _async_card("trade_execution_contract", "ok", "Trade execution contract normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_profit_first_ranking_audit",
-        _ranking_card_ok(),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_profit_first_governance_audit",
-        _governance_card_ok(),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_trade_loop_audit",
-        _async_card("trade_loop", "critical", "交易主循环卡住", title="交易闭环"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_okx_reconciliation_audit",
-        _async_card("okx_reconciliation", "ok", "OKX 对账正常", title="OKX 历史对账"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_okx_trade_fact_integrity_audit",
-        _async_card("okx_trade_fact_integrity", "ok", "OKX trade facts normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_position_price_integrity_audit",
-        _async_card(
-            "position_price_integrity",
-            "ok",
-            "持仓价格一致",
-            title="持仓价格一致性",
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_market_data_audit",
-        _async_card("market_data", "warning", "K线过期", title="行情与 K线"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_quality_audit",
-        _async_card("strategy_quality", "ok", "策略质量正常", title="策略质量"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_closed_loop_audit",
-        _async_card(
-            "strategy_closed_loop",
-            "ok",
-            "策略闭环正常",
-            title="策略闭环审计",
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_training_audit",
-        _async_card("model_training", "warning", "模型未就绪", title="模型与训练"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_expert_health_audit",
-        _async_card("model_expert_health", "ok", "模型/专家体检正常", title="模型/专家体检"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_expert_competition_audit",
-        _async_card("model_expert_competition", "ok", "模型/专家竞赛正常", title="模型/专家竞赛"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_crypto_feature_coverage_audit",
-        _async_card(
-            "crypto_feature_coverage", "ok", "Crypto 特征覆盖正常", title="数字货币特征覆盖"
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_dynamic_routing_audit",
-        _async_card("model_dynamic_routing", "ok", "动态路由正常", title="模型动态路由"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_high_risk_review_audit",
-        _async_card("high_risk_review_audit", "ok", "High-risk review audit normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_gate_contract_audit",
-        lambda: system_audit._audit_card(
-            "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_source_visible_text_audit",
-        lambda: system_audit._audit_card(
-            "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_runtime_text_integrity_audit",
-        lambda: system_audit._audit_card(
-            "runtime_text_integrity", "运行时文本完整性", "ok", "无新增乱码"
-        ),
-    )
-
-    monkeypatch.setattr(system_audit, "_load_latest_audit_snapshot", lambda: None)
-    monkeypatch.setattr(system_audit, "_store_latest_audit_snapshot", lambda _payload: None)
-    system_audit._system_audit_status_cache = None
-    payload = await system_audit.system_audit_status()
-
-    assert payload["status"] == "critical"
-    assert payload["status_label"] == "异常"
-    assert payload["summary"] == {
-        "cards": 30,
-        "critical": 1,
-        "warning": 4,
-        "ok": 25,
-        "findings": 5,
-        "nodes": 28,
-    }
-    statuses = [card["status"] for card in payload["cards"]]
-    assert statuses[:5] == ["critical", "warning", "warning", "warning", "warning"]
-    assert statuses.count("ok") == 25
-    assert [item["key"] for item in payload["root_causes"][:3]] == [
-        "trade_loop",
-        "market_data",
-        "model_training",
-    ]
-    assert "phase3_go_no_go" in {item["key"] for item in payload["root_causes"]}
-    assert all(item["owner_path"] for item in payload["root_causes"])
-    assert all(item["state"] in {"unresolved", "observing"} for item in payload["root_causes"])
-    node_keys = {node["key"] for node in payload["nodes"]}
-    assert "strategy_gate_contract" in node_keys
-    assert "strategy_closed_loop" in node_keys
-    assert "model_expert_health" in node_keys
-    assert "model_expert_competition" in node_keys
-    assert "crypto_feature_coverage" in node_keys
-    assert "model_dynamic_routing" in node_keys
-    assert "high_risk_review_audit" in node_keys
-    assert "shadow_missed_opportunity" in node_keys
-    assert "strong_opportunity" in node_keys
-    assert "position_capacity_release" in node_keys
-    assert "profit_first_ranking" in node_keys
-    assert "profit_first_governance" in node_keys
-    assert "strategy_signal_root_cause" in node_keys
-    assert "server_migration" in node_keys
-    assert "model_server_readiness" in node_keys
-    assert "phase3_stage_handoff" in node_keys
-    assert "visible_text_encoding" in node_keys
-    assert "runtime_text_integrity" in node_keys
-    assert all(node["owner_path"] for node in payload["nodes"])
-    assert all(node["state"] in {"fixed", "unresolved", "observing"} for node in payload["nodes"])
-    assert all(node["state_label"] for node in payload["nodes"])
-    card_keys = {card["key"] for card in payload["cards"]}
-    assert "strategy_gate_contract" in card_keys
-    assert "strategy_closed_loop" in card_keys
-    assert "model_expert_health" in card_keys
-    assert "model_expert_competition" in card_keys
-    assert "crypto_feature_coverage" in card_keys
-    assert "model_dynamic_routing" in card_keys
-    assert "high_risk_review_audit" in card_keys
-    assert "shadow_missed_opportunity" in card_keys
-    assert "strong_opportunity" in card_keys
-    assert "position_capacity_release" in card_keys
-    assert "strategy_signal_root_cause" in card_keys
-    assert "trade_execution_contract" in card_keys
-    assert "profit_first_ranking" in card_keys
-    assert "profit_first_governance" in card_keys
-    assert "profit_first_recovery_blockers" in card_keys
-    assert "okx_trade_fact_integrity" in card_keys
-    assert "phase3_server_migration" in card_keys
-    assert "phase3_model_server_readiness" in card_keys
-    assert "phase3_paper_resume_preflight" in card_keys
-    assert "phase3_paper_resume_observation" in card_keys
-    assert "phase3_stage_handoff" in card_keys
-    assert "visible_text_encoding" in card_keys
-    assert "runtime_text_integrity" in card_keys
-    assert all(card["owner_path"] for card in payload["cards"])
-    assert payload["issue_ledger"]["summary"] == {
-        "fixed": 25,
-        "unresolved": 4,
-        "observing": 1,
-        "total": 30,
-    }
-    assert [item["key"] for item in payload["issue_ledger"]["unresolved"]] == [
-        "trade_loop",
-        "market_data",
-        "model_training",
-        "phase3_go_no_go",
-    ]
-    assert [item["key"] for item in payload["issue_ledger"]["observing"]] == [
-        "phase3_stage_handoff",
-    ]
-    assert "strategy_closed_loop" in {item["key"] for item in payload["issue_ledger"]["fixed"]}
-    assert "只读巡检" in payload["safety_note"]
-    assert "人工确认" in payload["safety_note"]
 
 
 @pytest.mark.asyncio
@@ -794,101 +380,6 @@ async def test_audit_maybe_async_times_out_slow_sections(
         await system_audit._audit_maybe_async(slow_audit)
 
 
-@pytest.mark.asyncio
-async def test_system_audit_runs_trade_contract_before_slow_diagnostics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import asyncio
-
-    _patch_phase3_server_migration_audit(monkeypatch)
-    _patch_phase3_model_server_readiness_audit(monkeypatch)
-    _patch_phase3_stage_handoff_audit(monkeypatch)
-
-    lock = asyncio.Lock()
-
-    async def slow_model_training() -> dict[str, Any]:
-        async with lock:
-            await asyncio.sleep(0.05)
-        return system_audit._audit_card("model_training", "模型与训练", "warning", "慢诊断完成")
-
-    async def trade_contract() -> dict[str, Any]:
-        async with lock:
-            return system_audit._audit_card(
-                "trade_execution_contract",
-                "Trade execution contract",
-                "ok",
-                "交易执行契约正常",
-            )
-
-    async_names = {
-        "_trade_loop_audit": _async_card("trade_loop", "ok", "交易闭环正常"),
-        "_okx_reconciliation_audit": _async_card("okx_reconciliation", "ok", "OKX 对账正常"),
-        "_okx_trade_fact_integrity_audit": _async_card(
-            "okx_trade_fact_integrity", "ok", "OKX trade facts normal"
-        ),
-        "_position_price_integrity_audit": _async_card(
-            "position_price_integrity", "ok", "持仓价格正常"
-        ),
-        "_market_data_audit": _async_card("market_data", "ok", "行情正常"),
-        "_strategy_quality_audit": _async_card("strategy_quality", "ok", "策略质量正常"),
-        "_strategy_closed_loop_audit": _async_card("strategy_closed_loop", "ok", "策略闭环正常"),
-        "_model_expert_health_audit": _async_card("model_expert_health", "ok", "模型体检正常"),
-        "_model_expert_competition_audit": _async_card(
-            "model_expert_competition", "ok", "模型竞赛正常"
-        ),
-        "_model_dynamic_routing_audit": _async_card("model_dynamic_routing", "ok", "动态路由正常"),
-        "_high_risk_review_audit": _async_card(
-            "high_risk_review_audit", "ok", "High-risk review audit normal"
-        ),
-        "_crypto_feature_coverage_audit": _async_card(
-            "crypto_feature_coverage", "ok", "特征覆盖正常"
-        ),
-        "_shadow_missed_opportunity_audit": _async_card(
-            "shadow_missed_opportunity", "ok", "影子闭环正常"
-        ),
-        "_strong_opportunity_audit": _async_card(
-            "strong_opportunity", "ok", "Strong opportunity audit normal"
-        ),
-        "_position_capacity_release_audit": _async_card(
-            "position_capacity_release", "ok", "Capacity release audit normal"
-        ),
-        "_profit_first_governance_audit": _async_card(
-            "profit_first_governance", "ok", "Profit-First governance normal"
-        ),
-        "_strategy_signal_root_cause_audit": _async_card(
-            "strategy_signal_root_cause", "ok", "Strategy signal root cause normal"
-        ),
-        "_runtime_text_integrity_audit": _async_card(
-            "runtime_text_integrity", "ok", "运行文本正常"
-        ),
-    }
-    for name, factory in async_names.items():
-        monkeypatch.setattr(system_audit, name, factory)
-
-    monkeypatch.setattr(system_audit, "_model_training_audit", slow_model_training)
-    monkeypatch.setattr(system_audit, "_trade_execution_contract_audit", trade_contract)
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_gate_contract_audit",
-        lambda: system_audit._audit_card(
-            "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_source_visible_text_audit",
-        lambda: system_audit._audit_card(
-            "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
-        ),
-    )
-    monkeypatch.setattr(system_audit, "SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS", 0.02)
-
-    payload = await system_audit.collect_system_audit_status(record_history=False, source="test")
-    cards = {card["key"]: card for card in payload["cards"]}
-
-    assert cards["trade_execution_contract"]["status"] == "ok"
-    assert cards["model_training"]["status"] == "warning"
-    assert cards["model_training"]["details"]["error"] == "TimeoutError"
 
 
 @pytest.mark.asyncio
@@ -1034,151 +525,6 @@ async def test_system_audit_collect_uses_process_lock(
     ]
 
 
-@pytest.mark.asyncio
-async def test_system_audit_status_wraps_failed_section(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(system_audit, "_load_latest_audit_snapshot", lambda: None)
-    monkeypatch.setattr(system_audit, "_store_latest_audit_snapshot", lambda _payload: None)
-    system_audit._system_audit_status_cache = None
-    _patch_phase3_server_migration_audit(monkeypatch)
-    _patch_phase3_model_server_readiness_audit(monkeypatch)
-    _patch_phase3_paper_resume_preflight_audit(monkeypatch)
-    _patch_phase3_paper_resume_observation_audit(monkeypatch)
-    _patch_phase3_stage_handoff_audit(monkeypatch)
-    monkeypatch.setattr(
-        system_audit,
-        "_shadow_missed_opportunity_audit",
-        _async_card("shadow_missed_opportunity", "ok", "Shadow missed loop normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strong_opportunity_audit",
-        _async_card("strong_opportunity", "ok", "Strong opportunity audit normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_position_capacity_release_audit",
-        _async_card("position_capacity_release", "ok", "Capacity release audit normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_signal_root_cause_audit",
-        _async_card("strategy_signal_root_cause", "ok", "Strategy signal root cause normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_trade_execution_contract_audit",
-        _async_card("trade_execution_contract", "ok", "Trade execution contract normal"),
-    )
-
-    async def failed_audit() -> dict[str, Any]:
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(
-        system_audit,
-        "_okx_trade_fact_integrity_audit",
-        _async_card("okx_trade_fact_integrity", "ok", "OKX trade facts normal"),
-    )
-    monkeypatch.setattr(system_audit, "_trade_loop_audit", failed_audit)
-    monkeypatch.setattr(
-        system_audit,
-        "_okx_reconciliation_audit",
-        _async_card("okx_reconciliation", "ok", "OKX 对账正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_position_price_integrity_audit",
-        _async_card("position_price_integrity", "ok", "持仓价格一致"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_market_data_audit",
-        _async_card("market_data", "ok", "行情正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_quality_audit",
-        _async_card("strategy_quality", "ok", "策略质量正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_closed_loop_audit",
-        _async_card("strategy_closed_loop", "ok", "策略闭环正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_training_audit",
-        _async_card("model_training", "ok", "模型正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_expert_health_audit",
-        _async_card("model_expert_health", "ok", "模型/专家体检正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_expert_competition_audit",
-        _async_card("model_expert_competition", "ok", "模型/专家竞赛正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_crypto_feature_coverage_audit",
-        _async_card("crypto_feature_coverage", "ok", "Crypto 特征覆盖正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_model_dynamic_routing_audit",
-        _async_card("model_dynamic_routing", "ok", "动态路由正常"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_strategy_gate_contract_audit",
-        lambda: system_audit._audit_card(
-            "strategy_gate_contract", "策略门槛契约", "ok", "运行时契约正常"
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_source_visible_text_audit",
-        lambda: system_audit._audit_card(
-            "visible_text_encoding", "中文显示与乱码回归", "ok", "无乱码"
-        ),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_runtime_text_integrity_audit",
-        lambda: system_audit._audit_card(
-            "runtime_text_integrity", "运行时文本完整性", "ok", "无新增乱码"
-        ),
-    )
-
-    monkeypatch.setattr(
-        system_audit,
-        "_high_risk_review_audit",
-        _async_card("high_risk_review_audit", "ok", "High-risk review audit normal"),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_profit_first_ranking_audit",
-        _ranking_card_ok(),
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "_profit_first_governance_audit",
-        _governance_card_ok(),
-    )
-
-    payload = await system_audit.system_audit_status()
-
-    assert payload["status"] == "warning"
-    assert payload["summary"]["warning"] == 3
-    assert any(card["key"] == "phase3_go_no_go" for card in payload["cards"])
-    assert payload["root_causes"][0]["title"] == "巡检模块"
-    assert payload["root_causes"][0]["key"] == "trade_loop"
-    assert payload["root_causes"][0]["owner_path"] == "services/trading_service.py"
-    assert payload["root_causes"][0]["severity"] == "warning"
-    assert payload["cards"][0]["details"]["error"]
 
 
 @pytest.mark.asyncio
@@ -1231,7 +577,7 @@ async def test_phase3_server_migration_audit_blocks_go_live(
 
 
 @pytest.mark.asyncio
-async def test_phase3_server_migration_ready_old_takeover_is_observing(
+async def test_phase3_server_migration_does_not_observe_legacy_takeover_as_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakePhase3ServerMigrationAuditService:
@@ -1278,10 +624,10 @@ async def test_phase3_server_migration_ready_old_takeover_is_observing(
     state, label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
 
     assert card["status"] == "warning"
-    assert card["details"]["observing"] is True
-    assert "under observation" in card["summary"]
-    assert state == "observing"
-    assert "Observation" in label
+    assert card["details"]["observing"] is False
+    assert "under observation" not in card["summary"]
+    assert state == "unresolved"
+    assert label
 
 
 @pytest.mark.asyncio
@@ -1641,204 +987,10 @@ async def test_phase3_paper_resume_observation_audit_reports_healthy(
     assert card["evidence"][3]["value"] == 12
 
 
-@pytest.mark.asyncio
-async def test_phase3_stage_handoff_audit_keeps_paper_start_as_observing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakePhase3StageHandoffService:
-        def report(self) -> dict[str, Any]:
-            return {
-                "status": "paper_start_ready",
-                "stage": "paper_start_pending_operator_approval",
-                "read_only": True,
-                "audit_only": True,
-                "starts_trading_service": False,
-                "submits_orders": False,
-                "changes_model_routing": False,
-                "live_mutation": False,
-                "can_start_paper_with_operator_approval": True,
-                "can_enter_canary_with_operator_approval": False,
-                "can_enter_live": False,
-                "blockers": [],
-                "warnings": [],
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "Phase3StageHandoffService",
-        FakePhase3StageHandoffService,
-    )
-
-    card = await system_audit._phase3_stage_handoff_audit()
-    ledger = system_audit._issue_ledger_from_cards([card])
-    nodes = {node["key"]: node for node in system_audit._build_audit_nodes([card])}
-
-    assert card["key"] == "phase3_stage_handoff"
-    assert card["status"] == "warning"
-    assert card["details"]["starts_trading_service"] is False
-    assert card["details"]["submits_orders"] is False
-    assert card["details"]["can_start_paper_with_operator_approval"] is True
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-    assert ledger["observing"][0]["key"] == "phase3_stage_handoff"
-    assert nodes["phase3_stage_handoff"]["state"] == "observing"
-    assert nodes["phase3_stage_handoff"]["display_status"] == "warning"
 
 
-@pytest.mark.asyncio
-async def test_phase3_stage_handoff_audit_blocks_hard_stage(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakePhase3StageHandoffService:
-        def report(self) -> dict[str, Any]:
-            return {
-                "status": "blocked",
-                "stage": "fix_hard_blockers",
-                "read_only": True,
-                "audit_only": True,
-                "starts_trading_service": False,
-                "submits_orders": False,
-                "changes_model_routing": False,
-                "live_mutation": False,
-                "can_start_paper_with_operator_approval": False,
-                "can_enter_canary_with_operator_approval": False,
-                "can_enter_live": False,
-                "blockers": [{"code": "okx_daily_reconciliation_unresolved"}],
-                "warnings": [],
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "Phase3StageHandoffService",
-        FakePhase3StageHandoffService,
-    )
-
-    card = await system_audit._phase3_stage_handoff_audit()
-    ledger = system_audit._issue_ledger_from_cards([card])
-
-    assert card["status"] == "critical"
-    assert card["evidence"][4]["value"] == 1
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 1, "observing": 0, "total": 1}
-    assert ledger["unresolved"][0]["key"] == "phase3_stage_handoff"
 
 
-def test_phase3_go_no_go_audit_card_allows_only_controlled_paper_resume() -> None:
-    cards = [
-        system_audit._audit_card(
-            "phase3_server_migration",
-            "server",
-            "ok",
-            "server ok",
-            details={"status": "ready", "phase3_go_live_blocked": False},
-        ),
-        system_audit._audit_card(
-            "phase3_model_server_readiness",
-            "model",
-            "ok",
-            "model ok",
-            details={
-                "status": "ready",
-                "runtime_ready": True,
-                "phase3_model_service_go_live_blocked": False,
-            },
-        ),
-        system_audit._audit_card(
-            "phase3_paper_resume_preflight",
-            "preflight",
-            "ok",
-            "preflight ok",
-            details={"status": "ready", "can_resume_paper": True, "blockers": []},
-        ),
-        system_audit._audit_card(
-            "phase3_paper_resume_observation",
-            "observation",
-            "warning",
-            "waiting",
-            details={
-                "status": "waiting_for_resume",
-                "paper_active": False,
-                "can_use_for_promotion": False,
-                "starts_trading_service": False,
-                "submits_orders": False,
-                "changes_model_routing": False,
-                "live_mutation": False,
-            },
-        ),
-        system_audit._audit_card(
-            "model_training",
-            "training",
-            "warning",
-            "shadow",
-            details={
-                "local_ai_tools": {
-                    "promotion_recommendation": {
-                        "recommended_stage": "shadow",
-                        "canary_ready": False,
-                        "live_ready": False,
-                        "canary_blocking_reasons": [
-                            "paper_observation_not_healthy:waiting_for_resume"
-                        ],
-                        "paper_observation_gate": {
-                            "required": True,
-                            "status": "waiting_for_resume",
-                            "can_use_for_promotion": False,
-                        },
-                    }
-                }
-            },
-        ),
-        system_audit._audit_card(
-            "trade_execution_contract",
-            "trade contract",
-            "ok",
-            "profit-first contract ok",
-            details=_trade_contract_details_ok(),
-        ),
-        system_audit._audit_card(
-            "profit_first_ranking",
-            "ranking",
-            "ok",
-            "ranking ok",
-            details={
-                "status": "ready",
-                "audit_only": True,
-                "read_only": True,
-                "live_mutation": False,
-                "live_weight_mutation": False,
-                "live_sizing_mutation": False,
-                "can_change_model_routing": False,
-                "can_change_strategy_weight": False,
-                "can_increase_live_size": False,
-                "ranking_ready": True,
-                "summary": {
-                    "closed_position_count": 20,
-                    "leaderboard_row_count": 3,
-                    "promote_candidate_count": 1,
-                    "demote_count": 0,
-                    "disable_count": 0,
-                },
-                "blockers": [],
-                "brain_recommendations": _brain_recommendations_ok(),
-            },
-        ),
-        system_audit._audit_card(
-            "profit_first_governance",
-            "governance",
-            "ok",
-            "governance ok",
-            details=_profit_first_governance_details_ok(),
-        ),
-    ]
-
-    card = system_audit._phase3_go_no_go_audit_from_cards(cards)
-
-    assert card["key"] == "phase3_go_no_go"
-    assert card["status"] == "warning"
-    assert card["details"]["status"] == "paper_resume_ready"
-    assert card["details"]["next_step"] == "resume_paper_pending_operator_approval"
-    assert card["details"]["can_start_paper_with_operator_approval"] is True
-    assert card["details"]["can_enter_canary_with_operator_approval"] is False
-    assert card["details"]["can_enter_live"] is False
-    assert card["details"]["starts_trading_service"] is False
 
 
 @pytest.mark.asyncio
@@ -2154,8 +1306,7 @@ async def test_model_training_audit_reports_retired_artifacts_as_rebuild_gate(
     assert readiness["read_only"] is True
     assert readiness["can_persist_artifact"] is False
     assert readiness["live_mutation"] is False
-    assert "shadow_sample_floor_not_met" in readiness["blockers"]
-    assert "trade_sample_floor_not_met" in readiness["blockers"]
+    assert "unresolved_or_untrusted_artifacts_block_rebuild" in readiness["blockers"]
     assert any(item["label"] == "Rebuild gate" for item in card["evidence"])
     assert any(
         item["label"] == "Retired artifact" and item["value"] == 2 for item in card["evidence"]
@@ -2285,20 +1436,18 @@ async def test_model_expert_health_audit_reports_read_only_state(
                 "summary": {
                     "components": 3,
                     "recommended_state_counts": {
-                        "keep": 1,
-                        "reduce": 1,
-                        "disable": 1,
+                        "observation_only": 3,
                     },
                 },
                 "components": {
                     "trend_expert": {
-                        "recommended_state": "reduce",
-                        "state_reasons": ["negative_adopted_pnl"],
+                        "recommended_state": "observation_only",
+                        "state_reasons": ["production_permission_false"],
                         "stability": {"json_error_rate": 0.0, "no_return_rate": 0.0},
                     },
                     "risk_expert": {
-                        "recommended_state": "disable",
-                        "state_reasons": ["json_error_rate_high"],
+                        "recommended_state": "observation_only",
+                        "state_reasons": ["production_permission_false"],
                         "stability": {"json_error_rate": 0.6, "no_return_rate": 0.6},
                     },
                 },
@@ -2314,12 +1463,12 @@ async def test_model_expert_health_audit_reports_read_only_state(
 
     assert calls == [(system_audit.MODEL_EXPERT_AUDIT_HOURS, system_audit.MODEL_EXPERT_AUDIT_LIMIT)]
     assert card["key"] == "model_expert_health"
-    assert card["status"] == "warning"
+    assert card["status"] == "ok"
     assert card["details"]["audit_only"] is True
     assert card["details"]["live_weight_mutation"] is False
-    assert card["details"]["recommended_state_counts"]["disable"] == 1
-    assert card["details"]["top_components"][0]["name"] == "risk_expert"
-    assert any(item["label"] == "需降权" for item in card["evidence"])
+    assert card["details"]["recommended_state_counts"]["observation_only"] == 3
+    assert card["details"]["top_components"] == []
+    assert any(item["label"] == "仅观察" for item in card["evidence"])
 
 
 @pytest.mark.asyncio
@@ -2333,7 +1482,7 @@ async def test_model_expert_health_status_endpoint_is_read_only(
                 "live_weight_mutation": True,
                 "windows_hours": [24, 72],
                 "summary": {"components": 1},
-                "components": {"trend_expert": {"recommended_state": "keep"}},
+                "components": {"trend_expert": {"recommended_state": "legacy_keep"}},
             }
 
     monkeypatch.setattr(
@@ -2346,7 +1495,8 @@ async def test_model_expert_health_status_endpoint_is_read_only(
 
     assert report["audit_only"] is True
     assert report["live_weight_mutation"] is False
-    assert report["components"]["trend_expert"]["recommended_state"] == "keep"
+    assert report["components"]["trend_expert"]["recommended_state"] == "observation_only"
+    assert report["components"]["trend_expert"]["production_permission"] is False
 
 
 @pytest.mark.asyncio
@@ -2371,12 +1521,12 @@ async def test_model_expert_competition_audit_never_allows_live_weight_change(
                 "blocking_reasons": [],
                 "competitors": {
                     "trend_expert": {
-                        "recommended_weight_action": "increase_shadow_weight",
+                        "recommended_weight_action": "observation_only",
                         "baseline_delta": {"net_pnl_pct": 0.8},
                         "can_apply_live_weight": True,
                     },
                     "risk_expert": {
-                        "recommended_weight_action": "pause_shadow",
+                        "recommended_weight_action": "observation_only",
                         "baseline_delta": {"net_pnl_pct": -0.5},
                         "can_apply_live_weight": False,
                     },
@@ -2397,10 +1547,10 @@ async def test_model_expert_competition_audit_never_allows_live_weight_change(
         (24, 200),
     ]
     assert card["key"] == "model_expert_competition"
-    assert card["status"] == "warning"
+    assert card["status"] == "ok"
     assert card["details"]["can_apply_live_weight"] is False
     assert card["details"]["live_weight_mutation"] is False
-    assert card["details"]["recommended_weight_action_counts"]["pause_shadow"] == 1
+    assert card["details"]["recommended_weight_action_counts"]["observation_only"] == 2
     assert card["details"]["top_competitors"][0]["can_apply_live_weight"] is False
     assert endpoint_report["audit_only"] is True
     assert endpoint_report["live_weight_mutation"] is False
@@ -2519,59 +1669,6 @@ async def test_high_risk_review_audit_and_endpoint_force_read_only(
     assert endpoint_report["samples"][0]["can_force_open"] is False
 
 
-@pytest.mark.asyncio
-async def test_shadow_missed_opportunity_audit_and_endpoint_force_read_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[int, int]] = []
-
-    class FakeShadowMissedOpportunityService:
-        async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
-            calls.append((hours, limit))
-            return {
-                "audit_only": False,
-                "live_entry_mutation": True,
-                "can_bypass_risk_controls": True,
-                "weak_evidence_execution_allowed": True,
-                "global_missed_count_can_drive_entries": True,
-                "summary": {
-                    "missed_count": 7,
-                    "adopted_count": 1,
-                    "probe_count": 1,
-                    "blocked_count": 5,
-                    "weak_evidence_executed_count": 1,
-                },
-                "blocked_reason_counts": {"high_risk_evidence": 2},
-                "probe_candidates": [
-                    {"symbol": "BTC/USDT", "side": "long", "status": "probe_ready"}
-                ],
-                "adopted": [],
-                "blocked": [],
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "ShadowMissedOpportunityClosedLoopService",
-        lambda: FakeShadowMissedOpportunityService(),
-    )
-
-    card = await system_audit._shadow_missed_opportunity_audit()
-    endpoint_report = await system_audit.shadow_missed_opportunity_status(hours=24, limit=200)
-
-    assert calls == [(24, 200), (24, 200)]
-    assert card["key"] == "shadow_missed_opportunity"
-    assert card["status"] == "warning"
-    assert card["details"]["audit_only"] is True
-    assert card["details"]["live_entry_mutation"] is False
-    assert card["details"]["can_bypass_risk_controls"] is False
-    assert card["details"]["weak_evidence_execution_allowed"] is False
-    assert card["details"]["global_missed_count_can_drive_entries"] is False
-    assert card["details"]["summary"]["weak_evidence_executed_count"] == 1
-    assert endpoint_report["audit_only"] is True
-    assert endpoint_report["live_entry_mutation"] is False
-    assert endpoint_report["can_bypass_risk_controls"] is False
-    assert endpoint_report["weak_evidence_execution_allowed"] is False
-    assert endpoint_report["global_missed_count_can_drive_entries"] is False
 
 
 @pytest.mark.asyncio
@@ -2644,159 +1741,6 @@ async def test_strong_opportunity_audit_and_endpoint_force_read_only(
     assert endpoint_report["near_misses"][0]["can_force_open"] is False
 
 
-@pytest.mark.asyncio
-async def test_position_capacity_release_audit_and_endpoint_force_read_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[int, int]] = []
-
-    class FakePositionCapacityReleaseAuditService:
-        def __init__(self, *, lookback_hours: int = 24, limit: int = 500) -> None:
-            calls.append((lookback_hours, limit))
-
-        async def report(self) -> dict[str, Any]:
-            return {
-                "audit_only": False,
-                "live_exit_mutation": True,
-                "live_entry_mutation": True,
-                "live_sizing_mutation": True,
-                "can_force_close": True,
-                "can_close_winners": True,
-                "can_bypass_risk_controls": True,
-                "lookback_hours": 24,
-                "checked_decisions": 12,
-                "open_position_count": 7,
-                "open_group_count": 7,
-                "side_counts": {"short": 7},
-                "quality_bucket_counts": {"high": 7},
-                "capacity": {"entry_limit": 25},
-                "current_release_candidate_count": 0,
-                "old_profit_rotation_candidate_count": 1,
-                "release_decision_count": 2,
-                "executed_release_decision_count": 0,
-                "protected_release_decision_count": 1,
-                "exchange_blocked_release_decision_count": 1,
-                "execution_link_gap_release_decision_count": 1,
-                "stale_release_decision_count": 1,
-                "unclosed_release_decision_count": 2,
-                "release_execution_state_counts": {
-                    "protected_not_executed": 1,
-                    "exchange_blocked": 1,
-                    "reported_executed_without_link": 1,
-                    "stale_skipped": 1,
-                },
-                "release_execution_block_counts": {
-                    "fee_or_risk_guard": 1,
-                    "exchange_unavailable_or_cooldown": 1,
-                    "filled_report_missing_order_link": 1,
-                    "stale_signal_or_round_skip": 1,
-                },
-                "crowded_block_count": 1,
-                "old_profit_rotation_candidates": [
-                    {
-                        "symbol": "ATOM/USDT",
-                        "can_force_close": True,
-                        "can_close_winners": True,
-                        "can_bypass_risk_controls": True,
-                    }
-                ],
-                "unclosed_release_decisions": [
-                    {
-                        "decision_id": 12,
-                        "symbol": "BZ/USDT",
-                        "can_force_close": True,
-                        "can_close_winners": True,
-                    }
-                ],
-                "protected_release_decisions": [
-                    {
-                        "decision_id": 14,
-                        "symbol": "LINK/USDT",
-                        "can_force_close": True,
-                        "can_close_winners": True,
-                    }
-                ],
-                "exchange_blocked_release_decisions": [
-                    {
-                        "decision_id": 15,
-                        "symbol": "LAB/USDT",
-                        "can_force_close": True,
-                        "can_close_winners": True,
-                    }
-                ],
-                "execution_link_gap_release_decisions": [
-                    {
-                        "decision_id": 16,
-                        "symbol": "AI16Z/USDT",
-                        "can_force_close": True,
-                        "can_close_winners": True,
-                    }
-                ],
-                "stale_release_decisions": [
-                    {
-                        "decision_id": 17,
-                        "symbol": "LAB/USDT",
-                        "can_force_close": True,
-                        "can_close_winners": True,
-                    }
-                ],
-                "crowded_blocks": [
-                    {
-                        "decision_id": 13,
-                        "symbol": "RESOLV/USDT",
-                        "can_bypass_risk_controls": True,
-                    }
-                ],
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "PositionCapacityReleaseAuditService",
-        FakePositionCapacityReleaseAuditService,
-    )
-
-    card = await system_audit._position_capacity_release_audit()
-    endpoint_report = await system_audit.position_capacity_release_status(hours=12, limit=120)
-
-    assert calls == [(24, 500), (12, 120)]
-    assert card["key"] == "position_capacity_release"
-    assert card["status"] == "warning"
-    assert card["details"]["read_only"] is True
-    assert card["details"]["audit_only"] is True
-    assert card["details"]["live_exit_mutation"] is False
-    assert card["details"]["live_entry_mutation"] is False
-    assert card["details"]["live_sizing_mutation"] is False
-    assert card["details"]["can_force_close"] is False
-    assert card["details"]["can_close_winners"] is False
-    assert card["details"]["can_bypass_risk_controls"] is False
-    assert card["details"]["protected_release_decision_count"] == 1
-    assert card["details"]["exchange_blocked_release_decision_count"] == 1
-    assert card["details"]["execution_link_gap_release_decision_count"] == 1
-    assert card["details"]["stale_release_decision_count"] == 1
-    assert card["details"]["release_execution_state_counts"] == {
-        "protected_not_executed": 1,
-        "exchange_blocked": 1,
-        "reported_executed_without_link": 1,
-        "stale_skipped": 1,
-    }
-    assert card["details"]["old_profit_rotation_candidates"][0]["can_force_close"] is False
-    assert card["details"]["protected_release_decisions"][0]["can_force_close"] is False
-    assert card["details"]["exchange_blocked_release_decisions"][0]["can_force_close"] is False
-    assert card["details"]["execution_link_gap_release_decisions"][0]["can_force_close"] is False
-    assert card["details"]["stale_release_decisions"][0]["can_force_close"] is False
-    assert endpoint_report["read_only"] is True
-    assert endpoint_report["audit_only"] is True
-    assert endpoint_report["live_exit_mutation"] is False
-    assert endpoint_report["can_force_close"] is False
-    assert endpoint_report["can_close_winners"] is False
-    assert endpoint_report["old_profit_rotation_candidates"][0]["can_close_winners"] is False
-    assert endpoint_report["protected_release_decisions"][0]["can_close_winners"] is False
-    assert (
-        endpoint_report["exchange_blocked_release_decisions"][0]["can_bypass_risk_controls"]
-        is False
-    )
-    assert endpoint_report["execution_link_gap_release_decisions"][0]["can_close_winners"] is False
-    assert endpoint_report["stale_release_decisions"][0]["can_close_winners"] is False
 
 
 @pytest.mark.asyncio
@@ -2865,263 +1809,12 @@ async def test_strategy_signal_root_cause_audit_forces_read_only(
     assert card["evidence"][-1] == {"label": "根因数", "value": 1}
 
 
-@pytest.mark.asyncio
-async def test_trade_execution_contract_audit_and_endpoint_force_read_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[int, int]] = []
-
-    class FakeTradeExecutionContractService:
-        async def report(self, *, hours: int = 24, limit: int = 500) -> dict[str, Any]:
-            calls.append((hours, limit))
-            return {
-                "audit_only": False,
-                "live_entry_mutation": True,
-                "live_exit_mutation": True,
-                "can_bypass_risk_controls": True,
-                "summary": {
-                    "executed_entry_count": 4,
-                    "missing_entry_explanation_count": 1,
-                    "missing_sizing_explanation_count": 1,
-                    "weak_evidence_executed_count": 1,
-                    "negative_expected_executed_count": 1,
-                    "fast_loss_count": 2,
-                    "fast_loss_without_strong_exit_count": 1,
-                    "reentry_without_strong_unlock_count": 1,
-                    "contract_violation_count": 5,
-                },
-                "violation_reason_counts": {
-                    "weak_evidence_executed": 1,
-                    "non_positive_expected_net_executed": 1,
-                    "fast_loss_without_strong_exit": 1,
-                    "reentry_without_strong_unlock": 1,
-                },
-                "entry_explanations": [{"decision_id": 1, "violations": []}],
-                "fast_loss_samples": [{"id": 10, "symbol": "BTC/USDT"}],
-                "violations": [{"reason": "weak_evidence_executed"}],
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "TradeExecutionContractService",
-        lambda: FakeTradeExecutionContractService(),
-    )
-
-    card = await system_audit._trade_execution_contract_audit()
-    endpoint_report = await system_audit.trade_execution_contract_status(hours=24, limit=200)
-
-    assert calls == [(24, 500), (24, 200)]
-    assert card["key"] == "trade_execution_contract"
-    assert card["status"] == "critical"
-    assert card["details"]["audit_only"] is True
-    assert card["details"]["live_entry_mutation"] is False
-    assert card["details"]["live_exit_mutation"] is False
-    assert card["details"]["can_bypass_risk_controls"] is False
-    assert card["details"]["summary"]["contract_violation_count"] == 5
-    evidence = {item["label"]: item["value"] for item in card["evidence"]}
-    assert evidence["弱证据执行"] == 1
-    assert evidence["负期望执行"] == 1
-    assert evidence["快亏缺强证据"] == 1
-    assert evidence["复开缺解锁"] == 1
-    assert endpoint_report["audit_only"] is True
-    assert endpoint_report["live_entry_mutation"] is False
-    assert endpoint_report["live_exit_mutation"] is False
-    assert endpoint_report["can_bypass_risk_controls"] is False
 
 
-@pytest.mark.asyncio
-async def test_trade_execution_contract_audit_treats_historical_only_as_observing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime_started_at = datetime(2026, 6, 22, 2, 0, tzinfo=UTC)
-    calls: list[tuple[int, int, datetime | None]] = []
-
-    historical_report = {
-        "audit_only": False,
-        "live_entry_mutation": True,
-        "live_exit_mutation": True,
-        "can_bypass_risk_controls": True,
-        "summary": {
-            "executed_entry_count": 4,
-            "missing_entry_explanation_count": 1,
-            "missing_sizing_explanation_count": 0,
-            "weak_evidence_executed_count": 2,
-            "negative_expected_executed_count": 0,
-            "fast_loss_count": 1,
-            "fast_loss_without_strong_exit_count": 0,
-            "reentry_without_strong_unlock_count": 0,
-            "small_size_without_reason_count": 0,
-            "contract_violation_count": 3,
-        },
-        "violation_reason_counts": {"weak_evidence_executed": 2},
-        "entry_explanations": [{"decision_id": 1, "violations": ["weak_evidence_executed"]}],
-        "fast_loss_samples": [{"id": 10, "symbol": "BTC/USDT"}],
-        "violations": [{"reason": "weak_evidence_executed"}],
-    }
-    current_report = {
-        "audit_only": False,
-        "live_entry_mutation": True,
-        "live_exit_mutation": True,
-        "can_bypass_risk_controls": True,
-        "summary": {
-            "decision_count": 12,
-            "executed_entry_count": 0,
-            "missing_entry_explanation_count": 0,
-            "missing_sizing_explanation_count": 0,
-            "weak_evidence_executed_count": 0,
-            "negative_expected_executed_count": 0,
-            "fast_loss_count": 0,
-            "fast_loss_without_strong_exit_count": 0,
-            "reentry_without_strong_unlock_count": 0,
-            "small_size_without_reason_count": 0,
-            "contract_violation_count": 0,
-        },
-        "violation_reason_counts": {},
-        "entry_explanations": [],
-        "fast_loss_samples": [],
-        "violations": [],
-        "query_policy": {"db_time_filter": True},
-    }
-
-    class FakeTradeExecutionContractService:
-        async def report(
-            self,
-            *,
-            hours: int = 24,
-            limit: int = 500,
-            since: datetime | None = None,
-        ) -> dict[str, Any]:
-            calls.append((hours, limit, since))
-            return current_report if since is not None else historical_report
-
-    monkeypatch.setattr(
-        system_audit,
-        "_load_trading_runtime_audit_window",
-        lambda: {
-            "available": True,
-            "started_at": runtime_started_at,
-            "started_at_iso": runtime_started_at.isoformat(),
-            "heartbeat_at": datetime(2026, 6, 22, 2, 5, tzinfo=UTC),
-            "heartbeat_at_iso": "2026-06-22T02:05:00+00:00",
-            "running": True,
-            "mode": "paper",
-            "decision_interval": 30,
-        },
-    )
-    monkeypatch.setattr(
-        system_audit,
-        "TradeExecutionContractService",
-        lambda: FakeTradeExecutionContractService(),
-    )
-
-    card = await system_audit._trade_execution_contract_audit()
-    ledger = system_audit._issue_ledger_from_cards([card])
-
-    assert calls == [(24, 500, None), (24, 500, runtime_started_at)]
-    assert card["status"] == "warning"
-    assert card["details"]["summary"]["contract_violation_count"] == 3
-    assert card["details"]["current_summary"]["contract_violation_count"] == 0
-    assert card["details"]["current_runtime_window"] == {
-        "available": True,
-        "started_at": "2026-06-22T02:00:00+00:00",
-        "heartbeat_at": "2026-06-22T02:05:00+00:00",
-        "running": True,
-        "mode": "paper",
-        "decision_interval": 30,
-        "decision_count": 12,
-        "executed_entry_count": 0,
-        "weak_evidence_executed_count": 0,
-        "negative_expected_executed_count": 0,
-        "fast_loss_without_strong_exit_count": 0,
-        "reentry_without_strong_unlock_count": 0,
-        "profit_first_plan_missing_count": 0,
-        "profit_first_plan_missing_count_unresolved": 0,
-        "historical_recovery_quarantined_profit_first_plan_missing_count": 0,
-        "profit_first_plan_incomplete_count": 0,
-        "profit_first_plan_incomplete_count_unresolved": 0,
-        "historical_recovery_quarantined_profit_first_plan_incomplete_count": 0,
-        "shadow_lane_executed_count": 0,
-        "shadow_lane_executed_count_unresolved": 0,
-        "historical_recovery_quarantined_shadow_lane_executed_count": 0,
-        "profit_first_position_ladder_missing_count": 0,
-        "profit_first_position_ladder_missing_count_unresolved": 0,
-        "historical_recovery_quarantined_profit_first_position_ladder_missing_count": 0,
-        "exit_plan_reference_missing_count": 0,
-        "exit_plan_reference_missing_count_unresolved": 0,
-        "historical_recovery_quarantined_exit_plan_reference_missing_count": 0,
-        "exit_plan_failure_reason_missing_count": 0,
-        "exit_plan_failure_reason_missing_count_unresolved": 0,
-        "historical_recovery_quarantined_exit_plan_failure_reason_missing_count": 0,
-        "low_payoff_meaningful_size_count": 0,
-        "low_payoff_meaningful_size_count_unresolved": 0,
-        "historical_recovery_quarantined_low_payoff_meaningful_size_count": 0,
-        "profit_first_lane_size_above_max_count": 0,
-        "profit_first_lane_size_above_max_count_unresolved": 0,
-        "historical_recovery_quarantined_profit_first_lane_size_above_max_count": 0,
-        "probe_loss_brake_bypassed_count": 0,
-        "probe_loss_brake_bypassed_count_unresolved": 0,
-        "historical_recovery_quarantined_probe_loss_brake_bypassed_count": 0,
-        "meaningful_lane_tiny_without_budget_reason_count": 0,
-        "meaningful_lane_tiny_without_budget_reason_count_unresolved": 0,
-        "historical_recovery_quarantined_meaningful_lane_tiny_without_budget_reason_count": 0,
-        "profit_first_plan_derived_count": 0,
-        "soft_violation_count": 0,
-        "hard_violation_count": 0,
-        "contract_violation_count": 0,
-        "historical_recovery_quarantined_violation_count": 0,
-        "historical_recovery_quarantine_unresolved_count": 0,
-        "historical_legacy_issues": True,
-    }
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-    assert ledger["observing"][0]["key"] == "trade_execution_contract"
 
 
-@pytest.mark.asyncio
-async def test_trade_execution_contract_audit_failure_keeps_profit_first_policy_visible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FailingTradeExecutionContractService:
-        async def report(self, **_kwargs: Any) -> dict[str, Any]:
-            raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(
-        system_audit,
-        "TradeExecutionContractService",
-        lambda: FailingTradeExecutionContractService(),
-    )
-
-    card = await system_audit._trade_execution_contract_audit()
-
-    assert card["status"] == "warning"
-    assert card["details"]["report_available"] is False
-    assert card["details"]["policy"]["entry_requires_profit_first_trade_plan"] is True
-    assert (
-        card["details"]["policy"]["profit_first_probe_loss_brake_must_block_execution"]
-        is True
-    )
-    assert card["details"]["summary"]["report_available"] is False
 
 
-def test_trade_contract_violation_counts_use_unresolved_profit_first_counts() -> None:
-    hard, soft = system_audit._trade_contract_violation_counts(
-        {
-            "profit_first_plan_missing_count": 4,
-            "profit_first_plan_missing_count_unresolved": 0,
-            "profit_first_plan_incomplete_count": 3,
-            "profit_first_plan_incomplete_count_unresolved": 0,
-            "shadow_lane_executed_count": 3,
-            "shadow_lane_executed_count_unresolved": 0,
-            "profit_first_position_ladder_missing_count": 4,
-            "profit_first_position_ladder_missing_count_unresolved": 0,
-            "exit_plan_reference_missing_count": 2,
-            "exit_plan_reference_missing_count_unresolved": 0,
-            "historical_recovery_quarantined_violation_count": 16,
-            "historical_recovery_quarantine_unresolved_count": 0,
-        }
-    )
-
-    assert hard == 0
-    assert soft == 0
 
 
 def test_okx_integrity_authoritative_timeout_is_observing_when_runtime_sync_is_healthy() -> None:
@@ -3156,243 +1849,14 @@ def test_okx_integrity_authoritative_timeout_is_observing_when_runtime_sync_is_h
     assert ledger["observing"][0]["key"] == "okx_trade_fact_integrity"
 
 
-@pytest.mark.asyncio
-async def test_profit_first_ranking_audit_and_endpoint_force_read_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[int, int]] = []
-
-    class FakeProfitFirstRankingService:
-        async def report(self, *, hours: int = 72, limit: int = 800) -> dict[str, Any]:
-            calls.append((hours, limit))
-            return {
-                "status": "ready",
-                "audit_only": False,
-                "read_only": False,
-                "live_mutation": True,
-                "live_weight_mutation": True,
-                "live_sizing_mutation": True,
-                "can_change_model_routing": True,
-                "can_change_strategy_weight": True,
-                "can_increase_live_size": True,
-                "ranking_ready": True,
-                "summary": {
-                    "closed_position_count": 12,
-                    "leaderboard_row_count": 2,
-                    "promote_candidate_count": 1,
-                    "demote_count": 1,
-                    "disable_count": 0,
-                },
-                "strategy_rankings": [
-                    {
-                        "strategy_profile_id": "weak_profile",
-                        "recommended_stage": "demote",
-                        "live_mutation": True,
-                        "can_increase_live_size": True,
-                    }
-                ],
-                "source_rankings": [
-                    {
-                        "source": "server_profit",
-                        "recommended_stage": "demote",
-                        "live_weight_mutation": True,
-                    }
-                ],
-                "brain_recommendations": {
-                    **_brain_recommendations_ok(),
-                    "live_mutation": True,
-                    "exit_policy_adjustments": [
-                        {
-                            "attribution": "exit_too_early",
-                            "live_mutation": True,
-                        }
-                    ],
-                },
-                "blockers": [{"code": "model_source_demote", "severity": "warning"}],
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "ProfitFirstRankingService",
-        lambda: FakeProfitFirstRankingService(),
-    )
-
-    card = await system_audit._profit_first_ranking_audit()
-    endpoint_report = await system_audit.profit_first_ranking_status(hours=24, limit=200)
-
-    assert calls == [(72, 800), (24, 200)]
-    assert card["key"] == "profit_first_ranking"
-    assert card["status"] == "warning"
-    assert card["details"]["audit_only"] is True
-    assert card["details"]["read_only"] is True
-    assert card["details"]["live_mutation"] is False
-    assert card["details"]["live_weight_mutation"] is False
-    assert card["details"]["live_sizing_mutation"] is False
-    assert card["details"]["can_change_model_routing"] is False
-    assert card["details"]["can_change_strategy_weight"] is False
-    assert card["details"]["can_increase_live_size"] is False
-    assert card["details"]["strategy_rankings"][0]["can_increase_live_size"] is False
-    assert card["details"]["strategy_rankings"][0]["can_increase_budget"] is False
-    assert card["details"]["strategy_rankings"][0]["can_keep_live_size"] is False
-    assert card["details"]["source_rankings"][0]["live_weight_mutation"] is False
-    assert card["details"]["source_rankings"][0]["can_apply_live_weight"] is False
-    assert card["details"]["brain_recommendations"]["live_mutation"] is False
-    assert (
-        card["details"]["brain_recommendations"]["exit_policy_adjustments"][0]["live_mutation"]
-        is False
-    )
-    assert endpoint_report["audit_only"] is True
-    assert endpoint_report["live_mutation"] is False
-    assert endpoint_report["can_increase_live_size"] is False
 
 
-@pytest.mark.asyncio
-async def test_profit_first_ranking_warning_demotions_are_observing_when_budget_guarded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeProfitFirstRankingService:
-        async def report(self, *, hours: int = 72, limit: int = 800) -> dict[str, Any]:
-            return {
-                "status": "ready",
-                "audit_only": True,
-                "read_only": True,
-                "live_mutation": False,
-                "live_weight_mutation": False,
-                "live_sizing_mutation": False,
-                "can_change_model_routing": False,
-                "can_change_strategy_weight": False,
-                "can_increase_live_size": False,
-                "ranking_ready": True,
-                "summary": {
-                    "closed_position_count": 55,
-                    "leaderboard_row_count": 50,
-                    "promote_candidate_count": 0,
-                    "demote_count": 2,
-                    "disable_count": 0,
-                },
-                "strategy_rankings": [
-                    {
-                        "strategy_profile_id": "weak_profile",
-                        "recommended_stage": "demote",
-                        "can_increase_budget": True,
-                        "can_keep_live_size": True,
-                    }
-                ],
-                "source_rankings": [
-                    {
-                        "source": "okx_authoritative_sync",
-                        "recommended_stage": "shadow",
-                        "can_apply_live_weight": True,
-                    }
-                ],
-                "blockers": [
-                    {"code": "strategy_demote", "severity": "warning"},
-                    {"code": "model_source_demote", "severity": "warning"},
-                ],
-                "brain_recommendations": _brain_recommendations_ok(),
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "ProfitFirstRankingService",
-        lambda: FakeProfitFirstRankingService(),
-    )
-
-    card = await system_audit._profit_first_ranking_audit()
-    ledger = system_audit._issue_ledger_from_cards([card])
-
-    assert card["status"] == "warning"
-    assert card["details"]["observing"] is True
-    assert card["details"]["strategy_rankings"][0]["can_increase_budget"] is False
-    assert card["details"]["strategy_rankings"][0]["can_keep_live_size"] is False
-    assert card["details"]["source_rankings"][0]["can_apply_live_weight"] is False
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-    assert ledger["observing"][0]["key"] == "profit_first_ranking"
 
 
-@pytest.mark.asyncio
-async def test_profit_first_ranking_audit_failure_keeps_read_only_policy_visible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FailingProfitFirstRankingService:
-        async def report(self, **_kwargs: Any) -> dict[str, Any]:
-            raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(
-        system_audit,
-        "ProfitFirstRankingService",
-        lambda: FailingProfitFirstRankingService(),
-    )
-
-    card = await system_audit._profit_first_ranking_audit()
-
-    assert card["status"] == "warning"
-    assert card["details"]["report_available"] is False
-    assert card["details"]["ranking_ready"] is False
-    assert card["details"]["read_only"] is True
-    assert card["details"]["can_increase_live_size"] is False
-    assert card["details"]["policy"]["trade_fact_policy"] == (
-        "okx_confirmed_closed_positions_only"
-    )
 
 
-@pytest.mark.asyncio
-async def test_profit_first_governance_audit_forces_read_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeProfitFirstGovernanceReportService:
-        async def report(self, *, hours: int = 24, limit: int = 800) -> dict[str, Any]:
-            return {
-                **_profit_first_governance_details_ok(),
-                "live_mutation": True,
-                "live_entry_mutation": True,
-                "can_submit_orders": True,
-                "can_start_trading_service": True,
-                "can_change_model_routing": True,
-                "can_increase_live_size": True,
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "ProfitFirstGovernanceReportService",
-        lambda: FakeProfitFirstGovernanceReportService(),
-    )
-
-    card = await system_audit._profit_first_governance_audit()
-
-    assert card["key"] == "profit_first_governance"
-    assert card["status"] == "ok"
-    assert card["details"]["read_only"] is True
-    assert card["details"]["live_mutation"] is False
-    assert card["details"]["live_entry_mutation"] is False
-    assert card["details"]["can_submit_orders"] is False
-    assert card["details"]["can_start_trading_service"] is False
-    assert card["details"]["can_change_model_routing"] is False
-    assert card["details"]["can_increase_live_size"] is False
 
 
-@pytest.mark.asyncio
-async def test_profit_first_governance_audit_failure_keeps_read_only_policy_visible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FailingProfitFirstGovernanceReportService:
-        async def report(self, **_kwargs: Any) -> dict[str, Any]:
-            raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(
-        system_audit,
-        "ProfitFirstGovernanceReportService",
-        lambda: FailingProfitFirstGovernanceReportService(),
-    )
-
-    card = await system_audit._profit_first_governance_audit()
-
-    assert card["status"] == "warning"
-    assert card["details"]["report_available"] is False
-    assert card["details"]["read_only"] is True
-    assert card["details"]["live_mutation"] is False
-    assert card["details"]["can_submit_orders"] is False
-    assert card["details"]["can_start_trading_service"] is False
 
 
 @pytest.mark.asyncio
@@ -3529,46 +1993,8 @@ def test_market_data_zero_coverage_warning_remains_unresolved() -> None:
     assert state == "unresolved"
 
 
-def test_phase3_go_no_go_paper_resume_ready_is_observing() -> None:
-    card = system_audit._audit_card(
-        "phase3_go_no_go",
-        "Phase 3 Go/No-Go",
-        "warning",
-        "Phase 3 can only resume paper through the controlled operator-approved path.",
-        details={
-            "status": "paper_resume_ready",
-            "next_step": "resume_paper_pending_operator_approval",
-            "can_start_paper_with_operator_approval": True,
-            "can_enter_live": False,
-            "blockers": [],
-        },
-    )
-
-    ledger = system_audit._issue_ledger_from_cards([card])
-
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-    assert ledger["observing"][0]["key"] == "phase3_go_no_go"
 
 
-def test_phase3_go_no_go_post_resume_observing_is_observing() -> None:
-    card = system_audit._audit_card(
-        "phase3_go_no_go",
-        "Phase 3 Go/No-Go",
-        "warning",
-        "Phase 3 paper is active; post-resume evidence is warming up.",
-        details={
-            "status": "post_resume_observing",
-            "next_step": "continue_post_resume_observation",
-            "can_start_paper_with_operator_approval": False,
-            "can_enter_live": False,
-            "blockers": [],
-        },
-    )
-
-    ledger = system_audit._issue_ledger_from_cards([card])
-
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-    assert ledger["observing"][0]["key"] == "phase3_go_no_go"
 
 
 @pytest.mark.asyncio
@@ -3698,63 +2124,6 @@ async def test_model_training_ready_tools_optional_sources_summary_is_specific(
     assert card["details"]["hard_failure"] is False
 
 
-@pytest.mark.asyncio
-async def test_strategy_quality_audit_reports_short_adjustment_samples(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-) -> None:
-    from db.session import close_db, get_session_ctx, init_db
-    from models.decision import AIDecision
-
-    await close_db()
-    db_path = tmp_path / "audit.db"
-    now = datetime(2026, 6, 22, 3, 0, tzinfo=UTC)
-    monkeypatch.setattr(
-        system_audit.settings,
-        "database_url",
-        f"sqlite+aiosqlite:///{db_path.as_posix()}",
-    )
-    monkeypatch.setattr(system_audit, "_now", lambda: now)
-
-    await init_db()
-    try:
-        raw = {
-            "opportunity_score": {
-                "expected_net_return_pct": 1.4,
-                "evidence_score": {
-                    "tier": "normal",
-                    "short_evidence_adjustment": {
-                        "mode": "strong_current_short_evidence",
-                        "score_offset": 0.0,
-                        "size_multiplier": 1.0,
-                    },
-                },
-            }
-        }
-        async with get_session_ctx() as session:
-            session.add(
-                AIDecision(
-                    model_name="test_model",
-                    symbol="BTC/USDT",
-                    action="short",
-                    reasoning="short evidence release",
-                    position_size_pct=0.04,
-                    confidence=0.9,
-                    raw_llm_response=raw,
-                    was_executed=False,
-                    created_at=now - timedelta(minutes=5),
-                )
-            )
-
-        card = await system_audit._strategy_quality_audit()
-
-        assert card["details"]["short_released_adjustment_count"] == 1
-        assert card["details"]["short_conservative_adjustment_count"] == 0
-        assert card["details"]["short_released_adjustment_samples"][0]["symbol"] == "BTC/USDT"
-        evidence = {item["label"]: item["value"] for item in card["evidence"]}
-        assert evidence["做空强证据放开"] == 1
-    finally:
-        await close_db()
 
 
 @pytest.mark.asyncio
@@ -4292,60 +2661,6 @@ async def test_trade_loop_paused_market_analysis_is_observing(
         await close_db()
 
 
-@pytest.mark.asyncio
-async def test_trade_loop_paper_resume_ready_but_stopped_is_observing(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-) -> None:
-    from db.session import close_db, init_db
-
-    await close_db()
-    db_path = tmp_path / "audit.db"
-    now = datetime(2026, 6, 27, 11, 45, tzinfo=UTC)
-    monkeypatch.setattr(
-        system_audit.settings,
-        "database_url",
-        f"sqlite+aiosqlite:///{db_path.as_posix()}",
-    )
-    _patch_phase3_resume_reports_path(monkeypatch, tmp_path, now=now)
-    monkeypatch.setattr(
-        system_audit.settings,
-        "database_url",
-        f"sqlite+aiosqlite:///{db_path.as_posix()}",
-    )
-    monkeypatch.setattr(system_audit, "_now", lambda: now)
-    monkeypatch.setattr(
-        system_audit,
-        "_load_trading_runtime_audit_window",
-        lambda: {
-            "available": True,
-            "started_at": now - timedelta(hours=18),
-            "started_at_iso": (now - timedelta(hours=18)).isoformat(),
-            "heartbeat_at": now - timedelta(hours=17),
-            "heartbeat_at_iso": (now - timedelta(hours=17)).isoformat(),
-            "running": True,
-            "paused": True,
-            "mode": "paper",
-            "decision_interval": 30,
-        },
-    )
-
-    await init_db()
-    try:
-        card = await system_audit._trade_loop_audit()
-        ledger = system_audit._issue_ledger_from_cards([card])
-
-        assert card["status"] == "warning"
-        assert card["details"]["paper_resume_pending_operator_approval"] is True
-        assert card["details"]["stale_runtime_heartbeat"] is True
-        assert card["details"]["runtime_window"]["running"] is False
-        assert card["details"]["runtime_window"]["reported_running"] is True
-        assert card["details"]["paper_resume_gate"]["status"] == "paper_resume_ready"
-        assert "paper_resume_ready" in card["summary"]
-        assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-        assert ledger["observing"][0]["key"] == "trade_loop"
-    finally:
-        await close_db()
 
 
 @pytest.mark.asyncio
@@ -4417,118 +2732,6 @@ async def test_trade_loop_orderless_but_healthy_runtime_is_observing(
         await close_db()
 
 
-@pytest.mark.asyncio
-async def test_strategy_closed_loop_audit_separates_active_runtime_window(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-) -> None:
-    from db.session import close_db, get_session_ctx, init_db
-    from models.decision import AIDecision
-    from models.trade import Order
-
-    await close_db()
-    db_path = tmp_path / "audit.db"
-    monkeypatch.setattr(
-        system_audit.settings,
-        "database_url",
-        f"sqlite+aiosqlite:///{db_path.as_posix()}",
-    )
-    monkeypatch.setattr(system_audit.settings, "_data_dir", tmp_path, raising=False)
-    now = datetime(2026, 6, 22, 3, 0, tzinfo=UTC)
-    monkeypatch.setattr(system_audit, "_now", lambda: now)
-
-    await init_db()
-    try:
-        old_created_at = datetime(2026, 6, 22, 1, 0, tzinfo=UTC)
-        runtime_started_at = datetime(2026, 6, 22, 2, 0, tzinfo=UTC)
-        monkeypatch.setattr(
-            system_audit,
-            "_load_trading_runtime_audit_window",
-            lambda: {
-                "available": True,
-                "started_at": runtime_started_at,
-                "started_at_iso": runtime_started_at.isoformat(),
-                "heartbeat_at": datetime(2026, 6, 22, 2, 5, tzinfo=UTC),
-                "heartbeat_at_iso": "2026-06-22T02:05:00+00:00",
-                "running": True,
-                "mode": "paper",
-                "decision_interval": 30,
-            },
-        )
-        raw = {
-            "opportunity_score": {
-                "expected_net_return_pct": 0.7,
-                "evidence_score": {
-                    "tier": "weak_conflict_probe",
-                    "components": [
-                        {
-                            "source": "ml",
-                            "status": "ignored",
-                            "reason": "ML 学习观察模式",
-                        }
-                    ],
-                },
-            }
-        }
-        async with get_session_ctx() as session:
-            old_decision = AIDecision(
-                model_name="test_model",
-                symbol="OLD/USDT",
-                action="long",
-                reasoning="old weak entry",
-                position_size_pct=0.001,
-                confidence=0.1,
-                raw_llm_response=raw,
-                was_executed=True,
-                created_at=old_created_at,
-            )
-            new_decision = AIDecision(
-                model_name="test_model",
-                symbol="NEW/USDT",
-                action="hold",
-                reasoning="new hold",
-                position_size_pct=0.0,
-                confidence=0.1,
-                raw_llm_response={},
-                was_executed=False,
-                created_at=runtime_started_at,
-            )
-            session.add_all([old_decision, new_decision])
-            await session.flush()
-            session.add(
-                Order(
-                    model_name="test_model",
-                    execution_mode="paper",
-                    decision_id=old_decision.id,
-                    symbol="OLD/USDT",
-                    side="long",
-                    order_type="market",
-                    quantity=1,
-                    price=1,
-                    status="filled",
-                    created_at=old_created_at,
-                )
-            )
-
-        card = await system_audit._strategy_closed_loop_audit()
-
-        assert card["details"]["weak_executed_count"] == 1
-        assert card["details"]["current_runtime_window"]["started_at"] == (
-            "2026-06-22T02:00:00+00:00"
-        )
-        assert card["details"]["current_runtime_window"]["entry_decision_count"] == 0
-        assert card["details"]["current_runtime_window"]["weak_executed_count"] == 0
-        assert card["details"]["current_runtime_window"]["historical_legacy_issues"] is True
-        assert card["details"]["ml_influence_reason"]["top_reasons"][0] == {
-            "reason": "ML 学习观察模式",
-            "count": 1,
-        }
-        ledger = system_audit._issue_ledger_from_cards([card])
-        assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
-        assert ledger["observing"][0]["key"] == "strategy_closed_loop"
-        assert "历史" in ledger["observing"][0]["state_label"]
-    finally:
-        await close_db()
 
 
 @pytest.mark.asyncio

@@ -48,9 +48,6 @@ OKX_REST_CALL_TIMEOUT = 10.0
 OKX_TIME_DIFFERENCE_SYNC_TIMEOUT = 3.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
-ATTACHED_PROTECTION_MIN_STOP_PCT = 0.012
-ATTACHED_PROTECTION_MIN_TAKE_PROFIT_PCT = 0.024
-ATTACHED_PROTECTION_MIN_TRIGGER_GAP_PCT = 0.0015
 
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
@@ -80,7 +77,7 @@ class TokenBucket:
 class OKXExecutor(AbstractExecutor):
     """Executes trades on OKX via the official python-okx SDK adapter.
 
-    In demo mode (settings.okx_demo=True), trades go to OKX demo trading environment.
+    Paper and live modes use their explicitly isolated OKX credentials.
     In production mode, real orders are placed.
     """
 
@@ -3545,7 +3542,7 @@ class OKXExecutor(AbstractExecutor):
             )
 
         values = [value for value in values if value > 0]
-        return max(values) if values else float(settings.max_leverage)
+        return max(values) if values else 1.0
 
     def _extract_verified_leverage(self, leverage_response: dict[str, Any] | None) -> float:
         """Return the leverage reported by CCXT fetch_leverage."""
@@ -3570,9 +3567,7 @@ class OKXExecutor(AbstractExecutor):
         ccxt = await self._get_ccxt()
         okx_symbol = await self._resolve_swap_symbol(decision.symbol)
         params = {"mgnMode": "cross"}
-        requested_leverage = int(
-            max(1, min(int(round(decision.suggested_leverage)), settings.max_leverage))
-        )
+        requested_leverage = max(1, int(round(decision.suggested_leverage)))
         max_leverage = await self._fetch_okx_max_leverage(okx_symbol, params, requested_leverage)
         leverage = int(
             max(
@@ -3580,7 +3575,6 @@ class OKXExecutor(AbstractExecutor):
                 min(
                     requested_leverage,
                     int(max_leverage or requested_leverage),
-                    settings.max_leverage,
                 ),
             )
         )
@@ -4101,30 +4095,16 @@ class OKXExecutor(AbstractExecutor):
         primary_ref = self._safe_float(entry_price, 0.0)
         if primary_ref <= 0 and valid_refs:
             primary_ref = valid_refs[0]
-        stop_pct = max(
-            self._safe_float(decision.stop_loss_pct, 0.0),
-            ATTACHED_PROTECTION_MIN_STOP_PCT,
-        )
-        stop_pct = min(stop_pct, 0.15)
-        take_pct = max(
-            self._safe_float(decision.take_profit_pct, 0.0),
-            stop_pct * 1.8,
-            ATTACHED_PROTECTION_MIN_TAKE_PROFIT_PCT,
-        )
-        take_pct = min(take_pct, 0.50)
-        trigger_gap = max(primary_ref * ATTACHED_PROTECTION_MIN_TRIGGER_GAP_PCT, 1e-8)
+        stop_pct = self._safe_float(decision.stop_loss_pct, 0.0)
+        take_pct = self._safe_float(decision.take_profit_pct, 0.0)
+        if stop_pct <= 0 or take_pct <= 0:
+            return 0.0, 0.0
         if decision.action == Action.LONG:
             stop_loss_px = low_ref * (1 - stop_pct)
             take_profit_px = high_ref * (1 + take_pct)
-            if primary_ref > 0:
-                stop_loss_px = min(stop_loss_px, primary_ref - trigger_gap)
-                take_profit_px = max(take_profit_px, primary_ref + trigger_gap)
         else:
             stop_loss_px = high_ref * (1 + stop_pct)
             take_profit_px = low_ref * (1 - take_pct)
-            if primary_ref > 0:
-                stop_loss_px = max(stop_loss_px, primary_ref + trigger_gap)
-                take_profit_px = min(take_profit_px, primary_ref - trigger_gap)
         return stop_loss_px, take_profit_px
 
     def _format_attached_sl_tp_prices(

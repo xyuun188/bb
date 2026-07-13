@@ -43,6 +43,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101", "S105", "S106", "S107"]
 "scripts/**/*.py" = ["S603", "S607"]
+"tests/test_local_ai_tools_deploy_service.py" = ["S102"]
+"scripts/run_phase3_rebuild_preflight.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"

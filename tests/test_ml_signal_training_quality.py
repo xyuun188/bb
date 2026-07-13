@@ -45,6 +45,26 @@ def _with_return_objective(metadata: dict) -> dict:
     metadata.setdefault("objective_name", RETURN_OBJECTIVE_NAME)
     metadata.setdefault("objective_version", RETURN_OBJECTIVE_VERSION)
     metadata.setdefault("label_version", RETURN_LABEL_VERSION)
+    metadata.setdefault(
+        "training_cost_policy",
+        "per_sample_live_spread_fee_and_funding_complete",
+    )
+    metadata.setdefault("legacy_fixed_training_thresholds_enabled", False)
+    metadata.setdefault(
+        "tail_loss_policy",
+        {
+            side: {
+                "source": "artifact_holdout_fee_after_return_distribution",
+                "observation_window": "test_fixture_window",
+                "sample_count": int(metadata.get("sample_count") or 1),
+                "generated_at": "2026-07-12T00:00:00+00:00",
+                "strategy_version": "test.dynamic-tail.v1",
+                "fallback_reason": "",
+            }
+            for side in ("long", "short")
+        },
+    )
+    metadata.setdefault("tail_loss_scale_pct", {"long": 0.18, "short": 0.18})
     metrics = dict(metadata.get("metrics") or {})
     for side in ("long", "short"):
         top_return = float(metrics.get(f"top_{side}_avg_return_pct") or 0.0)
@@ -92,7 +112,7 @@ async def test_local_ml_training_counts_only_phase3_clean_shadow_rows(
         await session.flush()
 
     try:
-        selected = await load_shadow_training_rows(limit=10)
+        selected = await load_shadow_training_rows()
         count = await count_shadow_training_rows()
     finally:
         await close_db()
@@ -259,7 +279,6 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
 
     metadata = train_from_frame(
         _training_frame(),
-        min_samples=10,
         completed_sample_count=80,
         persist_artifact=False,
     )
@@ -290,7 +309,6 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
 
     metadata = train_from_frame(
         _training_frame(),
-        min_samples=10,
         completed_sample_count=80,
         persist_artifact=True,
     )
@@ -324,7 +342,6 @@ def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
 
     metadata = train_from_frame(
         frame,
-        min_samples=10,
         completed_sample_count=120,
         persist_artifact=False,
     )
@@ -355,7 +372,10 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
         horizon_minutes=30,
         feature_snapshot={
             "current_price": 100.0,
-            "spread_pct": 0.01,
+                "spread_pct": 0.01,
+                "taker_fee_rate": 0.0004,
+            "funding_rate": 0.0001,
+            "funding_interval_hours": 8,
             "abnormal_wick_count_72h": 2,
             "entry_activity_volume_ratio": 1.8,
             "notional_24h_usdt": 9999.0,
@@ -392,8 +412,7 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     async def forbidden_quarantine(**_kwargs: object) -> dict[str, object]:
         raise AssertionError("dry-run must not quarantine or mutate training rows")
 
-    async def load_rows(*, limit: int) -> list[object]:
-        assert limit == 20
+    async def load_rows() -> list[object]:
         return [object()]
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
@@ -418,11 +437,7 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
     monkeypatch.setattr(train_ml_signal_script, "train_from_frame", train_frame)
 
-    result = await train_ml_signal_script.run_training(
-        limit=20,
-        min_samples=10,
-        skip_quarantine=False,
-    )
+    result = await train_ml_signal_script.run_training(skip_quarantine=False)
 
     assert result["training_quarantine"] == {
         "skipped": True,
@@ -439,8 +454,6 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
 async def test_train_ml_signal_script_requires_confirmation_to_persist() -> None:
     with pytest.raises(ValueError, match="confirm_phase3_rebuild"):
         await train_ml_signal_script.run_training(
-            limit=20,
-            min_samples=10,
             persist_artifact=True,
             confirm_phase3_rebuild=False,
         )
@@ -462,8 +475,6 @@ async def test_train_ml_signal_script_blocks_persist_when_okx_gate_blocks(
 
     with pytest.raises(ValueError, match="OKX daily reconciliation blocks"):
         await train_ml_signal_script.run_training(
-            limit=100,
-            min_samples=10,
             persist_artifact=True,
             confirm_phase3_rebuild=True,
         )
@@ -480,8 +491,7 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
         quarantine_calls.append(kwargs)
         return {"skipped": False, "quarantined": 0}
 
-    async def load_rows(*, limit: int) -> list[object]:
-        assert limit == 20
+    async def load_rows() -> list[object]:
         return [object()]
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
@@ -514,13 +524,11 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
     monkeypatch.setattr(train_ml_signal_script, "train_from_frame", train_frame)
 
     result = await train_ml_signal_script.run_training(
-        limit=20,
-        min_samples=10,
         persist_artifact=True,
         confirm_phase3_rebuild=True,
     )
 
-    assert quarantine_calls == [{"batch_size": 20, "max_batches": 1}]
+    assert quarantine_calls == [{}]
     assert calls[0]["persist_artifact"] is True
     assert result["dry_run"] is False
     assert result["preflight_only"] is False
@@ -543,8 +551,7 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     async def quarantine_dirty_training_samples(**_kwargs: object) -> dict[str, object]:
         return {"scanned": 1300, "quarantined": 0}
 
-    async def load_rows(*, limit: int) -> list[object]:
-        assert limit > 0
+    async def load_rows() -> list[object]:
         return [object()]
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
@@ -585,8 +592,8 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert result["allow_live_position_influence"] is False
     assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
-    assert "long_top_return_below_threshold" in reason_codes
-    assert "short_top_return_below_threshold" in reason_codes
+    assert "long_top_return_lcb_not_positive" in reason_codes
+    assert "short_top_return_lcb_not_positive" in reason_codes
 
 
 @pytest.mark.asyncio
@@ -603,8 +610,7 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     async def quarantine_dirty_training_samples(**_kwargs: object) -> dict[str, object]:
         return {"scanned": 1300, "quarantined": 0}
 
-    async def load_rows(*, limit: int) -> list[object]:
-        assert limit > 0
+    async def load_rows() -> list[object]:
         return [object()]
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
@@ -662,17 +668,16 @@ def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -
 
     selected = select_shadow_training_rows(
         [*recent_hold_rows, *trade_rows, *missed_rows],
-        limit=20,
     )
 
     selected_ids = [row.id for row in selected]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     missed_count = sum(bool(row.missed_opportunity) for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 12
+    assert len(selected) == 18
     assert len(set(selected_ids)) == len(selected_ids)
     assert non_hold_count == 8
-    assert missed_count == 4
+    assert missed_count == 10
     assert best_trade_count == len(selected)
     assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
 
@@ -727,13 +732,12 @@ def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality
 
     selected = select_shadow_training_rows(
         [*noisy_holds, *clean_trade_rows, *clean_missed_rows],
-        limit=20,
     )
 
     noisy_selected = [row for row in selected if row.decision_confidence < 0.05]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 18
+    assert len(selected) == 24
     assert len(noisy_selected) == 0
     assert non_hold_count == 12
     assert best_trade_count == len(selected)
@@ -765,12 +769,11 @@ def test_shadow_training_selection_includes_low_confidence_missed_hold_opportuni
 
     selected = select_shadow_training_rows(
         [*noisy_missed_holds, *clean_trade_rows],
-        limit=20,
     )
 
-    assert len(selected) == 12
+    assert len(selected) == 48
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
-    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 4
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 40
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
 
 
@@ -790,13 +793,14 @@ def test_shadow_training_selection_excludes_low_confidence_non_opportunity_holds
         for idx in range(12)
     ]
 
-    selected = select_shadow_training_rows([*noisy_holds, *clean_missed_rows], limit=20)
+    selected = select_shadow_training_rows([*noisy_holds, *clean_missed_rows])
 
-    assert selected == []
+    assert len(selected) == 12
+    assert all(row.missed_opportunity for row in selected)
     assert not any(row.id in {item.id for item in noisy_holds} for row in selected)
 
 
-def test_shadow_training_selection_caps_recent_missed_hold_bursts() -> None:
+def test_shadow_training_selection_keeps_complete_clean_opportunity_history() -> None:
     base_time = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
     recent_missed_rows = [
         _shadow_row(
@@ -833,14 +837,12 @@ def test_shadow_training_selection_caps_recent_missed_hold_bursts() -> None:
 
     selected = select_shadow_training_rows(
         [*recent_missed_rows, *directional_rows, *older_missed_rows],
-        limit=60,
     )
 
-    newest_quartile = selected[: max(int(len(selected) * 0.25), 1)]
-    assert len(selected) == 30
+    assert len(selected) == 100
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 20
-    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 10
-    assert all(row.decision_action in {"long", "short"} for row in newest_quartile)
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 80
+    assert all(row.missed_opportunity for row in selected[:40])
 
 
 def test_train_from_frame_reports_training_window_composition() -> None:
@@ -852,7 +854,6 @@ def test_train_from_frame_reports_training_window_composition() -> None:
 
     metadata = train_from_frame(
         frame,
-        min_samples=10,
         completed_sample_count=120,
         persist_artifact=False,
     )
@@ -868,7 +869,12 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert metadata["objective_name"] == RETURN_OBJECTIVE_NAME
     assert metadata["objective_version"] == RETURN_OBJECTIVE_VERSION
     assert metadata["label_version"] == RETURN_LABEL_VERSION
-    assert metadata["prediction_distribution"]["lower_quantile"] == pytest.approx(0.20)
+    assert metadata["prediction_distribution"]["lower_bound"] == (
+        "tree_prediction_lower_hinge"
+    )
+    assert metadata["prediction_distribution"]["uncertainty_source"] == (
+        "random_forest_tree_empirical_order_statistics"
+    )
     assert "expected_return_calibration" not in metadata
     assert "top_long_return_lcb_pct" in metadata["metrics"]
     assert "top_short_profit_factor" in metadata["metrics"]
@@ -997,7 +1003,7 @@ def test_ml_readiness_blocks_high_win_rate_negative_fee_after_return() -> None:
 
     assert readiness["state"] == "degraded"
     assert readiness["allow_live_position_influence"] is False
-    assert "long_top_return_below_threshold" in codes
+    assert "long_top_return_lcb_not_positive" in codes
     assert "short_top_profit_factor_not_above_one" in codes
 
 
@@ -1091,6 +1097,7 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
                 "tail_loss_avg_return_pct": -2.0,
             },
         },
+        "tail_loss_scale_pct": {"long": 0.18, "short": 0.18},
     })
     service = MLSignalService()
     service._bundle = {
@@ -1150,17 +1157,17 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
         session.add_all([*recent_holds, *decision_trade_rows, *best_trade_rows, *excluded_rows])
 
     try:
-        selected = await load_shadow_training_rows(limit=20)
+        selected = await load_shadow_training_rows()
     finally:
         await close_db()
 
     selected_ids = {row.id for row in selected}
-    assert len(selected) == 12
+    assert len(selected) == 22
     assert all(not isinstance(row, ShadowBacktest) for row in selected)
     assert 90 not in selected_ids
     assert 91 not in selected_ids
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
-    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 4
+    assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 14
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
     assert not any(row.id >= 10_000 for row in selected)
 
@@ -1188,11 +1195,11 @@ async def test_load_shadow_training_rows_pulls_deeper_best_trade_pool(
         session.add_all([*recent_holds, *deeper_best_trade_rows])
 
     try:
-        selected = await load_shadow_training_rows(limit=20)
+        selected = await load_shadow_training_rows()
     finally:
         await close_db()
 
-    assert len(selected) == 20
+    assert len(selected) == 25
     assert {row.decision_action for row in selected} <= {"long", "short"}
     assert {row.best_action for row in selected} <= {"long", "short"}
     assert not any(row.id >= 20_000 for row in selected)
@@ -1222,7 +1229,7 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
         session.add(row)
 
     try:
-        selected = await load_shadow_training_rows(limit=10)
+        selected = await load_shadow_training_rows()
         async with get_session_ctx() as session:
             compact = await session.get(ShadowBacktest, 77)
             assert compact is not None
@@ -1297,18 +1304,22 @@ def test_ml_signal_status_exposes_learning_only_readiness_reasons() -> None:
     status = service.status()
 
     reason_codes = {item["code"] for item in status["readiness"]["blocking_reasons"]}
-    assert status["readiness_state"] == "learning_only"
+    assert status["readiness_state"] == "degraded"
     assert status["allow_live_position_influence"] is False
     assert status["readiness"]["metrics"]["dirty_sample_ratio"] == 0.0
     assert status["readiness"]["metrics"]["training_data_version"] == "2026-06-19.v1"
     assert status["readiness"]["metrics"]["required_training_data_version"] == DATA_QUALITY_VERSION
-    assert "sample_count_below_threshold" in reason_codes
-    assert "test_count_below_threshold" in reason_codes
+    assert "sample_count_below_threshold" not in reason_codes
+    assert "test_count_below_threshold" not in reason_codes
     assert "long_pr_auc_missing" not in reason_codes
     assert "short_pr_auc_missing" not in reason_codes
     assert "training_data_version_stale" in reason_codes
-    assert "model_stale" in reason_codes
-    assert status["readiness"]["next_training_conditions"]["min_new_samples"] > 0
+    assert "model_stale" not in reason_codes
+    next_conditions = status["readiness"]["next_training_conditions"]
+    assert next_conditions["trigger"] == (
+        "new_authoritative_cost_complete_sample_or_data_contract_change"
+    )
+    assert next_conditions["trigger"].startswith("new_authoritative_cost_complete_sample")
 
 
 def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> None:
@@ -1365,7 +1376,6 @@ def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> N
     assert long_diag["training_target"] == "fee_after_realized_return_quality"
     assert long_diag["top_avg_return_pct"] == -0.14
     assert long_diag["top_bottom_return_spread_pct"] == -0.12
-    assert "top_score_bucket_not_fee_after_profitable" in long_diag["diagnosis"]
     assert "top_score_bucket_not_better_than_bottom" in long_diag["diagnosis"]
     assert "top_score_tail_loss_worse_than_bottom" in long_diag["diagnosis"]
     assert long_diag["top_bucket"]["top_quality_reasons"][0]["reason"] == "fee_drag"

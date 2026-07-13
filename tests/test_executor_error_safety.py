@@ -1113,6 +1113,8 @@ def _entry_decision() -> DecisionOutput:
         reasoning="test entry",
         position_size_pct=0.1,
         suggested_leverage=5.0,
+        stop_loss_pct=0.013,
+        take_profit_pct=0.027,
         raw_response={},
         feature_snapshot={"current_price": 100.0},
     )

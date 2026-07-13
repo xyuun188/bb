@@ -10,7 +10,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
-from services.execution_service import ExecutionService, _profit_first_entry_contract_result
+from services.execution_service import ExecutionService, _return_entry_contract_result
 from services.trading_policies import PolicyGateResult
 
 
@@ -69,11 +69,6 @@ def _test_execution_service(
         execution_leverage_summary_attacher=lambda *_args: None,
         execution_reason_provider=lambda result: result.raw_response.get("error") if result else "",
         pending_execution_marker=_noop_async,
-        untradable_exchange_error_checker=lambda _text: False,
-        untradable_symbol_rememberer=lambda *_args: None,
-        transient_entry_exchange_error_checker=lambda _text: False,
-        temporary_entry_block_rememberer=lambda *_args: None,
-        transient_entry_block_minutes_provider=lambda _text: 5.0,
         trade_logger=trade_logger or _noop_async,
         exchange_confirmed_checker=lambda result: bool(
             result
@@ -87,7 +82,6 @@ def _test_execution_service(
         order_fact_recovery_trigger=order_fact_recovery_trigger,
         open_positions_execution_applier=lambda *_args: None,
         decision_executed_marker=_noop_async,
-        market_no_opportunity_symbol_clearer=lambda _symbol: None,
         account_update_persister=_noop_async,
         account_balance_provider=lambda _model: _noop_async(),
         decision_outcome_marker=_noop_async,
@@ -100,7 +94,6 @@ def _test_execution_service(
         open_positions_context_provider=lambda: _noop_async(),
         matching_exit_local_position_checker=lambda *_args: False,
         matching_exit_exchange_position_checker=lambda *_args: _noop_async(),
-        exit_cooldown_recorder=lambda *_args: None,
         trade_notional_recorder=lambda _notional: None,
     )
 
@@ -119,160 +112,57 @@ def _entry_decision(symbol: str = "SPK/USDT") -> DecisionOutput:
 
 
 def _profit_first_ready_position_review_decision() -> DecisionOutput:
-    return DecisionOutput(
-        model_name="ensemble_trader",
-        symbol="BTC/USDT",
-        action=Action.LONG,
-        confidence=0.84,
-        reasoning="position review add entry",
-        position_size_pct=0.06,
-        suggested_leverage=4.0,
-        stop_loss_pct=0.02,
-        take_profit_pct=0.05,
-        feature_snapshot={"close": 100.0},
-        raw_response={
-            "analysis_type": "position_review",
-            "current_price": 100.0,
-            "strategy_learning_context": {"strategy_profile_id": "balanced_probe"},
-            "opportunity_score": {
-                "score": 3.4,
-                "side": "long",
-                "expected_return_pct": 1.05,
-                "expected_net_return_pct": 0.9,
-                "fee_pct": 0.05,
-                "slippage_pct": 0.04,
-                "expected_loss_pct": 0.20,
-                "profit_quality_ratio": 1.25,
-                "reward_risk_ratio": 2.5,
-                "server_profit_loss_probability": 0.38,
-                "tail_risk_score": 0.62,
-                "side_realized_pnl_usdt": 2.0,
-                "ml_aligned": True,
-                "local_profit_aligned": True,
-                "timeseries_aligned": True,
-                "expert_aligned": True,
-                "evidence_score": {
-                    "tier": "normal",
-                    "effective_score": 88,
-                    "components": [
-                        {"source": "sentiment", "status": "aligned"},
-                        {"source": "shadow_memory", "status": "aligned"},
-                    ],
-                },
-            },
-            "profit_risk_sizing": {
-                "quality_tier": "high_profit",
-                "position_size_pct": 0.06,
-                "final_notional_usdt": 120.0,
-                "planned_stop_loss_usdt": 2.8,
-                "max_stop_loss_usdt": 4.0,
-                "expected_profit_usdt": 1.08,
-            },
-        },
-    )
+    return _dynamic_return_ready_decision()
 
 
-def test_profit_first_entry_contract_late_attaches_position_review_plan_and_ladder() -> None:
-    decision = _profit_first_ready_position_review_decision()
-
-    result = _profit_first_entry_contract_result(decision)
-
-    assert result.passed is True
-    raw = decision.raw_response
-    assert raw["profit_first_trade_plan"]["analysis_type"] == "position_review"
-    assert raw["profit_first_trade_plan"]["is_complete_for_real_trade"] is True
-    ladder = raw["profit_risk_sizing"]["profit_first_position_ladder"]
-    assert ladder["lane"] == "meaningful_entry"
-    assert ladder["late_attached_at"] == "execution_pre_submit"
-
-
-def test_profit_first_entry_contract_blocks_shadow_only_evidence_before_submit() -> None:
-    decision = _profit_first_ready_position_review_decision()
-    opportunity = decision.raw_response["opportunity_score"]
-    opportunity["evidence_score"] = {
-        **opportunity["evidence_score"],
-        "tier": "weak_conflict_probe",
-        "effective_score": 35.0,
-        "shadow_only": True,
-        "tradeable_probe": False,
-    }
-
-    result = _profit_first_entry_contract_result(decision)
-
-    assert result.passed is False
-    assert result.blocker == "entry_evidence_shadow_only"
-    assert result.data["skip_kind"] == "entry_evidence_shadow_only"
-    assert result.data["evidence_shadow_only"] is True
-
-
-def test_profit_first_entry_contract_blocks_incomplete_entry_before_submit() -> None:
+def _dynamic_return_ready_decision() -> DecisionOutput:
     decision = _entry_decision("BTC/USDT")
-
-    result = _profit_first_entry_contract_result(decision)
-
-    assert result.passed is False
-    assert result.blocker == "profit_first_trade_plan_incomplete"
-    assert result.data["shadow_only"] is True
-    assert result.data["profit_first_trade_plan"]["is_complete_for_real_trade"] is False
-
-
-def test_profit_first_entry_contract_blocks_low_payoff_one_x_probe_before_submit() -> None:
-    decision = _entry_decision("LINK/USDT")
-    decision.position_size_pct = 0.006
-    decision.suggested_leverage = 1.0
-    decision.stop_loss_pct = 0.02
-    decision.take_profit_pct = 0.04
+    provenance = {
+        "source": "authoritative_test_return",
+        "observation_window": "test_window",
+        "sample_count": 5,
+        "generated_at": "2026-07-12T00:00:00+00:00",
+        "strategy_version": "test.dynamic.v1",
+        "fallback_reason": "",
+    }
+    decision.position_size_pct = 0.03
     decision.raw_response = {
-        "analysis_type": "entry_candidate",
-        "current_price": 100.0,
-        "strategy_learning_context": {"strategy_profile_id": "profile_1"},
-        "opportunity_score": {
-            "score": 1.4,
-            "side": "short",
-            "expected_net_return_pct": 0.2,
-            "fee_pct": 0.05,
-            "slippage_pct": 0.04,
-            "expected_loss_pct": 0.2,
-            "profit_quality_ratio": 0.5,
-            "reward_risk_ratio": 0.9,
-            "server_profit_loss_probability": 0.48,
-            "tail_risk_score": 0.7,
-            "ml_aligned": True,
-            "local_profit_aligned": True,
-            "server_profit_expected_return_pct": 0.4,
-            "evidence_score": {"tier": "normal", "effective_score": 72.0},
+        "authoritative_return_candidate": {
+            "production_eligible": True,
+            "side_evidence": {
+                "production_eligible": True,
+                "expected_net_return_pct": 0.8,
+                "return_lcb_pct": 0.4,
+                "production_source_count": 5,
+                "policy_provenance": provenance,
+            },
         },
         "profit_risk_sizing": {
-            "low_payoff_quality": True,
-            "quality_tier": "base",
-            "high_quality_entry": False,
-            "position_size_pct": 0.006,
-            "final_notional_usdt": 30.0,
-            "planned_stop_loss_usdt": 1.5,
-            "max_stop_loss_usdt": 1.5,
-            "expected_profit_usdt": 0.12,
-            "dynamic_leverage_decision": {
-                "final_integer_leverage": 1,
-                "limiting_factor": "risk_budget",
-                "reasons": ["limited_by_risk_budget"],
-            },
-            "profit_first_position_ladder": {
-                "lane": "tiny_probe",
-                "adjusted_size_pct": 0.006,
-            },
+            "production_eligible": True,
+            "policy_provenance": provenance,
         },
     }
+    return decision
 
-    result = _profit_first_entry_contract_result(decision)
 
+def test_dynamic_return_contract_accepts_complete_governed_entry() -> None:
+    result = _return_entry_contract_result(_dynamic_return_ready_decision())
+    assert result.passed is True
+    assert result.data["return_execution_contract"] == "complete"
+
+
+def test_dynamic_return_contract_ignores_legacy_probe_fields_and_fails_closed() -> None:
+    decision = _dynamic_return_ready_decision()
+    decision.raw_response["opportunity_score"] = {
+        "evidence_score": {"tradeable_probe": True, "shadow_only": False}
+    }
+    decision.raw_response["authoritative_return_candidate"]["side_evidence"][
+        "policy_provenance"
+    ] = {}
+    result = _return_entry_contract_result(decision)
     assert result.passed is False
-    assert result.blocker == "profit_first_defensive_probe_shadow"
-    assert result.reason is not None
-    assert "Profit-First 防御探针拦截" in result.reason
-    assert "low-payoff" not in result.reason
-    assert result.data["shadow_only"] is True
-    assert result.data["skip_kind"] == "profit_first_defensive_probe_shadow"
-    assert result.data["dynamic_leverage_limiting_factor"] == "risk_budget"
+    assert result.blocker == "dynamic_return_execution_contract_incomplete"
+    assert "return_policy_provenance_incomplete" in result.data["block_reasons"]
 
 
 @pytest.mark.asyncio
@@ -310,11 +200,6 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
         execution_leverage_summary_attacher=lambda *_args: None,
         execution_reason_provider=lambda result: result.raw_response.get("error") if result else "",
         pending_execution_marker=_noop_async,
-        untradable_exchange_error_checker=lambda _text: False,
-        untradable_symbol_rememberer=lambda *_args: None,
-        transient_entry_exchange_error_checker=lambda _text: False,
-        temporary_entry_block_rememberer=lambda *_args: None,
-        transient_entry_block_minutes_provider=lambda _text: 5.0,
         trade_logger=_noop_async,
         exchange_confirmed_checker=lambda _result: False,
         exit_progress_checker=lambda _result: False,
@@ -323,7 +208,6 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
         position_execution_persister=_noop_async,
         open_positions_execution_applier=lambda *_args: None,
         decision_executed_marker=_noop_async,
-        market_no_opportunity_symbol_clearer=lambda _symbol: None,
         account_update_persister=_noop_async,
         account_balance_provider=lambda _model: _noop_async(),
         decision_outcome_marker=_noop_async,
@@ -336,7 +220,6 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
         open_positions_context_provider=lambda: _noop_async(),
         matching_exit_local_position_checker=lambda *_args: False,
         matching_exit_exchange_position_checker=lambda *_args: _noop_async(),
-        exit_cooldown_recorder=lambda *_args: None,
         trade_notional_recorder=lambda _notional: None,
     )
     results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
@@ -548,4 +431,10 @@ async def test_execution_service_shields_exchange_submit_from_outer_timeout() ->
     assert results["executions"][0]["order_id"] == "local-order-1"
     assert results["decisions"][0]["executed"] is True
     assert any(stage == DecisionStage.LOCAL_SYNC and status == DecisionStageStatus.COMPLETED for stage, status, _reason in stages)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
+    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
     assert not any("外层超时保护取消" in str(reason) for reason in reasons)

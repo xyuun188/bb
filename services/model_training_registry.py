@@ -47,14 +47,11 @@ def _fee_after_evaluation(
         }
     pnl = float(evidence.get("pnl") or 0.0)
     profit_factor = float(evidence.get("profit_factor") or 0.0)
-    state = str(evidence.get("state") or "learning")
     blockers = []
     if pnl <= 0:
         blockers.append("realized_net_pnl_non_positive")
     if profit_factor < 1.0:
         blockers.append("profit_factor_below_unity")
-    if state == "learning":
-        blockers.append("fee_after_sample_floor_not_met")
     return {
         "evaluation_mode": "fee_after_shadow_evaluated",
         "evaluation_objective": "fee_after_realized_net_pnl_and_profit_factor",
@@ -87,11 +84,6 @@ def _finquant_specialization_verified(
         return False
     if "trl_dpo_return_preference" not in str(evidence.get("training_stages") or ""):
         return False
-    try:
-        if float(evidence.get("preference_selection_accuracy") or 0.0) < 0.5:
-            return False
-    except (TypeError, ValueError):
-        return False
     required_text = (
         "adapter_version",
         "adapter_path",
@@ -104,7 +96,6 @@ def _finquant_specialization_verified(
         "objective_name",
         "objective_version",
         "preference_contract_version",
-        "preference_selection_accuracy",
         "training_stages",
     )
     if any(not str(evidence.get(key) or "").strip() for key in required_text):
@@ -379,15 +370,6 @@ def _llm_rows(
     model_server_report: dict[str, Any],
     contribution_performance: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    old_takeover = _safe_dict(
-        model_server_report.get("old_takeover_runtime") or model_server_report.get("old_takeover")
-    )
-    required_endpoints = _safe_list(old_takeover.get("required_endpoints"))
-    endpoint_by_model = {
-        str(row.get("served_model_name") or ""): row
-        for row in required_endpoints
-        if isinstance(row, dict)
-    }
     slot_reports = {
         str(row.get("slot") or ""): row
         for row in _safe_list(
@@ -398,10 +380,18 @@ def _llm_rows(
         if isinstance(row, dict)
     }
     finquant_slot = _safe_dict(slot_reports.get("llm_expert_pool"))
+    decision_slot = _safe_dict(slot_reports.get("llm_decision_maker"))
+    risk_slot = _safe_dict(slot_reports.get("llm_high_risk_review"))
+
+    def current_slot_runtime(slot: dict[str, Any]) -> bool:
+        return bool(
+            slot.get("ok")
+            and slot.get("service_active")
+            and slot.get("endpoint_ready")
+        )
+
     specialization = _safe_dict(finquant_slot.get("specialization_evidence"))
-    finquant_runtime = bool(
-        _safe_dict(endpoint_by_model.get("BB-FinQuant-Expert-14B")).get("ready")
-    )
+    finquant_runtime = current_slot_runtime(finquant_slot)
     finquant_specialized = _finquant_specialization_verified(finquant_slot, specialization)
     finquant = {
         "model_id": "bb_finquant_expert_14b",
@@ -426,21 +416,17 @@ def _llm_rows(
     base_rows = [
         {
             "model_id": "qwen3_14b_trade",
-            "display_name": "Qwen3-14B trade",
-            "model_family": "Qwen3-14B-AWQ",
+            "display_name": str(decision_slot.get("served_model_name") or "Decision model"),
+            "model_family": str(decision_slot.get("repo_id") or "phase3 decision model"),
             "task": "trade_reasoning_fallback",
-            "runtime_available": bool(
-                _safe_dict(endpoint_by_model.get("qwen3-14b-trade")).get("ready")
-            ),
+            "runtime_available": current_slot_runtime(decision_slot),
         },
         {
             "model_id": "deepseek_r1_14b_risk",
-            "display_name": "DeepSeek-R1-14B risk",
-            "model_family": "DeepSeek-R1-Distill-Qwen-14B-AWQ",
+            "display_name": str(risk_slot.get("served_model_name") or "Risk review model"),
+            "model_family": str(risk_slot.get("repo_id") or "phase3 risk review model"),
             "task": "risk_review",
-            "runtime_available": bool(
-                _safe_dict(endpoint_by_model.get("deepseek-r1-14b-risk")).get("ready")
-            ),
+            "runtime_available": current_slot_runtime(risk_slot),
         },
         {
             "model_id": "deepseek_online_decision",

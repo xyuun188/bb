@@ -145,28 +145,22 @@ def test_phase3_server_migration_snapshot_ready() -> None:
     assert report["warnings"][0]["code"] == "legacy_data_paths_preserved"
 
 
-def test_phase3_server_migration_accepts_old_one_gpu_takeover_contract() -> None:
+def test_phase3_server_migration_rejects_legacy_one_gpu_topology() -> None:
     report = evaluate_phase3_server_snapshot(_old_takeover_snapshot())
     blocker_codes = {item["code"] for item in report["blockers"]}
-    warning_codes = {item["code"] for item in report["warnings"]}
 
-    assert report["status"] == "ready"
-    assert report["deployment_contract"] == "old_one_gpu_timesfm_takeover"
-    assert report["phase3_go_live_blocked"] is False
-    assert report["old_takeover"]["active"] is True
-    assert report["old_takeover"]["service_ready"] is True
-    assert report["old_takeover"]["endpoint_ready"] is True
-    assert report["old_takeover"]["artifact_ready"] is True
-    assert report["legacy_process_count"] == 0
-    assert report["old_takeover_allowed_process_count"] == 3
-    assert blocker_codes == set()
-    assert "old_takeover_resource_release_marker_not_required" in warning_codes
-    assert "old_takeover_migration_manifest_not_required" in warning_codes
-    assert "old_takeover_legacy_14b_processes_allowed" in warning_codes
-    assert "legacy_processes_running" not in blocker_codes
+    assert report["status"] == "blocked"
+    assert report["deployment_contract"] == "phase3_full_model_server"
+    assert report["phase3_go_live_blocked"] is True
+    assert "old_takeover" not in report
+    assert report["legacy_process_count"] == 2
+    assert "resource_release_marker_missing" in blocker_codes
+    assert "migration_manifest_missing" in blocker_codes
+    assert "phase3_required_roots_missing" in blocker_codes
+    assert "legacy_processes_running" in blocker_codes
 
 
-def test_phase3_server_migration_old_takeover_still_blocks_32b_legacy_process() -> None:
+def test_phase3_server_migration_legacy_topology_also_blocks_32b_process() -> None:
     snapshot = _old_takeover_snapshot()
     snapshot["candidate_model_processes"].append(
         "777 python -m vllm.entrypoints.openai.api_server "
@@ -179,7 +173,7 @@ def test_phase3_server_migration_old_takeover_still_blocks_32b_legacy_process() 
     assert report["status"] == "blocked"
     assert report["phase3_go_live_blocked"] is True
     assert "legacy_processes_running" in blocker_codes
-    assert report["legacy_process_count"] == 1
+    assert report["legacy_process_count"] == 3
 
 
 def test_phase3_server_migration_allows_phase3_vllm_under_data_bb() -> None:

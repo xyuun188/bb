@@ -16,7 +16,6 @@ from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from services.execution_cost_model import execution_cost_estimate
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
-from services.runtime_entry_filters import default_entry_filters
 from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
 logger = structlog.get_logger(__name__)
@@ -499,8 +498,6 @@ class ShadowBacktestService:
                 return
             memory_type = "shadow_missed_opportunity"
             side = best_action
-            confidence_adjustment = 0.0
-            position_size_multiplier = 1.0
             success_count = 0
             failure_count = 0
             outcome_text = (
@@ -516,8 +513,6 @@ class ShadowBacktestService:
             )
             if realized_net_pct > 0.0:
                 memory_type = "shadow_good_signal"
-                confidence_adjustment = 0.0
-                position_size_multiplier = 1.0
                 success_count = 0
                 failure_count = 0
                 outcome_text = (
@@ -527,8 +522,6 @@ class ShadowBacktestService:
                 recommended = "shadow_observation_only"
             elif realized_net_pct < 0.0:
                 memory_type = "shadow_bad_signal"
-                confidence_adjustment = 0.0
-                position_size_multiplier = 1.0
                 success_count = 0
                 failure_count = 0
                 opposite = "short" if side == "long" else "long"
@@ -566,12 +559,9 @@ class ShadowBacktestService:
                     "market_pattern": pattern,
                     "lesson": lesson,
                     "recommended_action": recommended,
-                    "confidence_adjustment": confidence_adjustment,
-                    "position_size_multiplier": position_size_multiplier,
                     "evidence_count": 1,
                     "success_count": success_count,
                     "failure_count": failure_count,
-                    "confidence_score": 0.52,
                     "memory_key": (
                         f"{expert_name}|shadow_correlated_path|"
                         f"{getattr(row, 'decision_id', None) or getattr(row, 'id', None)}|"
@@ -683,25 +673,5 @@ class ShadowBacktestService:
         )
 
     def _feature_bucket(self, feature_snapshot: dict[str, Any]) -> str:
-        adx = self.float_parser(feature_snapshot.get("adx_14"), 0.0)
-        volume_ratio = self.float_parser(feature_snapshot.get("volume_ratio"), 0.0)
-        returns_5 = self.float_parser(feature_snapshot.get("returns_5"), 0.0)
-        imbalance = self.float_parser(feature_snapshot.get("orderbook_imbalance"), 0.0)
-        entry_filters = default_entry_filters(reason="shadow_backtest_bucket")
-        adx_bucket = (
-            "adx_hi"
-            if adx >= 25
-            else "adx_mid" if adx >= entry_filters.min_entry_adx else "adx_low"
-        )
-        volume_bucket = (
-            "vol_hi"
-            if volume_ratio >= 1.2
-            else "vol_ok" if volume_ratio >= entry_filters.min_entry_volume_ratio else "vol_low"
-        )
-        momentum_bucket = (
-            "mom_up" if returns_5 > 0.002 else "mom_down" if returns_5 < -0.002 else "mom_flat"
-        )
-        book_bucket = (
-            "bid_wall" if imbalance > 0.12 else "ask_wall" if imbalance < -0.12 else "book_flat"
-        )
-        return f"{adx_bucket}|{volume_bucket}|{momentum_bucket}|{book_bucket}"
+        del feature_snapshot
+        return "continuous_market_features"

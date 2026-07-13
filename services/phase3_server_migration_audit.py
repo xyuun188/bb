@@ -25,32 +25,6 @@ MIGRATION_MANIFEST_PATH = "/data/BB/manifests/phase3_migration_whitelist.json"
 PHASE3_RESOURCE_POLICY_ID = "phase3_stop_legacy_release_gpu_keep_old_data_2026_06_26"
 PHASE3_ROOT = "/data/BB"
 PROCESS_EVIDENCE_TEXT_LIMIT = 700
-OLD_TAKEOVER_CONTRACT_ID = "old_one_gpu_timesfm_takeover"
-OLD_TAKEOVER_REQUIRED_SERVICES = (
-    "qwen3-14b-trade.service",
-    "deepseek-r1-14b-risk.service",
-    "bb-finquant-expert-gateway.service",
-    "bb-phase3-quant-api.service",
-)
-OLD_TAKEOVER_REQUIRED_ENDPOINTS = (
-    (8000, "qwen3-14b-trade"),
-    (8002, "deepseek-r1-14b-risk"),
-    (8003, "BB-FinQuant-Expert-14B"),
-    (8101, ""),
-)
-OLD_TAKEOVER_REQUIRED_ARTIFACT_PATHS = (
-    "/data/BB/models/timeseries/google--timesfm-2.5-200m-pytorch",
-    "/data/BB/models/timeseries/amazon--chronos-2",
-    "/data/BB/models/sentiment/ProsusAI--finbert",
-    "/data/BB/models/local_ai_tools/local_quant_models.joblib",
-)
-OLD_TAKEOVER_CRITICAL_ROOTS = (
-    "/data/BB",
-    "/data/BB/models",
-    "/data/BB/runtime",
-    "/data/BB/logs",
-    "/data/BB/manifests",
-)
 
 FORBIDDEN_LEGACY_SERVICE_NAMES = (
     "qwen3-122b.service",
@@ -122,6 +96,7 @@ LEGACY_PROCESS_HINTS_ALWAYS_BLOCK = (
     "open-webui",
     "text-generation-webui",
     "ollama",
+    "finquant_expert_alias.py",
 )
 
 LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3 = (
@@ -129,6 +104,8 @@ LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3 = (
     "deepseek-r1-distill-qwen-32b",
     "deepseek_32b",
     "qwen3_32b",
+    "/data/trade_models/qwen/qwen3-14b-awq",
+    "/data/trade_models/deepseek/deepseek-r1-distill-qwen-14b-awq",
 )
 
 APPROVED_MIGRATION_CATEGORIES = (
@@ -256,99 +233,8 @@ def _is_legacy_process(value: Any) -> bool:
     return any(hint in line for hint in LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3)
 
 
-def _is_old_takeover_allowed_process(value: Any) -> bool:
-    line = _process_lower(value)
-    if not line:
-        return False
-    qwen14 = "qwen3-14b-trade" in line or "/data/trade_models/qwen/qwen3-14b-awq" in line
-    deepseek14 = (
-        "deepseek-r1-14b-risk" in line
-        or "/data/trade_models/deepseek/deepseek-r1-distill-qwen-14b-awq" in line
-    )
-    quant_api = "/data/bb/envs/phase3-quant/bin/python" in line
-    alias = "finquant_expert_alias.py" in line
-    return bool(qwen14 or deepseek14 or quant_api or alias)
-
-
 def _service_rows(snapshot: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return [_safe_dict(item) for item in _safe_list(snapshot.get(key))]
-
-
-def _endpoint_model_ready(
-    port: int,
-    served_model_name: str,
-    port_probes: list[dict[str, Any]],
-) -> bool:
-    expected = str(served_model_name or "").strip().lower()
-    for probe in port_probes:
-        try:
-            probe_port = int(probe.get("port"))
-        except (TypeError, ValueError):
-            continue
-        if probe_port != int(port):
-            continue
-        if not bool(probe.get("ok")):
-            continue
-        response = str(probe.get("response") or "").lower()
-        return bool(not expected or expected in response)
-    return False
-
-
-def _old_takeover_contract(
-    snapshot: dict[str, Any],
-    *,
-    old_takeover_services: list[dict[str, Any]],
-    port_probes: list[dict[str, Any]],
-    old_takeover_artifacts: list[dict[str, Any]],
-) -> dict[str, Any]:
-    service_checks = [
-        {
-            "service_name": service_name,
-            "active": any(
-                str(item.get("name") or "") == service_name and _service_hit(item)
-                for item in old_takeover_services
-            ),
-        }
-        for service_name in OLD_TAKEOVER_REQUIRED_SERVICES
-    ]
-    endpoint_checks = [
-        {
-            "port": port,
-            "served_model_name": served_model_name,
-            "ready": _endpoint_model_ready(port, served_model_name, port_probes),
-        }
-        for port, served_model_name in OLD_TAKEOVER_REQUIRED_ENDPOINTS
-    ]
-    artifact_checks = [
-        {
-            "path": path,
-            "exists": any(
-                str(item.get("path") or "") == path and _path_hit(item)
-                for item in old_takeover_artifacts
-            ),
-        }
-        for path in OLD_TAKEOVER_REQUIRED_ARTIFACT_PATHS
-    ]
-    process_signal = any(
-        _is_old_takeover_allowed_process(item)
-        for item in _safe_list(snapshot.get("candidate_model_processes"))
-        + _safe_list(snapshot.get("legacy_processes"))
-    )
-    service_ready = all(bool(item.get("active")) for item in service_checks)
-    endpoint_ready = all(bool(item.get("ready")) for item in endpoint_checks)
-    artifact_ready = all(bool(item.get("exists")) for item in artifact_checks)
-    active = bool(service_ready and endpoint_ready and artifact_ready)
-    return {
-        "contract_id": OLD_TAKEOVER_CONTRACT_ID,
-        "active": active,
-        "process_signal": process_signal,
-        "service_ready": service_ready,
-        "endpoint_ready": endpoint_ready,
-        "artifact_ready": artifact_ready,
-        "required_services": service_checks,
-        "required_endpoints": endpoint_checks,
-        "required_artifacts": artifact_checks,
-    }
 
 
 def _manifest_items(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -368,17 +254,6 @@ def _manifest_source(item: dict[str, Any]) -> str:
 
 def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Evaluate the model-server reset/migration snapshot without mutating it."""
-
-    old_takeover_services = _service_rows(snapshot, "old_takeover_services")
-    port_probes = _service_rows(snapshot, "port_probes")
-    old_takeover_artifacts = _service_rows(snapshot, "old_takeover_artifacts")
-    old_takeover = _old_takeover_contract(
-        snapshot,
-        old_takeover_services=old_takeover_services,
-        port_probes=port_probes,
-        old_takeover_artifacts=old_takeover_artifacts,
-    )
-    old_takeover_active = bool(old_takeover.get("active"))
 
     marker = _safe_dict(snapshot.get("resource_release_marker") or snapshot.get("reset_marker"))
     marker_present = bool(marker.get("present"))
@@ -421,14 +296,8 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         _process_line(item) for item in _safe_list(snapshot.get("candidate_model_processes"))
     )
     raw_processes = _dedupe_processes([item for item in raw_processes if item])
-    old_takeover_allowed_processes = [
-        item for item in raw_processes if _is_old_takeover_allowed_process(item)
-    ]
     legacy_processes = [
-        item
-        for item in raw_processes
-        if _is_legacy_process(item)
-        and not (old_takeover_active and _is_old_takeover_allowed_process(item))
+        item for item in raw_processes if _is_legacy_process(item)
     ]
     phase3_allowed_processes = [
         item
@@ -439,9 +308,6 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     legacy_process_evidence = [_compact_process_evidence(item) for item in legacy_processes]
     phase3_allowed_process_evidence = [
         _compact_process_evidence(item) for item in phase3_allowed_processes
-    ]
-    old_takeover_allowed_process_evidence = [
-        _compact_process_evidence(item) for item in old_takeover_allowed_processes
     ]
     ignored_probe_process_evidence = [
         _compact_process_evidence(item) for item in ignored_probe_processes
@@ -470,28 +336,13 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
 
     if not marker_present:
-        if old_takeover_active:
-            warnings.append(
-                _warning(
-                    "old_takeover_resource_release_marker_not_required",
-                    (
-                        "Old one-GPU takeover is a temporary compatibility profile, "
-                        "not the full new-server resource-release migration."
-                    ),
-                    evidence={
-                        "deployment_contract": OLD_TAKEOVER_CONTRACT_ID,
-                        "resource_release_marker_path": RESOURCE_RELEASE_MARKER_PATH,
-                    },
-                )
+        blockers.append(
+            _blocker(
+                "resource_release_marker_missing",
+                "Phase 3 resource-release evidence is missing on the new model server.",
+                evidence=RESOURCE_RELEASE_MARKER_PATH,
             )
-        else:
-            blockers.append(
-                _blocker(
-                    "resource_release_marker_missing",
-                    "Phase 3 resource-release evidence is missing on the new model server.",
-                    evidence=RESOURCE_RELEASE_MARKER_PATH,
-                )
-            )
+        )
     elif marker_policy not in {PHASE3_RESOURCE_POLICY_ID, "phase3_full_reset_2026_06_26"}:
         blockers.append(
             _blocker(
@@ -531,34 +382,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                 )
             )
 
-    if old_takeover_active:
-        critical_missing_roots = [
-            path for path in missing_phase3_roots if path in OLD_TAKEOVER_CRITICAL_ROOTS
-        ]
-        noncritical_missing_roots = [
-            path for path in missing_phase3_roots if path not in OLD_TAKEOVER_CRITICAL_ROOTS
-        ]
-        if critical_missing_roots:
-            blockers.append(
-                _blocker(
-                    "old_takeover_required_roots_missing",
-                    "Required old-server takeover workspace roots are missing.",
-                    evidence=critical_missing_roots,
-                )
-            )
-        if noncritical_missing_roots:
-            warnings.append(
-                _warning(
-                    "old_takeover_noncritical_roots_missing",
-                    (
-                        "Some full Phase 3 workspace roots are absent on the old "
-                        "temporary server profile; this does not block the takeover "
-                        "contract while model services and artifacts are healthy."
-                    ),
-                    evidence=noncritical_missing_roots,
-                )
-            )
-    elif missing_phase3_roots:
+    if missing_phase3_roots:
         blockers.append(
             _blocker(
                 "phase3_required_roots_missing",
@@ -590,18 +414,6 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                 ],
             )
         )
-    if old_takeover_active and old_takeover_allowed_processes:
-        warnings.append(
-            _warning(
-                "old_takeover_legacy_14b_processes_allowed",
-                (
-                    "Old-server takeover intentionally reuses existing 14B Qwen/"
-                    "DeepSeek vLLM services and the BB-FinQuant adapter gateway; these "
-                    "remain isolated from the full new-server migration contract."
-                ),
-                evidence=old_takeover_allowed_process_evidence[:10],
-            )
-        )
     if legacy_processes:
         blockers.append(
             _blocker(
@@ -612,29 +424,13 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         )
 
     if not manifest_present:
-        if old_takeover_active:
-            warnings.append(
-                _warning(
-                    "old_takeover_migration_manifest_not_required",
-                    (
-                        "Old-server takeover is not copying the old server into "
-                        "the new Phase 3 server, so the full whitelist migration "
-                        "manifest is not required for this temporary profile."
-                    ),
-                    evidence={
-                        "deployment_contract": OLD_TAKEOVER_CONTRACT_ID,
-                        "migration_manifest_path": MIGRATION_MANIFEST_PATH,
-                    },
-                )
+        blockers.append(
+            _blocker(
+                "migration_manifest_missing",
+                "Old-server migration must be controlled by a whitelist manifest, not an ad-hoc copy.",
+                evidence=MIGRATION_MANIFEST_PATH,
             )
-        else:
-            blockers.append(
-                _blocker(
-                    "migration_manifest_missing",
-                    "Old-server migration must be controlled by a whitelist manifest, not an ad-hoc copy.",
-                    evidence=MIGRATION_MANIFEST_PATH,
-                )
-            )
+        )
     else:
         if not bool(manifest_data.get("whitelist_only", True)):
             blockers.append(
@@ -675,10 +471,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "can_mutate_remote": False,
         "can_delete_remote_data": False,
         "phase3_go_live_blocked": bool(blockers),
-        "deployment_contract": (
-            OLD_TAKEOVER_CONTRACT_ID if old_takeover_active else "phase3_full_model_server"
-        ),
-        "old_takeover": old_takeover,
+        "deployment_contract": "phase3_full_model_server",
         "policy_id": PHASE3_RESOURCE_POLICY_ID,
         "resource_release_marker_path": RESOURCE_RELEASE_MARKER_PATH,
         "reset_marker_path": RESOURCE_RELEASE_MARKER_PATH,
@@ -690,13 +483,11 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             "legacy_model_or_cache_allowed_as_isolated_data": True,
             "phase3_data_root": PHASE3_ROOT,
             "target_usage": "full_capacity_for_phase3_quant_plan",
-            "temporary_old_server_takeover_allowed": True,
         },
         "migration_policy": {
             "whitelist_only": True,
             "whole_disk_copy_allowed": False,
             "old_server_production_role_after_migration": "retired",
-            "temporary_old_server_role": "compatibility_takeover_until_new_server_recovers",
             "approved_categories": list(APPROVED_MIGRATION_CATEGORIES),
             "approved_sources": list(MIGRATION_SOURCES_ALLOWED),
         },
@@ -731,14 +522,12 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "forbidden_path_count": 0,
         "forbidden_service_count": len(forbidden_services),
         "legacy_process_count": len(legacy_processes),
-        "old_takeover_allowed_process_count": len(old_takeover_allowed_processes),
         "phase3_allowed_process_count": len(phase3_allowed_processes),
         "ignored_probe_process_count": len(ignored_probe_processes),
         "legacy_data_paths": legacy_paths[:30],
         "forbidden_paths": [],
         "forbidden_services": forbidden_services[:30],
         "legacy_processes": legacy_process_evidence[:10],
-        "old_takeover_allowed_processes": old_takeover_allowed_process_evidence[:10],
         "phase3_allowed_processes": phase3_allowed_process_evidence[:10],
         "ignored_probe_processes": ignored_probe_process_evidence[:10],
         "approved_roots": _safe_list(snapshot.get("approved_roots")),
@@ -767,9 +556,6 @@ def render_phase3_server_probe() -> str:
             "trade_ai|trade_models|open-webui|text-generation-webui|ollama|vllm"
         )
         PHASE3_ROOT = {json.dumps(PHASE3_ROOT)}
-        OLD_TAKEOVER_REQUIRED_SERVICES = {json.dumps(OLD_TAKEOVER_REQUIRED_SERVICES)}
-        OLD_TAKEOVER_REQUIRED_ENDPOINTS = {json.dumps(OLD_TAKEOVER_REQUIRED_ENDPOINTS)}
-        OLD_TAKEOVER_REQUIRED_ARTIFACT_PATHS = {json.dumps(OLD_TAKEOVER_REQUIRED_ARTIFACT_PATHS)}
         PHASE3_ALLOWED_PROCESS_HINTS = {json.dumps(PHASE3_ALLOWED_PROCESS_HINTS)}
         AUDIT_PROBE_PROCESS_HINTS = {json.dumps(AUDIT_PROBE_PROCESS_HINTS)}
         LEGACY_PROCESS_HINTS_ALWAYS_BLOCK = {json.dumps(LEGACY_PROCESS_HINTS_ALWAYS_BLOCK)}
@@ -876,37 +662,6 @@ def render_phase3_server_probe() -> str:
                 "enabled_state": enabled_out or "unknown",
             }}
 
-        def port_probe(port):
-            code, response, _ = run(
-                [
-                    "curl",
-                    "-fsS",
-                    "--max-time",
-                    "3",
-                    "http://127.0.0.1:%s/v1/models" % port,
-                ],
-                timeout=5,
-            )
-            path = "/v1/models"
-            if not response:
-                code, response, _ = run(
-                    [
-                        "curl",
-                        "-fsS",
-                        "--max-time",
-                        "3",
-                        "http://127.0.0.1:%s/health" % port,
-                    ],
-                    timeout=5,
-                )
-                path = "/health"
-            return {{
-                "port": port,
-                "path": path,
-                "ok": code == 0 and bool(response.strip()),
-                "response": response[:1200],
-            }}
-
         _pg_code, pg_out, _pg_err = run(["pgrep", "-af", LEGACY_PROCESS_PATTERN], timeout=4)
         candidate_model_processes = [
             line.strip() for line in pg_out.splitlines()
@@ -935,15 +690,6 @@ def render_phase3_server_probe() -> str:
             "phase3_roots": [path_state(path) for path in PHASE3_REQUIRED_ROOTS],
             "forbidden_services": [
                 service_state(name) for name in FORBIDDEN_LEGACY_SERVICE_NAMES
-            ],
-            "old_takeover_services": [
-                service_state(name) for name in OLD_TAKEOVER_REQUIRED_SERVICES
-            ],
-            "old_takeover_artifacts": [
-                path_state(path) for path in OLD_TAKEOVER_REQUIRED_ARTIFACT_PATHS
-            ],
-            "port_probes": [
-                port_probe(item[0]) for item in OLD_TAKEOVER_REQUIRED_ENDPOINTS
             ],
             "candidate_model_processes": candidate_model_processes,
             "legacy_processes": legacy_processes,

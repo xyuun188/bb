@@ -1,120 +1,116 @@
 from datetime import UTC, datetime, timedelta
 
 from ai_brain.base_model import Action, DecisionOutput
-from services.decision_freshness import (
-    ENTRY_DECISION_MAX_AGE_SECONDS,
-    ENTRY_EXCEPTIONAL_OPPORTUNITY_MAX_AGE_SECONDS,
-    ENTRY_STRONG_OPPORTUNITY_MAX_AGE_SECONDS,
-    EXIT_DECISION_MAX_AGE_SECONDS,
-    PROFIT_PROTECTION_EXIT_MAX_AGE_SECONDS,
-    DecisionFreshnessPolicy,
-)
+from services.decision_freshness import DecisionFreshnessPolicy
 
 
 def _decision(
-    action: Action,
     *,
-    timestamp: datetime,
+    now: datetime,
+    generated_at: datetime | None,
+    valid_for_seconds: float | None,
     confidence: float = 0.7,
-    raw_response: dict | None = None,
-    feature_snapshot: dict | None = None,
 ) -> DecisionOutput:
+    provenance = {
+        "source": "production_return_distribution",
+        "generated_at": generated_at.isoformat() if generated_at else "",
+    }
+    if valid_for_seconds is not None:
+        provenance["valid_for_seconds"] = valid_for_seconds
     return DecisionOutput(
         model_name="ensemble_trader",
         symbol="BTC/USDT",
-        action=action,
+        action=Action.LONG,
         confidence=confidence,
-        reasoning="测试信号",
-        position_size_pct=0.05,
-        suggested_leverage=3.0,
-        raw_response=raw_response or {},
-        feature_snapshot=feature_snapshot or {},
-        timestamp=timestamp,
+        reasoning="test",
+        raw_response={
+            "opportunity_score": {
+                "production_eligible": True,
+                "policy_provenance": provenance,
+            }
+        },
+        feature_snapshot={"timestamp": (now - timedelta(seconds=1)).isoformat()},
+        timestamp=now,
     )
 
 
-def test_entry_decision_stale_reason_uses_timing_not_market_snapshot() -> None:
-    now = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
-    completed_at = now - timedelta(seconds=ENTRY_DECISION_MAX_AGE_SECONDS + 5)
-    fresh_market_snapshot = now - timedelta(seconds=10)
+def test_entry_freshness_uses_return_provenance_instead_of_market_snapshot() -> None:
+    now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
+    generated_at = now - timedelta(seconds=61)
     decision = _decision(
-        Action.LONG,
-        timestamp=now,
-        raw_response={"timing": {"decision_completed_at": completed_at.isoformat()}},
-        feature_snapshot={"timestamp": fresh_market_snapshot.isoformat()},
+        now=now,
+        generated_at=generated_at,
+        valid_for_seconds=60,
     )
     policy = DecisionFreshnessPolicy(clock=lambda: now)
 
     reason = policy.stale_decision_reason(decision)
 
     assert reason is not None
-    assert "AI开仓裁决完成到准备下单" in reason
-    assert decision.raw_response["stale_decision_check"]["max_age_seconds"] == (
-        ENTRY_DECISION_MAX_AGE_SECONDS
-    )
-    assert decision.raw_response["stale_decision_check"]["reference_time"] == (
-        completed_at.isoformat()
-    )
+    check = decision.raw_response["stale_decision_check"]
+    assert check["valid_for_seconds"] == 60
+    assert check["reason"] == "return_horizon_expired"
+    assert check["reference_time"] == generated_at.isoformat()
 
 
-def test_strong_entry_uses_shorter_freshness_window() -> None:
-    now = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
-    decision = _decision(
-        Action.LONG,
-        timestamp=now - timedelta(seconds=ENTRY_STRONG_OPPORTUNITY_MAX_AGE_SECONDS + 1),
-        confidence=0.76,
-        raw_response={
-            "opportunity_score": {
-                "score": 3.1,
-                "ai_expected_return_pct": 2.1,
-                "reward_risk_ratio": 1.25,
-            }
-        },
+def test_entry_freshness_changes_with_model_generated_horizon() -> None:
+    now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
+    generated_at = now - timedelta(seconds=90)
+    short_horizon = _decision(
+        now=now,
+        generated_at=generated_at,
+        valid_for_seconds=60,
+    )
+    long_horizon = _decision(
+        now=now,
+        generated_at=generated_at,
+        valid_for_seconds=120,
     )
     policy = DecisionFreshnessPolicy(clock=lambda: now)
 
-    assert policy.max_age_seconds(decision) == ENTRY_STRONG_OPPORTUNITY_MAX_AGE_SECONDS
-    assert policy.stale_decision_reason(decision) is not None
+    assert policy.stale_decision_reason(short_horizon) is not None
+    assert policy.stale_decision_reason(long_horizon) is None
 
 
-def test_exceptional_entry_keeps_default_freshness_window() -> None:
-    now = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+def test_entry_freshness_fails_closed_without_dynamic_horizon() -> None:
+    now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
     decision = _decision(
-        Action.LONG,
-        timestamp=now - timedelta(seconds=ENTRY_EXCEPTIONAL_OPPORTUNITY_MAX_AGE_SECONDS - 1),
-        confidence=0.86,
-        raw_response={
-            "opportunity_score": {
-                "score": 6.0,
-                "ai_expected_return_pct": 4.0,
-                "reward_risk_ratio": 1.5,
-            }
-        },
+        now=now,
+        generated_at=now,
+        valid_for_seconds=None,
     )
-    policy = DecisionFreshnessPolicy(clock=lambda: now)
 
-    assert policy.max_age_seconds(decision) == ENTRY_EXCEPTIONAL_OPPORTUNITY_MAX_AGE_SECONDS
-    assert policy.stale_decision_reason(decision) is None
+    reason = DecisionFreshnessPolicy(clock=lambda: now).stale_decision_reason(decision)
 
-
-def test_profit_protection_exit_uses_extended_window() -> None:
-    now = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
-    decision = _decision(
-        Action.CLOSE_LONG,
-        timestamp=now - timedelta(seconds=EXIT_DECISION_MAX_AGE_SECONDS + 10),
-        raw_response={"close_evidence": {"profit_protection": True}},
+    assert reason is not None
+    assert "动态有效期" in reason
+    assert decision.raw_response["stale_decision_check"]["reason"] == (
+        "return_horizon_provenance_missing"
     )
-    policy = DecisionFreshnessPolicy(clock=lambda: now)
-
-    assert policy.max_age_seconds(decision) == PROFIT_PROTECTION_EXIT_MAX_AGE_SECONDS
-    assert policy.stale_decision_reason(decision) is None
 
 
-def test_forced_exit_bypasses_freshness_check() -> None:
-    now = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+def test_confidence_and_score_cannot_extend_return_horizon() -> None:
+    now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
     decision = _decision(
-        Action.CLOSE_LONG,
-        timestamp=now - timedelta(seconds=PROFIT_PROTECTION_EXIT_MAX_AGE_SECONDS + 100),
+        now=now,
+        generated_at=now - timedelta(seconds=61),
+        valid_for_seconds=60,
+        confidence=0.99,
+    )
+    decision.raw_response["opportunity_score"]["score"] = 999
+
+    assert DecisionFreshnessPolicy(clock=lambda: now).stale_decision_reason(decision) is not None
+
+
+def test_forced_exit_is_not_subject_to_entry_horizon() -> None:
+    now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.5,
+        reasoning="hard risk",
+        timestamp=now - timedelta(days=1),
     )
     policy = DecisionFreshnessPolicy(
         forced_exit_checker=lambda checked: checked is decision,
@@ -122,4 +118,3 @@ def test_forced_exit_bypasses_freshness_check() -> None:
     )
 
     assert policy.stale_decision_reason(decision) is None
-    assert "stale_decision_check" not in decision.raw_response

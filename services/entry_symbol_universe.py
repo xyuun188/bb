@@ -9,25 +9,12 @@ from typing import Any
 from config.settings import ENSEMBLE_TRADER_NAME
 
 NormalizeSymbol = Callable[[Any], str | None]
-ReasonProvider = Callable[[str | None], str | None]
-
-
-@dataclass(frozen=True, slots=True)
-class BlockedSymbol:
-    symbol: str
-    reason: str
 
 
 @dataclass(frozen=True, slots=True)
 class SymbolFilterResult:
     symbols: list[str]
     skipped: list[str]
-
-
-@dataclass(frozen=True, slots=True)
-class BlockedSymbolFilterResult:
-    symbols: list[str]
-    skipped: list[BlockedSymbol]
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,22 +92,3 @@ class EntrySymbolUniversePolicy:
                 continue
             filtered.append(symbol)
         return SymbolFilterResult(symbols=filtered, skipped=skipped)
-
-    def filter_blocked_new_symbols(
-        self,
-        symbols: list[str],
-        open_positions: list[dict],
-        suspicious_reason: ReasonProvider,
-        blocked_reason: ReasonProvider,
-    ) -> BlockedSymbolFilterResult:
-        open_symbol_keys = self.open_position_symbol_keys(open_positions)
-        filtered: list[str] = []
-        skipped: list[BlockedSymbol] = []
-        for symbol in symbols or []:
-            normalized = self.normalize_symbol(symbol)
-            reason = suspicious_reason(normalized) or blocked_reason(normalized)
-            if reason and normalized not in open_symbol_keys:
-                skipped.append(BlockedSymbol(symbol=str(normalized or symbol), reason=reason))
-                continue
-            filtered.append(symbol)
-        return BlockedSymbolFilterResult(symbols=filtered, skipped=skipped)

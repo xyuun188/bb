@@ -33,15 +33,12 @@ def test_suspicious_symbol_policy_blocks_blank_symbols(symbol: str | None) -> No
         ("mock-USDT", "MOCK/USDT"),
     ],
 )
-def test_suspicious_symbol_policy_blocks_test_and_placeholder_symbols(
+def test_symbol_tokens_do_not_create_a_local_blocklist(
     symbol: str,
     normalized: str,
 ) -> None:
-    reason = EntrySuspiciousSymbolPolicy(_normalize).reason(symbol)
-
-    assert reason is not None
-    assert normalized in reason
-    assert "测试/模拟/占位合约" in reason
+    del normalized
+    assert EntrySuspiciousSymbolPolicy(_normalize).reason(symbol) is None
 
 
 def test_suspicious_symbol_policy_allows_normal_symbols() -> None:

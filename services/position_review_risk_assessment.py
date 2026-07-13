@@ -26,6 +26,7 @@ class PositionReviewRiskAssessmentPolicy:
         feature_vector: Any,
         account_balance_provider: AccountBalanceProvider,
     ) -> Any:
+        del feature_vector
         model_positions = [
             position for position in open_positions if position.get("model_name") == model_name
         ]
@@ -33,9 +34,4 @@ class PositionReviewRiskAssessmentPolicy:
             decision,
             current_positions=model_positions,
             account_balance=await account_balance_provider(model_name),
-            headlines=getattr(feature_vector, "recent_headlines", []),
-            sentiment_scores=[],
-            price_change_1m=getattr(feature_vector, "returns_1", 0.0),
-            volume_ratio=getattr(feature_vector, "volume_ratio", 1.0),
-            adx_14=getattr(feature_vector, "adx_14", None),
         )

@@ -636,7 +636,7 @@ class Phase3PaperResumePreflightService:
                 import json
 
                 payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except (OSError, TypeError, ValueError):
                 continue
             if isinstance(payload, dict):
                 payload.setdefault("available", True)
@@ -660,8 +660,10 @@ class Phase3PaperResumePreflightService:
         finally:
             try:
                 await executor.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                snapshot = {
+                    "error": f"executor shutdown failed: {safe_error_text(exc)}"
+                }
         if not isinstance(snapshot, dict):
             return {
                 "available": False,

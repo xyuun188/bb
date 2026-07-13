@@ -50,7 +50,6 @@ from services.entry_signal_extraction import (
     payload_side,
     signal_production_eligible,
 )
-from services.runtime_entry_filters import entry_filters_from_context, entry_filters_from_decision
 
 logger = structlog.get_logger(__name__)
 
@@ -85,231 +84,6 @@ def _snapshot_float(snapshot: dict[str, Any], key: str, default: float = 0.0) ->
         return default
 
 
-def _trend_aligned(decision: DecisionOutput) -> bool:
-    snapshot = decision.feature_snapshot or {}
-    price_vs_sma20 = _snapshot_float(snapshot, "price_vs_sma20")
-    price_vs_sma50 = _snapshot_float(snapshot, "price_vs_sma50")
-    if decision.action == Action.LONG:
-        return price_vs_sma20 > 0 and price_vs_sma50 > 0
-    if decision.action == Action.SHORT:
-        return price_vs_sma20 < 0 and price_vs_sma50 < 0
-    return False
-
-
-def _entry_filters_pass(decision: DecisionOutput) -> bool:
-    snapshot = decision.feature_snapshot or {}
-    entry_filters = entry_filters_from_decision(decision)
-    volume_ratio = _snapshot_float(snapshot, "volume_ratio", 1.0)
-    adx_14 = _snapshot_float(snapshot, "adx_14")
-    confirmations = [
-        volume_ratio >= entry_filters.min_entry_volume_ratio,
-        adx_14 >= entry_filters.min_entry_adx,
-        _trend_aligned(decision),
-    ]
-    return sum(1 for ok in confirmations if ok) >= 2
-
-
-def _directional_edge(snapshot: dict[str, Any]) -> tuple[Action, int, list[str]]:
-    """Score the market snapshot and return the stronger directional edge."""
-    long_score = 0
-    short_score = 0
-    long_reasons: list[str] = []
-    short_reasons: list[str] = []
-
-    price_vs_sma20 = _snapshot_float(snapshot, "price_vs_sma20")
-    price_vs_sma50 = _snapshot_float(snapshot, "price_vs_sma50")
-    macd_diff = _snapshot_float(snapshot, "macd_diff")
-    ema_12 = _snapshot_float(snapshot, "ema_12")
-    ema_26 = _snapshot_float(snapshot, "ema_26")
-    rsi_14 = _snapshot_float(snapshot, "rsi_14", 50.0)
-    stoch_k = _snapshot_float(snapshot, "stoch_k", 50.0)
-    returns_5 = _snapshot_float(snapshot, "returns_5")
-    returns_20 = _snapshot_float(snapshot, "returns_20")
-    bb_pct = _snapshot_float(snapshot, "bb_pct", 0.5)
-    adx_14 = _snapshot_float(snapshot, "adx_14")
-    volume_ratio = _snapshot_float(snapshot, "volume_ratio", 1.0)
-    entry_filters = entry_filters_from_context(snapshot)
-
-    if price_vs_sma20 > 0:
-        long_score += 1
-        long_reasons.append("价格站上 SMA20")
-    elif price_vs_sma20 < 0:
-        short_score += 1
-        short_reasons.append("价格跌破 SMA20")
-
-    if price_vs_sma50 > 0:
-        long_score += 1
-        long_reasons.append("价格站上 SMA50")
-    elif price_vs_sma50 < 0:
-        short_score += 1
-        short_reasons.append("价格跌破 SMA50")
-
-    if macd_diff > 0:
-        long_score += 1
-        long_reasons.append("MACD 动能偏多")
-    elif macd_diff < 0:
-        short_score += 1
-        short_reasons.append("MACD 动能偏空")
-
-    if ema_12 > 0 and ema_26 > 0:
-        if ema_12 > ema_26:
-            long_score += 1
-            long_reasons.append("EMA12 高于 EMA26")
-        elif ema_12 < ema_26:
-            short_score += 1
-            short_reasons.append("EMA12 低于 EMA26")
-
-    if returns_5 > 0 and returns_20 > 0:
-        long_score += 1
-        long_reasons.append("短中期收益为正")
-    elif returns_5 < 0 and returns_20 < 0:
-        short_score += 1
-        short_reasons.append("短中期收益为负")
-
-    if 52 <= rsi_14 <= 72:
-        long_score += 1
-        long_reasons.append("RSI 处于多头但未极端区间")
-    elif 28 <= rsi_14 <= 48:
-        short_score += 1
-        short_reasons.append("RSI 处于空头但未极端区间")
-
-    if stoch_k >= 55:
-        long_score += 1
-        long_reasons.append("随机指标偏强")
-    elif stoch_k <= 45:
-        short_score += 1
-        short_reasons.append("随机指标偏弱")
-
-    if 0.55 <= bb_pct <= 0.88:
-        long_score += 1
-        long_reasons.append("价格位于布林中上轨")
-    elif 0.12 <= bb_pct <= 0.45:
-        short_score += 1
-        short_reasons.append("价格位于布林中下轨")
-
-    if adx_14 >= entry_filters.min_entry_adx:
-        if long_score >= short_score:
-            long_score += 1
-            long_reasons.append("ADX 支持趋势交易")
-        else:
-            short_score += 1
-            short_reasons.append("ADX 支持趋势交易")
-
-    if volume_ratio >= entry_filters.min_entry_volume_ratio:
-        if long_score >= short_score:
-            long_score += 1
-            long_reasons.append("成交量达到入场要求")
-        else:
-            short_score += 1
-            short_reasons.append("成交量达到入场要求")
-
-    if rsi_14 > 78 and bb_pct > 0.9:
-        long_score -= 2
-    if rsi_14 < 22 and bb_pct < 0.1:
-        short_score -= 2
-
-    if long_score >= short_score:
-        return Action.LONG, long_score - short_score, long_reasons[:4]
-    return Action.SHORT, short_score - long_score, short_reasons[:4]
-
-
-def _format_expert_memories(memories: list[dict[str, Any]]) -> str:
-    lines = ["专家长期记忆：只作为风险教训和筛选参考，不是强制交易指令。"]
-    for idx, item in enumerate(
-        memories[: max(int(settings.expert_memory_per_prompt or 4), 1)], start=1
-    ):
-        lesson = str(item.get("lesson") or "").strip()
-        pattern = str(item.get("market_pattern") or "").strip()
-        action = str(item.get("recommended_action") or "reduce_risk").strip()
-        adjustment = item.get("confidence_adjustment")
-        multiplier = item.get("position_size_multiplier")
-        evidence = item.get("evidence_count")
-        parts = []
-        if pattern:
-            parts.append(f"场景={pattern[:60]}")
-        if lesson:
-            parts.append(f"教训={lesson[:100]}")
-        parts.append(f"建议={action}")
-        if adjustment is not None:
-            parts.append(f"信心调整={float(adjustment):+.0%}")
-        if multiplier is not None:
-            parts.append(f"仓位系数={float(multiplier):.2f}")
-        if evidence is not None:
-            parts.append(f"证据={int(evidence)}")
-        lines.append(f"{idx}. " + "；".join(parts))
-    return "\n".join(lines)
-
-
-def _format_market_regime(regime: dict[str, Any]) -> str:
-    if not isinstance(regime, dict) or not regime:
-        return ""
-    mode = str(regime.get("mode") or "unknown")
-    confidence = float(regime.get("confidence") or 0.0)
-    reason = str(regime.get("reason") or "")
-    soft_bias = []
-    if regime.get("avoid_long"):
-        soft_bias.append("long side needs stronger symbol-specific confirmation")
-    if regime.get("avoid_short"):
-        soft_bias.append("short side needs stronger symbol-specific confirmation")
-    bias_text = ", ".join(soft_bias) if soft_bias else "no directional bias"
-    return (
-        "Market regime forecast: "
-        f"mode={mode}, confidence={confidence:.0%}, {bias_text}. "
-        f"{reason} "
-        "This is background only, not a long/short ban. Judge every symbol independently and actively compare both long and short expected profit. "
-        "If a symbol has clear downside momentum, weak rebounds, negative order-book pressure, or better short expected return, a short is valid even in a rebound regime."
-    )
-
-
-def _format_strategy_mode(strategy: dict[str, Any]) -> str:
-    if not isinstance(strategy, dict) or not strategy:
-        return ""
-    blocked = strategy.get("blocked_directions")
-    if isinstance(blocked, (list, tuple, set)):
-        blocked_text = ",".join(str(item) for item in blocked) or "none"
-    else:
-        blocked_text = str(blocked or "none")
-    exposure = strategy.get("position_exposure")
-    exposure_text = ""
-    if isinstance(exposure, dict) and exposure:
-        dominant_side = str(exposure.get("dominant_side") or "neutral").lower()
-        long_count = int(exposure.get("long_count") or 0)
-        short_count = int(exposure.get("short_count") or 0)
-        net_ratio = float(exposure.get("net_ratio") or 0.0)
-        exposure_text = (
-            "Current exposure: "
-            f"long_notional={float(exposure.get('long_notional') or 0.0):.2f}, "
-            f"short_notional={float(exposure.get('short_notional') or 0.0):.2f}, "
-            f"net_ratio={net_ratio:.2f}, "
-            f"long_count={long_count}, "
-            f"short_count={short_count}, "
-            f"dominant_side={dominant_side}. "
-        )
-        if dominant_side in {"long", "short"}:
-            opposite = "short" if dominant_side == "long" else "long"
-            exposure_text += (
-                "Downstream execution has crowded-side protection: ordinary "
-                f"{dominant_side} additions are likely to be rejected while the portfolio "
-                "is this one-sided. Prefer hold or a symbol-specific "
-                f"{opposite} opportunity when evidence is marginal; choose the crowded side "
-                "only when expected net profit, payoff quality, and independent evidence are "
-                "clearly stronger than the opposite side. "
-            )
-    return (
-        "Execution strategy mode: "
-        f"strategy={strategy.get('strategy') or 'unknown'}, "
-        f"posture={strategy.get('posture') or 'balanced'}, "
-        f"allow_long={bool(strategy.get('allow_long', True))}, "
-        f"allow_short={bool(strategy.get('allow_short', True))}, "
-        f"blocked_directions={blocked_text}. "
-        f"{exposure_text}"
-        f"Reason: {strategy.get('reason') or ''} "
-        "Market regime is a soft bias only: it must not create global same-side entries. "
-        "Always evaluate long and short independently for this symbol; choose short when downside expected profit is better. "
-        "Portfolio exposure must be respected before generating ordinary same-side entries; add to a crowded side only when this symbol's expected profit justifies passing later execution guards. "
-        "Each symbol should be judged on trend, momentum, risk/reward, and execution quality without waiting for a perfect checklist. "
-        "Final goal is realized net profit maximization: do not chase losses, but act decisively on high-quality symbol-specific opportunities."
-    )
 
 
 def _format_local_ai_tools(tools: dict[str, Any]) -> str:
@@ -393,7 +167,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         )
 
     parts.append(
-        "Use these as profit-first evidence: expected realized return and downside risk matter more than raw win rate. "
+        "Use expected realized return and downside risk as observations; raw win rate is diagnostic only. "
         "If local tools are unavailable or weak, fall back to market features and expert judgment."
     )
     return " ".join(parts)
@@ -407,9 +181,6 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
         item = evidence.get(side)
         if not isinstance(item, dict):
             return f"{side}=unavailable"
-        review = (
-            item.get("review_feedback") if isinstance(item.get("review_feedback"), dict) else {}
-        )
         return (
             f"{side}: score={_fmt_num(item.get('score'), 3)}, "
             f"min_ref={_fmt_num(item.get('min_score_reference'), 3)}, "
@@ -417,11 +188,6 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
             f"loss_prob={_fmt_num(float(item.get('loss_probability') or 0) * 100, 1)}%, "
             f"profit_quality={_fmt_num(item.get('profit_quality_ratio'), 3)}, "
             f"tail_risk={_fmt_num(item.get('tail_risk_score'), 3)}, "
-            f"memory_bonus={_fmt_num(item.get('memory_candidate_score_bonus'), 3)}, "
-            f"memory_bias={review.get('action_bias') or 'neutral'}, "
-            f"missed={review.get('missed_opportunity_count') or 0}, "
-            f"memory_risk={review.get('risk_evidence_count') or 0}, "
-            f"high_profit={bool(item.get('high_profit_potential'))}, "
             f"history={str(item.get('historical_reason') or '')[:90]}, "
             f"recommendation={item.get('recommendation') or 'unknown'}"
         )
@@ -431,13 +197,9 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
         f"preferred_side_by_evidence={evidence.get('preferred_side_by_evidence') or 'neutral'}, "
         f"feature_score={_fmt_num(evidence.get('feature_opportunity_score'), 2)}. "
         f"{side_line('long')} | {side_line('short')}. "
-        f"memory_preferred={((evidence.get('memory_feedback') or {}).get('preferred_side_by_memory') if isinstance(evidence.get('memory_feedback'), dict) else 'neutral')}. "
-        "This evidence is for AI judgment, not a hard execution veto. Compare long/short expected net profit, "
-        "loss probability, payoff quality, realized history and tail risk before choosing action, size and leverage. "
-        "If the chosen side has non-positive expected_net, poor payoff quality, or probe_conversion_block_reasons, prefer hold or the better opposite side instead of producing a trade that will be stopped later. "
-        "If review memory shows repeated missed opportunities and current EV is positive, consider a small/probe entry instead of passive hold. "
-        "If realized-loss memory dominates, require stronger confirmation or reduce size/leverage. "
-        "If high_profit=true and the thesis is clear, larger size and higher leverage are allowed; otherwise keep risk small."
+        "Only production-governed fee-after return sources may choose a side. "
+        "Compare the selected side's net-return lower bound, expected downside, live costs, "
+        "and current account risk budget. Missing governance or non-positive lower bound means hold."
     )
 
 
@@ -468,51 +230,6 @@ def _format_portfolio_profit_protection(context: dict[str, Any]) -> str:
     )
 
 
-def _apply_aggressive_hold_policy(
-    decision: DecisionOutput,
-    symbol_positions: list[dict],
-) -> None:
-    if not decision.is_hold:
-        return
-
-    snapshot = decision.feature_snapshot or {}
-    snapshot["entry_filters"] = entry_filters_from_decision(decision).to_dict()
-    edge_action, edge, reasons = _directional_edge(snapshot)
-    if edge < 2:
-        return
-
-    existing_same_symbol = [p for p in symbol_positions if p.get("side") in ("long", "short")]
-    if existing_same_symbol:
-        current_side = existing_same_symbol[0].get("side")
-        if current_side == "long" and edge_action == Action.SHORT and edge >= 3:
-            decision.action = Action.CLOSE_LONG
-            decision.position_size_pct = 1.0
-            decision.confidence = max(decision.confidence, 0.62)
-            decision.reasoning += " [进攻型改写：观望但空头反转信号较强，改为平多]"
-        elif current_side == "short" and edge_action == Action.LONG and edge >= 3:
-            decision.action = Action.CLOSE_SHORT
-            decision.position_size_pct = 1.0
-            decision.confidence = max(decision.confidence, 0.62)
-            decision.reasoning += " [进攻型改写：观望但多头反转信号较强，改为平空]"
-        elif (
-            (current_side == "long" and edge_action == Action.LONG)
-            or (current_side == "short" and edge_action == Action.SHORT)
-        ) and edge >= 5:
-            decision.action = edge_action
-            decision.position_size_pct = 0.03
-            decision.confidence = max(decision.confidence, 0.55)
-            decision.reasoning += " [进攻型改写：观望但同向趋势延续很强，允许小幅加仓]"
-        return
-
-    decision.action = edge_action
-    decision.confidence = max(decision.confidence, 0.52 + min(edge, 5) * 0.03)
-    decision.position_size_pct = 0.04 if edge < 4 else 0.07
-    decision.stop_loss_pct = min(max(decision.stop_loss_pct or 0.03, 0.02), 0.06)
-    decision.take_profit_pct = max(decision.take_profit_pct or 0.06, decision.stop_loss_pct * 1.6)
-    decision.reasoning += (
-        " [进攻型改写：原始输出为观望，但技术边际足够清楚，"
-        f"改为{edge_action.value}试探；依据：{'、'.join(reasons)}]"
-    )
 
 
 def _strip_trailing_json_commas(text: str) -> str:
@@ -928,8 +645,8 @@ def _calibrate_sentiment_decision(
 
 
 _FAST_EXPERT_SYSTEM_PROMPT = """FAST_EXPERT_JSON_V1. Return only one compact JSON object. No markdown, no prose, no <think>.
-Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0.01-0.10,"take_profit_pct":0.02-0.25,"cross_check_for":null}
-Weak or conflicting evidence => hold with confidence <=0.55."""
+Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":"positive number, account-capped later","stop_loss_pct":"0-1, derived from current market risk","take_profit_pct":"0-1, derived from current expected move","cross_check_for":null}
+Confidence is diagnostic only. Incomplete fee-after return or provenance => hold."""
 
 
 def _fast_feature_text(feature_text: str, *, limit: int = 900) -> str:
@@ -944,7 +661,6 @@ def _build_fast_expert_user_prompt(
     role: str,
     feature_context: str,
     positions_text: str = "",
-    confidence_threshold: float = 0.65,
 ) -> str:
     """Build the bounded prompt used for provider independent retries."""
     role_hint = {
@@ -958,7 +674,7 @@ def _build_fast_expert_user_prompt(
         f" positions={_fast_feature_text(positions_text, limit=260)}" if positions_text else ""
     )
     return (
-        f"role={role}; threshold={confidence_threshold}; {role_hint} "
+        f"role={role}; {role_hint} "
         f"data={feature_context}{position_section}. "
         "Return JSON only. reasoning <=36 Chinese chars. cross_check_for null unless one concrete uncertainty."
     )
@@ -994,14 +710,11 @@ class LLMAgent(AbstractAIModel):
 
     async def initialize(self) -> None:
         if self._api_config:
-            self._base_url = self._api_config.get("api_base") or settings.ai_api_base
-            self._api_key = self._api_config.get("api_key") or settings.ai_api_key
-            self._model_name = self._api_config.get("model") or settings.ai_model
+            self._base_url = self._api_config.get("api_base") or ""
+            self._api_key = self._api_config.get("api_key") or ""
+            self._model_name = self._api_config.get("model") or ""
         else:
-            # Backward-compatible fallback to global settings
-            self._base_url = settings.ai_api_base
-            self._api_key = settings.ai_api_key
-            self._model_name = settings.ai_model
+            raise RuntimeError(f"{self.name} requires an explicit expert API configuration")
 
         self._llm = self._create_llm(self._model_name)
         logger.info(
@@ -1134,16 +847,6 @@ class LLMAgent(AbstractAIModel):
                     f"tp={pos.get('take_profit') or 'none'}"
                 )
             positions_text = "\n".join(lines)
-        memories_text = ""
-        expert_memories = (context.get("expert_memories") or {}).get(self.name, [])
-        if expert_mode and expert_memories:
-            memories_text = _format_expert_memories(expert_memories)
-        regime_text = ""
-        if expert_mode and context.get("market_regime"):
-            regime_text = _format_market_regime(context.get("market_regime") or {})
-        strategy_text = ""
-        if expert_mode and context.get("strategy_mode"):
-            strategy_text = _format_strategy_mode(context.get("strategy_mode") or {})
         local_tools_text = ""
         if (
             expert_mode
@@ -1179,9 +882,6 @@ class LLMAgent(AbstractAIModel):
                 part
                 for part in (
                     positions_text,
-                    memories_text,
-                    regime_text,
-                    strategy_text,
                     entry_candidate_text,
                     local_tools_text,
                     portfolio_profit_text,
@@ -1193,19 +893,15 @@ class LLMAgent(AbstractAIModel):
                     self._role,
                     feature_text,
                     positions_text,
-                    settings.confidence_threshold,
                 )
             else:
                 user_prompt = build_expert_user_prompt(
                     self._role,
                     feature_text,
                     extra_context,
-                    settings.confidence_threshold,
                 )
         else:
-            user_prompt = build_user_prompt(
-                feature_text, positions_text, settings.confidence_threshold
-            )
+            user_prompt = build_user_prompt(feature_text, positions_text)
 
         system_prompt = (
             DECISION_MAKER_SYSTEM_PROMPT
@@ -1216,7 +912,7 @@ class LLMAgent(AbstractAIModel):
                 else (
                     get_compact_role_system_prompt(self._role)
                     if expert_mode
-                    else get_role_system_prompt(self._role, settings.confidence_threshold)
+                    else get_role_system_prompt(self._role)
                 )
             )
         )
@@ -1264,9 +960,6 @@ class LLMAgent(AbstractAIModel):
                         decision.reasoning += (
                             f" [备用模型：{primary_model} 无有效输出，改用 {model_name}]"
                         )
-
-                    if not context.get("expert_mode") and not decision_maker_mode:
-                        _apply_aggressive_hold_policy(decision, symbol_positions)
 
                     logger.info(
                         "llm decision",
@@ -1429,15 +1122,15 @@ class LLMAgent(AbstractAIModel):
                 position_size_pct=min(
                     max(float(payload.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0
                 ),
-                suggested_leverage=min(
-                    max(float(payload.get("suggested_leverage", 1.0) or 1.0), 1.0),
-                    settings.max_leverage,
+                suggested_leverage=max(
+                    float(payload.get("suggested_leverage", 1.0) or 1.0),
+                    1.0,
                 ),
                 stop_loss_pct=min(
-                    max(float(payload.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15
+                    max(float(payload.get("stop_loss_pct", 0.0) or 0.0), 0.0), 1.0
                 ),
                 take_profit_pct=min(
-                    max(float(payload.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50
+                    max(float(payload.get("take_profit_pct", 0.0) or 0.0), 0.0), 1.0
                 ),
                 cross_check_for=payload.get("cross_check_for"),
                 raw_response=payload,
@@ -1468,8 +1161,8 @@ class LLMAgent(AbstractAIModel):
             reasoning=reason,
             position_size_pct=0.0,
             suggested_leverage=1.0,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.10,
+            stop_loss_pct=0.0,
+            take_profit_pct=0.0,
             cross_check_for={
                 "target": "trend",
                 "question": "新闻为空时按中性处理，请核实技术/量价/ML边际是否足够独立支持开仓。",
@@ -1503,13 +1196,13 @@ class LLMAgent(AbstractAIModel):
             position_size_pct=min(
                 max(float(parsed.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0
             ),
-            suggested_leverage=min(
-                max(float(parsed.get("suggested_leverage", 1.0) or 1.0), 1.0),
-                settings.max_leverage,
+            suggested_leverage=max(
+                float(parsed.get("suggested_leverage", 1.0) or 1.0),
+                1.0,
             ),
-            stop_loss_pct=min(max(float(parsed.get("stop_loss_pct", 0.05) or 0.05), 0.01), 0.15),
+            stop_loss_pct=min(max(float(parsed.get("stop_loss_pct", 0.0) or 0.0), 0.0), 1.0),
             take_profit_pct=min(
-                max(float(parsed.get("take_profit_pct", 0.10) or 0.10), 0.02), 0.50
+                max(float(parsed.get("take_profit_pct", 0.0) or 0.0), 0.0), 1.0
             ),
             cross_check_for=cross_check_for,
             raw_response=parsed,
@@ -1524,156 +1217,26 @@ class LLMAgent(AbstractAIModel):
         context: dict[str, Any],
         error: str,
     ) -> DecisionOutput:
-        action = Action.HOLD
-        confidence = 0.35
-        size = 0.0
-        leverage = 1.0
-        stop_loss = 0.05
-        take_profit = 0.10
-        cross_check_for: dict[str, str] | None = None
-        reason = "AI 模型暂时无有效输出，使用本地保守规则兜底。"
-
+        del context
         snapshot = features.to_dict()
-        entry_filters = entry_filters_from_context(context)
-        snapshot["entry_filters"] = entry_filters.to_dict()
-        edge_action, edge, edge_reasons = _directional_edge(snapshot)
-        volume_ratio = _snapshot_float(snapshot, "volume_ratio", 1.0)
-        adx_14 = _snapshot_float(snapshot, "adx_14")
-        volatility = _snapshot_float(snapshot, "volatility_20")
-        abnormal_wick_count = int(_snapshot_float(snapshot, "abnormal_wick_count_72h"))
-        abnormal_wick_max = _snapshot_float(snapshot, "abnormal_wick_max_pct")
-        abnormal_wick_recent = _snapshot_float(snapshot, "abnormal_wick_recent_hours", 9999.0)
-        sentiment = (
-            _snapshot_float(snapshot, "news_sentiment_avg")
-            + _snapshot_float(snapshot, "social_sentiment_avg")
-        ) / 2
-
-        if self._role in {"technical_trend", "trend_direction"}:
-            confidence = min(0.42 + edge * 0.04, 0.62)
-            if edge >= 3 and adx_14 >= entry_filters.min_entry_adx:
-                action = edge_action
-                size = 0.03
-                leverage = 1.0
-            reason = f"趋势规则兜底：{'、'.join(edge_reasons) if edge_reasons else '趋势证据不足'}，ADX={adx_14:.1f}。"
-            cross_check_for = {
-                "target": "momentum",
-                "question": "请核实当前成交量和短线动量是否支持趋势判断。",
-            }
-        elif self._role in {"short_term_momentum", "profit_quality"}:
-            returns_1 = _snapshot_float(snapshot, "returns_1")
-            returns_5 = _snapshot_float(snapshot, "returns_5")
-            if (
-                returns_1 > 0
-                and returns_5 > 0
-                and volume_ratio >= entry_filters.min_entry_volume_ratio
-            ):
-                action = Action.LONG
-                confidence = 0.52
-                size = 0.03
-            elif (
-                returns_1 < 0
-                and returns_5 < 0
-                and volume_ratio >= entry_filters.min_entry_volume_ratio
-            ):
-                action = Action.SHORT
-                confidence = 0.52
-                size = 0.03
-            else:
-                confidence = 0.38
-            reason = f"动量规则兜底：1周期收益={returns_1:.4f}，5周期收益={returns_5:.4f}，量比={volume_ratio:.2f}。"
-            cross_check_for = {
-                "target": "trend",
-                "question": "请核实短线动量方向是否与主要趋势一致。",
-            }
-        elif self._role in {"sentiment_news", "short_timeseries"}:
-            if sentiment >= 0.35:
-                action = Action.LONG
-                confidence = 0.46
-                size = 0.02
-            elif sentiment <= -0.35:
-                action = Action.SHORT
-                confidence = 0.46
-                size = 0.02
-            else:
-                confidence = 0.30
-            reason = f"情绪规则兜底：新闻/社媒综合情绪={sentiment:.2f}，缺少强事件驱动。"
-            cross_check_for = {
-                "target": "risk",
-                "question": "请核实是否存在未覆盖的突发风险事件。",
-            }
-        elif self._role in {"position_manager", "position_exit"}:
-            symbol_positions = [
-                p for p in context.get("open_positions", []) if p.get("symbol") == features.symbol
-            ]
-            if symbol_positions:
-                side = symbol_positions[0].get("side")
-                severe_reversal = edge >= 4 and volume_ratio >= entry_filters.min_entry_volume_ratio
-                if side == "long" and edge_action == Action.SHORT and severe_reversal:
-                    action = Action.CLOSE_LONG
-                    confidence = 0.62
-                    size = 0.5
-                elif side == "short" and edge_action == Action.LONG and severe_reversal:
-                    action = Action.CLOSE_SHORT
-                    confidence = 0.62
-                    size = 0.5
-                else:
-                    confidence = 0.48
-                reason = (
-                    "持仓规则兜底：已有持仓，小幅浮亏不直接平仓；"
-                    "只有趋势强反转且量能确认时才先减仓。"
-                )
-            else:
-                confidence = 0.42
-                reason = "持仓规则兜底：当前无持仓，未发现足够清晰的新开仓管理优势。"
-            cross_check_for = {
-                "target": "trend",
-                "question": "请核实当前趋势是否足以支撑开仓或继续持仓。",
-            }
-        elif self._role in {"risk_guardian", "risk_anomaly"}:
-            risk_flags = []
-            if volume_ratio < entry_filters.min_entry_volume_ratio:
-                risk_flags.append("成交量不足")
-            if adx_14 < entry_filters.min_entry_adx:
-                risk_flags.append("趋势强度不足")
-            if volatility > 0.05:
-                risk_flags.append("波动偏高")
-            if abnormal_wick_count > 0 and abnormal_wick_max >= 80 and abnormal_wick_recent <= 96:
-                risk_flags.append(
-                    f"近72小时异常插针{abnormal_wick_count}次，最大{abnormal_wick_max:.1f}%"
-                )
-            confidence = 0.62 if risk_flags else 0.40
-            reason = (
-                f"风控规则兜底：{('、'.join(risk_flags) if risk_flags else '未发现硬性否决项')}。"
-            )
-            cross_check_for = (
-                {
-                    "target": "sentiment",
-                    "question": "请核实是否存在会放大风险的新闻或情绪冲击。",
-                }
-                if risk_flags
-                else None
-            )
-
-        raw = {
-            "local_fallback": True,
-            "provider_model": self._model_name,
-            "error": error,
-            "cross_check_for": cross_check_for,
-            "entry_filters": entry_filters.to_dict(),
-            "entry_filters_are_hard_gate": False,
-        }
         return DecisionOutput(
             model_name=self.name,
             symbol=features.symbol,
-            action=action,
-            confidence=min(max(confidence, 0.0), 0.75),
-            reasoning=reason,
-            position_size_pct=size,
-            suggested_leverage=leverage,
-            stop_loss_pct=stop_loss,
-            take_profit_pct=take_profit,
-            cross_check_for=cross_check_for,
-            raw_response=raw,
+            action=Action.HOLD,
+            confidence=0.0,
+            reasoning="AI 模型没有返回可治理的收益判断，本轮只记录观察，不执行交易。",
+            position_size_pct=0.0,
+            suggested_leverage=1.0,
+            stop_loss_pct=0.0,
+            take_profit_pct=0.0,
+            cross_check_for=None,
+            raw_response={
+                "local_fallback": True,
+                "production_eligible": False,
+                "provider_model": self._model_name,
+                "fallback_reason": "model_output_unavailable",
+                "error": error,
+            },
             feature_snapshot=snapshot,
         )
 

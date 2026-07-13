@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Launch the live trading system (OKX demo or production).
-Only the best-performing model from paper trading executes real orders.
+Launch the live trading system against the explicit OKX live account.
+Model competition is reported without mutating the governed live route.
 
 Run: python scripts/run_live_trading.py
 """
@@ -22,7 +22,6 @@ from core.logging_config import setup_logging
 from core.redis_runtime import create_redis_client
 from core.safe_output import safe_error_text
 from core.secret_utils import secret_state
-from core.trading_mode import mode_manager
 from db.session import close_db, init_db
 from services.competition_service import CompetitionService
 from services.data_service import DataService
@@ -38,17 +37,15 @@ async def main():
     setup_logging()
     print("=" * 60)
     print("AI CRYPTO TRADING SYSTEM - LIVE TRADING MODE")
-    print(f"OKX Demo: {settings.okx_demo}")
+    print("OKX account: live")
     print("=" * 60)
 
-    # Confirm before proceeding
-    if not settings.okx_demo:
-        print("\n*** WARNING: LIVE TRADING MODE (REAL FUNDS) ***")
-        print(f"OKX API Key: {secret_state(settings.okx_api_key)}")
-        confirm = await asyncio.to_thread(input, "Type 'YES' to confirm live trading: ")
-        if confirm != "YES":
-            print("Aborted.")
-            return
+    print("\n*** WARNING: LIVE TRADING MODE (REAL FUNDS) ***")
+    print(f"OKX API Key: {secret_state(settings.okx_live_api_key)}")
+    confirm = await asyncio.to_thread(input, "Type 'YES' to confirm live trading: ")
+    if confirm != "YES":
+        print("Aborted.")
+        return
 
     # Init
     await init_db()
@@ -71,20 +68,15 @@ async def main():
     competition_service = CompetitionService()
     rankings = await competition_service.evaluate_all_models()
 
-    # Select best model for live trading
+    # Competition is observation-only. Live routing changes require the governed
+    # shadow -> canary -> live promotion flow and cannot happen during startup.
     if rankings:
         best_model = rankings[0]["model_name"]
-        print(f"\nBest model from paper trading: {best_model}")
-        print(f"  PnL: {rankings[0]['pnl_pct']:.2f}%")
-        print(f"  Sharpe: {rankings[0]['sharpe_ratio']:.2f}")
-        print(f"  Win Rate: {rankings[0]['win_rate']:.2f}%")
-
-        mode_manager._live_model_name = best_model
-        await mode_manager.switch_to_live(best_model)
+        print(f"\nTop fee-after model observation: {best_model}")
+        print(f"  Return LCB: {rankings[0].get('return_lcb_pct')}")
+        print("  Live model unchanged: startup competition cannot grant promotion.")
     else:
-        print("\nNo paper trading data found. Using LLM Agent as default.")
-        mode_manager._live_model_name = "llm_agent"
-        await mode_manager.switch_to_live("llm_agent")
+        print("\nNo cost-complete competition evidence found. Live model unchanged.")
 
     redis = await create_redis_client()
 

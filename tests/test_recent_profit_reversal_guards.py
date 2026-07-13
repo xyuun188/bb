@@ -1,10 +1,9 @@
 import inspect
+from pathlib import Path
 
 from ai_brain import ensemble_coordinator, llm_agent, prompts
 from services import (
     entry_candidate_evidence,
-    entry_evidence,
-    entry_evidence_probe,
     expert_memory_service,
     memory_feedback,
     shadow_backtest_service,
@@ -25,13 +24,13 @@ def test_fixed_confidence_leverage_floors_cannot_return() -> None:
 
 
 def test_shadow_memory_cannot_return_as_production_probe_authority() -> None:
+    assert not Path("services/entry_evidence_probe.py").exists()
+    assert not Path("services/entry_quant_profit_probe.py").exists()
     source = "\n".join(
         inspect.getsource(module)
         for module in (
             memory_feedback,
             entry_candidate_evidence,
-            entry_evidence,
-            entry_evidence_probe,
             prompts,
         )
     )

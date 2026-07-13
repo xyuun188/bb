@@ -26,7 +26,6 @@ class MemoryRepository(BaseRepository):
         expert_name: str,
         symbol: str,
         side: str | None = None,
-        limit: int = 4,
     ) -> list[ExpertMemory]:
         stmt = (
             select(ExpertMemory)
@@ -42,7 +41,6 @@ class MemoryRepository(BaseRepository):
                 ExpertMemory.updated_at.desc().nullslast(),
                 ExpertMemory.created_at.desc(),
             )
-            .limit(max(int(limit or 4), 1) * 2)
         )
         result = await self.session.execute(stmt)
         rows = list(result.scalars().all())
@@ -55,7 +53,7 @@ class MemoryRepository(BaseRepository):
             and (not row.side or not side_norm or str(row.side or "").lower() == side_norm)
             and _memory_row_usable(row)
         ]
-        return filtered[: max(int(limit or 4), 1)]
+        return filtered
 
     async def mark_memories_used(self, memory_ids: list[int]) -> None:
         if not memory_ids:
@@ -94,20 +92,7 @@ class MemoryRepository(BaseRepository):
             existing.failure_count = int(existing.failure_count or 0) + int(
                 data.get("failure_count", 0) or 0
             )
-            existing.confidence_adjustment = _blend(
-                float(existing.confidence_adjustment or 0.0),
-                float(data.get("confidence_adjustment", existing.confidence_adjustment) or 0.0),
-            )
-            existing.position_size_multiplier = min(
-                float(existing.position_size_multiplier or 1.0),
-                float(
-                    data.get("position_size_multiplier", existing.position_size_multiplier) or 1.0
-                ),
-            )
-            existing.confidence_score = min(
-                0.95,
-                max(0.10, float(existing.confidence_score or 0.5) + 0.05),
-            )
+            existing.confidence_score = existing.evidence_count / (existing.evidence_count + 1.0)
             existing.lesson = str(data.get("lesson") or existing.lesson or "")
             existing.market_pattern = str(
                 data.get("market_pattern") or existing.market_pattern or ""
@@ -119,24 +104,6 @@ class MemoryRepository(BaseRepository):
                 data.get("source_position_id") or existing.source_position_id
             )
             existing.extra = _merge_memory_outcomes(existing.extra, data.get("extra"))
-            outcome = _memory_outcome_aggregation(existing.extra)
-            if outcome:
-                avg_return = float(outcome.get("avg_net_return_pct") or 0.0)
-                profit_factor = float(outcome.get("profit_factor") or 0.0)
-                if avg_return <= 0 or profit_factor < 1.0:
-                    existing.confidence_adjustment = min(
-                        float(existing.confidence_adjustment or 0.0),
-                        -0.05,
-                    )
-                    existing.position_size_multiplier = min(
-                        float(existing.position_size_multiplier or 1.0),
-                        0.75,
-                    )
-                    existing.recommended_action = "avoid_or_reduce"
-                    existing.lesson = (
-                        f"同方向聚合费后期望 {avg_return:.4f}%、Profit Factor "
-                        f"{profit_factor:.2f}，真实负收益证据优先，禁止沿用旧的无条件支持。"
-                    )
             if data.get("is_active") is False:
                 existing.is_active = False
             existing.updated_at = datetime.now(UTC)
@@ -358,6 +325,8 @@ def _norm_symbol(symbol: str | None) -> str:
 
 
 def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
+    data.pop("confidence_adjustment", None)
+    data.pop("position_size_multiplier", None)
     for key in ("lesson", "market_pattern"):
         value = data.get(key)
         if value is not None:

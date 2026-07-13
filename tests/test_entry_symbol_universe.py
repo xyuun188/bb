@@ -60,17 +60,9 @@ def test_entry_symbol_universe_filters_active_analysis_symbols() -> None:
     assert result.skipped == ["BTC/USDT"]
 
 
-def test_entry_symbol_universe_filters_blocked_new_symbols_but_keeps_open_position() -> None:
+def test_entry_symbol_universe_has_no_local_symbol_blocklist() -> None:
     policy = EntrySymbolUniversePolicy(_normalize)
-
-    result = policy.filter_blocked_new_symbols(
-        ["BTC/USDT", "ETH/USDT"],
-        [{"symbol": "BTC/USDT"}],
-        suspicious_reason=lambda symbol: "suspicious" if symbol == "ETH/USDT" else None,
-        blocked_reason=lambda _symbol: None,
-    )
-
-    assert result.symbols == ["BTC/USDT"]
-    assert len(result.skipped) == 1
-    assert result.skipped[0].symbol == "ETH/USDT"
-    assert result.skipped[0].reason == "suspicious"
+    assert policy.dedupe_symbols(["TEST-USDT", "MOCK/USDT", "TEST/USDT"]) == [
+        "TEST/USDT",
+        "MOCK/USDT",
+    ]

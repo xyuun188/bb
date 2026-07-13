@@ -24,9 +24,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import FIXED_AI_MODEL_SLOTS  # noqa: E402
-from core.model_server_bridge import (  # noqa: E402
-    load_local_ai_tools_api_key_from_model_server,
-)
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 from scripts.audit_online_secret_files import (
@@ -39,6 +36,23 @@ REMOTE_DASHBOARD_SERVICE_NAME = "bb-dashboard.service"
 REMOTE_MODEL_TUNNEL_SERVICE_NAME = "bb-model-tunnels.service"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REMOTE_OWNER = "bb:bb"
+
+REMOTE_MANAGED_SOURCE_ROOTS = (
+    "ai_brain",
+    "backtest",
+    "config",
+    "core",
+    "data_feed",
+    "db",
+    "executor",
+    "models",
+    "risk_manager",
+    "scripts",
+    "services",
+    "web_dashboard",
+    "workers",
+)
+REMOTE_MANAGED_SOURCE_SUFFIXES = {".py"}
 
 SKIP_DIRS = {
     ".git",
@@ -201,6 +215,7 @@ app_env_ai_route_keys = {{
     'HIGH_RISK_REVIEW_API_BASE',
     'HIGH_RISK_REVIEW_MODEL',
 }}
+app_env_ai_route_prefixes = ('MODEL_SERVER_',)
 
 def parse_env(path):
     values = {{}}
@@ -224,7 +239,7 @@ def read_secret_file(path):
     return value
 
 
-def scrub_app_env_ai_routes(path, keys):
+def scrub_app_env_ai_routes(path, keys, prefixes):
     if not path.exists():
         return {{
             'exists': False,
@@ -239,7 +254,9 @@ def scrub_app_env_ai_routes(path, keys):
         if stripped and not stripped.startswith('#') and '=' in stripped:
             key = stripped.split('=', 1)[0].strip()
             normalized_key = key.upper()
-            if normalized_key in keys:
+            if normalized_key in keys or any(
+                normalized_key.startswith(prefix) for prefix in prefixes
+            ):
                 removed.append(normalized_key)
                 continue
         kept_lines.append(raw_line)
@@ -269,6 +286,9 @@ if not any(row.get('model') == 'BB-FinQuant-Expert-14B' for row in rows):
 
 current_runtime_text = runtime_path.read_text(encoding='utf-8') if runtime_path.exists() else ''
 values = parse_env(runtime_path)
+for runtime_key in tuple(values):
+    if runtime_key.upper().startswith('MODEL_SERVER_'):
+        values.pop(runtime_key, None)
 local_ai_tools_api_key = read_secret_file(local_ai_tools_key_path)
 app_env_values = parse_env(app_env_path)
 
@@ -340,10 +360,6 @@ decision_model = first_non_empty(
     app_env_values.get('AI_DECISION_MAKER_MODEL'),
     current_decision_route.get('model'),
 )
-model_server_active_profile = first_non_empty(
-    values.get('MODEL_SERVER_ACTIVE_PROFILE'),
-    app_env_values.get('MODEL_SERVER_ACTIVE_PROFILE'),
-).lower()
 if decision_api_base:
     for row in rows:
         if row.get('name') == 'decision_maker':
@@ -353,15 +369,6 @@ if decision_api_base:
             if decision_model:
                 row['model'] = decision_model
             row['route_mode'] = current_decision_route.get('route_mode') or 'online_slow_brain'
-            break
-    online_ai_models = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
-elif model_server_active_profile == 'old':
-    for row in rows:
-        if row.get('name') == 'decision_maker':
-            row['api_base'] = 'http://127.0.0.1:18003/v1'
-            row['api_key'] = ''
-            row['model'] = 'BB-FinQuant-Expert-14B'
-            row['route_mode'] = 'old_model_server_fast_fallback'
             break
     online_ai_models = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
 
@@ -383,13 +390,9 @@ values['DASHBOARD_AUTH_ENABLED'] = 'true'
 values['DASHBOARD_INLINE_ENABLED'] = 'false'
 values['USE_FAKEREDIS'] = 'false'
 values['REDIS_URL'] = 'redis://127.0.0.1:6379/0'
-if model_server_active_profile:
-    values['MODEL_SERVER_ACTIVE_PROFILE'] = model_server_active_profile
 values['AI_MODELS'] = online_ai_models
 values['LOCAL_AI_TOOLS_ENABLED'] = 'true'
 values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'
-values['LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT'] = '0.12'
-values['LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT'] = '0.18'
 values['HIGH_RISK_REVIEW_ENABLED'] = 'true'
 values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'
 values['HIGH_RISK_REVIEW_MODEL'] = 'deepseek-r1-14b-risk'
@@ -419,7 +422,11 @@ try:
     os.chmod(runtime_path, 0o640)
 except Exception:
     os.chmod(runtime_path, 0o600)
-app_env_cleanup = scrub_app_env_ai_routes(app_env_path, app_env_ai_route_keys)
+app_env_cleanup = scrub_app_env_ai_routes(
+    app_env_path,
+    app_env_ai_route_keys,
+    app_env_ai_route_prefixes,
+)
 if emit_summary:
     print(json.dumps({{
         'updated': True,
@@ -627,6 +634,45 @@ def upload_files(sftp, files: list[Path], remote_app_dir: str, *, dry_run: bool)
     return uploaded
 
 
+def prune_remote_stale_sources(
+    sftp,
+    files: list[Path],
+    remote_app_dir: str,
+) -> list[str]:
+    """Delete managed remote Python sources absent from the current local tree."""
+
+    expected = {remote_path_for(path, remote_app_dir) for path in files}
+    stale: list[str] = []
+    stack = [
+        str(PurePosixPath(remote_app_dir) / root)
+        for root in REMOTE_MANAGED_SOURCE_ROOTS
+    ]
+    while stack:
+        remote_dir = stack.pop()
+        try:
+            entries = sftp.listdir_attr(remote_dir)
+        except OSError:
+            continue
+        for entry in entries:
+            name = str(entry.filename)
+            if name in {".", ".."} or name in SKIP_DIRS:
+                continue
+            remote_path = str(PurePosixPath(remote_dir) / name)
+            if stat.S_ISDIR(entry.st_mode):
+                stack.append(remote_path)
+                continue
+            if PurePosixPath(name).suffix.lower() not in REMOTE_MANAGED_SOURCE_SUFFIXES:
+                continue
+            if remote_path not in expected:
+                stale.append(remote_path)
+
+    for remote_path in sorted(stale):
+        sftp.remove(remote_path)
+        relative = PurePosixPath(remote_path).relative_to(PurePosixPath(remote_app_dir))
+        safe_print(f"removed stale {relative.as_posix()}")
+    return sorted(stale)
+
+
 def upload_runtime_secret(sftp, *, value: str, remote_path: str) -> None:
     """Upload one short runtime secret to a temporary 0600 file."""
     if "\n" in value or "\r" in value:
@@ -664,16 +710,6 @@ def parse_args() -> argparse.Namespace:
         help="Fail the sync if loopback model tunnels do not become reachable.",
     )
     parser.add_argument(
-        "--skip-local-ai-tools-key-sync",
-        action="store_true",
-        help="Do not copy the model server local AI tools API key into the platform runtime env.",
-    )
-    parser.add_argument(
-        "--sync-legacy-local-ai-tools-key",
-        action="store_true",
-        help="Legacy-only: copy /data/trade_ai local-ai-tools key into platform runtime env.",
-    )
-    parser.add_argument(
         "--runtime-env-only",
         action="store_true",
         help=(
@@ -705,21 +741,6 @@ def main() -> None:
     )
     safe_print(f"Prepared {len(files)} files for upload to {args.remote_app_dir}.")
     local_ai_tools_api_key = ""
-    if (
-        args.split_services
-        and args.sync_legacy_local_ai_tools_key
-        and not args.skip_restart
-        and not args.skip_local_ai_tools_key_sync
-    ):
-        try:
-            local_ai_tools_api_key = load_local_ai_tools_api_key_from_model_server(ROOT)
-        except Exception as exc:
-            safe_print(f"Local AI tools key sync skipped: {exc}")
-        else:
-            if local_ai_tools_api_key:
-                safe_print("Prepared local AI tools API key sync payload.")
-            else:
-                safe_print("Local AI tools API key missing on model server; skipping key sync.")
     if args.dry_run:
         ssh = connect_remote_ssh(ROOT, timeout=20)
         ssh.close()
@@ -754,6 +775,11 @@ def main() -> None:
         sftp = ssh.open_sftp()
         try:
             uploaded = upload_files(sftp, files, args.remote_app_dir, dry_run=False)
+            removed = (
+                []
+                if args.only
+                else prune_remote_stale_sources(sftp, files, args.remote_app_dir)
+            )
             if remote_secret_path:
                 upload_runtime_secret(
                     sftp,
@@ -763,6 +789,7 @@ def main() -> None:
         finally:
             sftp.close()
         safe_print(f"Uploaded {len(uploaded)} changed files.")
+        safe_print(f"Removed {len(removed)} stale source files.")
         if any(path.endswith("/requirements.txt") for path in uploaded):
             safe_print("Installing updated Python requirements on online server.")
             run_remote_text(

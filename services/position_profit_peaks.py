@@ -124,31 +124,17 @@ class PositionProfitPeakTracker:
         position_notional: float,
         hold_minutes: float,
     ) -> bool:
-        stored_hold = self.float_parser(state.get("hold_minutes"), 0.0)
-        if hold_minutes + 5.0 < stored_hold:
+        if entry_price > 0.0 and self.float_parser(state.get("entry_price"), 0.0) <= 0.0:
             return False
-
-        stored_entry = self.float_parser(state.get("entry_price"), 0.0)
-        if stored_entry > 0 and entry_price > 0:
-            if abs(stored_entry - entry_price) / max(abs(stored_entry), 1e-9) > 0.02:
-                return False
-
-        stored_quantity = abs(self.float_parser(state.get("quantity"), 0.0))
-        if stored_quantity > 0 and quantity > 0:
-            if abs(stored_quantity - quantity) / max(stored_quantity, 1e-9) > 0.02:
-                return False
-
-        stored_notional = self.float_parser(state.get("position_notional"), 0.0)
-        if stored_notional <= 0:
-            peak = self.float_parser(state.get("peak_unrealized_pnl"), 0.0)
-            peak_ratio = self.float_parser(state.get("peak_pnl_ratio"), 0.0)
-            if peak > 0 and peak_ratio > 0:
-                stored_notional = abs(peak / peak_ratio)
-        if stored_notional > 0 and position_notional > 0:
-            ratio = position_notional / max(stored_notional, 1e-9)
-            if ratio < 0.5 or ratio > 2.0:
-                return False
-        return True
+        if quantity > 0.0 and self.float_parser(state.get("quantity"), 0.0) <= 0.0:
+            return False
+        if (
+            position_notional > 0.0
+            and self.float_parser(state.get("position_notional"), 0.0) <= 0.0
+        ):
+            return False
+        stored_hold = self.float_parser(state.get("hold_minutes"), 0.0)
+        return hold_minutes >= stored_hold
 
     def seconds_since_profit_exit(self, peak_state: dict[str, Any]) -> float:
         value = peak_state.get("last_profit_exit_at") if isinstance(peak_state, dict) else None

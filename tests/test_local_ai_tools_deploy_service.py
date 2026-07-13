@@ -25,11 +25,12 @@ def test_local_ai_tools_generated_service_requires_api_key_or_loopback() -> None
     assert "Bearer {LOCAL_AI_TOOLS_API_KEY}" in SERVICE_CODE
 
 
-def test_local_ai_tools_training_costs_are_runtime_configurable() -> None:
-    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" in SERVICE_CODE
-    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" in SERVICE_CODE
-    assert "ROUND_TRIP_COST_PCT = 0.12" not in SERVICE_CODE
-    assert "TAIL_LOSS_THRESHOLD_PCT = 0.18" not in SERVICE_CODE
+def test_local_ai_tools_training_uses_per_sample_costs_and_empirical_tail_policy() -> None:
+    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in SERVICE_CODE
+    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in SERVICE_CODE
+    assert "def cost_complete_net_returns(" in SERVICE_CODE
+    assert "def empirical_lower_hinge(" in SERVICE_CODE
+    assert "legacy_fixed_training_thresholds_enabled" not in SERVICE_CODE
 
 
 def test_remote_smoke_probe_rejects_oversized_responses_without_truncating_json() -> None:
@@ -350,16 +351,16 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
         def __init__(self, values: object) -> None:
             self.values = values
 
-        def reshape(self, *_args: object) -> "FakeTensor":
+        def reshape(self, *_args: object) -> FakeTensor:
             return self
 
-        def detach(self) -> "FakeTensor":
+        def detach(self) -> FakeTensor:
             return self
 
-        def cpu(self) -> "FakeTensor":
+        def cpu(self) -> FakeTensor:
             return self
 
-        def float(self) -> "FakeTensor":
+        def float(self) -> FakeTensor:
             return self
 
         def tolist(self) -> object:
@@ -493,7 +494,7 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
 
     class FakeChronosPipeline:
         @staticmethod
-        def from_pretrained(model_dir: str) -> "FakeChronosPipeline":
+        def from_pretrained(model_dir: str) -> FakeChronosPipeline:
             assert model_dir.endswith("amazon--chronos-2")
             return FakeChronosPipeline()
 
@@ -605,13 +606,13 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
         def __init__(self, values: object) -> None:
             self.values = values
 
-        def detach(self) -> "FakeChronosTensor":
+        def detach(self) -> FakeChronosTensor:
             return self
 
-        def cpu(self) -> "FakeChronosTensor":
+        def cpu(self) -> FakeChronosTensor:
             return self
 
-        def float(self) -> "FakeChronosTensor":
+        def float(self) -> FakeChronosTensor:
             return self
 
         def numpy(self) -> object:
@@ -619,7 +620,7 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
 
     class FakeChronosPipeline:
         @staticmethod
-        def from_pretrained(_model_dir: str) -> "FakeChronosPipeline":
+        def from_pretrained(_model_dir: str) -> FakeChronosPipeline:
             return FakeChronosPipeline()
 
         def predict_df(self, _df: object, **_kwargs: object) -> object:
@@ -705,7 +706,7 @@ def test_local_ai_tools_timeseries_shadow_rejects_short_synthetic_sequence() -> 
     assert shadow["actual_inference"] is False
     assert shadow["primary_shadow_result"]["reason"] == "not_enough_real_close_sequence"
     assert shadow["primary_shadow_result"]["sequence_length"] == 4
-    assert shadow["primary_shadow_result"]["minimum_sequence_length"] == 30
+    assert shadow["primary_shadow_result"]["model_input_rows"] == 30
     assert shadow["challenger_shadow_result"]["reason"] == "not_enough_real_close_sequence"
     assert result["sequence_input_status"] == "not_enough_real_close_sequence"
     assert result["live_mutation"] is False
@@ -918,9 +919,11 @@ def test_local_ai_tools_generated_exit_contract_uses_only_phase3_actions() -> No
     assert '"action": "no_position"' not in SERVICE_CODE
     assert 'action = "close_if_ai_agrees"' not in SERVICE_CODE
     assert '"action": "hold"' in SERVICE_CODE
-    assert 'action = "reduce_or_close"' in SERVICE_CODE
-    assert 'action = "protect_profit"' in SERVICE_CODE
-    assert 'action = "trail_profit"' in SERVICE_CODE
+    assert 'action = "reduce_or_close"' not in SERVICE_CODE
+    assert 'action = "protect_profit"' not in SERVICE_CODE
+    assert 'action = "trail_profit"' not in SERVICE_CODE
+    assert '"production_permission": False' in SERVICE_CODE
+    assert "dynamic_exit_policy_owns_production_exit" in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_does_not_use_wildcard_cors() -> None:
@@ -1014,7 +1017,7 @@ def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
     module.TrainRequest.model_rebuild()
 
     class DummyModel:
-        def fit(self, *_args: object, **_kwargs: object) -> "DummyModel":
+        def fit(self, *_args: object, **_kwargs: object) -> DummyModel:
             return self
 
     module._make_regressor = DummyModel
@@ -1049,6 +1052,10 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
                     "returns_20": 0.03,
                     "rsi_14": 55.0,
                     "volume_ratio": 1.1,
+                    "spread_pct": 0.02,
+                    "funding_rate": 0.0001,
+                    "funding_interval_hours": 8.0,
+                    "round_trip_fee_pct": 0.1,
                 },
                 "long_return_pct": 0.45,
                 "short_return_pct": -0.15,
@@ -1153,8 +1160,8 @@ def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:
         "LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,"
         "http://127.0.0.1:18001"
     ) in source
-    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT=0.12" in source
-    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT=0.18" in source
+    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
+    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
     assert "LimitNOFILE=65535" in source
     assert "--timeout-keep-alive 5" in source
 

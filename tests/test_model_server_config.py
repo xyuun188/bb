@@ -42,7 +42,6 @@ async def test_model_server_settings_are_encrypted_and_masked(
             port=2222,
             username="bbops",
             password=secret_value,
-            active_profile="old",
         )
         public = await get_model_server_settings_public()
         info = await load_model_server_info_from_secure_settings()
@@ -52,7 +51,7 @@ async def test_model_server_settings_are_encrypted_and_masked(
     assert payload.configured is True
     assert public.as_dict()["password_configured"] is True
     assert public.as_dict()["host"] == "203.0.113.17"
-    assert public.as_dict()["active_profile"] == "old"
+    assert "active_profile" not in public.as_dict()
     assert secret_value not in str(public.as_dict())
     assert info.connection_kwargs() == {
         "host": "203.0.113.17",
@@ -82,7 +81,6 @@ async def test_model_server_settings_update_reuses_existing_password(
             port=22,
             username="root",
             password="",
-            active_profile="new",
         )
         info = await load_model_server_info_from_secure_settings()
     finally:

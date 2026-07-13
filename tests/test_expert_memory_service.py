@@ -12,7 +12,6 @@ from services.expert_memory_service import (
     _reflection_lifecycle_key,
     _reflection_position_rank,
     build_expert_lessons,
-    dynamic_expert_weights_from_memories,
     reflection_pattern,
     reflection_summary,
 )
@@ -37,77 +36,6 @@ def _assert_clean_chinese(text: str) -> None:
     assert any(token in text for token in ("做多", "做空", "亏损", "盈利", "权重", "持仓"))
 
 
-def test_dynamic_expert_weights_use_chinese_reasons() -> None:
-    weights = dynamic_expert_weights_from_memories(
-        {},
-        [{"name": "trend_expert", "weight": 1.2}],
-    )
-
-    reason = weights["trend_expert"]["reason"]
-    assert reason == "暂无成本完整的权威费后收益样本，使用基础权重。"
-    _assert_clean_chinese(reason)
-
-
-def test_dynamic_expert_weights_reduce_losing_memory() -> None:
-    weights = dynamic_expert_weights_from_memories(
-        {
-            "trend_expert": [
-                {
-                    "confidence_score": 0.9,
-                    "evidence_count": 5,
-                    "success_count": 100,
-                    "failure_count": 0,
-                    "confidence_adjustment": -0.12,
-                    "memory_type": "loss_lesson",
-                    "extra": {
-                        "source": "authoritative_settlement_backfill",
-                        "source_position_id": 77,
-                        "net_return_after_cost_pct": -8.0,
-                        "realized_pnl": -12.0,
-                        "objective": "maximize_expected_realized_net_return_after_cost",
-                        "objective_version": "2026-07-12.v1",
-                        "cost_complete": True,
-                        "production_evidence_eligible": True,
-                    },
-                }
-            ]
-        },
-        [{"name": "trend_expert", "weight": 1.0}],
-    )
-
-    trend = weights["trend_expert"]
-    assert trend["multiplier"] < 1.0
-    assert trend["canonical_outcome_count"] == 1
-    assert trend["return_lcb_pct"] == -8.0
-    assert "动态降低权重" in trend["reason"]
-    _assert_clean_chinese(trend["reason"])
-
-
-def test_dynamic_expert_weights_ignore_shadow_success_counts() -> None:
-    weights = dynamic_expert_weights_from_memories(
-        {
-            "trend_expert": [
-                {
-                    "memory_type": "shadow_missed_opportunity",
-                    "evidence_count": 164,
-                    "success_count": 164,
-                    "failure_count": 0,
-                    "confidence_adjustment": 1.0,
-                    "extra": {
-                        "source": "shadow_backtest",
-                        "production_evidence_eligible": False,
-                    },
-                }
-            ]
-        },
-        [{"name": "trend_expert", "weight": 1.0}],
-    )
-
-    trend = weights["trend_expert"]
-    assert trend["multiplier"] == 1.0
-    assert trend["canonical_outcome_count"] == 0
-
-
 def test_trade_reflection_templates_are_clean_chinese() -> None:
     pos = SimpleNamespace(
         symbol="BTC/USDT",
@@ -130,11 +58,14 @@ def test_trade_reflection_templates_are_clean_chinese() -> None:
 
     _assert_clean_chinese(pattern)
     _assert_clean_chinese(mistake)
-    _assert_clean_chinese(improvement)
+    assert "不得直接调整方向、仓位、杠杆或退出" in improvement
     assert lessons["trend_expert"]["expert_label"] == "趋势专家"
     for lesson in lessons.values():
         _assert_clean_chinese(lesson["lesson"])
         _assert_clean_chinese(lesson["market_pattern"])
+        assert lesson["recommended_action"] == "observation_only"
+        assert "confidence_adjustment" not in lesson
+        assert "position_size_multiplier" not in lesson
 
 
 def test_authoritative_reflection_backfill_deduplicates_exchange_lifecycle() -> None:
@@ -209,13 +140,13 @@ async def test_expert_memory_service_records_reflection_and_memories(monkeypatch
     )
 
     assert len(created_reflections) == 1
-    assert len(upserted_memories) == 5
+    assert len(upserted_memories) == 1
     reflection = created_reflections[0]
     assert reflection["outcome"] == "loss"
     assert reflection["source"] == "unit_test"
     assert reflection["closed_at"] == pos.closed_at
     _assert_clean_chinese(reflection["mistake_summary"])
-    _assert_clean_chinese(reflection["improvement_summary"])
+    assert "不得直接调整方向、仓位、杠杆或退出" in reflection["improvement_summary"]
     assert all(memory["extra"]["reflection_id"] == 321 for memory in upserted_memories)
     assert all(
         memory["extra"]["net_return_after_cost_pct"] == pytest.approx(-2.0)
@@ -276,6 +207,6 @@ async def test_existing_reflection_still_refreshes_return_memories(monkeypatch) 
     )
 
     assert processed is True
-    assert len(upserted_memories) == 5
+    assert len(upserted_memories) == 1
     assert all(row["extra"]["reflection_id"] == 654 for row in upserted_memories)
     assert all(row["extra"]["net_return_after_cost_pct"] == -10.0 for row in upserted_memories)

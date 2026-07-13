@@ -5,7 +5,7 @@ from services.forced_exit import ForcedExitPolicy
 def _decision(
     *,
     model_name: str = "ensemble_trader",
-    reasoning: str = "普通平仓",
+    reasoning: str = "ordinary exit",
     raw_response: dict | None = None,
 ) -> DecisionOutput:
     return DecisionOutput(
@@ -21,43 +21,57 @@ def _decision(
     )
 
 
-def test_forced_exit_policy_detects_structured_raw_flags() -> None:
+def test_forced_exit_policy_rejects_legacy_structured_raw_flags() -> None:
     policy = ForcedExitPolicy()
 
-    assert policy.is_forced_exit(_decision(raw_response={"fast_risk_exit": True}))
-    assert policy.is_forced_exit(_decision(raw_response={"forced_exit": True}))
-    assert policy.is_forced_exit(_decision(raw_response={"close_evidence": {"hard_risk": True}}))
-    assert policy.is_forced_exit(
+    assert not policy.is_forced_exit(_decision(raw_response={"fast_risk_exit": True}))
+    assert not policy.is_forced_exit(_decision(raw_response={"forced_exit": True}))
+    assert not policy.is_forced_exit(
+        _decision(raw_response={"close_evidence": {"hard_risk": True}})
+    )
+    assert not policy.is_forced_exit(
         _decision(raw_response={"position_review_risk_alert": {"force_exit": True}})
     )
 
 
-def test_forced_exit_policy_detects_model_and_reason_keywords() -> None:
+def test_forced_exit_policy_rejects_model_and_reason_keywords() -> None:
     policy = ForcedExitPolicy()
 
-    assert policy.is_forced_exit(_decision(model_name="risk_engine"))
-    assert policy.is_forced_exit(_decision(reasoning="STOP LOSS triggered"))
-    assert policy.is_forced_exit(_decision(reasoning="触发止损，快速风控要求离场"))
+    assert not policy.is_forced_exit(_decision(model_name="risk_engine"))
+    assert not policy.is_forced_exit(_decision(reasoning="STOP LOSS triggered"))
 
 
-def test_forced_exit_policy_ignores_ordinary_exit() -> None:
-    assert not ForcedExitPolicy().is_forced_exit(_decision())
-
-
-def test_forced_exit_policy_ignores_low_quality_release_without_hard_risk() -> None:
+def test_forced_exit_policy_accepts_governed_planned_stop() -> None:
     decision = _decision(
         raw_response={
-            "forced_exit": True,
-            "position_release_policy": {
-                "source": "position_quality_capacity_release",
-                "forced": True,
-            },
-            "close_evidence": {
-                "forced_exit": True,
-                "hard_risk": False,
-                "source": "low_quality_position_release",
+            "dynamic_exit_policy": {
+                "eligible": True,
+                "hard_risk": True,
+                "planned_stop_crossed": True,
+                "policy_provenance": {
+                    "source": (
+                        "current_position_fee_after_pnl_peak_planned_stop_and_market_returns"
+                    ),
+                },
             },
         }
     )
 
-    assert not ForcedExitPolicy().is_forced_exit(decision)
+    assert ForcedExitPolicy().is_forced_exit(decision)
+
+
+def test_forced_exit_policy_requires_complete_governed_contract() -> None:
+    base = {
+        "eligible": True,
+        "hard_risk": True,
+        "planned_stop_crossed": True,
+        "policy_provenance": {
+            "source": "current_position_fee_after_pnl_peak_planned_stop_and_market_returns"
+        },
+    }
+    for missing in ("eligible", "hard_risk", "planned_stop_crossed", "policy_provenance"):
+        policy = dict(base)
+        policy.pop(missing)
+        assert not ForcedExitPolicy().is_forced_exit(
+            _decision(raw_response={"dynamic_exit_policy": policy})
+        )

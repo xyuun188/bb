@@ -240,6 +240,13 @@ def test_remote_trainer_and_registry_enforce_hashes_atomic_pointers_and_rollback
     assert 'subparsers.add_parser("status")' in training.REMOTE_REGISTRY_TOOL_CODE
     assert "validate_pointer(target)" in training.REMOTE_REGISTRY_TOOL_CODE
     assert '"verification_status": verification_status' in training.REMOTE_REGISTRY_TOOL_CODE
+    assert '"objective_name": manifest.get("objective_name")' in training.REMOTE_REGISTRY_TOOL_CODE
+    assert '"objective_version": manifest.get("objective_version")' in (
+        training.REMOTE_REGISTRY_TOOL_CODE
+    )
+    assert '"training_stages": manifest.get("training_stages")' in (
+        training.REMOTE_REGISTRY_TOOL_CODE
+    )
 
 
 def test_training_refuses_to_run_while_conflicting_14b_services_remain_active(
@@ -250,14 +257,12 @@ def test_training_refuses_to_run_while_conflicting_14b_services_remain_active(
 
     with pytest.raises(ValueError, match="stopping all conflicting 14B services"):
         training.deploy_and_optionally_train(
-            account_dir=tmp_path,
             dataset_jsonl=dataset,
             manifest_json=json.dumps(manifest),
             train=True,
             switch_service=True,
             stop_inference_for_training=False,
             max_steps=1,
-            max_samples=1,
         )
 
 
@@ -272,7 +277,7 @@ def test_rollback_switch_uses_existing_remote_registry_without_dataset_export(
             closed.append(True)
 
     connection = Connection()
-    monkeypatch.setattr(training, "_load_old_server_info", lambda _path: object())
+    monkeypatch.setattr(training, "load_model_server_info_from_platform", lambda _path: object())
     monkeypatch.setattr(training, "connect_remote_ssh", lambda *_args, **_kwargs: connection)
     monkeypatch.setattr(
         training,
@@ -283,17 +288,11 @@ def test_rollback_switch_uses_existing_remote_registry_without_dataset_export(
         },
     )
 
-    result = training.rollback_and_switch_service(account_dir=tmp_path)
+    result = training.rollback_and_switch_service()
 
     assert result == {"same_connection": True, "rollback": True}
     assert closed == [True]
 
 
-def test_retired_takeover_script_cannot_reinstall_pure_alias() -> None:
-    source = (training.ROOT / "scripts" / "deploy_old_model_server_takeover.py").read_text(
-        encoding="utf-8"
-    )
-
-    assert "pure_model_alias_is_not_a_valid_finquant_specialization" in source
-    assert 'payload["model"] = UPSTREAM_MODEL' not in source
-    assert "The pure 8003 model-alias takeover is retired" in source
+def test_retired_takeover_script_is_deleted() -> None:
+    assert not (training.ROOT / "scripts" / "deploy_old_model_server_takeover.py").exists()

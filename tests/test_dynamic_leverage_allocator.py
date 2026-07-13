@@ -14,21 +14,13 @@ def _input(**overrides):
         "profit_quality_ratio": 1.2,
         "loss_probability": 0.38,
         "tail_risk_score": 0.30,
-        "score": 3.0,
-        "min_score_required": 0.95,
-        "confidence": 0.82,
         "aligned_source_count": 3,
-        "evidence_tier": "exploration",
-        "evidence_effective_score": 48.0,
-        "low_payoff_quality": False,
-        "weak_history": False,
-        "negative_local_expected": False,
-        "symbol_profit_tier": "neutral",
-        "quality_tier": "base",
-        "high_quality_entry": True,
         "atr_pct": 0.006,
-        "execution_cost": {},
-        "open_positions_count": 1,
+        "execution_cost": {
+            "production_eligible": True,
+            "slippage_pct": 0.02,
+            "spread_pct": 0.02,
+        },
         "portfolio_exposure_pct": 0.04,
     }
     base.update(overrides)
@@ -51,7 +43,7 @@ def test_dynamic_leverage_lifts_exploration_signal_without_fixed_three_x_cap():
     }
 
 
-def test_dynamic_leverage_temper_risk_flags_instead_of_preserving_requested():
+def test_dynamic_leverage_continuously_tempers_weak_return_quality():
     decision = DynamicLeverageAllocator().allocate(
         _input(
             requested_leverage=10.0,
@@ -59,17 +51,14 @@ def test_dynamic_leverage_temper_risk_flags_instead_of_preserving_requested():
             profit_quality_ratio=0.40,
             loss_probability=0.55,
             tail_risk_score=0.78,
-            score=0.80,
-            aligned_source_count=0,
-            low_payoff_quality=True,
-            high_quality_entry=False,
-            quality_tier="probe",
+            aligned_source_count=3,
         )
     )
 
     assert decision.final_integer_leverage < 10
-    assert decision.rounding_policy == "floor_for_risk"
-    assert "tempered_by_risk_flags" in decision.reasons
+    assert decision.rounding_policy == "floor_to_exchange_integer"
+    assert decision.policy_provenance["production_eligible"] is True
+    assert decision.policy_provenance["fallback_reason"] == ""
 
 
 def test_dynamic_leverage_clamps_to_integer_risk_budget():
@@ -85,3 +74,12 @@ def test_dynamic_leverage_clamps_to_integer_risk_budget():
 
     assert decision.risk_budget_leverage == 3.75
     assert decision.final_integer_leverage == 3
+
+
+def test_dynamic_leverage_missing_cost_distribution_falls_back_to_one_x() -> None:
+    decision = DynamicLeverageAllocator().allocate(_input(execution_cost={}))
+
+    assert decision.final_integer_leverage == 1
+    assert decision.liquidity_leverage == 1.0
+    assert decision.policy_provenance["production_eligible"] is False
+    assert decision.policy_provenance["fallback_reason"] == "live_execution_cost_incomplete"

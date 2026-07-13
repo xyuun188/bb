@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
+from math import sqrt
 from typing import Any
 
 import structlog
@@ -84,10 +85,11 @@ def _empty_bucket(label: str) -> dict[str, Any]:
         "avg_pnl": 0.0,
         "win_rate": 0.0,
         "profit_factor": 0.0,
-        "score_multiplier": 1.0,
-        "size_multiplier": 1.0,
-        "state": "learning",
-        "reason": "样本不足，先学习不强干预。",
+        "pnl_lcb_usdt": 0.0,
+        "production_permission": False,
+        "state": "not_observed",
+        "reason": "尚无可归因的权威平仓结果。",
+        "_pnl_samples": [],
     }
 
 
@@ -320,7 +322,7 @@ class ModelContributionPerformanceService:
             reason = "linked_decisions_missing"
         elif matched_count <= 0:
             reason = "position_order_time_or_side_mismatch"
-        elif match_rate < 0.5:
+        elif matched_count < total_positions:
             reason = "partial_lineage"
         return {
             "total_closed_positions": total_positions,
@@ -342,162 +344,37 @@ class ModelContributionPerformanceService:
     ) -> list[str]:
         """Infer which evidence sources supported an entry decision."""
 
-        profit_first_plan = _safe_dict(raw.get("profit_first_trade_plan"))
-        plan_sources = self._profit_first_contribution_sources(profit_first_plan)
-        if plan_sources:
-            return plan_sources
-
-        sources: list[str] = []
-        if bool(opportunity.get("ml_aligned")):
-            sources.append("ml_profit_model")
-        if bool(opportunity.get("local_profit_aligned")):
-            sources.append("server_profit_model")
-        if bool(opportunity.get("timeseries_aligned")):
-            sources.append("timeseries_model")
-        evidence_score = _safe_dict(opportunity.get("evidence_score"))
-        components = _safe_list(evidence_score.get("components"))
-        for item in components:
-            if not isinstance(item, dict) or item.get("status") != "aligned":
-                continue
-            if item.get("source") == "sentiment":
-                sources.append("sentiment_model")
-            elif item.get("source") == "shadow_memory":
-                sources.append("shadow_memory")
-        if bool(opportunity.get("expert_aligned")):
-            sources.append("expert_alignment")
-        has_quant = any(
-            source in sources
-            for source in ("ml_profit_model", "server_profit_model", "timeseries_model")
-        )
-        if not has_quant and side in {"long", "short"}:
-            sources.append("ai_only_without_quant")
-        return sources
-
-    @staticmethod
-    def _profit_first_contribution_sources(plan: dict[str, Any]) -> list[str]:
+        del raw, side
+        breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
         source_map = {
-            "decision_llm": "decision_llm",
             "local_ml": "ml_profit_model",
             "server_profit": "server_profit_model",
             "timeseries": "timeseries_model",
-            "sentiment": "sentiment_model",
-            "shadow_memory": "shadow_memory",
-            "expert_alignment": "expert_alignment",
-            "high_risk_review": "high_risk_review",
         }
-        sources: list[str] = []
-        for contribution in _safe_list(plan.get("model_contributions")):
-            row = _safe_dict(contribution)
-            if row and row.get("valid") is False:
-                continue
-            mapped = source_map.get(str(row.get("source") or ""))
-            if mapped:
-                sources.append(mapped)
-        if not sources:
-            for source in _safe_list(plan.get("model_sources")):
-                mapped = source_map.get(str(source or ""))
-                if mapped:
-                    sources.append(mapped)
-        return list(dict.fromkeys(sources))
+        return list(
+            dict.fromkeys(
+                source_map[str(item.get("key"))]
+                for item in _safe_list(breakdown.get("components"))
+                if isinstance(item, dict)
+                and item.get("production_eligible") is True
+                and str(item.get("key")) in source_map
+            )
+        )
 
     def score_adjustment(
         self,
         sources: list[str],
         performance: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
-        """Convert source performance into bounded score and size adjustment."""
-
-        if not sources or not isinstance(performance, dict):
-            return {
-                "active": False,
-                "sources": sources or [],
-                "score_multiplier": 1.0,
-                "size_multiplier": 1.0,
-                "score_adjustment": 0.0,
-                "reason": "暂无模型贡献统计，使用基础机会评分。",
-            }
-
-        weighted_score_multiplier = 0.0
-        weighted_size_multiplier = 0.0
-        total_weight = 0.0
-        evidence: list[dict[str, Any]] = []
-        for source in sources:
-            bucket = performance.get(source)
-            if not isinstance(bucket, dict):
-                continue
-            count = int(bucket.get("count") or 0)
-            if count <= 0:
-                continue
-            sample_weight = min(max(count, 1), 25)
-            score_multiplier = _safe_float(bucket.get("score_multiplier"), 1.0)
-            size_multiplier = _safe_float(bucket.get("size_multiplier"), 1.0)
-            weighted_score_multiplier += score_multiplier * sample_weight
-            weighted_size_multiplier += size_multiplier * sample_weight
-            total_weight += sample_weight
-            evidence.append(
-                {
-                    "source": source,
-                    "label": bucket.get("label") or source,
-                    "count": count,
-                    "pnl": bucket.get("pnl", 0.0),
-                    "profit_factor": bucket.get("profit_factor", 0.0),
-                    "state": bucket.get("state", "learning"),
-                    "score_multiplier": round(score_multiplier, 6),
-                    "size_multiplier": round(size_multiplier, 6),
-                    "reason": bucket.get("reason", ""),
-                }
-            )
-
-        if total_weight <= 0:
-            return {
-                "active": False,
-                "sources": sources,
-                "score_multiplier": 1.0,
-                "size_multiplier": 1.0,
-                "score_adjustment": 0.0,
-                "evidence": evidence,
-                "reason": "贡献样本不足，先学习不强干预。",
-            }
-
-        score_multiplier = min(max(weighted_score_multiplier / total_weight, 0.60), 1.38)
-        size_multiplier = min(max(weighted_size_multiplier / total_weight, 0.65), 1.25)
-        score_adjustment = (score_multiplier - 1.0) * 2.25
-        state = (
-            "promote"
-            if score_multiplier > 1.04
-            else "degrade" if score_multiplier < 0.96 else "neutral"
-        )
-        negative_sources = [
-            item
-            for item in evidence
-            if _safe_float(item.get("pnl"), 0.0) < -8.0
-            and _safe_float(item.get("profit_factor"), 1.0) < 0.75
-            and int(item.get("count") or 0) >= 5
-        ]
-        hard_caution = bool(negative_sources)
-        if state == "promote":
-            reason = "这些证据来源最近真实平仓贡献为正，本轮提高机会评分和仓位倾向。"
-        elif state == "degrade":
-            reason = "这些证据来源最近真实平仓贡献偏弱，本轮降低机会评分并缩小仓位。"
-        else:
-            reason = "这些证据来源最近真实贡献接近中性，本轮保持基础评分。"
-        if hard_caution:
-            reason = (
-                f"{reason} 其中 {len(negative_sources)} 个证据来源最近真实净亏且盈利因子偏低，"
-                "本轮进入闭环强审查。"
-            )
+        """Expose attribution without changing production score or size."""
 
         return {
-            "active": True,
+            "active": False,
             "sources": sources,
-            "state": state,
-            "hard_caution": hard_caution,
-            "negative_sources": negative_sources,
-            "score_multiplier": round(score_multiplier, 6),
-            "size_multiplier": round(size_multiplier, 6),
-            "score_adjustment": round(score_adjustment, 6),
-            "evidence": evidence,
-            "reason": reason,
+            "score_adjustment": 0.0,
+            "evidence": [performance[source] for source in sources if source in performance],
+            "production_permission": False,
+            "reason": "模型贡献历史仅用于费后收益归因，不改变生产评分或仓位。",
         }
 
     def _match_entry_decision(
@@ -540,6 +417,7 @@ class ModelContributionPerformanceService:
     @staticmethod
     def _add_sample(bucket: dict[str, Any], pnl: float) -> None:
         bucket["count"] = int(bucket.get("count") or 0) + 1
+        bucket.setdefault("_pnl_samples", []).append(float(pnl))
         bucket["pnl"] = float(bucket.get("pnl") or 0.0) + pnl
         if pnl >= 0:
             bucket["wins"] = int(bucket.get("wins") or 0) + 1
@@ -554,43 +432,36 @@ class ModelContributionPerformanceService:
         profit = float(bucket.get("profit") or 0.0)
         loss = float(bucket.get("loss") or 0.0)
         pnl = float(bucket.get("pnl") or 0.0)
+        samples = [float(value) for value in bucket.pop("_pnl_samples", [])]
         if count <= 0:
             return
         win_rate = int(bucket.get("wins") or 0) / count
-        profit_factor = profit / loss if loss > 0 else (3.0 if profit > 0 else 0.0)
+        profit_factor = profit / loss if loss > 0 else None
         avg_pnl = pnl / count
-        edge = max(min(avg_pnl / 5.0, 0.28), -0.34)
-        factor_edge = max(min((profit_factor - 1.0) * 0.14, 0.22), -0.26)
-        multiplier = min(max(1.0 + edge + factor_edge, 0.60), 1.38)
-        state = "learning"
-        reason = "样本不足，先学习不强干预。"
-        if count >= 5:
-            if pnl > 0 and profit_factor >= 1.15:
-                state = "promote"
-                reason = (
-                    f"最近 {count} 笔贡献净盈利 {pnl:.2f}U，盈利因子 {profit_factor:.2f}，"
-                    "下轮提高权重。"
-                )
-            elif pnl < 0 or profit_factor < 0.85:
-                state = "degrade"
-                reason = (
-                    f"最近 {count} 笔贡献净亏损 {pnl:.2f}U，盈利因子 {profit_factor:.2f}，"
-                    "下轮降低权重。"
-                )
-            else:
-                state = "neutral"
-                reason = f"最近 {count} 笔贡献接近中性，保持基础权重。"
+        variance = (
+            sum((value - avg_pnl) ** 2 for value in samples) / (count - 1)
+            if count > 1
+            else avg_pnl**2
+        )
+        lcb = avg_pnl - sqrt(max(variance, 0.0) / count)
+        state = (
+            "positive_return_observation"
+            if lcb > 0 and profit_factor is not None and profit_factor > 1
+            else "negative_return_observation"
+            if lcb < 0
+            else "uncertain_return_observation"
+        )
         bucket.update(
             {
                 "pnl": round(pnl, 6),
                 "profit": round(profit, 6),
                 "loss": round(loss, 6),
                 "avg_pnl": round(avg_pnl, 6),
+                "pnl_lcb_usdt": round(lcb, 6),
                 "win_rate": round(win_rate, 6),
-                "profit_factor": round(profit_factor, 6),
-                "score_multiplier": round(multiplier, 6),
-                "size_multiplier": round(min(max(multiplier, 0.65), 1.25), 6),
+                "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
                 "state": state,
-                "reason": reason,
+                "production_permission": False,
+                "reason": "只读费后贡献归因，不参与生产评分、仓位或路由。",
             }
         )

@@ -1,3 +1,5 @@
+import pytest
+
 from ai_brain.base_model import Action, DecisionOutput
 from risk_manager.engine import RiskEngine
 
@@ -10,105 +12,66 @@ def _decision(symbol: str = "BTC/USDT", action: Action = Action.LONG) -> Decisio
         confidence=0.8,
         reasoning="entry",
         position_size_pct=0.03,
-        suggested_leverage=3.0,
+        suggested_leverage=12.0,
         stop_loss_pct=0.03,
-        take_profit_pct=0.08,
-        raw_response={},
+        raw_response={
+            "profit_risk_sizing": {
+                "production_eligible": True,
+                "planned_stop_loss_usdt": 0.9,
+                "max_stop_loss_usdt": 1.2,
+                "stress_stop_loss_pct": 0.03,
+                "policy_provenance": {
+                    "source": "fee_after_return_cost_stop_distance_account_and_portfolio_state",
+                    "observation_window": "current_decision_and_open_portfolio",
+                    "sample_count": 2,
+                    "generated_at": "2026-07-12T00:00:00+00:00",
+                    "strategy_version": "test.dynamic-risk.v1",
+                    "fallback_reason": "",
+                },
+            }
+        },
     )
 
 
-def test_risk_engine_blocks_new_symbol_using_capacity_snapshot_when_positions_are_stale() -> None:
-    engine = RiskEngine(
-        max_open_positions_provider=lambda: {
-            "base_limit": 20,
-            "effective_limit": 15,
-            "entry_limit": 15,
-            "open_group_count": 20,
-            "reason": "over_capacity_release_first=1",
-        }
-    )
-
-    result = engine.assess(
+def test_position_group_count_cannot_block_dynamic_return_entry() -> None:
+    result = RiskEngine().assess(
         decision=_decision("SOL/USDT"),
-        current_positions=[
-            {"model_name": "ensemble_trader", "symbol": "BTC/USDT", "side": "long"},
-            {"model_name": "ensemble_trader", "symbol": "ETH/USDT", "side": "short"},
-        ],
-        account_balance=1000.0,
-    )
-
-    assert result.approved is False
-    assert "容量快照 20 组" in result.rejection_reason
-    assert "本次持仓列表 2 组" in result.rejection_reason
-    assert "限制 15 组" in result.rejection_reason
-
-
-def test_risk_engine_allows_same_symbol_add_when_capacity_snapshot_is_full() -> None:
-    engine = RiskEngine(
-        max_open_positions_provider=lambda: {
-            "entry_limit": 1,
-            "effective_limit": 1,
-            "open_group_count": 4,
-        }
-    )
-
-    result = engine.assess(
-        decision=_decision("BTC/USDT"),
         current_positions=[
             {
                 "model_name": "ensemble_trader",
-                "symbol": "BTC/USDT",
+                "symbol": f"ASSET-{index}/USDT",
                 "side": "long",
-                "quantity": 1.0,
-                "entry_price": 100.0,
+                "quantity": 0.001,
+                "entry_price": 1.0,
+                "margin": 0.001,
             }
+            for index in range(500)
         ],
         account_balance=1000.0,
     )
 
     assert result.approved is True
+    assert result.decision is not None
+    assert result.decision.suggested_leverage == 12.0
 
 
-def test_risk_engine_keeps_dynamic_integer_leverage_without_runtime_tier_cap() -> None:
-    engine = RiskEngine(
-        max_open_positions_provider=lambda: {
-            "entry_limit": 20,
-            "effective_limit": 20,
-            "open_group_count": 1,
-        }
-    )
-    decision = _decision("ETH/USDT")
-    decision.suggested_leverage = 12.0
+def test_missing_dynamic_risk_contract_fails_closed_despite_obsolete_capacity_payload() -> None:
+    decision = _decision("SOL/USDT")
     decision.raw_response = {
-        "dynamic_leverage_decision": {
-            "version": "dynamic_leverage_allocator_v1",
-            "final_integer_leverage": 12,
+        "dynamic_position_capacity": {
+            "entry_limit": 999,
+            "available_group_slots": 999,
         }
     }
 
-    result = engine.assess(
-        decision=decision,
-        current_positions=[],
-        account_balance=1000.0,
-        volume_ratio=0.2,
-        adx_14=0.0,
-    )
+    result = RiskEngine().assess(decision, [], 1000.0)
 
-    assert result.approved is True
-    assert result.decision.suggested_leverage == 12.0
-    assert any("dynamic leverage allocator" in warning for warning in result.warnings)
+    assert result.approved is False
+    assert "Dynamic account risk budget" in result.rejection_reason
 
 
-def test_risk_engine_blocks_same_symbol_opposite_entry_in_net_position_mode() -> None:
-    engine = RiskEngine(
-        max_open_positions_provider=lambda: {
-            "entry_limit": 20,
-            "effective_limit": 20,
-            "open_group_count": 1,
-        }
-    )
-
-    result = engine.assess(
+def test_same_symbol_opposite_entry_is_still_rejected_by_okx_net_position_fact() -> None:
+    result = RiskEngine().assess(
         decision=_decision("MASK/USDT", Action.LONG),
         current_positions=[
             {
@@ -117,6 +80,7 @@ def test_risk_engine_blocks_same_symbol_opposite_entry_in_net_position_mode() ->
                 "side": "short",
                 "quantity": 47.0,
                 "entry_price": 0.4103,
+                "margin": 2.0,
             }
         ],
         account_balance=1000.0,
@@ -124,31 +88,25 @@ def test_risk_engine_blocks_same_symbol_opposite_entry_in_net_position_mode() ->
 
     assert result.approved is False
     assert "OKX 净持仓模式" in result.rejection_reason
-    assert "先平掉或反转已有 short 仓位" in result.rejection_reason
 
 
-def test_risk_engine_does_not_treat_closed_same_symbol_as_add() -> None:
-    engine = RiskEngine(
-        max_open_positions_provider=lambda: {
-            "entry_limit": 1,
-            "effective_limit": 1,
-            "open_group_count": 1,
-        }
-    )
-
-    result = engine.assess(
-        decision=_decision("BTC/USDT"),
+def test_physical_account_margin_boundary_caps_to_remaining_equity() -> None:
+    result = RiskEngine().assess(
+        decision=_decision("ETH/USDT"),
         current_positions=[
             {
                 "model_name": "ensemble_trader",
                 "symbol": "BTC/USDT",
                 "side": "long",
-                "is_open": False,
-                "quantity": 0.0,
+                "quantity": 1.0,
+                "entry_price": 1000.0,
+                "margin": 990.0,
             }
         ],
         account_balance=1000.0,
     )
 
-    assert result.approved is False
-    assert "容量快照 1 组" in result.rejection_reason
+    assert result.approved is True
+    assert result.decision is not None
+    assert result.decision.position_size_pct == pytest.approx(0.01)
+    assert any("current account capacity" in warning for warning in result.warnings)

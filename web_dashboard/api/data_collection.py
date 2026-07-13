@@ -1072,27 +1072,17 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
         )
         from services.model_promotion_policy import (
             build_phase3_promotion_recommendation,
-            build_profit_first_promotion_report,
+            build_return_objective_report,
             load_latest_paper_observation_report,
         )
         from services.training_data_quality import annotate_training_payload
 
-        shadow_samples = await _load_shadow_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
-        )
-        trade_reflection_samples = await _load_trade_reflection_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-        )
-        authoritative_samples = await _load_authoritative_trade_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-        )
+        shadow_samples = await _load_shadow_samples()
+        trade_reflection_samples = await _load_trade_reflection_samples(None)
+        authoritative_samples = await _load_authoritative_trade_samples(None)
         trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
-        sequence_samples = await _load_sequence_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
-        )
-        text_sentiment_samples = await _load_text_sentiment_samples(
-            _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
-        )
+        sequence_samples = await _load_sequence_samples()
+        text_sentiment_samples = await _load_text_sentiment_samples()
         payload = annotate_training_payload(
             shadow_samples=shadow_samples,
             trade_samples=trade_samples,
@@ -1118,7 +1108,7 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             "phase": "phase3_model_factory",
         }
         paper_observation_report = load_latest_paper_observation_report()
-        profit_first_report = build_profit_first_promotion_report(
+        return_objective_report = build_return_objective_report(
             trade_samples=payload["trade_samples"],
             shadow_samples=payload["shadow_samples"],
         )
@@ -1131,7 +1121,7 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             paper_observation_report=paper_observation_report,
             completed_shadow_sample_count=completed_shadow_count,
             completed_trade_sample_count=completed_trade_count,
-            profit_first_report=profit_first_report,
+            return_objective_report=return_objective_report,
         )
         result = await trainer(
             payload["shadow_samples"],
@@ -1157,7 +1147,7 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
         )
         result.setdefault("quality_report", payload["quality_report"])
         result.setdefault("governance_report", payload["governance_report"])
-        result.setdefault("profit_first_report", profit_first_report)
+        result.setdefault("return_objective_report", return_objective_report)
         result.setdefault("promotion_recommendation", promotion_recommendation)
         result.setdefault("paper_observation_report", paper_observation_report)
         result.setdefault("raw_trade_sample_count", raw_trade_sample_count)

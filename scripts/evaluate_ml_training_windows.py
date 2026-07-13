@@ -27,17 +27,13 @@ from db.session import get_read_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from services.ml_readiness import build_ml_readiness_report  # noqa: E402
 from services.ml_signal_service import (  # noqa: E402
-    MIN_TRAINING_SAMPLES,
-    TRAINING_SHADOW_SAMPLE_LIMIT,
     _influence_policy,
     _shadow_action,
-    _shadow_is_low_confidence_hold,
     _shadow_is_trainable_trade_opportunity,
     _shadow_quality_sample,
     _shadow_sort_key,
     _shadow_training_columns,
     _shadow_training_row_from_mapping,
-    _sort_shadow_quality_first,
     build_training_frame,
     count_shadow_training_rows,
     select_shadow_training_rows,
@@ -77,20 +73,20 @@ def _clean_trainable_rows(rows: list[Any]) -> list[Any]:
     return [
         row
         for row in _dedupe_rows(rows)
-        if _is_trainable(row) and not _shadow_is_low_confidence_hold(row)
+        if _is_trainable(row)
     ]
 
 
 def _quality_sorted(rows: list[Any]) -> list[Any]:
-    return _sort_shadow_quality_first(_dedupe_rows(rows))
+    return _dedupe_rows(rows)
 
 
 def _select_quality_first(rows: list[Any], *, limit: int) -> list[Any]:
     return _quality_sorted(_clean_trainable_rows(rows))[:limit]
 
 
-def _select_current_policy(rows: list[Any], limit: int) -> list[Any]:
-    return select_shadow_training_rows(rows, limit=limit)
+def _select_current_policy(rows: list[Any], _limit: int) -> list[Any]:
+    return select_shadow_training_rows(rows)
 
 
 def _select_exclude_best_hold(rows: list[Any], limit: int) -> list[Any]:
@@ -337,11 +333,7 @@ def extended_variants() -> list[WindowVariant]:
     ]
 
 
-async def load_candidate_rows(limit: int, *, multiplier: float) -> list[Any]:
-    safe_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
-    pool_limit = max(int(safe_limit * max(float(multiplier), 1.0)), safe_limit)
-    non_hold_limit = max(int(safe_limit * 0.75), safe_limit // 2)
-    best_trade_limit = max(int(safe_limit * 1.25), safe_limit)
+async def load_candidate_rows() -> list[Any]:
     columns = _shadow_training_columns()
     filters = (
         ShadowBacktest.status == "completed",
@@ -358,20 +350,8 @@ async def load_candidate_rows(limit: int, *, multiplier: float) -> list[Any]:
                 for row in (await session.execute(stmt)).mappings().all()
             ]
 
-        recent = await load(select(*columns).where(*filters).order_by(*order_by).limit(pool_limit))
-        non_hold = await load(
-            select(*columns)
-            .where(*filters, ShadowBacktest.decision_action.in_(["long", "short"]))
-            .order_by(*order_by)
-            .limit(non_hold_limit)
-        )
-        best_trade = await load(
-            select(*columns)
-            .where(*filters, ShadowBacktest.best_action.in_(["long", "short"]))
-            .order_by(*order_by)
-            .limit(best_trade_limit)
-        )
-    return _dedupe_rows([*recent, *non_hold, *best_trade])
+        rows = await load(select(*columns).where(*filters).order_by(*order_by))
+    return _dedupe_rows(rows)
 
 
 def _counter(rows: list[Any], field: str) -> dict[str, int]:
@@ -432,7 +412,6 @@ def evaluate_variant(
     candidates: list[Any],
     *,
     limit: int,
-    min_samples: int,
     completed_count: int,
 ) -> dict[str, Any]:
     selected = variant.selector(candidates, limit)
@@ -449,19 +428,8 @@ def evaluate_variant(
             "quality_status": _quality_counts(selected),
         },
     }
-    if len(frame) < min_samples:
-        result.update(
-            {
-                "status": "insufficient_frame_samples",
-                "readiness_state": "not_evaluated",
-                "allow_live_position_influence": False,
-            }
-        )
-        return result
-
     metadata = train_from_frame(
         frame,
-        min_samples=min_samples,
         completed_sample_count=completed_count,
         training_quality_report=quality_state["quality_report"],
         persist_artifact=False,
@@ -496,14 +464,8 @@ def evaluate_variant(
     return result
 
 
-async def run(
-    limit: int,
-    min_samples: int,
-    candidate_multiplier: float,
-    *,
-    include_extended: bool = False,
-) -> dict[str, Any]:
-    candidates = await load_candidate_rows(limit, multiplier=candidate_multiplier)
+async def run(*, include_extended: bool = False) -> dict[str, Any]:
+    candidates = await load_candidate_rows()
     completed_count = await count_shadow_training_rows()
     selected_variants = variants()
     if include_extended:
@@ -512,8 +474,7 @@ async def run(
         evaluate_variant(
             variant,
             candidates,
-            limit=limit,
-            min_samples=min_samples,
+            limit=len(candidates),
             completed_count=completed_count,
         )
         for variant in selected_variants
@@ -525,9 +486,7 @@ async def run(
         "dry_run": True,
         "artifact_persisted": False,
         "database_mutated": False,
-        "limit": int(limit),
-        "min_samples": int(min_samples),
-        "candidate_multiplier": float(candidate_multiplier),
+        "training_window_sample_count": len(candidates),
         "extended_diagnostics": bool(include_extended),
         "candidate_row_count": len(candidates),
         "completed_shadow_sample_count": completed_count,
@@ -543,9 +502,6 @@ async def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--limit", type=int, default=TRAINING_SHADOW_SAMPLE_LIMIT)
-    parser.add_argument("--min-samples", type=int, default=MIN_TRAINING_SAMPLES)
-    parser.add_argument("--candidate-multiplier", type=float, default=2.0)
     parser.add_argument(
         "--extended",
         action="store_true",
@@ -555,9 +511,6 @@ def main() -> None:
 
     result = asyncio.run(
         run(
-            limit=max(int(args.limit), 1),
-            min_samples=max(int(args.min_samples), 1),
-            candidate_multiplier=max(float(args.candidate_multiplier), 1.0),
             include_extended=bool(args.extended),
         )
     )

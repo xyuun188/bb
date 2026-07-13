@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from ai_brain.base_model import DecisionOutput
+from services.dynamic_exit_policy import apply_dynamic_exit
 from services.entry_capacity import EntryCapacityPolicy
 from services.position_review_entry_guard import PositionReviewEntryGuardPolicy
 from services.position_review_result_recorder import PositionReviewResultRecorder
@@ -17,7 +18,6 @@ from services.position_review_risk_assessment import PositionReviewRiskAssessmen
 logger = structlog.get_logger(__name__)
 
 AccountBalanceProvider = Callable[[str], Awaitable[float]]
-ExitFeeGuardReasonProvider = Callable[[str, DecisionOutput], Awaitable[str | None]]
 CandidateExecutor = Callable[..., Awaitable[None]]
 FinalStateEnsurer = Callable[
     [int, str, str, DecisionOutput, dict[str, Any] | None], Awaitable[None]
@@ -42,7 +42,6 @@ class PositionReviewDecisionProcessor:
     entry_capacity: EntryCapacityPolicy
     risk_assessment: PositionReviewRiskAssessmentPolicy
     result_recorder: PositionReviewResultRecorder
-    exit_fee_guard_reason_provider: ExitFeeGuardReasonProvider
     candidate_executor: CandidateExecutor
     final_state_ensurer: FinalStateEnsurer
     account_balance_provider: AccountBalanceProvider
@@ -226,14 +225,14 @@ class PositionReviewDecisionProcessor:
         risk_alert: str | None,
         results: dict[str, Any] | None,
     ) -> PositionReviewProcessResult:
-        review_guard_reason = await self.exit_fee_guard_reason_provider(model_name, executed)
-        if review_guard_reason:
+        dynamic_exit = apply_dynamic_exit(executed, open_positions)
+        if not dynamic_exit.eligible:
             await self.result_recorder.record_skip(
                 decision=executed,
                 model_name=model_name,
                 symbol=symbol,
                 model_mode=model_mode,
-                reason=review_guard_reason,
+                reason=dynamic_exit.reason,
                 decision_db_id=decision_db_id,
                 results=results,
                 risk_alert=risk_alert,

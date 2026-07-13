@@ -6,11 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-PORTFOLIO_PROFIT_PROTECTION_MIN_USDT = 3.0
-PORTFOLIO_PROFIT_PROTECTION_MIN_CONTRIBUTION_USDT = 0.6
-PORTFOLIO_PROFIT_PROTECTION_MIN_SHARE = 0.05
-PORTFOLIO_PROFIT_PROTECTION_MAX_FOCUS_GROUPS = 5
-
 NormalizeSymbol = Callable[[Any], str]
 
 
@@ -29,11 +24,6 @@ class PortfolioProfitProtectionPolicy:
 
     normalize_symbol: NormalizeSymbol
     default_model_name: str
-    min_unrealized_usdt: float = PORTFOLIO_PROFIT_PROTECTION_MIN_USDT
-    min_contribution_usdt: float = PORTFOLIO_PROFIT_PROTECTION_MIN_CONTRIBUTION_USDT
-    min_profit_share: float = PORTFOLIO_PROFIT_PROTECTION_MIN_SHARE
-    max_focus_groups: int = PORTFOLIO_PROFIT_PROTECTION_MAX_FOCUS_GROUPS
-
     def context(self, open_positions: list[dict[str, Any]]) -> dict[str, Any]:
         """Build a portfolio-level floating-profit context for AI lock-profit review."""
 
@@ -79,7 +69,7 @@ class PortfolioProfitProtectionPolicy:
             if str(item.get("side") or "") != side:
                 item["side"] = "mixed"
 
-        active = total_unrealized >= self.min_unrealized_usdt
+        active = total_positive > 0.0
         ranked = sorted(
             groups.values(),
             key=lambda item: _safe_float(item.get("unrealized_pnl"), 0.0),
@@ -90,7 +80,7 @@ class PortfolioProfitProtectionPolicy:
             for item in ranked:
                 unrealized = _safe_float(item.get("unrealized_pnl"), 0.0)
                 share = unrealized / max(total_positive, 1e-9) if unrealized > 0 else 0.0
-                if unrealized >= self.min_contribution_usdt and share >= self.min_profit_share:
+                if unrealized > 0.0:
                     focus_groups.append(
                         {
                             **item,
@@ -101,12 +91,8 @@ class PortfolioProfitProtectionPolicy:
                             ),
                         }
                     )
-                if len(focus_groups) >= self.max_focus_groups:
-                    break
-
         return {
             "active": active,
-            "threshold_usdt": self.min_unrealized_usdt,
             "total_unrealized_pnl": round(total_unrealized, 6),
             "total_positive_unrealized_pnl": round(total_positive, 6),
             "total_open_notional": round(total_notional, 6),
@@ -129,7 +115,7 @@ class PortfolioProfitProtectionPolicy:
                         6,
                     ),
                 }
-                for item in ranked[:5]
+                for item in ranked
             ],
             "instruction": (
                 "Portfolio floating profit has reached the winner-management line. "
@@ -182,11 +168,10 @@ class PortfolioProfitProtectionPolicy:
         return {
             "active": True,
             "is_focus": bool(focus),
-            "threshold_usdt": context.get("threshold_usdt"),
             "total_unrealized_pnl": context.get("total_unrealized_pnl"),
             "total_positive_unrealized_pnl": context.get("total_positive_unrealized_pnl"),
             "current_group": current,
-            "top_groups": context.get("top_groups", [])[:3],
+            "top_groups": context.get("top_groups", []),
             "required_choice": [
                 "continue_hold_with_reason",
                 "add_to_winner_if_trend_continues",

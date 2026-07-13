@@ -2215,7 +2215,6 @@ async def test_collect_platform_runtime_status_probes_real_local_tool_endpoints(
         ],
         local_ai_tools_api_base="http://local-ai.test",
         local_ai_tools_api_key="hidden-tools-key",
-        ai_api_key="",
     )
     monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
 
@@ -2278,7 +2277,6 @@ async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_set
         get_fixed_ai_models=lambda include_empty=False: [],
         local_ai_tools_api_base="http://local-ai.test",
         local_ai_tools_api_key="",
-        ai_api_key="",
     )
     monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
     monkeypatch.setenv("LOCAL_AI_TOOLS_API_KEY", "env-tools-key")
@@ -2322,7 +2320,6 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
         get_fixed_ai_models=lambda include_empty=False: [],
         local_ai_tools_api_base="",
         local_ai_tools_api_key="",
-        ai_api_key="",
     )
     monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
 
@@ -2399,7 +2396,6 @@ async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_por
         get_fixed_ai_models=lambda include_empty=False: [],
         local_ai_tools_api_base="http://127.0.0.1:8001",
         local_ai_tools_api_key="hidden-tools-key",
-        ai_api_key="",
     )
     monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
 
@@ -2465,7 +2461,6 @@ async def test_collect_platform_runtime_status_uses_external_decision_route(
         ],
         local_ai_tools_api_base="http://127.0.0.1:18001",
         local_ai_tools_api_key="hidden-tools-key",
-        ai_api_key="",
         high_risk_review_api_base="http://127.0.0.1:18002/v1",
         high_risk_review_api_key="",
         high_risk_review_model="deepseek-r1-14b-risk",

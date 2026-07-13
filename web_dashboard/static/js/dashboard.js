@@ -2029,127 +2029,9 @@ function opportunityScoreExecutionState(score, decision = null) {
     return { label: '等待排序', tone: 'neutral' };
 }
 
-function evidenceTierLabel(tier) {
-    return {
-        normal: '正常仓位',
-        medium: '中等仓位',
-        small: '小仓',
-        exploration: '探索小仓',
-        weak_conflict_probe: '弱冲突学习档',
-        degraded_missing_probe: '模型缺失降级学习档',
-        blocked: '不可交易档',
-    }[String(tier || '').toLowerCase()] || tier || '-';
-}
-
-function evidenceSourceLabel(source) {
-    return {
-        ai: 'AI/专家',
-        ml: '本地 ML',
-        timeseries: '时序',
-        sentiment: '情绪',
-        server_profit: '服务器盈利',
-        shadow_memory: '影子/记忆',
-        symbol_side_history: '币种方向历史',
-    }[String(source || '').toLowerCase()] || source || '-';
-}
-
-function evidenceStatusLabel(status) {
-    return {
-        aligned: '同向支持',
-        opposite: '反向冲突',
-        weak_opposite: '弱反向',
-        missing: '缺失',
-        neutral: '中性',
-        ignored: '学习观察',
-        limited_no_expert_support: '专家未同向',
-        limited_single_expert_support: '仅 1 个专家同向',
-        probe_derived_limited: '探针来源限分',
-        probe_derived_no_expert_support: '探针无专家支持',
-    }[String(status || '').toLowerCase()] || status || '-';
-}
-
-function evidenceListLabel(items) {
-    return Array.isArray(items) && items.length
-        ? items.map(evidenceSourceLabel).join('、')
-        : '无';
-}
-
 function evidencePercentLabel(value, digits = 1) {
     const num = Number(value);
     return Number.isFinite(num) ? `${(num * 100).toFixed(digits)}%` : '-';
-}
-
-function dynamicEvidenceBlock(score, decision = null) {
-    const evidence = score && typeof score === 'object' ? score.evidence_score : null;
-    if (!evidence || typeof evidence !== 'object') return '';
-    const rawScore = Number(evidence.score);
-    const effective = Number(evidence.effective_score);
-    const multiplier = Number(evidence.size_multiplier);
-    const maxSize = Number(evidence.max_size_pct);
-    const confidence = Number(decision?.confidence ?? score?.confidence);
-    const components = Array.isArray(evidence.components) ? evidence.components : [];
-    const componentRows = components.slice(0, 8).map(item => {
-        const points = Number(item.points);
-        const expected = Number(item.expected_return_pct ?? item.pnl);
-        const sub = Number.isFinite(expected) ? ` · ${signedPctValueLabel(expected)}` : '';
-        return `
-            <div class="decision-evidence-component">
-                <strong>${escHtml(item.label || evidenceSourceLabel(item.source))}</strong>
-                <span>${escHtml(evidenceStatusLabel(item.status))}${sub}</span>
-                <em>${Number.isFinite(points) ? points.toFixed(1) : '-'} 分</em>
-            </div>
-        `;
-    }).join('');
-    const waitReasons = Array.isArray(evidence.advisory_wait_reasons)
-        ? evidence.advisory_wait_reasons.filter(Boolean)
-        : [];
-    const shortAdjustment = evidence.short_evidence_adjustment && typeof evidence.short_evidence_adjustment === 'object'
-        ? evidence.short_evidence_adjustment
-        : null;
-    const shortAdjustmentMode = String(shortAdjustment?.mode || '');
-    const shortAdjustmentOffset = Number(shortAdjustment?.score_offset);
-    const shortAdjustmentSize = Number(shortAdjustment?.size_multiplier);
-    const shortAdjustmentLabel = shortAdjustmentMode === 'strong_current_short_evidence'
-        ? '做空强证据放开'
-        : (shortAdjustmentMode === 'conservative_short_evidence' ? '做空保守修正' : '做空动态修正');
-    const shortAdjustmentReason = shortAdjustmentMode === 'strong_current_short_evidence'
-        ? '当前净收益、盈利质量、亏损概率、尾部风险和多源同向证据达标，取消默认做空扣分和缩仓。'
-        : '当前做空证据还没有达到强证据标准，系统保留做空方向的风险修正。';
-    const shortAdjustmentHtml = shortAdjustment?.applied ? `
-        <div class="decision-evidence-adjustment ${shortAdjustmentMode === 'strong_current_short_evidence' ? 'good' : 'warn'}">
-            <strong>${escHtml(shortAdjustmentLabel)}</strong>
-            <span>分数偏移 ${Number.isFinite(shortAdjustmentOffset) ? shortAdjustmentOffset.toFixed(1) : '-'} · 仓位系数 ${Number.isFinite(shortAdjustmentSize) ? shortAdjustmentSize.toFixed(2) : '-'}</span>
-            <em>${escHtml(shortAdjustmentReason)}</em>
-        </div>
-    ` : '';
-    const tier = String(evidence.tier || '').toLowerCase();
-    const explanation = tier === 'weak_conflict_probe'
-        ? '弱证据不是单看分析信心；它表示有效证据分只够学习/观察，而且存在反向或同向来源不足。'
-        : tier === 'degraded_missing_probe'
-            ? '弱证据不是单看分析信心；它表示关键模型缺失或质量不足，只能作为学习样本。'
-            : '动态证据分综合 AI、ML、时序、情绪、服务器盈利、影子记忆和币种历史。';
-    return `
-        <div class="reason-block decision-evidence-block">
-            <div class="reason-label">动态证据评分</div>
-            <div class="decision-evidence-summary">
-                <div><span>分析信心</span><strong>${evidencePercentLabel(confidence)}</strong><small>AI/专家最终置信度</small></div>
-                <div><span>证据分</span><strong>${Number.isFinite(rawScore) ? rawScore.toFixed(1) : '-'}</strong><small>原始多来源分</small></div>
-                <div><span>有效分</span><strong>${Number.isFinite(effective) ? effective.toFixed(1) : '-'}</strong><small>做空偏移/风控修正后</small></div>
-                <div><span>档位</span><strong>${escHtml(evidenceTierLabel(evidence.tier))}</strong><small>仓位系数 ${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '-'}</small></div>
-            </div>
-            <div class="decision-evidence-explain">${escHtml(explanation)}</div>
-            ${shortAdjustmentHtml}
-            <div class="decision-evidence-lists">
-                <span>同向支持：${escHtml(evidenceListLabel(evidence.aligned_support_sources))}</span>
-                <span>明确反向：${escHtml(evidenceListLabel(evidence.major_opposites))}</span>
-                <span>弱反向：${escHtml(evidenceListLabel(evidence.weak_opposites))}</span>
-                <span>缺失关键源：${escHtml(evidenceListLabel(evidence.missing_key_sources))}</span>
-                ${Number.isFinite(maxSize) ? `<span>最大仓位参考：${(maxSize * 100).toFixed(2)}%</span>` : ''}
-            </div>
-            ${waitReasons.length ? `<div class="decision-evidence-wait">${waitReasons.map(item => `<span>${escHtml(analysisLocalizeText(item))}</span>`).join('')}</div>` : ''}
-            ${componentRows ? `<div class="decision-evidence-components">${componentRows}</div>` : ''}
-        </div>
-    `;
 }
 
 function decisionMetricItem(label, value, hint = '', tone = '') {
@@ -2196,7 +2078,6 @@ function opportunityScoreBlock(score, decision = null) {
                 <div>${escapeMultiline(reason)}</div>
             </div>
         </div>
-        ${dynamicEvidenceBlock(score, decision)}
     `;
 }
 
@@ -2411,13 +2292,6 @@ function analysisConsultationLabel(status, hasMajorConflict = false) {
     return hasMajorConflict ? '应会诊但未完成' : '无需会诊'; 
 } 
 
-function analysisAdjustmentLabel(value) { 
-    const num = Number(value || 0); 
-    if (num > 0) return `提高 ${num} 分`; 
-    if (num < 0) return `降低 ${Math.abs(num)} 分`; 
-    return '不调整'; 
-} 
-
 function analysisLocalizeText(text) { 
     let value = String(text || ''); 
     const replacements = [ 
@@ -2436,7 +2310,6 @@ function analysisLocalizeText(text) {
         [/\bbalanced\b/g, '均衡捕捉'],
         [/\bpatient\b/g, '耐心等待'],
         [/\bselective_recovery\b/g, '精选修复'],
-        [/\bprofit_first_expansion\b/g, '盈利优先扩张'],
         [/\btight_selective_reentry\b/g, '严格精选再入场'],
         [/\btight_selective\b/g, '严格精选'],
         [/\bdiversified_positive_expectancy\b/g, '分散正期望'],
@@ -2454,8 +2327,6 @@ function analysisLocalizeText(text) {
         [/\bcompleted\b/g, '已会诊'], 
         [/\bskipped\b/g, '已跳过'], 
         [/\bfailed\b/g, '会诊失败'], 
-        [/\bdegraded_missing_probe\b/g, '模型缺失降级探针'],
-        [/\bweak_conflict_probe\b/g, '弱冲突小仓探针'],
         [/\bexploration\b/g, '探索小仓'],
         [/\bsmall\b/g, '小仓'],
         [/\bmedium\b/g, '中等仓位'],
@@ -2463,7 +2334,6 @@ function analysisLocalizeText(text) {
         [/\bblocked\b/g, '硬风控阻断'],
         [/ML\/time-series services are unavailable/gi, 'ML/时序服务不可用'],
         [/missing model data is treated as degraded evidence/gi, '缺失模型数据按降级证据处理'],
-        [/controlled tiny probe/gi, '受控极小仓探针'],
         [/hard execution veto/gi, '硬执行否决'],
         [/\bclose_long\b/g, '平多'], 
         [/\bclose_short\b/g, '平空'], 
@@ -2873,11 +2743,6 @@ const SKILL_DATA_LABELS = {
     strategy: '调度策略',
     mode: '市场状态',
     posture: '调度姿态',
-    allow_long: '允许做多',
-    allow_short: '允许做空',
-    avoid_long: '谨慎做多',
-    avoid_short: '谨慎做空',
-    blocked_directions: '受限方向',
 };
 
 const SENSITIVE_DATA_KEY_RE = /(api[_-]?key|secret|password|passphrase|token|authorization|webhook)/i;
@@ -2959,7 +2824,6 @@ function renderAnalysisAgentSkills(agentSkills) {
         partial: '部分可用',
         unavailable: '不可用',
         blocked: '拦截',
-        degraded_missing_probe: '模型缺失降级探针',
         inactive: '未触发',
     }[String(status || '').toLowerCase()] || status || '-');
     const statusTone = (skill) => {
@@ -3631,7 +3495,7 @@ function renderAnalysisReasonModal(record) {
                     <div class="analysis-card-title">${escHtml(names || '-')}</div>
                     <div class="analysis-card-tags">
                         ${analysisPill(validationStatus, statusTone)}
-                        ${analysisPill(analysisAdjustmentLabel(v.confidence_adjustment), Number(v.confidence_adjustment || 0) > 0 ? 'good' : Number(v.confidence_adjustment || 0) < 0 ? 'warn' : 'muted')}
+                        ${analysisPill('仅观察', 'muted')}
                     </div>
                 </div>
                 <div class="analysis-card-text">   
@@ -3652,8 +3516,7 @@ function renderAnalysisReasonModal(record) {
                 <div class="analysis-card-title">${escHtml(consultationTitle)}</div>
                 <div class="analysis-card-tags">
                     ${analysisPill(analysisConsultationLabel(record.consultation.status, true), analysisTone(record.consultation.status))}
-                    ${analysisPill(analysisAdjustmentLabel(record.consultation.confidence_adjustment), Number(record.consultation.confidence_adjustment || 0) > 0 ? 'good' : Number(record.consultation.confidence_adjustment || 0) < 0 ? 'warn' : 'muted')}
-                    ${analysisPill(`建议交易：${record.consultation.should_trade === true ? '是' : record.consultation.should_trade === false ? '否' : '未说明'}`, record.consultation.should_trade === true ? 'good' : record.consultation.should_trade === false ? 'bad' : 'muted')}
+                    ${analysisPill('无生产权限', 'muted')}
                 </div>
             </div>
             <div class="analysis-card-text">
@@ -3669,12 +3532,11 @@ function renderAnalysisReasonModal(record) {
             <div class="analysis-card-head">
                 <div class="analysis-card-title">分歧怎么处理</div>
                 <div class="analysis-card-tags">
-                    ${analysisPill(`调整 ${analysisAdjustmentLabel((Number(conflictResolution.validation_adjustment || 0) * 100).toFixed(0))}`, Number(conflictResolution.validation_adjustment || 0) < 0 ? 'warn' : 'muted')}
-                    ${analysisPill(conflictResolution.consultation_used ? '已会诊' : '规则消化', conflictResolution.consultation_used ? 'good' : 'muted')}
+                    ${analysisPill(conflictResolution.consultation_used ? '已观察复核' : '只读记录', 'muted')}
                 </div>
             </div>
             <div class="analysis-card-text">
-                <div class="analysis-note"><span>处理结果</span>${analysisText(conflictResolution.summary || '没有需要额外处理的分歧，按专家权重和风控阈值裁决。')}</div>
+                <div class="analysis-note"><span>观察结果</span>${analysisText(conflictResolution.summary || '没有专家交叉观察记录。')}</div>
                 ${resolutionItems.length ? `
                     <div class="analysis-resolution-list">
                         ${resolutionItems.map(item => `
@@ -3956,9 +3818,6 @@ function renderExpertMemories(data = {}) {
             memoryBody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无专家记忆，平仓后会自动生成复盘经验。</td></tr>';
         } else {
             memoryBody.innerHTML = memories.map(m => {
-                const adjustment = valueNumber(m.confidence_adjustment) || 0;
-                const multiplier = valueNumber(m.position_size_multiplier) || 1;
-                const adjColor = adjustment >= 0 ? 'var(--green)' : 'var(--red)';
                 return `
                     <tr>
                         <td>${escHtml(m.expert_label || m.expert_name || '-')}</td>
@@ -3968,7 +3827,7 @@ function renderExpertMemories(data = {}) {
                         <td style="max-width:360px;">${escHtml(m.lesson || '-')}</td>
                         <td>${memoryActionLabel(m.recommended_action)}</td>
                         <td>${Number(m.evidence_count || 0)} / ${Number(m.hit_count || 0)}</td>
-                        <td style="color:${adjColor};white-space:nowrap;">${adjustment >= 0 ? '+' : ''}${(adjustment * 100).toFixed(1)}% · ${(multiplier * 100).toFixed(0)}%</td>
+                        <td style="color:var(--text-muted);white-space:nowrap;">仅观察</td>
                     </tr>
                 `;
             }).join('');
@@ -4156,7 +4015,6 @@ function memoryActionLabel(action) {
         reduce_risk: '降信心/降仓位',
         keep_with_filters: '保留但需过滤',
         wait_for_better_setup: '等待更好机会',
-        allow_small_probe_with_filters: '允许小仓位试探',
     };
     return map[action] || action || '-';
 }
@@ -5567,35 +5425,13 @@ function systemAuditStrategyDetails(details) {
     const blockedReasons = (Array.isArray(details.top_blocked_reasons) ? details.top_blocked_reasons : [])
         .slice(0, 5)
         .map(item => `${item.count || 0} 次：${systemAuditShortText(item.reason || '-', 120)}`);
-    const shortConservativeRows = (Array.isArray(details.short_conservative_adjustment_samples) ? details.short_conservative_adjustment_samples : [])
-        .slice(0, 6)
-        .map(item => [
-            item.symbol || '-',
-            item.score_offset ?? '-',
-            item.size_multiplier ?? '-',
-            item.expected_net_return_pct ?? '-',
-            item.created_at ? toBeijingTime(item.created_at) : '-',
-        ]);
-    const shortReleasedRows = (Array.isArray(details.short_released_adjustment_samples) ? details.short_released_adjustment_samples : [])
-        .slice(0, 6)
-        .map(item => [
-            item.symbol || '-',
-            item.score_offset ?? '-',
-            item.size_multiplier ?? '-',
-            item.expected_net_return_pct ?? '-',
-            item.created_at ? toBeijingTime(item.created_at) : '-',
-        ]);
     return `
         <div class="system-audit-detail-grid">
             ${systemAuditMetric('24小时决策', details.decision_count, '最近样本窗口')}
             ${systemAuditMetric('开仓候选', details.entry_decision_count, 'long/short 候选数')}
             ${systemAuditMetric('负净收益候选', details.negative_expected_net_count, '过高需查成本/收益')}
             ${systemAuditMetric('零净收益候选', details.zero_expected_net_count, '过高需查模型返回')}
-            ${systemAuditMetric('做空保守修正', details.short_conservative_adjustment_count, '仍按风险折扣处理的空单候选')}
-            ${systemAuditMetric('做空强证据放开', details.short_released_adjustment_count, '取消默认做空扣分/缩仓的空单候选')}
         </div>
-        ${systemAuditSection('做空保守修正样本', systemAuditTable(['交易对', '扣分', '仓位系数', '预期净收益', '时间'], shortConservativeRows))}
-        ${systemAuditSection('做空强证据放开样本', systemAuditTable(['交易对', '扣分', '仓位系数', '预期净收益', '时间'], shortReleasedRows))}
         ${systemAuditSection('快亏平样本', systemAuditTable(['交易对', '方向', '持仓时长', '盈亏', '平仓时间'], fastLossRows))}
         ${systemAuditCompactList('主要拦截原因', blockedReasons)}`;
 }
@@ -5709,37 +5545,33 @@ function systemAuditGenericDetailsHtml(details) {
 function systemAuditShadowMissedOpportunityDetails(details) {
     const summary = details.summary || {};
     const blockedCounts = details.blocked_reason_counts || {};
-    const groupRows = (items, fallbackStatus) => (Array.isArray(items) ? items : [])
+    const observationRows = (Array.isArray(details.return_observations) ? details.return_observations : [])
         .slice(0, 8)
-        .map(item => {
-            const probeRules = item.probe_rules || {};
-            const reasons = Array.isArray(item.adoption_reasons) && item.adoption_reasons.length
-                ? item.adoption_reasons
-                : (Array.isArray(item.blocked_reasons) ? item.blocked_reasons : []);
-            return [
-                item.symbol || '-',
-                sideLabel(item.side || '-'),
-                item.status || fallbackStatus,
-                item.missed_count ?? '-',
-                item.avg_return_pct ?? '-',
-                probeRules.max_position_size_pct ?? '-',
-                reasons.length ? reasons.join(', ') : '-'
-            ];
-        });
+        .map(item => [
+            item.symbol || '-',
+            sideLabel(item.side || '-'),
+            item.sample_count ?? 0,
+            item.average_return_pct ?? '-',
+            item.return_lower_hinge_pct ?? '-',
+            item.observation_only === true ? 'yes' : 'no',
+        ]);
+    const gapRows = (Array.isArray(details.executed_return_contract_gaps)
+        ? details.executed_return_contract_gaps
+        : [])
+        .slice(0, 8)
+        .map(item => [item.decision_id ?? '-', item.reason || '-']);
     const blockedReasonRows = Object.entries(blockedCounts)
         .slice(0, 8)
         .map(([reason, count]) => [reason, count]);
     return `
         <div class="system-audit-detail-grid">
-            ${systemAuditMetric('Missed', summary.missed_count || 0, 'shadow rows')}
-            ${systemAuditMetric('Adopted', summary.adopted_count || 0, 'learning evidence')}
-            ${systemAuditMetric('Probe', summary.probe_count || 0, 'controlled only')}
-            ${systemAuditMetric('Blocked', summary.blocked_count || 0, 'reason required')}
-            ${systemAuditMetric('Weak executed', summary.weak_evidence_executed_count || 0, 'must stay 0')}
+            ${systemAuditMetric('Completed', summary.completed_count || 0, 'shadow rows')}
+            ${systemAuditMetric('Missed', summary.missed_count || 0, 'observation only')}
+            ${systemAuditMetric('Observed groups', summary.observe_only_count || 0, 'cannot authorize entry')}
+            ${systemAuditMetric('Contract gaps', summary.executed_return_contract_gap_count || 0, 'must stay 0')}
         </div>
-        ${systemAuditSection('Adopted missed opportunities', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.adopted, 'adopted')))}
-        ${systemAuditSection('Controlled probe candidates', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.probe_candidates, 'probe')))}
-        ${systemAuditSection('Blocked missed opportunities', systemAuditTable(['Symbol', 'Side', 'Status', 'Missed', 'Avg return', 'Cap', 'Reasons'], groupRows(details.blocked_examples, 'blocked')))}
+        ${systemAuditSection('Fee-after return observations', systemAuditTable(['Symbol', 'Side', 'Samples', 'Average return', 'Lower hinge', 'Observe only'], observationRows))}
+        ${systemAuditSection('Executed return-contract gaps', systemAuditTable(['Decision', 'Reason'], gapRows))}
         ${systemAuditSection('Blocked reason counts', systemAuditTable(['Reason', 'Count'], blockedReasonRows))}`;
 }
 
@@ -7607,16 +7439,6 @@ function readNumberInput(id) {
     return Number.isFinite(n) ? n : null;
 }
 
-function riskFloorFromAccount(account) {
-    const accountEquity = valueNumber(account?.account_equity ?? account?.okx_equity_balance ?? account?.equity) || 0;
-    const maxLossUsdt = valueNumber(account?.max_loss_usdt) || 0;
-    const maxLossPct = valueNumber(account?.max_loss_pct) || 0;
-    if (valueNumber(account?.risk_floor) !== null) return valueNumber(account.risk_floor);
-    if (accountEquity <= 0) return 0;
-    const loss = maxLossUsdt > 0 ? maxLossUsdt : accountEquity * maxLossPct;
-    return Math.max(accountEquity - loss, 0);
-}
-
 function renderExecutionAccountSettings(data) {
     const paper = data?.paper || {};
     const live = data?.live || {};
@@ -7639,17 +7461,6 @@ function renderExecutionAccountSettings(data) {
         );
         setText(`${mode}-cumulative-loss`, `${fmtMoney(account.cumulative_loss ?? account.realized_loss)} USDT`);
         setText(`${mode}-cumulative-profit`, `${fmtMoney(account.cumulative_profit ?? account.realized_profit)} USDT`);
-
-        const maxLossPct = valueNumber(account.max_loss_pct);
-        setInputValue(
-            `exec-${mode}-max-loss-pct`,
-            maxLossPct !== null ? (maxLossPct * 100).toFixed(0) : ''
-        );
-        const cooldownPct = valueNumber(account.cooldown_loss_pct);
-        setInputValue(
-            `exec-${mode}-cooldown-loss-pct`,
-            cooldownPct !== null ? (cooldownPct * 100).toFixed(0) : ''
-        );
     });
 }
 
@@ -7667,48 +7478,23 @@ async function saveExecutionAccountSettings() {
     }
 
     const accountName = (document.getElementById('exec-account-name')?.value || '').trim();
-    for (const mode of ['paper', 'live']) {
-        const maxLossPct = readNumberInput(`exec-${mode}-max-loss-pct`);
-        if (maxLossPct !== null && (maxLossPct < 0 || maxLossPct > 100)) {
-            if (status) {
-                status.textContent = '保存失败: 最高可亏损比例必须在 0 到 100 之间';
-                status.style.color = 'var(--red)';
-            }
-            return;
-        }
-        const body = {
-            mode,
-            account_name: accountName,
-        };
-        if (maxLossPct !== null) body.max_loss_pct = maxLossPct / 100;
-        const cooldownPct = readNumberInput(`exec-${mode}-cooldown-loss-pct`);
-        if (cooldownPct !== null) {
-            if (cooldownPct < 0 || cooldownPct > 100) {
-                if (status) {
-                    status.textContent = '保存失败: 冷静期触发比例必须在 0 到 100 之间';
-                    status.style.color = 'var(--red)';
-                }
-                return;
-            }
-            body.cooldown_loss_pct = cooldownPct / 100;
-        }
-        Object.keys(body).forEach(key => {
-            if (body[key] === null || body[key] === undefined || body[key] === '') delete body[key];
-        });
+    const body = { account_name: accountName };
+    Object.keys(body).forEach(key => {
+        if (body[key] === null || body[key] === undefined || body[key] === '') delete body[key];
+    });
 
-        const res = await fetchWithAuth('/api/settings/execution-account', dashboardWriteOptions({
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        }));
-        if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            if (status) {
-                status.textContent = '保存失败: ' + apiErrorText(err);
-                status.style.color = 'var(--red)';
-            }
-            return;
+    const res = await fetchWithAuth('/api/settings/execution-account', dashboardWriteOptions({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }));
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        if (status) {
+            status.textContent = '保存失败: ' + apiErrorText(err);
+            status.style.color = 'var(--red)';
         }
+        return;
     }
 
     if (status) {
@@ -9039,15 +8825,6 @@ async function fetchTradingParams() {
     if (!data) return;
 
     const intervalInput = document.getElementById('cfg-decision-interval');
-    const thresholdInput = document.getElementById('cfg-confidence-threshold');
-    const totalMarginInput = document.getElementById('cfg-total-margin-limit-pct');
-    const maxSlippageInput = document.getElementById('cfg-max-slippage-pct');
-    const maxPositionInput = document.getElementById('cfg-max-position-pct');
-    const maxLeverageInput = document.getElementById('cfg-max-leverage');
-    const maxDailyLossInput = document.getElementById('cfg-max-daily-loss-pct');
-    const hardStopLossInput = document.getElementById('cfg-hard-stop-loss-pct');
-    const maxOpenPositionsInput = document.getElementById('cfg-max-open-positions-per-model');
-    const maxSameSymbolInput = document.getElementById('cfg-max-same-symbol-positions-per-side');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
@@ -9063,7 +8840,6 @@ async function fetchTradingParams() {
     const highRiskBreakerCooldownInput = document.getElementById('cfg-high-risk-review-breaker-cooldown');
 
     if (intervalInput) intervalInput.value = data.decision_interval;
-    if (thresholdInput) thresholdInput.value = data.confidence_threshold;
     if (localToolsEnabledInput) localToolsEnabledInput.checked = Boolean(data.local_ai_tools_enabled);
     if (localToolsBaseInput) localToolsBaseInput.value = data.local_ai_tools_api_base || '';
     if (localToolsTimeoutInput) localToolsTimeoutInput.value = data.local_ai_tools_timeout_seconds ?? 8.0;
@@ -9100,50 +8876,11 @@ async function fetchTradingParams() {
     if (highRiskBreakerCooldownInput) {
         highRiskBreakerCooldownInput.value = data.high_risk_review_circuit_breaker_cooldown_seconds ?? 120;
     }
-    if (totalMarginInput) {
-        const pct = valueNumber(data.total_margin_limit_pct);
-        totalMarginInput.value = pct !== null ? (pct * 100).toFixed(0) : '';
-    }
-    if (maxSlippageInput) {
-        const pct = valueNumber(data.max_slippage_pct);
-        maxSlippageInput.value = pct !== null ? (pct * 100).toFixed(2) : '';
-    }
-    if (maxPositionInput) {
-        const pct = valueNumber(data.max_position_pct);
-        maxPositionInput.value = pct !== null ? (pct * 100).toFixed(1) : '';
-    }
-    if (maxLeverageInput) {
-        const leverage = valueNumber(data.max_leverage);
-        maxLeverageInput.value = leverage !== null ? leverage.toFixed(1) : '';
-    }
-    if (maxDailyLossInput) {
-        const pct = valueNumber(data.max_daily_loss_pct);
-        maxDailyLossInput.value = pct !== null ? (pct * 100).toFixed(1) : '';
-    }
-    if (hardStopLossInput) {
-        const pct = valueNumber(data.hard_stop_loss_pct);
-        hardStopLossInput.value = pct !== null ? (pct * 100).toFixed(1) : '';
-    }
-    if (maxOpenPositionsInput) {
-        maxOpenPositionsInput.value = data.max_open_positions_per_model ?? '';
-    }
-    if (maxSameSymbolInput) {
-        maxSameSymbolInput.value = data.max_same_symbol_positions_per_side ?? '';
-    }
     await fetchThresholdCatalog();
 }
 
 async function saveTradingParams() {
     const intervalInput = document.getElementById('cfg-decision-interval');
-    const thresholdInput = document.getElementById('cfg-confidence-threshold');
-    const totalMarginInput = document.getElementById('cfg-total-margin-limit-pct');
-    const maxSlippageInput = document.getElementById('cfg-max-slippage-pct');
-    const maxPositionInput = document.getElementById('cfg-max-position-pct');
-    const maxLeverageInput = document.getElementById('cfg-max-leverage');
-    const maxDailyLossInput = document.getElementById('cfg-max-daily-loss-pct');
-    const hardStopLossInput = document.getElementById('cfg-hard-stop-loss-pct');
-    const maxOpenPositionsInput = document.getElementById('cfg-max-open-positions-per-model');
-    const maxSameSymbolInput = document.getElementById('cfg-max-same-symbol-positions-per-side');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
     const localToolsBaseInput = document.getElementById('cfg-local-ai-tools-api-base');
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
@@ -9161,57 +8898,6 @@ async function saveTradingParams() {
     const body = {};
     if (intervalInput && intervalInput.value) {
         body.decision_interval = parseInt(intervalInput.value);
-    }
-    if (thresholdInput && thresholdInput.value) {
-        body.confidence_threshold = parseFloat(thresholdInput.value);
-    }
-    if (maxPositionInput && maxPositionInput.value !== '') {
-        const pct = parseFloat(maxPositionInput.value);
-        if (!Number.isFinite(pct) || pct < 0.5 || pct > 50) {
-            alert('保存失败: 单笔保证金上限必须在 0.5% 到 50% 之间');
-            return;
-        }
-        body.max_position_pct = pct / 100;
-    }
-    if (maxLeverageInput && maxLeverageInput.value !== '') {
-        const leverage = parseFloat(maxLeverageInput.value);
-        if (!Number.isFinite(leverage) || leverage < 1 || leverage > 125) {
-            alert('保存失败: 最大杠杆必须在 1x 到 125x 之间');
-            return;
-        }
-        body.max_leverage = leverage;
-    }
-    if (maxDailyLossInput && maxDailyLossInput.value !== '') {
-        const pct = parseFloat(maxDailyLossInput.value);
-        if (!Number.isFinite(pct) || pct < 0.1 || pct > 50) {
-            alert('保存失败: 日内最大亏损必须在 0.1% 到 50% 之间');
-            return;
-        }
-        body.max_daily_loss_pct = pct / 100;
-    }
-    if (hardStopLossInput && hardStopLossInput.value !== '') {
-        const pct = parseFloat(hardStopLossInput.value);
-        if (!Number.isFinite(pct) || pct < 0.1 || pct > 50) {
-            alert('保存失败: 硬止损必须在 0.1% 到 50% 之间');
-            return;
-        }
-        body.hard_stop_loss_pct = pct / 100;
-    }
-    if (maxOpenPositionsInput && maxOpenPositionsInput.value !== '') {
-        const value = parseInt(maxOpenPositionsInput.value, 10);
-        if (!Number.isFinite(value) || value < 1 || value > 200) {
-            alert('保存失败: 基础持仓组数上限必须在 1 到 200 之间');
-            return;
-        }
-        body.max_open_positions_per_model = value;
-    }
-    if (maxSameSymbolInput && maxSameSymbolInput.value !== '') {
-        const value = parseInt(maxSameSymbolInput.value, 10);
-        if (!Number.isFinite(value) || value < 1 || value > 20) {
-            alert('保存失败: 同币同向持仓组数上限必须在 1 到 20 之间');
-            return;
-        }
-        body.max_same_symbol_positions_per_side = value;
     }
     if (localToolsEnabledInput) {
         body.local_ai_tools_enabled = Boolean(localToolsEnabledInput.checked);
@@ -9289,23 +8975,6 @@ async function saveTradingParams() {
         }
         body.high_risk_review_circuit_breaker_cooldown_seconds = cooldown;
     }
-    if (totalMarginInput && totalMarginInput.value) {
-        const pct = parseFloat(totalMarginInput.value);
-        if (!Number.isFinite(pct) || pct < 10 || pct > 100) {
-            alert('保存失败: 总保证金占用上限必须在 10 到 100 之间');
-            return;
-        }
-        body.total_margin_limit_pct = pct / 100;
-    }
-    if (maxSlippageInput && maxSlippageInput.value) {
-        const pct = parseFloat(maxSlippageInput.value);
-        if (!Number.isFinite(pct) || pct < 0.02 || pct > 2) {
-            alert('保存失败: 最大滑点上限必须在 0.02% 到 2% 之间');
-            return;
-        }
-        body.max_slippage_pct = pct / 100;
-    }
-
     const res = await fetchWithAuth('/api/settings/thresholds', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -9320,30 +8989,6 @@ async function saveTradingParams() {
 
     const data = await res.json();
     state.decisionInterval = data.decision_interval;
-    if (totalMarginInput && data.total_margin_limit_pct !== undefined) {
-        totalMarginInput.value = (Number(data.total_margin_limit_pct) * 100).toFixed(0);
-    }
-    if (maxSlippageInput && data.max_slippage_pct !== undefined) {
-        maxSlippageInput.value = (Number(data.max_slippage_pct) * 100).toFixed(2);
-    }
-    if (maxPositionInput && data.max_position_pct !== undefined) {
-        maxPositionInput.value = (Number(data.max_position_pct) * 100).toFixed(1);
-    }
-    if (maxLeverageInput && data.max_leverage !== undefined) {
-        maxLeverageInput.value = Number(data.max_leverage).toFixed(1);
-    }
-    if (maxDailyLossInput && data.max_daily_loss_pct !== undefined) {
-        maxDailyLossInput.value = (Number(data.max_daily_loss_pct) * 100).toFixed(1);
-    }
-    if (hardStopLossInput && data.hard_stop_loss_pct !== undefined) {
-        hardStopLossInput.value = (Number(data.hard_stop_loss_pct) * 100).toFixed(1);
-    }
-    if (maxOpenPositionsInput && data.max_open_positions_per_model !== undefined) {
-        maxOpenPositionsInput.value = data.max_open_positions_per_model;
-    }
-    if (maxSameSymbolInput && data.max_same_symbol_positions_per_side !== undefined) {
-        maxSameSymbolInput.value = data.max_same_symbol_positions_per_side;
-    }
     await fetchThresholdCatalog();
     alert('参数已保存，立即生效');
 }
@@ -9461,7 +9106,7 @@ function renderMLSignalOverview() {
             ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('三期完成样本', String(samples.completedMl), '只统计三期干净影子复盘', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
             ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}
-            ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, Number(readinessMetrics.dirty_sample_ratio || 0) > 0.08 ? 'bad' : 'good')}
+            ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, readinessTone)}
             ${mlMetricCard('PR-AUC 多/空（诊断）', prAucText, '仅观察分类器，不参与 ready、评分或晋升', 'muted')}
             ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
@@ -9867,7 +9512,6 @@ function renderProfitAttributionSummary(data) {
             <div><span>盈利 / 亏损</span><strong>${Number(summary.win_count || 0)} / ${Number(summary.loss_count || 0)}</strong></div>
             <div><span>平均盈利</span><strong>${signedMoney(summary.avg_win || 0)} U</strong></div>
             <div><span>平均亏损</span><strong>-${fmtMoney(summary.avg_loss || 0)} U</strong></div>
-            <div><span>小盈 / 大亏</span><strong>${Number(summary.small_win_count || 0)} / ${Number(summary.large_loss_count || 0)}</strong></div>
         </div>`;
 }
 
@@ -9961,7 +9605,6 @@ function stateStatusLabel(status) {
         pending: '处理中',
         passed: '通过',
         blocked: '拦截',
-        degraded_missing_probe: '模型缺失降级探针',
         failed: '失败',
         skipped: '跳过',
         completed: '完成',
@@ -10025,33 +9668,6 @@ function renderProfitAttributionReason(row) {
             ${noteHtml}
             <em>置信度 ${confidenceZh(row.attribution_confidence)}</em>
         </div>`;
-}
-
-function profitAttributionEvidenceScoreChip(score) {
-    if (!score || typeof score !== 'object') return null;
-    const rawScore = Number(score.score);
-    const effective = Number(score.effective_score);
-    const multiplier = Number(score.size_multiplier);
-    const scoreText = Number.isFinite(rawScore) ? rawScore.toFixed(0) : '-';
-    const effectiveText = Number.isFinite(effective) ? effective.toFixed(0) : '-';
-    const multiplierText = Number.isFinite(multiplier) ? `x${multiplier.toFixed(2)}` : 'x-';
-    const tier = String(score.tier || '');
-    const tierLabel = {
-        degraded_missing_probe: '模型缺失降级探针',
-        weak_conflict_probe: '弱冲突小仓探针',
-        exploration: '探索小仓',
-        small: '小仓',
-        medium: '中等仓位',
-        normal: '正常仓位',
-        blocked: '硬风控阻断',
-    }[tier] || tier || '-';
-    const title = `证据分 ${scoreText} / 有效 ${effectiveText} / 仓位 ${multiplierText} / ${tierLabel}`;
-    const tone = score.hard_block ? 'bad' : tier === 'degraded_missing_probe' ? 'warn' : effective >= 80 ? 'good' : effective >= 60 ? 'warn' : 'muted';
-    return {
-        tone,
-        text: title,
-        html: `<span class="profit-attribution-evidence-chip evidence-score profit-attribution-evidence-score ${tone}" title="${escHtml(title)}"><b>证据</b><em>${escHtml(scoreText)}</em><small>${escHtml(tierLabel === '-' ? multiplierText : tierLabel)}</small></span>`,
-    };
 }
 
 function profitAttributionEvidenceChip(label, side, options = {}) {
@@ -10164,10 +9780,6 @@ function renderProfitAttributionEvidence(record) {
                 || evidence.sentiment?.available === true,
         }),
     ];
-    const scoreChip = profitAttributionEvidenceScoreChip(
-        entryDecision?.evidence_score || entryDecision?.opportunity_score?.evidence_score
-    );
-    if (scoreChip) supporting.push(scoreChip);
     const title = rows.flat().concat(supporting).map(chip => chip.text).filter(Boolean).join(' | ');
     return `
         <div class="profit-attribution-evidence-rail" title="${escHtml(title)}">
@@ -10246,61 +9858,5 @@ function renderStrategyLearningFallback(data) {
     if (!summary) return;
     const profile = data?.schedule?.active_profile || data?.active_profile || {};
     summary.innerHTML = `<div class="opening-funnel-empty">\u7b56\u7565\u63a7\u5236\u53f0\u6570\u636e\u5df2\u52a0\u8f7d\uff1a${escHtml(profile.label || profile.id || '\u5f53\u524d\u57fa\u7ebf')}</div>`;
-}
-
-function strategyLearningSetActionState(profileId, status, message = '') {
-    if (!window.strategyLearningActionState) window.strategyLearningActionState = {};
-    const key = String(profileId || 'auto');
-    window.strategyLearningActionState[key] = {
-        status,
-        message,
-        updatedAt: Date.now(),
-    };
-    if (state.strategyLearning && typeof renderStrategyLearning === 'function') {
-        renderStrategyLearning(state.strategyLearning);
-    }
-}
-
-async function strategyLearningWriteRequest(profileId, statusText, requestFactory) {
-    strategyLearningSetActionState(profileId, 'loading', statusText);
-    try {
-        const res = await requestFactory();
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(apiErrorText(data, res.statusText || '请求失败'));
-        strategyLearningSetActionState(profileId, 'success', '已生效，正在刷新调度状态');
-        await fetchStrategyLearning();
-        return data;
-    } catch (error) {
-        strategyLearningSetActionState(profileId, 'error', error.message || String(error));
-        throw error;
-    }
-}
-
-async function setStrategyLearningProfileDisabled(profileId, disabled) {
-    await strategyLearningWriteRequest(
-        profileId,
-        disabled ? '正在禁用策略...' : '正在取消禁用...',
-        () => fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/disabled?disabled=${disabled}`, dashboardWriteOptions({ method: 'POST' })),
-    );
-}
-
-async function activateStrategyLearningProfile(profileId) {
-    await strategyLearningWriteRequest(
-        profileId,
-        '正在人工指定策略...',
-        () => fetchWithAuth(`/api/strategy-learning/profiles/${encodeURIComponent(profileId)}/activate`, dashboardWriteOptions({ method: 'POST' })),
-    );
-}
-
-async function clearStrategyLearningManualOverride() {
-    await strategyLearningWriteRequest(
-        'auto',
-        '正在恢复系统自动调度...',
-        () => fetchWithAuth('/api/strategy-learning/rollback', dashboardWriteOptions({ method: 'POST' })),
-    );
-}
-
-async function rollbackStrategyLearning() {
-    await clearStrategyLearningManualOverride();
 }
 

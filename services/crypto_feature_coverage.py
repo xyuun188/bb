@@ -814,14 +814,8 @@ def _news_feature(
             reasons=["news_feed_missing"],
         )
     confidence = _news_confidence(items, direct_count, article_count or db_count)
-    status = (
-        "low_confidence"
-        if confidence < 0.35
-        else ("stale" if age is None or age > NEWS_STALE_LIMIT_SECONDS else "available")
-    )
+    status = "stale" if age is None or age > NEWS_STALE_LIMIT_SECONDS else "available"
     reasons: list[str] = []
-    if status == "low_confidence":
-        reasons.append("low_source_confidence")
     if status == "stale":
         reasons.append("news_stale")
     return _feature_row(
@@ -912,16 +906,15 @@ def _event_calendar_feature(
             reasons=["dedicated_event_calendar_missing"],
         )
     confidence = _event_confidence(all_items)
-    status = "low_confidence" if confidence < 0.45 else "available"
     return _feature_row(
         "event_calendar",
-        status,
+        "available",
         source="event_calendar",
         confidence=confidence,
         timestamp=source_timestamp,
         age_seconds=_age_seconds(source_timestamp, now),
         affected_symbols=symbols,
-        reasons=["low_source_confidence"] if status == "low_confidence" else [],
+        reasons=[],
         details={"item_count": len(all_items)},
     )
 

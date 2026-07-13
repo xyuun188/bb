@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -14,11 +13,10 @@ from config.settings import ENSEMBLE_TRADER_NAME, FIXED_AI_MODEL_SLOTS, settings
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
-from models.decision import AIDecision
 from models.learning import TradeReflection
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
-from services.memory_feedback import MemoryFeedbackPolicy, canonical_memory_outcome
+from services.memory_feedback import MemoryFeedbackPolicy
 from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
@@ -72,7 +70,6 @@ class ExpertMemoryService:
         *,
         session_factory: Callable[[], AbstractAsyncContextManager[Any]] = get_session_ctx,
         memory_enabled_provider: Callable[[], bool] | None = None,
-        memory_limit_provider: Callable[[], int] | None = None,
         model_slots: Sequence[dict[str, Any]] | None = None,
         ensemble_model_name: str = ENSEMBLE_TRADER_NAME,
     ) -> None:
@@ -80,12 +77,8 @@ class ExpertMemoryService:
         self.memory_enabled_provider = memory_enabled_provider or (
             lambda: bool(settings.expert_memory_enabled)
         )
-        self.memory_limit_provider = memory_limit_provider or (
-            lambda: int(settings.expert_memory_per_prompt or 4)
-        )
         self.model_slots = tuple(model_slots or FIXED_AI_MODEL_SLOTS)
         self.ensemble_model_name = ensemble_model_name
-        self._realized_weight_cache: dict[str, Any] = {"expires_at": None, "weights": {}}
         self.memory_feedback_policy = MemoryFeedbackPolicy()
 
     async def context(self, symbol: str) -> dict[str, Any]:
@@ -94,7 +87,6 @@ class ExpertMemoryService:
         if not self.memory_enabled_provider():
             return _empty_memory_context()
 
-        limit = max(1, int(self.memory_limit_provider() or 4))
         by_expert: dict[str, list[dict[str, Any]]] = {}
         flat: list[dict[str, Any]] = []
         used_ids: list[int] = []
@@ -108,7 +100,6 @@ class ExpertMemoryService:
                     rows = await repo.get_relevant_memories(
                         expert_name=expert_name,
                         symbol=symbol,
-                        limit=limit,
                     )
                     serialized = [serialize_memory(row) for row in rows]
                     if serialized:
@@ -124,190 +115,11 @@ class ExpertMemoryService:
             )
             return _empty_memory_context()
 
-        dynamic_weights = dynamic_expert_weights_from_memories(by_expert, self.model_slots)
-        realized_weights = await self.realized_expert_weight_adjustments()
-        for expert_name, realized in realized_weights.items():
-            if expert_name not in dynamic_weights:
-                dynamic_weights[expert_name] = realized
-                continue
-            current = dynamic_weights[expert_name]
-            base_weight = _safe_float(current.get("base_weight"), realized.get("base_weight", 1.0))
-            memory_multiplier = _safe_float(current.get("multiplier"), 1.0)
-            realized_multiplier = _safe_float(realized.get("multiplier"), 1.0)
-            combined = min(max(memory_multiplier * realized_multiplier, 0.65), 1.30)
-            current.update(
-                {
-                    "multiplier": round(combined, 4),
-                    "effective_weight": round(base_weight * combined, 4),
-                    "realized_pnl": realized.get("realized_pnl", 0.0),
-                    "realized_count": realized.get("realized_count", 0),
-                    "reason": (
-                        f"{current.get('reason') or ''} 实盘/模拟已实现盈亏校准："
-                        f"{realized.get('reason') or '暂无'}"
-                    ),
-                }
-            )
-
         return {
             "expert_memories": by_expert,
             "expert_memories_flat": flat,
-            "dynamic_expert_weights": dynamic_weights,
             "memory_feedback": self.memory_feedback_policy.build(flat),
         }
-
-    async def realized_expert_weight_adjustments(self) -> dict[str, dict[str, Any]]:
-        """Calibrate expert weights from today's realized same-side PnL."""
-
-        now = datetime.now(UTC)
-        expires_at = self._realized_weight_cache.get("expires_at")
-        if isinstance(expires_at, datetime) and expires_at > now:
-            return self._realized_weight_cache.get("weights") or {}
-
-        slot_weights = {
-            str(slot.get("name") or ""): float(slot.get("weight", 1.0) or 1.0)
-            for slot in self.model_slots
-            if slot.get("name")
-        }
-        stats: dict[str, dict[str, Any]] = {
-            name: {"pnl": 0.0, "profit": 0.0, "loss": 0.0, "count": 0, "wins": 0, "losses": 0}
-            for name in slot_weights
-        }
-        start_utc = (
-            datetime.now(timezone(timedelta(hours=8)))
-            .replace(hour=0, minute=0, second=0, microsecond=0)
-            .astimezone(UTC)
-        )
-
-        try:
-            async with self.session_factory() as session:
-                positions_result = await session.execute(
-                    select(Position)
-                    .where(
-                        Position.model_name == self.ensemble_model_name,
-                        Position.is_open.is_(False),
-                        Position.closed_at.is_not(None),
-                        Position.closed_at >= start_utc,
-                    )
-                    .order_by(Position.closed_at.desc())
-                    .limit(800)
-                )
-                positions = list(positions_result.scalars().all())
-                if not positions:
-                    self._realized_weight_cache = {
-                        "expires_at": now + timedelta(minutes=15),
-                        "weights": {},
-                    }
-                    return {}
-
-                symbols = {pos.symbol for pos in positions if pos.symbol}
-                manual_close_orders = []
-                if symbols:
-                    manual_close_result = await session.execute(
-                        select(Order).where(
-                            Order.model_name == self.ensemble_model_name,
-                            Order.status == "filled",
-                            Order.symbol.in_(symbols),
-                            Order.exchange_order_id.like("manual_close:%"),
-                        )
-                    )
-                    manual_close_orders = list(manual_close_result.scalars().all())
-                positions = [
-                    pos
-                    for pos in positions
-                    if not position_has_manual_close_order(pos, manual_close_orders)
-                    and closed_position_trade_fact_trusted(pos)
-                ]
-                if not positions:
-                    self._realized_weight_cache = {
-                        "expires_at": now + timedelta(minutes=15),
-                        "weights": {},
-                    }
-                    return {}
-                symbols = {pos.symbol for pos in positions if pos.symbol}
-                order_symbol_filter = Order.symbol.in_(symbols) if symbols else Order.id == -1
-                orders_result = await session.execute(
-                    select(Order)
-                    .where(
-                        Order.model_name == self.ensemble_model_name,
-                        Order.status == "filled",
-                        Order.decision_id.is_not(None),
-                        order_symbol_filter,
-                    )
-                    .order_by(Order.filled_at.desc(), Order.created_at.desc())
-                    .limit(2400)
-                )
-                orders = list(orders_result.scalars().all())
-                decision_ids = [order.decision_id for order in orders if order.decision_id]
-                decisions: dict[int, AIDecision] = {}
-                if decision_ids:
-                    decisions_result = await session.execute(
-                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
-                    )
-                    decisions = {
-                        decision.id: decision for decision in decisions_result.scalars().all()
-                    }
-        except Exception as exc:
-            logger.warning(
-                "failed to calculate realized expert weights",
-                error=safe_error_text(exc),
-            )
-            return {}
-
-        for pos in positions:
-            pos_created = _aware_utc(pos.created_at)
-            pos_side = str(pos.side or "").lower()
-            candidates: list[tuple[float, AIDecision]] = []
-            for order in orders:
-                if order.symbol != pos.symbol or order.decision_id not in decisions:
-                    continue
-                decision = decisions[order.decision_id]
-                decision_side = _entry_side_from_action(decision.action)
-                if decision_side != pos_side:
-                    continue
-                order_time = _aware_utc(order.filled_at or order.created_at)
-                if (
-                    pos_created
-                    and order_time
-                    and abs((order_time - pos_created).total_seconds()) > 180
-                ):
-                    continue
-                distance = (
-                    abs(((order_time or pos_created) - pos_created).total_seconds())
-                    if pos_created and order_time
-                    else 0.0
-                )
-                candidates.append((distance, decision))
-            if not candidates:
-                continue
-            _, decision = sorted(candidates, key=lambda item: item[0])[0]
-            raw = _safe_dict(decision.raw_llm_response)
-            opinions = _safe_list(raw.get("opinions"))
-            pnl = float(pos.realized_pnl or 0.0)
-            for opinion in opinions:
-                if not isinstance(opinion, dict):
-                    continue
-                name = str(opinion.get("model_name") or "")
-                if name not in stats:
-                    continue
-                action = str(opinion.get("action") or "").lower()
-                if action != pos_side:
-                    continue
-                bucket = stats[name]
-                bucket["pnl"] += pnl
-                bucket["count"] += 1
-                if pnl >= 0:
-                    bucket["wins"] += 1
-                    bucket["profit"] += pnl
-                else:
-                    bucket["losses"] += 1
-                    bucket["loss"] += abs(pnl)
-
-        result = _realized_weight_result(stats, slot_weights)
-        self._realized_weight_cache = {
-            "expires_at": now + timedelta(minutes=15),
-            "weights": result,
-        }
-        return result
 
     async def record_trade_reflection_in_session(
         self,
@@ -535,8 +347,6 @@ def serialize_memory(memory: Any) -> dict[str, Any]:
         "market_pattern": memory.market_pattern,
         "lesson": memory.lesson,
         "recommended_action": memory.recommended_action,
-        "confidence_adjustment": float(memory.confidence_adjustment or 0.0),
-        "position_size_multiplier": float(memory.position_size_multiplier or 1.0),
         "evidence_count": int(memory.evidence_count or 0),
         "success_count": int(getattr(memory, "success_count", 0) or 0),
         "failure_count": int(getattr(memory, "failure_count", 0) or 0),
@@ -545,97 +355,6 @@ def serialize_memory(memory: Any) -> dict[str, Any]:
         "created_at": memory.created_at.isoformat() if memory.created_at else None,
         "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
     }
-
-
-def dynamic_expert_weights_from_memories(
-    by_expert: dict[str, list[dict[str, Any]]],
-    model_slots: Sequence[dict[str, Any]] = FIXED_AI_MODEL_SLOTS,
-) -> dict[str, dict[str, Any]]:
-    """Adjust expert weights only from authoritative fee-after outcome quality."""
-
-    result: dict[str, dict[str, Any]] = {}
-    slot_weights = {
-        str(slot.get("name") or ""): float(slot.get("weight", 1.0) or 1.0)
-        for slot in model_slots
-        if slot.get("name")
-    }
-    for expert_name, base_weight in slot_weights.items():
-        memories = [memory for memory in by_expert.get(expert_name, []) if isinstance(memory, dict)]
-        outcomes: list[dict[str, Any]] = []
-        seen_positions: set[int] = set()
-        for memory in memories:
-            outcome = canonical_memory_outcome(memory)
-            if outcome is None:
-                continue
-            position_ids = set(outcome["position_ids"])
-            if position_ids.intersection(seen_positions):
-                continue
-            outcomes.append(outcome)
-            seen_positions.update(position_ids)
-
-        evidence = sum(max(int(memory.get("evidence_count", 1) or 1), 1) for memory in memories)
-        success = sum(max(int(memory.get("success_count", 0) or 0), 0) for memory in memories)
-        failure = sum(max(int(memory.get("failure_count", 0) or 0), 0) for memory in memories)
-        if not outcomes:
-            result[expert_name] = {
-                "base_weight": base_weight,
-                "multiplier": 1.0,
-                "effective_weight": base_weight,
-                "memory_count": len(memories),
-                "evidence_count": evidence,
-                "success_count": success,
-                "failure_count": failure,
-                "canonical_outcome_count": 0,
-                "canonical_position_count": 0,
-                "reason": "暂无成本完整的权威费后收益样本，使用基础权重。",
-            }
-            continue
-
-        count = sum(int(item["count"]) for item in outcomes)
-        total_pnl = sum(float(item["total_pnl_usdt"]) for item in outcomes)
-        gross_profit = sum(float(item["gross_profit_usdt"]) for item in outcomes)
-        gross_loss = sum(float(item["gross_loss_usdt"]) for item in outcomes)
-        total_return = sum(float(item["total_return_pct"]) for item in outcomes)
-        avg_return = total_return / count
-        return_lcb = sum(
-            float(item["return_lcb_pct"]) * int(item["count"]) for item in outcomes
-        ) / count
-        worst_return = min(float(item["worst_return_pct"]) for item in outcomes)
-        pnl_activity = gross_profit + gross_loss
-        pnl_efficiency = total_pnl / pnl_activity if pnl_activity > 0 else 0.0
-        downside_scale = max(abs(worst_return), abs(avg_return), 1e-9)
-        return_quality = return_lcb / downside_scale
-        utility = (return_quality + pnl_efficiency) / 2.0
-        credibility = math.sqrt(count) / (math.sqrt(count) + 1.0)
-        multiplier = math.exp(math.tanh(utility) * credibility)
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
-        if utility > 0:
-            reason = f"权威费后收益质量为正，按收益分布动态提高权重到 {multiplier:.2f} 倍。"
-        elif utility < 0:
-            reason = f"权威费后收益下界或左尾为负，按收益分布动态降低权重到 {multiplier:.2f} 倍。"
-        else:
-            reason = "权威费后收益质量相对中性，保持基础权重。"
-
-        result[expert_name] = {
-            "base_weight": base_weight,
-            "multiplier": round(multiplier, 4),
-            "effective_weight": round(base_weight * multiplier, 4),
-            "memory_count": len(memories),
-            "evidence_count": evidence,
-            "success_count": success,
-            "failure_count": failure,
-            "canonical_outcome_count": count,
-            "canonical_position_count": len(seen_positions),
-            "total_realized_net_pnl_usdt": round(total_pnl, 6),
-            "avg_net_return_after_cost_pct": round(avg_return, 6),
-            "return_lcb_pct": round(return_lcb, 6),
-            "worst_net_return_pct": round(worst_return, 6),
-            "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
-            "utility": round(utility, 6),
-            "weight_policy": "fee_after_return_distribution_not_success_failure_counts",
-            "reason": reason,
-        }
-    return result
 
 
 def position_hold_minutes(pos: Any) -> float:
@@ -652,12 +371,11 @@ def position_hold_minutes(pos: Any) -> float:
 
 def reflection_pattern(pos: Any, pnl_pct: float, hold_minutes: float) -> str:
     side_label = "做多" if str(pos.side).lower() == "long" else "做空"
-    speed = "极短持仓" if hold_minutes < 5 else "短线持仓" if hold_minutes < 30 else "较长持仓"
-    loss_level = (
-        "大亏" if pnl_pct <= -0.01 else "小亏" if pnl_pct < 0 else "盈利" if pnl_pct > 0 else "打平"
-    )
     leverage = float(getattr(pos, "leverage", 1.0) or 1.0)
-    return f"{pos.symbol} {side_label}，{speed}，{leverage:.1f}x，{loss_level}"
+    return (
+        f"{pos.symbol} {side_label}，费后收益率={pnl_pct:.6%}，"
+        f"持仓分钟={hold_minutes:.2f}，杠杆={leverage:.2f}x"
+    )
 
 
 def reflection_summary(
@@ -667,26 +385,11 @@ def reflection_summary(
     hold_minutes: float,
 ) -> tuple[str, str]:
     side_label = "做多" if str(pos.side).lower() == "long" else "做空"
-    if outcome == "loss":
-        mistake = (
-            f"{pos.symbol} {side_label} 最终亏损 {pnl_pct:.2%}，"
-            "说明入场后的趋势延续、成交量配合或退出时机至少有一项不足。"
-        )
-        improvement = (
-            "下次同类场景需要提高入场质量要求，优先降低仓位和杠杆；"
-            "如果短时间内没有走出利润缓冲，持仓专家应更早要求复盘。"
-        )
-    elif outcome == "profit":
-        mistake = f"{pos.symbol} {side_label} 本次盈利，" "说明该方向在当时条件下存在可执行边际。"
-        improvement = (
-            "保留这类有效条件，但仍需确认成交量、趋势强度和止损收益比，" "不允许盲目放大。"
-        )
-    else:
-        mistake = f"{pos.symbol} {side_label} 基本打平，收益没有明显覆盖机会成本。"
-        improvement = "下次同类场景降低优先级，只有当趋势、动量和成交量更明确时才开仓。"
-    if hold_minutes < 5 and outcome != "profit":
-        improvement += " 本次持仓很短即退出，说明入场点或止盈止损距离可能过窄。"
-    return mistake, improvement
+    observation = (
+        f"{pos.symbol} {side_label} 权威结算结果={outcome}，"
+        f"费后收益率={pnl_pct:.6%}，持仓分钟={hold_minutes:.2f}。"
+    )
+    return observation, "仅作为训练与复盘事实；不得直接调整方向、仓位、杠杆或退出。"
 
 
 def build_expert_lessons(
@@ -702,15 +405,9 @@ def build_expert_lessons(
     del decision
     side = str(pos.side or "").lower()
     symbol = str(pos.symbol or "")
-    is_loss = outcome == "loss"
-    big_loss = pnl_pct <= -0.01
     is_profit = outcome == "profit"
-    adjustment = -0.12 if big_loss else -0.08 if is_loss else 0.03 if is_profit else -0.03
-    size_multiplier = 0.45 if big_loss else 0.60 if is_loss else 1.0 if is_profit else 0.80
-    memory_type = "loss_lesson" if is_loss else "profit_pattern" if is_profit else "flat_lesson"
-    recommended = (
-        "reduce_risk" if is_loss else "keep_with_filters" if is_profit else "wait_for_better_setup"
-    )
+    is_loss = outcome == "loss"
+    memory_type = "fee_after_outcome_observation"
     evidence_success = 1 if is_profit else 0
     evidence_failure = 1 if is_loss else 0
 
@@ -719,33 +416,14 @@ def build_expert_lessons(
         for slot in model_slots
         if slot.get("name")
     }
-    side_label = "做多" if side == "long" else "做空"
-    outcome_text = {"loss": "亏损", "profit": "盈利", "flat": "打平"}.get(outcome, outcome)
     base_key = f"{symbol}|{side}|{memory_type}|{lesson_bucket(pnl_pct, hold_minutes)}"
-    lessons = {
-        "trend_expert": (
-            f"{symbol} {side_label} 在场景[{pattern}]下结果为{outcome_text}。"
-            "下次只判断方向质量：均线方向、ADX、MACD 和突破结构，不直接决定仓位。"
-        ),
-        "momentum_expert": (
-            f"{symbol} {side_label} 在场景[{pattern}]下结果为{outcome_text}。"
-            "下次优先看预期净收益、手续费覆盖、亏损概率和盈亏比，不只看胜率。"
-        ),
-        "sentiment_expert": (
-            f"{symbol} {side_label} 在场景[{pattern}]下结果为{outcome_text}。"
-            "下次核对 1/5/10/30 分钟路径、延续风险、反转风险和事件冲击后再判断执行时机。"
-        ),
-        "position_expert": (
-            f"{symbol} {side_label} 持仓 {hold_minutes:.1f} 分钟后结果为{outcome_text}。"
-            "下次检查是否该锁盈、亏损能否修复、亏损是否扩大，以及是否值得加仓或减仓。"
-        ),
-        "risk_expert": (
-            f"{symbol} {side_label} 在场景[{pattern}]下结果为{outcome_text}。"
-            "下次检查异常插针、流动性、极端波动、保证金限制和交易所约束后再放行风险。"
-        ),
-    }
+    lesson = (
+        f"权威费后结果事实：symbol={symbol}, side={side}, outcome={outcome}, "
+        f"net_return_after_cost_pct={pnl_pct * 100.0:.8f}, "
+        f"hold_minutes={hold_minutes:.4f}, pattern={pattern}。"
+    )
     result: dict[str, dict[str, Any]] = {}
-    for expert_name, lesson in lessons.items():
+    for expert_name in labels:
         result[expert_name] = {
             "expert_name": expert_name,
             "expert_label": labels.get(expert_name, expert_name),
@@ -754,87 +432,24 @@ def build_expert_lessons(
             "memory_type": memory_type,
             "market_pattern": pattern,
             "lesson": lesson,
-            "recommended_action": recommended,
-            "confidence_adjustment": adjustment,
-            "position_size_multiplier": size_multiplier,
+            "recommended_action": "observation_only",
             "evidence_count": 1,
             "success_count": evidence_success,
             "failure_count": evidence_failure,
-            "confidence_score": 0.65 if is_loss else 0.55,
             "memory_key": f"{expert_name}|{base_key}",
         }
     return result
 
 
 def lesson_bucket(pnl_pct: float, hold_minutes: float) -> str:
-    pnl_bucket = (
-        "big_loss"
-        if pnl_pct <= -0.01
-        else "loss" if pnl_pct < 0 else "profit" if pnl_pct > 0 else "flat"
-    )
-    time_bucket = "fast" if hold_minutes < 5 else "short" if hold_minutes < 30 else "long"
-    return f"{pnl_bucket}|{time_bucket}"
-
-
-def _realized_weight_result(
-    stats: dict[str, dict[str, Any]],
-    slot_weights: dict[str, float],
-) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for name, bucket in stats.items():
-        count = int(bucket["count"])
-        if count < 3:
-            continue
-        pnl = float(bucket["pnl"])
-        avg_pnl = pnl / count
-        win_rate = bucket["wins"] / count
-        profit_factor = (
-            float(bucket["profit"]) / float(bucket["loss"])
-            if float(bucket["loss"]) > 0
-            else (3.0 if float(bucket["profit"]) > 0 else 0.0)
-        )
-        expectancy_component = max(min(avg_pnl / 8.0, 0.24), -0.30)
-        factor_component = max(min((profit_factor - 1.0) * 0.12, 0.14), -0.18)
-        raw_multiplier = 1.0 + expectancy_component + factor_component
-        multiplier = min(max(raw_multiplier, 0.65), 1.30)
-        result[name] = {
-            "base_weight": slot_weights.get(name, 1.0),
-            "multiplier": round(multiplier, 4),
-            "effective_weight": round(slot_weights.get(name, 1.0) * multiplier, 4),
-            "realized_count": count,
-            "realized_pnl": round(pnl, 6),
-            "win_rate": round(win_rate, 4),
-            "avg_pnl": round(avg_pnl, 6),
-            "profit_factor": round(profit_factor, 4),
-            "reason": (
-                f"北京时间今日同向参与 {count} 笔，真实盈亏 {pnl:.2f}U，"
-                f"单笔期望 {avg_pnl:.2f}U、Profit Factor {profit_factor:.2f}，"
-                f"权重调整到 {multiplier:.2f} 倍；胜率仅作诊断。"
-            ),
-        }
-    return result
-
-
-def _entry_side_from_action(action: Any) -> str:
-    value = str(action or "").lower()
-    if value == "short":
-        return "short"
-    if value == "long":
-        return "long"
-    return ""
-
-
-def _aware_utc(value: datetime | None) -> datetime | None:
-    if value and value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value
+    del pnl_pct, hold_minutes
+    return "canonical_fee_after_outcome"
 
 
 def _empty_memory_context() -> dict[str, Any]:
     return {
         "expert_memories": {},
         "expert_memories_flat": [],
-        "dynamic_expert_weights": {},
         "memory_feedback": MemoryFeedbackPolicy().build([]),
     }
 

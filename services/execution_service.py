@@ -20,9 +20,7 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
-from services.profit_first_position_ladder import ProfitFirstPositionLadderPolicy
-from services.profit_first_stage2 import DefensiveProbeShadowPolicy
-from services.profit_first_trade_plan import attach_profit_first_trade_plan
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.strategy_arbitration import arbitrate_decision
 from services.trading_policies import PolicyGateResult
 
@@ -44,172 +42,69 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _entry_shadow_only_evidence_result(
-    raw: dict[str, Any],
-    base_data: dict[str, Any],
-) -> PolicyGateResult | None:
-    opportunity = _safe_dict(raw.get("opportunity_score"))
-    evidence = _safe_dict(opportunity.get("evidence_score"))
-    if not bool(evidence.get("shadow_only")) or bool(evidence.get("tradeable_probe")):
-        return None
-    return PolicyGateResult.block(
-        "entry_evidence_shadow_only",
-        (
-            "动态证据仍处于影子观察档，尚未升级为可交易探针；"
-            "系统已在提交 OKX 前拦截本次开仓。"
-        ),
-        {
-            **base_data,
-            "stage_status": "skipped",
-            "skip_kind": "entry_evidence_shadow_only",
-            "evidence_tier": evidence.get("tier") or "",
-            "evidence_effective_score": evidence.get("effective_score"),
-            "evidence_shadow_only": True,
-            "evidence_tradeable_probe": bool(evidence.get("tradeable_probe")),
-        },
+def _governance_complete(value: dict[str, Any]) -> bool:
+    return all(
+        value.get(key) not in {None, ""}
+        for key in (
+            "source",
+            "observation_window",
+            "sample_count",
+            "generated_at",
+            "strategy_version",
+        )
     )
 
 
-def _profit_first_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
-    """Ensure an entry cannot reach OKX without the Profit-First v3 contract."""
+def _return_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
+    """Fail closed unless the dynamic fee-after-return contract is complete."""
 
     if not decision.is_entry:
-        return PolicyGateResult.allow({"profit_first_contract": "not_entry"})
+        return PolicyGateResult.allow({"return_execution_contract": "not_entry"})
 
-    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-    analysis_type = str(raw.get("analysis_type") or "market").strip() or "market"
-    raw = attach_profit_first_trade_plan(decision, analysis_type=analysis_type)
-    plan = _safe_dict(raw.get("profit_first_trade_plan"))
+    raw = _safe_dict(decision.raw_response)
+    candidate = _safe_dict(raw.get("authoritative_return_candidate"))
+    side_evidence = _safe_dict(candidate.get("side_evidence"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
-    missing_fields = [
-        str(item)
-        for item in (plan.get("missing_required_fields") or [])
-        if str(item or "").strip()
-    ]
-    lane = str(plan.get("decision_lane") or "").lower().strip()
-    complete = bool(plan.get("is_complete_for_real_trade"))
-
-    base_data = {
-        "profit_first_trade_plan": plan,
-        "profit_first_contract_required": True,
-        "profit_first_contract_source": "execution_service_pre_submit",
-    }
-    if not complete or lane == "shadow_only":
+    candidate_provenance = _safe_dict(side_evidence.get("policy_provenance"))
+    sizing_provenance = _safe_dict(sizing.get("policy_provenance"))
+    expected_net = _safe_float(side_evidence.get("expected_net_return_pct"), 0.0)
+    return_lcb = _safe_float(side_evidence.get("return_lcb_pct"), 0.0)
+    source_count = int(_safe_float(side_evidence.get("production_source_count"), 0.0))
+    reasons: list[str] = []
+    if candidate.get("production_eligible") is not True:
+        reasons.append("authoritative_return_candidate_not_eligible")
+    if side_evidence.get("production_eligible") is not True:
+        reasons.append("selected_side_return_not_eligible")
+    if expected_net <= 0 or return_lcb <= 0:
+        reasons.append("fee_after_return_lower_bound_not_positive")
+    if source_count <= 0:
+        reasons.append("authoritative_return_samples_missing")
+    if not _governance_complete(candidate_provenance):
+        reasons.append("return_policy_provenance_incomplete")
+    if sizing.get("production_eligible") is not True:
+        reasons.append("dynamic_position_sizing_not_eligible")
+    if _safe_float(decision.position_size_pct, 0.0) <= 0:
+        reasons.append("dynamic_position_size_zero")
+    if not _governance_complete(sizing_provenance):
+        reasons.append("sizing_policy_provenance_incomplete")
+    if reasons:
         return PolicyGateResult.block(
-            "profit_first_trade_plan_incomplete",
-            "Profit-First 交易计划不完整或仍处于影子档，本轮未提交 OKX 开仓订单。",
+            "dynamic_return_execution_contract_incomplete",
+            "Dynamic fee-after-return execution contract is incomplete; entry fails closed.",
             {
-                **base_data,
-                "stage_status": "skipped",
-                "skip_kind": "profit_first_trade_plan_incomplete",
-                "shadow_only": True,
-                "missing_required_fields": missing_fields,
-                "decision_lane": lane,
-            },
-        )
-
-    if not sizing:
-        return PolicyGateResult.block(
-            "missing_profit_risk_sizing",
-            "Profit-First 开仓缺少收益/风险仓位快照，本轮在提交 OKX 前拦截。",
-            {
-                **base_data,
                 "stage_status": "blocked",
-                "missing_required_fields": ["profit_risk_sizing"],
-                "decision_lane": lane,
+                "block_reasons": reasons,
+                "expected_net_return_pct": expected_net,
+                "return_lcb_pct": return_lcb,
+                "production_source_count": source_count,
             },
         )
-
-    ladder = _safe_dict(sizing.get("profit_first_position_ladder"))
-    if not ladder:
-        current_size = _safe_float(
-            sizing.get("position_size_pct"),
-            _safe_float(plan.get("position_size_pct"), _safe_float(decision.position_size_pct)),
-        )
-        ladder_decision = ProfitFirstPositionLadderPolicy().apply(
-            lane=lane,
-            current_size_pct=current_size,
-            low_payoff_quality=bool(sizing.get("low_payoff_quality")),
-            high_risk_review=_safe_dict(raw.get("high_risk_review")),
-        )
-        adjusted_size = float(ladder_decision.adjusted_size_pct or 0.0)
-        if abs(adjusted_size - current_size) > 1e-9:
-            return PolicyGateResult.block(
-                "profit_first_position_ladder_missing_before_sizing",
-                (
-                    "Profit-First 仓位阶梯缺失，且临时重建会改变下单仓位；"
-                    "本轮在提交 OKX 前拦截。"
-                ),
-                {
-                    **base_data,
-                    "stage_status": "blocked",
-                    "decision_lane": lane,
-                    "current_size_pct": current_size,
-                    "required_ladder_size_pct": adjusted_size,
-                    "missing_required_fields": ["profit_first_position_ladder"],
-                },
-            )
-        ladder = {
-            **ladder_decision.to_dict(),
-            "classifier": {
-                "lane": lane,
-                "source": "execution_service_late_contract_reconstruction",
-            },
-            "pre_stop_budget_size_pct": round(current_size, 6),
-            "post_stop_budget_size_pct": round(current_size, 6),
-            "capped_by_stop_loss_budget": False,
-            "late_attached_at": "execution_pre_submit",
-        }
-        sizing["profit_first_position_ladder"] = ladder
-        raw["profit_risk_sizing"] = sizing
-        decision.raw_response = raw
-
-    if str(ladder.get("lane") or "").lower().strip() == "shadow_only":
-        return PolicyGateResult.block(
-            "profit_first_position_ladder_shadow_only",
-            "Profit-First 仓位阶梯仍为影子档，本轮未提交 OKX 开仓订单。",
-            {
-                **base_data,
-                "stage_status": "skipped",
-                "skip_kind": "profit_first_position_ladder_shadow_only",
-                "shadow_only": True,
-                "profit_first_position_ladder": ladder,
-            },
-        )
-
-    shadow_only_evidence = _entry_shadow_only_evidence_result(raw, base_data)
-    if shadow_only_evidence is not None:
-        return shadow_only_evidence
-
-    defensive_probe = DefensiveProbeShadowPolicy().evaluate(raw, decision)
-    if not defensive_probe.allowed:
-        return PolicyGateResult.block(
-            "profit_first_defensive_probe_shadow",
-            defensive_probe.reason,
-            {
-                **base_data,
-                "stage_status": "skipped",
-                **(defensive_probe.data or {}),
-            },
-        )
-
-    if _safe_float(ladder.get("adjusted_size_pct")) <= 0.0:
-        return PolicyGateResult.block(
-            "profit_first_position_ladder_zero_size",
-            "Profit-First 仓位阶梯计算出的真实仓位为 0，本轮在提交 OKX 前拦截。",
-            {
-                **base_data,
-                "stage_status": "blocked",
-                "profit_first_position_ladder": ladder,
-            },
-        )
-
     return PolicyGateResult.allow(
         {
-            "profit_first_contract": "passed",
-            "profit_first_trade_plan": plan,
-            "profit_first_position_ladder": ladder,
-            "decision_lane": lane,
+            "return_execution_contract": "complete",
+            "expected_net_return_pct": expected_net,
+            "return_lcb_pct": return_lcb,
+            "production_source_count": source_count,
         }
     )
 
@@ -245,11 +140,6 @@ class ExecutionService:
         ) = None,
         execution_reason_provider: Callable[[ExecutionResult | None], str] | None = None,
         pending_execution_marker: Callable[[int, str], Awaitable[None]] | None = None,
-        untradable_exchange_error_checker: Callable[[str], bool] | None = None,
-        untradable_symbol_rememberer: Callable[[str, str], None] | None = None,
-        transient_entry_exchange_error_checker: Callable[[str], bool] | None = None,
-        temporary_entry_block_rememberer: Callable[[str, str, float], None] | None = None,
-        transient_entry_block_minutes_provider: Callable[[str], float] | None = None,
         trade_logger: (
             Callable[[ExecutionResult, str, DecisionOutput, int | None], Awaitable[None]] | None
         ) = None,
@@ -265,7 +155,6 @@ class ExecutionService:
             Callable[[list[dict[str, Any]], str, DecisionOutput, ExecutionResult], None] | None
         ) = None,
         decision_executed_marker: Callable[[int, float], Awaitable[None]] | None = None,
-        market_no_opportunity_symbol_clearer: Callable[[str], None] | None = None,
         account_update_persister: (
             Callable[[str, str, ExecutionResult], Awaitable[None]] | None
         ) = None,
@@ -298,7 +187,6 @@ class ExecutionService:
         matching_exit_exchange_position_checker: (
             Callable[[str, DecisionOutput], Awaitable[bool | None]] | None
         ) = None,
-        exit_cooldown_recorder: Callable[[str, DecisionOutput], None] | None = None,
         trade_notional_recorder: Callable[[float], None] | None = None,
     ) -> None:
         self.execution_lock = execution_lock
@@ -316,11 +204,6 @@ class ExecutionService:
         self.execution_leverage_summary_attacher = execution_leverage_summary_attacher
         self.execution_reason_provider = execution_reason_provider
         self.pending_execution_marker = pending_execution_marker
-        self.untradable_exchange_error_checker = untradable_exchange_error_checker
-        self.untradable_symbol_rememberer = untradable_symbol_rememberer
-        self.transient_entry_exchange_error_checker = transient_entry_exchange_error_checker
-        self.temporary_entry_block_rememberer = temporary_entry_block_rememberer
-        self.transient_entry_block_minutes_provider = transient_entry_block_minutes_provider
         self.trade_logger = trade_logger
         self.exchange_confirmed_checker = exchange_confirmed_checker
         self.exit_progress_checker = exit_progress_checker
@@ -330,7 +213,6 @@ class ExecutionService:
         self.order_fact_recovery_trigger = order_fact_recovery_trigger
         self.open_positions_execution_applier = open_positions_execution_applier
         self.decision_executed_marker = decision_executed_marker
-        self.market_no_opportunity_symbol_clearer = market_no_opportunity_symbol_clearer
         self.account_update_persister = account_update_persister
         self.account_balance_provider = account_balance_provider
         self.decision_outcome_marker = decision_outcome_marker
@@ -343,7 +225,6 @@ class ExecutionService:
         self.open_positions_context_provider = open_positions_context_provider
         self.matching_exit_local_position_checker = matching_exit_local_position_checker
         self.matching_exit_exchange_position_checker = matching_exit_exchange_position_checker
-        self.exit_cooldown_recorder = exit_cooldown_recorder
         self.trade_notional_recorder = trade_notional_recorder
 
     def _required_execution_lock(self) -> AbstractAsyncContextManager[Any]:
@@ -449,39 +330,6 @@ class ExecutionService:
             raise RuntimeError("ExecutionService requires pending_execution_marker dependency")
         return self.pending_execution_marker
 
-    def _required_untradable_exchange_error_checker(self) -> Callable[[str], bool]:
-        if self.untradable_exchange_error_checker is None:
-            raise RuntimeError(
-                "ExecutionService requires untradable_exchange_error_checker dependency"
-            )
-        return self.untradable_exchange_error_checker
-
-    def _required_untradable_symbol_rememberer(self) -> Callable[[str, str], None]:
-        if self.untradable_symbol_rememberer is None:
-            raise RuntimeError("ExecutionService requires untradable_symbol_rememberer dependency")
-        return self.untradable_symbol_rememberer
-
-    def _required_transient_entry_exchange_error_checker(self) -> Callable[[str], bool]:
-        if self.transient_entry_exchange_error_checker is None:
-            raise RuntimeError(
-                "ExecutionService requires transient_entry_exchange_error_checker dependency"
-            )
-        return self.transient_entry_exchange_error_checker
-
-    def _required_temporary_entry_block_rememberer(self) -> Callable[[str, str, float], None]:
-        if self.temporary_entry_block_rememberer is None:
-            raise RuntimeError(
-                "ExecutionService requires temporary_entry_block_rememberer dependency"
-            )
-        return self.temporary_entry_block_rememberer
-
-    def _required_transient_entry_block_minutes_provider(self) -> Callable[[str], float]:
-        if self.transient_entry_block_minutes_provider is None:
-            raise RuntimeError(
-                "ExecutionService requires transient_entry_block_minutes_provider dependency"
-            )
-        return self.transient_entry_block_minutes_provider
-
     def _required_trade_logger(
         self,
     ) -> Callable[[ExecutionResult, str, DecisionOutput, int | None], Awaitable[None]]:
@@ -552,13 +400,6 @@ class ExecutionService:
         if self.decision_executed_marker is None:
             raise RuntimeError("ExecutionService requires decision_executed_marker dependency")
         return self.decision_executed_marker
-
-    def _required_market_no_opportunity_symbol_clearer(self) -> Callable[[str], None]:
-        if self.market_no_opportunity_symbol_clearer is None:
-            raise RuntimeError(
-                "ExecutionService requires market_no_opportunity_symbol_clearer dependency"
-            )
-        return self.market_no_opportunity_symbol_clearer
 
     def _required_account_update_persister(
         self,
@@ -650,11 +491,6 @@ class ExecutionService:
             )
         return self.matching_exit_exchange_position_checker
 
-    def _required_exit_cooldown_recorder(self) -> Callable[[str, DecisionOutput], None]:
-        if self.exit_cooldown_recorder is None:
-            raise RuntimeError("ExecutionService requires exit_cooldown_recorder dependency")
-        return self.exit_cooldown_recorder
-
     def _required_trade_notional_recorder(self) -> Callable[[float], None]:
         if self.trade_notional_recorder is None:
             raise RuntimeError("ExecutionService requires trade_notional_recorder dependency")
@@ -709,11 +545,6 @@ class ExecutionService:
         attach_execution_leverage_summary = self._required_execution_leverage_summary_attacher()
         execution_reason_from_result = self._required_execution_reason_provider()
         mark_decision_pending_execution = self._required_pending_execution_marker()
-        is_untradable_exchange_error = self._required_untradable_exchange_error_checker()
-        remember_untradable_symbol = self._required_untradable_symbol_rememberer()
-        is_transient_entry_exchange_error = self._required_transient_entry_exchange_error_checker()
-        remember_temporary_entry_block = self._required_temporary_entry_block_rememberer()
-        transient_entry_block_minutes = self._required_transient_entry_block_minutes_provider()
         log_trade = self._required_trade_logger()
         is_exchange_confirmed_execution = self._required_exchange_confirmed_checker()
         is_exit_progress_execution = self._required_exit_progress_checker()
@@ -722,7 +553,6 @@ class ExecutionService:
         persist_position_from_execution = self._required_position_execution_persister()
         apply_execution_to_open_positions = self._required_open_positions_execution_applier()
         mark_decision_executed = self._required_decision_executed_marker()
-        clear_market_no_opportunity_symbol = self._required_market_no_opportunity_symbol_clearer()
         persist_account_update = self._required_account_update_persister()
         get_account_balance = self._required_account_balance_provider()
         mark_decision_outcome = self._required_decision_outcome_marker()
@@ -737,7 +567,6 @@ class ExecutionService:
         has_matching_exchange_exit_position = (
             self._required_matching_exit_exchange_position_checker()
         )
-        remember_exit_cooldown = self._required_exit_cooldown_recorder()
         record_trade_notional = self._required_trade_notional_recorder()
         for warning in assessment.warnings:
             results["warnings"].append(
@@ -1213,9 +1042,9 @@ class ExecutionService:
                 )
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
-            profit_first_contract_result = _profit_first_entry_contract_result(decision)
-            if not profit_first_contract_result.passed:
-                return await block_before_submit(profit_first_contract_result)
+            return_contract_result = _return_entry_contract_result(decision)
+            if not return_contract_result.passed:
+                return await block_before_submit(return_contract_result)
             if decision_db_id is not None:
                 attach_execution_parameters("entry_policy_passed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
@@ -1505,21 +1334,8 @@ class ExecutionService:
                 )
             )
             transient_entry_exchange_error = bool(
-                decision.is_entry and is_transient_entry_exchange_error(result_text)
+                decision.is_entry and is_okx_temporary_service_error(result_text)
             )
-            if decision.is_entry and is_untradable_exchange_error(result_text):
-                remember_untradable_symbol(symbol, result_text)
-            elif decision.is_exit and is_untradable_exchange_error(result_text):
-                raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-                raw["untradable_exit_execution_error"] = {"reason": result_text[:1000]}
-                decision.raw_response = raw
-                remember_exit_cooldown(model_name, decision)
-            elif transient_entry_exchange_error:
-                remember_temporary_entry_block(
-                    symbol,
-                    result_text,
-                    transient_entry_block_minutes(result_text),
-                )
             exchange_confirmed = is_exchange_confirmed_execution(execution_result)
             exit_progress = is_exit_progress_execution(execution_result)
             confirm_reason = execution_reason_from_result(execution_result)
@@ -1622,8 +1438,6 @@ class ExecutionService:
                             decision,
                             execution_result,
                         )
-                    if decision.is_exit:
-                        remember_exit_cooldown(model_name, decision)
                     await mark_stage(
                         DecisionStage.LOCAL_SYNC,
                         DecisionStageStatus.COMPLETED,
@@ -1682,8 +1496,6 @@ class ExecutionService:
                     exit_progress=exit_progress,
                 )
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
-                if decision.is_entry:
-                    clear_market_no_opportunity_symbol(symbol)
             elif decision_db_id is not None:
                 await mark_decision_reason(
                     decision_db_id,
@@ -1754,4 +1566,5 @@ class ExecutionService:
                 "is_paper": (model_mode == "paper"),
             }
         )
+        return execution_result
         return execution_result

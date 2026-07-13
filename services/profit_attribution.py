@@ -428,10 +428,6 @@ def _classify_record(
     side = str(position.side or "").lower()
     signals = extract_signal_sides(_raw(entry_decision))
     shadow_action = _shadow_best_action(shadow)
-    opened = _position_open_time(position)
-    closed = _position_close_time(position)
-    hold_minutes = max((closed - opened).total_seconds() / 60.0, 0.0) if opened and closed else 0.0
-
     notes: list[str] = []
     if shadow_action in {"long", "short"} and shadow_action != side:
         notes.append(f"影子复盘显示更优方向是{_side_label(shadow_action)}")
@@ -440,29 +436,31 @@ def _classify_record(
         if signal_side in {"long", "short"} and signal_side != side:
             notes.append(f"{label} 当时偏向{_side_label(signal_side)}")
 
-    close_reason = _close_reason(close_decision)
-    lowered_close_reason = close_reason.lower()
-    if close_reason:
-        if "止损" in close_reason or "stop" in lowered_close_reason:
-            notes.append("平仓来自止损或快速风控")
-        if "锁盈" in close_reason or "止盈" in close_reason or "profit" in lowered_close_reason:
-            notes.append("平仓来自锁盈/止盈")
+    close_raw = _raw(close_decision)
+    dynamic_exit = _safe_dict(close_raw.get("dynamic_exit_policy"))
+    if not dynamic_exit:
+        dynamic_exit = _safe_dict(
+            _safe_dict(close_raw.get("close_evidence")).get("dynamic_exit_policy")
+        )
+    governed_exit = bool(dynamic_exit.get("eligible") is True)
+    planned_stop_crossed = bool(dynamic_exit.get("planned_stop_crossed"))
+    profit_retrace = _safe_float(dynamic_exit.get("profit_retrace_ratio"), 0.0)
+    if governed_exit and planned_stop_crossed:
+        notes.append("governed planned stop crossed")
+    elif governed_exit and profit_retrace > 0.0:
+        notes.append("governed fee-after profit retrace")
 
     if pnl < 0:
         if shadow_action in {"long", "short"} and shadow_action != side:
             return "ai_direction_error", "AI 方向判断偏差", "high", notes
         if notes:
             return "model_conflict_ignored", "模型分歧未充分消化", "medium", notes
-        if hold_minutes <= 5:
-            return "entry_quality", "入场后快速不利", "medium", notes
-        if "止损" in close_reason or "stop" in lowered_close_reason:
+        if governed_exit and planned_stop_crossed:
             return "stop_loss_or_fast_risk", "止损/快速风控亏损", "medium", notes
         return "loss_unclassified", "亏损原因待复盘", "low", notes
 
     if pnl > 0:
-        if hold_minutes <= 5 and pnl < 1.0:
-            return "early_small_profit", "小盈快跑", "medium", notes
-        if close_reason and ("锁盈" in close_reason or "止盈" in close_reason):
+        if governed_exit and profit_retrace > 0.0:
             return "profit_locked", "利润保护生效", "medium", notes
         return "profitable_exit", "盈利兑现", "medium", notes
 
@@ -653,9 +651,6 @@ def build_profit_attribution(
         "avg_win": round(profit / wins, 6) if wins else 0.0,
         "avg_loss": round(loss / losses, 6) if losses else 0.0,
         "profit_factor": round(profit / loss, 4) if loss > 0 else (999.0 if profit > 0 else 0.0),
-        "small_win_count": sum(1 for row in records if 0 < row["realized_pnl"] < 1.0),
-        "large_loss_count": sum(1 for row in records if row["realized_pnl"] <= -5.0),
-        "early_exit_count": sum(1 for row in records if row["bucket"] == "early_small_profit"),
         "direction_error_count": sum(1 for row in records if row["bucket"] == "ai_direction_error"),
         "execution_issue_count": sum(
             1 for row in records if row["bucket"] in {"stop_loss_or_fast_risk", "flat_or_fee_churn"}

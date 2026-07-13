@@ -39,12 +39,12 @@ def _row(**overrides):
     return row
 
 
-def test_quality_sample_marks_out_of_range_shadow_sample_for_quarantine() -> None:
+def test_quality_sample_does_not_apply_fixed_price_range_quarantine() -> None:
     assessment = assess_shadow_sample(_quality_sample(_row()))
 
-    assert assessment.exclude_from_training is True
-    assert assessment.status == "excluded"
-    assert "price_outside_24h_range" in assessment.reasons
+    assert assessment.exclude_from_training is False
+    assert assessment.status == "included"
+    assert "price_outside_24h_range" not in assessment.reasons
 
 
 def test_quality_sample_marks_feature_snapshot_future_leakage_for_quarantine() -> None:
@@ -68,10 +68,10 @@ def test_quality_sample_marks_feature_snapshot_future_leakage_for_quarantine() -
 
 
 def test_note_with_quarantine_reason_is_idempotent() -> None:
-    note = _note_with_quarantine_reason("old note", ("price_outside_24h_range",))
-    second = _note_with_quarantine_reason(note, ("price_outside_24h_range",))
+    note = _note_with_quarantine_reason("old note", ("future_leakage",))
+    second = _note_with_quarantine_reason(note, ("future_leakage",))
 
-    assert "[training_quarantine] price_outside_24h_range" in note
+    assert "[training_quarantine] future_leakage" in note
     assert second == note
 
 
@@ -80,14 +80,14 @@ def test_quarantine_status_constant_is_not_completed() -> None:
     assert QUARANTINE_STATUS != "completed"
 
 
-def test_quarantine_completed_shadow_row_updates_status_and_note() -> None:
+def test_quarantine_completed_shadow_row_ignores_old_price_range_rule() -> None:
     row = _row()
 
     result = quarantine_completed_shadow_row(row)
 
-    assert result["applied"] is True
-    assert row.status == QUARANTINE_STATUS
-    assert "price_outside_24h_range" in row.note
+    assert result["applied"] is False
+    assert row.status == "completed"
+    assert "price_outside_24h_range" not in row.note
 
 
 def test_clean_shadow_row_is_not_quarantined() -> None:

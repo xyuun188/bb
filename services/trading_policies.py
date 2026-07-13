@@ -12,71 +12,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
-from services.exit_arbitrator import ExitArbitrationResult, ExitArbitrator
+from services.dynamic_exit_policy import apply_dynamic_exit
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
-from services.profit_first_exit_binding import attach_profit_first_exit_reference
-from services.profit_first_stage2 import (
-    DefensiveProbeShadowPolicy,
-    RecentProbePnLBrakePolicy,
-    profit_first_real_trade_upgrade_context,
-)
-from services.profit_first_trade_plan import attach_profit_first_trade_plan
-
-
-def _safe_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _exit_binding_positions(
-    refreshed_positions: list[dict[str, Any]] | None,
-    original_positions: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
-    """Keep local Profit-First metadata when exchange refresh returns a thinner snapshot."""
-
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for position in [*(refreshed_positions or []), *(original_positions or [])]:
-        if not isinstance(position, dict):
-            continue
-        key = (
-            str(position.get("model_name") or ""),
-            str(position.get("symbol") or ""),
-            str(position.get("side") or ""),
-            str(position.get("okx_pos_id") or position.get("entry_exchange_order_id") or ""),
-        )
-        has_profit_first_ref = bool(
-            position.get("profit_first_exit_plan_id")
-            or (
-                isinstance(position.get("profit_first_exit_plan"), dict)
-                and position["profit_first_exit_plan"].get("exit_plan_id")
-            )
-            or (
-                isinstance(position.get("profit_first_trade_plan"), dict)
-                and position["profit_first_trade_plan"].get("exit_plan_id")
-            )
-            or any(
-                isinstance(leg, dict)
-                and (leg.get("profit_first_exit_plan_id") or leg.get("exit_plan_id"))
-                for leg in _safe_list(position.get("entry_legs"))
-            )
-        )
-        if key in seen and not has_profit_first_ref:
-            continue
-        if key in seen and has_profit_first_ref:
-            merged = [
-                item
-                for item in merged
-                if (
-                    str(item.get("model_name") or ""),
-                    str(item.get("symbol") or ""),
-                    str(item.get("side") or ""),
-                    str(item.get("okx_pos_id") or item.get("entry_exchange_order_id") or ""),
-                )
-                != key
-            ]
-        seen.add(key)
-        merged.append(position)
-    return merged
+from services.return_execution_policy import apply_production_entry_policy
 
 
 @dataclass(slots=True)
@@ -108,23 +46,17 @@ class EntryPolicy:
         entry_priority: Any | None = None,
         entry_opportunity_score: Any | None = None,
         entry_profit_risk_sizing: Any | None = None,
-        abnormal_wick_guard: Any | None = None,
         entry_price_guard: Any | None = None,
         entry_opportunity_gate: Any | None = None,
         high_risk_review_gate: Any | None = None,
-        profit_first_probe_brake: Any | None = None,
-        defensive_probe_shadow: Any | None = None,
     ) -> None:
         self.decision_freshness = decision_freshness
         self.entry_priority = entry_priority
         self.entry_opportunity_score = entry_opportunity_score
         self.entry_profit_risk_sizing = entry_profit_risk_sizing
-        self.abnormal_wick_guard = abnormal_wick_guard
         self.entry_price_guard = entry_price_guard
         self.entry_opportunity_gate = entry_opportunity_gate
         self.high_risk_review_gate_policy = high_risk_review_gate
-        self.profit_first_probe_brake = profit_first_probe_brake or RecentProbePnLBrakePolicy()
-        self.defensive_probe_shadow = defensive_probe_shadow or DefensiveProbeShadowPolicy()
 
     def score_candidate(
         self,
@@ -171,53 +103,6 @@ class EntryPolicy:
             return None
         return self.entry_priority.immediate_execution_reason(decision)
 
-    @staticmethod
-    def _entry_evidence_advisory(decision: DecisionOutput) -> dict[str, Any]:
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
-        if not isinstance(opportunity, dict):
-            return {}
-        evidence_score = opportunity.get("evidence_score")
-        if not isinstance(evidence_score, dict):
-            return {}
-
-        advisory = {
-            "evidence_tier": str(evidence_score.get("tier") or ""),
-            "effective_score": float(evidence_score.get("effective_score") or 0.0),
-            "tradeable_probe": bool(evidence_score.get("tradeable_probe")),
-            "shadow_only": bool(evidence_score.get("shadow_only")),
-            "advisory_wait_reasons": list(
-                item for item in _safe_list(evidence_score.get("advisory_wait_reasons")) if item
-            )[:6],
-            "hard_block": bool(evidence_score.get("hard_block")),
-        }
-        return advisory
-
-    @classmethod
-    def _attach_entry_evidence_advisory(cls, decision: DecisionOutput) -> tuple[str, dict[str, Any]]:
-        advisory = cls._entry_evidence_advisory(decision)
-        evidence_tier = str(advisory.get("evidence_tier") or "")
-        if evidence_tier not in {"weak_conflict_probe", "degraded_missing_probe"}:
-            return evidence_tier, advisory
-
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
-        if not isinstance(opportunity, dict):
-            return evidence_tier, advisory
-
-        opportunity["entry_evidence_advisory"] = {
-            "applied": True,
-            "policy": "weak_evidence_is_soft_advisory_before_unified_profit_adjudication",
-            "reason": (
-                "动态证据仍偏弱，但不再在证据层直接终止开仓；"
-                "会保留弱证据标签、仓位约束和风险提示，继续进入统一收益裁决。"
-            ),
-            **advisory,
-        }
-        raw["opportunity_score"] = opportunity
-        decision.raw_response = raw
-        return evidence_tier, advisory
-
     def wait_sort_reason(
         self,
         decision: DecisionOutput,
@@ -234,21 +119,17 @@ class EntryPolicy:
         )
 
     def gate_reason(self, decision: DecisionOutput) -> str | None:
-        if self.entry_opportunity_gate is None:
-            raise RuntimeError("EntryPolicy requires entry_opportunity_gate dependency")
+        """Run exchange-safety checks without granting production permission."""
+
         if self.entry_opportunity_score is not None:
             self.ensure_opportunity_score(decision, self.strategy_context_from_decision(decision))
-        self._attach_entry_evidence_advisory(decision)
-        return self.entry_opportunity_gate.gate_reason(decision)
+        if self.entry_opportunity_gate is not None:
+            return self.entry_opportunity_gate.safety_reason(decision)
+        return None
 
     def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
         if self.decision_freshness is not None:
             return self.decision_freshness.stale_decision_reason(decision)
-        return None
-
-    def abnormal_wick_guard_reason(self, decision: DecisionOutput) -> str | None:
-        if self.abnormal_wick_guard is not None:
-            return self.abnormal_wick_guard.guard_reason(decision)
         return None
 
     async def pre_execution_price_guard_reason(self, decision: DecisionOutput) -> str | None:
@@ -303,22 +184,6 @@ class EntryPolicy:
                 {"intent": "not_entry", "pipeline_context": context.public_data()}
             )
 
-        stale_reason = self.stale_decision_reason(decision)
-        if stale_reason:
-            return PolicyGateResult.block(
-                "stale_decision",
-                stale_reason,
-                {"pipeline_context": context.public_data()},
-            )
-
-        abnormal_wick_reason = self.abnormal_wick_guard_reason(decision)
-        if abnormal_wick_reason:
-            return PolicyGateResult.block(
-                "abnormal_wick_entry_guard",
-                abnormal_wick_reason,
-                {"pipeline_context": context.public_data()},
-            )
-
         price_guard_reason = await self.pre_execution_price_guard_reason(decision)
         if price_guard_reason:
             return PolicyGateResult.block(
@@ -327,107 +192,48 @@ class EntryPolicy:
                 {"pipeline_context": context.public_data()},
             )
 
+        safety_reason = self.gate_reason(decision)
+        if safety_reason:
+            return PolicyGateResult.block(
+                "entry_exchange_safety",
+                safety_reason,
+                {"pipeline_context": context.public_data()},
+            )
+
         self.ensure_opportunity_score(decision, self.strategy_context_from_decision(decision))
+
+        stale_reason = self.stale_decision_reason(decision)
+        if stale_reason:
+            return PolicyGateResult.block(
+                "stale_decision",
+                stale_reason,
+                {"pipeline_context": context.public_data()},
+            )
 
         await self.apply_profit_risk_sizing(
             decision,
             model_mode,
             open_positions=open_positions or [],
         )
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        raw = attach_profit_first_trade_plan(
-            decision,
-            analysis_type=str(raw.get("analysis_type") or "market"),
-        )
-        profit_first_plan = (
-            raw.get("profit_first_trade_plan")
-            if isinstance(raw.get("profit_first_trade_plan"), dict)
-            else {}
-        )
-        profit_first_lane = str(profit_first_plan.get("decision_lane") or "").lower().strip()
-        profit_first_upgrade = profit_first_real_trade_upgrade_context(raw, decision)
-        profit_first_real_entry_upgrade = bool(profit_first_upgrade.get("ready"))
-        probe_brake = self.profit_first_probe_brake.evaluate(profit_first_plan, raw)
-        if not probe_brake.allowed:
+        production_assessment = apply_production_entry_policy(decision)
+        if not production_assessment.eligible:
             return PolicyGateResult.block(
-                "profit_first_probe_loss_brake",
-                probe_brake.reason,
+                "production_return_policy",
+                production_assessment.reason,
                 {
                     "pipeline_context": context.public_data(),
                     "stage_status": "skipped",
-                    **(probe_brake.data or {}),
+                    "skip_kind": "production_return_policy",
+                    "production_return_policy": production_assessment.to_dict(),
                 },
-            )
-        defensive_probe_shadow = self.defensive_probe_shadow.evaluate(raw, decision)
-        if not defensive_probe_shadow.allowed:
-            return PolicyGateResult.block(
-                "profit_first_defensive_probe_shadow",
-                defensive_probe_shadow.reason,
-                {
-                    "pipeline_context": context.public_data(),
-                    "stage_status": "skipped",
-                    **(defensive_probe_shadow.data or {}),
-                },
-            )
-        evidence_tier, entry_evidence_advisory = self._attach_entry_evidence_advisory(decision)
-        evidence_score = {}
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        opportunity_data = raw.get("opportunity_score") if isinstance(raw, dict) else {}
-        if isinstance(opportunity_data, dict) and isinstance(
-            opportunity_data.get("evidence_score"), dict
-        ):
-            evidence_score = opportunity_data["evidence_score"]
-        evidence_shadow_only = bool(evidence_score.get("shadow_only")) and not bool(
-            evidence_score.get("tradeable_probe")
-        )
-        should_wait_for_evidence = decision.position_size_pct <= 0 or evidence_shadow_only or (
-            evidence_tier == "blocked"
-            and not bool(evidence_score.get("tradeable_probe"))
-            and not profit_first_real_entry_upgrade
-        )
-        if should_wait_for_evidence:
-            return PolicyGateResult.block(
-                "entry_evidence_wait",
-                (
-                    "动态证据仍未达到可执行状态：当前仓位预算已收敛为 0，"
-                    "或动态证据明确标记为影子观察，或有效证据层级仍为 blocked "
-                    "且没有被统一收益裁决提升。"
-                    "本轮不提交 OKX 订单，下一轮会用最新市场与模型证据重新评估。"
-                ),
-                {
-                    "pipeline_context": context.public_data(),
-                    "stage_status": "skipped",
-                    "skip_kind": "entry_evidence_wait",
-                    "evidence_tier": evidence_tier,
-                    "evidence_score": evidence_score,
-                    "evidence_shadow_only": evidence_shadow_only,
-                    "entry_evidence_advisory": entry_evidence_advisory,
-                    "profit_first_decision_lane": profit_first_lane,
-                    "profit_first_real_entry_upgrade": profit_first_real_entry_upgrade,
-                    "profit_first_real_entry_upgrade_context": profit_first_upgrade,
-                },
-            )
-        gate_reason = self.gate_reason(decision)
-        if gate_reason:
-            return PolicyGateResult.block(
-                "entry_opportunity_gate",
-                gate_reason,
-                {"pipeline_context": context.public_data()},
-            )
-        high_risk_reason = await self.high_risk_review_gate(
-            decision,
-            model_mode,
-            open_positions or [],
-        )
-        if high_risk_reason:
-            return PolicyGateResult.block(
-                "high_risk_review",
-                high_risk_reason,
-                {"pipeline_context": context.public_data()},
             )
 
         return PolicyGateResult.allow(
-            {"intent": "entry", "pipeline_context": context.public_data()}
+            {
+                "intent": "entry",
+                "pipeline_context": context.public_data(),
+                "production_return_policy": production_assessment.to_dict(),
+            }
         )
 
 
@@ -435,23 +241,11 @@ class ExitPolicy:
     def __init__(
         self,
         *,
-        exit_cooldown: Any | None = None,
-        decision_freshness: Any | None = None,
         exit_position_matcher: Any | None = None,
-        exit_partial_guard: Any | None = None,
         exit_position_snapshot: Any | None = None,
-        exit_profit_precheck: Any | None = None,
-        exit_fee_churn_guard: Any | None = None,
-        exit_arbitrator: Any | None = None,
     ) -> None:
-        self.exit_cooldown = exit_cooldown
-        self.decision_freshness = decision_freshness
         self.exit_position_matcher = exit_position_matcher
-        self.exit_partial_guard = exit_partial_guard
         self.exit_position_snapshot = exit_position_snapshot
-        self.exit_profit_precheck = exit_profit_precheck
-        self.exit_fee_churn_guard = exit_fee_churn_guard
-        self.exit_arbitrator = exit_arbitrator or ExitArbitrator()
 
     def has_matching_position(
         self,
@@ -473,75 +267,6 @@ class ExitPolicy:
         side_label = "多单" if decision.action == Action.CLOSE_LONG else "空单"
         return f"没有找到 {decision.symbol} 对应的可平{side_label}仓位，未向 OKX 提交平仓单。"
 
-    def loss_partial_guard_reason(
-        self,
-        model_name: str,
-        decision: DecisionOutput,
-        open_positions: list[dict[str, Any]] | None,
-    ) -> str | None:
-        if self.exit_partial_guard is None:
-            return None
-        return self.exit_partial_guard.guard_reason(
-            model_name,
-            decision,
-            open_positions,
-        )
-
-    def recent_exit_cooldown_reason(
-        self,
-        model_name: str,
-        decision: DecisionOutput,
-    ) -> str | None:
-        if self.exit_cooldown is not None:
-            return self.exit_cooldown.recent_exit_cooldown_reason(model_name, decision)
-        if not decision.is_exit:
-            return None
-        raise RuntimeError("ExitPolicy requires exit_cooldown dependency")
-
-    def recent_untradable_exit_cooldown_reason(
-        self,
-        model_name: str,
-        decision: DecisionOutput,
-    ) -> str | None:
-        if self.exit_cooldown is None:
-            return None
-        checker = getattr(
-            self.exit_cooldown,
-            "recent_untradable_exit_cooldown_reason",
-            None,
-        )
-        if checker is None:
-            return None
-        return checker(model_name, decision)
-
-    def stale_decision_reason(self, decision: DecisionOutput) -> str | None:
-        if self.decision_freshness is not None:
-            return self.decision_freshness.stale_decision_reason(decision)
-        return None
-
-    async def pre_execution_profit_guard_reason(
-        self,
-        decision: DecisionOutput,
-        open_positions: list[dict[str, Any]] | None,
-    ) -> str | None:
-        if self.exit_profit_precheck is None:
-            return None
-        return await self.exit_profit_precheck.guard_reason(decision, open_positions)
-
-    async def fee_churn_guard_reason(
-        self,
-        model_name: str,
-        decision: DecisionOutput,
-    ) -> str | None:
-        if self.exit_fee_churn_guard is None:
-            return None
-        return await self.exit_fee_churn_guard.guard_reason(model_name, decision)
-
-    def arbitrate_exit(self, decision: DecisionOutput) -> ExitArbitrationResult:
-        if self.exit_arbitrator is None:
-            return ExitArbitrator().arbitrate(decision)
-        return self.exit_arbitrator.arbitrate(decision)
-
     async def evaluate(
         self,
         decision: DecisionOutput,
@@ -560,27 +285,15 @@ class ExitPolicy:
                 {"intent": "not_exit", "pipeline_context": context.public_data()}
             )
 
-        arbitration = self.arbitrate_exit(decision)
-        arbitration_data = arbitration.to_dict()
-        context = context.with_arbitration(arbitration_data)
-
         def gate_data() -> dict[str, Any]:
             return {
                 "pipeline_context": context.public_data(),
-                "exit_arbitration": arbitration_data,
             }
 
-        original_exit_positions = list(open_positions or [])
         exit_positions = open_positions or []
         if refresh_positions and self.exit_position_snapshot is not None:
             exit_positions = await self.exit_position_snapshot.refresh_positions(open_positions)
         context = context.with_refreshed_positions(exit_positions)
-        attach_profit_first_exit_reference(
-            decision,
-            _exit_binding_positions(exit_positions, original_exit_positions),
-            model_name=model_name,
-        )
-
         if not self.has_matching_position(exit_positions, model_name, decision):
             exchange_has_position = False
             if self.exit_position_snapshot is not None:
@@ -606,69 +319,19 @@ class ExitPolicy:
                     gate_data(),
                 )
 
-        untradable_exit_reason = self.recent_untradable_exit_cooldown_reason(
-            model_name,
-            decision,
-        )
-        if untradable_exit_reason:
+        dynamic_exit = apply_dynamic_exit(decision, exit_positions)
+        if not dynamic_exit.eligible:
             return PolicyGateResult.block(
-                "untradable_exit_cooldown",
-                untradable_exit_reason,
-                gate_data(),
+                "dynamic_exit_policy",
+                dynamic_exit.reason,
+                {**gate_data(), "dynamic_exit_policy": dynamic_exit.to_dict()},
             )
-
-        if not arbitration.bypass_partial_guard:
-            loss_partial_reason = self.loss_partial_guard_reason(
-                model_name,
-                decision,
-                exit_positions,
-            )
-            if loss_partial_reason:
-                return PolicyGateResult.block(
-                    "loss_partial_exit_guard",
-                    loss_partial_reason,
-                    gate_data(),
-                )
-
-        if not arbitration.bypass_cooldown:
-            recent_exit_reason = self.recent_exit_cooldown_reason(model_name, decision)
-            if recent_exit_reason:
-                return PolicyGateResult.block(
-                    "recent_exit_cooldown",
-                    recent_exit_reason,
-                    gate_data(),
-                )
-
-        if not arbitration.bypass_profit_precheck:
-            profit_exit_guard_reason = await self.pre_execution_profit_guard_reason(
-                decision,
-                exit_positions,
-            )
-            if profit_exit_guard_reason:
-                return PolicyGateResult.block(
-                    "profit_exit_precheck",
-                    profit_exit_guard_reason,
-                    gate_data(),
-                )
-
-        if not arbitration.bypass_fee_churn_guard:
-            guard_reason = await self.fee_churn_guard_reason(model_name, decision)
-            if guard_reason:
-                return PolicyGateResult.block(
-                    "exit_fee_churn_guard",
-                    guard_reason,
-                    gate_data(),
-                )
-
-        stale_reason = self.stale_decision_reason(decision)
-        if stale_reason:
-            return PolicyGateResult.block("stale_decision", stale_reason, gate_data())
 
         return PolicyGateResult.allow(
             {
                 "intent": "exit",
                 "target_side": "long" if decision.action == Action.CLOSE_LONG else "short",
                 "pipeline_context": context.public_data(),
-                "exit_arbitration": arbitration_data,
+                "dynamic_exit_policy": dynamic_exit.to_dict(),
             }
         )

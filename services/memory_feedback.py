@@ -8,10 +8,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
-from services.trading_params import DEFAULT_TRADING_PARAMS
 
 SIDES = ("long", "short")
-ENTRY_RISK_SIZING_PARAMS = DEFAULT_TRADING_PARAMS.entry_risk_sizing
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -122,7 +120,7 @@ class MemoryFeedbackPolicy:
             side: self._side_feedback(side, side_memories)
             for side, side_memories in side_rows.items()
         }
-        preferred = self._preferred_side(by_side)
+        preferred = "neutral"
         return {
             "enabled": bool(memories),
             "preferred_side_by_memory": preferred,
@@ -130,7 +128,7 @@ class MemoryFeedbackPolicy:
             "decision_habit": self._decision_habit(by_side, preferred),
             "policy": (
                 "Shadow and cost-incomplete memories are observation-only. Only authoritative "
-                "fee-after outcomes may tighten risk; memory never grants a production probe."
+                "fee-after outcomes may tighten risk; memory never grants production permission."
             ),
         }
 
@@ -190,10 +188,6 @@ class MemoryFeedbackPolicy:
         downside_scale = max(abs(worst_return), abs(avg_return), 1e-9)
         return_quality = return_lcb / downside_scale if count else 0.0
         utility = (return_quality + pnl_efficiency) / 2.0
-        credibility = math.sqrt(count) / (math.sqrt(count) + 1.0) if count else 0.0
-        score_adjustment = min(math.tanh(utility) * credibility, 0.0)
-        risk_dominant = bool(count and return_lcb < 0.0)
-
         return {
             "side": side,
             "memory_count": len(memories),
@@ -212,13 +206,9 @@ class MemoryFeedbackPolicy:
             "worst_net_return_pct": round(worst_return, 6),
             "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
             "utility": round(utility, 6),
-            "score_adjustment": round(score_adjustment, 6),
+            "score_adjustment": 0.0,
             "candidate_score_bonus": 0.0,
-            "allow_probe": False,
-            "action_bias": (
-                "require_stronger_confirmation" if risk_dominant else "fee_after_observation_only"
-            ),
-            "max_probe_size_pct": 0.0,
+            "action_bias": "fee_after_observation_only",
             "expected_return_hint_pct": 0.0,
             "missed_return_evidence_count": 0,
             "missed_avg_return_pct": 0.0,
@@ -233,47 +223,22 @@ class MemoryFeedbackPolicy:
         side_habits: dict[str, dict[str, Any]] = {}
         for side in SIDES:
             item = _safe_dict(by_side.get(side))
-            strict = bool(item.get("canonical_outcome_count") and _safe_float(item.get("return_lcb_pct")) < 0)
             side_habits[side] = {
-                "stance": "strict_confirm" if strict else "fee_after_observation_only",
+                "stance": "fee_after_observation_only",
                 "proactive_level": 0.0,
-                "probe_budget_pct": 0.0,
                 "expected_return_hint_pct": 0.0,
-                "score_adjustment": _safe_float(item.get("score_adjustment")),
+                "score_adjustment": 0.0,
                 "return_lcb_pct": item.get("return_lcb_pct"),
                 "canonical_outcome_count": item.get("canonical_outcome_count", 0),
                 "cost_complete": bool(item.get("cost_complete")),
-                "reason": (
-                    "authoritative fee-after return lower bound is negative"
-                    if strict
-                    else "memory is observation-only and cannot authorize production probes"
-                ),
+                "reason": "memory is observation-only and cannot change production actions",
             }
-        conservative = [
-            side for side, habit in side_habits.items() if habit["stance"] == "strict_confirm"
-        ]
         return {
-            "posture": "defensive_selective" if conservative else "neutral",
-            "preferred_side": preferred_side,
-            "active_probe_sides": [],
-            "conservative_sides": conservative,
+            "posture": "observation_only",
+            "preferred_side": "neutral",
+            "conservative_sides": [],
             "by_side": side_habits,
             "rule": (
-                "Memory cannot grant probes. Negative authoritative fee-after lower bounds "
-                "tighten risk; current dynamic strategy must independently authorize entries."
+                "Memory cannot grant or modify trades, direction, sizing, leverage, exits, or routing."
             ),
         }
-
-    @staticmethod
-    def _preferred_side(by_side: dict[str, dict[str, Any]]) -> str:
-        long_item = _safe_dict(by_side.get("long"))
-        short_item = _safe_dict(by_side.get("short"))
-        long_count = _safe_int(long_item.get("canonical_outcome_count"), 0)
-        short_count = _safe_int(short_item.get("canonical_outcome_count"), 0)
-        if not long_count and not short_count:
-            return "neutral"
-        long_lcb = _safe_float(long_item.get("return_lcb_pct")) if long_count else -math.inf
-        short_lcb = _safe_float(short_item.get("return_lcb_pct")) if short_count else -math.inf
-        if long_lcb == short_lcb:
-            return "neutral"
-        return "long" if long_lcb > short_lcb else "short"

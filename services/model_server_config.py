@@ -17,11 +17,8 @@ MODEL_SERVER_HOST_KEY = f"{MODEL_SERVER_PREFIX}.host"
 MODEL_SERVER_PORT_KEY = f"{MODEL_SERVER_PREFIX}.port"
 MODEL_SERVER_USERNAME_KEY = f"{MODEL_SERVER_PREFIX}.username"
 MODEL_SERVER_PASSWORD_KEY = f"{MODEL_SERVER_PREFIX}.password"
-MODEL_SERVER_ACTIVE_PROFILE_KEY = f"{MODEL_SERVER_PREFIX}.active_profile"
 MODEL_SERVER_SECURE_SOURCE = Path("<secure_settings>")
 MODEL_SERVER_CONFIG_MESSAGE = "请在系统设置 > 模型服务器 中配置服务器连接信息。"
-DEFAULT_MODEL_SERVER_PROFILE = "custom"
-MODEL_SERVER_PROFILE_CHOICES = {"custom", "old", "new"}
 
 
 class ModelServerConfigError(RuntimeError):
@@ -43,7 +40,6 @@ class ModelServerSettingsPayload:
     password_configured: bool
     masked_password: str
     updated_at: str | None
-    active_profile: str = DEFAULT_MODEL_SERVER_PROFILE
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -54,7 +50,6 @@ class ModelServerSettingsPayload:
             "password_configured": self.password_configured,
             "masked_password": self.masked_password,
             "updated_at": self.updated_at,
-            "active_profile": self.active_profile,
         }
 
 
@@ -68,9 +63,6 @@ async def get_model_server_settings_public() -> ModelServerSettingsPayload:
             port_text = (await service.get_secret(MODEL_SERVER_PORT_KEY) or "").strip()
             username = (await service.get_secret(MODEL_SERVER_USERNAME_KEY) or "").strip()
             password = await service.get_secret(MODEL_SERVER_PASSWORD_KEY)
-            active_profile = _normalize_profile(
-                await service.get_secret(MODEL_SERVER_ACTIVE_PROFILE_KEY)
-            )
             public_password = await service.public(MODEL_SERVER_PASSWORD_KEY)
     except SecureSettingsError as exc:
         raise ModelServerConfigError(str(exc)) from exc
@@ -85,7 +77,6 @@ async def get_model_server_settings_public() -> ModelServerSettingsPayload:
         password_configured=bool(password),
         masked_password=mask_secret(password or "") if password else "",
         updated_at=public_password.updated_at if public_password else None,
-        active_profile=active_profile,
     )
 
 
@@ -96,7 +87,6 @@ async def save_model_server_settings(
     username: str,
     password: str | None,
     actor: str = "dashboard",
-    active_profile: str = DEFAULT_MODEL_SERVER_PROFILE,
 ) -> ModelServerSettingsPayload:
     """Validate and persist model-server settings in encrypted storage."""
 
@@ -111,11 +101,6 @@ async def save_model_server_settings(
         await service.set_secret(MODEL_SERVER_HOST_KEY, info.host, actor=actor)
         await service.set_secret(MODEL_SERVER_PORT_KEY, str(info.port), actor=actor)
         await service.set_secret(MODEL_SERVER_USERNAME_KEY, info.username, actor=actor)
-        await service.set_secret(
-            MODEL_SERVER_ACTIVE_PROFILE_KEY,
-            _normalize_profile(active_profile),
-            actor=actor,
-        )
         if str(password or "").strip() and not is_masked_secret(str(password or "")):
             await service.set_secret(MODEL_SERVER_PASSWORD_KEY, info.password, actor=actor)
 
@@ -258,8 +243,3 @@ def _safe_port_or_none(value: str) -> int | None:
     if port <= 0 or port > 65535:
         return None
     return port
-
-
-def _normalize_profile(value: str | None) -> str:
-    profile = str(value or "").strip().lower()
-    return profile if profile in MODEL_SERVER_PROFILE_CHOICES else DEFAULT_MODEL_SERVER_PROFILE

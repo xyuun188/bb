@@ -702,7 +702,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
         lambda: FakeLocalAIToolsClient(),
     )
 
-    async def fake_shadow(_limit: int) -> list[dict[str, Any]]:
+    async def fake_shadow(_limit: int | None = None) -> list[dict[str, Any]]:
         return [
             {
                 "symbol": "BTC/USDT",
@@ -721,19 +721,19 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_trade_reflection_samples",
-        lambda _limit: _async_value([]),
+        lambda _limit=None: _async_value([]),
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_authoritative_trade_samples",
-        lambda _limit: _async_value([]),
+        lambda _limit=None: _async_value([]),
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_sequence_samples",
-        lambda _limit: _async_value([]),
+        lambda _limit=None: _async_value([]),
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_text_sentiment_samples",
-        lambda _limit: _async_value([]),
+        lambda _limit=None: _async_value([]),
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._completed_shadow_sample_count",
@@ -752,12 +752,16 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert captured["kwargs"]["confirm_phase3_rebuild"] is True
     assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
     assert captured["kwargs"]["promotion_recommendation"]["policy"] == (
-        "phase3_shadow_to_canary_to_live"
+        "2026-07-12.return-distribution-promotion.v1"
     )
-    assert result["profit_first_report"]["evidence_source"] == "phase3_training_samples"
+    assert result["return_objective_report"]["objective_name"] == (
+        "maximize_expected_realized_net_return_after_cost"
+    )
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is True
-    assert result["promotion_recommendation"]["policy"] == "phase3_shadow_to_canary_to_live"
+    assert result["promotion_recommendation"]["policy"] == (
+        "2026-07-12.return-distribution-promotion.v1"
+    )
     assert result["promotion_recommendation"]["live_ready"] is False
 
 

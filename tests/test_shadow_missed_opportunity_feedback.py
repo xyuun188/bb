@@ -57,9 +57,8 @@ def test_missed_opportunity_memory_feedback_remains_observation_only() -> None:
 
     long_side = feedback["by_side"]["long"]
     habit = feedback["decision_habit"]["by_side"]["long"]
-    assert long_side["allow_probe"] is False
     assert long_side["candidate_score_bonus"] == 0.0
     assert long_side["canonical_outcome_count"] == 0
     assert habit["stance"] == "fee_after_observation_only"
     assert habit["proactive_level"] == 0.0
-    assert habit["probe_budget_pct"] == 0.0
+    assert habit["score_adjustment"] == 0.0

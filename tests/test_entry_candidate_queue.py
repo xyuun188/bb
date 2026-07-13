@@ -70,7 +70,7 @@ def test_entry_candidate_queue_ranks_by_opportunity_score() -> None:
     assert reasons_seen == [("BTC/USDT", 1, 3), ("SOL/USDT", 2, 3), ("ETH/USDT", 3, 3)]
 
 
-def test_entry_candidate_queue_prefers_diversifying_candidate_when_slots_are_scarce() -> None:
+def test_entry_candidate_queue_strategy_context_cannot_override_return_order() -> None:
     def score_candidate(decision: DecisionOutput, strategy: dict[str, Any] | None) -> float:
         return float(decision.raw_response["test_score"])
 
@@ -136,14 +136,16 @@ def test_entry_candidate_queue_prefers_diversifying_candidate_when_slots_are_sca
         },
     )
 
-    assert [item.candidate[0] for item in ranked] == ["ETH/USDT", "BTC/USDT"]
-    top_queue = ranked[0].candidate[2].raw_response["opportunity_score"]["portfolio_queue"]
-    assert "diversification_bonus" in top_queue["reasons"]
-    assert "roster_fill_bonus" in top_queue["reasons"]
-    assert top_queue["adjusted_score"] > top_queue["base_score"]
+    assert [item.candidate[0] for item in ranked] == ["BTC/USDT", "ETH/USDT"]
+    top_queue = ranked[0].candidate[2].raw_response["opportunity_score"][
+        "authoritative_queue"
+    ]
+    assert top_queue["score"] == 1.02
+    assert top_queue["policy"] == "fee_after_return_lcb_minus_expected_downside_only"
+    assert "portfolio_queue" not in ranked[0].candidate[2].raw_response["opportunity_score"]
 
 
-def test_entry_candidate_queue_penalizes_duplicate_symbol_followups() -> None:
+def test_entry_candidate_queue_does_not_apply_duplicate_symbol_penalty() -> None:
     def score_candidate(decision: DecisionOutput, strategy: dict[str, Any] | None) -> float:
         return float(decision.raw_response["test_score"])
 
@@ -207,10 +209,12 @@ def test_entry_candidate_queue_penalizes_duplicate_symbol_followups() -> None:
         },
     )
 
-    assert [item.candidate[0] for item in ranked] == ["BTC/USDT", "SOL/USDT", "BTC/USDT"]
-    duplicate_queue = ranked[2].candidate[2].raw_response["opportunity_score"]["portfolio_queue"]
-    assert "duplicate_symbol_penalty" in duplicate_queue["reasons"]
-    assert duplicate_queue["adjusted_score"] < duplicate_queue["base_score"]
+    assert [item.candidate[0] for item in ranked] == ["BTC/USDT", "BTC/USDT", "SOL/USDT"]
+    assert [item.score for item in ranked] == [1.10, 1.09, 1.00]
+    for item in ranked:
+        opportunity = item.candidate[2].raw_response["opportunity_score"]
+        assert "portfolio_queue" not in opportunity
+        assert opportunity["authoritative_queue"]["score"] == item.score
 
 
 def test_trading_service_entry_candidate_queue_delegates_to_policy() -> None:

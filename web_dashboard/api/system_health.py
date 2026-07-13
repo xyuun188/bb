@@ -19,7 +19,7 @@ from models.decision import AIDecision
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.trade import Order
-from services.entry_symbol_blocklist import UNTRADABLE_EXCHANGE_ERROR_MARKERS
+from services.execution_result_classifier import UNTRADABLE_EXCHANGE_ERROR_MARKERS
 from services.server_monitor_status import (
     clear_server_monitor_cache,
     get_server_monitor_status_async,
@@ -68,12 +68,6 @@ HANDLED_TERMINAL_FAILURE_MARKERS = tuple(
     str(marker).lower()
     for marker in (
         *UNTRADABLE_EXCHANGE_ERROR_MARKERS,
-        "已暂时跳过该交易对",
-        "系统已暂时跳过该交易对",
-        "避免重复分析和下单",
-        "entry_symbol_blocklist",
-        "untradable_symbol",
-        "known_untradable_symbol",
     )
 )
 

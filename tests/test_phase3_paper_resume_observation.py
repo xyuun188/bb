@@ -115,7 +115,7 @@ def test_paper_resume_observation_is_healthy_when_samples_and_gates_pass() -> No
     assert report["starts_trading_service"] is False
     assert report["submits_orders"] is False
     assert report["blockers"] == []
-    assert "post_resume_shadow_samples_accumulating" in report["passed_checks"]
+    assert "post_resume_shadow_counts_are_diagnostic_only" in report["passed_checks"]
 
 
 def test_paper_resume_observation_waits_when_paper_is_inactive() -> None:
@@ -201,16 +201,17 @@ def test_paper_resume_observation_blocks_on_okx_pull_timeout_when_runtime_is_not
     }
 
 
-def test_paper_resume_observation_warms_up_when_samples_are_missing() -> None:
+def test_paper_resume_observation_does_not_use_fixed_sample_floors() -> None:
     report = evaluate_phase3_paper_resume_observation_inputs(
         **_ready_inputs(sample_summary=_samples(created_shadow_count=1, completed_shadow_count=0))
     )
 
-    assert report["status"] == "warming_up"
-    assert report["can_use_for_promotion"] is False
+    assert report["status"] == "healthy"
+    assert report["can_use_for_promotion"] is True
     codes = {item["code"] for item in report["warnings"]}
-    assert "post_resume_shadow_sample_floor_not_met" in codes
-    assert "post_resume_completed_shadow_floor_not_met" in codes
+    assert "post_resume_shadow_sample_floor_not_met" not in codes
+    assert "post_resume_completed_shadow_floor_not_met" not in codes
+    assert "post_resume_shadow_counts_are_diagnostic_only" in report["passed_checks"]
 
 
 def test_paper_resume_observation_treats_active_paper_preflight_as_consumed() -> None:
@@ -286,8 +287,6 @@ async def test_paper_resume_observation_cli_drops_runtime_user_before_collection
         "parse_args",
         lambda: SimpleNamespace(
             observation_hours=2,
-            min_created_shadow_samples=5,
-            min_completed_shadow_samples=1,
             report_max_age_seconds=7200,
             json_indent=0,
             output_dir=None,

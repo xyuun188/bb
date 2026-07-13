@@ -28,9 +28,10 @@ def test_phase3_rebuild_readiness_blocks_when_clean_training_inputs_are_weak() -
     assert report["writes_artifacts"] is False
     assert report["can_run_confirmed_rebuild"] is False
     assert report["can_persist_artifact"] is False
-    assert "shadow_sample_floor_not_met" in report["blockers"]
-    assert "trade_sample_floor_not_met" in report["blockers"]
+    assert "shadow_sample_floor_not_met" not in report["blockers"]
+    assert "trade_sample_floor_not_met" not in report["blockers"]
     assert "no_clean_closed_trade_facts" in report["blockers"]
+    assert report["sample_floor"]["distribution_requirement"]
     assert report["target_artifacts"]["ml_signal"]["can_persist_artifact"] is False
     assert report["next_action"] == "run_preflight_until_blockers_clear"
 

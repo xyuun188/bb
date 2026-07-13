@@ -4,17 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from services.entry_wick_guard import ABNORMAL_WICK_ENTRY_BLOCK_MAX_PCT
-from services.trading_params import DEFAULT_TRADING_PARAMS
-
-_ENTRY_MARKET_DATA_PARAMS = DEFAULT_TRADING_PARAMS.entry_market_data_quality
-ENTRY_PRICE_FIELD_SPLIT_BLOCK_PCT = _ENTRY_MARKET_DATA_PARAMS.price_field_split_block_pct
-ENTRY_PRICE_24H_RANGE_TOLERANCE_PCT = _ENTRY_MARKET_DATA_PARAMS.price_24h_range_tolerance_pct
-ENTRY_DATA_STALE_ZERO_RETURNS_MIN_24H_CHANGE = (
-    _ENTRY_MARKET_DATA_PARAMS.stale_zero_returns_min_24h_change
-)
-DEFAULT_MAX_SLIPPAGE_PCT = _ENTRY_MARKET_DATA_PARAMS.default_max_slippage_pct
-
 
 @dataclass(frozen=True, slots=True)
 class MarketDataQualityIssue:
@@ -55,12 +44,8 @@ class EntryMarketDataQualityPolicy:
         self,
         *,
         market_value_reader: Callable[[Any, str, Any], Any] | None = None,
-        max_slippage_pct_provider: Callable[[], float] | None = None,
     ) -> None:
         self.market_value_reader = market_value_reader or MarketValueReader().read
-        self.max_slippage_pct_provider = max_slippage_pct_provider or (
-            lambda: DEFAULT_MAX_SLIPPAGE_PCT
-        )
 
     def reason(self, source: Any, *, stage_label: str = "下单前") -> str | None:
         issue = self.issue(source, stage_label=stage_label)
@@ -89,10 +74,8 @@ class EntryMarketDataQualityPolicy:
         for checker in (
             self._price_source_split_issue,
             self._outside_24h_range_issue,
-            self._spread_issue,
             self._depth_issue,
             self._stale_zero_returns_issue,
-            self._abnormal_wick_issue,
         ):
             issue = checker(snapshot, price, stage_label)
             if issue:
@@ -124,8 +107,6 @@ class EntryMarketDataQualityPolicy:
             "bid_depth": self._read_float(source, "orderbook_bid_depth"),
             "ask_depth": self._read_float(source, "orderbook_ask_depth"),
             "imbalance": self._read_float(source, "orderbook_imbalance"),
-            "abnormal_wick_count": int(self._read_float(source, "abnormal_wick_count_72h")),
-            "abnormal_wick_max": self._read_float(source, "abnormal_wick_max_pct"),
         }
 
     def _read_float(self, source: Any, key: str) -> float:
@@ -149,11 +130,34 @@ class EntryMarketDataQualityPolicy:
         ]
         if len(reference_prices) < 2:
             return None
-        min_ref = min(reference_prices)
-        max_ref = max(reference_prices)
-        split = (max_ref - min_ref) / max(min_ref, 1e-12)
-        if split < ENTRY_PRICE_FIELD_SPLIT_BLOCK_PCT:
-            return None
+        bid = float(snapshot["bid"])
+        ask = float(snapshot["ask"])
+        if bid > 0 and ask > 0:
+            if bid > ask:
+                return self._issue(
+                    "crossed_bid_ask",
+                    stage_label,
+                    f"盘口结构无效：买一 {bid:g} 高于卖一 {ask:g}，本次不执行新开仓。",
+                    snapshot,
+                )
+            spread_width = ask - bid
+            lower_bound = bid - spread_width
+            upper_bound = ask + spread_width
+            outliers = [
+                value
+                for value in (float(snapshot["current_price"]), float(snapshot["close_price"]))
+                if value > 0 and not lower_bound <= value <= upper_bound
+            ]
+            if not outliers:
+                return None
+            mid = max((ask + bid) / 2.0, 1e-12)
+            split = max(abs(value - mid) / mid for value in outliers)
+        else:
+            min_ref = min(reference_prices)
+            max_ref = max(reference_prices)
+            if min_ref == max_ref:
+                return None
+            split = (max_ref - min_ref) / max(min_ref, 1e-12)
         return self._issue(
             "price_source_split",
             stage_label,
@@ -176,9 +180,7 @@ class EntryMarketDataQualityPolicy:
         low_24h = float(snapshot["low_24h"])
         if high_24h <= 0 or low_24h <= 0 or high_24h < low_24h:
             return None
-        range_floor = low_24h * (1.0 - ENTRY_PRICE_24H_RANGE_TOLERANCE_PCT)
-        range_ceiling = high_24h * (1.0 + ENTRY_PRICE_24H_RANGE_TOLERANCE_PCT)
-        if range_floor <= price <= range_ceiling:
+        if low_24h <= price <= high_24h:
             return None
         return self._issue(
             "price_outside_24h_range",
@@ -192,39 +194,8 @@ class EntryMarketDataQualityPolicy:
             {
                 **snapshot,
                 "reference_price": price,
-                "range_floor": round(range_floor, 12),
-                "range_ceiling": round(range_ceiling, 12),
-            },
-        )
-
-    def _spread_issue(
-        self,
-        snapshot: dict[str, float | int],
-        _price: float,
-        stage_label: str,
-    ) -> MarketDataQualityIssue | None:
-        bid = float(snapshot["bid"])
-        ask = float(snapshot["ask"])
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return None
-        spread = (ask - bid) / max((ask + bid) / 2.0, 1e-12)
-        threshold = max(
-            _safe_float(self.max_slippage_pct_provider(), DEFAULT_MAX_SLIPPAGE_PCT) * 2.0,
-            0.012,
-        )
-        if spread <= threshold:
-            return None
-        return self._issue(
-            "spread_too_wide",
-            stage_label,
-            (
-                f"盘口价差过大：买一 {bid:g} / 卖一 {ask:g}，"
-                f"价差约 {spread * 100:.2f}%，容易产生明显滑点，本次不执行新开仓。"
-            ),
-            {
-                **snapshot,
-                "spread_pct": round(spread * 100, 6),
-                "threshold_pct": round(threshold * 100, 6),
+                "range_floor": round(low_24h, 12),
+                "range_ceiling": round(high_24h, 12),
             },
         )
 
@@ -237,7 +208,7 @@ class EntryMarketDataQualityPolicy:
         bid_depth = float(snapshot["bid_depth"])
         ask_depth = float(snapshot["ask_depth"])
         imbalance = float(snapshot["imbalance"])
-        if (bid_depth > 0 and ask_depth > 0) or abs(imbalance) < 0.98:
+        if bid_depth > 0 and ask_depth > 0:
             return None
         return self._issue(
             "orderbook_depth_invalid",
@@ -264,7 +235,7 @@ class EntryMarketDataQualityPolicy:
         if not all_short_returns_zero:
             return None
         change_24h_pct = float(snapshot["change_24h_pct"])
-        if abs(change_24h_pct) < ENTRY_DATA_STALE_ZERO_RETURNS_MIN_24H_CHANGE * 100:
+        if change_24h_pct == 0:
             return None
         return self._issue(
             "short_cycle_features_missing",
@@ -273,27 +244,6 @@ class EntryMarketDataQualityPolicy:
                 "短周期行情特征疑似缺失：1/5/20周期收益率和波动率都为0，"
                 f"但24小时涨跌幅为 {change_24h_pct:.2f}%。"
                 "本次不把不完整行情送入开仓执行。"
-            ),
-            snapshot,
-        )
-
-    def _abnormal_wick_issue(
-        self,
-        snapshot: dict[str, float | int],
-        _price: float,
-        stage_label: str,
-    ) -> MarketDataQualityIssue | None:
-        if not (
-            int(snapshot["abnormal_wick_count"]) > 0
-            and float(snapshot["abnormal_wick_max"]) >= ABNORMAL_WICK_ENTRY_BLOCK_MAX_PCT
-        ):
-            return None
-        return self._issue(
-            "abnormal_wick_entry_block",
-            stage_label,
-            (
-                f"检测到近72小时异常插针，最大振幅约 {float(snapshot['abnormal_wick_max']):.2f}%，"
-                "该币种容易出现非连续成交价格，本次不执行新开仓。"
             ),
             snapshot,
         )

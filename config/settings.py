@@ -25,7 +25,6 @@ DECISION_MAKER_NAME = "decision_maker"
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
 RUNTIME_ENV_REFRESH_MIN_SECONDS = 2.0
-DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL = 20
 
 FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     {
@@ -313,21 +312,12 @@ class Settings(BaseSettings):
     okx_live_api_key: str = ""
     okx_live_api_secret: str = ""
     okx_live_passphrase: str = ""
-    # Backward compatibility: old unified fields
-    okx_api_key: str = ""
-    okx_api_secret: str = ""
-    okx_passphrase: str = ""
-    okx_demo: bool = True
     okx_proxy: str = ""
 
     # --- AI API (OpenAI-compatible) ---
     # Per-model AI configurations (list of dicts from AI_MODELS env var)
     # Each element: {"name": "gpt-5.4", "api_base": "...", "api_key": "...", "model": "...", "balance": 1000}
     ai_models: Annotated[list[dict], NoDecode] = Field(default_factory=list)
-    # Backward compatibility: fallback for single-model setups
-    ai_api_base: str = ""
-    ai_api_key: str = ""
-    ai_model: str = "qwen3-32b-trade"
     local_ai_tools_enabled: bool = False
     local_ai_tools_api_base: str = ""
     local_ai_tools_api_key: str = ""
@@ -363,29 +353,13 @@ class Settings(BaseSettings):
     model_initial_balances: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
     execution_account_name: str = "多专家执行账户"
     execution_account_balances: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
-    execution_account_max_loss_pct: Annotated[dict[str, float], NoDecode] = Field(
-        default_factory=dict
-    )
-    execution_account_max_loss_usdt: Annotated[dict[str, float], NoDecode] = Field(
-        default_factory=dict
-    )
-    execution_account_cooldown_loss_pct: Annotated[dict[str, float], NoDecode] = Field(
-        default_factory=lambda: {"paper": 0.5, "live": 0.5}
-    )
     decision_interval_seconds: int = 60
-    confidence_threshold: float = 0.50
     auto_scan_symbol_limit: int = 20
     market_analysis_watchdog_seconds: int = 180
     position_analysis_watchdog_seconds: int = 180
-    max_open_positions_per_model: int = DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
-    max_same_symbol_positions_per_side: int = 2
-    min_entry_adx: float = 15.0
-    min_entry_volume_ratio: float = 0.2
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
-    expert_memory_per_prompt: int = 4
     shadow_memory_enabled: bool = True
-    shadow_memory_min_return_pct: float = 0.40
     ai_llm_concurrency: int = 2
     ai_llm_call_delay_seconds: float = 0.15
     ai_expert_timeout_seconds: float = 30.0
@@ -398,13 +372,9 @@ class Settings(BaseSettings):
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0
     strategy_learning_llm_candidates_enabled: bool = True
-    strategy_learning_min_trade_count_target: int = 8
     strategy_learning_llm_candidate_interval_seconds: int = 21600
     strategy_learning_llm_candidate_timeout_seconds: float = 20.0
     strategy_learning_llm_candidate_max_tokens: int = 360
-    ai_market_fast_prefilter_enabled: bool = True
-    ai_market_fast_prefilter_min_expected_return_pct: float = 0.03
-    ai_market_fast_prefilter_max_loss_probability: float = 0.58
     sentiment_blocking_timeout_seconds: float = 6.0
     cryptopanic_api_key: str = ""
     coinmarketcal_api_key: str = ""
@@ -423,19 +393,10 @@ class Settings(BaseSettings):
     vector_memory_max_documents: int = 20000
     vector_memory_decision_index_limit: int = 1200
     vector_memory_news_index_limit: int = 1500
-    vector_memory_min_score: float = 0.18
     vector_memory_auto_reindex_enabled: bool = True
     vector_memory_auto_reindex_interval_seconds: int = 1800
 
     # --- Risk Management ---
-    max_position_pct: float = 0.25
-    max_total_margin_pct: float = 0.0  # 0 = use legacy max_position_pct * 3
-    max_leverage: float = 20.0
-    max_daily_loss_pct: float = 0.05
-    max_slippage_pct: float = 0.005
-    hard_stop_loss_pct: float = 0.05
-    trailing_stop_activation: float = 0.03
-    trailing_stop_distance: float = 0.015
 
     # --- Web Dashboard ---
     dashboard_port: int = 8002
@@ -490,15 +451,13 @@ class Settings(BaseSettings):
     def get_okx_credentials(self, mode: str | None = None) -> dict[str, str]:
         """Return OKX credentials for the given mode ("paper" or "live").
 
-        Paper may use legacy unified fields for backward compatibility.
-        Live must use live-specific fields so demo/global credentials cannot
-        accidentally unlock real-exchange mode.
+        Paper and live credentials are isolated and must be configured explicitly.
         """
         m = mode or self.trading_mode.value
         if m == "paper":
-            key = self.okx_paper_api_key or self.okx_api_key
-            secret = self.okx_paper_api_secret or self.okx_api_secret
-            passphrase = self.okx_paper_passphrase or self.okx_passphrase
+            key = self.okx_paper_api_key
+            secret = self.okx_paper_api_secret
+            passphrase = self.okx_paper_passphrase
         else:  # live
             key = self.okx_live_api_key
             secret = self.okx_live_api_secret
@@ -547,17 +506,6 @@ class Settings(BaseSettings):
     def parse_external_event_scraper_sources(cls, v: Any) -> list[dict[str, Any]]:
         return parse_external_event_scraper_sources_value(v)
 
-    @field_validator("max_open_positions_per_model", mode="before")
-    @classmethod
-    def normalize_max_open_positions_per_model(cls, v: Any) -> int:
-        try:
-            value = int(float(v))
-        except (TypeError, ValueError):
-            return DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
-        if value <= 0:
-            return DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
-        return value
-
     def dashboard_allowed_origins(self) -> list[str]:
         """Return explicit Dashboard CORS origins without wildcard credentials."""
         if self.dashboard_cors_origins:
@@ -584,9 +532,6 @@ class Settings(BaseSettings):
 
     @field_validator(
         "execution_account_balances",
-        "execution_account_max_loss_pct",
-        "execution_account_max_loss_usdt",
-        "execution_account_cooldown_loss_pct",
         mode="before",
     )
     @classmethod
@@ -625,22 +570,14 @@ class Settings(BaseSettings):
             for m in self.ai_models
             if isinstance(m, dict) and m.get("name")
         }
-        fixed_names = {slot["name"] for slot in FIXED_AI_MODEL_SLOTS}
-        has_fixed_config = any(name in configured_by_name for name in fixed_names)
-        legacy_cfg = None
-        if not has_fixed_config:
-            legacy_cfg = next(
-                (dict(m) for m in self.ai_models if isinstance(m, dict) and m.get("api_key")),
-                None,
-            )
         result: list[dict[str, Any]] = []
         for slot in FIXED_AI_MODEL_SLOTS:
-            cfg = dict(configured_by_name.get(slot["name"], legacy_cfg or {}))
+            cfg = dict(configured_by_name.get(slot["name"], {}))
             merged = {
                 **slot,
-                "api_base": cfg.get("api_base", self.ai_api_base),
-                "api_key": cfg.get("api_key") or self.ai_api_key,
-                "model": cfg.get("model", self.ai_model),
+                "api_base": str(cfg.get("api_base") or "").strip(),
+                "api_key": str(cfg.get("api_key") or "").strip(),
+                "model": str(cfg.get("model") or "").strip(),
                 "enabled": bool(cfg.get("enabled", True)),
             }
             if "balance" in cfg:
@@ -656,21 +593,6 @@ class Settings(BaseSettings):
             raise ValueError(f"Unknown fixed AI model slot: {name}")
 
         current = {m.get("name"): dict(m) for m in self.ai_models if isinstance(m, dict)}
-        fixed_names = set(slots_by_name)
-        has_fixed_config = any(slot_name in current for slot_name in fixed_names)
-        if not has_fixed_config:
-            legacy_cfg = next(
-                (dict(m) for m in self.ai_models if isinstance(m, dict) and m.get("api_key")),
-                {},
-            )
-            for slot in FIXED_AI_MODEL_SLOTS:
-                current[slot["name"]] = {
-                    **legacy_cfg,
-                    "name": slot["name"],
-                    "role": slot["role"],
-                    "label": slot["label"],
-                    "weight": slot["weight"],
-                }
         existing = current.get(name, {})
         slot = slots_by_name[name]
         updated = {
@@ -680,10 +602,10 @@ class Settings(BaseSettings):
             "label": slot["label"],
             "weight": slot["weight"],
             "api_base": str(
-                updates.get("api_base", existing.get("api_base", self.ai_api_base)) or ""
+                updates.get("api_base", existing.get("api_base", "")) or ""
             ).strip(),
             "api_key": str(updates.get("api_key", existing.get("api_key", "")) or "").strip(),
-            "model": str(updates.get("model", existing.get("model", self.ai_model)) or "").strip(),
+            "model": str(updates.get("model", existing.get("model", "")) or "").strip(),
             "enabled": bool(updates.get("enabled", existing.get("enabled", True))),
         }
         current[name] = updated
@@ -706,16 +628,11 @@ class Settings(BaseSettings):
     def get_execution_account_config(self, mode: str = "paper") -> dict[str, Any]:
         """Return the mode-specific execution account quota and risk settings."""
         mode = "live" if mode == "live" else "paper"
-        max_loss_pct = self.execution_account_max_loss_pct.get(mode, self.max_daily_loss_pct)
-        max_loss_usdt = self.execution_account_max_loss_usdt.get(mode, 0.0)
         return {
             "mode": mode,
             "account_name": self.execution_account_name,
             "internal_model_name": ENSEMBLE_TRADER_NAME,
             "allocated_balance": None,
-            "max_loss_pct": max_loss_pct,
-            "max_loss_usdt": max_loss_usdt,
-            "cooldown_loss_pct": self.execution_account_cooldown_loss_pct.get(mode, 0.5),
         }
 
     def to_safe_dict(self) -> dict[str, Any]:

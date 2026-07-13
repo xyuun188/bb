@@ -12,12 +12,13 @@ from scripts.install_specialist_shadow_evaluation_timer import (
 
 
 def test_specialist_shadow_evaluation_service_is_read_only_oneshot() -> None:
-    service = render_service(hours=72, limit=500)
+    service = render_service(hours=72)
 
     assert "Type=oneshot" in service
     assert "User=bb" in service
     assert "scripts/run_specialist_shadow_evaluation.py" in service
-    assert "--hours 72 --limit 500" in service
+    assert "--hours 72" in service
+    assert "--limit" not in service
     assert f"--output-dir {REPORT_DIR}" in service
     assert "bb-paper-trading.service" not in service
     assert "systemctl start" not in service
@@ -33,7 +34,7 @@ def test_specialist_shadow_evaluation_timer_runs_periodically() -> None:
 
 
 def test_specialist_shadow_evaluation_install_command_keeps_paper_inactive_probe() -> None:
-    command = install_command(minutes=30, hours=168, limit=2000)
+    command = install_command(minutes=30, hours=168)
 
     assert SERVICE_NAME in command
     assert TIMER_NAME in command

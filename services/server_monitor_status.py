@@ -140,7 +140,7 @@ def primary_provider_model_id() -> str:
         model = str(cfg.get("model") or "").strip()
         if model:
             return model
-    return str(settings.ai_model or "").strip()
+    return ""
 
 
 def _host_from_api_base(value: Any) -> str:
@@ -1251,7 +1251,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             result = await _probe_platform_json(
                 client,
                 f"{api_base}/models",
-                api_key=str(cfg.get("api_key") or settings.ai_api_key or ""),
+                api_key=str(cfg.get("api_key") or ""),
             )
             models = _model_ids_from_models_response(result.get("data"))
             lowered = model.lower()
@@ -1416,11 +1416,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 result = await _probe_platform_json(
                     client,
                     f"{hr_base}/models",
-                    api_key=str(
-                        getattr(settings, "high_risk_review_api_key", "")
-                        or getattr(settings, "ai_api_key", "")
-                        or ""
-                    ),
+                    api_key=str(getattr(settings, "high_risk_review_api_key", "") or ""),
                 )
                 models = _model_ids_from_models_response(result.get("data"))
                 lowered = hr_model.lower()

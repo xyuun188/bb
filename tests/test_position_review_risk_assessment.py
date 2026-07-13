@@ -58,17 +58,12 @@ async def test_position_review_risk_assessment_filters_model_positions() -> None
             "decision": decision,
             "current_positions": [{"model_name": "ensemble_trader", "symbol": "BTC/USDT"}],
             "account_balance": 456.0,
-            "headlines": ["risk headline"],
-            "sentiment_scores": [],
-            "price_change_1m": -0.01,
-            "volume_ratio": 1.4,
-            "adx_14": 22.0,
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_position_review_risk_assessment_uses_feature_defaults() -> None:
+async def test_position_review_risk_assessment_does_not_forward_strategy_features() -> None:
     risk_engine = FakeRiskEngine()
     policy = PositionReviewRiskAssessmentPolicy(risk_engine)
 
@@ -81,10 +76,7 @@ async def test_position_review_risk_assessment_uses_feature_defaults() -> None:
     )
 
     call = risk_engine.calls[0]
-    assert call["headlines"] == []
-    assert call["price_change_1m"] == 0.0
-    assert call["volume_ratio"] == 1.0
-    assert call["adx_14"] is None
+    assert set(call) == {"decision", "current_positions", "account_balance"}
 
 
 async def _balance(model_name: str, value: float) -> float:

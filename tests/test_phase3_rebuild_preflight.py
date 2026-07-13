@@ -114,10 +114,6 @@ async def test_phase3_rebuild_preflight_is_read_only_and_lists_commands(
     _patch_preflight_inputs(monkeypatch)
 
     report = await preflight.collect_phase3_rebuild_preflight(
-        shadow_limit=500,
-        trade_limit=80,
-        sequence_limit=12,
-        text_limit=7,
         local_ai_tools_base_url="http://127.0.0.1:8001",
     )
 
@@ -129,7 +125,10 @@ async def test_phase3_rebuild_preflight_is_read_only_and_lists_commands(
     assert report["readiness"]["can_run_confirmed_rebuild"] is True
     assert report["readiness"]["can_persist_artifact"] is False
     assert report["paper_observation_report"]["status"] == "healthy"
-    assert report["profit_first_report"]["evidence_source"] == "phase3_training_samples"
+    assert report["return_objective_report"]["objective_name"] == (
+        "maximize_expected_realized_net_return_after_cost"
+    )
+    assert "profit_first_report" not in report
     assert "paper_observation_report_missing" not in report["promotion_recommendation"][
         "canary_blocking_reasons"
     ]
@@ -174,10 +173,6 @@ async def test_phase3_rebuild_preflight_blocks_unconfirmed_artifact_write(
     _patch_preflight_inputs(monkeypatch)
 
     report = await preflight.collect_phase3_rebuild_preflight(
-        shadow_limit=500,
-        trade_limit=80,
-        sequence_limit=12,
-        text_limit=7,
         requested_persist_artifact=True,
         confirm_phase3_rebuild=False,
     )
@@ -195,10 +190,6 @@ async def test_phase3_rebuild_preflight_reports_confirmed_rebuild_gate(
     _patch_preflight_inputs(monkeypatch)
 
     report = await preflight.collect_phase3_rebuild_preflight(
-        shadow_limit=500,
-        trade_limit=80,
-        sequence_limit=12,
-        text_limit=7,
         requested_persist_artifact=True,
         confirm_phase3_rebuild=True,
     )
@@ -228,12 +219,7 @@ async def test_phase3_rebuild_preflight_returns_structured_blocked_report_on_col
     monkeypatch.setattr(preflight, "_artifact_retirement_report", fail_artifact_report)
     monkeypatch.setattr(preflight, "_runtime_probe_report", _fake_runtime_report)
 
-    report = await preflight.collect_phase3_rebuild_preflight(
-        shadow_limit=1,
-        trade_limit=1,
-        sequence_limit=1,
-        text_limit=1,
-    )
+    report = await preflight.collect_phase3_rebuild_preflight()
 
     assert report["status"] == "blocked"
     assert report["read_only"] is True
@@ -263,10 +249,6 @@ async def test_phase3_rebuild_preflight_cli_writes_report_artifacts(
             "Args",
             (),
             {
-                "shadow_limit": 500,
-                "trade_limit": 80,
-                "sequence_limit": 12,
-                "text_limit": 7,
                 "historical_audit_days": 180,
                 "historical_audit_limit": 5000,
                 "include_runtime_probe": False,
@@ -305,10 +287,6 @@ async def test_phase3_rebuild_preflight_cli_stdout_only_does_not_write_report(
             "Args",
             (),
             {
-                "shadow_limit": 500,
-                "trade_limit": 80,
-                "sequence_limit": 12,
-                "text_limit": 7,
                 "historical_audit_days": 180,
                 "historical_audit_limit": 5000,
                 "include_runtime_probe": False,

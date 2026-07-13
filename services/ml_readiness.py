@@ -8,17 +8,7 @@ from services.return_objective import (
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
 )
-from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import DATA_QUALITY_VERSION
-
-_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
-
-
-ML_READINESS_MIN_SAMPLE_COUNT = _PARAMS.influence_min_sample_count
-ML_READINESS_MIN_TEST_COUNT = _PARAMS.influence_min_test_count
-ML_READINESS_MAX_DIRTY_SAMPLE_RATIO = _PARAMS.readiness_max_dirty_sample_ratio
-ML_READINESS_MAX_MODEL_AGE_SECONDS = _PARAMS.readiness_max_model_age_seconds
-ML_READINESS_MIN_TOP_RETURN_PCT = _PARAMS.positive_net_return_threshold_pct
 
 
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -80,15 +70,6 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
     top_profit_factor = _safe_float(metrics.get(f"top_{side}_profit_factor"), None)
     top_tail_loss = _safe_float(metrics.get(f"top_{side}_tail_loss_rate"), None)
     bottom_tail_loss = _safe_float(metrics.get(f"bottom_{side}_tail_loss_rate"), None)
-    if top_return <= ML_READINESS_MIN_TOP_RETURN_PCT:
-        blockers.append(
-            _reason(
-                f"{side}_top_return_below_threshold",
-                f"{side} top-score bucket return is not strong enough.",
-                actual=round(top_return, 4),
-                required=ML_READINESS_MIN_TOP_RETURN_PCT,
-            )
-        )
     if top_return <= bottom_return:
         blockers.append(
             _reason(
@@ -159,8 +140,6 @@ def _side_profit_quality_diagnostics(
         else round(top_return - bottom_return, 6)
     )
     diagnosis: list[str] = []
-    if top_return is not None and top_return <= ML_READINESS_MIN_TOP_RETURN_PCT:
-        diagnosis.append("top_score_bucket_not_fee_after_profitable")
     if spread is not None and spread <= 0:
         diagnosis.append("top_score_bucket_not_better_than_bottom")
     if top_return_lcb is None or top_return_lcb <= 0:
@@ -216,6 +195,9 @@ def build_ml_readiness_report(
     objective_name = metadata.get("objective_name")
     objective_version = metadata.get("objective_version")
     label_version = metadata.get("label_version")
+    training_cost_policy = str(metadata.get("training_cost_policy") or "")
+    tail_loss_policy = _safe_dict(metadata.get("tail_loss_policy"))
+    tail_loss_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
 
     global_blockers: list[dict[str, Any]] = []
     if objective_name != RETURN_OBJECTIVE_NAME or objective_version != RETURN_OBJECTIVE_VERSION:
@@ -236,22 +218,49 @@ def build_ml_readiness_report(
                 required=RETURN_LABEL_VERSION,
             )
         )
-    if sample_count < ML_READINESS_MIN_SAMPLE_COUNT:
+    if training_cost_policy != "per_sample_live_spread_fee_and_funding_complete":
         global_blockers.append(
             _reason(
-                "sample_count_below_threshold",
-                "Training sample count is below the influence threshold.",
-                actual=sample_count,
-                required=ML_READINESS_MIN_SAMPLE_COUNT,
+                "artifact_cost_policy_incomplete",
+                "Artifact was not trained from per-sample live spread, fee, and funding costs.",
+                actual=training_cost_policy or "missing",
+                required="per_sample_live_spread_fee_and_funding_complete",
             )
         )
-    if test_count < ML_READINESS_MIN_TEST_COUNT:
+    for side in ("long", "short"):
+        side_policy = _safe_dict(tail_loss_policy.get(side))
+        scale = _safe_float(tail_loss_scales.get(side), None)
+        required_provenance = {
+            "source",
+            "observation_window",
+            "sample_count",
+            "generated_at",
+            "strategy_version",
+            "fallback_reason",
+        }
+        if not required_provenance.issubset(side_policy) or scale is None or scale <= 0:
+            global_blockers.append(
+                _reason(
+                    f"{side}_dynamic_tail_policy_incomplete",
+                    f"{side} dynamic tail-loss policy metadata is incomplete.",
+                    actual={"policy": side_policy, "scale_pct": scale},
+                    required="complete empirical policy provenance and positive artifact scale",
+                )
+            )
+    if sample_count <= 0:
         global_blockers.append(
             _reason(
-                "test_count_below_threshold",
-                "Holdout test sample count is below the influence threshold.",
+                "training_distribution_missing",
+                "Training return distribution is missing.",
+                actual=sample_count,
+            )
+        )
+    if test_count <= 0:
+        global_blockers.append(
+            _reason(
+                "holdout_distribution_missing",
+                "Holdout return distribution is missing.",
                 actual=test_count,
-                required=ML_READINESS_MIN_TEST_COUNT,
             )
         )
     side_blockers = {side: _side_metric_blockers(metrics, side) for side in ("long", "short")}
@@ -263,15 +272,6 @@ def build_ml_readiness_report(
         side: not bool(blockers) and bool(_safe_dict(influence.get(side)).get("enabled", True))
         for side, blockers in side_blockers.items()
     }
-    if dirty_ratio > ML_READINESS_MAX_DIRTY_SAMPLE_RATIO:
-        global_blockers.append(
-            _reason(
-                "dirty_sample_ratio_high",
-                "Excluded/downweighted sample ratio is too high for live influence.",
-                actual=round(dirty_ratio, 4),
-                required=ML_READINESS_MAX_DIRTY_SAMPLE_RATIO,
-            )
-        )
     if data_quality_version != DATA_QUALITY_VERSION:
         global_blockers.append(
             _reason(
@@ -281,13 +281,11 @@ def build_ml_readiness_report(
                 required=DATA_QUALITY_VERSION,
             )
         )
-    if age_seconds is None or age_seconds > ML_READINESS_MAX_MODEL_AGE_SECONDS:
+    if age_seconds is None:
         global_blockers.append(
             _reason(
-                "model_stale",
-                "Model is too old or missing a valid trained_at timestamp.",
-                actual=None if age_seconds is None else round(age_seconds, 1),
-                required=ML_READINESS_MAX_MODEL_AGE_SECONDS,
+                "model_training_timestamp_missing",
+                "Model is missing a valid trained_at timestamp.",
             )
         )
 
@@ -305,11 +303,7 @@ def build_ml_readiness_report(
         ]
     )
     maturity_blocked = any(
-        item["code"]
-        in {
-            "sample_count_below_threshold",
-            "test_count_below_threshold",
-        }
+        item["code"] in {"training_distribution_missing", "holdout_distribution_missing"}
         for item in blockers
     )
     if partial_live_influence_allowed:
@@ -323,16 +317,6 @@ def build_ml_readiness_report(
     else:
         state = "learning_only"
 
-    min_new_samples = (
-        _PARAMS.auto_train_min_new_samples
-        if state == "ready"
-        else _PARAMS.auto_train_learning_only_min_new_samples
-    )
-    min_interval_seconds = (
-        _PARAMS.auto_train_min_interval_seconds
-        if state == "ready"
-        else _PARAMS.auto_train_learning_only_interval_seconds
-    )
     return {
         "state": state,
         "allow_live_position_influence": partial_live_influence_allowed,
@@ -341,18 +325,21 @@ def build_ml_readiness_report(
         "blocking_reasons": blockers,
         "profit_quality_diagnostics": profit_quality_diagnostics,
         "next_training_conditions": {
-            "min_interval_seconds": min_interval_seconds,
-            "min_new_samples": min_new_samples,
-            "min_training_samples": _PARAMS.min_training_samples,
-            "min_influence_samples": ML_READINESS_MIN_SAMPLE_COUNT,
-            "min_test_samples": ML_READINESS_MIN_TEST_COUNT,
+            "trigger": "new_authoritative_cost_complete_sample_or_data_contract_change",
         },
         "thresholds": {
-            "min_top_return_pct": ML_READINESS_MIN_TOP_RETURN_PCT,
             "min_top_return_lcb_pct": 0.0,
             "min_top_profit_factor": 1.0,
-            "max_dirty_sample_ratio": ML_READINESS_MAX_DIRTY_SAMPLE_RATIO,
-            "max_model_age_seconds": ML_READINESS_MAX_MODEL_AGE_SECONDS,
+            "threshold_policy": "profitability_math_boundaries_and_empirical_confidence_intervals",
+        },
+        "policy_provenance": {
+            "source": "artifact_holdout_fee_after_return_distribution",
+            "observation_window": "artifact_train_and_holdout_windows",
+            "sample_count": sample_count,
+            "test_sample_count": test_count,
+            "generated_at": (now or datetime.now(UTC)).isoformat(),
+            "strategy_version": "2026-07-12.ml-readiness-return-lcb.v1",
+            "fallback_reason": "" if sample_count > 0 and test_count > 0 else "distribution_missing",
         },
         "metrics": {
             "sample_count": sample_count,
@@ -424,18 +411,21 @@ def disabled_ml_readiness(reason_code: str, message: str) -> dict[str, Any]:
         "allow_live_position_influence": False,
         "blocking_reasons": [_reason(reason_code, message)],
         "next_training_conditions": {
-            "min_interval_seconds": _PARAMS.auto_train_learning_only_interval_seconds,
-            "min_new_samples": _PARAMS.auto_train_learning_only_min_new_samples,
-            "min_training_samples": _PARAMS.min_training_samples,
-            "min_influence_samples": ML_READINESS_MIN_SAMPLE_COUNT,
-            "min_test_samples": ML_READINESS_MIN_TEST_COUNT,
+            "trigger": "new_authoritative_cost_complete_sample_or_data_contract_change",
         },
         "thresholds": {
-            "min_top_return_pct": ML_READINESS_MIN_TOP_RETURN_PCT,
             "min_top_return_lcb_pct": 0.0,
             "min_top_profit_factor": 1.0,
-            "max_dirty_sample_ratio": ML_READINESS_MAX_DIRTY_SAMPLE_RATIO,
-            "max_model_age_seconds": ML_READINESS_MAX_MODEL_AGE_SECONDS,
+            "threshold_policy": "profitability_math_boundaries_and_empirical_confidence_intervals",
+        },
+        "policy_provenance": {
+            "source": "artifact_holdout_fee_after_return_distribution",
+            "observation_window": "artifact_train_and_holdout_windows",
+            "sample_count": 0,
+            "test_sample_count": 0,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "strategy_version": "2026-07-12.ml-readiness-return-lcb.v1",
+            "fallback_reason": reason_code,
         },
         "metrics": {
             "sample_count": 0,

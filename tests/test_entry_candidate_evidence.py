@@ -1,300 +1,107 @@
-from types import SimpleNamespace
-from typing import Any
+from dataclasses import dataclass
+
+import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
-from services.trading_service import TradingService
 
 
-def _feature() -> SimpleNamespace:
-    feature = SimpleNamespace(symbol="BTC/USDT", current_price=100.0)
-    feature.to_dict = lambda: {"current_price": 100.0}
-    return feature
+@dataclass
+class _Feature:
+    symbol: str = "BTC/USDT"
+
+    def to_dict(self) -> dict:
+        return {"current_price": 100.0, "bid": 99.99, "ask": 100.01}
 
 
-def _policy(
-    opportunities: dict[str, dict[str, Any]],
-    scores: dict[str, float],
-) -> EntryCandidateEvidencePolicy:
-    def score_candidate(
-        decision: DecisionOutput,
-        strategy: dict[str, Any] | None,
-    ) -> float:
-        side = "long" if decision.action == Action.LONG else "short"
-        assert strategy == {"mode": "test"}
-        assert decision.raw_response["pre_ai_candidate_evidence"] is True
-        assert decision.raw_response["direction_competition"]["preferred_side"] == "long"
-        decision.raw_response["opportunity_score"] = dict(opportunities[side])
-        return scores[side]
+def _score(decision: DecisionOutput, _strategy: dict | None) -> float:
+    is_long = decision.action == Action.LONG
+    expected_net = 0.8 if is_long else 0.3
+    return_lcb = 0.5 if is_long else 0.1
+    raw = dict(decision.raw_response)
+    raw["opportunity_score"] = {
+        "score": return_lcb - 0.05,
+        "score_policy": "fee_after_return_lcb_minus_expected_downside",
+        "expected_net_return_pct": expected_net,
+        "return_lcb_pct": return_lcb,
+        "return_uncertainty_pct": expected_net - return_lcb,
+        "expected_loss_pct": 0.05,
+        "profit_quality_ratio": expected_net / 0.05,
+        "server_profit_loss_probability": 0.2,
+        "tail_risk_score": 0.1,
+        "production_eligible": True,
+        "execution_cost": {"production_eligible": True, "total_pct": 0.05},
+        "policy_provenance": {
+            "source": "test_return_distribution",
+            "observation_window": "test_window",
+            "sample_count": 2,
+            "generated_at": "2026-07-12T00:00:00+00:00",
+            "strategy_version": "test.v1",
+            "fallback_reason": "",
+        },
+    }
+    decision.raw_response = raw
+    return return_lcb - 0.05
 
+
+def _policy(score=_score) -> EntryCandidateEvidencePolicy:
     return EntryCandidateEvidencePolicy(
         model_name="ensemble_trader",
-        score_candidate=score_candidate,
+        score_candidate=score,
         feature_opportunity_score=lambda _feature: 3.14159,
     )
 
 
-def test_candidate_evidence_builds_high_profit_long_side_and_compacts_history() -> None:
-    profile = {
-        "count": "3",
-        "pnl": 12.34567,
-        "today_pnl": 2.0,
-        "wins": 2,
-        "losses": 1,
-        "profit_factor": 2.4,
-        "largest_loss": -1.25,
-        "first_closed_at": "2026-06-08T10:00:00+00:00",
-        "last_closed_at": "2026-06-09T10:00:00+00:00",
-        "last_loss_at": "2026-06-08T11:00:00+00:00",
-        "last_loss_age_hours": 23.5,
-        "lookback_days": 14,
-        "cooldown": False,
-        "cooldown_reason": "not active",
-    }
-    opportunities = {
-        "long": {
-            "expected_net_return_pct": 1.4,
-            "tail_risk_score": 0.5,
-            "server_profit_loss_probability": 0.3,
-            "profit_quality_ratio": 1.3,
-            "min_score_required": 0.7,
-            "local_profit_aligned": True,
-            "reward_risk_ratio": 2.0,
-            "symbol_profile": profile,
-            "symbol_side_profile": profile,
-        },
-        "short": {
-            "expected_net_return_pct": 0.2,
-            "tail_risk_score": 0.75,
-            "server_profit_loss_probability": 0.52,
-            "profit_quality_ratio": 0.4,
-            "min_score_required": 0.7,
-        },
-    }
+def test_candidate_evidence_prefers_highest_positive_fee_after_lcb() -> None:
+    evidence = _policy().build(_Feature(), {}, {}, {}, {}, {})
 
-    evidence = _policy(opportunities, {"long": 1.35, "short": 0.75}).build(
-        _feature(),
-        {"mode": "test"},
-        {"predictions": []},
-        {"profit_prediction": {}},
-        {"preferred_side": "long"},
-    )
-
-    assert evidence["feature_opportunity_score"] == 3.1416
     assert evidence["preferred_side_by_evidence"] == "long"
-    assert evidence["long"]["high_profit_potential"] is True
-    assert (
-        evidence["long"]["recommendation"] == "high_profit_candidate_allow_larger_size_and_leverage"
-    )
-    assert evidence["short"]["recommendation"] == "tradable_if_ai_thesis_confirms"
-    assert evidence["long"]["symbol_side_profile"]["last_closed_at"] == (
-        "2026-06-09T10:00:00+00:00"
-    )
-    assert evidence["long"]["symbol_side_profile"]["pnl"] == 12.3457
+    assert evidence["long"]["production_eligible"] is True
+    assert evidence["long"]["return_lcb_pct"] > evidence["short"]["return_lcb_pct"]
+    assert evidence["feature_opportunity_score"] == pytest.approx(3.14159)
+    assert evidence["read_only"] is True
+    assert evidence["is_entry_gate"] is False
 
 
-def test_candidate_evidence_marks_low_quality_side_as_tiny_probe_only() -> None:
-    opportunities = {
-        "long": {
-            "expected_net_return_pct": -0.1,
-            "tail_risk_score": 0.4,
-            "server_profit_loss_probability": 0.5,
-            "profit_quality_ratio": 0.5,
-            "min_score_required": 0.7,
-        },
-        "short": {
+def test_memory_feedback_is_observation_only_and_cannot_change_side_scores() -> None:
+    memory = {
+        "preferred_side_by_memory": "short",
+        "by_side": {"short": {"allow_probe": True, "score_adjustment": 100.0}},
+    }
+
+    evidence = _policy().build(_Feature(), {}, {}, {}, {}, memory)
+
+    assert evidence["preferred_side_by_evidence"] == "long"
+    assert evidence["memory_feedback_observation"] == memory
+    assert evidence["long"]["score"] == pytest.approx(0.45)
+    assert evidence["short"]["score"] == pytest.approx(0.05)
+    assert "memory_score_adjustment" not in evidence["policy_provenance"]
+
+
+def test_candidate_evidence_has_no_legacy_probe_contract() -> None:
+    evidence = _policy().build(_Feature(), {}, {}, {}, {}, {})
+
+    for side in ("long", "short"):
+        assert "probe_conversion_ready" not in evidence[side]
+        assert "probe_conversion_block_reasons" not in evidence[side]
+    assert "legacy_probe_permission_enabled" not in evidence["policy_provenance"]
+
+
+def test_no_positive_production_lcb_returns_neutral() -> None:
+    def ineligible_score(decision: DecisionOutput, _strategy: dict | None) -> float:
+        raw = dict(decision.raw_response)
+        raw["opportunity_score"] = {
+            "score": -0.2,
             "expected_net_return_pct": 0.1,
-            "tail_risk_score": 1.2,
-            "server_profit_loss_probability": 0.5,
-            "profit_quality_ratio": 0.6,
-            "min_score_required": 0.7,
-        },
-    }
+            "return_lcb_pct": -0.1,
+            "production_eligible": True,
+            "policy_provenance": {"sample_count": 1},
+        }
+        decision.raw_response = raw
+        return -0.2
 
-    evidence = _policy(opportunities, {"long": 0.2, "short": 0.22}).build(
-        _feature(),
-        {"mode": "test"},
-        {},
-        {},
-        {"preferred_side": "long"},
-    )
+    evidence = _policy(ineligible_score).build(_Feature(), {}, {}, {}, {}, {})
 
     assert evidence["preferred_side_by_evidence"] == "neutral"
-    assert evidence["long"]["recommendation"] == "hold_or_tiny_probe_only"
-    assert evidence["short"]["recommendation"] == "hold_or_tiny_probe_only"
-
-
-def test_candidate_evidence_ignores_untrusted_memory_probe_feedback() -> None:
-    opportunities = {
-        "long": {
-            "expected_net_return_pct": 0.35,
-            "tail_risk_score": 0.82,
-            "server_profit_loss_probability": 0.48,
-            "profit_quality_ratio": 0.35,
-            "min_score_required": 0.7,
-        },
-        "short": {
-            "expected_net_return_pct": 0.20,
-            "tail_risk_score": 0.8,
-            "server_profit_loss_probability": 0.50,
-            "profit_quality_ratio": 0.30,
-            "min_score_required": 0.7,
-        },
-    }
-    memory_feedback = {
-        "enabled": True,
-        "preferred_side_by_memory": "long",
-        "vector_memory": {
-            "enabled": True,
-            "status": "ok",
-            "matched_count": 1,
-            "policy": "三期相似样本只作为软证据调节和解释，不作为硬拦截。",
-            "hits": [{"score": 0.72, "action": "long", "outcome": "loss", "pnl_pct": -0.8}],
-        },
-        "decision_habit": {
-            "posture": "selective_probe",
-            "preferred_side": "long",
-            "active_probe_sides": ["long"],
-            "conservative_sides": [],
-            "by_side": {
-                "long": {
-                    "stance": "probe_when_ev_ok",
-                    "proactive_level": 0.5,
-                    "probe_budget_pct": 0.015,
-                    "min_expected_net_pct": 0.12,
-                    "max_loss_probability": 0.58,
-                    "max_tail_risk": 0.98,
-                }
-            },
-        },
-        "by_side": {
-            "long": {
-                "side": "long",
-                "candidate_score_bonus": 0.18,
-                "score_adjustment": 0.12,
-                "allow_probe": True,
-                "action_bias": "prefer_small_probe_when_current_ev_positive",
-                "missed_opportunity_count": 5,
-                "positive_evidence_count": 5,
-                "risk_evidence_count": 0,
-                "max_probe_size_pct": 0.015,
-            },
-            "short": {
-                "side": "short",
-                "candidate_score_bonus": 0.0,
-                "score_adjustment": 0.0,
-                "allow_probe": False,
-                "action_bias": "neutral",
-            },
-        },
-    }
-
-    evidence = _policy(opportunities, {"long": 0.52, "short": 0.51}).build(
-        _feature(),
-        {"mode": "test"},
-        {},
-        {},
-        {"preferred_side": "long"},
-        memory_feedback,
-    )
-
-    assert evidence["preferred_side_by_evidence"] == "neutral"
-    assert evidence["memory_feedback"]["preferred_side_by_memory"] == "long"
-    assert evidence["memory_feedback"]["vector_memory"]["status"] == "ok"
-    assert evidence["memory_feedback"]["vector_memory"]["matched_count"] == 1
-    assert evidence["memory_feedback"]["vector_memory"]["hits"][0]["pnl_pct"] == -0.8
-    assert evidence["memory_feedback"]["decision_habit"]["posture"] == "neutral"
-    assert evidence["memory_feedback"]["decision_habit"]["long"]["stance"] == (
-        "fee_after_observation_only"
-    )
-    assert evidence["memory_feedback"]["decision_habit"]["long"]["probe_budget_pct"] == 0.0
-    assert evidence["long"]["score_before_memory_feedback"] == 0.52
-    assert evidence["long"]["score"] == 0.52
-    assert evidence["long"]["expected_net_return_pct"] == 0.35
-    assert evidence["long"]["recommendation"] == "needs_stronger_ai_confirmation"
-    assert evidence["long"]["probe_conversion_ready"] is True
-    assert evidence["long"]["probe_conversion_block_reasons"] == []
-    assert evidence["long"]["review_feedback"]["missed_opportunity_count"] == 5
-
-
-def test_candidate_evidence_does_not_label_subthreshold_memory_as_probe_candidate() -> None:
-    opportunities = {
-        "long": {
-            "expected_net_return_pct": 0.34,
-            "tail_risk_score": 0.32,
-            "server_profit_loss_probability": 0.50,
-            "profit_quality_ratio": 0.45,
-            "min_score_required": 0.7,
-        },
-        "short": {
-            "expected_net_return_pct": -0.05,
-            "tail_risk_score": 0.7,
-            "server_profit_loss_probability": 0.55,
-            "profit_quality_ratio": -0.1,
-            "min_score_required": 0.7,
-        },
-    }
-    memory_feedback = {
-        "enabled": True,
-        "by_side": {
-            "long": {
-                "side": "long",
-                "candidate_score_bonus": 0.24,
-                "score_adjustment": 0.18,
-                "allow_probe": True,
-                "action_bias": "prefer_small_probe_when_current_ev_positive",
-                "missed_opportunity_count": 90,
-                "positive_evidence_count": 90,
-                "risk_evidence_count": 0,
-            }
-        },
-    }
-
-    evidence = _policy(opportunities, {"long": -0.8, "short": -1.2}).build(
-        _feature(),
-        {"mode": "test"},
-        {},
-        {},
-        {"preferred_side": "long"},
-        memory_feedback,
-    )
-
-    assert evidence["long"]["recommendation"] == "needs_stronger_ai_confirmation"
-    assert evidence["long"]["probe_conversion_ready"] is False
-    assert evidence["long"]["probe_conversion_block_reasons"] == [
-        "expected_net_below_probe_threshold"
-    ]
-    assert evidence["long"]["probe_conversion_thresholds"]["min_expected_net_return_pct"] == 0.35
-
-
-def test_trading_service_candidate_evidence_delegates_to_policy() -> None:
-    service = object.__new__(TradingService)
-
-    class FakeEntryPolicy:
-        def score_candidate(
-            self,
-            decision: DecisionOutput,
-            _strategy: dict[str, Any] | None,
-        ) -> float:
-            side = "long" if decision.action == Action.LONG else "short"
-            decision.raw_response["opportunity_score"] = {
-                "expected_net_return_pct": 0.8 if side == "long" else 0.1,
-                "tail_risk_score": 0.3,
-                "server_profit_loss_probability": 0.35,
-                "profit_quality_ratio": 1.0,
-                "min_score_required": 0.7,
-            }
-            return 0.9 if side == "long" else 0.3
-
-    service.entry_policy = FakeEntryPolicy()
-    evidence = service._ai_entry_candidate_evidence(
-        _feature(),
-        {},
-        {},
-        {},
-        {},
-    )
-
-    assert evidence["enabled"] is True
-    assert evidence["preferred_side_by_evidence"] == "long"
-    assert evidence["long"]["score"] == 0.9
+    assert evidence["long"]["production_eligible"] is False
+    assert evidence["short"]["production_eligible"] is False

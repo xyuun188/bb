@@ -6,8 +6,6 @@ from scripts import install_phase3_paper_resume_observation_timer as timer_scrip
 def test_phase3_paper_resume_observation_timer_service_is_read_only() -> None:
     service = timer_script.render_service(
         observation_hours=4,
-        min_created_shadow_samples=9,
-        min_completed_shadow_samples=3,
         report_max_age_seconds=3600,
     )
     timer = timer_script.render_timer(on_calendar="*-*-* *:07,37:00")
@@ -18,8 +16,8 @@ def test_phase3_paper_resume_observation_timer_service_is_read_only() -> None:
     assert "EnvironmentFile=/etc/bb/bb-runtime.env" in service
     assert "run_phase3_paper_resume_observation.py" in service
     assert "--observation-hours 4" in service
-    assert "--min-created-shadow-samples 9" in service
-    assert "--min-completed-shadow-samples 3" in service
+    assert "--min-created-shadow-samples" not in service
+    assert "--min-completed-shadow-samples" not in service
     assert "--report-max-age-seconds 3600" in service
     assert "bb-paper-trading.service" not in service
     assert "systemctl start" not in service

@@ -58,17 +58,6 @@ class OpenPositionsExecutionApplier:
     ) -> None:
         if execution_result.status != OrderStatus.FILLED:
             return
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        trade_plan = (
-            raw.get("profit_first_trade_plan")
-            if isinstance(raw.get("profit_first_trade_plan"), dict)
-            else {}
-        )
-        exit_plan = (
-            raw.get("profit_first_exit_plan")
-            if isinstance(raw.get("profit_first_exit_plan"), dict)
-            else {}
-        )
         side = "long" if decision.action == Action.LONG else "short"
         entry_exchange_order_id = self._entry_exchange_order_id(execution_result)
         existing = self._matching_entry_position(
@@ -87,8 +76,6 @@ class OpenPositionsExecutionApplier:
                 existing,
                 decision,
                 execution_result,
-                trade_plan,
-                exit_plan,
                 entry_exchange_order_id=entry_exchange_order_id,
                 add_execution=not is_replay,
             )
@@ -98,9 +85,6 @@ class OpenPositionsExecutionApplier:
             "quantity": execution_result.quantity,
             "price": execution_result.price,
             "exchange_order_id": entry_exchange_order_id,
-            "profit_first_exit_plan_id": (
-                exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
-            ),
         }
         open_positions.append(
             {
@@ -122,11 +106,6 @@ class OpenPositionsExecutionApplier:
                     else execution_result.price * (1 - decision.take_profit_pct)
                 ),
                 "is_open": True,
-                "profit_first_trade_plan": trade_plan,
-                "profit_first_exit_plan": exit_plan,
-                "profit_first_exit_plan_id": (
-                    exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
-                ),
                 "entry_exchange_order_id": entry_exchange_order_id,
                 "entry_legs": [entry_leg],
             }
@@ -159,8 +138,6 @@ class OpenPositionsExecutionApplier:
         position: dict[str, Any],
         decision: DecisionOutput,
         execution_result: ExecutionResult,
-        trade_plan: dict[str, Any],
-        exit_plan: dict[str, Any],
         *,
         entry_exchange_order_id: str,
         add_execution: bool,
@@ -184,11 +161,6 @@ class OpenPositionsExecutionApplier:
                         "quantity": execution_result.quantity,
                         "price": execution_result.price,
                         "exchange_order_id": entry_exchange_order_id,
-                        "profit_first_exit_plan_id": (
-                            exit_plan.get("exit_plan_id")
-                            or trade_plan.get("exit_plan_id")
-                            or ""
-                        ),
                     }
                 )
         position["symbol"] = decision.symbol
@@ -209,11 +181,6 @@ class OpenPositionsExecutionApplier:
             * (1 - decision.take_profit_pct)
         )
         position["is_open"] = True
-        position["profit_first_trade_plan"] = trade_plan
-        position["profit_first_exit_plan"] = exit_plan
-        position["profit_first_exit_plan_id"] = (
-            exit_plan.get("exit_plan_id") or trade_plan.get("exit_plan_id") or ""
-        )
         if entry_exchange_order_id:
             position["entry_exchange_order_id"] = self._merge_entry_order_ids(
                 position.get("entry_exchange_order_id"),

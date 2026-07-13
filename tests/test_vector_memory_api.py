@@ -60,7 +60,6 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
                 "enabled": settings.vector_memory_enabled,
                 "status": "ready" if settings.vector_memory_enabled else "disabled",
                 "configured_backend": settings.vector_memory_backend,
-                "min_score": settings.vector_memory_min_score,
             }
 
     def capture_update_env_file(self: object, updates: dict[str, str]) -> None:
@@ -69,7 +68,6 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
     monkeypatch.setattr(settings, "vector_memory_enabled", False)
     monkeypatch.setattr(settings, "vector_memory_backend", "auto")
-    monkeypatch.setattr(settings, "vector_memory_min_score", 0.18)
     monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
     monkeypatch.setattr(
         vector_memory_module,
@@ -82,7 +80,7 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/api/vector-memory/settings",
-            json={"enabled": True, "backend": "jsonl", "min_score": 0.33},
+            json={"enabled": True, "backend": "jsonl"},
         )
 
     assert response.status_code == 200
@@ -90,7 +88,6 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
     assert captured_updates[-1] == {
         "VECTOR_MEMORY_ENABLED": "true",
         "VECTOR_MEMORY_BACKEND": "jsonl",
-        "VECTOR_MEMORY_MIN_SCORE": "0.33",
     }
     assert reset_calls == 1
 

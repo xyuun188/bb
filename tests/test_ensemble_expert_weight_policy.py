@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
@@ -71,37 +69,61 @@ def _strong_long_opinions(
     }
 
 
+def _return_context(**extra: object) -> dict[str, object]:
+    provenance = {
+        "source": "test_authoritative_return_distribution",
+        "observation_window": "current_test_round",
+        "sample_count": 4,
+        "generated_at": "2026-07-12T00:00:00+00:00",
+        "strategy_version": "test",
+        "fallback_reason": "",
+    }
+    context: dict[str, object] = {
+        "entry_candidate_evidence": {
+            "preferred_side_by_evidence": "long",
+            "long": {
+                "production_eligible": True,
+                "expected_net_return_pct": 0.6,
+                "return_lcb_pct": 0.4,
+                "production_source_count": 2,
+                "policy_provenance": provenance,
+            },
+            "short": {
+                "production_eligible": False,
+                "expected_net_return_pct": -0.2,
+                "return_lcb_pct": -0.3,
+                "production_source_count": 2,
+                "policy_provenance": provenance,
+            },
+            "policy_provenance": provenance,
+        }
+    }
+    context.update(extra)
+    return context
+
+
 def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote() -> None:
-    decision = _coordinator().combine(_features(), {}, _strong_long_opinions())
+    decision = _coordinator().combine(_features(), _return_context(), _strong_long_opinions())
 
     assert decision.action == Action.LONG
-    weights = decision.raw_response["dynamic_expert_weights"]
-    assert weights["trend_expert"]["effective_weight"] == pytest.approx(0.33)
-    assert weights["momentum_expert"]["effective_weight"] == pytest.approx(0.33)
-    assert weights["sentiment_expert"]["effective_weight"] == pytest.approx(0.14)
-    assert weights["position_expert"]["effective_weight"] == pytest.approx(0.05)
-    assert weights["risk_expert"]["effective_weight"] == 0.0
+    assert "dynamic_expert_weights" not in decision.raw_response
 
     policy = decision.raw_response["expert_weight_policy"]
-    assert policy["mode"] == "no_position_entry_overlay"
-    assert "position_expert" in policy["entry_support_excluded_experts"]
-    assert "risk_expert" in policy["entry_support_excluded_experts"]
+    assert policy["mode"] == "market_entry"
 
-    support = decision.raw_response["entry_signal_support"]
-    assert "position_expert" in support["excluded_direction_experts"]
-    assert "risk_expert" in support["excluded_direction_experts"]
-    assert "position_expert" not in support["directional_support_experts"]
-    assert "risk_expert" not in support["directional_support_experts"]
+    candidate = decision.raw_response["authoritative_return_candidate"]
+    assert candidate["production_eligible"] is True
+    assert "legacy_expert_vote_permission_enabled" not in candidate
 
 
 def test_expert_diversity_policy_is_carried_into_ensemble_raw() -> None:
-    context = {
-        "_expert_diversity_policy": {
+    context = _return_context(
+        _expert_diversity_policy={
             "should_retry": True,
             "reason": "strong entry-candidate evidence requires independent confirmation",
             "objective_evidence": {"side": "long", "score": 3.5},
         }
-    }
+    )
     opinions = _strong_long_opinions()
     opinions["trend_expert"].raw_response = {
         "independent_expert_retry": True,
@@ -119,29 +141,29 @@ def test_expert_diversity_policy_is_carried_into_ensemble_raw() -> None:
     assert trend["provider_independent_expert_mode"] is True
 
 
-def test_risk_expert_hard_veto_blocks_new_entry_even_without_direction_weight() -> None:
+def test_risk_expert_text_cannot_grant_or_veto_production_entry() -> None:
     opinions = _strong_long_opinions(
         risk_action=Action.HOLD,
         risk_confidence=0.82,
         risk_reasoning="hard veto: prohibit entry because exchange/liquidity risk is extreme",
     )
 
-    decision = _coordinator().combine(_features(), {}, opinions)
+    decision = _coordinator().combine(_features(), _return_context(), opinions)
 
-    assert decision.action == Action.HOLD
+    assert decision.action == Action.LONG
     risk_policy = decision.raw_response["risk_expert_policy"]
-    assert risk_policy["hard_veto"] is True
-    assert risk_policy["score_discount_pct"] == 1.0
-    assert decision.raw_response["dynamic_expert_weights"]["risk_expert"]["effective_weight"] == 0.0
+    assert risk_policy["hard_veto"] is False
+    assert decision.raw_response["authoritative_return_candidate"]["production_eligible"] is True
 
 
-def test_non_hard_risk_caution_discounts_score_and_size_without_becoming_support() -> None:
+def test_non_hard_risk_caution_is_observation_only() -> None:
     coordinator = _coordinator()
     features = _features(volatility_20=0.07, spread_pct=0.0035)
-    baseline = coordinator.combine(features, {}, _strong_long_opinions())
+    context = _return_context()
+    baseline = coordinator.combine(features, context, _strong_long_opinions())
     cautious = coordinator.combine(
         features,
-        {},
+        context,
         _strong_long_opinions(
             risk_action=Action.HOLD,
             risk_confidence=0.84,
@@ -152,253 +174,42 @@ def test_non_hard_risk_caution_discounts_score_and_size_without_becoming_support
     assert cautious.action == Action.LONG
     risk_policy = cautious.raw_response["risk_expert_policy"]
     assert risk_policy["hard_veto"] is False
-    assert risk_policy["score_discount_pct"] > 0.0
-    assert risk_policy["score_after_discount"] < risk_policy["score_before_discount"]
-    assert cautious.position_size_pct < baseline.position_size_pct
-    assert cautious.raw_response["risk_expert_size_discount"]["applied"] is True
+    assert "score_discount_pct" not in risk_policy
+    assert "size_multiplier" not in risk_policy
+    assert cautious.position_size_pct == baseline.position_size_pct == 0.0
+    assert cautious.raw_response["authoritative_return_candidate"]["production_eligible"] is True
 
 
-def test_risk_expert_same_direction_does_not_unlock_entry_support_gate() -> None:
-    coordinator = _coordinator()
-    opinions = {
-        "trend_expert": _decision("trend_expert", Action.LONG, confidence=0.70),
-        "momentum_expert": _decision("momentum_expert", Action.HOLD, confidence=0.80),
-        "sentiment_expert": _decision("sentiment_expert", Action.HOLD, confidence=0.80),
-        "risk_expert": _decision("risk_expert", Action.LONG, confidence=0.95),
+def test_local_fallback_is_trace_only_and_has_zero_effective_weight() -> None:
+    opinions = _strong_long_opinions()
+    opinions["trend_expert"].raw_response = {
+        "local_fallback": True,
+        "production_eligible": False,
     }
 
-    allowed = coordinator._entry_signal_allowed(
-        Action.LONG,
-        opinions,
-        [{"consistency": "aligned"}, {"consistency": "aligned"}],
-        validation_adjustment=0.20,
-        disagreement=0.0,
-        context={},
+    decision = _coordinator().combine(_features(), _return_context(), opinions)
+
+    trend = next(
+        item for item in decision.raw_response["opinions"] if item["model_name"] == "trend_expert"
     )
+    assert decision.action == Action.LONG
+    assert trend["trace_only_fallback"] is True
+    assert trend["effective_weight"] == 0.0
+    assert trend["weight_policy"]["production_permission"] is False
 
-    assert allowed is False
 
-
-def test_same_provider_llm_roles_do_not_count_as_independent_entry_sources() -> None:
-    coordinator = _coordinator()
-    opinions = {
-        "trend_expert": _decision(
-            "trend_expert",
-            Action.LONG,
-            confidence=0.74,
-            provider_model="BB-FinQuant-Expert-14B",
-        ),
-        "momentum_expert": _decision(
-            "momentum_expert",
-            Action.LONG,
-            confidence=0.76,
-            provider_model="BB-FinQuant-Expert-14B",
-        ),
-        "sentiment_expert": _decision(
-            "sentiment_expert",
-            Action.LONG,
-            confidence=0.73,
-            provider_model="BB-FinQuant-Expert-14B",
-        ),
+def test_local_fallback_risk_opinion_cannot_veto_authoritative_return_entry() -> None:
+    opinions = _strong_long_opinions(risk_action=Action.SHORT, risk_confidence=0.99)
+    opinions["risk_expert"].raw_response = {
+        "local_fallback": True,
+        "production_eligible": False,
     }
 
-    allowed = coordinator._entry_signal_allowed(
-        Action.LONG,
-        opinions,
-        [{"consistency": "aligned"}, {"consistency": "aligned"}],
-        validation_adjustment=0.20,
-        disagreement=0.0,
-        context={},
+    decision = _coordinator().combine(_features(), _return_context(), opinions)
+
+    risk = next(
+        item for item in decision.raw_response["opinions"] if item["model_name"] == "risk_expert"
     )
-
-    assert allowed is False
-    policy = coordinator._expert_source_policy_from_decisions(opinions, Action.LONG, context={})
-    assert policy["directional_independent_source_count"] == 1
-    assert policy["technical_independent_source_count"] == 1
-    assert policy["independent_quant_support_count"] == 0
-
-
-def test_same_provider_llm_roles_need_independent_quant_support_to_enter() -> None:
-    coordinator = _coordinator()
-    opinions = {
-        "trend_expert": _decision(
-            "trend_expert",
-            Action.LONG,
-            confidence=0.74,
-            provider_model="BB-FinQuant-Expert-14B",
-        ),
-        "momentum_expert": _decision(
-            "momentum_expert",
-            Action.LONG,
-            confidence=0.76,
-            provider_model="BB-FinQuant-Expert-14B",
-        ),
-    }
-    context = {
-        "local_ai_tools": {
-            "enabled": True,
-            "profit_prediction": {
-                "available": True,
-                "best_side": "long",
-                "adjusted_long_return_pct": 0.32,
-                "adjusted_short_return_pct": -0.08,
-                "long_loss_probability": 0.34,
-            },
-            "time_series_prediction": {
-                "available": True,
-                "best_side": "long",
-                "expected_return_pct": 0.10,
-                "confidence": 0.12,
-            },
-        }
-    }
-
-    allowed = coordinator._entry_signal_allowed(
-        Action.LONG,
-        opinions,
-        [{"consistency": "aligned"}],
-        validation_adjustment=0.05,
-        disagreement=0.0,
-        context=context,
-    )
-
-    assert allowed is True
-    policy = coordinator._expert_source_policy_from_decisions(
-        opinions,
-        Action.LONG,
-        context=context,
-    )
-    assert policy["directional_independent_source_count"] == 1
-    assert policy["technical_independent_source_count"] == 1
-    assert policy["independent_quant_supports"] == ["server_profit_model", "time_series_model"]
-
-
-def test_quant_only_probe_does_not_hard_block_long_when_timeseries_opposes() -> None:
-    result = _coordinator()._quant_only_probe_evidence(
-        {},
-        {
-            "local_ai_tools": {
-                "profit_prediction": {
-                    "available": True,
-                    "best_side": "long",
-                    "adjusted_long_return_pct": 0.35,
-                    "adjusted_short_return_pct": -0.10,
-                    "long_loss_probability": 0.42,
-                },
-                "time_series_prediction": {
-                    "available": True,
-                    "best_side": "short",
-                    "expected_return_pct": 0.20,
-                    "confidence": 0.20,
-                },
-                "sentiment_analysis": {
-                    "available": True,
-                    "best_side": "long",
-                    "expected_return_pct": 0.40,
-                },
-            },
-            "market_regime": {"mode": "selloff_squeeze_down", "avoid_long": True},
-        },
-        [
-            {"model_name": "trend_expert", "action": "hold", "confidence": 0.80},
-            {"model_name": "momentum_expert", "action": "hold", "confidence": 0.78},
-        ],
-    )
-
-    assert result["allow"] is True
-    assert result["status"] == "quant_only_tiny_probe"
-    assert result["side"] == "long"
-
-
-def test_quant_only_probe_allows_tiny_short_when_quant_timeseries_and_direction_align() -> None:
-    result = _coordinator()._quant_only_probe_evidence(
-        {},
-        {
-            "local_ai_tools": {
-                "profit_prediction": {
-                    "available": True,
-                    "best_side": "short",
-                    "adjusted_short_return_pct": 0.28,
-                    "adjusted_long_return_pct": -0.12,
-                    "short_loss_probability": 0.46,
-                },
-                "time_series_prediction": {
-                    "available": True,
-                    "best_side": "short",
-                    "expected_return_pct": 0.12,
-                    "confidence": 0.12,
-                },
-            },
-            "direction_competition": {
-                "preferred_side": "short",
-                "score_gap": 0.18,
-                "short": {"score": 0.48},
-                "long": {"score": 0.12},
-            },
-        },
-        [
-            {"model_name": "trend_expert", "action": "hold", "confidence": 0.80},
-            {"model_name": "momentum_expert", "action": "hold", "confidence": 0.78},
-        ],
-    )
-
-    assert result["allow"] is True
-    assert result["status"] == "quant_only_tiny_probe"
-    assert result["side"] == "short"
-    assert result["supports"] == ["server_profit_model", "time_series_model"]
-    assert result["direction_preferred_side"] == "short"
-
-
-def test_ml_gate_allows_low_win_rate_when_fee_after_return_distribution_is_strong() -> None:
-    gate = _coordinator()._ml_profit_quality_entry_gate(
-        Action.LONG,
-        {
-            "ml_signal": {
-                "available": True,
-                "influence_enabled": True,
-                "influence_policy": {"long": {"enabled": True}},
-                "predictions": [
-                    {
-                        "long_expected_return_pct": 0.20,
-                        "short_expected_return_pct": -0.08,
-                        "long_lower_quantile_return_pct": 0.09,
-                        "long_win_rate": 0.35,
-                        "best_side": "long",
-                    }
-                ],
-            }
-        },
-        confidence=0.70,
-        min_confidence=0.65,
-    )
-
-    assert gate["allow"] is True
-    assert gate["status"] == "supported_by_profit_quality"
-    assert gate["diagnostic_win_rate"] == pytest.approx(0.35)
-
-
-def test_ml_gate_blocks_high_win_rate_when_fee_after_return_is_negative() -> None:
-    gate = _coordinator()._ml_profit_quality_entry_gate(
-        Action.LONG,
-        {
-            "ml_signal": {
-                "available": True,
-                "influence_enabled": True,
-                "influence_policy": {"long": {"enabled": True}},
-                "predictions": [
-                    {
-                        "long_expected_return_pct": -0.03,
-                        "short_expected_return_pct": -0.08,
-                        "long_lower_quantile_return_pct": -0.12,
-                        "long_win_rate": 0.80,
-                        "best_side": "long",
-                    }
-                ],
-            }
-        },
-        confidence=0.99,
-        min_confidence=0.65,
-    )
-
-    assert gate["allow"] is False
-    assert gate["status"] == "blocked_negative_expectancy"
+    assert decision.action == Action.LONG
+    assert risk["effective_weight"] == 0.0
+    assert decision.raw_response["risk_expert_policy"]["hard_veto"] is False

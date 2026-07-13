@@ -11,7 +11,7 @@ def _decision(action: Action = Action.HOLD) -> DecisionOutput:
         symbol="BTC/USDT",
         action=action,
         confidence=0.8,
-        reasoning="测试",
+        reasoning="test",
         position_size_pct=0.0,
         suggested_leverage=1.0,
         raw_response={},
@@ -26,24 +26,7 @@ def _policy() -> PositionReviewRiskAlertPolicy:
     )
 
 
-def test_position_review_risk_alert_requires_urgent_risk_opinion() -> None:
-    policy = _policy()
-    decision = _decision()
-    decision.raw_response = {
-        "opinions": [
-            {
-                "model_name": "risk_expert",
-                "action": "hold",
-                "confidence": 0.4,
-                "reasoning": "风险普通",
-            }
-        ]
-    }
-
-    assert policy.build_alert(decision, [{"side": "long"}]) is None
-
-
-def test_position_review_risk_alert_builds_and_attaches_context() -> None:
+def test_position_review_risk_alert_requires_governed_dynamic_exit() -> None:
     policy = _policy()
     decision = _decision(Action.CLOSE_LONG)
     decision.raw_response = {
@@ -51,10 +34,27 @@ def test_position_review_risk_alert_builds_and_attaches_context() -> None:
             {
                 "model_name": "risk_expert",
                 "action": "close_long",
-                "confidence": 0.76,
-                "reasoning": "止损风险扩大，需要立即处理",
+                "confidence": 1.0,
             }
         ]
+    }
+
+    assert policy.build_alert(decision, [{"side": "long"}]) is None
+
+
+def test_position_review_risk_alert_builds_observation_after_dynamic_exit() -> None:
+    policy = _policy()
+    decision = _decision(Action.CLOSE_LONG)
+    decision.raw_response = {
+        "close_evidence": {"dynamic_exit_policy": {"eligible": True}},
+        "opinions": [
+            {
+                "model_name": "risk_expert",
+                "action": "close_long",
+                "confidence": 0.76,
+                "reasoning": "risk observation",
+            }
+        ],
     }
 
     message = policy.build_alert(
@@ -64,11 +64,12 @@ def test_position_review_risk_alert_builds_and_attaches_context() -> None:
 
     assert message is not None
     assert "BTC/USDT" in message
-    assert "置信度=76%" in message
+    assert "(76%)" in message
     policy.attach(decision, message)
     assert policy.alert_context(decision) == {
         "message": message,
         "planned_action": "close_long",
+        "production_permission": False,
     }
 
 
@@ -96,26 +97,19 @@ def test_position_review_risk_alert_formats_execution_result_text() -> None:
         status=OrderStatus.REJECTED,
     )
 
-    assert "已执行完成" in policy.execution_result_text(
-        decision,
-        filled,
-        lambda _result: "unused",
+    assert "Execution filled" in policy.execution_result_text(
+        decision, filled, lambda _result: "unused"
     )
-    assert "原因=blocked" in policy.execution_result_text(
-        decision,
-        rejected,
-        lambda _result: "blocked",
+    assert "reason=blocked" in policy.execution_result_text(
+        decision, rejected, lambda _result: "blocked"
     )
 
 
 def test_position_review_risk_alert_detail_uses_original_alert_message() -> None:
-    policy = _policy()
-    decision = _decision(Action.CLOSE_LONG)
-
-    detail = policy.risk_event_detail(
-        decision,
+    detail = _policy().risk_event_detail(
+        _decision(Action.CLOSE_LONG),
         {"message": "risk message"},
         "done",
     )
 
-    assert detail == "risk message 系统动作=close_long。执行结果=done"
+    assert detail == "risk message System action=close_long. Execution result=done"

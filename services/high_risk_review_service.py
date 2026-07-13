@@ -62,13 +62,10 @@ class HighRiskReviewService:
         return self._circuit_open_until
 
     def api_key(self, api_base: str) -> str:
-        """Return the isolated reviewer key, falling back only when bases match exactly."""
+        """Return only the isolated reviewer key."""
         explicit = str(self._settings.high_risk_review_api_key or "").strip()
         if explicit:
             return explicit
-        primary_base = str(self._settings.ai_api_base or "").rstrip("/")
-        if primary_base and api_base.rstrip("/") == primary_base:
-            return str(self._settings.ai_api_key or "").strip()
         return ""
 
     def circuit_payload(self) -> dict[str, Any] | None:

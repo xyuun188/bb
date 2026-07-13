@@ -18,12 +18,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
-from config.settings import DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL, ENSEMBLE_TRADER_NAME, settings
+from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from db.repositories.decision_repo import DecisionRepository
@@ -43,11 +43,7 @@ from services.account_accounting_service import (
     balance_from_snapshot,
     tradeable_balance_from_snapshot,
 )
-from services.analysis_budget import (
-    POSITION_REVIEW_MAX_GROUPS_PER_ROUND,
-    POSITION_REVIEW_URGENT_EXIT_MARKERS,
-    AnalysisBudgetPolicy,
-)
+from services.analysis_budget import POSITION_REVIEW_MAX_GROUPS_PER_ROUND, AnalysisBudgetPolicy
 from services.analysis_services import MarketAnalysisService, PositionReviewService
 from services.daily_performance_service import DailyPerformanceService
 from services.daily_side_performance import DailySidePerformanceService
@@ -62,56 +58,32 @@ from services.decision_state import (
     decision_state_from_raw,
     is_decision_terminal_state,
 )
+from services.dynamic_exit_policy import apply_dynamic_exit
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
 from services.entry_candidate_queue import EntryCandidateQueuePolicy
 from services.entry_capacity import EntryCapacityPolicy
-from services.entry_crowded_side_cap import EntryCrowdedSideCapPolicy
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
-from services.entry_evidence_probe import EntryEvidenceProbePolicy
 from services.entry_execution_handoff import await_entry_execution_handoff
-from services.entry_existing_winner import EntryExistingWinnerContextPolicy
 from services.entry_feature_ranker import EntryFeatureRankerPolicy
 from services.entry_fee_provider import EntryFeeProvider
-from services.entry_high_risk_review import EntryHighRiskReviewGatePolicy
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
-from services.entry_loss_cooldown import EntryLossCooldownPolicy
 from services.entry_market_data_quality import (
     EntryMarketDataQualityPolicy,
     MarketValueReader,
 )
-from services.entry_market_hold_penalty import EntryMarketHoldPenaltyPolicy
 from services.entry_market_prefilter import EntryMarketLLMPrefilterPolicy
 from services.entry_market_regime import EntryMarketRegimeContextPolicy, EntryMarketRegimePolicy
 from services.entry_opportunity_gate import EntryOpportunityGatePolicy
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
-from services.entry_payoff_quality import EntryLowPayoffQualityPolicy
 from services.entry_position_exposure import EntryPositionExposurePolicy
-from services.entry_post_crash_rebound import EntryPostCrashReboundGuardPolicy
 from services.entry_price_guard import EntryPriceGuardPolicy
 from services.entry_priority import EntryExecutionPriorityPolicy
-from services.entry_probe_market_quality import EntryProbeMarketQualityPolicy
 from services.entry_profit_risk_sizing import EntryProfitRiskSizingPolicy
-from services.entry_quant_profit_probe import EntryQuantProfitProbePolicy
-from services.entry_stop_loss_budget import (
-    EntryStopLossBudgetPolicy,
-)
 from services.entry_strategy_mode import EntryStrategyModeContextPolicy
-from services.entry_stress_stop import EntryStressStopPolicy
 from services.entry_suspicious_symbol import EntrySuspiciousSymbolPolicy
-from services.entry_symbol_blocklist import (
-    PRICE_GUARD_ENTRY_BLOCK_MINUTES,
-    TRANSIENT_ENTRY_BLOCK_MINUTES,
-    UNTRADABLE_SYMBOL_BLOCK_HOURS,
-    EntrySymbolBlocklistPolicy,
-)
-from services.entry_symbol_profit_quarantine import EntrySymbolProfitQuarantinePolicy
 from services.entry_symbol_universe import EntrySymbolUniversePolicy
-from services.entry_symbol_winner import EntrySymbolWinnerDecayPolicy
-from services.entry_wick_guard import (
-    EntryAbnormalWickGuardPolicy,
-)
 from services.exchange_backed_position_provider import ExchangeBackedPositionProvider
 from services.exchange_close_fill_finder import ExchangeCloseFillFinder
 from services.exchange_position_state import (
@@ -123,26 +95,8 @@ from services.execution_pipelines import EntryExecutionPipeline, ExitExecutionPi
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService
-from services.exit_arbitrator import ExitArbitrator
-from services.exit_cooldown import ExitCooldownPolicy
-from services.exit_fast_risk import (
-    FAST_RISK_1M_MOVE_PCT,
-    FAST_RISK_5M_MOVE_PCT,
-    FAST_RISK_FULL_STOP_PROGRESS,
-    FAST_RISK_MAX_FEATURE_POSITION_PRICE_GAP,
-    FAST_RISK_NEAR_STOP_PROGRESS,
-    ExitFastRiskPolicy,
-)
-from services.exit_fee_churn_guard import ExitFeeChurnGuardPolicy
-from services.exit_invalidation_snapshot import ExitInvalidationSnapshotPolicy
-from services.exit_partial_guard import ExitPartialGuardPolicy
 from services.exit_position_matcher import ExitPositionMatcher
 from services.exit_position_snapshot import ExitPositionSnapshotPolicy
-from services.exit_predictive_reversal import (
-    PREDICTIVE_REVERSAL_EXIT_SCORE,
-    ExitPredictiveReversalPolicy,
-)
-from services.exit_profit_precheck import ExitProfitPrecheckPolicy
 from services.expert_memory_service import ExpertMemoryService
 from services.fast_risk_exit_execution import FastRiskExitExecutionProcessor
 from services.forced_exit import ForcedExitPolicy
@@ -170,7 +124,6 @@ from services.model_training_state import (
     LOCAL_AI_TOOL_MODEL_IDS,
     ModelTrainingStateStore,
 )
-from services.new_pair_loss_pause import NewPairLossPausePolicy
 from services.okx_order_fact_sync import OkxOrderFactSyncService
 from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncService
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
@@ -184,10 +137,7 @@ from services.position_open_time import position_open_time
 from services.position_profit_peak_context import PositionProfitPeakContextPolicy
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
-from services.position_quality import PositionQualityScorer
-from services.position_release_decision import PositionReleaseDecisionPolicy
 from services.position_review_batch import PositionReviewBatchPolicy
-from services.position_review_decision_normalizer import PositionReviewDecisionNormalizer
 from services.position_review_decision_processor import PositionReviewDecisionProcessor
 from services.position_review_decision_service import (
     PositionReviewDecisionRequest,
@@ -215,7 +165,6 @@ from services.position_settlement import (
 )
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
-from services.runtime_entry_filters import RuntimeEntryFilters, entry_filters_from_context
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.strategy_context_performance import StrategyContextPerformanceService
@@ -308,8 +257,6 @@ OKX_BALANCE_SNAPSHOT_FRESH_SECONDS = 15.0
 OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
 MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 5.0
 NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
-ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS = 60.0
-ENTRY_SYMBOL_BLOCK_SCAN_LIMIT = 250
 SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 200
 SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
 STRATEGY_CONTEXT_IO_CONCURRENCY = 2
@@ -317,38 +264,12 @@ STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS = 20.0
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_MAX_STALE_SECONDS = 300.0
 STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS = 8.0
 STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION = "single_flight_batched_maintenance"
-MIN_DISCRETIONARY_HOLD_MINUTES = 4.0
-ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS = 120.0
-DISCRETIONARY_CLOSE_CONFIDENCE = 0.66
-PROFIT_PROTECTION_MIN_NET_PNL_RATIO = 0.004
-PROFIT_PROTECTION_STRONG_NET_PNL_RATIO = 0.010
-PROFIT_PROTECTION_MIN_NET_USDT = 3.00
-PROFIT_PROTECTION_MIN_FEE_MULTIPLE = 4.0
-PROFIT_PROTECTION_STRONG_FEE_MULTIPLE = 5.0
 UNCONFIRMED_EXCHANGE_CLOSE_GRACE_SECONDS = 180.0
-ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS = (
-    DEFAULT_TRADING_PARAMS.entry_price_guard.recheck_timeout_seconds
-)
-ENTRY_BLACK_SWAN_RECHECK_SAFE_1M_DROP = -0.08
-ENTRY_BLACK_SWAN_RECHECK_SAFE_5M_DROP = -0.12
-ENTRY_BLACK_SWAN_REBOUND_MIN_1M = 0.001
-ENTRY_BLACK_SWAN_REBOUND_MIN_5M = 0.003
-ENTRY_BLACK_SWAN_REBOUND_MIN_EXPECTED_NET = 0.60
-ENTRY_BLACK_SWAN_REBOUND_MIN_PROFIT_QUALITY = 1.00
-ENTRY_BLACK_SWAN_REBOUND_MIN_CONFIDENCE = 0.72
-ENTRY_BLACK_SWAN_REBOUND_MAX_SPREAD = 0.015
-QUANT_PROFIT_PROBE_PARAMS = DEFAULT_TRADING_PARAMS.entry_quant_profit_probe
-QUANT_PROFIT_PROBE_MIN_PROFIT_QUALITY_RATIO = QUANT_PROFIT_PROBE_PARAMS.min_profit_quality_ratio
+ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS = 5.0
 SYMBOL_SIDE_PROFILE_LOOKBACK = 2000
 SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS = 7.0
-ENTRY_LOSS_COOLDOWN_PARAMS = DEFAULT_TRADING_PARAMS.entry_loss_cooldown
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_SCAN_PARAMS = DEFAULT_TRADING_PARAMS.auto_scan
-AUTO_TRADE_MIN_NOTIONAL_24H = 4_000_000.0
-AUTO_TRADE_MIN_VOLUME_RATIO = 0.65
-AUTO_TRADE_MAX_VOLATILITY_20 = 0.085
-AUTO_TRADE_MAX_ABS_CHANGE_24H = 12.0
-ABNORMAL_WICK_TAIL_RISK_MAX_PCT = 60.0
 AUTO_SCAN_ROTATION_POOL_MULTIPLIER = AUTO_SCAN_PARAMS.rotation_pool_multiplier
 AUTO_SCAN_ROTATION_POOL_MIN = AUTO_SCAN_PARAMS.rotation_pool_min
 AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER = AUTO_SCAN_PARAMS.feature_fetch_pool_multiplier
@@ -381,18 +302,13 @@ class TradingService:
         self.models = model_registry
         self.ensemble = EnsembleCoordinator(model_registry)
         self.data_service = data_service
-        self.position_quality_scorer = PositionQualityScorer()
-        self.dynamic_capacity = DynamicPositionCapacityPolicy(
-            lambda: settings.max_open_positions_per_model,
-            quality_scorer=self.position_quality_scorer,
-        )
+        self.dynamic_capacity = DynamicPositionCapacityPolicy()
         self._current_capacity_context = self.dynamic_capacity.evaluate(open_positions=[]).as_dict()
         self._current_strategy_mode_context: dict[str, Any] = {}
-        self.risk_engine = RiskEngine(max_open_positions_provider=self._dynamic_capacity_context)
+        self.risk_engine = RiskEngine()
         self.market_decision_risk_assessment = MarketDecisionRiskAssessmentPolicy(
             risk_engine=self.risk_engine,
             account_balance_provider=self.get_account_balance,
-            false_positive_checker=self._price_action_black_swan_false_positive,
         )
         self.manual_trade_risk_assessment = ManualTradeRiskAssessmentPolicy(self.risk_engine)
         self.manual_trade_execution_processor = ManualTradeExecutionProcessor(
@@ -419,11 +335,7 @@ class TradingService:
         )
         self.market_decision_result_recorder = MarketDecisionResultRecorder()
         self.redis = redis_client
-        self.entry_symbol_blocklist = EntrySymbolBlocklistPolicy(self._normalize_position_symbol)
-        self._entry_symbol_blocks_refreshed_at: datetime | None = None
-        self.execution_result_classifier = ExecutionResultClassifier(
-            untradable_exchange_error_checker=self.is_untradable_exchange_error
-        )
+        self.execution_result_classifier = ExecutionResultClassifier()
         self.execution_result_factory = ExecutionResultFactory()
         self.open_positions_execution_applier = OpenPositionsExecutionApplier(
             normalize_symbol=self._normalize_position_symbol,
@@ -469,11 +381,6 @@ class TradingService:
             execution_leverage_summary_attacher=self.attach_execution_leverage_summary,
             execution_reason_provider=self.execution_reason_from_result,
             pending_execution_marker=self.mark_decision_pending_execution,
-            untradable_exchange_error_checker=self.is_untradable_exchange_error,
-            untradable_symbol_rememberer=self.remember_untradable_symbol,
-            transient_entry_exchange_error_checker=self.is_transient_entry_exchange_error,
-            temporary_entry_block_rememberer=self.remember_temporary_entry_block,
-            transient_entry_block_minutes_provider=self.transient_entry_block_minutes,
             trade_logger=self.log_trade,
             exchange_confirmed_checker=self.is_exchange_confirmed_execution,
             exit_progress_checker=self.is_exit_progress_execution,
@@ -483,7 +390,6 @@ class TradingService:
             order_fact_recovery_trigger=self.request_okx_order_fact_recovery,
             open_positions_execution_applier=self.apply_execution_to_open_positions,
             decision_executed_marker=self.mark_decision_executed,
-            market_no_opportunity_symbol_clearer=self.clear_market_no_opportunity_symbol,
             account_update_persister=self.persist_account_update,
             account_balance_provider=self.get_account_balance,
             decision_outcome_marker=self.mark_decision_outcome,
@@ -498,7 +404,6 @@ class TradingService:
             matching_exit_exchange_position_checker=(
                 self.has_matching_exchange_exit_position_for_execution
             ),
-            exit_cooldown_recorder=self.remember_exit_cooldown,
             trade_notional_recorder=self.record_executed_trade_notional,
         )
         self._exchange_reconcile_lock = asyncio.Lock()
@@ -521,9 +426,6 @@ class TradingService:
         )
         self.position_snapshot_syncer = PositionSnapshotSyncer(self._safe_float)
         self.position_time = PositionTimeParser()
-        self.position_review_decision_normalizer = PositionReviewDecisionNormalizer(
-            self._normalize_position_symbol
-        )
         self.position_review_defer_tracker = PositionReviewDeferTracker()
         self.position_review_entry_guard = PositionReviewEntryGuardPolicy()
         self.position_review_fast_scan_hold = PositionReviewFastScanHoldPolicy()
@@ -559,7 +461,6 @@ class TradingService:
         self.market_value_reader = MarketValueReader()
         self.entry_market_data_quality = EntryMarketDataQualityPolicy(
             market_value_reader=self.market_value_reader.read,
-            max_slippage_pct_provider=lambda: float(settings.max_slippage_pct or 0.005),
         )
         self.entry_market_llm_prefilter = EntryMarketLLMPrefilterPolicy(
             self.entry_market_data_quality.reason
@@ -587,7 +488,6 @@ class TradingService:
             normalize_symbol=self._normalize_position_symbol,
             lookback_limit=SYMBOL_SIDE_PROFILE_LOOKBACK,
             lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
-            loss_cooldown_params=ENTRY_LOSS_COOLDOWN_PARAMS,
         )
         self.strategy_context_performance_service = StrategyContextPerformanceService(
             daily_performance=self.daily_performance_service,
@@ -659,30 +559,9 @@ class TradingService:
         self.okx_order_fact_sync_factory = OkxOrderFactSyncService
         self.okx_position_history_mirror_sync_factory = OkxPositionHistoryMirrorSyncService
         self.okx_position_settlement_sync_factory = OkxPositionSettlementSyncService
-        self.exit_cooldown = ExitCooldownPolicy(self._normalize_position_symbol)
         self.exit_position_matcher = ExitPositionMatcher(self._normalize_position_symbol)
         self.exit_position_snapshot = ExitPositionSnapshotPolicy(self.okx_sync_service)
-        self.exit_profit_precheck = ExitProfitPrecheckPolicy(
-            self._latest_price_for_symbol,
-            self._normalize_position_symbol,
-            min_net_usdt=PROFIT_PROTECTION_MIN_NET_USDT,
-        )
-        self.exit_partial_guard = ExitPartialGuardPolicy(self.exit_position_matcher)
-        self.exit_invalidation_snapshot = ExitInvalidationSnapshotPolicy(
-            self._runtime_min_entry_volume_ratio
-        )
         self.forced_exit_policy = ForcedExitPolicy()
-        self.exit_fee_churn_guard = ExitFeeChurnGuardPolicy(
-            session_factory=get_session_ctx,
-            model_execution_mode_provider=self._get_model_execution_mode,
-            entry_fee_provider=self.entry_fee_provider.entry_fee_for_position,
-            invalidation_snapshot_provider=self.exit_invalidation_snapshot.snapshot,
-            forced_exit_policy=self.forced_exit_policy,
-            position_peaks=self.position_profit_peaks.peaks,
-            position_peak_key_provider=self.position_profit_peaks.key,
-        )
-        self.exit_arbitrator = ExitArbitrator()
-        self.exit_predictive_reversal = ExitPredictiveReversalPolicy()
         self.portfolio_profit_protection = PortfolioProfitProtectionPolicy(
             normalize_symbol=self._normalize_position_symbol,
             default_model_name=ENSEMBLE_TRADER_NAME,
@@ -691,9 +570,6 @@ class TradingService:
             normalize_symbol=self._normalize_position_symbol,
             position_peak_key=self.position_profit_peaks.key,
             position_peaks_provider=lambda: self.position_profit_peaks.peaks,
-            predictive_reversal=self.exit_predictive_reversal,
-            quality_scorer=self.position_quality_scorer,
-            urgent_exit_markers=POSITION_REVIEW_URGENT_EXIT_MARKERS,
         )
         self.position_review_batch = PositionReviewBatchPolicy(
             urgent_exit_checker=self._is_urgent_position_exit_scan,
@@ -705,10 +581,6 @@ class TradingService:
             position_review_scanner=self._scan_position_review_groups,
             urgent_exit_checker=self._is_urgent_position_exit_scan,
             default_model_name=ENSEMBLE_TRADER_NAME,
-        )
-        self.exit_fast_risk = ExitFastRiskPolicy(
-            predictive_reversal=self.exit_predictive_reversal,
-            seconds_since_profit_exit=self.position_profit_peaks.seconds_since_profit_exit,
         )
         self.fast_risk_exit_execution_processor = FastRiskExitExecutionProcessor(
             model_execution_mode_provider=self._get_model_execution_mode,
@@ -726,30 +598,16 @@ class TradingService:
         )
         self.decision_freshness = DecisionFreshnessPolicy(self.forced_exit_policy.is_forced_exit)
         self.entry_priority = EntryExecutionPriorityPolicy()
-        self.entry_symbol_winner_decay = EntrySymbolWinnerDecayPolicy()
-        self.entry_symbol_profit_quarantine = EntrySymbolProfitQuarantinePolicy(
-            self._normalize_position_symbol
-        )
         self.model_contribution_performance_service = ModelContributionPerformanceService(
             lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
         )
         self.entry_opportunity_score = EntryOpportunityScoringPolicy(
             normalize_symbol=self._normalize_position_symbol,
-            model_contribution_score_adjustment=(
-                self.model_contribution_performance_service.score_adjustment
-            ),
             annotate_decision_source=self._annotate_decision_source,
-            entry_symbol_winner_decay=self.entry_symbol_winner_decay,
         )
-        self.entry_capacity = EntryCapacityPolicy(
-            self._normalize_position_symbol,
-            self._dynamic_capacity_context,
-        )
+        self.entry_capacity = EntryCapacityPolicy(self._normalize_position_symbol)
         self.entry_position_exposure = EntryPositionExposurePolicy()
-        self.entry_market_regime = EntryMarketRegimePolicy(
-            self._normalize_position_symbol,
-            ALT_LONG_ALLOWED_SYMBOLS,
-        )
+        self.entry_market_regime = EntryMarketRegimePolicy()
         self.entry_market_regime_context = EntryMarketRegimeContextPolicy(
             self._is_valid_feature_vector,
         )
@@ -759,49 +617,14 @@ class TradingService:
         self.entry_suspicious_symbol = EntrySuspiciousSymbolPolicy(self._normalize_position_symbol)
         self.entry_feature_ranker = EntryFeatureRankerPolicy(
             suspicious_symbol_reason=self.entry_suspicious_symbol.reason,
-            min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
-            min_entry_adx_provider=self._runtime_min_entry_adx,
             major_symbols=frozenset(ALT_LONG_ALLOWED_SYMBOLS),
         )
-        self.entry_market_hold_penalty = EntryMarketHoldPenaltyPolicy(
-            normalize_symbol=self._normalize_position_symbol,
-            feature_opportunity_score=self._feature_opportunity_score,
-            min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
-            min_entry_adx_provider=self._runtime_min_entry_adx,
-        )
         self._market_budget_deferred_symbols: list[str] = []
-        self.entry_loss_cooldown = EntryLossCooldownPolicy(self._normalize_position_symbol)
-        self.entry_post_crash_rebound_guard = EntryPostCrashReboundGuardPolicy()
-        self.entry_probe_market_quality = EntryProbeMarketQualityPolicy()
-        self.entry_evidence_probe = EntryEvidenceProbePolicy(
-            ENSEMBLE_TRADER_NAME,
-            lambda: settings.max_leverage,
-            self.entry_probe_market_quality,
-        )
-        self.entry_crowded_side_cap = EntryCrowdedSideCapPolicy()
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
-            blocked_symbol_reason=self.blocked_symbol_reason,
-            symbol_loss_cooldown_policy=self.entry_loss_cooldown,
-            crowded_side_cap_policy=self.entry_crowded_side_cap,
-            post_crash_rebound_guard=self.entry_post_crash_rebound_guard,
-        )
-        self.entry_low_payoff_quality = EntryLowPayoffQualityPolicy()
-        self.entry_stress_stop = EntryStressStopPolicy()
-        self.entry_stop_loss_budget = EntryStopLossBudgetPolicy()
-        self.entry_existing_winner_context = EntryExistingWinnerContextPolicy(
-            self._normalize_position_symbol
         )
         self.entry_profit_risk_sizing = EntryProfitRiskSizingPolicy(
             allocated_order_balance=self.allocated_order_balance,
-            entry_low_payoff_quality=self.entry_low_payoff_quality,
-            entry_stop_loss_budget=self.entry_stop_loss_budget,
-            entry_stress_stop=self.entry_stress_stop,
-            entry_existing_winner_context=self.entry_existing_winner_context,
-            max_leverage_provider=lambda: settings.max_leverage,
-        )
-        self.new_pair_loss_pause = NewPairLossPausePolicy(
-            balance_snapshot_provider=self._get_okx_balance_snapshot_for_mode,
         )
         self._open_positions_context_cache: dict[str, Any] = {}
         self._open_positions_context_refresh_task: asyncio.Task | None = None
@@ -823,27 +646,14 @@ class TradingService:
             fresh_feature_provider=self._fresh_feature_vector_for_price_recheck,
             market_data_quality_reason_provider=self.entry_market_data_quality.reason,
             decision_age_seconds_provider=self.decision_freshness.decision_age_seconds,
-            temporary_entry_block_recorder=self.remember_temporary_entry_block,
-            temporary_block_minutes=PRICE_GUARD_ENTRY_BLOCK_MINUTES,
-        )
-        self.abnormal_wick_guard = EntryAbnormalWickGuardPolicy(
-            self.remember_temporary_entry_block,
-            temporary_block_minutes=PRICE_GUARD_ENTRY_BLOCK_MINUTES,
-        )
-        self.high_risk_review_gate_policy = EntryHighRiskReviewGatePolicy(
-            reviewer=self.high_risk_review_service,
-            allocation_state_provider=self.execution_allocation_state,
-            quant_probe_min_profit_quality_ratio=QUANT_PROFIT_PROBE_MIN_PROFIT_QUALITY_RATIO,
         )
         self.entry_policy = EntryPolicy(
             decision_freshness=self.decision_freshness,
             entry_priority=self.entry_priority,
             entry_opportunity_score=self.entry_opportunity_score,
             entry_profit_risk_sizing=self.entry_profit_risk_sizing,
-            abnormal_wick_guard=self.abnormal_wick_guard,
             entry_price_guard=self.entry_price_guard,
             entry_opportunity_gate=self.entry_opportunity_gate,
-            high_risk_review_gate=self.high_risk_review_gate_policy,
         )
         self.entry_candidate_queue = EntryCandidateQueuePolicy(
             score_candidate=self.entry_policy.score_candidate,
@@ -869,7 +679,6 @@ class TradingService:
             mark_decision_reason=self._mark_decision_reason,
             mark_decision_pending_execution=self._mark_decision_pending_execution,
             result_recorder=self.market_decision_result_recorder,
-            clear_market_no_opportunity_symbol=self._clear_market_no_opportunity_symbol,
             set_loop_stage=self._set_loop_stage,
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
@@ -884,7 +693,6 @@ class TradingService:
             mark_decision_raw_response=self._mark_decision_raw_response,
             mark_decision_reason=self._mark_decision_reason,
             result_recorder=self.market_decision_result_recorder,
-            clear_market_no_opportunity_symbol=self._clear_market_no_opportunity_symbol,
             candidate_executor=self._execute_candidate,
             capacity_releaser=self.entry_capacity.release_slot,
             execution_confirmed_checker=self._is_exchange_confirmed_execution,
@@ -913,26 +721,15 @@ class TradingService:
             score_candidate=self.entry_policy.score_candidate,
             feature_opportunity_score=self._feature_opportunity_score,
         )
-        self.entry_quant_profit_probe = EntryQuantProfitProbePolicy(
-            self.entry_probe_market_quality,
-            self.entry_policy.score_candidate,
-        )
         self.exit_policy = ExitPolicy(
-            exit_cooldown=self.exit_cooldown,
-            decision_freshness=self.decision_freshness,
             exit_position_matcher=self.exit_position_matcher,
-            exit_partial_guard=self.exit_partial_guard,
             exit_position_snapshot=self.exit_position_snapshot,
-            exit_profit_precheck=self.exit_profit_precheck,
-            exit_fee_churn_guard=self.exit_fee_churn_guard,
-            exit_arbitrator=self.exit_arbitrator,
         )
         self.position_review_decision_processor = PositionReviewDecisionProcessor(
             entry_guard=self.position_review_entry_guard,
             entry_capacity=self.entry_capacity,
             risk_assessment=self.position_review_risk_assessment,
             result_recorder=self.position_review_result_recorder,
-            exit_fee_guard_reason_provider=self.exit_policy.fee_churn_guard_reason,
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
             account_balance_provider=self.get_account_balance,
@@ -940,7 +737,6 @@ class TradingService:
 
         # Executors: paper routes to OKX demo, live routes to OKX real.
         self.paper_executor: PaperExecutor | None = None
-        self.okx_executor: OKXExecutor | None = None  # kept for backward compat
         self._okx_paper: OKXExecutor | None = None
         self._okx_live: OKXExecutor | None = None
         self._model_execution_modes: dict[str, str] = {}  # model_name -> "paper"/"live"
@@ -1070,80 +866,11 @@ class TradingService:
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         base_budget = max(8.0, interval * 0.90)
-        context = self._safe_dict(strategy_context)
-        roster = self._safe_dict(context.get("portfolio_roster"))
-        capacity = self._safe_dict(context.get("dynamic_position_capacity"))
-        capacity_factors = self._safe_dict(capacity.get("factors"))
-        profit_first = self._safe_dict(context.get("profit_first_runtime_feedback"))
-        missed = self._safe_dict(profit_first.get("missed_opportunity_feedback"))
-        profit_acceptance = self._safe_dict(profit_first.get("profit_acceptance"))
-        roster_underfilled = bool(roster.get("underfilled")) or self._safe_int(
-            roster.get("gap"), 0
-        ) > 0
-        risk_mode = str(context.get("risk_mode") or "").lower()
-        if risk_mode in {"hard_recovery", "defensive_recovery"}:
-            return base_budget
-
+        del strategy_context
         requested_symbols = max(self._safe_int(market_symbol_count, 0), 0)
-        roster_symbol_min = max(self._safe_int(roster.get("market_symbol_min"), 0), 0)
-        target_symbols = max(4, roster_symbol_min)
-        if requested_symbols > 0:
-            target_symbols = min(target_symbols, requested_symbols)
-        target_symbols = min(max(target_symbols, 1), 8)
+        target_symbols = min(max(requested_symbols, 1), 8)
         per_symbol_floor = max(8.0, min(14.0, interval * 0.35))
-        expanded_budget = max(base_budget, target_symbols * per_symbol_floor)
-        market_budget = base_budget
-        if roster_underfilled:
-            market_budget = max(market_budget, expanded_budget)
-
-        release_pressure_active = bool(
-            context.get("strategy_learning_release_pressure_active")
-            or self._safe_dict(context.get("strategy_learning_sizing")).get(
-                "release_pressure_active"
-            )
-        )
-        available_slots = max(
-            self._safe_int(context.get("max_open_positions_entry"), 0),
-            self._safe_int(capacity.get("entry_limit"), 0),
-        )
-        open_groups = max(
-            self._safe_int(roster.get("current_position_groups"), 0),
-            self._safe_int(capacity.get("open_group_count"), 0),
-        )
-        remaining_slots = (
-            max(available_slots - open_groups, 0) if available_slots > 0 else 0
-        )
-        rotation_slots = max(
-            self._safe_int(context.get("rotation_slots"), 0),
-            self._safe_int(roster.get("rotation_slots"), 0),
-            self._safe_int(capacity_factors.get("rotation_slots"), 0),
-            self._safe_int(capacity_factors.get("strategy_rotation_slots"), 0),
-        )
-        quality_expand_signal = bool(
-            missed.get("entry_bias") == "expand_quality_entries"
-            or self._safe_float(profit_acceptance.get("profit_factor"), 0.0) >= 1.15
-            or self._safe_float(profit_acceptance.get("net_pnl"), 0.0) > 0.0
-        )
-        if quality_expand_signal:
-            quality_target_symbols = min(
-                max(target_symbols, roster_symbol_min, 4) + (1 if requested_symbols >= 6 else 0),
-                max(8, requested_symbols or 8),
-            )
-            quality_expanded_budget = max(
-                market_budget,
-                quality_target_symbols * max(per_symbol_floor, 9.5),
-            )
-            market_budget = quality_expanded_budget
-
-        if release_pressure_active and remaining_slots <= max(rotation_slots, 1):
-            market_budget = max(
-                market_budget,
-                base_budget * 1.20,
-            )
-
-        if not roster_underfilled and not quality_expand_signal and not release_pressure_active:
-            return base_budget
-
+        market_budget = max(base_budget, target_symbols * per_symbol_floor)
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
         return min(market_budget, watchdog_ceiling)
 
@@ -2490,7 +2217,6 @@ class TradingService:
                 mode=selected_mode,
                 strategy_context=dict(context),
                 open_positions=open_positions,
-                max_open_positions=int(settings.max_open_positions_per_model or 20),
                 limit=DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_row_limit,
             )
             learned_context["strategy_learning_cache_status"] = "fresh"
@@ -2531,45 +2257,12 @@ class TradingService:
             0.25,
             float(fallback_timeout or self.position_review_stage_timeout_seconds()),
         )
-        context = self._safe_dict(strategy_context)
-        profit_first = self._safe_dict(context.get("profit_first_runtime_feedback"))
-        missed = self._safe_dict(profit_first.get("missed_opportunity_feedback"))
-        sizing_feedback = [
-            self._safe_dict(row) for row in self._safe_list(profit_first.get("size_feedback"))
-        ]
-        capacity = self._safe_dict(context.get("dynamic_position_capacity"))
-        capacity_factors = self._safe_dict(capacity.get("factors"))
-        release_pressure_active = bool(
-            context.get("strategy_learning_release_pressure_active")
-            or self._safe_dict(context.get("strategy_learning_sizing")).get(
-                "release_pressure_active"
-            )
-        )
-        if (
-            str(stage or "").lower() in {"position_review_decision", "position_feature_refresh"}
-            and (
-                missed.get("entry_bias") == "expand_quality_entries"
-                or any(
-                    str(row.get("sizing_bias") or "")
-                    == "quality_entries_can_expand_after_validation"
-                    for row in sizing_feedback
-                )
-            )
-        ):
-            stage_timeout *= 1.12
-        if release_pressure_active:
-            stage_timeout *= 1.10
-        if max(
-            self._safe_int(context.get("rotation_slots"), 0),
-            self._safe_int(capacity_factors.get("rotation_slots"), 0),
-            self._safe_int(capacity_factors.get("strategy_rotation_slots"), 0),
-        ) > 0:
-            stage_timeout *= 1.06
+        del strategy_context, symbol
         remaining = self._remaining_monotonic_seconds(deadline)
         if remaining is None:
             return stage_timeout
         reserve_ratio = 0.25
-        if release_pressure_active or str(stage or "").lower() == "position_review_decision":
+        if str(stage or "").lower() == "position_review_decision":
             reserve_ratio = 0.18
         reserve = min(2.0, max(0.25, stage_timeout * 0.03), remaining * reserve_ratio)
         return max(0.0, min(stage_timeout, remaining - reserve))
@@ -3180,63 +2873,6 @@ class TradingService:
 
         await self._mark_decision_pending_execution(decision_id, reason)
 
-    def _entry_symbol_blocklist_policy(self) -> EntrySymbolBlocklistPolicy:
-        policy = getattr(self, "entry_symbol_blocklist", None)
-        if policy is None:
-            policy = EntrySymbolBlocklistPolicy(self._normalize_position_symbol)
-            self.entry_symbol_blocklist = policy
-        return policy
-
-    def is_untradable_exchange_error(self, result_text: str) -> bool:
-        """Classify non-tradable exchange errors through an explicit boundary."""
-
-        return self._entry_symbol_blocklist_policy().is_untradable_exchange_error(result_text)
-
-    def remember_untradable_symbol(self, symbol: str, result_text: str) -> None:
-        """Remember permanently untradable symbols through an explicit boundary."""
-
-        self._entry_symbol_blocklist_policy().remember_untradable_symbol(symbol, result_text)
-
-    def is_transient_entry_exchange_error(self, result_text: str) -> bool:
-        """Classify transient entry errors through an explicit boundary."""
-
-        return self._entry_symbol_blocklist_policy().is_transient_entry_exchange_error(result_text)
-
-    def remember_temporary_entry_block(
-        self,
-        symbol: str,
-        reason: str,
-        minutes: float,
-    ) -> None:
-        """Remember temporary entry blocks through an explicit execution boundary."""
-
-        self._entry_symbol_blocklist_policy().remember_temporary_entry_block(
-            symbol,
-            reason,
-            minutes,
-        )
-
-    def transient_entry_block_minutes(self, result_text: str) -> float:
-        """Return transient entry-block duration through an explicit boundary."""
-
-        return self._entry_symbol_blocklist_policy().transient_entry_block_minutes(result_text)
-
-    def blocked_symbol_reason(self, symbol: str | None) -> str | None:
-        """Return active new-entry block reason through the symbol blocklist boundary."""
-
-        return self._entry_symbol_blocklist_policy().blocked_symbol_reason(symbol)
-
-    async def _refresh_entry_symbol_blocks_if_stale(self, *, force: bool = False) -> None:
-        last_refresh = getattr(self, "_entry_symbol_blocks_refreshed_at", None)
-        now = datetime.now(UTC)
-        if (
-            not force
-            and isinstance(last_refresh, datetime)
-            and (now - last_refresh).total_seconds() < ENTRY_SYMBOL_BLOCK_REFRESH_SECONDS
-        ):
-            return
-        await self._load_untradable_symbol_blocks()
-
     async def evaluate_entry_execution_policy(
         self,
         decision: DecisionOutput,
@@ -3244,24 +2880,9 @@ class TradingService:
         model_mode: str,
         open_positions: list[dict[str, Any]] | None,
     ) -> PolicyGateResult:
-        """Refresh persisted entry blocks before the execution-facing entry policy."""
+        """Apply current exchange/account safety before the return policy."""
 
-        await self._refresh_entry_symbol_blocks_if_stale()
         if decision.is_entry:
-            recovery_reason = self._entry_symbol_blocklist_policy().exchange_recovery_block_reason(
-                decision,
-                open_positions,
-            )
-            if recovery_reason:
-                return PolicyGateResult.block(
-                    "okx_exchange_recovery_cooldown",
-                    recovery_reason,
-                    {
-                        "stage_status": "blocked",
-                        "execution_blocker": "okx_exchange_recovery_cooldown",
-                        "recovery_scope": "symbol_side_candidate_state",
-                    },
-                )
             okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
             if okx_sync_reason:
                 return PolicyGateResult.block(
@@ -3280,54 +2901,6 @@ class TradingService:
             open_positions,
         )
 
-    @staticmethod
-    def _decision_execution_error_text(
-        execution_reason: Any,
-        raw_llm_response: Any,
-    ) -> str:
-        """Extract persisted execution-error fields without scanning unrelated LLM text."""
-
-        pieces: list[str] = []
-
-        def add(value: Any, *, depth: int = 0) -> None:
-            if value is None or depth > 5:
-                return
-            if isinstance(value, (str, int, float, bool)):
-                text = str(value).strip()
-                if text:
-                    pieces.append(text[:1200])
-                return
-            if isinstance(value, dict):
-                for key in (
-                    "error",
-                    "raw_error",
-                    "message",
-                    "msg",
-                    "code",
-                    "sCode",
-                    "sMsg",
-                    "status",
-                    "execution_blocker",
-                    "okx_rejection",
-                    "system_pre_submit_rejection",
-                ):
-                    add(value.get(key), depth=depth + 1)
-                data = value.get("data")
-                if isinstance(data, (dict, list, tuple)):
-                    add(data, depth=depth + 1)
-                return
-            if isinstance(value, (list, tuple)):
-                for item in list(value)[:20]:
-                    add(item, depth=depth + 1)
-
-        add(execution_reason)
-        raw = raw_llm_response if isinstance(raw_llm_response, dict) else {}
-        execution_result = raw.get("execution_result")
-        if isinstance(execution_result, dict):
-            add(execution_result)
-            add(execution_result.get("raw_response"))
-        return " ".join(pieces)
-
     async def log_trade(
         self,
         execution_result: ExecutionResult,
@@ -3337,16 +2910,6 @@ class TradingService:
     ) -> None:
         """Persist trade logs through an explicit execution-service boundary."""
 
-        raw = (
-            execution_result.raw_response
-            if isinstance(execution_result.raw_response, dict)
-            else {}
-        )
-        if decision.is_entry and raw.get("okx_rejection"):
-            self._entry_symbol_blocklist_policy().remember_exchange_rejection(
-                decision,
-                raw,
-            )
         await self._log_trade(execution_result, model_name, decision, decision_id)
 
     def is_exchange_confirmed_execution(self, execution_result: ExecutionResult | None) -> bool:
@@ -3405,11 +2968,6 @@ class TradingService:
         """Mark a decision as executed through an explicit execution boundary."""
 
         await self._mark_decision_executed(decision_id, price)
-
-    def clear_market_no_opportunity_symbol(self, symbol: str) -> None:
-        """Clear market no-opportunity memory through an explicit boundary."""
-
-        self._clear_market_no_opportunity_symbol(symbol)
 
     async def persist_account_update(
         self,
@@ -3529,11 +3087,6 @@ class TradingService:
             model_name,
             decision,
         )
-
-    def remember_exit_cooldown(self, model_name: str, decision: DecisionOutput) -> None:
-        """Record successful exit cooldown through an explicit boundary."""
-
-        self.exit_cooldown.remember_exit(model_name, decision)
 
     def record_executed_trade_notional(self, amount: float) -> None:
         """Record executed notional in the risk circuit breaker boundary."""
@@ -4212,166 +3765,6 @@ class TradingService:
             ),
         }
 
-    async def _price_action_black_swan_false_positive(
-        self,
-        decision: DecisionOutput,
-        rejection_reason: str | None,
-        assessment: Any,
-    ) -> bool:
-        """Recheck price-action black-swan entry blocks with fresh data.
-
-        Recent diagnostics showed some liquid symbols receiving impossible
-        one-minute returns such as -30% to -50% from stale/bad feature data.
-        A real flash crash should remain visible in a fresh snapshot; if it
-        disappears, we keep the warning but allow the AI entry to continue to
-        the normal price/liquidity guards.
-        """
-        if not decision.is_entry:
-            return False
-        bs_result = getattr(assessment, "black_swan_result", None)
-        if not bs_result or getattr(bs_result, "severity", "") != "critical":
-            return False
-        reason_text = str(rejection_reason or getattr(bs_result, "reason", "") or "")
-        bs_source = str(getattr(bs_result, "source", "") or "").lower()
-        is_price_action_risk = bs_source in {"price_action", "combined"}
-        if (
-            not is_price_action_risk
-            and "异常暴跌" not in reason_text
-            and "行情风险" not in reason_text
-        ):
-            return False
-
-        fresh = await self._fresh_feature_vector_for_price_recheck(decision.symbol)
-        fresh_snapshot = fresh.to_dict() if fresh is not None and hasattr(fresh, "to_dict") else {}
-        fresh_quality_reason = (
-            self.entry_market_data_quality.reason(fresh_snapshot, stage_label="黑天鹅复核刷新行情")
-            if fresh_snapshot
-            else "黑天鹅复核刷新行情失败，无法确认最新短周期特征。"
-        )
-        fresh_returns_1 = (
-            self._safe_float(fresh_snapshot.get("returns_1"), 0.0) if fresh_snapshot else 0.0
-        )
-        fresh_returns_5 = (
-            self._safe_float(fresh_snapshot.get("returns_5"), 0.0) if fresh_snapshot else 0.0
-        )
-        fresh_returns_20 = (
-            self._safe_float(fresh_snapshot.get("returns_20"), 0.0) if fresh_snapshot else 0.0
-        )
-        fresh_change_24h = (
-            self._safe_float(fresh_snapshot.get("change_24h_pct"), 0.0) if fresh_snapshot else 0.0
-        )
-        bid = self._safe_float(fresh_snapshot.get("bid"), 0.0) if fresh_snapshot else 0.0
-        ask = self._safe_float(fresh_snapshot.get("ask"), 0.0) if fresh_snapshot else 0.0
-        bid_depth = (
-            self._safe_float(fresh_snapshot.get("orderbook_bid_depth"), 0.0)
-            if fresh_snapshot
-            else 0.0
-        )
-        ask_depth = (
-            self._safe_float(fresh_snapshot.get("orderbook_ask_depth"), 0.0)
-            if fresh_snapshot
-            else 0.0
-        )
-        spread = (
-            (ask - bid) / max((ask + bid) / 2.0, 1e-12)
-            if bid > 0 and ask > 0 and ask >= bid
-            else 0.0
-        )
-        has_normal_book = bool(
-            bid_depth > 0 and ask_depth > 0 and spread <= ENTRY_BLACK_SWAN_REBOUND_MAX_SPREAD
-        )
-        raw = self._safe_dict(decision.raw_response)
-        opportunity = self._safe_dict(raw.get("opportunity_score"))
-        expected_net = self._safe_float(opportunity.get("expected_net_return_pct"), 0.0)
-        profit_quality = self._safe_float(opportunity.get("profit_quality_ratio"), 0.0)
-        high_quality_entry = bool(
-            decision.confidence >= ENTRY_BLACK_SWAN_REBOUND_MIN_CONFIDENCE
-            and expected_net >= ENTRY_BLACK_SWAN_REBOUND_MIN_EXPECTED_NET
-            and profit_quality >= ENTRY_BLACK_SWAN_REBOUND_MIN_PROFIT_QUALITY
-        )
-        rebound_recovery_for_long = bool(
-            decision.action == Action.LONG
-            and high_quality_entry
-            and has_normal_book
-            and fresh_change_24h > -18.0
-            and (
-                (
-                    fresh_returns_1 >= ENTRY_BLACK_SWAN_REBOUND_MIN_1M
-                    and fresh_returns_5 >= ENTRY_BLACK_SWAN_REBOUND_MIN_5M
-                )
-                or (
-                    fresh_returns_5 >= ENTRY_BLACK_SWAN_REBOUND_MIN_5M
-                    and fresh_returns_20 >= -0.015
-                )
-            )
-        )
-        impossible_short_return_artifact = bool(
-            fresh_snapshot
-            and not fresh_quality_reason
-            and fresh_returns_1 <= -0.20
-            and fresh_returns_5 <= -0.20
-            and fresh_change_24h > -18.0
-            and has_normal_book
-        )
-        false_positive = bool(
-            fresh_snapshot
-            and not fresh_quality_reason
-            and (
-                (
-                    fresh_returns_1 > ENTRY_BLACK_SWAN_RECHECK_SAFE_1M_DROP
-                    and fresh_returns_5 > ENTRY_BLACK_SWAN_RECHECK_SAFE_5M_DROP
-                )
-                or impossible_short_return_artifact
-                or rebound_recovery_for_long
-            )
-        )
-
-        raw["black_swan_price_action_recheck"] = {
-            "triggered": True,
-            "original_reason": reason_text,
-            "fresh_available": bool(fresh_snapshot),
-            "fresh_quality_reason": fresh_quality_reason,
-            "fresh_returns_1": round(fresh_returns_1, 6),
-            "fresh_returns_5": round(fresh_returns_5, 6),
-            "fresh_returns_20": round(fresh_returns_20, 6),
-            "fresh_change_24h_pct": round(fresh_change_24h, 6),
-            "fresh_spread_pct": round(spread * 100, 6),
-            "fresh_bid_depth": round(bid_depth, 6),
-            "fresh_ask_depth": round(ask_depth, 6),
-            "impossible_short_return_artifact": impossible_short_return_artifact,
-            "rebound_recovery_for_long": rebound_recovery_for_long,
-            "high_quality_entry": high_quality_entry,
-            "expected_net_return_pct": round(expected_net, 6),
-            "profit_quality_ratio": round(profit_quality, 6),
-            "treated_as_false_positive": false_positive,
-            "policy": (
-                "价格动作黑天鹅拦截必须用最新行情复核；复核后不再显示极端暴跌，"
-                "或高质量做多信号已出现明确反弹恢复时，按警告处理并继续进入价格偏移和盘口检查。"
-            ),
-        }
-        if false_positive:
-            raw.setdefault("execution_advisory_warnings", []).append(
-                {
-                    "reason": (
-                        "风险引擎检测到疑似 1 分钟极端暴跌，但最新行情复核显示该信号可能是脏数据"
-                        "或已经完成反弹恢复，已降级为警告。"
-                    ),
-                    "fresh_returns_1": round(fresh_returns_1, 6),
-                    "fresh_returns_5": round(fresh_returns_5, 6),
-                    "fresh_returns_20": round(fresh_returns_20, 6),
-                }
-            )
-            decision.feature_snapshot = fresh_snapshot
-            logger.warning(
-                "price-action black swan entry block downgraded after fresh recheck",
-                symbol=decision.symbol,
-                original_reason=reason_text[:160],
-                fresh_returns_1=fresh_returns_1,
-                fresh_returns_5=fresh_returns_5,
-            )
-        decision.raw_response = raw
-        return false_positive
-
     def _feature_opportunity_score(self, fv: Any) -> float:
         """Compatibility delegate for feature-based auto-scan opportunity score."""
 
@@ -4379,69 +3772,10 @@ class TradingService:
         if ranker is None:
             ranker = EntryFeatureRankerPolicy(
                 suspicious_symbol_reason=self._suspicious_new_symbol_reason,
-                min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
-                min_entry_adx_provider=self._runtime_min_entry_adx,
                 major_symbols=frozenset(ALT_LONG_ALLOWED_SYMBOLS),
             )
         return ranker.feature_opportunity_score(fv)
 
-    def _entry_market_hold_penalty_policy(self) -> EntryMarketHoldPenaltyPolicy:
-        policy = getattr(self, "entry_market_hold_penalty", None)
-        if policy is not None:
-            return policy
-        policy = EntryMarketHoldPenaltyPolicy(
-            normalize_symbol=self._normalize_position_symbol,
-            feature_opportunity_score=self._feature_opportunity_score,
-            min_entry_volume_ratio_provider=self._runtime_min_entry_volume_ratio,
-            min_entry_adx_provider=self._runtime_min_entry_adx,
-        )
-        self.entry_market_hold_penalty = policy
-        return policy
-
-    def _remember_market_hold_symbol(
-        self,
-        symbol: str,
-        fv: Any | None = None,
-        reason: str | None = None,
-    ) -> None:
-        self._entry_market_hold_penalty_policy().remember_hold_symbol(symbol, fv, reason)
-
-    def _prune_market_no_opportunity_symbols(self) -> None:
-        self._entry_market_hold_penalty_policy().prune_no_opportunity_symbols()
-
-    def _clear_market_no_opportunity_symbol(self, symbol: str) -> None:
-        self._entry_market_hold_penalty_policy().clear_symbol(symbol)
-
-    def _remember_market_analyzed_symbol(self, symbol: str) -> None:
-        self._entry_market_hold_penalty_policy().remember_analyzed_symbol(symbol)
-
-    def _recent_market_hold_penalty(self, symbol: str) -> float:
-        return self._entry_market_hold_penalty_policy().recent_hold_penalty(symbol)
-
-    def _recent_market_analysis_penalty(self, symbol: str) -> float:
-        return self._entry_market_hold_penalty_policy().recent_analysis_penalty(symbol)
-
-    def _no_opportunity_rotation_penalty(self, symbol: str, fv: Any | None = None) -> float:
-        return self._entry_market_hold_penalty_policy().no_opportunity_rotation_penalty(
-            symbol,
-            fv,
-        )
-
-    def _sync_market_recent_loss_profiles(self, profiles: dict[str, Any] | None) -> None:
-        if not isinstance(profiles, dict) or not profiles:
-            return
-        policy = getattr(self, "entry_market_hold_penalty", None)
-        if policy is None:
-            if not hasattr(self, "_normalize_position_symbol"):
-                return
-            policy = self._entry_market_hold_penalty_policy()
-        try:
-            policy.sync_recent_loss_profiles(profiles)
-        except Exception as exc:
-            logger.warning(
-                "failed to sync market recent loss profiles",
-                error=safe_error_text(exc),
-            )
 
     def _entry_market_regime_context_policy(self) -> EntryMarketRegimeContextPolicy:
         policy = getattr(self, "entry_market_regime_context", None)
@@ -4453,9 +3787,6 @@ class TradingService:
         """Predict the current market style before asking for per-symbol entries."""
         return self._entry_market_regime_context_policy().context(feature_vectors)
 
-    def _btc_eth_alt_long_filter(self, majors: list[Any]) -> dict[str, Any]:
-        return self._entry_market_regime_context_policy().btc_eth_alt_long_filter(majors)
-
     def _entry_strategy_mode_context_policy(self) -> EntryStrategyModeContextPolicy:
         policy = getattr(self, "entry_strategy_mode_context", None)
         if policy is not None:
@@ -4466,39 +3797,29 @@ class TradingService:
         context = getattr(self, "_current_capacity_context", None)
         if isinstance(context, dict):
             return dict(context)
-        fallback = int(
-            settings.max_open_positions_per_model or DEFAULT_MAX_OPEN_POSITIONS_PER_MODEL
-        )
         return {
-            "entry_limit": fallback,
-            "effective_limit": fallback,
-            "base_limit": fallback,
+            "entry_limit": None,
+            "hard_limit": None,
+            "open_group_count": 0,
+            "available_group_slots": None,
+            "reason": "position count is observation-only",
+            "policy_provenance": {
+                "source": "position_capacity_context_unavailable",
+                "observation_window": "current_open_position_snapshot",
+                "sample_count": 0,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "strategy_version": "2026-07-12.position-count-observation.v1",
+                "fallback_reason": "position_snapshot_missing",
+                "production_eligible": False,
+                "production_permission": False,
+            },
         }
-
-    def _runtime_entry_filters(self) -> RuntimeEntryFilters:
-        context = getattr(self, "_current_strategy_mode_context", None)
-        if isinstance(context, dict):
-            return entry_filters_from_context(context)
-        return entry_filters_from_context(None)
-
-    def _runtime_min_entry_volume_ratio(self) -> float:
-        return self._runtime_entry_filters().min_entry_volume_ratio
-
-    def _runtime_min_entry_adx(self) -> float:
-        return self._runtime_entry_filters().min_entry_adx
 
     def _dynamic_capacity_policy(self) -> DynamicPositionCapacityPolicy:
         policy = getattr(self, "dynamic_capacity", None)
         if policy is not None:
             return policy
-        scorer = getattr(self, "position_quality_scorer", None)
-        if scorer is None:
-            scorer = PositionQualityScorer()
-            self.position_quality_scorer = scorer
-        policy = DynamicPositionCapacityPolicy(
-            lambda: settings.max_open_positions_per_model,
-            quality_scorer=scorer,
-        )
+        policy = DynamicPositionCapacityPolicy()
         self.dynamic_capacity = policy
         return policy
 
@@ -4524,9 +3845,6 @@ class TradingService:
         self._current_capacity_context = decision
         strategy_context["dynamic_position_capacity"] = decision
         strategy_context["account_equity"] = account_equity
-        strategy_context["max_open_positions_base"] = decision.get("base_limit")
-        strategy_context["max_open_positions_effective"] = decision.get("effective_limit")
-        strategy_context["max_open_positions_entry"] = decision.get("entry_limit")
         self._current_strategy_mode_context = dict(strategy_context)
         return strategy_context
 
@@ -4600,7 +3918,6 @@ class TradingService:
             account_equity=account_equity,
             account_config=settings.get_execution_account_config(selected_mode),
         )
-        self._sync_market_recent_loss_profiles(symbol_side_perf)
         context["account_equity"] = account_equity
         context["strategy_context_performance"] = performance_snapshot
         if _analysis_scope_context.get() == "market":
@@ -4789,54 +4106,10 @@ class TradingService:
         if not isinstance(strategy_mode_context, dict):
             return
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        raw["strategy_mode"] = self._json_safe_payload(strategy_mode_context)
         raw["strategy_learning_context"] = {
-            "strategy_profile_id": strategy_mode_context.get("strategy_profile_id"),
-            "strategy_profile_version": strategy_mode_context.get("strategy_profile_version"),
-            "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
-            "expert_integrity_mode": strategy_mode_context.get("expert_integrity_mode"),
-            "strategy_learning_entry_pause": strategy_mode_context.get(
-                "strategy_learning_entry_pause", False
-            ),
-            "strategy_learning_entry_pause_reason": strategy_mode_context.get(
-                "strategy_learning_entry_pause_reason", ""
-            ),
-            "strategy_learning_execution_guard_active": strategy_mode_context.get(
-                "strategy_learning_execution_guard_active", False
-            ),
-            "strategy_learning_execution_guard_reason": strategy_mode_context.get(
-                "strategy_learning_execution_guard_reason", ""
-            ),
-            "strategy_learning_release_pressure_active": strategy_mode_context.get(
-                "strategy_learning_release_pressure_active", False
-            ),
-            "strategy_learning_release_pressure_reason": strategy_mode_context.get(
-                "strategy_learning_release_pressure_reason", ""
-            ),
-            "strategy_learning_health_guard_active": strategy_mode_context.get(
-                "strategy_learning_health_guard_active", False
-            ),
-            "strategy_learning_recovery_probe_allowed": strategy_mode_context.get(
-                "strategy_learning_recovery_probe_allowed", False
-            ),
-            "strategy_learning_recovery_probe_reason": strategy_mode_context.get(
-                "strategy_learning_recovery_probe_reason", ""
-            ),
-            "strategy_learning_sizing": strategy_mode_context.get("strategy_learning_sizing", {}),
-            "side_weights": strategy_mode_context.get("side_weights", {}),
-            "winner_hold_extension": strategy_mode_context.get("winner_hold_extension", "normal"),
-            "profit_lock_min_usdt_multiplier": strategy_mode_context.get(
-                "profit_lock_min_usdt_multiplier",
-                1.0,
-            ),
-            "pullback_lock_enabled": strategy_mode_context.get("pullback_lock_enabled", False),
-            "entry_filters": strategy_mode_context.get("entry_filters", {}),
-            "min_entry_volume_ratio": strategy_mode_context.get("min_entry_volume_ratio"),
-            "min_entry_adx": strategy_mode_context.get("min_entry_adx"),
-            "entry_filters_are_hard_gate": False,
-            "strategy_learning_release_pressure_detail": strategy_mode_context.get(
-                "strategy_learning_release_pressure_detail", {}
-            ),
+            "observation_only": True,
+            "production_permission": False,
+            "optimization_target": "realized_fee_after_return",
             "strategy_learning": strategy_mode_context.get("strategy_learning"),
         }
         decision.raw_response = raw
@@ -4984,19 +4257,13 @@ class TradingService:
         decision: DecisionOutput,
         strategy: dict[str, Any] | None = None,
     ) -> float:
-        """Compatibility delegate for older tests/tools that call the legacy private method."""
+        """Delegate opportunity aggregation to the authoritative return policy."""
 
         scorer = getattr(self, "entry_opportunity_score", None)
         if scorer is None:
             scorer = EntryOpportunityScoringPolicy(
                 normalize_symbol=self._normalize_position_symbol,
-                model_contribution_score_adjustment=self._model_contribution_score_adjustment,
                 annotate_decision_source=self._annotate_decision_source,
-                entry_symbol_winner_decay=getattr(
-                    self,
-                    "entry_symbol_winner_decay",
-                    EntrySymbolWinnerDecayPolicy(),
-                ),
             )
         return scorer.score_candidate(decision, strategy)
 
@@ -5007,76 +4274,27 @@ class TradingService:
             if decision.is_entry
             else ("exit" if decision.is_exit else "hold")
         )
-        opinions = self._safe_list(raw.get("opinions"))
-        decision_maker = self._safe_dict(raw.get("decision_maker"))
         opportunity = self._safe_dict(raw.get("opportunity_score"))
-        evidence_score = self._safe_dict(opportunity.get("evidence_score"))
-        ml_signal = self._safe_dict(raw.get("ml_signal"))
-        quant_probe = self._safe_dict(raw.get("quant_validation_probe_entry"))
-        server_tools = self._safe_dict(raw.get("server_quant_tools"))
-
-        expert_support = 0
-        expert_opposite = 0
-        opposite_side = "short" if side == "long" else "long"
-        for opinion in opinions:
-            if not isinstance(opinion, dict):
-                continue
-            action = str(opinion.get("action") or "").lower()
-            confidence = self._safe_float(opinion.get("confidence"), 0.0)
-            if action == side and confidence >= 0.55:
-                expert_support += 1
-            elif action == opposite_side and confidence >= 0.55:
-                expert_opposite += 1
-
-        ml_influence_enabled = bool(
-            ml_signal.get("influence_enabled")
-            or opportunity.get("ml_influence_enabled")
-            or opportunity.get("ml_aligned")
+        policy = self._safe_dict(raw.get("production_return_policy"))
+        dynamic_exit = self._safe_dict(raw.get("dynamic_exit_policy"))
+        primary_source = (
+            "authoritative_fee_after_return_distribution"
+            if decision.is_entry
+            else "position_economics_dynamic_exit"
+            if decision.is_exit
+            else "observation_only_hold"
         )
-        local_profit_influence = bool(
-            opportunity.get("local_profit_aligned")
-            or quant_probe.get("status")
-            or server_tools.get("profit_model")
-        )
-        primary_source = "ai_experts_and_decision_maker"
-        if decision.is_hold:
-            primary_source = "ai_hold_decision"
-        elif decision.is_exit:
-            primary_source = "ai_position_review_or_fast_risk"
 
         raw["decision_source"] = {
             "primary_source": primary_source,
-            "primary_source_cn": (
-                "AI 专家/最终交易员"
-                if decision.is_entry
-                else ("AI 持仓复盘/快速风控" if decision.is_exit else "AI 观望")
-            ),
             "symbol": decision.symbol,
             "action": decision.action.value,
             "side": side,
-            "ai_role": "决定方向和动作",
-            "expert_support_count": expert_support,
-            "expert_opposite_count": expert_opposite,
-            "decision_maker_action": decision_maker.get("action"),
-            "decision_maker_confidence": decision_maker.get("confidence"),
-            "local_ml_role": (
-                "参与评分/过滤/仓位控制"
-                if ml_influence_enabled
-                else "学习观察或证据不足，未作为主决策"
-            ),
-            "server_profit_model_role": (
-                "参与盈利质量判断" if local_profit_influence else "未提供有效同向盈利证据"
-            ),
-            "ml_influence_enabled": ml_influence_enabled,
-            "server_profit_aligned": bool(opportunity.get("local_profit_aligned")),
-            "timeseries_aligned": bool(opportunity.get("timeseries_aligned")),
-            "opportunity_score": opportunity.get("score"),
-            "entry_evidence_score": evidence_score.get("score"),
-            "entry_evidence_effective_score": evidence_score.get("effective_score"),
-            "entry_evidence_tier": evidence_score.get("tier"),
-            "entry_evidence_size_multiplier": evidence_score.get("size_multiplier"),
             "expected_net_return_pct": opportunity.get("expected_net_return_pct"),
-            "profit_quality_ratio": opportunity.get("profit_quality_ratio"),
+            "return_lcb_pct": opportunity.get("return_lcb_pct"),
+            "production_return_eligible": policy.get("eligible"),
+            "dynamic_exit_eligible": dynamic_exit.get("eligible"),
+            "expert_memory_strategy_learning_role": "observation_only",
         }
         decision.raw_response = raw
         return raw
@@ -5128,11 +4346,10 @@ class TradingService:
                 if isinstance(learning_context, dict):
                     strategy.update(learning_context)
                 scorer.score_candidate(decision, strategy)
-            return gate.gate_reason(decision)
+            return gate.safety_reason(decision)
         return EntryOpportunityGatePolicy(
-            symbol_loss_cooldown_policy=EntryLossCooldownPolicy(self._normalize_position_symbol),
-            post_crash_rebound_guard=EntryPostCrashReboundGuardPolicy(),
-        ).gate_reason(decision)
+            suspicious_symbol_policy=EntrySuspiciousSymbolPolicy(self._normalize_position_symbol),
+        ).safety_reason(decision)
 
     async def _today_side_performance(self, mode: str) -> dict[str, dict[str, float]]:
         """Delegate today's long/short realized-PnL feedback to a dedicated service."""
@@ -5173,7 +4390,6 @@ class TradingService:
                 normalize_symbol=self._normalize_position_symbol,
                 lookback_limit=SYMBOL_SIDE_PROFILE_LOOKBACK,
                 lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
-                loss_cooldown_params=ENTRY_LOSS_COOLDOWN_PARAMS,
             )
             self.symbol_side_performance_service = service
         return await service.recent(mode)
@@ -5189,59 +4405,14 @@ class TradingService:
             self.model_contribution_performance_service = service
         return await service.recent(mode)
 
-    def _decision_contribution_sources(
-        self,
-        opportunity: dict[str, Any],
-        raw: dict[str, Any],
-        side: str,
-    ) -> list[str]:
-        """Compatibility delegate for legacy callers/tests."""
-
-        service = getattr(self, "model_contribution_performance_service", None)
-        if service is None:
-            service = ModelContributionPerformanceService(
-                lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
-            )
-            self.model_contribution_performance_service = service
-        return service.contribution_sources(opportunity, raw, side)
-
-    def _model_contribution_score_adjustment(
-        self,
-        sources: list[str],
-        performance: dict[str, dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Compatibility delegate for legacy callers/tests."""
-
-        service = getattr(self, "model_contribution_performance_service", None)
-        if service is None:
-            service = ModelContributionPerformanceService(
-                lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
-            )
-            self.model_contribution_performance_service = service
-        return service.score_adjustment(sources, performance)
-
-    def _is_auto_tradeable_feature(self, fv: Any) -> bool:
-        """Compatibility delegate for the hard auto-scan feature filter."""
-
-        return self.entry_feature_ranker.is_auto_tradeable_feature(fv)
-
-    def _is_auto_analysis_candidate_feature(self, fv: Any) -> bool:
-        """Compatibility delegate for the secondary auto-scan feature filter."""
-
-        return self.entry_feature_ranker.is_auto_analysis_candidate_feature(fv)
-
     def _rank_auto_feature_vectors(
         self,
         feature_vectors: dict[str, Any],
         limit: int,
     ) -> dict[str, Any]:
-        hold_penalty = self._entry_market_hold_penalty_policy()
         result = self.entry_feature_ranker.rank(
             feature_vectors,
             limit,
-            recent_hold_penalty=hold_penalty.recent_hold_penalty,
-            recent_analysis_penalty=hold_penalty.recent_analysis_penalty,
-            no_opportunity_rotation_penalty=hold_penalty.no_opportunity_rotation_penalty,
         )
         logger.info(
             "auto opportunity shortlist",
@@ -5254,7 +4425,6 @@ class TradingService:
         self,
         *,
         scan_symbols: list[str],
-        blocked_filter: Any,
         open_position_filter: Any,
         unclaimed_filter: Any | None,
         fetch_symbols: list[str],
@@ -5286,7 +4456,6 @@ class TradingService:
             "analysis_scope": analysis_scope,
             "run_market_analysis": bool(run_market_analysis),
             "scan_symbol_count": len(scan_symbols or []),
-            "blocked_filter_count": len(getattr(blocked_filter, "skipped", []) or []),
             "open_position_filtered_count": len(getattr(open_position_filter, "skipped", []) or []),
             "unclaimed_filtered_count": (
                 len(getattr(unclaimed_filter, "skipped", []) or [])
@@ -5306,14 +4475,6 @@ class TradingService:
             "rank_underfilled": rank_diagnostics.get("rank_underfilled"),
             "rank_underfill_reason": rank_diagnostics.get("rank_underfill_reason"),
             "rank_filtered_out_candidates": rank_diagnostics.get("filtered_out_candidates"),
-            "rank_fallback_filtered_fill_count": rank_diagnostics.get(
-                "fallback_filtered_fill_count",
-                0,
-            ),
-            "rank_fallback_filtered_fill_policy": rank_diagnostics.get(
-                "fallback_filtered_fill_policy",
-                {},
-            ),
             "rank_filtered_out_reason_counts": rank_diagnostics.get(
                 "filtered_out_reason_counts", []
             ),
@@ -5475,40 +4636,19 @@ class TradingService:
                 start_index = normalized_index[key]
                 break
         if start_key is None or start_index <= 0:
-            recent_start_index = self._recent_analysis_rotation_start_index(items)
-            if recent_start_index <= 0:
-                if isinstance(analysis_budget_context, dict):
-                    analysis_budget_context["market_budget_rotation"] = {
-                        "read_only": True,
-                        "is_entry_gate": False,
-                        "applied": False,
-                        "deferred_symbol_count": len(deferred),
-                        "reason": (
-                            "deferred symbols no longer match current shortlist"
-                            if start_key is None
-                            else "deferred symbol already leads current shortlist"
-                        ),
-                    }
-                return dict(items)
-            rotated_items = items[recent_start_index:] + items[:recent_start_index]
             if isinstance(analysis_budget_context, dict):
                 analysis_budget_context["market_budget_rotation"] = {
                     "read_only": True,
                     "is_entry_gate": False,
-                    "applied": True,
-                    "start_symbol": rotated_items[0][0],
-                    "start_index": recent_start_index,
-                    "ranked_symbol_count": len(items),
+                    "applied": False,
                     "deferred_symbol_count": len(deferred),
-                    "rotation_source": "recent_analysis_coverage",
                     "reason": (
-                        "current shortlist no longer contains deferred symbols, so recent "
-                        "analysis coverage rotates the shortlist toward less-covered ranked "
-                        "symbols without changing ranking scores, entry thresholds, sizing, "
-                        "leverage, ML readiness, or risk gates"
+                        "deferred symbols no longer match current shortlist"
+                        if start_key is None
+                        else "deferred symbol already leads current shortlist"
                     ),
                 }
-            return dict(rotated_items)
+            return dict(items)
 
         rotated_items = items[start_index:] + items[:start_index]
         if isinstance(analysis_budget_context, dict):
@@ -5528,20 +4668,6 @@ class TradingService:
                 ),
             }
         return dict(rotated_items)
-
-    def _recent_analysis_rotation_start_index(self, items: list[tuple[str, Any]]) -> int:
-        if len(items) <= 1:
-            return 0
-        penalties = [max(0.0, self._recent_market_analysis_penalty(symbol)) for symbol, _ in items]
-        if not any(penalty > 0.0 for penalty in penalties):
-            return 0
-        lowest_penalty = min(penalties)
-        if penalties[0] <= lowest_penalty + 1e-9:
-            return 0
-        for index, penalty in enumerate(penalties[1:], start=1):
-            if penalty <= lowest_penalty + 1e-9:
-                return index
-        return 0
 
     def _remember_market_budget_deferred_symbols(self, symbols: list[str]) -> None:
         normalized_seen: set[str] = set()
@@ -5572,105 +4698,6 @@ class TradingService:
         async with self._analysis_symbol_lock:
             self._active_analysis_symbols.discard(normalized)
 
-    async def _load_untradable_symbol_blocks(self) -> None:
-        try:
-            from models.decision import AIDecision
-
-            now = datetime.now(UTC)
-            cutoff = now - timedelta(hours=UNTRADABLE_SYMBOL_BLOCK_HOURS)
-            async with get_session_ctx() as session:
-                result = await session.execute(
-                    select(
-                        AIDecision.model_name,
-                        AIDecision.symbol,
-                        AIDecision.action,
-                        AIDecision.confidence,
-                        AIDecision.position_size_pct,
-                        AIDecision.suggested_leverage,
-                        AIDecision.stop_loss_pct,
-                        AIDecision.take_profit_pct,
-                        AIDecision.reasoning,
-                        AIDecision.feature_snapshot,
-                        AIDecision.execution_reason,
-                        AIDecision.raw_llm_response,
-                        AIDecision.created_at,
-                    )
-                    .where(
-                        or_(
-                            AIDecision.execution_reason.is_not(None),
-                            AIDecision.raw_llm_response.is_not(None),
-                        ),
-                        AIDecision.created_at >= cutoff,
-                    )
-                    .order_by(AIDecision.created_at.desc())
-                    .limit(ENTRY_SYMBOL_BLOCK_SCAN_LIMIT)
-                )
-                for row in result.all():
-                    reason = self._decision_execution_error_text(
-                        row.execution_reason,
-                        row.raw_llm_response,
-                    )
-                    created_at = row.created_at
-                    if created_at and created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=UTC)
-                    recent = not created_at or (now - created_at) <= timedelta(
-                        hours=UNTRADABLE_SYMBOL_BLOCK_HOURS
-                    )
-                    if recent and self.is_untradable_exchange_error(reason):
-                        self.remember_untradable_symbol(row.symbol, reason)
-                        action = Action.from_string(str(row.action or ""))
-                        if action.is_exit():
-                            self.exit_cooldown.remember_exit(
-                                str(row.model_name or ENSEMBLE_TRADER_NAME),
-                                DecisionOutput(
-                                    model_name=str(row.model_name or ENSEMBLE_TRADER_NAME),
-                                    symbol=str(row.symbol or ""),
-                                    action=action,
-                                    confidence=float(row.confidence or 0.0),
-                                    reasoning=str(
-                                        row.reasoning
-                                        or "Restored untradable exit cooldown from recent OKX error."
-                                    ),
-                                    position_size_pct=float(row.position_size_pct or 1.0),
-                                    suggested_leverage=float(row.suggested_leverage or 1.0),
-                                    stop_loss_pct=float(row.stop_loss_pct or 0.0),
-                                    take_profit_pct=float(row.take_profit_pct or 0.0),
-                                    raw_response={
-                                        "untradable_exit_execution_error": {
-                                            "reason": reason,
-                                        }
-                                    },
-                                    feature_snapshot=(
-                                        row.feature_snapshot
-                                        if isinstance(row.feature_snapshot, dict)
-                                        else {}
-                                    ),
-                                ),
-                            )
-                    elif (
-                        created_at
-                        and now - created_at <= timedelta(minutes=TRANSIENT_ENTRY_BLOCK_MINUTES)
-                        and self.is_transient_entry_exchange_error(reason)
-                    ):
-                        self.remember_temporary_entry_block(
-                            row.symbol,
-                            reason,
-                            TRANSIENT_ENTRY_BLOCK_MINUTES,
-                        )
-                    elif (
-                        created_at
-                        and now - created_at <= timedelta(minutes=PRICE_GUARD_ENTRY_BLOCK_MINUTES)
-                        and self.entry_symbol_blocklist.is_entry_price_guard_skip(reason)
-                    ):
-                        self.remember_temporary_entry_block(
-                            row.symbol,
-                            reason,
-                            PRICE_GUARD_ENTRY_BLOCK_MINUTES,
-                        )
-            self._entry_symbol_blocks_refreshed_at = now
-        except Exception as e:
-            logger.warning("failed to load untradable symbol blocks", error=safe_error_text(e))
-
     async def initialize(self) -> None:
         """Initialize models, executors, and connections."""
         await self.models.initialize_all()
@@ -5679,7 +4706,6 @@ class TradingService:
         # Initialize OKX demo/live connections for balance sync, position checks,
         # and actual order execution. Paper mode means OKX demo trading, not a
         # local fake fill.
-        self.okx_executor = None
         self._okx_paper = OKXExecutor(mode="paper", load_markets_on_initialize=False)
         try:
             await self._okx_paper.initialize()
@@ -5717,7 +4743,6 @@ class TradingService:
             )
             self._trade_count = trade_count.scalar() or 0
 
-        await self._refresh_entry_symbol_blocks_if_stale(force=True)
         await self.expert_memory_service.backfill_trade_reflections(mode_manager.mode.value)
         await self._prime_strategy_context_performance_snapshot(mode_manager.mode.value)
 
@@ -5734,8 +4759,6 @@ class TradingService:
         settings.refresh_runtime_env(force=True)
         if not self._running:
             return {"status": "stopped"}
-        await self._refresh_entry_symbol_blocks_if_stale()
-
         analysis_scope = (
             analysis_scope if analysis_scope in {"full", "market", "position"} else "full"
         )
@@ -5915,30 +4938,7 @@ class TradingService:
                 if run_position_analysis
                 else []
             )
-            blocked_filter = self.entry_symbol_universe.filter_blocked_new_symbols(
-                scan_symbols,
-                open_positions,
-                self._suspicious_new_symbol_reason,
-                self.blocked_symbol_reason,
-            )
-            market_scan_symbols = blocked_filter.symbols
-            if blocked_filter.skipped:
-                logger.info(
-                    "skipping blocked symbols before AI analysis",
-                    count=len(blocked_filter.skipped),
-                    symbols=[item.symbol for item in blocked_filter.skipped[:10]],
-                )
-                for item in blocked_filter.skipped[:20]:
-                    results["warnings"].append(
-                        {
-                            "model": ENSEMBLE_TRADER_NAME,
-                            "symbol": item.symbol,
-                            "warning": (
-                                "Symbol is temporarily skipped for new entry analysis: "
-                                f"{item.reason}"
-                            ),
-                        }
-                    )
+            market_scan_symbols = self.entry_symbol_universe.dedupe_symbols(scan_symbols)
             open_position_filter = self.entry_symbol_universe.filter_open_position_market_symbols(
                 market_scan_symbols,
                 open_positions,
@@ -5987,12 +4987,7 @@ class TradingService:
                 diagnostics = {
                     "scan_symbol_count": len(scan_symbols or []),
                     "scan_symbol_sample": list(scan_symbols or [])[:10],
-                    "market_scan_after_blocked": len(blocked_filter.symbols),
-                    "blocked_count": len(blocked_filter.skipped),
-                    "blocked_sample": [
-                        {"symbol": item.symbol, "reason": item.reason}
-                        for item in blocked_filter.skipped[:5]
-                    ],
+                    "market_scan_after_normalize": len(market_scan_symbols),
                     "open_position_filtered_count": len(open_position_filter.skipped),
                     "open_position_filtered_sample": open_position_filter.skipped[:10],
                     "unclaimed_filtered_count": (
@@ -6272,27 +5267,6 @@ class TradingService:
                         if self._normalize_position_symbol(s) in allowed_keys
                     }
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
-                dedupe_policy = self._entry_market_hold_penalty_policy()
-                recently_analyzed_symbols = [
-                    symbol
-                    for symbol in market_feature_vectors
-                    if dedupe_policy.recently_analyzed(symbol)
-                ]
-                if recently_analyzed_symbols:
-                    market_feature_vectors = {
-                        symbol: fv
-                        for symbol, fv in market_feature_vectors.items()
-                        if symbol not in recently_analyzed_symbols
-                    }
-                    analysis_budget_context["recent_market_analysis_dedupe"] = {
-                        "skipped_symbols": recently_analyzed_symbols[:20],
-                        "skipped_count": len(recently_analyzed_symbols),
-                        "is_entry_gate": False,
-                        "reason": (
-                            "同一交易对刚完成市场分析，本轮跳过以避免同一分钟重复消耗模型资源；"
-                            "持仓复盘不受该去重影响。"
-                        ),
-                    }
                 market_feature_vectors = self._rotate_market_feature_vectors_for_budget_coverage(
                     market_feature_vectors,
                     analysis_budget_context=analysis_budget_context,
@@ -6300,7 +5274,6 @@ class TradingService:
             market_feature_vectors_after_dedupe = dict(market_feature_vectors)
             market_candidate_funnel = self._market_candidate_funnel_snapshot(
                 scan_symbols=list(scan_symbols or []),
-                blocked_filter=blocked_filter,
                 open_position_filter=open_position_filter,
                 unclaimed_filter=unclaimed_filter_for_funnel,
                 fetch_symbols=list(fetch_symbols or []),
@@ -6337,18 +5310,13 @@ class TradingService:
             logger.info(
                 "market regime prediction",
                 mode=market_regime_context.get("mode"),
-                confidence=market_regime_context.get("confidence"),
-                avoid_long=market_regime_context.get("avoid_long"),
-                avoid_short=market_regime_context.get("avoid_short"),
+                sample_count=market_regime_context.get("sample_count"),
                 reason=market_regime_context.get("reason"),
             )
             logger.info(
                 "strategy mode selected",
                 strategy=strategy_mode_context.get("strategy"),
                 posture=strategy_mode_context.get("posture"),
-                allow_long=strategy_mode_context.get("allow_long"),
-                allow_short=strategy_mode_context.get("allow_short"),
-                blocked_directions=strategy_mode_context.get("blocked_directions"),
                 exposure=strategy_mode_context.get("position_exposure"),
                 reason=strategy_mode_context.get("reason"),
             )
@@ -6489,16 +5457,6 @@ class TradingService:
                     )
                     self._remember_market_budget_deferred_symbols(remaining)
                     break
-                quarantine_reason = self.entry_symbol_profit_quarantine.reason(
-                    symbol,
-                    strategy_mode_context,
-                )
-                if quarantine_reason:
-                    logger.info(
-                        "market symbol has realized loss cooldown evidence; still sending to AI",
-                        symbol=symbol,
-                        reason=quarantine_reason,
-                    )
                 if not await self._try_claim_analysis_symbol(symbol, "market"):
                     logger.info(
                         "market symbol skipped because another analysis owns it", symbol=symbol
@@ -6509,7 +5467,6 @@ class TradingService:
                 self._set_loop_stage(f"market_ai:{symbol}")
 
                 results["symbols_processed"] += 1
-                self._remember_market_analyzed_symbol(symbol)
                 fv = await self._fresh_feature_vector_for_analysis(symbol, fv)
                 if not self._is_valid_feature_vector(fv):
                     logger.warning("skip symbol after fresh feature check failed", symbol=symbol)
@@ -6636,7 +5593,6 @@ class TradingService:
                         reason=prefilter_reason,
                         confidence=0.0,
                     )
-                    self._remember_market_hold_symbol(symbol)
                     continue
                 analysis_started = datetime.now(UTC)
                 decision, _opinions = await self.ensemble.decide(
@@ -6752,96 +5708,6 @@ class TradingService:
                         executed.feature_snapshot or decision.feature_snapshot
                     )
                 if executed.is_hold:
-                    probe_decision = self.entry_evidence_probe.create(
-                        executed,
-                        fv,
-                        strategy_mode_context,
-                        ml_signal_context,
-                        local_ai_tools_context,
-                        direction_competition_context,
-                    )
-                    probe_source_label = "入场候选证据包"
-                    if probe_decision is None:
-                        probe_decision = self.entry_quant_profit_probe.create(
-                            executed,
-                            fv,
-                            strategy_mode_context,
-                            ml_signal_context,
-                            local_ai_tools_context,
-                            direction_competition_context,
-                        )
-                        probe_source_label = "服务器盈利模型"
-                    if probe_decision is not None:
-                        executed = probe_decision
-                        self._candidate_opportunity_score(executed, strategy_mode_context)
-                        self._attach_strategy_learning_context(executed, strategy_mode_context)
-                        if decision_db_id is not None:
-                            if isinstance(executed.raw_response, dict):
-                                await self._mark_decision_raw_response(
-                                    decision_db_id,
-                                    executed.raw_response,
-                                )
-                            await self._mark_decision_reason(
-                                decision_db_id,
-                                f"AI 原始裁决为观望；{probe_source_label}触发正期望候选，另建一条候选决策继续风控。",
-                            )
-                        probe_decision_db_id = await self._log_decision(
-                            executed, is_paper=(model_mode == "paper")
-                        )
-                        if probe_decision_db_id is not None:
-                            round_decision_ids.add(probe_decision_db_id)
-                            round_decisions[probe_decision_db_id] = executed
-                            decision_db_id = probe_decision_db_id
-                            self._decision_count += 1
-                        assessment = await self.market_decision_risk_assessment.assess(
-                            decision=executed,
-                            model_name=model_name,
-                            open_positions=open_positions,
-                            feature_vector=fv,
-                            strategy_mode_context=strategy_mode_context,
-                        )
-
-                        if not assessment.approved:
-                            reason = assessment.rejection_reason or "量化盈利探针未通过风控。"
-                            if decision_db_id is not None:
-                                await self._mark_decision_reason(decision_db_id, reason)
-                            self.market_decision_result_recorder.append_result(
-                                results=results,
-                                model_name=model_name,
-                                symbol=symbol,
-                                decision_or_action=executed,
-                                model_mode=model_mode,
-                                approved=False,
-                                execution_status="quant_probe_rejected",
-                                reason=reason,
-                            )
-                            continue
-                    else:
-                        hold_reason = getattr(executed, "reasoning", None) or getattr(
-                            decision, "reasoning", None
-                        )
-                        self._remember_market_hold_symbol(symbol, fv, hold_reason)
-                        if decision_db_id is not None:
-                            await self._mark_decision_reason(
-                                decision_db_id,
-                                "多模型裁决结果为观望，未提交订单。",
-                            )
-                        self.market_decision_result_recorder.append_result(
-                            results=results,
-                            model_name=model_name,
-                            symbol=symbol,
-                            decision_or_action="hold",
-                            model_mode=model_mode,
-                            approved=True,
-                            confidence=executed.confidence,
-                        )
-                        continue
-
-                if executed.is_hold:
-                    hold_reason = getattr(executed, "reasoning", None) or getattr(
-                        decision, "reasoning", None
-                    )
-                    self._remember_market_hold_symbol(symbol, fv, hold_reason)
                     if decision_db_id is not None:
                         if isinstance(executed.raw_response, dict):
                             await self._mark_decision_raw_response(
@@ -7278,7 +6144,7 @@ class TradingService:
         self._stale_entry_expire_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
-        for okx in (self.okx_executor, self._okx_paper, self._okx_live):
+        for okx in (self._okx_paper, self._okx_live):
             if okx:
                 try:
                     await okx.shutdown()
@@ -7484,14 +6350,6 @@ class TradingService:
                 "local AI tools status probe failed before training; continuing with local cursors",
                 error=status_probe_error,
             )
-        now = datetime.now(UTC)
-        trained_at_raw = status.get("trained_at") if isinstance(status, dict) else None
-        trained_at = self._parse_datetime(trained_at_raw)
-        age_seconds = (
-            (now - trained_at).total_seconds()
-            if trained_at is not None
-            else AUTO_TRAIN_CHECK_INTERVAL_SECONDS * 12
-        )
         server_shadow_count = int((status or {}).get("shadow_sample_count") or 0)
         server_trade_count = int((status or {}).get("trade_sample_count") or 0)
         completed_shadow_total = await self._completed_shadow_backtest_total()
@@ -7515,22 +6373,12 @@ class TradingService:
             )
             from services.training_data_quality import annotate_training_payload
 
-            shadow_samples = await _load_shadow_samples(
-                LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
-            )
-            trade_reflection_samples = await _load_trade_reflection_samples(
-                LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-            )
-            authoritative_samples = await _load_authoritative_trade_samples(
-                LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-            )
+            shadow_samples = await _load_shadow_samples()
+            trade_reflection_samples = await _load_trade_reflection_samples()
+            authoritative_samples = await _load_authoritative_trade_samples()
             trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
-            sequence_samples = await _load_sequence_samples(
-                LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
-            )
-            text_sentiment_samples = await _load_text_sentiment_samples(
-                LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
-            )
+            sequence_samples = await _load_sequence_samples()
+            text_sentiment_samples = await _load_text_sentiment_samples()
             training_payload = annotate_training_payload(
                 shadow_samples=shadow_samples,
                 trade_samples=trade_samples,
@@ -7563,33 +6411,11 @@ class TradingService:
         learning_only = not bool(
             (status or {}).get("model_bundle_available", (status or {}).get("available"))
         )
-        min_interval_seconds = (
-            LOCAL_ML_TRAINING_PARAMS.auto_train_learning_only_interval_seconds
-            if learning_only
-            else LOCAL_ML_TRAINING_PARAMS.auto_train_min_interval_seconds
-        )
-        min_new_shadow = (
-            LOCAL_ML_TRAINING_PARAMS.auto_train_learning_only_min_new_samples
-            if learning_only
-            else LOCAL_ML_TRAINING_PARAMS.auto_train_min_new_samples
-        )
-        min_new_trade = (
-            LOCAL_ML_TRAINING_PARAMS.local_tools_learning_only_min_new_trade_samples
-            if learning_only
-            else LOCAL_ML_TRAINING_PARAMS.local_tools_min_new_trade_samples
-        )
         training_policy = {
             "learning_only": learning_only,
-            "min_interval_seconds": min_interval_seconds,
-            "min_new_shadow_samples": min_new_shadow,
-            "min_new_trade_samples": min_new_trade,
-            "min_training_shadow_samples": LOCAL_ML_TRAINING_PARAMS.min_training_samples,
-            "training_shadow_sample_limit": (LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit),
-            "training_trade_sample_limit": LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
-            "training_sequence_sample_limit": (
-                LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
-            ),
-            "training_text_sample_limit": LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
+            "trigger": "new_clean_cost_complete_sample_or_forced_rebuild",
+            "distribution_requirement": "non_empty_train_and_holdout",
+            "training_window_policy": "all_current_clean_cost_complete_samples",
             "cursor_source": "last_trained_completed_shadow_sample_count",
             "trade_cursor_source": "last_trained_completed_trade_sample_count",
             "trade_cursor_policy": "clean_training_view_only",
@@ -7597,10 +6423,10 @@ class TradingService:
         if status_probe_error:
             training_policy["status_probe_error"] = status_probe_error
             training_policy["status_probe_fallback"] = "train_when_due_from_local_counts"
-        if completed_shadow_total < LOCAL_ML_TRAINING_PARAMS.min_training_samples:
+        if trainable_shadow_count <= 1:
             return {
                 "trained": False,
-                "reason": "not_enough_shadow_samples",
+                "reason": "clean_training_distribution_unavailable",
                 "server_shadow_sample_count": server_shadow_count,
                 "local_shadow_sample_count": training_shadow_count,
                 "trainable_shadow_sample_count": trainable_shadow_count,
@@ -7618,12 +6444,7 @@ class TradingService:
                 "new_trade_sample_count": new_trade,
                 "training_policy": training_policy,
             }
-        should_train = (
-            force
-            or age_seconds >= min_interval_seconds
-            or new_shadow >= min_new_shadow
-            or new_trade >= min_new_trade
-        )
+        should_train = force or learning_only or new_shadow > 0 or new_trade > 0
         if not should_train:
             return {
                 "trained": False,
@@ -7639,18 +6460,14 @@ class TradingService:
                 "quality_report": quality_report,
                 "governance_report": governance_report,
                 "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
-                "training_shadow_sample_limit": (
-                    LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
-                ),
                 "completed_trade_sample_count": completed_trade_total,
                 "last_trained_completed_trade_sample_count": previous_completed_trade_total,
                 "new_shadow_sample_count": new_shadow,
                 "new_trade_sample_count": new_trade,
-                "model_age_seconds": round(age_seconds, 1),
                 "training_policy": training_policy,
             }
 
-        self._local_tools_last_train_started_at = now
+        self._local_tools_last_train_started_at = datetime.now(UTC)
         if self._local_tools_active_training_run_id:
             self._model_training_state().start_run(
                 scheduler_id="local_ai_tools_auto_train",
@@ -7705,9 +6522,6 @@ class TradingService:
             result["quality_report"] = quality_report
             result["governance_report"] = governance_report
             result["paper_observation_report"] = paper_observation_report
-            result["training_shadow_sample_limit"] = (
-                LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
-            )
             result["training_policy"] = training_policy
             self._local_tools_last_completed_shadow_count = completed_shadow_total
             logger.info(
@@ -7759,34 +6573,6 @@ class TradingService:
             open_positions=open_positions,
             round_decision_ids=round_decision_ids,
         )
-
-    async def _apply_entry_profit_risk_sizing(
-        self,
-        decision: DecisionOutput,
-        model_mode: str,
-        open_positions: list[dict] | None = None,
-    ) -> None:
-        """Compatibility delegate for older tests/tools that call the legacy private method."""
-
-        sizer = getattr(self, "entry_profit_risk_sizing", None)
-        if sizer is None:
-            sizer = EntryProfitRiskSizingPolicy(
-                allocated_order_balance=self.allocated_order_balance,
-                entry_low_payoff_quality=getattr(
-                    self, "entry_low_payoff_quality", EntryLowPayoffQualityPolicy()
-                ),
-                entry_stop_loss_budget=getattr(
-                    self, "entry_stop_loss_budget", EntryStopLossBudgetPolicy()
-                ),
-                entry_stress_stop=getattr(self, "entry_stress_stop", EntryStressStopPolicy()),
-                entry_existing_winner_context=getattr(
-                    self,
-                    "entry_existing_winner_context",
-                    EntryExistingWinnerContextPolicy(self._normalize_position_symbol),
-                ),
-                max_leverage_provider=lambda: settings.max_leverage,
-            )
-        await sizer.apply(decision, model_mode, open_positions or [])
 
     def _entry_side_value(self, decision: DecisionOutput) -> str:
         if decision.action == Action.LONG:
@@ -7998,22 +6784,6 @@ class TradingService:
             decision,
             execution_result,
         )
-
-    def _reserve_entry_slot(
-        self,
-        model_name: str,
-        decision: DecisionOutput,
-        staged_entry_counts: dict[str, dict],
-    ) -> None:
-        """Compatibility delegate for older tests/tools that reserve staged entry slots."""
-
-        capacity = getattr(self, "entry_capacity", None)
-        if capacity is None:
-            capacity = EntryCapacityPolicy(
-                self._normalize_position_symbol,
-                lambda: settings.max_open_positions_per_model,
-            )
-        capacity.reserve_slot(model_name, decision, staged_entry_counts)
 
     async def manual_trade(self, symbol: str, model_name: str | None = None) -> dict[str, Any]:
         """Execute a one-shot AI analysis and trade for a specific symbol.
@@ -8737,7 +7507,7 @@ class TradingService:
         *,
         open_positions: list[dict[str, Any]] | None = None,
     ) -> list[dict]:
-        """Run fast non-AI protection for open positions before slow AI review."""
+        """Execute the unified dynamic exit policy before slow position review."""
         auto_closes: list[dict[str, Any]] = []
         if open_positions is None:
             open_positions = await self.okx_sync_service.get_open_positions_context()
@@ -8745,415 +7515,134 @@ class TradingService:
             return auto_closes
 
         handled: set[tuple[str, str, str]] = set()
-        fast_adverse_pct = min(
-            max(float(settings.hard_stop_loss_pct or 0.05) * 0.6, 0.018),
-            0.035,
-        )
-
-        for pos in open_positions:
-            if pos.get("is_open", True) is False:
+        for position in open_positions:
+            if position.get("is_open", True) is False:
                 continue
-
-            model_name = str(pos.get("model_name") or ENSEMBLE_TRADER_NAME)
-            sym = self._normalize_position_symbol(pos.get("symbol"))
-            side = str(pos.get("side") or "").lower()
-            if not sym or side not in {"long", "short"}:
-                continue
-
-            key = (model_name, sym, side)
-            if key in handled:
+            model_name = str(position.get("model_name") or ENSEMBLE_TRADER_NAME)
+            symbol = self._normalize_position_symbol(position.get("symbol"))
+            side = str(position.get("side") or "").lower()
+            key = (model_name, symbol, side)
+            if not symbol or side not in {"long", "short"} or key in handled:
                 continue
             handled.add(key)
 
-            fv = feature_vectors.get(sym) or feature_vectors.get(pos.get("symbol"))
-            fv_current_price = self._safe_float(
-                getattr(fv, "current_price", 0) if fv is not None else 0,
+            feature = feature_vectors.get(symbol) or feature_vectors.get(position.get("symbol"))
+            position_price = self._safe_float(position.get("current_price"), 0.0)
+            feature_price = self._safe_float(
+                getattr(feature, "current_price", 0.0) if feature is not None else 0.0,
                 0.0,
             )
-            position_current_price = self._safe_float(pos.get("current_price"), 0.0)
-            current_price = fv_current_price or position_current_price
-            entry_price = self._safe_float(pos.get("entry_price"), 0.0)
-            if current_price <= 0 or entry_price <= 0:
+            current_price = position_price or feature_price
+            entry_price = self._safe_float(position.get("entry_price"), 0.0)
+            if current_price <= 0.0 or entry_price <= 0.0:
                 continue
 
-            stop_loss = self._safe_float(pos.get("stop_loss"), 0.0)
-            take_profit = self._safe_float(pos.get("take_profit"), 0.0)
-            returns_1 = self._safe_float(getattr(fv, "returns_1", 0) if fv is not None else 0, 0.0)
-            returns_5 = self._safe_float(getattr(fv, "returns_5", 0) if fv is not None else 0, 0.0)
-            returns_20 = self._safe_float(
-                getattr(fv, "returns_20", 0) if fv is not None else 0, 0.0
+            stop_loss = self._safe_float(position.get("stop_loss"), 0.0)
+            take_profit = self._safe_float(position.get("take_profit"), 0.0)
+            stop_crossed = bool(
+                stop_loss
+                and (
+                    (side == "long" and current_price <= stop_loss)
+                    or (side == "short" and current_price >= stop_loss)
+                )
             )
-            volume_ratio = self._safe_float(
-                getattr(fv, "volume_ratio", 0) if fv is not None else 0, 0.0
+            target_crossed = bool(
+                take_profit
+                and (
+                    (side == "long" and current_price >= take_profit)
+                    or (side == "short" and current_price <= take_profit)
+                )
             )
-            rsi_14 = self._safe_float(getattr(fv, "rsi_14", 50) if fv is not None else 50, 50.0)
-            bb_pct = self._safe_float(getattr(fv, "bb_pct", 0.5) if fv is not None else 0.5, 0.5)
-            macd_diff = self._safe_float(getattr(fv, "macd_diff", 0) if fv is not None else 0, 0.0)
-            adx_14 = self._safe_float(getattr(fv, "adx_14", 0) if fv is not None else 0, 0.0)
-            high_24h = self._safe_float(getattr(fv, "high_24h", 0) if fv is not None else 0, 0.0)
-            low_24h = self._safe_float(getattr(fv, "low_24h", 0) if fv is not None else 0, 0.0)
+            returns = [
+                self._safe_float(
+                    getattr(feature, name, 0.0) if feature is not None else 0.0,
+                    0.0,
+                )
+                for name in ("returns_1", "returns_5", "returns_20")
+            ]
+            adverse_returns = [
+                value
+                for value in returns
+                if (side == "long" and value < 0.0)
+                or (side == "short" and value > 0.0)
+            ]
             hold_minutes = self.position_time.position_age_minutes(
-                position_open_time(pos) or pos.get("created_at")
+                position_open_time(position) or position.get("created_at")
             )
-            feature_price_suspicious_reason = (
-                self.exit_fast_risk.suspicious_feature_price_reason(
-                    side=side,
-                    feature_price=fv_current_price,
-                    position_price=position_current_price,
-                    high_24h=high_24h,
-                    low_24h=low_24h,
-                    returns_1=returns_1,
-                    returns_5=returns_5,
-                )
-                if fv_current_price > 0
-                and hasattr(self.exit_fast_risk, "suspicious_feature_price_reason")
-                else None
-            )
-            if feature_price_suspicious_reason:
-                logger.warning(
-                    "fast risk feature price marked suspicious",
-                    model=model_name,
-                    symbol=sym,
-                    side=side,
-                    reason=feature_price_suspicious_reason,
-                    fv_current_price=fv_current_price,
-                    position_current_price=position_current_price,
-                    high_24h=high_24h,
-                    low_24h=low_24h,
-                    returns_1=returns_1,
-                    returns_5=returns_5,
-                )
-                if position_current_price <= 0:
-                    continue
-                current_price = position_current_price
-            if fv_current_price > 0 and position_current_price > 0:
-                feature_position_gap = abs(fv_current_price - position_current_price) / max(
-                    position_current_price, 1e-12
-                )
-                feature_price_implies_adverse = (
-                    side == "long" and fv_current_price < position_current_price
-                ) or (side == "short" and fv_current_price > position_current_price)
-                short_returns_contradict_adverse = (
-                    side == "long" and returns_1 >= 0 and returns_5 >= 0
-                ) or (side == "short" and returns_1 <= 0 and returns_5 <= 0)
-                if (
-                    feature_position_gap >= FAST_RISK_MAX_FEATURE_POSITION_PRICE_GAP
-                    and feature_price_implies_adverse
-                    and short_returns_contradict_adverse
-                ):
-                    logger.warning(
-                        "fast risk skipped due to contradictory feature current price",
-                        model=model_name,
-                        symbol=sym,
-                        side=side,
-                        fv_current_price=fv_current_price,
-                        position_current_price=position_current_price,
-                        gap_pct=round(feature_position_gap * 100, 4),
-                        returns_1=returns_1,
-                        returns_5=returns_5,
-                        hold_minutes=hold_minutes,
-                    )
-                    continue
-            close_fraction = 1.0
-            fast_exit_plan: dict[str, Any] = {}
-            profit_exit_plan: dict[str, Any] = {}
-            current_unrealized = self._safe_float(pos.get("unrealized_pnl"), 0.0)
+            current_unrealized = self._safe_float(position.get("unrealized_pnl"), 0.0)
             peak_state = self.position_profit_peaks.update(
                 model_name=model_name,
-                symbol=sym,
+                symbol=symbol,
                 side=side,
                 current_price=current_price,
                 entry_price=entry_price,
                 unrealized_pnl=current_unrealized,
                 hold_minutes=hold_minutes,
-                quantity=self._safe_float(pos.get("quantity"), 0.0),
+                quantity=self._safe_float(position.get("quantity"), 0.0),
             )
-
-            hit_sl = False
-            hit_tp = False
-            # Direct hard-adverse exits are disabled; route hard moves through policy below.
-            legacy_hard_adverse_direct_exit = False
-            hard_adverse_observed = False
-            hit_fast_adverse = False
-            if side == "long":
-                hit_sl = bool(stop_loss and current_price <= stop_loss)
-                hit_tp = bool(take_profit and current_price >= take_profit)
-                hard_adverse_observed = current_price <= entry_price * (1 - fast_adverse_pct)
-                hit_fast_adverse = (
-                    returns_1 <= -FAST_RISK_1M_MOVE_PCT or returns_5 <= -FAST_RISK_5M_MOVE_PCT
-                )
-                adverse_pct = max((entry_price - current_price) / entry_price, 0.0)
-                stop_distance_pct = (
-                    (entry_price - stop_loss) / entry_price if 0 < stop_loss < entry_price else 0.0
-                )
-            else:
-                hit_sl = bool(stop_loss and current_price >= stop_loss)
-                hit_tp = bool(take_profit and current_price <= take_profit)
-                hard_adverse_observed = current_price >= entry_price * (1 + fast_adverse_pct)
-                hit_fast_adverse = (
-                    returns_1 >= FAST_RISK_1M_MOVE_PCT or returns_5 >= FAST_RISK_5M_MOVE_PCT
-                )
-                adverse_pct = max((current_price - entry_price) / entry_price, 0.0)
-                stop_distance_pct = (
-                    (stop_loss - entry_price) / entry_price if stop_loss > entry_price else 0.0
-                )
-            hit_near_stop_progress = bool(
-                stop_distance_pct > 0
-                and adverse_pct >= stop_distance_pct * FAST_RISK_NEAR_STOP_PROGRESS
+            position_snapshot = dict(position)
+            position_snapshot["symbol"] = symbol
+            position_snapshot["side"] = side
+            position_snapshot["current_price"] = current_price
+            position_snapshot["peak_unrealized_pnl"] = self._safe_float(
+                peak_state.get("peak_unrealized_pnl"), current_unrealized
             )
-            hit_full_stop_progress = bool(
-                stop_distance_pct > 0
-                and adverse_pct >= stop_distance_pct * FAST_RISK_FULL_STOP_PROGRESS
-            )
-            stop_risk_progress = (
-                adverse_pct / max(stop_distance_pct, 1e-12) if stop_distance_pct > 0 else 0.0
-            )
-            predictive_reversal = self.exit_predictive_reversal.evidence(
-                side=side,
-                returns_1=returns_1,
-                returns_5=returns_5,
-                returns_20=returns_20,
-                volume_ratio=volume_ratio,
-                rsi_14=rsi_14,
-                bb_pct=bb_pct,
-                macd_diff=macd_diff,
-                adx_14=adx_14,
-            )
-            settlement_guard_active = (
-                hold_minutes is not None
-                and hold_minutes * 60.0 < ENTRY_SETTLEMENT_EXIT_GUARD_SECONDS
-                and self._safe_float(predictive_reversal.get("score"), 0.0)
-                < PREDICTIVE_REVERSAL_EXIT_SCORE
-            )
-            if not settlement_guard_active:
-                profit_exit_plan = self.exit_fast_risk.profit_drawdown_exit_plan(
-                    side=side,
-                    current_price=current_price,
-                    entry_price=entry_price,
-                    unrealized_pnl=current_unrealized,
-                    peak_state=peak_state,
-                    hold_minutes=hold_minutes,
-                    volume_ratio=volume_ratio,
-                    returns_1=returns_1,
-                    returns_5=returns_5,
-                    returns_20=returns_20,
-                    rsi_14=rsi_14,
-                    bb_pct=bb_pct,
-                    macd_diff=macd_diff,
-                    adx_14=adx_14,
-                )
-
-            if hit_sl:
-                trigger = "stop_loss"
-                reason = (
-                    "快速风控触发：价格已经触及本地记录的止损位，优先提交平仓，不等待 AI 会诊。"
-                )
-            elif hit_tp:
-                trigger = "take_profit"
-                reason = "快速风控触发：价格已经触及本地记录的止盈位，优先提交平仓锁定结果。"
-            elif profit_exit_plan.get("should_exit"):
-                fast_exit_plan = profit_exit_plan
-                close_fraction = self._safe_float(profit_exit_plan.get("fraction"), 1.0)
-                close_fraction = min(max(close_fraction, 0.05), 1.0)
-                trigger = (
-                    "profit_drawdown_reduce" if close_fraction < 0.999 else "profit_drawdown_close"
-                )
-                reason = (
-                    "盈利保护触发：持仓曾经达到可保护浮盈，现在利润明显回撤，"
-                    "本轮先于普通风控和慢专家复盘执行锁盈。"
-                    f"{profit_exit_plan.get('note')}"
-                )
-            elif hit_full_stop_progress:
-                trigger = "near_stop_progress"
-                reason = (
-                    "快速风控触发：亏损已经走完止损距离的"
-                    f"{adverse_pct / max(stop_distance_pct, 1e-12):.0%}，"
-                    f"超过强制退出阈值 {FAST_RISK_FULL_STOP_PROGRESS:.0%}。"
-                    "为避免继续拖到完整止损，优先提交全平。"
-                )
-            elif legacy_hard_adverse_direct_exit:
-                trigger = "hard_adverse_move"
-                reason = (
-                    "快速风控触发：价格已经相对开仓价出现明显反向波动，"
-                    f"超过快速硬风险阈值 {fast_adverse_pct:.2%}，"
-                    "这不是普通短线回撤，优先提交平仓控制单笔亏损。"
-                )
-            elif hard_adverse_observed or hit_fast_adverse or hit_near_stop_progress:
-                fast_exit_plan = self.exit_fast_risk.fast_adverse_exit_plan(
-                    side=side,
-                    entry_price=entry_price,
-                    current_price=current_price,
-                    stop_loss=stop_loss,
-                    returns_1=returns_1,
-                    returns_5=returns_5,
-                    hold_minutes=hold_minutes,
-                    volume_ratio=volume_ratio,
-                    current_unrealized_pnl=current_unrealized,
-                    hard_adverse_observed=hard_adverse_observed,
-                    data_quality_suspicious=bool(feature_price_suspicious_reason),
-                    predictive_reversal_score=self._safe_float(
-                        predictive_reversal.get("score"), 0.0
-                    ),
-                )
-                if not fast_exit_plan.get("should_exit"):
-                    logger.info(
-                        "fast adverse move observed but held",
-                        model=model_name,
-                        symbol=sym,
-                        side=side,
-                        entry=entry_price,
-                        current=current_price,
-                        returns_1=returns_1,
-                        returns_5=returns_5,
-                        adverse_pct=fast_exit_plan.get("adverse_pct"),
-                        hold_minutes=hold_minutes,
-                        note=fast_exit_plan.get("note"),
-                    )
-                    if settlement_guard_active:
-                        logger.info(
-                            "settlement guard blocked profit drawdown check after fast adverse hold",
-                            model=model_name,
-                            symbol=sym,
-                            side=side,
-                            hold_minutes=hold_minutes,
-                        )
-                        continue
-                    profit_exit_plan = self.exit_fast_risk.profit_drawdown_exit_plan(
-                        side=side,
-                        current_price=current_price,
-                        entry_price=entry_price,
-                        unrealized_pnl=current_unrealized,
-                        peak_state=peak_state,
-                        hold_minutes=hold_minutes,
-                        volume_ratio=volume_ratio,
-                        returns_1=returns_1,
-                        returns_5=returns_5,
-                        returns_20=returns_20,
-                        rsi_14=rsi_14,
-                        bb_pct=bb_pct,
-                        macd_diff=macd_diff,
-                        adx_14=adx_14,
-                    )
-                    if not profit_exit_plan.get("should_exit"):
-                        continue
-                    fast_exit_plan = profit_exit_plan
-                    close_fraction = self._safe_float(profit_exit_plan.get("fraction"), 1.0)
-                    close_fraction = min(max(close_fraction, 0.05), 1.0)
-                    trigger = (
-                        "profit_drawdown_reduce"
-                        if close_fraction < 0.999
-                        else "profit_drawdown_close"
-                    )
-                    reason = (
-                        "盈利保护触发：短线有反向波动但未达到亏损止损条件；"
-                        "同时浮盈已明显回撤，优先锁定剩余利润。"
-                        f"{profit_exit_plan.get('note')}"
-                    )
-                else:
-                    close_fraction = self._safe_float(fast_exit_plan.get("fraction"), 1.0)
-                    close_fraction = min(max(close_fraction, 0.05), 1.0)
-                    if settlement_guard_active and close_fraction < 0.999:
-                        logger.info(
-                            "settlement guard blocked fast partial reduce",
-                            model=model_name,
-                            symbol=sym,
-                            side=side,
-                            hold_minutes=hold_minutes,
-                            close_fraction=close_fraction,
-                        )
-                        continue
-                    trigger = (
-                        "fast_adverse_reduce"
-                        if close_fraction < 0.999
-                        else ("hard_adverse_move" if hard_adverse_observed else "fast_adverse_move")
-                    )
-                    reason = (
-                        "快速风控触发：1-5 分钟短线波动明显反向。" f"{fast_exit_plan.get('note')}"
-                    )
-            else:
-                if settlement_guard_active:
-                    logger.info(
-                        "settlement guard blocked profit drawdown reduce",
-                        model=model_name,
-                        symbol=sym,
-                        side=side,
-                        hold_minutes=hold_minutes,
-                    )
-                    continue
-                if not profit_exit_plan.get("should_exit"):
-                    continue
-                fast_exit_plan = profit_exit_plan
-                close_fraction = self._safe_float(profit_exit_plan.get("fraction"), 1.0)
-                close_fraction = min(max(close_fraction, 0.05), 1.0)
-                trigger = (
-                    "profit_drawdown_reduce" if close_fraction < 0.999 else "profit_drawdown_close"
-                )
-                reason = (
-                    "盈利保护触发：持仓已有浮盈，但利润开始明显回撤。"
-                    f"{profit_exit_plan.get('note')}"
-                )
 
             close_action = Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT
+            trigger = (
+                "stop_loss"
+                if stop_crossed
+                else "take_profit"
+                if target_crossed
+                else "dynamic_position_scan"
+            )
             close_decision = DecisionOutput(
                 model_name=model_name,
-                symbol=sym,
+                symbol=symbol,
                 action=close_action,
-                confidence=1.0,
-                reasoning=reason,
-                position_size_pct=close_fraction,
-                suggested_leverage=self._safe_float(pos.get("leverage"), 1.0),
+                confidence=0.0,
+                reasoning="unified dynamic fee-after exit scan",
+                position_size_pct=0.0,
+                suggested_leverage=self._safe_float(position.get("leverage"), 1.0),
                 stop_loss_pct=0.0,
                 take_profit_pct=0.0,
                 raw_response={
-                    "fast_risk_exit": True,
                     "fast_risk_trigger": trigger,
-                    "fast_exit_plan": fast_exit_plan,
-                    "close_fraction": close_fraction,
-                    "returns_1": returns_1,
-                    "returns_5": returns_5,
-                    "returns_20": returns_20,
-                    "predictive_reversal": predictive_reversal,
-                    "hard_adverse_observed": hard_adverse_observed,
-                    "feature_price_suspicious_reason": feature_price_suspicious_reason,
+                    "forced_exit": bool(stop_crossed or target_crossed),
+                    "close_evidence": {
+                        "hard_risk": stop_crossed,
+                        "continuation_deteriorated": bool(adverse_returns),
+                        "peak_unrealized_pnl_usdt": position_snapshot[
+                            "peak_unrealized_pnl"
+                        ],
+                    },
                 },
-                feature_snapshot={
-                    "current_price": current_price,
-                    "feature_current_price": fv_current_price,
-                    "position_current_price": position_current_price,
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "returns_1": returns_1,
-                    "returns_5": returns_5,
-                    "volume_ratio": volume_ratio,
-                    "stop_risk_progress": stop_risk_progress,
-                    "position_age_minutes": hold_minutes,
-                    "adverse_from_entry_pct": (
-                        fast_exit_plan.get("adverse_pct") if fast_exit_plan else None
-                    ),
-                    "close_fraction": close_fraction,
-                    "fast_adverse_pct": fast_adverse_pct,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                },
+                feature_snapshot=(
+                    feature.to_dict()
+                    if feature is not None and callable(getattr(feature, "to_dict", None))
+                    else {"current_price": current_price}
+                ),
             )
+            assessment = apply_dynamic_exit(close_decision, [position_snapshot])
+            if not assessment.eligible or assessment.close_fraction <= 0.0:
+                continue
+
+            close_fraction = assessment.close_fraction
+            reason = assessment.reason
             logger.info(
-                "fast position risk triggered",
+                "dynamic position risk triggered",
                 model=model_name,
-                symbol=sym,
+                symbol=symbol,
                 side=side,
                 trigger=trigger,
-                entry=entry_price,
-                current=current_price,
-                sl=stop_loss,
-                tp=take_profit,
                 close_fraction=close_fraction,
+                policy_version=assessment.policy_provenance.get("strategy_version"),
             )
-
-            fast_execution = await self._fast_risk_exit_execution_processor().execute(
+            execution = await self._fast_risk_exit_execution_processor().execute(
                 model_name=model_name,
-                symbol=sym,
+                symbol=symbol,
                 side=side,
-                position=pos,
+                position=position,
                 decision=close_decision,
                 trigger=trigger,
                 reason=reason,
@@ -9161,10 +7650,8 @@ class TradingService:
                 entry_price=entry_price,
                 current_price=current_price,
             )
-            if fast_execution.skipped:
-                continue
-            if fast_execution.auto_close is not None:
-                auto_closes.append(fast_execution.auto_close)
+            if not execution.skipped and execution.auto_close is not None:
+                auto_closes.append(execution.auto_close)
 
         return auto_closes
 
@@ -9351,30 +7838,6 @@ class TradingService:
                     )
                     fv = None
 
-            scan = self._position_release_scan(
-                model_name=model_name,
-                symbol=symbol,
-                normalized_symbol=normalized_symbol,
-                positions=positions,
-                fast_scan=fast_scan.get((model_name, symbol), {}),
-                feature_vector=fv,
-            )
-            release_result = await self._process_position_release_decision(
-                model_name=model_name,
-                symbol=symbol,
-                positions=positions,
-                scan=scan,
-                feature_vector=fv,
-                open_positions=open_positions,
-                position_entry_pause_reason=position_entry_pause_reason,
-                results=results,
-                round_decision_ids=round_decision_ids,
-            )
-            if release_result is not None:
-                handled_keys.add((model_name, normalized_symbol))
-                if release_result.candidate is not None:
-                    candidates.append(release_result.candidate)
-                continue
             if fv is None:
                 continue
 
@@ -9466,7 +7929,6 @@ class TradingService:
                 "position_review",
             )
 
-            decision = self.position_review_decision_normalizer.normalize(decision, positions)
             model_mode = self._get_model_execution_mode(model_name)
             decision_db_id = await self._log_decision(decision, is_paper=(model_mode == "paper"))
             self._decision_count += 1
@@ -9568,140 +8030,7 @@ class TradingService:
                         },
                     )
 
-    def _position_release_scan(
-        self,
-        *,
-        model_name: str,
-        symbol: str,
-        normalized_symbol: str,
-        positions: list[dict[str, Any]],
-        fast_scan: dict[str, Any] | None,
-        feature_vector: Any | None,
-    ) -> dict[str, Any]:
-        scan = dict(fast_scan) if isinstance(fast_scan, dict) else {}
-        if bool(scan.get("force_exit_candidate")):
-            return scan
 
-        by_side: dict[str, list[dict[str, Any]]] = {}
-        for position in positions or []:
-            side = str(position.get("side") or "").lower()
-            if side in {"long", "short"}:
-                by_side.setdefault(side, []).append(position)
-
-        capacity = self._dynamic_capacity_context()
-        capacity_release_pressure = bool(
-            self._safe_float(capacity.get("open_group_count"), 0.0)
-            > self._safe_float(capacity.get("effective_limit"), 0.0)
-            and self._safe_float(capacity.get("low_quality_count"), 0.0) > 0
-        )
-        best_scan = scan
-        best_exit_score = self._safe_float(scan.get("exit_score"), 0.0)
-        for side, side_positions in by_side.items():
-            aggregate = self._position_group_aggregator_policy().aggregate(
-                side_positions,
-                model_name,
-                normalized_symbol or symbol,
-                side,
-            )
-            if not aggregate:
-                continue
-            quality = self.position_quality_scorer.score(
-                aggregate,
-                feature_vector=feature_vector,
-            )
-            should_release = bool(
-                quality.bucket == "release_now"
-                or (capacity_release_pressure and quality.should_release)
-            )
-            if not should_release:
-                continue
-            exit_score = max(
-                best_exit_score,
-                94.0 if quality.bucket == "release_now" else 92.0,
-            )
-            if exit_score < best_exit_score:
-                continue
-            reason = "; ".join(quality.reasons) or quality.bucket
-            best_exit_score = exit_score
-            best_scan = {
-                **scan,
-                "priority_score": max(
-                    self._safe_float(scan.get("priority_score"), 0.0),
-                    exit_score,
-                ),
-                "exit_score": exit_score,
-                "force_exit_candidate": True,
-                "release_action": "close_long" if side == "long" else "close_short",
-                "release_fraction": 1.0,
-                "release_reason": reason[:260],
-                "reason": "; ".join(
-                    dict.fromkeys(
-                        [
-                            str(scan.get("reason") or ""),
-                            reason,
-                            "deterministic_position_quality_release",
-                        ]
-                    )
-                ).strip("; ")[:260],
-                "position_quality": quality.as_dict(),
-            }
-        return best_scan
-
-    async def _process_position_release_decision(
-        self,
-        *,
-        model_name: str,
-        symbol: str,
-        positions: list[dict[str, Any]],
-        scan: dict[str, Any],
-        feature_vector: Any | None,
-        open_positions: list[dict[str, Any]],
-        position_entry_pause_reason: str | None,
-        results: dict[str, Any] | None,
-        round_decision_ids: set[int] | None,
-    ) -> Any | None:
-        release_policy = self._position_release_decision_policy()
-        if not release_policy.should_release(scan):
-            return None
-        release_decision = release_policy.build(
-            model_name=model_name,
-            symbol=symbol,
-            positions=positions,
-            scan=scan,
-            feature_vector=feature_vector,
-        )
-        if not isinstance(release_decision, DecisionOutput):
-            return None
-
-        model_mode = self._get_model_execution_mode(model_name)
-        decision_db_id = await self._log_decision(
-            release_decision,
-            is_paper=(model_mode == "paper"),
-        )
-        self._decision_count += 1
-        if decision_db_id is not None and round_decision_ids is not None:
-            round_decision_ids.add(decision_db_id)
-        risk_alert = self.position_review_risk_alert_policy.build_alert(
-            release_decision,
-            positions,
-        )
-        if risk_alert:
-            self.position_review_risk_alert_policy.attach(
-                release_decision,
-                risk_alert,
-            )
-        return await self.position_review_decision_processor.process(
-            decision=release_decision,
-            model_name=model_name,
-            symbol=symbol,
-            model_mode=model_mode,
-            decision_db_id=decision_db_id,
-            open_positions=open_positions,
-            feature_vector=feature_vector,
-            position_entry_pause_reason=position_entry_pause_reason,
-            risk_alert=risk_alert,
-            results=results,
-        )
 
     def _position_review_priority_policy(self) -> PositionReviewPriorityPolicy:
         policy = getattr(self, "position_review_priority", None)
@@ -9723,12 +8052,6 @@ class TradingService:
             normalize_symbol=self._normalize_position_symbol,
             position_peak_key=peak_key,
             position_peaks_provider=peak_states,
-            predictive_reversal=getattr(
-                self,
-                "exit_predictive_reversal",
-                ExitPredictiveReversalPolicy(),
-            ),
-            urgent_exit_markers=POSITION_REVIEW_URGENT_EXIT_MARKERS,
         )
 
     def _scan_position_review_groups(
@@ -9763,13 +8086,6 @@ class TradingService:
             urgent_exit_checker=self._is_urgent_position_exit_scan,
         )
 
-    def _position_release_decision_policy(self) -> PositionReleaseDecisionPolicy:
-        policy = getattr(self, "position_release_decision", None)
-        if policy is not None:
-            return policy
-        policy = PositionReleaseDecisionPolicy()
-        self.position_release_decision = policy
-        return policy
 
     def _analysis_budget_policy(self) -> AnalysisBudgetPolicy:
         policy = getattr(self, "analysis_budget", None)
@@ -9924,16 +8240,12 @@ class TradingService:
         self,
         *,
         strict: bool = False,
-        include_profit_first_metadata: bool = True,
     ) -> list[dict]:
         loader = getattr(self.okx_sync_service, "get_local_open_positions_context", None)
         if loader is None:
             return []
         try:
-            return await loader(
-                strict=strict,
-                include_profit_first_metadata=include_profit_first_metadata,
-            )
+            return await loader(strict=strict)
         except TypeError:
             if strict:
                 raise
@@ -9960,7 +8272,6 @@ class TradingService:
             try:
                 local_positions = await self._get_local_open_positions_context(
                     strict=True,
-                    include_profit_first_metadata=False,
                 )
             except Exception as exc:
                 logger.warning(
@@ -10135,7 +8446,6 @@ class TradingService:
         model_mode: str,
         open_positions: list[dict],
     ) -> str | None:
-        account_cfg = settings.get_execution_account_config(model_mode)
         okx_snapshot = self._okx_balance_snapshot_for_new_pair_pause_context(model_mode)
         if not okx_snapshot:
             self._schedule_okx_balance_snapshot_refresh_for_new_pair_pause(model_mode)
@@ -10152,76 +8462,12 @@ class TradingService:
             reason = "未获取到 OKX 账户权益或余额，暂停分析新的交易对。"
             self._remember_new_pair_pause_context_reason(cache_key, reason)
             return reason
-        max_loss_pct = float(account_cfg.get("max_loss_pct") or settings.max_daily_loss_pct)
-        max_loss_usdt = okx_allocatable * max_loss_pct if max_loss_pct > 0 else 0.0
-        allocation_state = await self.execution_allocation_state(model_mode)
-        total_pnl = float(allocation_state.get("total_pnl") or 0.0)
-        account_guard = DEFAULT_TRADING_PARAMS.entry_account_guard
-        min_available = max(
-            account_guard.min_available_balance_usdt,
-            okx_allocatable * account_guard.min_available_balance_ratio,
-        )
-        if okx_available <= min_available:
+        if okx_available <= 0:
             reason = (
-                f"OKX 可交易余额过低：当前可用 {okx_available:.2f} USDT，"
-                f"最低需要 {min_available:.2f} USDT，暂停分析新的交易对。"
+                f"OKX 没有可交易余额：当前可用 {okx_available:.2f} USDT，暂停分析新的交易对。"
             )
             self._remember_new_pair_pause_context_reason(cache_key, reason)
             return reason
-        if max_loss_usdt > 0 and total_pnl <= -max_loss_usdt:
-            reason = (
-                f"执行账户已达到最高亏损限制：当前累计盈亏 {total_pnl:.2f} USDT，"
-                f"最高允许亏损 {max_loss_usdt:.2f} USDT（{max_loss_pct * 100:.1f}%）。暂停分析新的交易对。"
-            )
-            self._remember_new_pair_pause_context_reason(cache_key, reason)
-            return reason
-
-        model_positions = [
-            p
-            for p in (open_positions or [])
-            if p.get("model_name") == model_name and p.get("is_open", True)
-        ]
-        capacity_reason = self.risk_engine.position_checker.entry_capacity_reason(
-            current_positions=model_positions,
-            account_balance=okx_allocatable,
-            min_new_margin_pct=min(
-                max(
-                    float(settings.max_position_pct or 0.12)
-                    / account_guard.capacity_min_new_margin_divisor,
-                    account_guard.capacity_min_new_margin_floor_pct,
-                ),
-                float(settings.max_position_pct or 0.12),
-            ),
-            default_leverage=account_guard.capacity_default_leverage,
-            default_stop_loss_pct=account_guard.capacity_default_stop_loss_pct,
-        )
-        if capacity_reason:
-            logger.info(
-                "new-pair scan remains active despite capacity warning; execution gate will recheck",
-                reason=capacity_reason,
-            )
-
-        cooldown_loss_pct = float(account_cfg.get("cooldown_loss_pct") or 0.0)
-        cooldown_loss_reason = await self.new_pair_loss_pause.cooldown_loss_pause_reason(
-            model_mode,
-            max_loss_usdt,
-            cooldown_loss_pct,
-        )
-        if cooldown_loss_reason:
-            logger.info(
-                "loss cooldown is advisory; market scan remains active with tighter sizing",
-                reason=cooldown_loss_reason,
-            )
-        loss_streak_reason = await self.new_pair_loss_pause.recent_loss_streak_pause_reason(
-            model_mode,
-            max_loss_usdt,
-            cooldown_loss_pct,
-        )
-        if loss_streak_reason:
-            logger.info(
-                "recent loss streak is advisory; market scan remains active with tighter sizing",
-                reason=loss_streak_reason,
-            )
         self._remember_new_pair_pause_context_reason(cache_key, None)
         return None
 
@@ -10331,9 +8577,6 @@ class TradingService:
         self._model_execution_modes = {ENSEMBLE_TRADER_NAME: mode_manager.mode.value}
         for cfg in settings.ai_models:
             self._model_execution_modes[cfg.get("name", "")] = cfg.get("execution_mode", "paper")
-        # Also check legacy model
-        if not settings.ai_models and settings.ai_api_key:
-            self._model_execution_modes["llm_agent"] = "paper"
 
     def _has_live_models(self) -> bool:
         return mode_manager.mode.value == "live" or any(
@@ -11264,4 +9507,5 @@ class TradingService:
             "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
         }
         self._write_runtime_heartbeat()
+        return stats
         return stats

@@ -230,6 +230,12 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
         return {"eligible": False, "reason": "signal_unavailable"}
 
     governance_seen = False
+    route_live = False
+    live_influence_allowed = False
+    promotion_ready = False
+    quality_approved = False
+    objective_approved = False
+    objective_version_approved = False
     for node in _signal_governance_nodes(payload):
         route_mode = str(node.get("route_mode") or "").strip().lower()
         if route_mode:
@@ -240,6 +246,7 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                     "reason": "non_production_route_mode",
                     "route_mode": route_mode,
                 }
+            route_live = route_mode == "live"
 
         stage = str(node.get("model_stage") or node.get("training_mode") or "").strip().lower()
         if stage:
@@ -261,11 +268,14 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                 governance_seen = True
                 if node.get(key) is False:
                     return {"eligible": False, "reason": f"{key}_disabled"}
+                if node.get(key) is True:
+                    live_influence_allowed = True
 
         if "promotion_ready" in node:
             governance_seen = True
             if node.get("promotion_ready") is False:
                 return {"eligible": False, "reason": "promotion_not_ready"}
+            promotion_ready = node.get("promotion_ready") is True
 
         readiness = safe_dict(node.get("readiness"))
         if readiness:
@@ -275,6 +285,8 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                     "eligible": False,
                     "reason": "readiness_blocks_live_influence",
                 }
+            if readiness.get("allow_live_position_influence") is True:
+                live_influence_allowed = True
 
         evaluation_policy = safe_dict(node.get("evaluation_policy"))
         if evaluation_policy:
@@ -284,6 +296,8 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                     "eligible": False,
                     "reason": "evaluation_policy_blocks_live_mutation",
                 }
+            if evaluation_policy.get("live_mutation") is True:
+                live_influence_allowed = True
 
         prediction_quality = safe_dict(node.get("prediction_quality"))
         if prediction_quality:
@@ -297,6 +311,10 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                         prediction_quality.get("reason") or "prediction_quality_blocked"
                     ),
                 }
+            quality_approved = (
+                prediction_quality.get("production_eligible") is True
+                and prediction_quality.get("anomalous") is not True
+            )
 
         objective_name = str(
             node.get("artifact_objective")
@@ -311,15 +329,30 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
             governance_seen = True
             if objective_name != RETURN_OBJECTIVE_NAME:
                 return {"eligible": False, "reason": "artifact_objective_mismatch"}
+            objective_approved = True
         if objective_version:
             governance_seen = True
             if objective_version != RETURN_OBJECTIVE_VERSION:
                 return {"eligible": False, "reason": "artifact_objective_version_mismatch"}
+            objective_version_approved = True
 
-    return {
-        "eligible": True,
-        "reason": "governance_allows_live_influence" if governance_seen else "legacy_internal_signal",
+    required = {
+        "governance_metadata": governance_seen,
+        "live_route": route_live,
+        "live_influence": live_influence_allowed,
+        "promotion_ready": promotion_ready,
+        "prediction_quality": quality_approved,
+        "return_objective": objective_approved,
+        "return_objective_version": objective_version_approved,
     }
+    missing = [name for name, present in required.items() if not present]
+    if missing:
+        return {
+            "eligible": False,
+            "reason": "production_governance_incomplete",
+            "missing_governance": missing,
+        }
+    return {"eligible": True, "reason": "governance_allows_live_influence"}
 
 
 def signal_production_eligible(payload: dict[str, Any]) -> bool:

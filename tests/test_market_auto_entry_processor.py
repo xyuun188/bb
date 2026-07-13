@@ -123,9 +123,6 @@ def _processor(
     async def mark_pending(decision_id: int, reason: str) -> None:
         calls.append(("pending", decision_id, reason))
 
-    def clear_no_opportunity(symbol: str) -> None:
-        calls.append(("clear", symbol))
-
     def set_stage(stage: str) -> None:
         calls.append(("stage", stage))
 
@@ -158,7 +155,6 @@ def _processor(
         mark_decision_reason=mark_reason,
         mark_decision_pending_execution=mark_pending,
         result_recorder=MarketDecisionResultRecorder(),
-        clear_market_no_opportunity_symbol=clear_no_opportunity,
         set_loop_stage=set_stage,
         candidate_executor=execute_candidate,
         final_state_ensurer=ensure_final,
@@ -449,7 +445,6 @@ async def test_market_auto_entry_processor_waits_for_execution_after_outer_timeo
         mark_decision_reason=processor.mark_decision_reason,
         mark_decision_pending_execution=processor.mark_decision_pending_execution,
         result_recorder=processor.result_recorder,
-        clear_market_no_opportunity_symbol=processor.clear_market_no_opportunity_symbol,
         set_loop_stage=processor.set_loop_stage,
         candidate_executor=slow_execute,
         final_state_ensurer=processor.final_state_ensurer,

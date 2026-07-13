@@ -24,8 +24,8 @@ from services.entry_signal_extraction import (
     unwrap_tool_payload,
 )
 from services.model_promotion_policy import (
-    build_profit_first_promotion_report,
     build_phase3_promotion_recommendation,
+    build_return_objective_report,
     load_latest_paper_observation_report,
 )
 
@@ -263,13 +263,15 @@ class LocalAIToolsClient:
                     "expected_return_from_sentiment_pct"
                 )
         elif name == "exit_advice":
-            action = str(
+            reported_action = str(
                 normalized.get("action") or normalized.get("recommendation") or "hold"
             ).lower()
-            normalized["action"] = action or "hold"
-            reason = str(normalized.get("reason") or normalized.get("note") or "").strip()
-            normalized["reason"] = self._humanize_exit_reason(reason, action)
-            normalized["action_label"] = self._humanize_exit_action(action)
+            normalized["reported_action"] = reported_action or "hold"
+            normalized["action"] = "hold"
+            normalized["action_label"] = "继续观察"
+            normalized["reason"] = "本地退出模型仅提供观察画像，生产平仓由动态退出契约独占。"
+            normalized["production_permission"] = False
+            normalized["live_mutation"] = False
         return self._attach_model_metadata(name, normalized)
 
     def _attach_model_metadata(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -290,9 +292,9 @@ class LocalAIToolsClient:
                 "model_version": "local_ai_tools.v1",
             },
             "exit_advice": {
-                "primary_model": "exit_v1_rules",
+                "primary_model": "exit_profile_observer_v2",
                 "challenger_model": None,
-                "model_version": "local_ai_tools.v1",
+                "model_version": "local_ai_tools.v2",
             },
         }.get(name, {})
         for key, value in defaults.items():
@@ -310,46 +312,6 @@ class LocalAIToolsClient:
             ratio = min(max(float(raw), 0.0), 1.0)
             return {"ratio": round(ratio, 6), "status": "reported"}
         return {"ratio": None, "status": "not_reported"}
-
-    def _humanize_exit_action(self, action: str) -> str:
-        return {
-            "hold": "继续持有",
-            "wait": "继续观察",
-            "observe": "继续观察",
-            "reduce": "减仓",
-            "partial_close": "部分平仓",
-            "close": "平仓",
-            "full_close": "全部平仓",
-            "close_long": "平多",
-            "close_short": "平空",
-            "no_position": "无匹配持仓",
-            "reduce_or_close": "减仓或平仓",
-            "protect_profit": "保护利润",
-            "close_if_ai_agrees": "AI 确认后平仓",
-            "trail_profit": "移动锁盈",
-        }.get(str(action or "").lower(), "继续观察")
-
-    def _humanize_exit_reason(self, reason: str, action: str = "") -> str:
-        text = str(reason or "").strip()
-        normalized = text.lower().strip(" .")
-        if not text or normalized in {
-            "no trained exit pressure",
-            "no exit pressure",
-            "no trained close pressure",
-        }:
-            if str(action or "").lower() in {"hold", "wait", "observe", ""}:
-                return "平仓建议模型未识别到明确的主动平仓压力，本轮倾向继续持有。"
-            return "平仓建议模型已参与本轮持仓分析。"
-        known = {
-            "no matching open position was supplied": "本轮没有传入与该币种匹配的当前持仓，平仓建议模型不参与。",
-            "this symbol/side has weak realized profile and the open position is losing": "该币种/方向历史实盘表现偏弱，且当前持仓正在亏损，建议减仓或平仓。",
-            "profit exists but historical giveback/loss pressure is elevated": "当前已有浮盈，但历史回吐或亏损压力偏高，建议优先保护利润。",
-            "loss is expanding beyond the local exit model tolerance": "亏损扩大到本地平仓模型容忍线之外，若 AI 也确认应优先退出。",
-            "position is profitable; trail rather than cap upside immediately": "当前持仓盈利且历史盈亏质量尚可，建议移动保护利润，不急于完全限制上行空间。",
-        }
-        if normalized in known:
-            return known[normalized]
-        return text
 
     def _to_float(self, value: Any, default: float = 0.0) -> float:
         try:
@@ -586,7 +548,7 @@ class LocalAIToolsClient:
         effective_paper_observation = (
             paper_observation_report or load_latest_paper_observation_report()
         )
-        profit_first_report = build_profit_first_promotion_report(
+        return_objective_report = build_return_objective_report(
             trade_samples=trade_samples,
             shadow_samples=shadow_samples,
         )
@@ -599,7 +561,7 @@ class LocalAIToolsClient:
             paper_observation_report=effective_paper_observation,
             completed_shadow_sample_count=int(completed_shadow_sample_count or 0),
             completed_trade_sample_count=int(completed_trade_sample_count or 0),
-            profit_first_report=profit_first_report,
+            return_objective_report=return_objective_report,
         )
         payload = {
             "source": source,
@@ -619,7 +581,7 @@ class LocalAIToolsClient:
             "model_stage": model_stage,
             "evaluation_policy": effective_evaluation_policy,
             "paper_observation_report": effective_paper_observation,
-            "profit_first_report": profit_first_report,
+            "return_objective_report": return_objective_report,
             "promotion_recommendation": effective_promotion,
             "persist_artifact": bool(persist_artifact),
             "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),

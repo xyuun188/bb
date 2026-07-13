@@ -697,8 +697,8 @@
             <div class="card strategy-learning-card">
                 <div class="card-header">
                     <div class="strategy-learning-title-block">
-                        <span class="card-title">策略生成 / 调度控制台</span>
-                        <span class="card-subtitle">把问题归因、策略候选、影子验证和执行事件分层展示</span>
+                        <span class="card-title">费后收益观察</span>
+                        <span class="card-subtitle">只读归因，不授权交易、仓位、杠杆或晋升</span>
                     </div>
                     <div class="opening-funnel-controls">
                         <span class="card-subtitle" id="strategy-learning-updated">等待刷新</span>
@@ -709,7 +709,6 @@
                             <option value="720">最近 30 天</option>
                         </select>
                         <button class="btn btn-sm" onclick="fetchStrategyLearning()">刷新</button>
-                        <button class="btn btn-sm" id="strategy-learning-auto-button" onclick="clearStrategyLearningManualOverride()" disabled title="当前没有人工指定策略，系统会自动选择策略画像">当前自动调度</button>
                     </div>
                 </div>
                 <div class="strategy-learning-body">
@@ -720,15 +719,15 @@
                         <div class="strategy-learning-stage-head">
                             <div>
                                 <span class="strategy-learning-stage-kicker">01 · Diagnostics</span>
-                                <strong>诊断看板</strong>
+                                <strong>收益观察</strong>
                             </div>
-                            <p>先看系统为什么调度、哪里拖累收益，再决定是否需要切换策略。</p>
+                            <p>只展示权威平仓的费后收益分布和左尾质量。</p>
                         </div>
                         <div class="strategy-learning-grid strategy-learning-grid-diagnostics">
                         <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-problems">
                             <div class="analysis-section-head">
-                                <span class="analysis-section-title">问题归因</span>
-                                <span class="analysis-section-subtitle">不开仓、亏损、满仓、fallback</span>
+                                <span class="analysis-section-title">权威收益分布</span>
+                                <span class="analysis-section-subtitle">费后净收益、PF 和左尾</span>
                             </div>
                             <div id="strategy-learning-problems" class="opening-funnel-list"></div>
                         </div>
@@ -741,39 +740,39 @@
                         </div>
                         <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-release">
                             <div class="analysis-section-head">
-                                <span class="analysis-section-title">动态容量 / 释放候选</span>
-                                <span class="analysis-section-subtitle">容量参考随行情、风险和持仓质量变化</span>
+                                <span class="analysis-section-title">持仓压力观察</span>
+                                <span class="analysis-section-subtitle">不改变容量或释放权</span>
                             </div>
                             <div id="strategy-learning-release" class="opening-funnel-list"></div>
                         </div>
                         <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-experts">
                             <div class="analysis-section-head">
-                                <span class="analysis-section-title">专家稳定性</span>
-                                <span class="analysis-section-subtitle">fallback 与完整性保护</span>
+                                <span class="analysis-section-title">权限隔离</span>
+                                <span class="analysis-section-subtitle">专家、记忆和影子只能观察</span>
                             </div>
                             <div id="strategy-learning-experts" class="opening-funnel-list"></div>
                         </div>
                         <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-reflections">
                             <div class="analysis-section-head">
-                                <span class="analysis-section-title">策略复盘反馈</span>
-                                <span class="analysis-section-subtitle">训练复盘、错误模式、改进建议</span>
+                                <span class="analysis-section-title">训练数据政策</span>
+                                <span class="analysis-section-subtitle">成本完整和收益目标</span>
                             </div>
                             <div id="strategy-learning-reflections" class="opening-funnel-list"></div>
                         </div>
                     </div>
                     </section>
-                    <section class="strategy-learning-stage strategy-learning-stage-profiles" aria-label="候选策略实验室">
+                    <section class="strategy-learning-stage strategy-learning-stage-profiles" aria-label="只读归因配置">
                         <div class="strategy-learning-stage-head">
                             <div>
-                                <span class="strategy-learning-stage-kicker">02 · Strategy Lab</span>
-                                <strong>候选策略实验室</strong>
+                                <span class="strategy-learning-stage-kicker">02 · Attribution</span>
+                                <strong>只读归因配置</strong>
                             </div>
-                            <p>每个策略画像必须同时看回测、影子验证、探针仓位和人工控制状态。</p>
+                            <p>归因配置不带生产参数，也不提供人工覆盖入口。</p>
                         </div>
                         <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel strategy-learning-panel-candidates">
                         <div class="analysis-section-head">
-                            <span class="analysis-section-title">候选策略 / 回测 / 影子验证 / 探针</span>
-                            <span class="analysis-section-subtitle">只允许受控参数，不生成交易代码</span>
+                            <span class="analysis-section-title">观察配置</span>
+                            <span class="analysis-section-subtitle">无交易、仓位、杠杆或晋升权限</span>
                         </div>
                         <div id="strategy-learning-profiles" class="strategy-learning-profile-list"></div>
                     </div>
@@ -899,7 +898,7 @@
                                 <th>教训</th>
                                 <th>动作</th>
                                 <th>证据/命中</th>
-                                <th>调整</th>
+                                <th>生产权限</th>
                             </tr>
                         </thead>
                         <tbody id="expert-memory-tbody">
@@ -1335,32 +1334,7 @@
                     </div>
                     <div style="font-size:11px;color:var(--text-muted);">5 个 AI 专家只负责分析，最终只由这个执行账户提交交易。</div>
                 </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-                    <div class="settings-panel">
-                        <div class="settings-panel-title">模拟盘风控</div>
-                        <div class="settings-readonly-note">下单资金自动使用 OKX 模拟盘当前可用余额，不再设置固定分配资金。</div>
-                        <div class="form-group">
-                            <label class="form-label">最高可亏损比例 %</label>
-                            <input type="number" class="form-input" id="exec-paper-max-loss-pct" min="0" max="100" step="1">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">冷静期触发比例 %</label>
-                            <input type="number" class="form-input" id="exec-paper-cooldown-loss-pct" min="0" max="100" step="1">
-                        </div>
-                    </div>
-                    <div class="settings-panel">
-                        <div class="settings-panel-title">实盘风控</div>
-                        <div class="settings-readonly-note">下单资金自动使用 OKX 实盘当前可用余额；未配置或余额同步失败时禁止新开仓。</div>
-                        <div class="form-group">
-                            <label class="form-label">最高可亏损比例 %</label>
-                            <input type="number" class="form-input" id="exec-live-max-loss-pct" min="0" max="100" step="1">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">冷静期触发比例 %</label>
-                            <input type="number" class="form-input" id="exec-live-cooldown-loss-pct" min="0" max="100" step="1">
-                        </div>
-                    </div>
-                </div>
+                <div class="settings-readonly-note">生产风险预算由当前费后收益、实时成本、计划止损、账户权益和组合敞口连续生成；余额或来源不完整时禁止新增风险。</div>
                 <div style="padding:8px 12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;margin-top:12px;">
                     <button class="btn btn-accent btn-sm" onclick="saveExecutionAccountSettings()">保存执行账户</button>
                     <span id="execution-account-save-status" style="font-size:11px;color:var(--text-muted);"></span>
@@ -1430,64 +1404,6 @@
                             <input type="number" class="form-input" id="cfg-decision-interval" min="10" max="3600" step="5" placeholder="60">
                         </div>
                         <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">AI 每隔多少秒扫描一次市场并做出决策</div>
-                    </div>
-                    <div class="settings-panel">
-                        <div class="settings-panel-title">信心阈值</div>
-                        <div class="form-group">
-                            <label class="form-label">最低信心度（0.10-1.00）</label>
-                            <input type="number" class="form-input" id="cfg-confidence-threshold" min="0.1" max="1.0" step="0.05" placeholder="0.65">
-                        </div>
-                        <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">AI 信心低于此值则不会开仓（降低=更频繁交易，提高=更保守）</div>
-                    </div>
-                    <div class="settings-panel">
-                        <div class="settings-panel-title">仓位保证金上限</div>
-                        <div class="form-group">
-                            <label class="form-label">总保证金占用上限 %</label>
-                            <input type="number" class="form-input" id="cfg-total-margin-limit-pct" min="10" max="100" step="1" placeholder="45">
-                        </div>
-                        <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">达到上限后暂停分析新交易对，已有持仓仍会复盘和平仓</div>
-                        <div class="form-group" style="margin-top:12px;">
-                            <label class="form-label">最大滑点上限 %</label>
-                            <input type="number" class="form-input" id="cfg-max-slippage-pct" min="0.02" max="2" step="0.01" placeholder="0.50">
-                        </div>
-                        <div style="font-size:10px;color:var(--text-muted);margin-top:-6px;">
-                            这是下单与评分的滑点安全上限，不是每笔固定扣费；系统会按实时点差、盘口深度动态估算。
-                        </div>
-                    </div>
-                    <div class="settings-panel" style="grid-column:1 / -1;">
-                        <div class="settings-panel-title">手动硬风控上限</div>
-                        <div class="settings-form-grid">
-                            <div class="form-group">
-                                <label class="form-label">单笔保证金上限 %</label>
-                                <input type="number" class="form-input" id="cfg-max-position-pct" min="0.5" max="50" step="0.1" placeholder="25">
-                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">调高会放大单笔亏损和保证金占用；调低会让单笔更小但盈利弹性下降。</div>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">最大杠杆 x</label>
-                                <input type="number" class="form-input" id="cfg-max-leverage" min="1" max="125" step="0.5" placeholder="20">
-                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">这是账户级杠杆天花板，运行态仍会按证据质量压到更低。</div>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">日内最大亏损 %</label>
-                                <input type="number" class="form-input" id="cfg-max-daily-loss-pct" min="0.1" max="50" step="0.1" placeholder="5">
-                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">调低会更早停手保护本金；调高会延后停手并扩大当天风险。</div>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">硬止损 %</label>
-                                <input type="number" class="form-input" id="cfg-hard-stop-loss-pct" min="0.1" max="50" step="0.1" placeholder="5">
-                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">调低更快止损但容易被普通波动洗出；调高会给仓位更大回撤空间。</div>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">基础持仓组数上限</label>
-                                <input type="number" class="form-input" id="cfg-max-open-positions-per-model" min="1" max="200" step="1" placeholder="20">
-                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">动态容量策略以此为基础，调高会扩大组合复杂度和保证金压力。</div>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">同币同向持仓组数上限</label>
-                                <input type="number" class="form-input" id="cfg-max-same-symbol-positions-per-side" min="1" max="20" step="1" placeholder="2">
-                                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">限制同一个币种同方向重复堆仓，调高会增加集中暴露。</div>
-                            </div>
-                        </div>
                     </div>
                     <div class="settings-panel">
                         <div class="settings-panel-title">本地量化 AI 工具</div>

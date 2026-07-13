@@ -856,18 +856,14 @@ class DataService:
         ask = self._safe_float(ticker.get("ask"), 0.0)
         high_24h = self._safe_float(ticker.get("high_24h"), 0.0)
         low_24h = self._safe_float(ticker.get("low_24h"), 0.0)
-        if bid > 0 and ask > 0 and ask >= bid:
-            mid = (bid + ask) / 2.0
-            if last_price > 0:
-                last_mid_gap = abs(last_price - mid) / max(mid, 1e-12)
-                if last_mid_gap > _MARKET_DATA_PARAMS.price_field_split_block_pct:
-                    return "last_price_bid_ask_split"
+        if bid > 0 and ask > 0:
+            if bid > ask:
+                return "crossed_bid_ask"
+            if last_price > 0 and not bid <= last_price <= ask:
+                return "last_price_outside_bid_ask"
         if last_price <= 0 or high_24h <= 0 or low_24h <= 0 or high_24h < low_24h:
             return None
-        tolerance = _MARKET_DATA_PARAMS.price_24h_range_tolerance_pct
-        floor = low_24h * (1.0 - tolerance)
-        ceiling = high_24h * (1.0 + tolerance)
-        if floor <= last_price <= ceiling:
+        if low_24h <= last_price <= high_24h:
             return None
         return "last_price_outside_24h_range"
 

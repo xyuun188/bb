@@ -211,8 +211,6 @@ class ModelRegistry:
     Usage:
         registry = ModelRegistry()
         registry.register(LLMAgent())
-        registry.register(FinBERTDecisionModel())
-        registry.register(XGBoostModel())
         await registry.initialize_all()
 
         models = registry.get_all()
@@ -387,8 +385,8 @@ class ModelRegistry:
                         reasoning="市场快筛未发现正期望机会，本轮跳过大模型专家，快速观望。",
                         position_size_pct=0.0,
                         suggested_leverage=1.0,
-                        stop_loss_pct=0.05,
-                        take_profit_pct=0.10,
+                        stop_loss_pct=0.0,
+                        take_profit_pct=0.0,
                         cross_check_for=None,
                         raw_response={
                             "market_fast_prefilter": True,
@@ -647,8 +645,8 @@ class ModelRegistry:
                 reasoning=reason,
                 position_size_pct=0.0,
                 suggested_leverage=1.0,
-                stop_loss_pct=0.05,
-                take_profit_pct=0.10,
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
                 cross_check_for=None,
                 raw_response={
                     "timeout_fallback": True,
@@ -1192,8 +1190,8 @@ class ModelRegistry:
                     reasoning="批量专家暂不可用，使用快速本地观望兜底。",
                     position_size_pct=0.0,
                     suggested_leverage=1.0,
-                    stop_loss_pct=0.05,
-                    take_profit_pct=0.10,
+                    stop_loss_pct=0.0,
+                    take_profit_pct=0.0,
                     cross_check_for=None,
                     raw_response={
                         "batch_expert_fallback": True,

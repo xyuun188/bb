@@ -1,4 +1,4 @@
-"""Train the local ML win-rate model from completed shadow backtests."""
+"""Train the local ML fee-after-return model from all clean shadow backtests."""
 
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.ml_signal_service import (
-    MIN_TRAINING_SAMPLES,
-    TRAINING_SHADOW_SAMPLE_LIMIT,
     build_training_frame,
     count_shadow_training_rows,
     load_shadow_training_rows,
@@ -25,8 +23,6 @@ from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 
 async def run_training(
     *,
-    limit: int,
-    min_samples: int,
     skip_quarantine: bool = False,
     persist_artifact: bool = False,
     confirm_phase3_rebuild: bool = False,
@@ -51,18 +47,14 @@ async def run_training(
             "reason": "phase3_preflight_no_quarantine_writes",
         }
     elif not skip_quarantine:
-        quarantine_result = await quarantine_dirty_shadow_samples(
-            batch_size=min(limit, 1000),
-            max_batches=max((int(limit) + 999) // 1000, 1),
-        )
+        quarantine_result = await quarantine_dirty_shadow_samples()
 
-    rows = await load_shadow_training_rows(limit=limit)
+    rows = await load_shadow_training_rows()
     quality_state = shadow_training_quality_report(rows)
     frame = build_training_frame(rows)
     completed_count = await count_shadow_training_rows()
     metadata = train_from_frame(
         frame,
-        min_samples=min_samples,
         completed_sample_count=completed_count,
         training_quality_report=quality_state["quality_report"],
         persist_artifact=persist_artifact,
@@ -83,13 +75,6 @@ async def run_training(
 
 async def _main() -> None:
     parser = argparse.ArgumentParser(description="Train local ML signal model")
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=TRAINING_SHADOW_SAMPLE_LIMIT,
-        help="Max completed shadow samples to load",
-    )
-    parser.add_argument("--min-samples", type=int, default=MIN_TRAINING_SAMPLES)
     parser.add_argument("--skip-quarantine", action="store_true")
     parser.add_argument(
         "--dry-run",
@@ -112,8 +97,6 @@ async def _main() -> None:
     args = parser.parse_args()
 
     result = await run_training(
-        limit=args.limit,
-        min_samples=args.min_samples,
         skip_quarantine=bool(args.skip_quarantine),
         persist_artifact=bool(args.persist_artifact),
         confirm_phase3_rebuild=bool(args.confirm_phase3_rebuild),

@@ -30,7 +30,6 @@ from services.decision_state import (
     decision_state_from_raw,
     is_decision_terminal_state,
 )
-from services.profit_first_trade_plan import attach_profit_first_trade_plan
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
 
 logger = structlog.get_logger(__name__)
@@ -77,10 +76,6 @@ class DecisionPersistenceService:
                     },
                 )
                 decision.raw_response = raw_response
-                raw_response = attach_profit_first_trade_plan(
-                    decision,
-                    analysis_type=analysis_type,
-                )
                 display_symbol = self._normalize_symbol(decision.symbol) or decision.symbol
                 record = await repo.log_decision(
                     {
@@ -114,8 +109,6 @@ class DecisionPersistenceService:
         if raw_analysis_type in {
             "entry_candidate",
             "market_entry_candidate",
-            "probe_candidate",
-            "quant_profit_probe",
         }:
             return "entry_candidate"
         if raw_analysis_type in {"market", "market_scan", "symbol_scan"}:

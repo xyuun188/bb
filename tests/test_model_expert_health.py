@@ -130,13 +130,13 @@ def test_model_expert_health_report_marks_detractors_without_mutating_weights() 
     assert trend["windows"]["24h"]["adopted_count"] == 2
     assert trend["windows"]["24h"]["adopted_net_pnl_pct"] == -0.6
     assert trend["windows"]["24h"]["wrong_recommendation_rate"] > 0
-    assert trend["recommended_state"] == "reduce"
-    assert "negative_adopted_pnl" in trend["state_reasons"]
+    assert trend["recommended_state"] == "observation_only"
+    assert trend["state_reasons"] == ["production_permission_false"]
 
     risk = report["components"]["risk_expert"]
     assert risk["windows"]["24h"]["json_error_count"] == 2
     assert risk["windows"]["24h"]["no_return_count"] == 2
-    assert risk["recommended_state"] in {"shadow_only", "disable"}
+    assert risk["recommended_state"] == "observation_only"
     assert risk["stability"]["json_error_rate"] > 0
     assert report["summary"]["components"] >= 2
 
@@ -169,9 +169,9 @@ def test_model_expert_health_report_observes_insufficient_samples() -> None:
     report = summarize_model_expert_health(decisions, [], now=now)
 
     sentiment = report["components"]["sentiment_expert"]
-    assert sentiment["recommended_state"] == "shadow_only"
-    assert sentiment["evidence_state"] == "observing"
-    assert "insufficient_samples" in sentiment["state_reasons"]
+    assert sentiment["recommended_state"] == "observation_only"
+    assert sentiment["evidence_state"] == "diagnostic"
+    assert sentiment["state_reasons"] == ["production_permission_false"]
 
 
 def test_model_expert_health_does_not_count_successful_independent_retry_as_json_error() -> None:

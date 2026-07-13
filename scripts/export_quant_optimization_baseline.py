@@ -32,36 +32,9 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
     _merge_trade_samples,
 )
 from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason  # noqa: E402
-from services.trading_params import DEFAULT_TRADING_PARAMS  # noqa: E402
 from services.training_data_quality import annotate_training_payload  # noqa: E402
 
 DEFAULT_HOURS = 24
-_LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
-DEFAULT_QUALITY_SHADOW_LIMIT = min(
-    3_000,
-    _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
-)
-DEFAULT_QUALITY_TRADE_REFLECTION_LIMIT = min(
-    1_200,
-    _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
-)
-DEFAULT_QUALITY_CLOSED_POSITION_LIMIT = min(
-    1_200,
-    _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
-)
-DEFAULT_QUALITY_SEQUENCE_LIMIT = min(
-    3_000,
-    _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit,
-)
-DEFAULT_QUALITY_TEXT_LIMIT = min(
-    1_500,
-    _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
-)
-DEEP_QUALITY_SHADOW_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit
-DEEP_QUALITY_TRADE_REFLECTION_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-DEEP_QUALITY_CLOSED_POSITION_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit
-DEEP_QUALITY_SEQUENCE_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit
-DEEP_QUALITY_TEXT_LIMIT = _LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -245,12 +218,6 @@ async def _position_metrics(since: datetime) -> dict[str, Any]:
 
 
 async def _training_source_metrics(
-    *,
-    shadow_limit: int,
-    trade_reflection_limit: int,
-    closed_position_limit: int,
-    sequence_limit: int,
-    text_sentiment_limit: int,
 ) -> dict[str, Any]:
     async with get_read_session_ctx() as session:
         shadow_total = int(
@@ -281,16 +248,12 @@ async def _training_source_metrics(
         ticker_count = int((await session.execute(select(func.count(Ticker.id)))).scalar() or 0)
         news_count = int((await session.execute(select(func.count(NewsArticle.id)))).scalar() or 0)
         social_count = int((await session.execute(select(func.count(SocialPost.id)))).scalar() or 0)
-    shadow_samples = await _load_shadow_samples(max(int(shadow_limit), 0))
-    trade_reflection_samples = await _load_trade_reflection_samples(
-        max(int(trade_reflection_limit), 0)
-    )
-    authoritative_samples = await _load_authoritative_trade_samples(
-        max(int(closed_position_limit), 0)
-    )
+    shadow_samples = await _load_shadow_samples()
+    trade_reflection_samples = await _load_trade_reflection_samples()
+    authoritative_samples = await _load_authoritative_trade_samples()
     trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
-    sequence_samples = await _load_sequence_samples(max(int(sequence_limit), 0))
-    text_sentiment_samples = await _load_text_sentiment_samples(max(int(text_sentiment_limit), 0))
+    sequence_samples = await _load_sequence_samples()
+    text_sentiment_samples = await _load_text_sentiment_samples()
     payload = annotate_training_payload(
         shadow_samples=shadow_samples,
         trade_samples=trade_samples,
@@ -311,13 +274,7 @@ async def _training_source_metrics(
         "ticker_count": ticker_count,
         "news_count": news_count,
         "social_count": social_count,
-        "quality_sample_limits": {
-            "shadow": shadow_limit,
-            "trade_reflection": trade_reflection_limit,
-            "closed_position": closed_position_limit,
-            "sequence": sequence_limit,
-            "text_sentiment": text_sentiment_limit,
-        },
+        "training_window_policy": "all_current_clean_cost_complete_samples",
         "quality_report": payload["quality_report"],
         "trainable_shadow_sample_count": len(payload["shadow_samples"]),
         "trainable_trade_sample_count": len(payload["trade_samples"]),
@@ -329,12 +286,6 @@ async def _training_source_metrics(
 async def build_baseline(
     hours: int,
     decision_limit: int,
-    *,
-    quality_shadow_limit: int,
-    quality_trade_reflection_limit: int,
-    quality_closed_position_limit: int,
-    quality_sequence_limit: int,
-    quality_text_limit: int,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     since = now - timedelta(hours=max(int(hours), 1))
@@ -345,13 +296,7 @@ async def build_baseline(
         "decision_metrics": await _recent_decision_metrics(since, decision_limit),
         "order_metrics": await _order_metrics(since),
         "position_metrics": await _position_metrics(since),
-        "training_source_metrics": await _training_source_metrics(
-            shadow_limit=quality_shadow_limit,
-            trade_reflection_limit=quality_trade_reflection_limit,
-            closed_position_limit=quality_closed_position_limit,
-            sequence_limit=quality_sequence_limit,
-            text_sentiment_limit=quality_text_limit,
-        ),
+        "training_source_metrics": await _training_source_metrics(),
     }
 
 
@@ -359,44 +304,12 @@ async def _main() -> None:
     parser = argparse.ArgumentParser(description="Export second-batch quant optimization baseline")
     parser.add_argument("--hours", type=int, default=DEFAULT_HOURS)
     parser.add_argument("--decision-limit", type=int, default=5000)
-    parser.add_argument("--quality-shadow-limit", type=int, default=DEFAULT_QUALITY_SHADOW_LIMIT)
-    parser.add_argument(
-        "--quality-trade-reflection-limit",
-        type=int,
-        default=DEFAULT_QUALITY_TRADE_REFLECTION_LIMIT,
-    )
-    parser.add_argument(
-        "--quality-closed-position-limit",
-        type=int,
-        default=DEFAULT_QUALITY_CLOSED_POSITION_LIMIT,
-    )
-    parser.add_argument(
-        "--quality-sequence-limit", type=int, default=DEFAULT_QUALITY_SEQUENCE_LIMIT
-    )
-    parser.add_argument("--quality-text-limit", type=int, default=DEFAULT_QUALITY_TEXT_LIMIT)
-    parser.add_argument(
-        "--deep",
-        action="store_true",
-        help="Use the full training quality window; slower and intended for scheduled jobs.",
-    )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
-
-    if args.deep:
-        args.quality_shadow_limit = DEEP_QUALITY_SHADOW_LIMIT
-        args.quality_trade_reflection_limit = DEEP_QUALITY_TRADE_REFLECTION_LIMIT
-        args.quality_closed_position_limit = DEEP_QUALITY_CLOSED_POSITION_LIMIT
-        args.quality_sequence_limit = DEEP_QUALITY_SEQUENCE_LIMIT
-        args.quality_text_limit = DEEP_QUALITY_TEXT_LIMIT
 
     baseline = await build_baseline(
         args.hours,
         args.decision_limit,
-        quality_shadow_limit=args.quality_shadow_limit,
-        quality_trade_reflection_limit=args.quality_trade_reflection_limit,
-        quality_closed_position_limit=args.quality_closed_position_limit,
-        quality_sequence_limit=args.quality_sequence_limit,
-        quality_text_limit=args.quality_text_limit,
     )
     text = json.dumps(baseline, ensure_ascii=False, indent=2)
     if args.output:

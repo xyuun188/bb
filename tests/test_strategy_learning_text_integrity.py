@@ -90,7 +90,7 @@ async def test_record_event_uses_unified_runtime_text_boundary(
         "unified": session.added.strategy_snapshot["unified"]
     }
     assert session.added.market_state == {"unified": {"note": "raw explicit market"}}
-    assert session.added.side_weights == {"unified": {"long": "raw side weight"}}
+    assert session.added.side_weights is None
     assert session.added.expert_integrity == {"unified": session.added.expert_integrity["unified"]}
     assert session.added.attribution == {"unified": {"note": "raw attribution"}}
     assert "raw event reason" in calls

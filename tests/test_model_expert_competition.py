@@ -94,10 +94,10 @@ def test_competition_report_compares_components_to_baseline_without_live_weight_
     assert baseline["net_pnl_pct"] == 0.3
     trend = report["competitors"]["trend_expert"]
     assert trend["baseline_delta"]["net_pnl_pct"] > 0
-    assert trend["recommended_weight_action"] == "increase_shadow_weight"
+    assert trend["recommended_weight_action"] == "observation_only"
     assert trend["can_apply_live_weight"] is False
     risk = report["competitors"]["risk_expert"]
-    assert risk["recommended_weight_action"] in {"reduce_shadow_weight", "pause_shadow"}
+    assert risk["recommended_weight_action"] == "observation_only"
     assert "no_direct_live_weight_change" in report["safety_rules"]
 
 

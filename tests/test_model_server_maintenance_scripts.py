@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,13 +29,12 @@ def test_model_server_maintenance_scripts_use_model_server_settings() -> None:
         assert "info=info" in source, rel_path
 
 
-def test_sync_to_online_server_syncs_local_ai_tools_key_without_logging_secret() -> None:
+def test_sync_to_online_server_does_not_restore_legacy_local_ai_tools_key() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 
-    assert "load_local_ai_tools_api_key_from_model_server" in source
-    assert "Prepared local AI tools API key sync payload." in source
+    assert "load_local_ai_tools_api_key_from_model_server" not in source
     assert "upload_runtime_secret" in source
-    assert "sync_legacy_local_ai_tools_key" in source
+    assert "sync_legacy_local_ai_tools_key" not in source
     assert "LOCAL_AI_TOOLS_API_KEY" in source
     assert "trap " in source and "rm -f" in source
     assert "safe_print(local_ai_tools_api_key" not in source
@@ -71,8 +72,8 @@ def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
     assert "BB-FinQuant-Expert-14B" in source
     assert "values['LOCAL_AI_TOOLS_ENABLED'] = 'true'" in source
     assert "values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'" in source
-    assert "values['LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT'] = '0.12'" in source
-    assert "values['LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT'] = '0.18'" in source
+    assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
+    assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
     assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" in source
     assert "qwen3-32b-trade" in source
     assert "deepseek-r1-14b-risk" in source
@@ -204,7 +205,7 @@ def test_sync_to_online_server_runtime_env_preserves_existing_external_ai_models
     assert '"model":"qwen3-32b-trade"' not in runtime_text
 
 
-def test_sync_to_online_server_old_profile_routes_decision_to_alias(
+def test_sync_to_online_server_ignores_removed_old_profile_route(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -230,11 +231,39 @@ def test_sync_to_online_server_old_profile_routes_decision_to_alias(
     exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
 
     runtime_text = runtime_env.read_text(encoding="utf-8")
-    assert "MODEL_SERVER_ACTIVE_PROFILE=old" in runtime_text
+    assert "MODEL_SERVER_ACTIVE_PROFILE=old" not in runtime_text
     assert '"name":"decision_maker"' in runtime_text
-    assert '"api_base":"http://127.0.0.1:18003/v1"' in runtime_text
-    assert '"model":"BB-FinQuant-Expert-14B"' in runtime_text
-    assert '"route_mode":"old_model_server_fast_fallback"' in runtime_text
+    assert '"route_mode":"old_model_server_fast_fallback"' not in runtime_text
+
+
+def test_sync_to_online_server_prunes_only_stale_managed_python_sources() -> None:
+    from scripts import sync_to_online_server as sync
+
+    remote_app_dir = "/srv/bb/app"
+    current = ROOT / "services" / "model_server_config.py"
+
+    class FakeSftp:
+        def __init__(self) -> None:
+            self.removed: list[str] = []
+
+        def listdir_attr(self, remote_dir: str) -> list[SimpleNamespace]:
+            if remote_dir == f"{remote_app_dir}/services":
+                return [
+                    SimpleNamespace(filename="model_server_config.py", st_mode=stat.S_IFREG),
+                    SimpleNamespace(filename="legacy_fixed_gate.py", st_mode=stat.S_IFREG),
+                    SimpleNamespace(filename="runtime_state.json", st_mode=stat.S_IFREG),
+                    SimpleNamespace(filename="__pycache__", st_mode=stat.S_IFDIR),
+                ]
+            return []
+
+        def remove(self, remote_path: str) -> None:
+            self.removed.append(remote_path)
+
+    sftp = FakeSftp()
+    removed = sync.prune_remote_stale_sources(sftp, [current], remote_app_dir)
+
+    assert removed == [f"{remote_app_dir}/services/legacy_fixed_gate.py"]
+    assert sftp.removed == removed
 
 
 def test_sync_to_online_server_runtime_env_only_does_not_restart_services() -> None:
@@ -315,14 +344,13 @@ def test_start_online_model_tunnels_swallow_short_client_disconnects() -> None:
     assert ForwardHandler._sendall_or_closed(socket_obj, b"hello") is False
 
 
-def test_model_server_bridge_reads_only_local_ai_tools_key_payload() -> None:
+def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:
     source = (ROOT / "core" / "model_server_bridge.py").read_text(encoding="utf-8")
 
-    assert "load_local_ai_tools_api_key_from_model_server" in source
-    assert "'/data/BB/env/phase3.env'" in source
-    assert "'/data/trade_ai/local_ai_tools.env'" in source
-    assert "values.get('LOCAL_AI_TOOLS_API_KEY', '')" in source
-    assert "selected_env_path" in source
+    assert "load_model_server_info_from_platform" in source
+    assert "load_local_ai_tools_api_key_from_model_server" not in source
+    assert "_REMOTE_LOCAL_AI_TOOLS_KEY_COMMAND" not in source
+    assert "/data/trade_ai/local_ai_tools.env" not in source
     assert "safe_error_text" in source
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
-import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,7 +21,10 @@ from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
-from services.decision_freshness import ENTRY_DECISION_MAX_AGE_SECONDS
+from services.decision_freshness import (
+    entry_reference_time_from_raw,
+    entry_validity_seconds_from_raw,
+)
 from services.decision_state import (
     DecisionStage,
     DecisionStageStatus,
@@ -31,7 +33,6 @@ from services.decision_state import (
     is_decision_terminal_state,
 )
 from services.entry_direction_metrics import entry_side_from_action, selected_side_evidence
-from services.entry_priority import MIN_ENTRY_OPPORTUNITY_SCORE
 from web_dashboard.api.text_sanitize import sanitize_text
 
 logger = structlog.get_logger(__name__)
@@ -173,6 +174,21 @@ def pending_execution_failed_reason(symbol: str, action: str | None = None) -> s
     )
 
 
+def _waiting_candidate_expired(row: Any, now: datetime) -> bool:
+    raw = _safe_raw_response(getattr(row, "raw_llm_response", None))
+    valid_for = entry_validity_seconds_from_raw(raw)
+    if valid_for <= 0:
+        return True
+    reference = entry_reference_time_from_raw(raw) or getattr(row, "created_at", None)
+    if not isinstance(reference, datetime):
+        return True
+    if reference.tzinfo is not None and now.tzinfo is None:
+        reference = reference.replace(tzinfo=None)
+    elif reference.tzinfo is None and now.tzinfo is not None:
+        reference = reference.replace(tzinfo=now.tzinfo)
+    return max((now - reference).total_seconds(), 0.0) > valid_for
+
+
 @dataclass(slots=True)
 class StaleEntryCandidateExpirer:
     """Clear stale entry candidates that can otherwise suppress fresh entries."""
@@ -183,14 +199,13 @@ class StaleEntryCandidateExpirer:
         """Expire one bounded batch without retaining a session during evaluation."""
 
         now = datetime.utcnow()
-        waiting_cutoff = now - timedelta(seconds=ENTRY_DECISION_MAX_AGE_SECONDS)
         maintenance_since = now - STALE_ENTRY_MAINTENANCE_LOOKBACK
         try:
             async with get_session_ctx() as session:
                 waiting_rows = await self._load_rows(
                     session,
                     since=maintenance_since,
-                    cutoff=waiting_cutoff,
+                    cutoff=None,
                     reason_patterns=WAITING_ENTRY_PATTERNS,
                 )
                 pending_rows = await self._load_rows(
@@ -202,7 +217,7 @@ class StaleEntryCandidateExpirer:
                 open_state_rows = await self._load_stale_open_state_rows(
                     session,
                     since=maintenance_since,
-                    cutoff=waiting_cutoff,
+                    cutoff=now,
                 )
                 waiting_rows, pending_rows = _merge_open_state_repairs(
                     waiting_rows,
@@ -377,6 +392,8 @@ class StaleEntryCandidateExpirer:
         for row in waiting_rows:
             if not _needs_terminal_state_repair(row):
                 continue
+            if not _waiting_candidate_expired(row, current_time):
+                continue
             reason = self._waiting_expiration_reason(row)
             self._apply_reason(
                 row,
@@ -484,14 +501,10 @@ class StaleEntryCandidateExpirer:
 
     def _waiting_expiration_reason(self, row: Any) -> str:
         raw = _safe_raw_response(row.raw_llm_response)
+        valid_for = entry_validity_seconds_from_raw(raw)
         opportunity = raw.get("opportunity_score")
         if not isinstance(opportunity, dict):
             opportunity = {}
-        score = self.float_parser(opportunity.get("score"), float("nan"))
-        min_score = self.float_parser(
-            opportunity.get("min_score_required"),
-            MIN_ENTRY_OPPORTUNITY_SCORE,
-        )
         expected_net = self.float_parser(
             opportunity.get("expected_net_return_pct"),
             0.0,
@@ -508,14 +521,11 @@ class StaleEntryCandidateExpirer:
                 f"候选排序超时后复核：{row.symbol} 本次{action_label(row.action)}"
                 f"预期净收益 {expected_net:.4f}% 不为正，旧信号不再执行，下一轮重新分析。"
             )
-        if math.isfinite(score) and score <= min_score:
-            return (
-                f"候选排序超时后复核：{row.symbol} 本次{action_label(row.action)}"
-                f"机会评分 {score:.4f} 低于执行门槛 {min_score:.2f}，旧信号不再执行，下一轮重新分析。"
-            )
+        if valid_for <= 0:
+            return "候选缺少收益模型动态有效期，旧信号不再执行，下一轮重新分析。"
         return (
-            f"候选排序等待超过 {ENTRY_DECISION_MAX_AGE_SECONDS:.0f} 秒，"
-            "行情快照已经过期。为避免追单，本次旧信号不再执行，下一轮重新分析。"
+            f"候选已超过收益模型生成的 {valid_for:.0f} 秒预测周期，"
+            "本次旧信号不再执行，下一轮重新分析。"
         )
 
     def _apply_reason(

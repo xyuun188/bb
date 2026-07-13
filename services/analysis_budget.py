@@ -7,11 +7,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from services.entry_strategy_mode import (
-    PORTFOLIO_MIN_POSITION_GROUPS_TARGET,
-    PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN,
-)
-
 POSITION_REVIEW_MAX_GROUPS_PER_ROUND = 6
 POSITION_REVIEW_HIGH_RISK_MAX_GROUPS_PER_ROUND = 8
 POSITION_REVIEW_URGENT_EXIT_MAX_GROUPS_PER_ROUND = 14
@@ -19,15 +14,6 @@ POSITION_REVIEW_MEDIUM_LOAD_GROUP_THRESHOLD = 13
 POSITION_REVIEW_HIGH_LOAD_GROUP_THRESHOLD = 25
 POSITION_REVIEW_MEDIUM_LOAD_MAX_GROUPS_PER_ROUND = 10
 POSITION_REVIEW_HIGH_LOAD_MAX_GROUPS_PER_ROUND = 14
-POSITION_REVIEW_FAST_EXIT_SCORE = 70.0
-POSITION_REVIEW_FAST_ADD_SCORE = 62.0
-POSITION_REVIEW_URGENT_EXIT_MARKERS = (
-    "loss_expanding",
-    "loss_needs_review",
-    "near_stop",
-    "adverse_momentum",
-    "predictive_reversal",
-)
 MARKET_ANALYSIS_MIN_EXPLORATION_SYMBOLS = 2
 MARKET_ANALYSIS_HIGH_RISK_MIN_EXPLORATION_SYMBOLS = 1
 MARKET_ANALYSIS_NO_POSITION_CAP = 6
@@ -65,8 +51,6 @@ class AnalysisBudgetConfig:
         POSITION_REVIEW_MEDIUM_LOAD_MAX_GROUPS_PER_ROUND
     )
     position_high_load_max_groups_per_round: int = POSITION_REVIEW_HIGH_LOAD_MAX_GROUPS_PER_ROUND
-    position_fast_exit_score: float = POSITION_REVIEW_FAST_EXIT_SCORE
-    position_fast_add_score: float = POSITION_REVIEW_FAST_ADD_SCORE
     market_min_exploration_symbols: int = MARKET_ANALYSIS_MIN_EXPLORATION_SYMBOLS
     market_high_risk_min_exploration_symbols: int = (
         MARKET_ANALYSIS_HIGH_RISK_MIN_EXPLORATION_SYMBOLS
@@ -75,8 +59,8 @@ class AnalysisBudgetConfig:
     market_low_risk_open_position_cap: int = MARKET_ANALYSIS_LOW_RISK_OPEN_POSITION_CAP
     market_medium_risk_cap: int = MARKET_ANALYSIS_MEDIUM_RISK_CAP
     market_high_risk_cap: int = MARKET_ANALYSIS_HIGH_RISK_CAP
-    target_position_groups: int = PORTFOLIO_MIN_POSITION_GROUPS_TARGET
-    roster_fill_market_symbol_min: int = PORTFOLIO_ROSTER_FILL_MARKET_SYMBOL_MIN
+    target_position_groups: int = 0
+    roster_fill_market_symbol_min: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,21 +216,19 @@ class AnalysisBudgetPolicy:
         forced_exit = [
             scan
             for scan in fast_scan.values()
-            if _safe_float(scan.get("exit_score"), 0.0) >= self.config.position_fast_exit_score
+            if scan.get("dynamic_exit_hard_risk") is True
         ]
         urgent_exit = [scan for scan in fast_scan.values() if self.urgent_exit_checker(scan)]
-        high_exit = [
-            scan for scan in fast_scan.values() if _safe_float(scan.get("exit_score"), 0.0) >= 90.0
-        ]
+        high_exit = list(forced_exit)
         priority = [
             scan
             for scan in fast_scan.values()
-            if _safe_float(scan.get("priority_score"), 0.0) >= self.config.position_fast_add_score
+            if scan.get("dynamic_exit_eligible") is True
         ]
 
         risk_level = "low"
         position_max_groups = dynamic_position_max_groups
-        if high_exit or len(forced_exit) >= 3:
+        if high_exit:
             risk_level = "high"
             position_max_groups = max(
                 runtime.position_high_risk_max_groups_per_round,
@@ -254,18 +236,14 @@ class AnalysisBudgetPolicy:
                 min(
                     len(grouped_items),
                     runtime.position_urgent_exit_max_groups_per_round,
-                    (
-                        len(urgent_exit) + 2
-                        if urgent_exit
-                        else runtime.position_high_risk_max_groups_per_round
-                    ),
+                    len(urgent_exit) if urgent_exit else len(high_exit),
                 ),
             )
-        elif forced_exit or len(priority) >= 3:
+        elif priority:
             risk_level = "medium"
             position_max_groups = max(
                 dynamic_position_max_groups,
-                min(len(priority) + 2, runtime.position_high_risk_max_groups_per_round),
+                min(len(priority), runtime.position_high_risk_max_groups_per_round),
             )
 
         market_limit, market_limit_policy = self._market_limit_with_positions(
@@ -423,93 +401,25 @@ class AnalysisBudgetPolicy:
 
     def _runtime(self, strategy_context: dict[str, Any] | None) -> AnalysisBudgetRuntime:
         context = _safe_dict(strategy_context)
-        learning = _safe_dict(context.get("strategy_learning"))
-        runtime = _safe_dict(learning.get("runtime"))
         capacity = _safe_dict(context.get("dynamic_position_capacity"))
-        roster = _safe_dict(context.get("portfolio_roster"))
-        open_pressure = _safe_dict(learning.get("open_position_pressure"))
-        budget = _safe_dict(runtime.get("analysis_budget"))
-        source = "config"
-
-        target_position_groups = self._first_positive_int(
-            context.get("target_open_position_groups"),
-            context.get("target_position_groups"),
-            runtime.get("target_open_position_groups"),
-            runtime.get("target_position_groups"),
-            learning.get("target_position_groups"),
-            capacity.get("target_limit"),
-            roster.get("target_position_groups"),
-            default=self.config.target_position_groups,
-        )
-        if target_position_groups != self.config.target_position_groups:
-            source = "strategy_learning"
-
-        max_bound = self._first_positive_int(
-            runtime.get("max_open_positions"),
-            open_pressure.get("max_open_positions"),
-            context.get("max_open_positions_base"),
-            capacity.get("base_limit"),
-            default=max(
-                target_position_groups,
-                self.config.position_high_load_max_groups_per_round,
-            ),
-        )
-        max_bound = max(max_bound, target_position_groups, 1)
-
-        position_max_groups = self._runtime_int(
-            budget.get("position_max_groups"),
-            runtime.get("position_review_max_groups"),
-            context.get("position_review_max_groups"),
-            default=self.config.position_max_groups_per_round,
-            upper=max_bound,
-        )
-        if position_max_groups != self.config.position_max_groups_per_round:
-            source = "strategy_learning"
-
-        position_high_risk_max = self._runtime_int(
-            budget.get("position_high_risk_max_groups"),
-            runtime.get("position_high_risk_max_groups"),
-            runtime.get("position_review_high_risk_max_groups"),
-            default=self.config.position_high_risk_max_groups_per_round,
-            upper=max_bound,
-        )
-        position_urgent_max = self._runtime_int(
-            budget.get("position_urgent_exit_max_groups"),
-            runtime.get("position_urgent_exit_max_groups"),
-            runtime.get("position_review_urgent_max_groups"),
-            default=self.config.position_urgent_exit_max_groups_per_round,
-            upper=max_bound,
-        )
-        medium_load_max = self._runtime_int(
-            budget.get("position_medium_load_max_groups"),
-            runtime.get("position_medium_load_max_groups"),
-            default=self.config.position_medium_load_max_groups_per_round,
-            upper=max_bound,
-        )
-        high_load_max = self._runtime_int(
-            budget.get("position_high_load_max_groups"),
-            runtime.get("position_high_load_max_groups"),
-            default=self.config.position_high_load_max_groups_per_round,
-            upper=max_bound,
+        max_bound = max(
+            _safe_int(capacity.get("hard_limit"), 0),
+            int(self.config.position_high_load_max_groups_per_round),
+            1,
         )
 
-        medium_threshold = self._runtime_int(
-            budget.get("position_medium_load_group_threshold"),
-            runtime.get("position_medium_load_group_threshold"),
-            default=min(
-                self.config.position_medium_load_group_threshold,
-                max(target_position_groups + 2, 1),
-            ),
-            upper=max_bound * 2,
-        )
-        high_threshold = self._runtime_int(
-            budget.get("position_high_load_group_threshold"),
-            runtime.get("position_high_load_group_threshold"),
-            default=min(
-                self.config.position_high_load_group_threshold,
-                max(target_position_groups * 2, medium_threshold + 1),
-            ),
-            upper=max_bound * 3,
+        def bounded(value: Any) -> int:
+            return max(1, min(int(value or 1), max_bound))
+
+        position_max_groups = bounded(self.config.position_max_groups_per_round)
+        position_high_risk_max = bounded(self.config.position_high_risk_max_groups_per_round)
+        position_urgent_max = bounded(self.config.position_urgent_exit_max_groups_per_round)
+        medium_load_max = bounded(self.config.position_medium_load_max_groups_per_round)
+        high_load_max = bounded(self.config.position_high_load_max_groups_per_round)
+        medium_threshold = max(int(self.config.position_medium_load_group_threshold), 1)
+        high_threshold = max(
+            int(self.config.position_high_load_group_threshold),
+            medium_threshold + 1,
         )
 
         return AnalysisBudgetRuntime(
@@ -527,80 +437,24 @@ class AnalysisBudgetPolicy:
             position_high_load_group_threshold=max(high_threshold, medium_threshold + 1),
             position_medium_load_max_groups_per_round=max(medium_load_max, position_max_groups),
             position_high_load_max_groups_per_round=max(high_load_max, medium_load_max),
-            market_min_exploration_symbols=self._runtime_int(
-                budget.get("market_min_exploration_symbols"),
-                runtime.get("market_min_exploration_symbols"),
-                default=self.config.market_min_exploration_symbols,
-                upper=10_000,
+            market_min_exploration_symbols=max(
+                int(self.config.market_min_exploration_symbols), 1
             ),
-            market_high_risk_min_exploration_symbols=self._runtime_int(
-                budget.get("market_high_risk_min_exploration_symbols"),
-                runtime.get("market_high_risk_min_exploration_symbols"),
-                default=self.config.market_high_risk_min_exploration_symbols,
-                upper=10_000,
+            market_high_risk_min_exploration_symbols=max(
+                int(self.config.market_high_risk_min_exploration_symbols), 1
             ),
-            market_no_position_cap=self._runtime_int(
-                budget.get("market_no_position_cap"),
-                runtime.get("market_no_position_cap"),
-                default=self.config.market_no_position_cap,
-                upper=10_000,
+            market_no_position_cap=max(int(self.config.market_no_position_cap), 1),
+            market_low_risk_open_position_cap=max(
+                int(self.config.market_low_risk_open_position_cap), 1
             ),
-            market_low_risk_open_position_cap=self._runtime_int(
-                budget.get("market_low_risk_open_position_cap"),
-                runtime.get("market_low_risk_open_position_cap"),
-                default=self.config.market_low_risk_open_position_cap,
-                upper=10_000,
-            ),
-            market_medium_risk_cap=self._runtime_int(
-                budget.get("market_medium_risk_cap"),
-                runtime.get("market_medium_risk_cap"),
-                default=self.config.market_medium_risk_cap,
-                upper=10_000,
-            ),
-            market_high_risk_cap=self._runtime_int(
-                budget.get("market_high_risk_cap"),
-                runtime.get("market_high_risk_cap"),
-                default=self.config.market_high_risk_cap,
-                upper=10_000,
-            ),
-            target_position_groups=max(1, min(target_position_groups, max_bound)),
-            roster_fill_market_symbol_min=max(
-                self.config.roster_fill_market_symbol_min,
-                self._runtime_int(
-                    budget.get("roster_fill_market_symbol_min"),
-                    runtime.get("roster_fill_market_symbol_min"),
-                    default=self.config.roster_fill_market_symbol_min,
-                    upper=10_000,
-                ),
-            ),
+            market_medium_risk_cap=max(int(self.config.market_medium_risk_cap), 1),
+            market_high_risk_cap=max(int(self.config.market_high_risk_cap), 1),
+            target_position_groups=0,
+            roster_fill_market_symbol_min=0,
             max_position_group_bound=max_bound,
-            source=source,
-            strategy_profile_id=str(
-                context.get("strategy_profile_id")
-                or runtime.get("profile_id")
-                or _safe_dict(learning.get("active_profile")).get("id")
-                or ""
-            )
-            or None,
+            source="config_compute_budget_only",
+            strategy_profile_id=None,
         )
-
-    @staticmethod
-    def _first_positive_int(*values: Any, default: int) -> int:
-        for value in values:
-            parsed = _safe_int(value, 0)
-            if parsed > 0:
-                return parsed
-        return max(1, int(default or 1))
-
-    @staticmethod
-    def _runtime_int(*values: Any, default: int, upper: int) -> int:
-        selected = max(1, int(default or 1))
-        for value in values:
-            parsed = _safe_int(value, 0)
-            if parsed > 0:
-                selected = parsed
-                break
-        return max(1, min(selected, max(1, int(upper or 1))))
 
     def _result(
         self,

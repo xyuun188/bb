@@ -57,13 +57,13 @@ def _trade_sample(**overrides):
     return sample
 
 
-def test_shadow_hold_samples_are_downweighted_not_deleted() -> None:
+def test_shadow_hold_samples_are_not_penalized_by_action_type() -> None:
     assessment = assess_shadow_sample(_shadow_sample(decision_action="hold"))
 
-    assert assessment.status == "downweighted"
+    assert assessment.status == "included"
     assert assessment.exclude_from_training is False
-    assert assessment.weight < 1.0
-    assert "hold_observation_downweighted" in assessment.reasons
+    assert assessment.weight == 1.0
+    assert assessment.reasons == ()
 
 
 def test_shadow_missing_features_are_excluded() -> None:
@@ -93,12 +93,10 @@ def test_duplicate_training_sample_is_excluded() -> None:
     assert "duplicate_sample" in assessment.reasons
 
 
-def test_trade_fast_loss_exit_is_downweighted_for_review() -> None:
+def test_trade_hold_duration_does_not_apply_fixed_fast_loss_penalty() -> None:
     assessment = assess_trade_sample(_trade_sample(realized_pnl=-0.8, hold_minutes=1.5))
 
-    assert assessment.status == "downweighted"
-    assert assessment.exclude_from_training is False
-    assert "fast_loss_exit_requires_review" in assessment.reasons
+    assert "fast_loss_exit_requires_review" not in assessment.reasons
 
 
 def test_manual_trade_samples_are_excluded() -> None:
@@ -108,7 +106,7 @@ def test_manual_trade_samples_are_excluded() -> None:
     assert "manual_or_test_trade" in assessment.reasons
 
 
-def test_trade_missing_fee_and_micro_probe_are_excluded() -> None:
+def test_trade_missing_fee_is_excluded_but_size_and_old_tier_are_not_gates() -> None:
     no_fee = assess_trade_sample(_trade_sample(fee_estimate=None))
     micro_probe = assess_trade_sample(
         _trade_sample(position_size_pct=0.0003, evidence_tier="weak_conflict_probe")
@@ -116,8 +114,8 @@ def test_trade_missing_fee_and_micro_probe_are_excluded() -> None:
 
     assert no_fee.status == "excluded"
     assert "missing_fee_estimate" in no_fee.reasons
-    assert micro_probe.status == "excluded"
-    assert "weak_evidence_micro_probe" in micro_probe.reasons
+    assert micro_probe.status == "included"
+    assert "weak_evidence_micro_probe" not in micro_probe.reasons
 
 
 def test_trade_mode_mixing_and_failed_close_are_excluded() -> None:
@@ -286,7 +284,8 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     assert report["by_kind"]["text_sentiment"]["sources"]["scrapling:ethereum_blog"] == 1
     assert report["by_kind"]["text_sentiment"]["trainable_sources"]["scrapling:ethereum_blog"] == 1
     assert report["specialist_shadow_models"] == {}
-    assert report["policy"]["hold_observation_penalty"] == 0.55
+    assert "hold_observation_penalty" not in report["policy"]
+    assert "include_score_threshold" not in report["policy"]
     governance = payload["governance_report"]
     assert governance["cleanup_mode"] == "quarantine_not_delete"
     assert governance["training_policy"] == "clean_training_view_only"
@@ -306,13 +305,14 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
                 fee_estimate=0.08,
                 hold_minutes=18.0,
                 leverage=1.0,
+                loss_attribution="position_too_small_fee_drag",
                 raw_llm_response={
-                    "profit_first_trade_plan": {
-                        "decision_lane": "tiny_probe",
+                    "production_return_policy": {
                         "position_size_pct": 0.01,
-                        "leverage": 3.0,
-                        "exit_plan_id": "pfep-test-1",
-                        "strategy_profile_id": "profile-a",
+                        "production_source_count": 2,
+                        "policy_provenance": {
+                            "strategy_version": "return-test-v1",
+                        },
                     },
                     "profit_risk_sizing": {
                         "position_size_pct": 0.01,
@@ -331,14 +331,16 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
     assert labels["training_supervision_ready"] is True
     assert labels["losing_exit_attribution"] == "position_too_small_fee_drag"
     assert labels["trade_profit_class"] == "cost_drag_loss"
-    assert labels["size_efficiency_label"] == "too_small_fee_drag"
+    assert "size_efficiency_label" not in labels
     assert labels["cost_basis_label"] == "fee_plus_funding"
     assert labels["realized_net_pnl_usdt"] == -0.12
     assert labels["return_after_cost_pct"] == -1.0
     assert labels["net_return_after_cost_pct"] == -1.0
     assert labels["return_on_margin_pct"] == -1.0
     assert labels["return_after_cost_pct_deprecated"] is True
-    assert labels["strategy_context"]["decision_lane"] == "tiny_probe"
+    assert labels["strategy_context"]["return_policy_version"] == "return-test-v1"
+    assert labels["strategy_context"]["return_policy_source_count"] == 2
+    assert "decision_lane" not in labels["strategy_context"]
     assert trade["losing_exit_attribution"] == "position_too_small_fee_drag"
     report = payload["quality_report"]["by_kind"]["trade"]["profit_learning"]
     assert report["supervision_ready_count"] == 1
@@ -450,7 +452,8 @@ def test_training_payload_reports_specialist_shadow_model_quality() -> None:
     assert chronos["direction_hit_rate"] == 1.0
     assert chronos["avg_shadow_expected_return_pct"] == 0.21
     assert chronos["avg_realized_return_pct"] == 0.42
-    assert chronos["tail_loss_count"] == 0
+    assert chronos["return_lower_hinge_pct"] == 0.42
+    assert chronos["observation_policy"]["promotion_authority"] is False
     assert timesfm["tool"] == "time_series_prediction"
     assert timesfm["model"] == "timesfm-2.5-shadow-challenger"
     assert timesfm["sample_count"] == 1
@@ -460,7 +463,7 @@ def test_training_payload_reports_specialist_shadow_model_quality() -> None:
     assert timesfm["direction_hit_rate"] == 1.0
     assert timesfm["avg_shadow_expected_return_pct"] == 0.42
     assert timesfm["avg_realized_return_pct"] == 0.42
-    assert timesfm["tail_loss_count"] == 0
+    assert timesfm["return_lower_hinge_pct"] == 0.42
     assert sentiment["direction_hit_count"] == 0
 
 
@@ -510,12 +513,12 @@ def test_training_payload_reports_specialist_tail_loss_quality() -> None:
     assert model["false_signal_count"] == 34
     assert model["avg_realized_return_pct"] == -0.25
     assert model["worst_realized_return_pct"] == -0.25
-    assert model["tail_loss_count"] == 34
-    assert model["tail_loss_symbols"] == [{"symbol": "ACT/USDT", "count": 34}]
+    assert model["return_lower_hinge_pct"] == -0.25
+    assert model["return_distribution_provenance"]["sample_count"] == 34
     assert model["worst_samples"][0]["predicted_side"] == "long"
     assert model["worst_samples"][0]["actual_best_side"] == "short"
-    assert "avg_realized_return_below_floor" in model["promotion_blockers"]
-    assert "false_signal_loss_exceeds_floor" in model["promotion_blockers"]
+    assert model["observation_policy"]["promotion_authority"] is False
+    assert "promotion_blockers" not in model
 
 
 def test_training_payload_quarantines_legacy_mixed_timeseries_shadow() -> None:
@@ -557,15 +560,12 @@ def test_training_payload_quarantines_legacy_mixed_timeseries_shadow() -> None:
 
     assert legacy["legacy_mixed_shadow_count"] == 1
     assert legacy["legacy_quarantined_count"] == 1
-    assert legacy["legacy_sequence_too_short_count"] == 1
-    assert legacy["sequence_too_short_count"] == 0
     assert legacy["actual_inference_count"] == 0
     assert legacy["direction_count"] == 0
-    assert legacy["tail_loss_count"] == 0
-    assert legacy["promotion_ready"] is False
-    assert legacy["promotion_blockers"] == ["specialist_shadow_sample_floor_not_met"]
-    assert "legacy_mixed_shadow_result_not_promotable" not in legacy["promotion_blockers"]
-    assert "timeseries_sequence_too_short_for_promotion" not in legacy["promotion_blockers"]
+    assert legacy["return_lower_hinge_pct"] is None
+    assert legacy["return_distribution_provenance"]["production_eligible"] is False
+    assert legacy["observation_policy"]["promotion_authority"] is False
+    assert "promotion_ready" not in legacy
 
 
 def test_training_payload_skips_baseline_only_profit_shadow_model_quality() -> None:
@@ -679,7 +679,7 @@ def test_shadow_price_reconciliation_warning_is_excluded_from_training() -> None
     )
 
 
-def test_shadow_price_outside_24h_range_is_excluded_from_training() -> None:
+def test_shadow_price_range_does_not_apply_fixed_tolerance() -> None:
     assessment = assess_shadow_sample(
         _shadow_sample(
             features={
@@ -692,9 +692,9 @@ def test_shadow_price_outside_24h_range_is_excluded_from_training() -> None:
         )
     )
 
-    assert assessment.status == "excluded"
-    assert assessment.weight == 0.0
-    assert "price_outside_24h_range" in assessment.reasons
+    assert assessment.status == "included"
+    assert assessment.weight == 1.0
+    assert assessment.reasons == ()
 
 
 def test_training_governance_report_preserves_raw_records_and_targets_refresh() -> None:
@@ -720,7 +720,7 @@ def test_training_governance_report_preserves_raw_records_and_targets_refresh() 
     assert "vector_memory_reindex" in report["refresh_targets"]
 
 
-def test_training_governance_marks_small_quarantined_slice_as_medium_risk() -> None:
+def test_training_governance_treats_any_contamination_as_high_risk() -> None:
     report = governance_report(
         {
             "data_quality_version": DATA_QUALITY_VERSION,
@@ -736,7 +736,7 @@ def test_training_governance_marks_small_quarantined_slice_as_medium_risk() -> N
     )
 
     assert report["status"] == "quarantined"
-    assert report["contamination_risk"] == "medium"
+    assert report["contamination_risk"] == "high"
     assert report["excluded_ratio"] == 0.001306
     assert report["blocked_reason_count"] == 13
     assert report["requires_artifact_refresh"] is True

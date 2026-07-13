@@ -16,8 +16,8 @@ from services.decision_state import (
     DecisionStageStatus,
     append_decision_stage,
 )
-from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.entry_execution_handoff import await_entry_execution_handoff
+from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
 logger = structlog.get_logger(__name__)
@@ -31,7 +31,6 @@ PendingExecutionMarker = Callable[[int, str], Awaitable[None]]
 LoopStageSetter = Callable[[str], None]
 CandidateExecutor = Callable[..., Awaitable[Any]]
 FinalStateEnsurer = Callable[[int, str, str, DecisionOutput, dict[str, Any]], Awaitable[None]]
-MarketNoOpportunityClearer = Callable[[str], None]
 CapacityReleaser = Callable[[str, DecisionOutput, dict[str, dict[Any, int]]], None]
 CapacityReasonProvider = Callable[
     [str, DecisionOutput, list[dict[str, Any]], dict[str, dict[Any, int]]],
@@ -62,7 +61,6 @@ class MarketAutoEntryProcessor:
     mark_decision_reason: DecisionReasonMarker
     mark_decision_pending_execution: PendingExecutionMarker
     result_recorder: MarketDecisionResultRecorder
-    clear_market_no_opportunity_symbol: MarketNoOpportunityClearer
     set_loop_stage: LoopStageSetter
     candidate_executor: CandidateExecutor
     final_state_ensurer: FinalStateEnsurer
@@ -84,7 +82,6 @@ class MarketAutoEntryProcessor:
         staged_entry_counts: dict[str, dict[Any, int]],
         strategy_mode_context: dict[str, Any] | None,
     ) -> MarketAutoEntryProcessResult:
-        self.clear_market_no_opportunity_symbol(symbol)
         self.score_candidate(decision, strategy_mode_context)
         if decision_db_id is not None:
             await self.mark_decision_raw_response(decision_db_id, decision.raw_response)

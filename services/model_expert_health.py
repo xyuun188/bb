@@ -20,10 +20,6 @@ MODEL_COMPONENTS = {
     "local_ai_tools",
 }
 DEFAULT_WINDOWS_HOURS = (24, 72)
-MIN_DECISION_SAMPLES = 3
-HIGH_JSON_ERROR_RATE = 0.25
-HIGH_NO_RETURN_RATE = 0.25
-NEGATIVE_PNL_DEGRADE_PCT = -0.01
 _MODEL_HEALTH_RAW_KEYS = (
     "model_timings",
     "_model_timings",
@@ -244,35 +240,8 @@ def _window_keys_for(row_time: datetime | None, now: datetime) -> list[str]:
 
 
 def _recommendation_state(w24: dict[str, Any]) -> tuple[str, str, list[str]]:
-    reasons: list[str] = []
-    samples = int(w24["participation_count"])
-    adopted = int(w24["adopted_count"])
-    if samples < MIN_DECISION_SAMPLES:
-        reasons.append("insufficient_samples")
-        return "shadow_only", "observing", reasons
-    pnl = _safe_float(w24["adopted_net_pnl_pct"])
-    json_error_rate = _safe_float(w24["json_error_rate"])
-    no_return_rate = _safe_float(w24["no_return_rate"])
-    wrong_rate = _safe_float(w24["wrong_recommendation_rate"])
-    if json_error_rate >= HIGH_JSON_ERROR_RATE:
-        reasons.append("json_error_rate_high")
-    if no_return_rate >= HIGH_NO_RETURN_RATE:
-        reasons.append("no_return_rate_high")
-    if adopted and pnl <= NEGATIVE_PNL_DEGRADE_PCT:
-        reasons.append("negative_adopted_pnl")
-    if wrong_rate >= 0.5:
-        reasons.append("wrong_recommendation_rate_high")
-    if "json_error_rate_high" in reasons and "no_return_rate_high" in reasons:
-        return "disable", "needs_review", reasons
-    if reasons:
-        if "negative_adopted_pnl" in reasons or "wrong_recommendation_rate_high" in reasons:
-            return "reduce", "needs_review", reasons
-        return "shadow_only", "needs_review", reasons
-    if adopted and pnl > 0:
-        reasons.append("positive_adopted_pnl")
-        return "keep", "supported", reasons
-    reasons.append("no_adopted_outcome_yet")
-    return "shadow_only", "observing", reasons
+    del w24
+    return "observation_only", "diagnostic", ["production_permission_false"]
 
 
 def _extract_component_rows(decision: Any) -> list[dict[str, Any]]:
@@ -425,7 +394,7 @@ def summarize_model_expert_health(
             "recommended_state_counts": dict(state_counts),
         },
         "components": final_components,
-        "handling_states": ["keep", "reduce", "shadow_only", "disable", "replace", "add_candidate"],
+        "handling_states": ["observation_only"],
     }
 
 

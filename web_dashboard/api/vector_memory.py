@@ -19,13 +19,11 @@ class VectorMemorySearchRequest(BaseModel):
     top_k: int = 8
     symbol: str = ""
     kind: str = ""
-    min_score: float | None = None
 
 
 class VectorMemorySettingsRequest(BaseModel):
     enabled: bool | None = None
     backend: str | None = None
-    min_score: float | None = None
 
 
 @router.get("/vector-memory/status")
@@ -40,7 +38,6 @@ async def vector_memory_search(req: VectorMemorySearchRequest) -> dict[str, Any]
         top_k=req.top_k,
         symbol=req.symbol,
         kind=req.kind,
-        min_score=req.min_score,
     )
 
 
@@ -76,10 +73,6 @@ async def vector_memory_settings(
             backend = "auto"
         settings.vector_memory_backend = backend
         updates["VECTOR_MEMORY_BACKEND"] = backend
-    if req.min_score is not None:
-        min_score = max(0.0, min(float(req.min_score), 1.0))
-        settings.vector_memory_min_score = min_score
-        updates["VECTOR_MEMORY_MIN_SCORE"] = str(min_score)
     if updates:
         settings.update_env_file(updates)
         await get_vector_memory_service().reset_store()

@@ -78,9 +78,6 @@ def _processor(
     async def mark_reason(decision_id: int, reason: str) -> None:
         calls.append(("reason", decision_id, reason))
 
-    def clear_no_opportunity(symbol: str) -> None:
-        calls.append(("clear", symbol))
-
     async def execute_candidate(*args: Any, **kwargs: Any) -> ExecutionResult | None:
         decision = args[2]
         calls.append(("execute", args[0], args[1], decision.action.value, bool(kwargs)))
@@ -93,7 +90,6 @@ def _processor(
         mark_decision_raw_response=mark_raw,
         mark_decision_reason=mark_reason,
         result_recorder=MarketDecisionResultRecorder(),
-        clear_market_no_opportunity_symbol=clear_no_opportunity,
         candidate_executor=execute_candidate,
         capacity_releaser=release,
         execution_confirmed_checker=lambda result: bool(
@@ -160,7 +156,6 @@ async def test_market_direct_entry_processor_keeps_capacity_on_confirmed_executi
     assert result.execution_confirmed is True
     assert staged_counts["reserved"]["ensemble_trader"] == 1
     assert ("release", "ensemble_trader", "BTC/USDT") not in calls
-    assert ("clear", "BTC/USDT") in calls
     assert ("execute", "BTC/USDT", "ensemble_trader", "long", True) in calls
 
 

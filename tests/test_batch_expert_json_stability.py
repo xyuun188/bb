@@ -29,7 +29,7 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
         in prompt
     )
     assert "do not copy one expert's opinion into all experts" in prompt
-    assert "weak evidence=hold" in prompt
+    assert "Missing governed return evidence holds" in prompt
     assert "cross_check_for must be null in batch mode" in prompt
     assert "12-28字" in prompt
     assert '"action":"hold","confidence":0.50' not in prompt

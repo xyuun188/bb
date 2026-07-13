@@ -1,27 +1,21 @@
 from risk_manager.circuit_breaker import BreakerState, CircuitBreaker
-from risk_manager.stop_loss import StopLossManager, StopLossType
 
 
-def test_circuit_breaker_reads_runtime_daily_loss_setting(monkeypatch):
+def test_trade_losses_are_diagnostic_not_a_fixed_pnl_gate() -> None:
     breaker = CircuitBreaker()
-    breaker.record_trade(-4.0)
 
-    monkeypatch.setattr("risk_manager.circuit_breaker.settings.max_daily_loss_pct", 0.03)
-    breaker.evaluate_daily_loss(account_balance=100.0)
+    for _ in range(200):
+        breaker.record_trade(-100.0)
 
-    assert breaker.state == BreakerState.OPEN
+    assert breaker.state == BreakerState.CLOSED
+    assert breaker.get_state()["consecutive_losses"] == 200
+    assert breaker.get_state()["daily_pnl"] == -20000.0
 
 
-def test_stop_loss_manager_reads_runtime_hard_stop_setting(monkeypatch):
-    manager = StopLossManager()
+def test_profit_resets_diagnostic_consecutive_loss_counter() -> None:
+    breaker = CircuitBreaker()
+    breaker.record_trade(-1.0)
+    breaker.record_trade(0.5)
 
-    monkeypatch.setattr("risk_manager.stop_loss.settings.hard_stop_loss_pct", 0.02)
-    result = manager.evaluate(
-        symbol="BTC/USDT",
-        side="long",
-        entry_price=100.0,
-        current_price=97.9,
-    )
-
-    assert result.triggered is True
-    assert result.stop_type == StopLossType.HARD
+    assert breaker.state == BreakerState.CLOSED
+    assert breaker.get_state()["consecutive_losses"] == 0

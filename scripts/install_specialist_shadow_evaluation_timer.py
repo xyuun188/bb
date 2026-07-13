@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.remote_ssh import connect_remote_ssh, run_remote_text
-from core.safe_output import safe_print
+from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
+from core.safe_output import safe_print  # noqa: E402
 
 REMOTE_APP_DIR = "/data/bb/app"
 SERVICE_NAME = "bb-specialist-shadow-evaluation.service"
@@ -25,7 +25,7 @@ def sh(value: str) -> str:
     return "'" + str(value).replace("'", "'\"'\"'") + "'"
 
 
-def render_service(*, hours: int = 168, limit: int = 2000) -> str:
+def render_service(*, hours: int = 168) -> str:
     return (
         textwrap.dedent(
             f"""
@@ -40,7 +40,7 @@ def render_service(*, hours: int = 168, limit: int = 2000) -> str:
             WorkingDirectory={REMOTE_APP_DIR}
             EnvironmentFile=-{REMOTE_APP_DIR}/.env
             EnvironmentFile=-/etc/bb/bb-runtime.env
-            ExecStart={REMOTE_APP_DIR}/.venv/bin/python {REMOTE_APP_DIR}/scripts/run_specialist_shadow_evaluation.py --hours {int(hours)} --limit {int(limit)} --output-dir {REPORT_DIR}
+            ExecStart={REMOTE_APP_DIR}/.venv/bin/python {REMOTE_APP_DIR}/scripts/run_specialist_shadow_evaluation.py --hours {int(hours)} --output-dir {REPORT_DIR}
             """
         ).strip()
         + "\n"
@@ -69,8 +69,8 @@ def render_timer(*, minutes: int = 30) -> str:
     )
 
 
-def install_command(*, minutes: int, hours: int, limit: int) -> str:
-    service = render_service(hours=hours, limit=limit)
+def install_command(*, minutes: int, hours: int) -> str:
+    service = render_service(hours=hours)
     timer = render_timer(minutes=minutes)
     return "\n".join(
         [
@@ -99,14 +99,13 @@ def main() -> None:
     )
     parser.add_argument("--minutes", type=int, default=30)
     parser.add_argument("--hours", type=int, default=168)
-    parser.add_argument("--limit", type=int, default=2000)
     args = parser.parse_args()
 
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
         output = run_remote_text(
             ssh,
-            install_command(minutes=args.minutes, hours=args.hours, limit=args.limit),
+            install_command(minutes=args.minutes, hours=args.hours),
             timeout=180,
         )
         safe_print(output)

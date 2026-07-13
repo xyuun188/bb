@@ -23,9 +23,9 @@ import structlog
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
-from sqlalchemy import func, select, union_all
+from sqlalchemy import and_, func, or_, select
 
 from config.settings import settings
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
@@ -37,6 +37,8 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_PROMOTION_FLOW,
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
+from services.dynamic_policy_values import empirical_policy_value
+from services.execution_cost_model import execution_cost_estimate
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
 from services.model_training_state import (
@@ -95,20 +97,6 @@ def _training_source_code_version() -> str:
     return f"source-sha256:{digest.hexdigest()}"
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
-AUTO_TRAIN_MIN_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_min_interval_seconds
-AUTO_TRAIN_MIN_NEW_SAMPLES = _LOCAL_ML_PARAMS.auto_train_min_new_samples
-AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS = (
-    _LOCAL_ML_PARAMS.auto_train_learning_only_interval_seconds
-)
-AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES = _LOCAL_ML_PARAMS.auto_train_learning_only_min_new_samples
-TRAINING_SHADOW_SAMPLE_LIMIT = _LOCAL_ML_PARAMS.training_shadow_sample_limit
-TRAINING_BALANCED_RECENT_CANDIDATE_SHARE = 0.60
-TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE = 1.00
-TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE = 1.25
-TRAINING_MIN_NON_HOLD_SHARE = 0.25
-TRAINING_MIN_BEST_TRADE_SHARE = 1.00
-TRAINING_MAX_MISSED_OPPORTUNITY_SHARE = 0.35
-TRAINING_MAX_MISSED_TO_DIRECTIONAL_RATIO = 0.75
 
 FEATURE_KEYS = [
     "abnormal_wick_count_72h",
@@ -159,20 +147,6 @@ FEATURE_KEYS = [
     "decision_confidence",
     "horizon_minutes",
 ]
-
-POSITIVE_NET_RETURN_THRESHOLD_PCT = _LOCAL_ML_PARAMS.positive_net_return_threshold_pct
-PREDICTION_LOWER_QUANTILE = _LOCAL_ML_PARAMS.prediction_lower_quantile
-_EXECUTION_COST_PARAMS = DEFAULT_TRADING_PARAMS.execution_cost
-ROUND_TRIP_COST_PCT = _EXECUTION_COST_PARAMS.local_ml_round_trip_cost_pct
-TAIL_LOSS_THRESHOLD_PCT = _EXECUTION_COST_PARAMS.local_ml_tail_loss_threshold_pct
-MIN_PROFIT_EDGE_PCT = _LOCAL_ML_PARAMS.min_profit_edge_pct
-MIN_TRAINING_SAMPLES = _LOCAL_ML_PARAMS.min_training_samples
-ML_INFLUENCE_MIN_SAMPLE_COUNT = _LOCAL_ML_PARAMS.influence_min_sample_count
-ML_INFLUENCE_MIN_TEST_COUNT = _LOCAL_ML_PARAMS.influence_min_test_count
-READINESS_MAX_DIRTY_SAMPLE_RATIO = _LOCAL_ML_PARAMS.readiness_max_dirty_sample_ratio
-READINESS_MAX_MODEL_AGE_SECONDS = _LOCAL_ML_PARAMS.readiness_max_model_age_seconds
-ML_INFLUENCE_MIN_TOP_RETURN_PCT = POSITIVE_NET_RETURN_THRESHOLD_PCT
-
 
 def _parse_json(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -380,22 +354,26 @@ def _bucket_return_summary(
     scores: np.ndarray,
     *,
     top: bool,
+    tail_loss_threshold_pct: float,
 ) -> dict[str, Any]:
-    if len(scores) < 10:
-        return return_distribution_summary([], tail_loss_threshold_pct=TAIL_LOSS_THRESHOLD_PCT)
-    count = max(int(len(scores) * 0.20), 1)
+    if not len(scores):
+        return return_distribution_summary(
+            [],
+            tail_loss_threshold_pct=tail_loss_threshold_pct,
+        )
+    count = max(int(math.sqrt(len(scores))), 1)
     order = np.argsort(scores)
     idx = order[-count:] if top else order[:count]
     return return_distribution_summary(
         pd.Series(y_return).iloc[idx].astype(float).tolist(),
-        tail_loss_threshold_pct=TAIL_LOSS_THRESHOLD_PCT,
+        tail_loss_threshold_pct=tail_loss_threshold_pct,
     )
 
 
 def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float | None:
-    if len(scores) < 10:
+    if not len(scores):
         return None
-    count = max(int(len(scores) * 0.20), 1)
+    count = max(int(math.sqrt(len(scores))), 1)
     order = np.argsort(scores)
     idx = order[-count:] if top else order[:count]
     return float(pd.Series(y_win).iloc[idx].mean())
@@ -420,14 +398,12 @@ def _regression_prediction_distribution(
         }
     transformed = imputer.transform(x)
     tree_predictions = np.asarray([tree.predict(transformed) for tree in trees], dtype=float)
+    ordered_tree_predictions = np.sort(tree_predictions, axis=0)
+    lower_tail_count = max(int(math.sqrt(len(ordered_tree_predictions))), 1)
     return {
         "expected": expected,
         "median": np.median(tree_predictions, axis=0),
-        "lower_quantile": np.quantile(
-            tree_predictions,
-            PREDICTION_LOWER_QUANTILE,
-            axis=0,
-        ),
+        "lower_quantile": np.median(ordered_tree_predictions[:lower_tail_count], axis=0),
         "std": np.std(tree_predictions, axis=0),
     }
 
@@ -435,6 +411,8 @@ def _regression_prediction_distribution(
 def _risk_adjusted_expected_scores(
     distribution: dict[str, np.ndarray],
     tail_loss_scores: np.ndarray,
+    *,
+    tail_loss_scale_pct: float,
 ) -> np.ndarray:
     return np.asarray(
         [
@@ -442,7 +420,7 @@ def _risk_adjusted_expected_scores(
                 expected_return_pct=float(distribution["expected"][index]),
                 lower_quantile_return_pct=float(distribution["lower_quantile"][index]),
                 tail_loss_probability=float(tail_loss_scores[index]),
-                tail_loss_scale_pct=TAIL_LOSS_THRESHOLD_PCT,
+                tail_loss_scale_pct=tail_loss_scale_pct,
             )["objective_net_return_pct"]
             for index in range(len(distribution["expected"]))
         ],
@@ -455,25 +433,67 @@ def _profit_quality_score(
     lower_quantile_return_pct: float,
     edge_pct: float,
     tail_loss_probability: float,
+    tail_loss_scale_pct: float,
 ) -> float:
     """Score fee-after return quality without win-rate input."""
 
     expected_component = max(objective_return_pct, 0.0)
-    lower_bound_component = max(lower_quantile_return_pct, 0.0) * 0.35
-    edge_component = max(edge_pct, 0.0) * 0.5
-    tail_penalty = _clamp(tail_loss_probability) * TAIL_LOSS_THRESHOLD_PCT * 0.25
+    lower_bound_component = max(lower_quantile_return_pct, 0.0)
+    edge_component = max(edge_pct, 0.0)
+    tail_penalty = _clamp(tail_loss_probability) * max(tail_loss_scale_pct, 0.0)
     return expected_component + lower_bound_component + edge_component - tail_penalty
 
 
 def _net_return_pct(raw_return_pct: float) -> float:
-    """Approximate executable net return after round-trip fee/slippage costs."""
-    return _safe_float(raw_return_pct) - ROUND_TRIP_COST_PCT
+    """Compatibility helper for values already expressed after costs."""
+    return _safe_float(raw_return_pct)
+
+
+def _cost_complete_shadow_returns(
+    snapshot: dict[str, Any],
+    *,
+    horizon_minutes: int,
+    long_gross_return_pct: float,
+    short_gross_return_pct: float,
+) -> tuple[float, float, dict[str, Any]] | None:
+    execution_cost = execution_cost_estimate(snapshot)
+    funding_rate = _safe_float(snapshot.get("funding_rate"), float("nan"))
+    funding_interval_minutes = _safe_float(
+        snapshot.get("funding_interval_minutes"),
+        float("nan"),
+    )
+    if not math.isfinite(funding_interval_minutes):
+        funding_interval_hours = _safe_float(
+            snapshot.get("funding_interval_hours"),
+            float("nan"),
+        )
+        if math.isfinite(funding_interval_hours):
+            funding_interval_minutes = funding_interval_hours * 60.0
+    if (
+        not execution_cost.production_eligible
+        or not math.isfinite(funding_rate)
+        or not math.isfinite(funding_interval_minutes)
+        or funding_interval_minutes <= 0
+    ):
+        return None
+    funding_drag = funding_rate * 100.0 * horizon_minutes / funding_interval_minutes
+    long_net = (
+        long_gross_return_pct
+        - execution_cost.fee_pct
+        - execution_cost.slippage_pct
+        - funding_drag
+    )
+    short_net = (
+        short_gross_return_pct
+        - execution_cost.fee_pct
+        - execution_cost.slippage_pct
+        + funding_drag
+    )
+    return long_net, short_net, execution_cost.to_dict()
 
 
 def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any]:
     metrics = _safe_dict(metadata.get("metrics"))
-    sample_count = int(metadata.get("sample_count") or 0)
-    test_count = int(metadata.get("test_count") or 0)
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0)
     bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), 0.0)
     top_return_lcb = _safe_float(metrics.get(f"top_{side}_return_lcb_pct"), None)
@@ -482,21 +502,12 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     bottom_tail_loss = _safe_float(metrics.get(f"bottom_{side}_tail_loss_rate"), None)
 
     hard_reasons: list[str] = []
-    maturity_reasons: list[str] = []
-    if sample_count < ML_INFLUENCE_MIN_SAMPLE_COUNT:
-        maturity_reasons.append(f"样本数 {sample_count} < {ML_INFLUENCE_MIN_SAMPLE_COUNT}")
-    if test_count < ML_INFLUENCE_MIN_TEST_COUNT:
-        maturity_reasons.append(f"测试样本 {test_count} < {ML_INFLUENCE_MIN_TEST_COUNT}")
     if (
         metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
         or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
         or metadata.get("label_version") != RETURN_LABEL_VERSION
     ):
         hard_reasons.append("artifact objective/label version is not fee-after-return v1")
-    if top_return <= ML_INFLUENCE_MIN_TOP_RETURN_PCT:
-        hard_reasons.append(
-            f"高分组平均收益 {top_return:.3f}% <= {ML_INFLUENCE_MIN_TOP_RETURN_PCT:.2f}%"
-        )
     if top_return <= bottom_return:
         hard_reasons.append(
             f"高分组平均收益 {top_return:.3f}% 未优于低分组 {bottom_return:.3f}%"
@@ -512,11 +523,11 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     ):
         hard_reasons.append("高分组尾部损失率缺失或劣于低分组")
 
-    reliable = not hard_reasons and not maturity_reasons
-    advisory = not hard_reasons and sample_count >= MIN_TRAINING_SAMPLES and test_count >= 40
-    influence_weight = 1.0 if reliable else 0.35 if advisory else 0.0
-    reasons = hard_reasons + maturity_reasons
-    status = "active" if reliable else "advisory" if advisory else "learning_only"
+    reliable = not hard_reasons
+    advisory = False
+    influence_weight = 1.0 if reliable else 0.0
+    reasons = hard_reasons
+    status = "active" if reliable else "learning_only"
     return {
         "enabled": reliable,
         "advisory_enabled": advisory,
@@ -541,6 +552,7 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
             "bottom_win_rate": _safe_float(metrics.get(f"bottom_{side}_win_rate"), None),
         },
         "reasons": reasons,
+        "policy": "fee_after_return_lcb_without_fixed_sample_or_return_threshold",
     }
 
 
@@ -653,9 +665,6 @@ _TRAINING_FEATURE_SNAPSHOT_KEYS = (
     "whale_txn_count",
 )
 _TRAINING_FEATURE_COLUMN_PREFIX = "training_feature__"
-_TRAINING_SHADOW_READ_PAGE_SIZE = 500
-
-
 def _shadow_training_columns() -> tuple[Any, ...]:
     return (
         ShadowBacktest.id,
@@ -714,13 +723,6 @@ def _shadow_decision_confidence(row: Any) -> float:
     return _safe_float(getattr(row, "decision_confidence", 0.0), 0.0) or 0.0
 
 
-def _shadow_is_low_confidence_hold(row: Any) -> bool:
-    threshold = DEFAULT_TRADING_PARAMS.training_data_quality.very_low_confidence_threshold
-    return _shadow_action(row, "decision_action") == "hold" and (
-        _shadow_decision_confidence(row) < threshold
-    )
-
-
 def _shadow_is_trainable_trade_opportunity(row: Any) -> bool:
     action = _shadow_action(row, "decision_action")
     best_action = _shadow_action(row, "best_action")
@@ -748,99 +750,16 @@ def _shadow_quality_sample(row: Any) -> dict[str, Any]:
     }
 
 
-def _shadow_quality_rank(row: Any) -> tuple[int, float, int]:
-    """Prefer trainable directional samples before recent low-confidence holds."""
+def select_shadow_training_rows(rows: list[Any]) -> list[Any]:
+    """Select the latest quality-governed chronological training window."""
 
-    assessment = assess_shadow_sample(_shadow_quality_sample(row))
-    action = _shadow_action(row, "decision_action")
-    best_action = _shadow_action(row, "best_action")
-    directional = int(action in {"long", "short"})
-    best_trade = int(best_action in {"long", "short"})
-    missed_trade = int(bool(getattr(row, "missed_opportunity", False)) and best_trade)
-    action_score = directional * 4 + best_trade * 3 + missed_trade
-    trainable_score = 0 if assessment.exclude_from_training else 10
-    return (
-        trainable_score + action_score,
-        float(assessment.weight),
-        int(getattr(row, "id", 0) or 0),
-    )
-
-
-def _sort_shadow_quality_first(rows: list[Any]) -> list[Any]:
-    return sorted(
-        rows,
-        key=lambda row: (_shadow_quality_rank(row), _shadow_sort_key(row)),
-        reverse=True,
-    )
-
-
-def select_shadow_training_rows(rows: list[Any], *, limit: int) -> list[Any]:
-    """Select a trade-opportunity shadow window for the profit-quality model.
-
-    The local ML artifact is used to judge long/short profit quality. Rows whose
-    hindsight ``best_action`` is still hold are useful for audit, but they dilute
-    the directional profit labels and keep readiness degraded. Sample-count gates
-    should block live influence when there are not enough trade-opportunity rows.
-
-    Missed-opportunity holds are useful as counterfactual opportunity discovery,
-    but they are not directional decisions. Keep them as a minority supplement in
-    the same chronological stream so the walk-forward holdout cannot be dominated
-    by recent low-confidence holds that only prove "a move happened".
-    """
-
-    capped_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
     deduped: dict[Any, Any] = {}
     for row in rows:
         deduped.setdefault(_shadow_row_id(row), row)
     recent = sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
     trainable_rows = [row for row in recent if _shadow_is_trainable_trade_opportunity(row)]
 
-    selected: list[Any] = []
-    selected_ids: set[Any] = set()
-    missed_count = 0
-    directional_count = 0
-
-    def can_add_missed() -> bool:
-        if directional_count <= 0:
-            return False
-        projected_total = len(selected) + 1
-        projected_missed = missed_count + 1
-        if projected_total <= 0:
-            return False
-        missed_share = projected_missed / projected_total
-        missed_to_directional = projected_missed / max(directional_count, 1)
-        return (
-            missed_share <= TRAINING_MAX_MISSED_OPPORTUNITY_SHARE
-            and missed_to_directional <= TRAINING_MAX_MISSED_TO_DIRECTIONAL_RATIO
-        )
-
-    def add(candidate: Any) -> None:
-        nonlocal directional_count, missed_count
-        candidate_id = _shadow_row_id(candidate)
-        if candidate_id in selected_ids or len(selected) >= capped_limit:
-            return
-        selected.append(candidate)
-        selected_ids.add(candidate_id)
-        if _shadow_action(candidate, "decision_action") in {"long", "short"}:
-            directional_count += 1
-        elif bool(getattr(candidate, "missed_opportunity", False)):
-            missed_count += 1
-
-    for row in trainable_rows:
-        if len(selected) >= capped_limit:
-            break
-        action = _shadow_action(row, "decision_action")
-        if action in {"long", "short"}:
-            add(row)
-            continue
-        if (
-            action == "hold"
-            and bool(getattr(row, "missed_opportunity", False))
-            and _shadow_action(row, "best_action") in {"long", "short"}
-            and can_add_missed()
-        ):
-            add(row)
-    return sorted(selected[:capped_limit], key=_shadow_sort_key, reverse=True)
+    return trainable_rows
 
 
 def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
@@ -908,13 +827,21 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         assessment = assess_shadow_sample(quality_sample)
         if assessment.exclude_from_training:
             continue
-        long_return = _net_return_pct(_safe_float(raw_long_return))
-        short_return = _net_return_pct(_safe_float(raw_short_return))
+        horizon_minutes = int(getattr(row, "horizon_minutes", 10) or 10)
+        cost_complete_returns = _cost_complete_shadow_returns(
+            snapshot,
+            horizon_minutes=horizon_minutes,
+            long_gross_return_pct=_safe_float(raw_long_return),
+            short_gross_return_pct=_safe_float(raw_short_return),
+        )
+        if cost_complete_returns is None:
+            continue
+        long_return, short_return, execution_cost = cost_complete_returns
         feature_row: dict[str, Any] = dict(
             _feature_row_from_snapshot(
                 snapshot,
                 decision_confidence=_safe_float(getattr(row, "decision_confidence", 0.0)),
-                horizon_minutes=int(getattr(row, "horizon_minutes", 10) or 10),
+                horizon_minutes=horizon_minutes,
             )
         )
         feature_row.update(
@@ -928,10 +855,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "raw_short_return_pct": _safe_float(raw_short_return),
                 "long_return_pct": long_return,
                 "short_return_pct": short_return,
-                "long_tail_loss": int(long_return < -TAIL_LOSS_THRESHOLD_PCT),
-                "short_tail_loss": int(short_return < -TAIL_LOSS_THRESHOLD_PCT),
-                "long_win": int(long_return > POSITIVE_NET_RETURN_THRESHOLD_PCT),
-                "short_win": int(short_return > POSITIVE_NET_RETURN_THRESHOLD_PCT),
+                "execution_cost": execution_cost,
                 "sample_weight": assessment.weight,
                 "data_quality_status": assessment.status,
                 "data_quality_score": assessment.score,
@@ -939,7 +863,24 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             }
         )
         data.append(feature_row)
-    return pd.DataFrame(data)
+    frame = pd.DataFrame(data)
+    if frame.empty:
+        return frame
+    tail_policy: dict[str, Any] = {}
+    for side in ("long", "short"):
+        returns = frame[f"{side}_return_pct"].astype(float)
+        boundary = empirical_policy_value(
+            f"{side}_tail_loss_boundary_pct",
+            returns[returns < 0].tolist(),
+            selector="lower_hinge",
+            observation_window="current_cost_complete_training_window",
+        )
+        threshold = float(boundary.value) if boundary.value is not None else 0.0
+        frame[f"{side}_tail_loss"] = (returns < threshold).astype(int)
+        frame[f"{side}_win"] = (returns > 0.0).astype(int)
+        tail_policy[side] = boundary.to_dict()
+    frame.attrs["tail_loss_policy"] = tail_policy
+    return frame
 
 
 def shadow_training_quality_report(rows: list[Any]) -> dict[str, Any]:
@@ -975,26 +916,37 @@ def shadow_training_quality_report(rows: list[Any]) -> dict[str, Any]:
 def train_from_frame(
     frame: pd.DataFrame,
     *,
-    min_samples: int = MIN_TRAINING_SAMPLES,
     completed_sample_count: int | None = None,
     training_quality_report: dict[str, Any] | None = None,
     persist_artifact: bool = True,
 ) -> dict[str, Any]:
-    if len(frame) < min_samples:
-        raise ValueError(f"训练样本不足：{len(frame)} < {min_samples}")
+    if len(frame) <= 1:
+        raise ValueError("训练收益分布不足，无法形成非空训练集和留出集")
 
+    tail_policy = dict(frame.attrs.get("tail_loss_policy") or {})
     frame = frame.sort_values("id").reset_index(drop=True)
-    if "long_tail_loss" not in frame.columns:
-        frame["long_tail_loss"] = (
-            frame["long_return_pct"].astype(float) < -TAIL_LOSS_THRESHOLD_PCT
+    tail_scales: dict[str, float] = {}
+    for side in ("long", "short"):
+        boundary = _safe_float(_safe_dict(tail_policy.get(side)).get("value"), float("nan"))
+        if not math.isfinite(boundary):
+            negatives = frame.loc[
+                frame[f"{side}_return_pct"].astype(float) < 0,
+                f"{side}_return_pct",
+            ].tolist()
+            generated = empirical_policy_value(
+                f"{side}_tail_loss_boundary_pct",
+                negatives,
+                selector="lower_hinge",
+                observation_window="current_cost_complete_training_window",
+            )
+            tail_policy[side] = generated.to_dict()
+            boundary = float(generated.value) if generated.value is not None else 0.0
+        frame[f"{side}_tail_loss"] = (
+            frame[f"{side}_return_pct"].astype(float) < boundary
         ).astype(int)
-    if "short_tail_loss" not in frame.columns:
-        frame["short_tail_loss"] = (
-            frame["short_return_pct"].astype(float) < -TAIL_LOSS_THRESHOLD_PCT
-        ).astype(int)
-    split = max(int(len(frame) * _LOCAL_ML_PARAMS.train_split_ratio), 1)
-    if len(frame) - split < _LOCAL_ML_PARAMS.min_test_rows:
-        split = max(len(frame) - _LOCAL_ML_PARAMS.min_test_rows, 1)
+        frame[f"{side}_win"] = (frame[f"{side}_return_pct"].astype(float) > 0.0).astype(int)
+        tail_scales[side] = max(abs(boundary), 1e-12)
+    split = len(frame) // 2
 
     train = frame.iloc[:split].copy()
     test = frame.iloc[split:].copy()
@@ -1029,29 +981,40 @@ def train_from_frame(
     long_expected_scores = _risk_adjusted_expected_scores(
         long_distribution,
         long_tail_scores,
+        tail_loss_scale_pct=tail_scales["long"],
     )
     short_expected_scores = _risk_adjusted_expected_scores(
         short_distribution,
         short_tail_scores,
+        tail_loss_scale_pct=tail_scales["short"],
     )
-    long_pred = (long_scores >= 0.50).astype(int)
-    short_pred = (short_scores >= 0.50).astype(int)
-
     return_buckets = {
         "long": {
             "top": _bucket_return_summary(
-                test["long_return_pct"], long_expected_scores, top=True
+                test["long_return_pct"],
+                long_expected_scores,
+                top=True,
+                tail_loss_threshold_pct=tail_scales["long"],
             ),
             "bottom": _bucket_return_summary(
-                test["long_return_pct"], long_expected_scores, top=False
+                test["long_return_pct"],
+                long_expected_scores,
+                top=False,
+                tail_loss_threshold_pct=tail_scales["long"],
             ),
         },
         "short": {
             "top": _bucket_return_summary(
-                test["short_return_pct"], short_expected_scores, top=True
+                test["short_return_pct"],
+                short_expected_scores,
+                top=True,
+                tail_loss_threshold_pct=tail_scales["short"],
             ),
             "bottom": _bucket_return_summary(
-                test["short_return_pct"], short_expected_scores, top=False
+                test["short_return_pct"],
+                short_expected_scores,
+                top=False,
+                tail_loss_threshold_pct=tail_scales["short"],
             ),
         },
     }
@@ -1077,7 +1040,9 @@ def train_from_frame(
         "trained_at": now,
         "sample_count": int(len(frame)),
         "completed_shadow_sample_count": completed_count,
+        "phase3_clean_completed_shadow_sample_count": completed_count,
         "last_trained_completed_shadow_sample_count": completed_count,
+        "last_trained_phase3_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
         "training_window_composition": _training_window_composition(frame),
         "quality_report": frame_quality_report,
@@ -1085,8 +1050,7 @@ def train_from_frame(
             frame_quality_report,
             persist_artifact=persist_artifact,
         ),
-        "training_shadow_sample_limit": TRAINING_SHADOW_SAMPLE_LIMIT,
-        "training_sample_note": "sample_count is the latest training window, not the all-time total.",
+        "training_window_policy": "all_current_clean_cost_complete_samples",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
         "train_count": int(len(train)),
         "test_count": int(len(test)),
@@ -1097,13 +1061,14 @@ def train_from_frame(
         "label_name": RETURN_LABEL_NAME,
         "label_version": RETURN_LABEL_VERSION,
         "cost_model_version": COST_MODEL_VERSION,
-        "positive_net_return_threshold_pct": POSITIVE_NET_RETURN_THRESHOLD_PCT,
-        "win_return_threshold_pct": POSITIVE_NET_RETURN_THRESHOLD_PCT,
-        "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
-        "tail_loss_threshold_pct": TAIL_LOSS_THRESHOLD_PCT,
+        "positive_net_return_boundary_pct": 0.0,
+        "positive_return_boundary_policy": "fee_after_profitability_math_boundary",
+        "tail_loss_policy": tail_policy,
+        "tail_loss_scale_pct": tail_scales,
+        "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
         "prediction_distribution": {
-            "lower_quantile": PREDICTION_LOWER_QUANTILE,
-            "uncertainty_source": "random_forest_tree_prediction_distribution",
+            "lower_bound": "tree_prediction_lower_hinge",
+            "uncertainty_source": "random_forest_tree_empirical_order_statistics",
             "tail_risk_source": "tail_loss_classifier_diagnostic_risk_penalty",
         },
         "training_objective": (
@@ -1116,12 +1081,6 @@ def train_from_frame(
             "short_auc": _safe_auc(test["short_win"], short_scores),
             "long_pr_auc": _safe_pr_auc(test["long_win"], long_scores),
             "short_pr_auc": _safe_pr_auc(test["short_win"], short_scores),
-            "long_accuracy": (
-                float(accuracy_score(test["long_win"], long_pred)) if len(test) else None
-            ),
-            "short_accuracy": (
-                float(accuracy_score(test["short_win"], short_pred)) if len(test) else None
-            ),
             "top_long_avg_return_pct": return_buckets["long"]["top"]["avg_return_pct"],
             "bottom_long_avg_return_pct": return_buckets["long"]["bottom"]["avg_return_pct"],
             "top_long_median_return_pct": return_buckets["long"]["top"]["median_return_pct"],
@@ -1267,11 +1226,8 @@ class MLSignalService:
             "training_shadow_sample_count": int(
                 metadata.get("training_shadow_sample_count") or training_count
             ),
-            "training_shadow_sample_limit": int(
-                metadata.get("training_shadow_sample_limit") or TRAINING_SHADOW_SAMPLE_LIMIT
-            ),
-            "training_sample_note": metadata.get("training_sample_note")
-            or "sample_count is the latest training window, not the all-time total.",
+            "training_window_policy": metadata.get("training_window_policy")
+            or "all_current_clean_cost_complete_samples",
             **phase3_counts,
             "status": (
                 "ready"
@@ -1310,35 +1266,15 @@ class MLSignalService:
     def _phase3_cursor_from_metadata(metadata: dict[str, Any], completed_count: int) -> int:
         """Return a trained cursor on the current Phase 3 clean-sample scale."""
 
-        candidates = (
-            metadata.get("last_trained_phase3_shadow_sample_count"),
-            metadata.get("phase3_trained_shadow_sample_count"),
-            metadata.get("last_trained_completed_shadow_sample_count"),
-            metadata.get("last_trained_completed_sample_count"),
-            metadata.get("training_shadow_sample_count"),
-            metadata.get("sample_count"),
-        )
-        for value in candidates:
-            try:
-                cursor = int(value)
-            except (TypeError, ValueError):
-                continue
-            if 0 <= cursor <= completed_count:
-                return cursor
+        value = metadata.get("last_trained_completed_shadow_sample_count")
         try:
-            sample_count = int(metadata.get("sample_count") or 0)
+            cursor = int(value)
         except (TypeError, ValueError):
-            sample_count = 0
-        return max(min(sample_count, completed_count), 0)
+            return 0
+        return cursor if 0 <= cursor <= completed_count else 0
 
     def _phase3_sample_count_status(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        """Normalize legacy artifact counters to the Phase 3 clean training view.
-
-        Older artifacts stored all-time completed cursors.  Phase 3 training is
-        intentionally scoped to clean samples from the Phase 3 boundary, so an
-        all-time cursor such as 150810 must not make the UI or auto-trainer show
-        "0 new samples" when the current clean view has fewer rows.
-        """
+        """Expose authoritative clean-training counters without inferred fallbacks."""
 
         try:
             completed_count = int(metadata.get("phase3_clean_completed_shadow_sample_count") or 0)
@@ -1346,12 +1282,10 @@ class MLSignalService:
             completed_count = 0
         if completed_count <= 0:
             try:
-                training_count = int(
-                    metadata.get("training_shadow_sample_count") or metadata.get("sample_count") or 0
-                )
+                completed_count = int(metadata.get("completed_shadow_sample_count") or 0)
             except (TypeError, ValueError):
-                training_count = 0
-            completed_count = max(training_count, 0)
+                completed_count = 0
+        completed_count = max(completed_count, 0)
         trained_cursor = self._phase3_cursor_from_metadata(metadata, completed_count)
         new_count = max(completed_count - trained_cursor, 0)
         return {
@@ -1470,56 +1404,33 @@ class MLSignalService:
                     )
                 )
                 learning_only = not bool(readiness.get("allow_live_position_influence"))
-                min_interval_seconds = (
-                    AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS
-                    if learning_only
-                    else AUTO_TRAIN_MIN_INTERVAL_SECONDS
-                )
-                min_new_samples = (
-                    AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES
-                    if learning_only
-                    else AUTO_TRAIN_MIN_NEW_SAMPLES
-                )
-                trained_at = self._parse_datetime(
-                    metadata.get("trained_at") or metadata.get("version")
-                )
-                age_seconds = (
-                    (now - trained_at).total_seconds()
-                    if trained_at is not None
-                    else min_interval_seconds
-                )
                 new_samples = max(completed_count - last_completed_count, 0)
                 training_policy = {
                     "learning_only": learning_only,
                     "readiness_state": readiness.get("state"),
                     "readiness_blocking_reasons": readiness.get("blocking_reasons") or [],
-                    "min_interval_seconds": min_interval_seconds,
-                    "min_new_samples": min_new_samples,
-                    "min_training_samples": MIN_TRAINING_SAMPLES,
+                    "trigger": "new_cost_complete_authoritative_sample_or_forced_rebuild",
                     "cursor_source": "phase3_clean_training_view",
-                    "legacy_cursor_ignored_when_outside_phase3_view": True,
                     "promotion_requires_readiness": True,
                     "candidate_artifact_persisted": False,
                     "persist_artifact_only_when_readiness_allows_live_influence": False,
                     "persist_latest_artifact_even_when_readiness_blocks_live_influence": True,
                 }
-                if completed_count < MIN_TRAINING_SAMPLES:
+                if completed_count <= 1:
                     result = {
                         "trained": False,
-                        "reason": "not_enough_samples",
+                        "reason": "training_distribution_unavailable",
                         "completed_sample_count": completed_count,
                         "last_trained_sample_count": last_sample_count,
                         "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
                         "training_policy": training_policy,
-                        "message": f"本地 ML 自动训练三期干净样本不足：{completed_count} < {MIN_TRAINING_SAMPLES}。等待三期新影子复盘样本形成。",
+                        "message": "本地 ML 尚无法形成非空训练集和留出集，继续收集成本完整样本。",
                     }
                     self._last_train_result = result
                     return result
 
-                should_train = force or (
-                    age_seconds >= min_interval_seconds or new_samples >= min_new_samples
-                )
+                should_train = force or not metadata or new_samples > 0
                 if not should_train:
                     result = {
                         "trained": False,
@@ -1528,12 +1439,8 @@ class MLSignalService:
                         "last_trained_sample_count": last_sample_count,
                         "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
-                        "model_age_seconds": round(age_seconds, 1),
                         "training_policy": training_policy,
-                        "message": (
-                            f"未达到自动训练条件：需要距离上次训练至少 {min_interval_seconds // 3600} 小时，"
-                            f"或新增 completed 影子复盘样本不少于 {min_new_samples} 条。"
-                        ),
+                        "message": "没有新增成本完整权威样本，当前 artifact 无需重复训练。",
                     }
                     self._last_train_result = result
                     return result
@@ -1552,26 +1459,35 @@ class MLSignalService:
                 quarantine_result = await self._quarantine_dirty_training_samples()
                 completed_count = await self._completed_shadow_sample_count()
                 new_samples = max(completed_count - last_completed_count, 0)
-                if completed_count < MIN_TRAINING_SAMPLES:
+                if completed_count <= 1:
                     result = {
                         "trained": False,
-                        "reason": "not_enough_clean_samples",
+                        "reason": "clean_training_distribution_unavailable",
                         "completed_sample_count": completed_count,
                         "last_trained_sample_count": last_sample_count,
                         "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
                         "training_policy": training_policy,
                         "training_quarantine": quarantine_result,
-                        "message": (
-                            f"自动隔离脏样本后，干净影子复盘样本不足："
-                            f"{completed_count} < {MIN_TRAINING_SAMPLES}。继续累计可训练样本。"
-                        ),
+                        "message": "自动隔离后无法形成非空训练集和留出集，继续累计成本完整样本。",
                     }
                     self._last_train_result = result
                     return result
-                rows = await load_shadow_training_rows(limit=TRAINING_SHADOW_SAMPLE_LIMIT)
+                rows = await load_shadow_training_rows()
                 quality_state = shadow_training_quality_report(rows)
                 frame = build_training_frame(rows)
+                if len(frame) <= 1:
+                    result = {
+                        "trained": False,
+                        "reason": "cost_complete_training_distribution_unavailable",
+                        "completed_sample_count": completed_count,
+                        "cost_complete_sample_count": int(len(frame)),
+                        "training_policy": training_policy,
+                        "training_quarantine": quarantine_result,
+                        "message": "成本完整样本无法形成训练集和留出集，本轮不训练也不回退旧成本。",
+                    }
+                    self._last_train_result = result
+                    return result
                 candidate_metadata = await asyncio.to_thread(
                     train_from_frame,
                     frame,
@@ -1696,6 +1612,9 @@ class MLSignalService:
         advisory_enabled = bool(
             influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
         )
+        tail_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
+        long_tail_scale = max(_safe_float(tail_scales.get("long"), 0.0), 0.0)
+        short_tail_scale = max(_safe_float(tail_scales.get("short"), 0.0), 0.0)
 
         predictions = []
         for horizon in horizons:
@@ -1741,13 +1660,13 @@ class MLSignalService:
                 expected_return_pct=raw_long_expected,
                 lower_quantile_return_pct=long_lower_quantile,
                 tail_loss_probability=long_tail_loss_probability,
-                tail_loss_scale_pct=TAIL_LOSS_THRESHOLD_PCT,
+                tail_loss_scale_pct=long_tail_scale,
             )
             short_objective = risk_adjusted_expected_return(
                 expected_return_pct=raw_short_expected,
                 lower_quantile_return_pct=short_lower_quantile,
                 tail_loss_probability=short_tail_loss_probability,
-                tail_loss_scale_pct=TAIL_LOSS_THRESHOLD_PCT,
+                tail_loss_scale_pct=short_tail_scale,
             )
             long_expected = long_objective["objective_net_return_pct"]
             short_expected = short_objective["objective_net_return_pct"]
@@ -1768,12 +1687,13 @@ class MLSignalService:
                 best_lower_quantile,
                 profit_edge,
                 float(best_tail_loss_probability or 0.0),
+                long_tail_scale if best_side == "long" else short_tail_scale,
             )
             side_influence = _safe_dict(influence.get(best_side))
+            downside = max(-best_expected, 0.0) + max(-best_lower_quantile, 0.0)
+            return_scale = abs(best_expected) + abs(best_lower_quantile)
             risk_score = _clamp(
-                max(-best_expected, 0.0) / max(POSITIVE_NET_RETURN_THRESHOLD_PCT, 1e-9)
-                + max(-best_lower_quantile, 0.0)
-                / max(POSITIVE_NET_RETURN_THRESHOLD_PCT, 1e-9)
+                downside / max(return_scale, 1e-9)
                 + float(best_tail_loss_probability or 0.0)
             )
             predictions.append(
@@ -1791,7 +1711,10 @@ class MLSignalService:
                         if short_tail_loss_probability is None
                         else round(short_tail_loss_probability, 4)
                     ),
-                    "tail_loss_threshold_pct": round(float(TAIL_LOSS_THRESHOLD_PCT), 4),
+                    "tail_loss_threshold_pct": round(
+                        long_tail_scale if best_side == "long" else short_tail_scale,
+                        4,
+                    ),
                     "long_raw_expected_return_pct": round(raw_long_expected, 4),
                     "short_raw_expected_return_pct": round(raw_short_expected, 4),
                     "long_lower_quantile_return_pct": round(long_lower_quantile, 4),
@@ -1823,8 +1746,9 @@ class MLSignalService:
                     "profit_signal": bool(
                         allow_live_position_influence
                         and side_influence.get("enabled")
-                        and best_expected > POSITIVE_NET_RETURN_THRESHOLD_PCT
-                        and profit_edge >= MIN_PROFIT_EDGE_PCT
+                        and best_expected > 0.0
+                        and best_lower_quantile > 0.0
+                        and profit_edge > 0.0
                     ),
                     "risk_score": round(risk_score, 4),
                     "ml_influence_enabled": bool(
@@ -1968,10 +1892,10 @@ class MLSignalService:
         return {
             "auto_train_enabled": True,
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
-            "auto_train_min_interval_seconds": AUTO_TRAIN_MIN_INTERVAL_SECONDS,
-            "auto_train_min_new_samples": AUTO_TRAIN_MIN_NEW_SAMPLES,
-            "auto_train_learning_only_interval_seconds": AUTO_TRAIN_LEARNING_ONLY_INTERVAL_SECONDS,
-            "auto_train_learning_only_min_new_samples": AUTO_TRAIN_LEARNING_ONLY_MIN_NEW_SAMPLES,
+            "auto_train_trigger": "new_cost_complete_authoritative_sample_or_forced_rebuild",
+            "auto_train_distribution_requirement": (
+                "non_empty_train_and_holdout_from_cost_complete_samples"
+            ),
             "auto_training": row.get("state") == "running",
             "auto_train_last_check_at": row.get("last_check_at") or self._last_check_at,
             "auto_train_next_check_at": row.get("next_check_at") or self._next_check_at,
@@ -2046,111 +1970,44 @@ class MLSignalService:
         )
         tail_probability = float(primary.get("best_tail_loss_probability") or 0.0)
         side = "做多" if primary.get("best_side") == "long" else "做空"
-        if (
-            expected > POSITIVE_NET_RETURN_THRESHOLD_PCT
-            and edge >= MIN_PROFIT_EDGE_PCT
-            and lower_quantile > 0
-        ):
+        if expected > 0.0 and edge > 0.0 and lower_quantile > 0.0:
             return f"ML 费后收益分布支持{side}，可作为开仓收益质量证据。"
         if expected <= 0:
             return "ML 风险调整后的费后预期收益为负，应阻止该方向获得模型加分。"
         if lower_quantile <= 0:
             return "ML 平均费后收益为正但置信下界未转正，继续 shadow 验证。"
-        if tail_probability >= 0.50:
-            return "ML 费后收益为正但左尾风险偏高，不能晋升或放大风险。"
-        if edge < MIN_PROFIT_EDGE_PCT:
+        if tail_probability * max(abs(lower_quantile), 0.0) >= max(expected, 0.0):
+            return "ML 费后收益为正但动态左尾损失预算已覆盖预期收益，不能晋升或放大风险。"
+        if edge <= 0.0:
             return "ML 多空预期收益差距不明显，信号中性。"
         return "ML 盈亏质量信号中性，暂不改变 AI 决策。"
 
 
-async def load_shadow_training_rows(limit: int = TRAINING_SHADOW_SAMPLE_LIMIT) -> list[Any]:
-    safe_limit = max(int(limit or TRAINING_SHADOW_SAMPLE_LIMIT), 1)
-    recent_limit = max(int(safe_limit * TRAINING_BALANCED_RECENT_CANDIDATE_SHARE), 1)
-    non_hold_limit = max(
-        int(safe_limit * TRAINING_BALANCED_NON_HOLD_CANDIDATE_SHARE),
-        int(safe_limit * TRAINING_MIN_NON_HOLD_SHARE),
-    )
-    best_trade_limit = max(
-        int(safe_limit * TRAINING_BALANCED_BEST_TRADE_CANDIDATE_SHARE),
-        int(safe_limit * TRAINING_MIN_BEST_TRADE_SHARE),
-    )
+async def load_shadow_training_rows() -> list[Any]:
     base_filters = (
         ShadowBacktest.status == "completed",
         ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
+        or_(
+            ShadowBacktest.decision_action.in_(["long", "short"]),
+            and_(
+                ShadowBacktest.missed_opportunity.is_(True),
+                ShadowBacktest.best_action.in_(["long", "short"]),
+            ),
+        ),
     )
     order_by = (ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
     columns = _shadow_training_columns()
 
-    if "sqlite" in settings.database_url:
-        # SQLite does not support ORDER BY/LIMIT in each branch of a compound
-        # SELECT. Keep the equivalent path for local tests and development.
-        async with get_read_session_ctx() as session:
-
-            async def load_rows(*filters: Any, row_limit: int) -> list[ShadowTrainingRow]:
-                rows: list[ShadowTrainingRow] = []
-                before_id: int | None = None
-                while len(rows) < row_limit:
-                    page_limit = min(_TRAINING_SHADOW_READ_PAGE_SIZE, row_limit - len(rows))
-                    stmt = select(*columns).where(*base_filters, *filters).order_by(*order_by).limit(
-                        page_limit
-                    )
-                    if before_id is not None:
-                        stmt = stmt.where(ShadowBacktest.id < before_id)
-                    page = [
-                        _shadow_training_row_from_mapping(row)
-                        for row in (await session.execute(stmt)).mappings().all()
-                    ]
-                    if not page:
-                        break
-                    rows.extend(page)
-                    before_id = page[-1].id or before_id
-                    if len(page) < page_limit:
-                        break
-                return rows
-
-            recent_rows = await load_rows(row_limit=recent_limit)
-            non_hold_rows = await load_rows(
-                ShadowBacktest.decision_action.in_(["long", "short"]),
-                row_limit=non_hold_limit,
-            )
-            best_trade_rows = await load_rows(
-                ShadowBacktest.best_action.in_(["long", "short"]),
-                row_limit=best_trade_limit,
-            )
-        return select_shadow_training_rows(
-            [*recent_rows, *non_hold_rows, *best_trade_rows],
-            limit=safe_limit,
-        )
-
-    def candidate_ids(*filters: Any, row_limit: int) -> Any:
-        return (
-            select(ShadowBacktest.id.label("id"))
-            .where(*base_filters, *filters)
-            .order_by(*order_by)
-            .limit(row_limit)
-        )
-
-    candidate_set = union_all(
-        candidate_ids(row_limit=recent_limit),
-        candidate_ids(ShadowBacktest.decision_action.in_(["long", "short"]), row_limit=non_hold_limit),
-        candidate_ids(ShadowBacktest.best_action.in_(["long", "short"]), row_limit=best_trade_limit),
-    ).subquery("training_candidates")
     async with get_read_session_ctx() as session:
-        result = await session.execute(
-            select(*columns)
-            .where(ShadowBacktest.id.in_(select(candidate_set.c.id)))
-            .order_by(*order_by)
-        )
+        stmt = select(*columns).where(*base_filters).order_by(*order_by)
+        result = await session.execute(stmt)
         rows = [
             _shadow_training_row_from_mapping(row)
             for row in result.mappings().all()
         ]
-    return select_shadow_training_rows(
-        rows,
-        limit=safe_limit,
-    )
+    return select_shadow_training_rows(rows)
 
 
 async def count_shadow_training_rows() -> int:

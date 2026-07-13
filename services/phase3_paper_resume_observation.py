@@ -21,8 +21,6 @@ from services.server_monitor_status import (
 )
 
 DEFAULT_OBSERVATION_HOURS = 2
-DEFAULT_MIN_CREATED_SHADOW_SAMPLES = 5
-DEFAULT_MIN_COMPLETED_SHADOW_SAMPLES = 1
 DEFAULT_REPORT_MAX_AGE_SECONDS = 2 * 3600
 DEFAULT_SAMPLE_LIMIT = 800
 
@@ -204,8 +202,6 @@ def evaluate_phase3_paper_resume_observation_inputs(
     trading_runtime_status: dict[str, Any] | None = None,
     specialist_shadow_evaluation: dict[str, Any],
     latest_preflight: dict[str, Any],
-    min_created_shadow_samples: int = DEFAULT_MIN_CREATED_SHADOW_SAMPLES,
-    min_completed_shadow_samples: int = DEFAULT_MIN_COMPLETED_SHADOW_SAMPLES,
     report_max_age_seconds: int = DEFAULT_REPORT_MAX_AGE_SECONDS,
 ) -> dict[str, Any]:
     """Evaluate post-resume observation inputs without mutating runtime state."""
@@ -383,33 +379,8 @@ def evaluate_phase3_paper_resume_observation_inputs(
     else:
         passed.append("specialist_shadow_evaluation_fresh_after_resume")
 
-    if paper_active and created_shadow_count < min_created_shadow_samples:
-        warnings.append(
-            _warning(
-                "post_resume_shadow_sample_floor_not_met",
-                "Paper is active but new shadow samples have not reached the observation floor yet.",
-                evidence={
-                    "created_shadow_count": created_shadow_count,
-                    "minimum": min_created_shadow_samples,
-                },
-            )
-        )
-    elif paper_active:
-        passed.append("post_resume_shadow_samples_accumulating")
-
-    if paper_active and completed_shadow_count < min_completed_shadow_samples:
-        warnings.append(
-            _warning(
-                "post_resume_completed_shadow_floor_not_met",
-                "Completed shadow outcomes are still warming up.",
-                evidence={
-                    "completed_shadow_count": completed_shadow_count,
-                    "minimum": min_completed_shadow_samples,
-                },
-            )
-        )
-    elif paper_active:
-        passed.append("post_resume_completed_shadow_samples_available")
+    if paper_active:
+        passed.append("post_resume_shadow_counts_are_diagnostic_only")
 
     if paper_active and specialist_eligible_count <= 0:
         warnings.append(
@@ -473,7 +444,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "operator_sequence": [
             "If status is waiting_for_resume, keep the report as the baseline before paper is started.",
             "After paper starts, watch the first 30/60/120 minutes for OKX clean state and sample accumulation.",
-            "Do not use specialist models for canary/live promotion until this observation is healthy and sample floors pass.",
+            "Use cost-complete fee-after return distributions, not fixed sample floors, for canary/live promotion.",
         ],
         "checked_at": _now_iso(),
     }
@@ -516,8 +487,6 @@ class Phase3PaperResumeObservationService:
     specialist_shadow_provider: ReportProvider | None = None
     latest_preflight_provider: ReportProvider | None = None
     observation_hours: int = DEFAULT_OBSERVATION_HOURS
-    min_created_shadow_samples: int = DEFAULT_MIN_CREATED_SHADOW_SAMPLES
-    min_completed_shadow_samples: int = DEFAULT_MIN_COMPLETED_SHADOW_SAMPLES
     report_max_age_seconds: int = DEFAULT_REPORT_MAX_AGE_SECONDS
     sample_limit: int = DEFAULT_SAMPLE_LIMIT
 
@@ -565,8 +534,6 @@ class Phase3PaperResumeObservationService:
             trading_runtime_status=trading_runtime,
             specialist_shadow_evaluation=specialist,
             latest_preflight=preflight,
-            min_created_shadow_samples=self.min_created_shadow_samples,
-            min_completed_shadow_samples=self.min_completed_shadow_samples,
             report_max_age_seconds=self.report_max_age_seconds,
         )
 

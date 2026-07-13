@@ -8,7 +8,8 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from services.profit_first_trade_plan import normalize_losing_exit_attribution
+from services.dynamic_policy_values import empirical_policy_value
+from services.return_loss_attribution import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
@@ -16,14 +17,6 @@ _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
 DATA_QUALITY_VERSION = "2026-07-12.v1"
 PROFIT_LEARNING_VERSION = "fee-after-return-training-v3"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
-HIGH_CONTAMINATION_EXCLUDED_RATIO = 0.05
-HIGH_CONTAMINATION_BLOCKED_REASON_RATIO = 0.02
-MEDIUM_CONTAMINATION_EXCLUDED_RATIO = 0.005
-MIN_PROMOTION_SHADOW_SAMPLES = 30
-MIN_DIRECTION_HIT_RATE = 0.48
-MIN_AVG_REALIZED_RETURN_PCT = 0.02
-MAX_FALSE_SIGNAL_LOSS_PCT = -0.18
-MIN_TIMESERIES_SEQUENCE_LENGTH = 30
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
     "hold_missed_opportunity_downweighted",
@@ -305,13 +298,10 @@ def _final_assessment(
     if exclude:
         status: QualityStatus = "excluded"
         weight = 0.0
-        score = min(score, _QUALITY_PARAMS.excluded_score_cap)
-    elif score < _QUALITY_PARAMS.include_score_threshold or reasons:
+        score = 0.0
+    elif reasons:
         status = "downweighted"
-        weight = max(
-            _QUALITY_PARAMS.downweighted_min_weight,
-            min(score, _QUALITY_PARAMS.downweighted_max_weight),
-        )
+        weight = max(0.0, min(score, 1.0))
     else:
         status = "included"
         weight = 1.0
@@ -342,8 +332,7 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         return _final_assessment(0.0, ["missing_features"], exclude=True)
 
     price_warning = _safe_str(features.get("price_reconciliation_warning"))
-    indicator_gap = abs(_safe_float(features.get("indicator_price_gap_pct"), 0.0) or 0.0)
-    if price_warning or indicator_gap >= _QUALITY_PARAMS.abnormal_indicator_price_gap_pct:
+    if price_warning:
         return _final_assessment(
             0.0,
             ["price_reconciliation:" f"{price_warning or 'indicator_close_diverged'}"],
@@ -353,62 +342,13 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if bool(features.get("stale")) or bool(features.get("ticker_stale")):
         return _final_assessment(0.0, ["stale_ticker_snapshot"], exclude=True)
 
-    current_price = _safe_float(features.get("current_price") or features.get("close"), None)
-    low_24h = _safe_float(features.get("low_24h"), None)
-    high_24h = _safe_float(features.get("high_24h"), None)
-    if current_price is not None and low_24h is not None and high_24h is not None:
-        if current_price > 0 and high_24h > 0 and low_24h > 0 and high_24h >= low_24h:
-            tolerance = _QUALITY_PARAMS.training_price_24h_range_tolerance_pct
-            lower_bound = low_24h * (1.0 - tolerance)
-            upper_bound = high_24h * (1.0 + tolerance)
-            if current_price < lower_bound or current_price > upper_bound:
-                return _final_assessment(
-                    0.0,
-                    ["price_outside_24h_range"],
-                    exclude=True,
-                )
-
     long_return = _safe_float(sample.get("long_return_pct"), None)
     short_return = _safe_float(sample.get("short_return_pct"), None)
     if long_return is None or short_return is None:
         return _final_assessment(0.0, ["missing_outcome_returns"], exclude=True)
-    if (
-        abs(long_return) > _QUALITY_PARAMS.abnormal_shadow_return_abs_pct
-        or abs(short_return) > _QUALITY_PARAMS.abnormal_shadow_return_abs_pct
-    ):
-        return _final_assessment(0.05, ["abnormal_outcome_return"], exclude=True)
-
-    action = _safe_str(sample.get("decision_action")).lower()
-    best_action = _safe_str(sample.get("best_action")).lower()
-    if action == "hold":
-        if bool(sample.get("missed_opportunity")) and best_action in {"long", "short"}:
-            score -= _QUALITY_PARAMS.hold_missed_opportunity_penalty
-            reasons.append("hold_missed_opportunity_downweighted")
-        else:
-            score -= _QUALITY_PARAMS.hold_observation_penalty
-            reasons.append("hold_observation_downweighted")
-
-    confidence = _safe_float(sample.get("decision_confidence"), 0.0) or 0.0
-    if confidence < _QUALITY_PARAMS.very_low_confidence_threshold:
-        score -= _QUALITY_PARAMS.very_low_confidence_penalty
-        reasons.append("very_low_decision_confidence")
-
     horizon = int(_safe_float(sample.get("horizon_minutes"), 0.0) or 0)
-    if horizon <= 0 or horizon > _QUALITY_PARAMS.max_horizon_minutes:
-        score -= _QUALITY_PARAMS.invalid_horizon_penalty
-        reasons.append("invalid_horizon_minutes")
-
-    if current_price is None or current_price <= 0:
-        score -= _QUALITY_PARAMS.invalid_price_penalty
-        reasons.append("missing_or_invalid_price_feature")
-
-    spread = abs(_safe_float(features.get("spread_pct"), 0.0) or 0.0)
-    if spread > _QUALITY_PARAMS.abnormal_spread_pct:
-        exclude = True
-        reasons.append("abnormal_spread_feature")
-    elif spread > _QUALITY_PARAMS.wide_spread_pct:
-        score -= _QUALITY_PARAMS.wide_spread_penalty
-        reasons.append("wide_spread_feature")
+    if horizon <= 0:
+        return _final_assessment(0.0, ["invalid_horizon_minutes"], exclude=True)
 
     return _final_assessment(score, reasons, exclude=exclude)
 
@@ -461,17 +401,6 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if close_status in {"failed", "rejected", "cancelled", "canceled", "error"}:
         return _final_assessment(0.0, ["failed_close_status"], exclude=True)
 
-    position_size_pct = _safe_float(sample.get("position_size_pct"), None)
-    evidence_text = " ".join(
-        _safe_str(sample.get(field)).lower() for field in ("evidence_tier", "quality_tier")
-    )
-    if (
-        position_size_pct is not None
-        and position_size_pct <= 0.001
-        and any(token in evidence_text for token in ("weak", "probe", "degraded"))
-    ):
-        return _final_assessment(0.0, ["weak_evidence_micro_probe"], exclude=True)
-
     fee_source = sample.get("fee_estimate")
     if fee_source is None:
         fee_source = sample.get("fee")
@@ -503,40 +432,25 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     entry_price = _safe_float(sample.get("entry_price"), 0.0) or 0.0
     exit_price = _safe_float(sample.get("exit_price"), 0.0) or 0.0
     if entry_price <= 0 or exit_price < 0:
-        score -= _QUALITY_PARAMS.invalid_trade_price_penalty
-        reasons.append("invalid_trade_price")
+        return _final_assessment(0.0, ["invalid_trade_price"], exclude=True)
 
     hold_minutes = _safe_float(sample.get("hold_minutes"), 0.0) or 0.0
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
-    fee = abs(_safe_float(fee_source, 0.0) or 0.0)
-    if hold_minutes < _QUALITY_PARAMS.fast_loss_exit_minutes and pnl < 0:
-        score -= _QUALITY_PARAMS.fast_loss_exit_penalty
-        reasons.append("fast_loss_exit_requires_review")
-    elif hold_minutes <= 0:
-        score -= _QUALITY_PARAMS.missing_hold_duration_penalty
-        reasons.append("missing_hold_duration")
-
-    if fee > 0 and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple:
-        score -= _QUALITY_PARAMS.fee_dominated_penalty
-        reasons.append("fee_dominated_trade")
+    if hold_minutes <= 0:
+        return _final_assessment(0.0, ["missing_hold_duration"], exclude=True)
 
     outcome = _safe_str(sample.get("outcome")).lower()
     if outcome not in {"profit", "loss", "flat", "win"}:
-        score -= _QUALITY_PARAMS.unknown_outcome_penalty
-        reasons.append("missing_or_unknown_outcome")
+        return _final_assessment(0.0, ["missing_or_unknown_outcome"], exclude=True)
 
     if pnl < 0:
         attribution = _trade_losing_exit_attribution(sample)
         if attribution == "okx_slippage_or_execution":
             return _final_assessment(0.0, ["execution_anomaly_trade"], exclude=True)
         if attribution == "unknown_requires_review":
-            if source == "okx_position_history":
-                score -= _QUALITY_PARAMS.unknown_outcome_penalty
-                reasons.append("unknown_losing_exit_attribution_downweighted")
-            else:
-                return _final_assessment(
-                    0.0, ["unknown_losing_exit_attribution"], exclude=True
-                )
+            return _final_assessment(
+                0.0, ["unknown_losing_exit_attribution"], exclude=True
+            )
 
     return _final_assessment(score, reasons, exclude=exclude)
 
@@ -549,20 +463,17 @@ def assess_sequence_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         return _final_assessment(0.0, guard_reasons, exclude=True)
 
     closes = sample.get("close_sequence") or []
-    if not isinstance(closes, list) or len(closes) < _QUALITY_PARAMS.min_sequence_length:
-        return _final_assessment(0.0, ["short_price_sequence"], exclude=True)
+    if not isinstance(closes, list) or not closes:
+        return _final_assessment(0.0, ["empty_price_sequence"], exclude=True)
     numeric_closes = [_safe_float(value, None) for value in closes]
     if any(value is None or value <= 0 for value in numeric_closes):
         return _final_assessment(0.0, ["invalid_price_sequence"], exclude=True)
     future_return = _safe_float(sample.get("future_return_pct"), None)
     if future_return is None:
         return _final_assessment(0.0, ["missing_future_return"], exclude=True)
-    if abs(future_return) > _QUALITY_PARAMS.abnormal_future_return_abs_pct:
-        return _final_assessment(0.05, ["abnormal_future_return"], exclude=True)
     timeframe = _safe_str(sample.get("timeframe"))
     if timeframe not in set(_QUALITY_PARAMS.allowed_sequence_timeframes):
-        score -= _QUALITY_PARAMS.unknown_timeframe_penalty
-        reasons.append("unknown_timeframe")
+        return _final_assessment(0.0, ["unknown_timeframe"], exclude=True)
     return _final_assessment(score, reasons)
 
 
@@ -571,18 +482,16 @@ def assess_text_sentiment_sample(sample: dict[str, Any]) -> SampleQualityAssessm
     guard_reasons = _sample_guard_reasons(sample, text)
     if guard_reasons:
         return _final_assessment(0.0, guard_reasons, exclude=True)
-    if len(text) < _QUALITY_PARAMS.min_text_length:
-        return _final_assessment(0.0, ["empty_or_too_short_text"], exclude=True)
+    if not text:
+        return _final_assessment(0.0, ["empty_text"], exclude=True)
     score = 1.0
     reasons: list[str] = []
     platform = _safe_str(sample.get("platform")).lower()
     if platform in {"", "unknown"}:
-        score -= _QUALITY_PARAMS.unknown_text_source_penalty
-        reasons.append("unknown_text_source")
+        return _final_assessment(0.0, ["unknown_text_source"], exclude=True)
     sentiment = _safe_float(sample.get("sentiment_score"), None)
     if sentiment is None:
-        score -= _QUALITY_PARAMS.missing_sentiment_penalty
-        reasons.append("missing_sentiment_score")
+        return _final_assessment(0.0, ["missing_sentiment_score"], exclude=True)
     return _final_assessment(score, reasons)
 
 
@@ -610,8 +519,8 @@ def _trade_shadow(sample: dict[str, Any]) -> dict[str, Any]:
     return _safe_dict(sample.get("shadow"))
 
 
-def _trade_plan(sample: dict[str, Any]) -> dict[str, Any]:
-    return _safe_dict(_trade_entry_raw(sample).get("profit_first_trade_plan"))
+def _trade_return_policy(sample: dict[str, Any]) -> dict[str, Any]:
+    return _safe_dict(_trade_entry_raw(sample).get("production_return_policy"))
 
 
 def _trade_sizing(sample: dict[str, Any]) -> dict[str, Any]:
@@ -686,7 +595,6 @@ def _trade_planned_leverage(sample: dict[str, Any]) -> float | None:
     return _first_float(
         sample.get("decision_suggested_leverage"),
         sample.get("suggested_leverage"),
-        _trade_plan(sample).get("leverage"),
     )
 
 
@@ -694,7 +602,7 @@ def _trade_position_size_pct(sample: dict[str, Any]) -> float | None:
     return _first_float(
         sample.get("position_size_pct"),
         _trade_sizing(sample).get("position_size_pct"),
-        _trade_plan(sample).get("position_size_pct"),
+        _trade_return_policy(sample).get("position_size_pct"),
     )
 
 
@@ -718,13 +626,13 @@ def _trade_profit_class(
 ) -> str:
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
     if pnl > 0:
-        if fee and pnl <= fee * 1.5:
+        if fee and pnl <= fee:
             return "micro_profit_after_cost"
         return "net_profit"
     if pnl < 0:
         if attribution == "position_too_small_fee_drag":
             return "cost_drag_loss"
-        if fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple:
+        if fee and abs(pnl) <= fee:
             return "cost_drag_loss"
         return "net_loss"
     return "flat"
@@ -736,38 +644,14 @@ def _trade_exit_timing_label(sample: dict[str, Any], *, attribution: str) -> str
     if attribution in {"exit_too_late", "capital_release_forced_loss"}:
         return "too_late"
     close_evidence = _trade_close_evidence(sample)
-    if _safe_float(sample.get("realized_pnl"), 0.0) > 0 and (
-        close_evidence.get("profit_protection")
-        or close_evidence.get("profit_retrace_protection")
-        or close_evidence.get("small_position_profit_lock")
+    dynamic_exit = _safe_dict(close_evidence.get("dynamic_exit_policy"))
+    if (
+        _safe_float(sample.get("realized_pnl"), 0.0) > 0
+        and dynamic_exit.get("eligible") is True
+        and (_safe_float(dynamic_exit.get("profit_retrace_ratio"), 0.0) or 0.0) > 0.0
     ):
         return "profit_locked"
     return "neutral_or_unknown"
-
-
-def _trade_size_efficiency_label(
-    sample: dict[str, Any],
-    *,
-    attribution: str,
-    actual_leverage: float | None,
-    planned_leverage: float | None,
-) -> str:
-    if attribution == "position_too_small_fee_drag":
-        return "too_small_fee_drag"
-    if (
-        planned_leverage is not None
-        and planned_leverage >= 2.0
-        and actual_leverage is not None
-        and actual_leverage <= max(1.0, planned_leverage * 0.6)
-    ):
-        return "underleveraged_vs_plan"
-    position_size_pct = _trade_position_size_pct(sample)
-    if position_size_pct is not None and position_size_pct <= 0.015:
-        return "tiny_size"
-    notional_usdt = _trade_notional_usdt(sample)
-    if notional_usdt is not None and notional_usdt < 15.0:
-        return "tiny_notional"
-    return "adequate_or_unknown"
 
 
 def _trade_payoff_label(
@@ -784,7 +668,7 @@ def _trade_payoff_label(
         return "loss_cut_fast"
     if pnl > 0 and exit_timing_label == "profit_locked":
         return "profit_locked"
-    if pnl > 0 and fee and pnl <= fee * 1.5:
+    if pnl > 0 and fee and pnl <= fee:
         return "micro_profit"
     return "normal_or_unknown"
 
@@ -799,11 +683,14 @@ def _trade_cost_basis_label(sample: dict[str, Any], *, fee: float | None) -> str
 
 
 def _trade_strategy_context(sample: dict[str, Any]) -> dict[str, Any]:
-    plan = _trade_plan(sample)
+    return_policy = _trade_return_policy(sample)
     return {
-        "decision_lane": _safe_str(plan.get("decision_lane")),
-        "exit_plan_id": _safe_str(plan.get("exit_plan_id")),
-        "strategy_profile_id": _safe_str(plan.get("strategy_profile_id")),
+        "return_policy_version": _safe_str(
+            _safe_dict(return_policy.get("policy_provenance")).get("strategy_version")
+        ),
+        "return_policy_source_count": int(
+            _safe_float(return_policy.get("production_source_count"), 0.0) or 0
+        ),
         "position_size_pct": _trade_position_size_pct(sample),
         "planned_leverage": _trade_planned_leverage(sample),
         "actual_leverage": _trade_actual_leverage(sample),
@@ -817,19 +704,12 @@ def _trade_profit_learning_labels(
     fee = _trade_fee(sample)
     funding_fee = _trade_funding_fee(sample)
     actual_leverage = _trade_actual_leverage(sample)
-    planned_leverage = _trade_planned_leverage(sample)
     attribution = _trade_losing_exit_attribution(sample)
     exit_timing_label = _trade_exit_timing_label(sample, attribution=attribution)
-    size_efficiency_label = _trade_size_efficiency_label(
-        sample,
-        attribution=attribution,
-        actual_leverage=actual_leverage,
-        planned_leverage=planned_leverage,
-    )
     trade_profit_class = _trade_profit_class(sample, fee=fee, attribution=attribution)
     cost_basis_label = _trade_cost_basis_label(sample, fee=fee)
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
-    fee_dominated = bool(fee and abs(pnl) <= fee * _QUALITY_PARAMS.fee_dominated_multiple)
+    fee_dominated = bool(fee and abs(pnl) <= fee)
     notional = _trade_notional_usdt(sample)
     net_return_after_cost_pct = _trade_return_after_cost_pct(
         sample,
@@ -883,7 +763,6 @@ def _trade_profit_learning_labels(
         "trade_profit_class": trade_profit_class,
         "losing_exit_attribution": attribution,
         "exit_timing_label": exit_timing_label,
-        "size_efficiency_label": size_efficiency_label,
         "payoff_profile_label": _trade_payoff_label(
             sample,
             attribution=attribution,
@@ -962,7 +841,6 @@ def _apply_profit_learning_aliases(
             "trade_profit_class",
             "losing_exit_attribution",
             "exit_timing_label",
-            "size_efficiency_label",
             "payoff_profile_label",
             "cost_basis_label",
         ):
@@ -1391,60 +1269,41 @@ def _finalize_shadow_model_row(row: dict[str, Any]) -> dict[str, Any]:
     hit_rate = float(row.get("direction_hit_count") or 0) / max(direction_count, 1)
     avg_realized = realized_sum / max(direction_count, 1)
     avg_expected = float(row.get("shadow_expected_return_sum") or 0.0) / max(expected_count, 1)
-    blockers: list[str] = []
-    if int(row.get("actual_inference_count") or 0) < MIN_PROMOTION_SHADOW_SAMPLES:
-        blockers.append("specialist_shadow_sample_floor_not_met")
-    if direction_count >= MIN_PROMOTION_SHADOW_SAMPLES and hit_rate < MIN_DIRECTION_HIT_RATE:
-        blockers.append("direction_hit_rate_below_floor")
-    if direction_count >= MIN_PROMOTION_SHADOW_SAMPLES and avg_realized < MIN_AVG_REALIZED_RETURN_PCT:
-        blockers.append("avg_realized_return_below_floor")
-    worst = row.get("worst_realized_return_pct")
-    if worst is not None and float(worst) <= MAX_FALSE_SIGNAL_LOSS_PCT:
-        blockers.append("false_signal_loss_exceeds_floor")
-    if int(row.get("sequence_too_short_count") or 0) > 0:
-        blockers.append("timeseries_sequence_too_short_for_promotion")
-    blocker_counts = dict(Counter(blockers))
+    realized_returns = [float(value) for value in row.get("realized_returns") or []]
+    tail_policy = empirical_policy_value(
+        "shadow_return_lower_hinge",
+        realized_returns,
+        selector="lower_hinge",
+        observation_window="completed_shadow_fee_after_returns",
+    )
     row["direction_hit_rate"] = round(hit_rate, 4)
     row["avg_shadow_expected_return_pct"] = round(avg_expected, 6)
     row["avg_expected_return_pct"] = round(avg_expected, 6)
     row["avg_realized_return_pct"] = round(avg_realized, 6)
     row["false_signal_count"] = int(row.get("false_signal_count") or 0)
-    row["tail_loss_count"] = int(row.get("tail_loss_count") or 0)
-    row["tail_loss_symbols"] = [
-        {"symbol": symbol, "count": count}
-        for symbol, count in row["tail_loss_symbols"].most_common(10)
-    ]
+    row["return_lower_hinge_pct"] = tail_policy.value
+    row["return_distribution_provenance"] = tail_policy.to_dict()
     row["worst_samples"] = list(row.get("worst_samples") or [])[:MAX_WORST_SAMPLE_COUNT]
-    row["sequence_too_short_count"] = int(row.get("sequence_too_short_count") or 0)
     row["legacy_mixed_shadow_count"] = int(row.get("legacy_mixed_shadow_count") or 0)
     row["legacy_quarantined_count"] = int(row.get("legacy_quarantined_count") or 0)
-    row["legacy_sequence_too_short_count"] = int(
-        row.get("legacy_sequence_too_short_count") or 0
-    )
-    row["promotion_ready"] = not bool(blockers)
-    row["promotion_blockers"] = blockers
-    row["blockers"] = blockers
-    row["blocked_reasons"] = blockers
-    row["blocked_reason_counts"] = blocker_counts
-    row["promotion_gate"] = {
-        "minimum_actual_inference_samples": MIN_PROMOTION_SHADOW_SAMPLES,
-        "minimum_direction_hit_rate": MIN_DIRECTION_HIT_RATE,
-        "minimum_avg_realized_return_pct": MIN_AVG_REALIZED_RETURN_PCT,
-        "max_false_signal_loss_pct": MAX_FALSE_SIGNAL_LOSS_PCT,
-        "minimum_timeseries_sequence_length": MIN_TIMESERIES_SEQUENCE_LENGTH,
+    row["observation_policy"] = {
+        "observation_only": True,
+        "promotion_authority": False,
+        "optimization_target": "fee_after_realized_return",
         "actual_inference_count": int(row.get("actual_inference_count") or 0),
         "direction_count": direction_count,
         "direction_hit_rate": round(hit_rate, 4),
         "avg_realized_return_pct": round(avg_realized, 6),
         "worst_realized_return_pct": row.get("worst_realized_return_pct"),
-        "tail_loss_count": row["tail_loss_count"],
-        "sequence_too_short_count": row["sequence_too_short_count"],
+        "return_lower_hinge_pct": tail_policy.value,
         "legacy_mixed_shadow_count": row["legacy_mixed_shadow_count"],
         "legacy_quarantined_count": row["legacy_quarantined_count"],
-        "legacy_sequence_too_short_count": row["legacy_sequence_too_short_count"],
     }
     row.pop("realized_return_sum_pct", None)
     row.pop("shadow_expected_return_sum", None)
+    row.pop("realized_returns", None)
+    row.pop("tail_loss_count", None)
+    row.pop("tail_loss_symbols", None)
     return row
 
 
@@ -1517,6 +1376,7 @@ def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                         "shadow_expected_return_sum": 0.0,
                         "shadow_expected_return_count": 0,
                         "realized_return_sum_pct": 0.0,
+                        "realized_returns": [],
                         "false_signal_count": 0,
                         "worst_realized_return_pct": None,
                         "best_realized_return_pct": None,
@@ -1524,10 +1384,8 @@ def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                         "tail_loss_symbols": Counter(),
                         "worst_samples": [],
                         "specialist_inference_count": 0,
-                        "sequence_too_short_count": 0,
                         "legacy_mixed_shadow_count": 0,
                         "legacy_quarantined_count": 0,
-                        "legacy_sequence_too_short_count": 0,
                     },
                 )
                 row["sample_count"] += 1
@@ -1537,13 +1395,7 @@ def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 if legacy_mixed_shadow:
                     row["legacy_mixed_shadow_count"] += 1
                 sequence_length = int(candidate.get("sequence_length") or 0)
-                sequence_too_short = (
-                    tool_name == "time_series_prediction"
-                    and sequence_length < MIN_TIMESERIES_SEQUENCE_LENGTH
-                )
-                if sequence_too_short:
-                    row["legacy_sequence_too_short_count"] += 1
-                if legacy_mixed_shadow or sequence_too_short:
+                if legacy_mixed_shadow:
                     row["legacy_quarantined_count"] += 1
                     continue
                 row["actual_inference_count"] += 1
@@ -1553,6 +1405,7 @@ def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                     if actual_return is not None:
                         row["direction_count"] += 1
                         row["realized_return_sum_pct"] += actual_return
+                        row["realized_returns"].append(actual_return)
                         if actual_side == direction:
                             row["direction_hit_count"] += 1
                         elif actual_return < 0:
@@ -1569,11 +1422,6 @@ def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                             if best is None
                             else round(max(float(best), actual_return), 6)
                         )
-                        symbol = _sample_symbol(sample)
-                        if actual_return <= MAX_FALSE_SIGNAL_LOSS_PCT:
-                            row["tail_loss_count"] += 1
-                            if symbol:
-                                row["tail_loss_symbols"][symbol] += 1
                         _remember_worst_shadow_sample(
                             row,
                             _compact_worst_shadow_sample(
@@ -1840,15 +1688,8 @@ def _contamination_risk(
 ) -> str:
     if not has_contamination:
         return "low"
-    if (
-        excluded_ratio >= HIGH_CONTAMINATION_EXCLUDED_RATIO
-        or blocked_reason_ratio >= HIGH_CONTAMINATION_BLOCKED_REASON_RATIO
-        or (effective_weight_ratio > 0 and effective_weight_ratio < 0.5)
-    ):
-        return "high"
-    if excluded_ratio >= MEDIUM_CONTAMINATION_EXCLUDED_RATIO or blocked_reason_ratio > 0:
-        return "medium"
-    return "low"
+    del excluded_ratio, blocked_reason_ratio, effective_weight_ratio
+    return "high"
 
 
 def annotate_training_payload(

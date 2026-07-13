@@ -181,7 +181,7 @@ def test_authoritative_loss_with_exact_entry_lineage_remains_supervision_ready()
     labels = trade["profit_learning_labels"]
     assert labels["training_supervision_ready"] is True
     assert labels["exit_attribution_supervision_ready"] is True
-    assert labels["losing_exit_attribution"] == "model_false_positive"
+    assert labels["losing_exit_attribution"] == "fee_after_return_forecast_error"
     assert labels["realized_net_pnl_usdt"] == -8.5
 
 

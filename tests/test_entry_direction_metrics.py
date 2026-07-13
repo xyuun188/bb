@@ -43,7 +43,7 @@ def test_selected_entry_metrics_uses_selected_side_for_normal_entry() -> None:
     assert metrics.loss_probability == 0.42
 
 
-def test_selected_entry_metrics_conserves_original_hold_probe_without_support() -> None:
+def test_selected_entry_metrics_ignore_deleted_probe_payload() -> None:
     metrics = selected_entry_metrics(
         _decision(
             {
@@ -73,15 +73,15 @@ def test_selected_entry_metrics_conserves_original_hold_probe_without_support() 
         )
     )
 
-    assert metrics.source == "entry_candidate_evidence:original_hold_probe_conservative"
-    assert metrics.expected_net_return_pct == 0.17
-    assert metrics.profit_quality_ratio == 0.22
-    assert metrics.server_profit_expected_return_pct == -0.3
-    assert metrics.loss_probability == 0.57
-    assert metrics.tail_risk_score == 0.44
+    assert metrics.source == "entry_candidate_evidence"
+    assert metrics.expected_net_return_pct == 1.08
+    assert metrics.profit_quality_ratio == 1.4
+    assert metrics.server_profit_expected_return_pct == 0.5
+    assert metrics.loss_probability == 0.41
+    assert metrics.tail_risk_score == 0.20
 
 
-def test_selected_entry_metrics_keeps_supported_original_hold_probe_side_metrics() -> None:
+def test_selected_entry_metrics_are_unchanged_by_legacy_probe_support_flags() -> None:
     metrics = selected_entry_metrics(
         _decision(
             {

@@ -32,7 +32,7 @@ from services.artifact_retirement_audit import ArtifactRetirementAuditService
 from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
-    build_profit_first_promotion_report,
+    build_return_objective_report,
     load_latest_paper_observation_report,
 )
 from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
@@ -151,13 +151,7 @@ def _training_payload_unavailable(error: Exception) -> dict[str, Any]:
     }
 
 
-async def _collect_training_payload(
-    *,
-    shadow_limit: int,
-    trade_limit: int,
-    sequence_limit: int,
-    text_limit: int,
-) -> dict[str, Any]:
+async def _collect_training_payload() -> dict[str, Any]:
     from scripts.train_local_ai_tools_models import (
         _completed_shadow_sample_count,
         _completed_trade_sample_count,
@@ -169,12 +163,12 @@ async def _collect_training_payload(
         _merge_trade_samples,
     )
 
-    shadow_samples = await _load_shadow_samples(shadow_limit)
-    trade_reflection_samples = await _load_trade_reflection_samples(trade_limit)
-    authoritative_samples = await _load_authoritative_trade_samples(trade_limit)
+    shadow_samples = await _load_shadow_samples()
+    trade_reflection_samples = await _load_trade_reflection_samples()
+    authoritative_samples = await _load_authoritative_trade_samples()
     trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
-    sequence_samples = await _load_sequence_samples(sequence_limit)
-    text_sentiment_samples = await _load_text_sentiment_samples(text_limit)
+    sequence_samples = await _load_sequence_samples()
+    text_sentiment_samples = await _load_text_sentiment_samples()
     payload = annotate_training_payload(
         shadow_samples=shadow_samples,
         trade_samples=trade_samples,
@@ -246,10 +240,6 @@ async def _runtime_probe_report(*, include_runtime_probe: bool) -> dict[str, Any
 
 async def collect_phase3_rebuild_preflight(
     *,
-    shadow_limit: int,
-    trade_limit: int,
-    sequence_limit: int,
-    text_limit: int,
     historical_audit_days: int = DEFAULT_HISTORICAL_AUDIT_DAYS,
     historical_audit_limit: int = DEFAULT_HISTORICAL_AUDIT_LIMIT,
     include_runtime_probe: bool = False,
@@ -260,12 +250,7 @@ async def collect_phase3_rebuild_preflight(
     started_at = datetime.now(UTC)
     collection_errors: dict[str, str] = {}
     try:
-        training = await _collect_training_payload(
-            shadow_limit=shadow_limit,
-            trade_limit=trade_limit,
-            sequence_limit=sequence_limit,
-            text_limit=text_limit,
-        )
+        training = await _collect_training_payload()
     except Exception as exc:
         training = _training_payload_unavailable(exc)
         collection_errors["training_payload"] = training["collection_error"]
@@ -277,7 +262,7 @@ async def collect_phase3_rebuild_preflight(
         "phase": "phase3_model_factory",
     }
     paper_observation_report = load_latest_paper_observation_report(root=ROOT)
-    profit_first_report = build_profit_first_promotion_report(
+    return_objective_report = build_return_objective_report(
         trade_samples=payload["trade_samples"],
         shadow_samples=payload["shadow_samples"],
     )
@@ -290,7 +275,7 @@ async def collect_phase3_rebuild_preflight(
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=training["completed_shadow_sample_count"],
         completed_trade_sample_count=training["completed_trade_sample_count"],
-        profit_first_report=profit_first_report,
+        return_objective_report=return_objective_report,
     )
     local_ai_tools = {
         "available": True,
@@ -304,7 +289,7 @@ async def collect_phase3_rebuild_preflight(
         "text_sentiment_sample_count": training["text_sentiment_sample_count"],
         "quality_report": payload["quality_report"],
         "governance_report": payload["governance_report"],
-        "profit_first_report": profit_first_report,
+        "return_objective_report": return_objective_report,
         "training_mode": "shadow",
         "model_stage": "shadow",
         "promotion_flow": "shadow_to_canary_to_live",
@@ -372,7 +357,7 @@ async def collect_phase3_rebuild_preflight(
         },
         "quality_report": payload["quality_report"],
         "governance_report": payload["governance_report"],
-        "profit_first_report": profit_first_report,
+        "return_objective_report": return_objective_report,
         "promotion_recommendation": promotion,
         "paper_observation_report": paper_observation_report,
         "historical_trade_fact_audit": historical_report,
@@ -392,26 +377,6 @@ async def collect_phase3_rebuild_preflight(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--shadow-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_shadow_sample_limit,
-    )
-    parser.add_argument(
-        "--trade-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_trade_sample_limit,
-    )
-    parser.add_argument(
-        "--sequence-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_sequence_sample_limit,
-    )
-    parser.add_argument(
-        "--text-limit",
-        type=int,
-        default=_LOCAL_ML_TRAINING_PARAMS.training_text_sample_limit,
-    )
     parser.add_argument("--historical-audit-days", type=int, default=DEFAULT_HISTORICAL_AUDIT_DAYS)
     parser.add_argument("--historical-audit-limit", type=int, default=DEFAULT_HISTORICAL_AUDIT_LIMIT)
     parser.add_argument("--include-runtime-probe", action="store_true")
@@ -441,10 +406,6 @@ def parse_args() -> argparse.Namespace:
 async def _main() -> int:
     args = parse_args()
     report = await collect_phase3_rebuild_preflight(
-        shadow_limit=args.shadow_limit,
-        trade_limit=args.trade_limit,
-        sequence_limit=args.sequence_limit,
-        text_limit=args.text_limit,
         historical_audit_days=args.historical_audit_days,
         historical_audit_limit=args.historical_audit_limit,
         include_runtime_probe=bool(args.include_runtime_probe),

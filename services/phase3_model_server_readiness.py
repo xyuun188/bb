@@ -28,10 +28,6 @@ VALIDATION_MANIFEST_PATH = "/data/BB/manifests/phase3_model_validation.json"
 SERVICE_MANIFEST_PATH = "/data/BB/manifests/phase3_model_service_manifest.json"
 PHASE3_MODEL_POLICY_ID = "phase3_quant_model_server_shadow_first_2026_06_27"
 EXPECTED_GPU_COUNT = 8
-OLD_TAKEOVER_CONTRACT_ID = "old_one_gpu_timesfm_takeover"
-OLD_TAKEOVER_EXPECTED_GPU_COUNT = 1
-OLD_TAKEOVER_QUANT_API_PORT = 8101
-OLD_TAKEOVER_QUANT_API_SERVICE = "bb-phase3-quant-api.service"
 FINQUANT_EXPERT_SLOT = "llm_expert_pool"
 FINQUANT_EXPERT_SERVED_MODEL_NAME = "BB-FinQuant-Expert-14B"
 
@@ -48,26 +44,6 @@ SHADOW_FIRST_LLM_SLOTS = (
     "llm_decision_maker",
     "llm_expert_pool",
     "llm_high_risk_review",
-)
-
-OLD_TAKEOVER_REQUIRED_ARTIFACT_SLOTS = (
-    "timeseries_primary",
-    "timeseries_challenger",
-    "sentiment_primary",
-)
-
-OLD_TAKEOVER_REQUIRED_SERVICES = (
-    "qwen3-14b-trade.service",
-    "deepseek-r1-14b-risk.service",
-    "bb-finquant-expert-gateway.service",
-    OLD_TAKEOVER_QUANT_API_SERVICE,
-)
-
-OLD_TAKEOVER_REQUIRED_ENDPOINTS = (
-    (8000, "qwen3-14b-trade"),
-    (8002, "deepseek-r1-14b-risk"),
-    (8003, FINQUANT_EXPERT_SERVED_MODEL_NAME),
-    (OLD_TAKEOVER_QUANT_API_PORT, ""),
 )
 
 LLM_ROLE_DIVERSITY_REQUIRED_PAIRS = (("llm_decision_maker", "llm_expert_pool"),)
@@ -93,7 +69,7 @@ LLM_SPECIALIZATION_KEYS = (
 )
 
 MODEL_RUNTIME_PORTS = tuple(range(8000, 8011))
-PROBED_RUNTIME_PORTS = tuple(dict.fromkeys((*MODEL_RUNTIME_PORTS, OLD_TAKEOVER_QUANT_API_PORT)))
+PROBED_RUNTIME_PORTS = MODEL_RUNTIME_PORTS
 
 RemoteProbe = Callable[[], dict[str, Any]]
 InfoLoader = Callable[[Path], Any]
@@ -269,11 +245,6 @@ def _finquant_specialization_evidence_verified(evidence: dict[str, str]) -> bool
         return False
     if "trl_dpo_return_preference" not in evidence.get("training_stages", ""):
         return False
-    try:
-        if float(evidence.get("preference_selection_accuracy") or 0.0) < 0.5:
-            return False
-    except (TypeError, ValueError):
-        return False
     required_text = (
         "adapter_version",
         "adapter_path",
@@ -286,7 +257,6 @@ def _finquant_specialization_evidence_verified(evidence: dict[str, str]) -> bool
         "objective_name",
         "objective_version",
         "preference_contract_version",
-        "preference_selection_accuracy",
         "training_stages",
     )
     if any(not evidence.get(key) for key in required_text):
@@ -509,119 +479,6 @@ def _endpoint_ready(service: dict[str, Any], active_endpoints: list[dict[str, An
     return False
 
 
-def _endpoint_model_ready(
-    port: int,
-    served_model_name: str,
-    active_endpoints: list[dict[str, Any]],
-) -> bool:
-    expected_model = str(served_model_name or "").strip().lower()
-    for endpoint in active_endpoints:
-        try:
-            endpoint_port = int(endpoint.get("port"))
-        except (TypeError, ValueError):
-            continue
-        if endpoint_port != port:
-            continue
-        if not bool(endpoint.get("ok")):
-            continue
-        response = str(endpoint.get("response") or "").lower()
-        return bool(not expected_model or expected_model in response)
-    return False
-
-
-def _endpoint_port_ready(port: int, active_endpoints: list[dict[str, Any]]) -> bool:
-    return _endpoint_model_ready(port, "", active_endpoints)
-
-
-def _service_fragment_active(fragment: str, active_services: list[str]) -> bool:
-    expected = str(fragment or "").strip().lower()
-    return bool(expected and any(expected in line.lower() for line in active_services))
-
-
-def _old_takeover_runtime_checks(
-    *,
-    active_services: list[str],
-    active_endpoints: list[dict[str, Any]],
-) -> dict[str, Any]:
-    service_checks = [
-        {
-            "service_name": service_name,
-            "active": _service_fragment_active(service_name, active_services),
-        }
-        for service_name in OLD_TAKEOVER_REQUIRED_SERVICES
-    ]
-    endpoint_checks = [
-        {
-            "port": port,
-            "served_model_name": served_model_name,
-            "ready": _endpoint_model_ready(port, served_model_name, active_endpoints),
-        }
-        for port, served_model_name in OLD_TAKEOVER_REQUIRED_ENDPOINTS
-    ]
-    return {
-        "contract_id": OLD_TAKEOVER_CONTRACT_ID,
-        "required_gpu_count": OLD_TAKEOVER_EXPECTED_GPU_COUNT,
-        "required_services": service_checks,
-        "required_endpoints": endpoint_checks,
-        "service_ready": all(bool(item.get("active")) for item in service_checks),
-        "endpoint_ready": all(bool(item.get("ready")) for item in endpoint_checks),
-    }
-
-
-def _old_takeover_artifact_signal(
-    download_by_slot: dict[str, dict[str, Any]],
-    validation_by_slot: dict[str, dict[str, Any]],
-) -> bool:
-    row = validation_by_slot.get("timeseries_primary") or download_by_slot.get(
-        "timeseries_primary",
-        {},
-    )
-    identity = _slot_artifact_identity(row)
-    return "timesfm" in identity
-
-
-def _looks_like_old_one_gpu_takeover(
-    *,
-    observed_gpu_count: int,
-    active_services: list[str],
-    active_endpoints: list[dict[str, Any]],
-    artifact_signal: bool,
-) -> bool:
-    old_gpu_shape = 0 < observed_gpu_count < EXPECTED_GPU_COUNT
-    if not old_gpu_shape:
-        return False
-    signals = 0
-    if artifact_signal:
-        signals += 1
-    if _service_fragment_active(
-        "qwen3-14b-trade.service", active_services
-    ) or _endpoint_model_ready(
-        8000,
-        "qwen3-14b-trade",
-        active_endpoints,
-    ):
-        signals += 1
-    if _service_fragment_active(
-        "deepseek-r1-14b-risk.service",
-        active_services,
-    ) or _endpoint_model_ready(8002, "deepseek-r1-14b-risk", active_endpoints):
-        signals += 1
-    if (
-        _service_fragment_active("bb-finquant-expert-gateway.service", active_services)
-        or _service_fragment_active("bb-finquant-expert-alias.service", active_services)
-        or _endpoint_model_ready(8003, FINQUANT_EXPERT_SERVED_MODEL_NAME, active_endpoints)
-    ):
-        signals += 2
-    if _service_fragment_active(
-        OLD_TAKEOVER_QUANT_API_SERVICE, active_services
-    ) or _endpoint_port_ready(
-        OLD_TAKEOVER_QUANT_API_PORT,
-        active_endpoints,
-    ):
-        signals += 1
-    return signals >= 3
-
-
 def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Evaluate model artifacts and runtime service readiness without mutation."""
 
@@ -646,31 +503,9 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
     ]
     validation_gpu_count = int(torch_info.get("device_count") or 0)
     observed_gpu_count = max(len(gpu_rows), validation_gpu_count)
-    old_takeover_contract = _looks_like_old_one_gpu_takeover(
-        observed_gpu_count=observed_gpu_count,
-        active_services=active_services,
-        active_endpoints=active_endpoints,
-        artifact_signal=_old_takeover_artifact_signal(download_by_slot, validation_by_slot),
-    )
-    expected_gpu_count = (
-        OLD_TAKEOVER_EXPECTED_GPU_COUNT if old_takeover_contract else EXPECTED_GPU_COUNT
-    )
-    required_artifact_slots = (
-        OLD_TAKEOVER_REQUIRED_ARTIFACT_SLOTS if old_takeover_contract else REQUIRED_ARTIFACT_SLOTS
-    )
-    reported_artifact_slots = (
-        tuple(dict.fromkeys((*required_artifact_slots, FINQUANT_EXPERT_SLOT)))
-        if old_takeover_contract
-        else required_artifact_slots
-    )
-    old_takeover_runtime = (
-        _old_takeover_runtime_checks(
-            active_services=active_services,
-            active_endpoints=active_endpoints,
-        )
-        if old_takeover_contract
-        else {}
-    )
+    expected_gpu_count = EXPECTED_GPU_COUNT
+    required_artifact_slots = REQUIRED_ARTIFACT_SLOTS
+    reported_artifact_slots = required_artifact_slots
 
     slot_reports: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
@@ -710,69 +545,29 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
 
     cuda_available = bool(torch_info.get("cuda_available"))
     tiny_cuda_ok = bool(torch_info.get("tiny_cuda_tensor_ok", cuda_available))
-    old_takeover_gpu_observed = bool(
-        old_takeover_contract and gpu_rows and observed_gpu_count >= OLD_TAKEOVER_EXPECTED_GPU_COUNT
-    )
     if validation_present and not cuda_available:
-        if old_takeover_gpu_observed:
-            warnings.append(
-                _warning(
-                    "old_takeover_cuda_validation_manifest_incomplete",
-                    (
-                        "Old one-GPU takeover is using live nvidia-smi/GPU process "
-                        "evidence because the lightweight validation manifest does "
-                        "not include torch CUDA fields."
-                    ),
-                    evidence={
-                        "torch": torch_info,
-                        "gpu_rows": gpu_rows[:4],
-                        "gpu_process_count": len(gpu_processes),
-                    },
-                )
+        blockers.append(
+            _blocker(
+                "cuda_unavailable",
+                "Torch validation says CUDA is unavailable on the model server.",
+                evidence=torch_info,
             )
-        else:
-            blockers.append(
-                _blocker(
-                    "cuda_unavailable",
-                    "Torch validation says CUDA is unavailable on the model server.",
-                    evidence=torch_info,
-                )
-            )
+        )
     if validation_present and not tiny_cuda_ok:
-        if old_takeover_gpu_observed:
-            warnings.append(
-                _warning(
-                    "old_takeover_cuda_tensor_probe_manifest_incomplete",
-                    (
-                        "Old one-GPU takeover is using live GPU service/process "
-                        "evidence because the lightweight validation manifest does "
-                        "not include the tiny CUDA tensor probe result."
-                    ),
-                    evidence={
-                        "torch": torch_info,
-                        "gpu_process_count": len(gpu_processes),
-                    },
-                )
+        blockers.append(
+            _blocker(
+                "cuda_tensor_probe_failed",
+                "Tiny CUDA tensor validation failed on the model server.",
+                evidence=torch_info.get("tiny_cuda_tensor_error") or torch_info,
             )
-        else:
-            blockers.append(
-                _blocker(
-                    "cuda_tensor_probe_failed",
-                    "Tiny CUDA tensor validation failed on the model server.",
-                    evidence=torch_info.get("tiny_cuda_tensor_error") or torch_info,
-                )
-            )
+        )
     if observed_gpu_count < expected_gpu_count:
         blockers.append(
             _blocker(
                 "gpu_count_below_phase3_plan",
                 ("Model-server GPU count is below the active deployment " "contract requirement."),
                 evidence={
-                    "deployment_contract": (
-                        OLD_TAKEOVER_CONTRACT_ID
-                        if old_takeover_contract
-                        else "phase3_full_model_server"
-                    ),
+                    "deployment_contract": "phase3_full_model_server",
                     "expected": expected_gpu_count,
                     "observed": observed_gpu_count,
                 },
@@ -888,32 +683,16 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
                 )
             )
     if not service_present:
-        if old_takeover_contract:
-            warnings.append(
-                _warning(
-                    "old_takeover_service_manifest_not_required",
-                    (
-                        "Old one-GPU takeover uses live legacy Qwen/DeepSeek, "
-                        "BB-FinQuant verified adapter gateway and Phase 3 quant API checks "
-                        "instead of the full new-server service manifest."
-                    ),
-                    evidence={
-                        "deployment_contract": OLD_TAKEOVER_CONTRACT_ID,
-                        "service_manifest_path": SERVICE_MANIFEST_PATH,
-                    },
-                )
+        warnings.append(
+            _warning(
+                "model_service_manifest_missing",
+                (
+                    "Model service manifest is missing; runtime services "
+                    "cannot be promoted from an audited contract."
+                ),
+                evidence=SERVICE_MANIFEST_PATH,
             )
-        else:
-            warnings.append(
-                _warning(
-                    "model_service_manifest_missing",
-                    (
-                        "Model service manifest is missing; runtime services "
-                        "cannot be promoted from an audited contract."
-                    ),
-                    evidence=SERVICE_MANIFEST_PATH,
-                )
-            )
+        )
     elif not manifest_services:
         blockers.append(
             _blocker(
@@ -954,48 +733,9 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
     if service_present and manifest_services:
         blockers.extend(_finquant_service_manifest_blockers(manifest_service_reports))
     slot_reports_by_slot = _merge_slot_service_identity(slot_reports, manifest_service_reports)
-    if old_takeover_contract:
-        old_missing_services = [
-            item
-            for item in _safe_list(old_takeover_runtime.get("required_services"))
-            if not bool(_safe_dict(item).get("active"))
-        ]
-        old_missing_endpoints = [
-            item
-            for item in _safe_list(old_takeover_runtime.get("required_endpoints"))
-            if not bool(_safe_dict(item).get("ready"))
-        ]
-        if old_missing_services:
-            warnings.append(
-                _warning(
-                    "old_takeover_required_services_not_active",
-                    "Some required old-server takeover services are not active.",
-                    evidence=old_missing_services,
-                )
-            )
-        if old_missing_endpoints:
-            warnings.append(
-                _warning(
-                    "old_takeover_required_endpoints_not_ready",
-                    "Some required old-server takeover endpoints are not ready.",
-                    evidence=old_missing_endpoints,
-                )
-            )
-        warnings.append(
-            _warning(
-                "old_model_server_takeover_active",
-                (
-                    "Temporary old one-GPU model-server takeover is active; keep "
-                    "the full Phase 3 model-server contract for switching back "
-                    "when the new server is repaired."
-                ),
-                evidence=old_takeover_runtime,
-            )
-        )
-    else:
-        blockers.extend(_llm_policy_candidate_blockers(policy, slot_reports_by_slot))
-        blockers.extend(_llm_role_diversity_blockers(slot_reports_by_slot))
-        warnings.extend(_finquant_specialization_warnings(slot_reports_by_slot))
+    blockers.extend(_llm_policy_candidate_blockers(policy, slot_reports_by_slot))
+    blockers.extend(_llm_role_diversity_blockers(slot_reports_by_slot))
+    warnings.extend(_finquant_specialization_warnings(slot_reports_by_slot))
     if not active_endpoints:
         warnings.append(
             _warning(
@@ -1019,15 +759,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         and manifest_service_reports
         and all(bool(item.get("ready")) for item in manifest_service_reports)
     )
-    old_takeover_runtime_ready = bool(
-        old_takeover_contract
-        and old_takeover_runtime.get("service_ready")
-        and old_takeover_runtime.get("endpoint_ready")
-        and observed_gpu_count >= expected_gpu_count
-    )
-    runtime_ready = bool(
-        old_takeover_runtime_ready if old_takeover_contract else full_runtime_ready
-    )
+    runtime_ready = full_runtime_ready
     service_go_live_blocked = bool(blockers or not runtime_ready)
     status = (
         "blocked" if blockers else ("ready" if runtime_ready else "artifact_ready_service_pending")
@@ -1046,11 +778,8 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         "phase3_model_service_go_live_blocked": service_go_live_blocked,
         "policy_id": PHASE3_MODEL_POLICY_ID,
         "phase3_root": PHASE3_ROOT,
-        "deployment_contract": (
-            OLD_TAKEOVER_CONTRACT_ID if old_takeover_contract else "phase3_full_model_server"
-        ),
+        "deployment_contract": "phase3_full_model_server",
         "expected_gpu_count": expected_gpu_count,
-        "old_takeover_runtime": old_takeover_runtime,
         "download_manifest_path": DOWNLOAD_MANIFEST_PATH,
         "validation_manifest_path": VALIDATION_MANIFEST_PATH,
         "service_manifest_path": SERVICE_MANIFEST_PATH,
