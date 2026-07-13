@@ -759,14 +759,27 @@ def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:
     style = (PROJECT_ROOT / "web_dashboard/static/css/strategy_learning.css").read_text(
         encoding="utf-8"
     )
+    dashboard_style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(
+        encoding="utf-8"
+    )
 
     assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));" in style
     assert "grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));" in style
     assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 142px), 1fr));" in style
     assert ".strategy-learning-profile-chips span" in style
+    assert ".strategy-learning-event-list" in style
+    assert ".strategy-learning-empty" in style
+    assert "#page-strategy-learning .analysis-section-subtitle" in style
+    assert ".strategy-learning-guard-state span," in style
     assert "text-overflow: clip;" in style
     assert "overflow-wrap: anywhere;" in style
     assert "white-space: normal;" in style
+    assert "/* Strategy learning console */" not in dashboard_style
+    assert ".strategy-learning-profile-list {" not in dashboard_style
+    assert ".strategy-learning-event-list {" not in dashboard_style
+    assert "strategy_learning.css?v=20260713-mobile-evidence-wrap" in (
+        PROJECT_ROOT / "web_dashboard/static/index.html"
+    ).read_text(encoding="utf-8")
     assert (
         "text-overflow: ellipsis;"
         not in style[

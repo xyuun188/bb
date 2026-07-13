@@ -8,17 +8,6 @@
     overflow: hidden;
 }
 
-#page-strategy-learning .card-header::before {
-    content: "";
-    position: absolute;
-    inset: -80px auto auto 22%;
-    width: 360px;
-    height: 180px;
-    border-radius: 999px;
-    background: radial-gradient(circle, rgba(6,182,212,0.20), transparent 66%);
-    pointer-events: none;
-}
-
 .strategy-learning-title-block {
     display: grid;
     gap: 4px;
@@ -28,7 +17,7 @@
 }
 
 .strategy-learning-title-block .card-title {
-    letter-spacing: -0.02em;
+    letter-spacing: 0;
 }
 
 #page-strategy-learning .opening-funnel-controls {
@@ -458,16 +447,26 @@
 }
 
 .strategy-learning-panel .opening-funnel-list,
-.strategy-learning-profile-list {
+.strategy-learning-profile-list,
+.strategy-learning-event-list {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    min-width: 0;
+    max-width: 100%;
     margin-top: 8px;
 }
 
 .strategy-learning-empty {
     display: flex;
+    min-width: 0;
+    max-width: 100%;
     min-height: 44px;
     align-items: center;
     color: var(--text-muted);
     font-size: 12px;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .strategy-learning-issue-list,
@@ -890,6 +889,13 @@
     min-width: 0;
 }
 
+.strategy-learning-profile-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 142px), 1fr));
+    gap: 8px;
+    min-width: 0;
+}
+
 .strategy-learning-profile-card {
     display: grid;
     gap: 11px;
@@ -1063,8 +1069,10 @@
 }
 
 .strategy-learning-guard-state strong {
+    min-width: 0;
     color: var(--text);
     font-size: 13px;
+    overflow-wrap: anywhere;
 }
 
 .strategy-learning-guard-state span {
@@ -1260,6 +1268,22 @@
         justify-content: flex-start;
     }
 
+    #page-strategy-learning .analysis-section-head {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+    }
+
+    #page-strategy-learning .analysis-section-title,
+    #page-strategy-learning .analysis-section-subtitle {
+        min-width: 0;
+        max-width: 100%;
+        text-align: left;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+
     .strategy-learning-body {
         padding: 10px;
     }
@@ -1365,5 +1389,19 @@
 
     .strategy-learning-profile-card-stats .strategy-learning-profile-stat:nth-child(4) {
         grid-column: auto;
+    }
+
+    .strategy-learning-guard-state {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .strategy-learning-guard-state span,
+    .strategy-learning-guard-state em {
+        grid-column: 1;
+        grid-row: auto;
+        justify-self: start;
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
     }
 }
