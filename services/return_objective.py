@@ -15,10 +15,10 @@ from typing import Any
 import numpy as np
 
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
-RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
-RETURN_LABEL_NAME = "net_return_after_cost_pct"
-RETURN_LABEL_VERSION = "2026-07-12.v1"
-COST_MODEL_VERSION = "okx_fee_slippage_funding_v1"
+RETURN_OBJECTIVE_VERSION = "2026-07-14.separated-supervision.v2"
+RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
+RETURN_LABEL_VERSION = "2026-07-14.separated-supervision.v2"
+COST_MODEL_VERSION = "okx_live_cost_and_authoritative_slippage_distribution_v2"
 
 
 def safe_float(value: Any, default: float | None = 0.0) -> float | None:

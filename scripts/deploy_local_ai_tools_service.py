@@ -90,10 +90,15 @@ FEATURE_KEYS = [
 ]
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
-RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
-RETURN_LABEL_NAME = "net_return_after_cost_pct"
-RETURN_LABEL_VERSION = "2026-07-12.v1"
-COST_MODEL_VERSION = "okx_fee_slippage_funding_v1"
+RETURN_OBJECTIVE_VERSION = "2026-07-14.separated-supervision.v2"
+RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
+RETURN_LABEL_VERSION = "2026-07-14.separated-supervision.v2"
+COST_MODEL_VERSION = "okx_live_cost_and_authoritative_slippage_distribution_v2"
+PROFIT_SUPERVISION_VERSION = "2026-07-14.separated-profit-supervision.v1"
+MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
+EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
+AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
+COMPACT_SEQUENCE_SERIES_FORMAT = "compact_native_kline_series.v1"
 TIMESERIES_MODEL_INPUT_ROWS = int(
     os.environ.get("LOCAL_AI_TOOLS_TIMESERIES_MODEL_INPUT_ROWS", "30")
 )
@@ -134,6 +139,10 @@ _STATUS_METADATA_KEYS = (
     "trained_at",
     "source",
     "shadow_sample_count",
+    "train_shadow_sample_count",
+    "holdout_shadow_sample_count",
+    "train_decision_group_count",
+    "holdout_decision_group_count",
     "completed_shadow_sample_count",
     "last_trained_completed_shadow_sample_count",
     "trade_sample_count",
@@ -147,8 +156,14 @@ _STATUS_METADATA_KEYS = (
     "feature_count",
     "horizons",
     "profile_count",
-    "round_trip_cost_pct",
-    "tail_loss_threshold_pct",
+    "objective_name",
+    "objective_version",
+    "label_name",
+    "label_version",
+    "cost_model_version",
+    "training_cost_policy",
+    "profit_supervision_version",
+    "profit_supervision_report",
     "quality_report",
     "governance_report",
     "return_objective_report",
@@ -248,6 +263,7 @@ class TrainRequest(BaseModel):
     quality_report: dict[str, Any] = {}
     governance_report: dict[str, Any] = {}
     return_objective_report: dict[str, Any] = {}
+    profit_supervision_report: dict[str, Any] = {}
     training_mode: str = "shadow"
     model_stage: str = "shadow"
     evaluation_policy: dict[str, Any] = {}
@@ -486,8 +502,18 @@ def load_bundle() -> dict[str, Any] | None:
             metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
             or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
             or metadata.get("label_version") != RETURN_LABEL_VERSION
+            or metadata.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION
+            or not all(
+                key in candidate
+                for key in (
+                    "long_return_model",
+                    "short_return_model",
+                    "long_cost_model",
+                    "short_cost_model",
+                )
+            )
         ):
-            raise ValueError("legacy local quant artifact objective rejected")
+            raise ValueError("local quant artifact separated supervision rejected")
         _BUNDLE_CACHE = candidate
         _BUNDLE_MTIME = mtime
         return _BUNDLE_CACHE
@@ -588,6 +614,7 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
             "expected": expected,
             "median": expected,
             "lower_bound": expected,
+            "upper_bound": expected,
             "std": 0.0,
             "spread": 0.0,
             "sample_count": 0,
@@ -601,6 +628,7 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
             "expected": expected,
             "median": expected,
             "lower_bound": expected,
+            "upper_bound": expected,
             "std": 0.0,
             "spread": 0.0,
             "sample_count": 0,
@@ -618,10 +646,26 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
         "expected": expected,
         "median": float(np.median(values)),
         "lower_bound": float(np.median(ordered[:lower_tail_count])),
+        "upper_bound": float(np.median(ordered[-lower_tail_count:])),
         "std": float(np.std(values)),
         "spread": spread,
         "sample_count": int(values.size),
         "distribution_ready": spread > numerical_resolution,
+    }
+
+
+def execution_cost_distribution_contract(
+    distribution: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose one stable counterfactual-cost contract to return composition."""
+
+    return {
+        "expected_pct": distribution.get("expected"),
+        "upper_tail_pct": distribution.get("upper_bound"),
+        "uncertainty_pct": distribution.get("std"),
+        "distribution_member_count": distribution.get("sample_count"),
+        "distribution_ready": distribution.get("distribution_ready") is True,
+        "source_authority": "shadow_counterfactual_live_microstructure",
     }
 
 
@@ -636,58 +680,116 @@ def symbol_key(symbol: str | None) -> str:
     return value
 
 
+def _weighted_empirical_distribution(values: list[tuple[Any, Any]]) -> dict[str, Any]:
+    pairs = []
+    for raw_value, raw_weight in values:
+        value = f({"value": raw_value}, "value", float("nan"))
+        weight = max(f({"weight": raw_weight}, "weight", 0.0), 0.0)
+        if math.isfinite(value) and weight > 0:
+            pairs.append((value, weight))
+    if not pairs:
+        return {
+            "count": 0,
+            "effective_sample_size": 0.0,
+            "expected": None,
+            "median": None,
+            "lower_hinge": None,
+            "upper_hinge": None,
+        }
+    pairs.sort(key=lambda item: item[0])
+    total = sum(weight for _value, weight in pairs)
+    square_total = sum(weight * weight for _value, weight in pairs)
+
+    def quantile(fraction: float) -> float:
+        target = total * fraction
+        cumulative = 0.0
+        for value, weight in pairs:
+            cumulative += weight
+            if cumulative >= target:
+                return value
+        return pairs[-1][0]
+
+    return {
+        "count": len(pairs),
+        "effective_sample_size": total * total / square_total if square_total > 0 else 0.0,
+        "expected": sum(value * weight for value, weight in pairs) / total,
+        "median": quantile(0.5),
+        "lower_hinge": quantile(0.25),
+        "upper_hinge": quantile(0.75),
+    }
+
+
 def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
-    profile: dict[str, Any] = {}
+    buckets: dict[str, list[dict[str, Any]]] = {}
     for row in trade_samples:
         if bool(row.get("exclude_from_training")):
             continue
+        supervision = row.get("profit_supervision") or {}
+        if supervision.get("version") != PROFIT_SUPERVISION_VERSION:
+            continue
+        tasks = supervision.get("tasks") or {}
+        realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
+        if realized.get("eligible") is not True:
+            continue
         symbol = symbol_key(row.get("symbol"))
-        side = str(row.get("side") or "").lower()
+        side = str(realized.get("side") or row.get("side") or "").lower()
         if not symbol or side not in {"long", "short"}:
             continue
-        key = f"{symbol}|{side}"
-        bucket = profile.setdefault(key, {
-            "symbol": symbol,
+        for key in (f"{symbol}|{side}", f"*|{side}"):
+            buckets.setdefault(key, []).append(row)
+
+    profiles: dict[str, Any] = {}
+    for key, rows in buckets.items():
+        side = key.rsplit("|", 1)[-1]
+
+        def task_pairs(task_name: str, field: str) -> list[tuple[Any, Any]]:
+            pairs = []
+            for row in rows:
+                tasks = (row.get("profit_supervision") or {}).get("tasks") or {}
+                task = tasks.get(task_name) or {}
+                if task.get("eligible") is True:
+                    pairs.append((task.get(field), row.get("sample_weight", 1.0)))
+            return pairs
+
+        profiles[key] = {
+            "source_authority": "okx_position_history",
+            "symbol": key.rsplit("|", 1)[0],
             "side": side,
-            "count": 0,
-            "wins": 0,
-            "losses": 0,
-            "pnl": 0.0,
-            "profit": 0.0,
-            "loss": 0.0,
-            "largest_profit": 0.0,
-            "largest_loss": 0.0,
-            "avg_hold_minutes": 0.0,
-        })
-        pnl = f(row, "realized_pnl")
-        hold = f(row, "hold_minutes")
-        bucket["count"] += 1
-        bucket["pnl"] += pnl
-        bucket["avg_hold_minutes"] += hold
-        if pnl >= 0:
-            bucket["wins"] += 1
-            bucket["profit"] += pnl
-            bucket["largest_profit"] = max(bucket["largest_profit"], pnl)
-        else:
-            bucket["losses"] += 1
-            bucket["loss"] += abs(pnl)
-            bucket["largest_loss"] = max(bucket["largest_loss"], abs(pnl))
-    for bucket in profile.values():
-        count = max(int(bucket.get("count") or 0), 1)
-        bucket["avg_pnl"] = bucket["pnl"] / count
-        bucket["avg_hold_minutes"] = bucket["avg_hold_minutes"] / count
-        bucket["win_rate"] = bucket["wins"] / count
-        bucket["profit_factor"] = bucket["profit"] / max(bucket["loss"], 1e-9)
-        bucket["avg_profit"] = bucket["profit"] / max(bucket["wins"], 1)
-        bucket["avg_loss"] = bucket["loss"] / max(bucket["losses"], 1)
-        bucket["payoff_ratio"] = bucket["avg_profit"] / max(bucket["avg_loss"], 1e-9)
-        bucket["small_win_big_loss_risk"] = clamp(
-            (bucket["avg_loss"] - bucket["avg_profit"]) / max(bucket["avg_loss"] + bucket["avg_profit"], 1e-9),
-            0.0,
-            1.0,
-        )
-        bucket["loss_pressure"] = clamp((bucket["loss"] - bucket["profit"]) / max(bucket["loss"] + bucket["profit"], 1e-9), 0.0, 1.0)
-    return profile
+            "net_return_after_cost_pct": _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "realized_net_return_pct")
+            ),
+            "execution_cost_pct": _weighted_empirical_distribution(
+                task_pairs(EXECUTION_COST_TASK, "total_cost_pct")
+            ),
+            "slippage_pct": _weighted_empirical_distribution(
+                task_pairs(EXECUTION_COST_TASK, "slippage_pct")
+            ),
+            "stop_loss_slippage_pct": _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "stop_loss_slippage_pct")
+            ),
+            "hold_minutes": _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "hold_minutes")
+            ),
+        }
+    return profiles
+
+
+def _profile_for_side(
+    profiles: dict[str, Any],
+    *,
+    symbol: str,
+    side: str,
+) -> dict[str, Any]:
+    exact = f"{symbol_key(symbol)}|{side}"
+    global_key = f"*|{side}"
+    if exact in profiles:
+        return {**(profiles.get(exact) or {}), "profile_source": "symbol_side"}
+    if global_key in profiles:
+        return {**(profiles.get(global_key) or {}), "profile_source": "global_side"}
+    return {
+        "profile_source": "missing",
+        "fallback_reason": "authoritative_trade_calibration_missing",
+    }
 
 
 def side_scores(features: dict[str, Any]) -> tuple[float, float]:
@@ -728,6 +830,74 @@ def _safe_sequence(values: Any, limit: int = 80) -> list[float]:
         except Exception:
             continue
     return out
+
+
+def _compact_sequence_series(
+    sample: dict[str, Any],
+) -> tuple[list[float], list[float]] | None:
+    if sample.get("sequence_format") != COMPACT_SEQUENCE_SERIES_FORMAT:
+        return None
+    closes = sample.get("close_sequence")
+    volumes = sample.get("volume_sequence")
+    if not isinstance(closes, list) or not isinstance(volumes, list):
+        return None
+    if len(closes) != len(volumes):
+        return None
+    parsed_closes: list[float] = []
+    parsed_volumes: list[float] = []
+    for raw_close, raw_volume in zip(closes, volumes):
+        try:
+            close = float(raw_close)
+            volume = float(raw_volume)
+        except Exception:
+            return None
+        if not math.isfinite(close) or close <= 0:
+            return None
+        if not math.isfinite(volume) or volume < 0:
+            return None
+        parsed_closes.append(close)
+        parsed_volumes.append(volume)
+    expected_count = max(len(parsed_closes) - 31, 0)
+    if int(f(sample, "observation_count", -1.0)) != expected_count:
+        return None
+    if str(sample.get("label_name") or "") != "gross_market_move_pct":
+        return None
+    if not str(sample.get("label_version") or "").strip():
+        return None
+    return parsed_closes, parsed_volumes
+
+
+def _iter_sequence_training_windows(
+    samples: list[dict[str, Any]],
+):
+    """Expand compact native series lazily on the model server."""
+
+    for sample in samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        compact = _compact_sequence_series(sample)
+        if sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
+            if compact is None:
+                continue
+        else:
+            yield sample
+            continue
+        closes, volumes = compact
+        for idx in range(30, len(closes) - 1):
+            start = max(0, idx - 59)
+            current_close = closes[start : idx + 1]
+            current_volume = volumes[start : idx + 1]
+            current_price = current_close[-1]
+            future_return = (closes[idx + 1] - current_price) / current_price * 100.0
+            yield {
+                "symbol": sample.get("symbol"),
+                "timeframe": sample.get("timeframe"),
+                "close_sequence": current_close,
+                "volume_sequence": current_volume,
+                "future_return_pct": future_return,
+                "long_return_pct": future_return,
+                "short_return_pct": -future_return,
+            }
 
 
 def sequence_features(close_sequence: Any, volume_sequence: Any | None = None) -> list[float]:
@@ -791,9 +961,7 @@ def sequence_deep_features(close_sequence: Any, volume_sequence: Any | None = No
 
 def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
     rows = []
-    for sample in samples or []:
-        if bool(sample.get("exclude_from_training")):
-            continue
+    for sample in _iter_sequence_training_windows(samples):
         x = sequence_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         future_move = f(sample, "future_return_pct")
         long_return = f(sample, "long_return_pct", future_move)
@@ -826,9 +994,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         return {"available": False, "reason": f"torch_unavailable: {safe_error(exc, 120)}"}
 
     rows = []
-    for sample in samples or []:
-        if bool(sample.get("exclude_from_training")):
-            continue
+    for sample in _iter_sequence_training_windows(samples):
         x = sequence_deep_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         future_move = f(sample, "future_return_pct")
         long_return = f(sample, "long_return_pct", future_move)
@@ -1713,6 +1879,7 @@ def with_model_metadata(
             "artifact_persisted",
             "model_stage",
             "training_mode",
+            "profit_supervision_version",
         ):
             if key in metadata:
                 payload.setdefault(key, metadata.get(key))
@@ -1722,7 +1889,11 @@ def with_model_metadata(
             and payload.get("label_name") == RETURN_LABEL_NAME
             and payload.get("label_version") == RETURN_LABEL_VERSION
             and payload.get("training_cost_policy")
-            == "per_sample_live_spread_fee_and_funding_complete"
+            == "separated_market_opportunity_and_execution_cost_tasks"
+            and payload.get("profit_supervision_version")
+            == PROFIT_SUPERVISION_VERSION
+            and payload.get("return_semantics")
+            == "gross_market_opportunity_before_execution"
             and payload.get("artifact_persisted") is True
         )
         prediction_quality = payload.get("prediction_quality")
@@ -2240,6 +2411,7 @@ def health() -> dict[str, Any]:
     payload.setdefault("quality_report", {})
     payload.setdefault("governance_report", {})
     payload.setdefault("return_objective_report", {})
+    payload.setdefault("profit_supervision_report", {})
     payload.update(_phase3_inventory_status())
     payload["specialist_model_chains"] = {
         "timeseries": _specialist_model_chain("timeseries"),
@@ -2278,70 +2450,118 @@ def train(req: TrainRequest) -> dict[str, Any]:
             continue
         features = sample.get("features") or {}
         horizon = int(sample.get("horizon_minutes") or features.get("horizon_minutes") or 10)
-        raw_long_return = f(sample, "long_return_pct")
-        raw_short_return = f(sample, "short_return_pct")
         if not features:
             continue
-        cost_complete = cost_complete_net_returns(
-            sample,
-            features,
-            horizon_minutes=horizon,
-            long_gross_return_pct=raw_long_return,
-            short_gross_return_pct=raw_short_return,
-        )
-        if cost_complete is None:
+        supervision = sample.get("profit_supervision") or {}
+        if supervision.get("version") != PROFIT_SUPERVISION_VERSION:
             continue
-        long_return, short_return, execution_cost = cost_complete
+        tasks = supervision.get("tasks") or {}
+        market_task = tasks.get(MARKET_OPPORTUNITY_TASK) or {}
+        cost_task = tasks.get(EXECUTION_COST_TASK) or {}
+        if market_task.get("eligible") is not True or cost_task.get("eligible") is not True:
+            continue
+        long_return = f(
+            market_task,
+            "long_gross_market_return_pct",
+            float("nan"),
+        )
+        short_return = f(
+            market_task,
+            "short_gross_market_return_pct",
+            float("nan"),
+        )
+        long_cost = f(cost_task, "long_total_cost_pct", float("nan"))
+        short_cost = f(cost_task, "short_total_cost_pct", float("nan"))
+        if not all(
+            math.isfinite(value)
+            for value in (long_return, short_return, long_cost, short_cost)
+        ):
+            continue
+        correlation = sample.get("correlation_weight") or {}
         rows.append({
             "x": model_x(features, horizon_minutes=horizon),
             "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
             "horizon": horizon,
-            "raw_long_return": raw_long_return,
-            "raw_short_return": raw_short_return,
+            "decision_group": str(
+                correlation.get("correlation_group")
+                or f"shadow_decision:{sample.get('decision_id') or sample.get('id')}"
+            ),
+            "raw_long_return": long_return,
+            "raw_short_return": short_return,
             "long_return": long_return,
             "short_return": short_return,
+            "long_execution_cost": long_cost,
+            "short_execution_cost": short_cost,
             "best_side": "long" if long_return >= short_return else "short",
-            "execution_cost": execution_cost,
+            "execution_cost": cost_task,
             "features": features,
-            "sample_weight": max(0.0, min(f(sample, "sample_weight", 1.0), 1.0)),
+            "sample_weight": max(0.0, f(sample, "sample_weight", 1.0)),
         })
     if len(rows) <= 1:
         return {
             "trained": False,
-            "reason": "cost_complete_training_distribution_unavailable",
+            "reason": "separated_supervision_distribution_unavailable",
             "shadow_sample_count": len(rows),
-            "message": "Need non-empty train and holdout distributions from cost-complete samples.",
+            "message": "Need market-opportunity and execution-cost tasks from separate decision groups.",
+        }
+
+    ordered_groups = list(dict.fromkeys(str(row["decision_group"]) for row in rows))
+    if len(ordered_groups) <= 1:
+        return {
+            "trained": False,
+            "reason": "decision_group_holdout_unavailable",
+            "shadow_sample_count": len(rows),
+            "decision_group_count": len(ordered_groups),
+        }
+    split = len(ordered_groups) // 2
+    train_groups = set(ordered_groups[:split])
+    holdout_groups = set(ordered_groups[split:])
+    train_rows = [row for row in rows if str(row["decision_group"]) in train_groups]
+    holdout_rows = [row for row in rows if str(row["decision_group"]) in holdout_groups]
+    if not train_rows or not holdout_rows or train_groups & holdout_groups:
+        return {
+            "trained": False,
+            "reason": "decision_group_holdout_unavailable",
+            "shadow_sample_count": len(rows),
         }
 
     long_tail_boundary = empirical_lower_hinge(
-        [row["long_return"] for row in rows if row["long_return"] < 0]
+        [row["long_return"] for row in train_rows if row["long_return"] < 0]
     )
     short_tail_boundary = empirical_lower_hinge(
-        [row["short_return"] for row in rows if row["short_return"] < 0]
+        [row["short_return"] for row in train_rows if row["short_return"] < 0]
     )
     for row in rows:
         row["lossy_long"] = int(row["long_return"] < long_tail_boundary)
         row["lossy_short"] = int(row["short_return"] < short_tail_boundary)
 
-    X = [r["x"] for r in rows]
-    long_y = [r["long_return"] for r in rows]
-    short_y = [r["short_return"] for r in rows]
-    long_loss_y = [r["lossy_long"] for r in rows]
-    short_loss_y = [r["lossy_short"] for r in rows]
-    sample_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in rows]
+    X = [r["x"] for r in train_rows]
+    long_y = [r["long_return"] for r in train_rows]
+    short_y = [r["short_return"] for r in train_rows]
+    long_cost_y = [r["long_execution_cost"] for r in train_rows]
+    short_cost_y = [r["short_execution_cost"] for r in train_rows]
+    long_loss_y = [r["lossy_long"] for r in train_rows]
+    short_loss_y = [r["lossy_short"] for r in train_rows]
+    sample_weights = [
+        max(0.0, float(r.get("sample_weight") or 0.0)) for r in train_rows
+    ]
 
-    long_return_model = _make_regressor(len(rows))
-    short_return_model = _make_regressor(len(rows))
+    long_return_model = _make_regressor(len(train_rows))
+    short_return_model = _make_regressor(len(train_rows))
+    long_cost_model = _make_regressor(len(train_rows))
+    short_cost_model = _make_regressor(len(train_rows))
     long_loss_model = _make_classifier(long_loss_y)
     short_loss_model = _make_classifier(short_loss_y)
     long_return_model.fit(X, long_y, model__sample_weight=sample_weights)
     short_return_model.fit(X, short_y, model__sample_weight=sample_weights)
+    long_cost_model.fit(X, long_cost_y, model__sample_weight=sample_weights)
+    short_cost_model.fit(X, short_cost_y, model__sample_weight=sample_weights)
     long_loss_model.fit(X, long_loss_y, model__sample_weight=sample_weights)
     short_loss_model.fit(X, short_loss_y, model__sample_weight=sample_weights)
 
     horizon_models: dict[int, dict[str, Any]] = {}
-    for horizon in sorted({int(r["horizon"]) for r in rows}):
-        h_rows = [r for r in rows if int(r["horizon"]) == horizon]
+    for horizon in sorted({int(r["horizon"]) for r in train_rows}):
+        h_rows = [r for r in train_rows if int(r["horizon"]) == horizon]
         hX = [r["x"] for r in h_rows]
         long_horizon_y = [r["long_return"] for r in h_rows]
         short_horizon_y = [r["short_return"] for r in h_rows]
@@ -2361,7 +2581,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
 
     sentiment_model = None
     sentiment_samples = []
-    for row in rows:
+    for row in train_rows:
         features = row["features"]
         sentiment_samples.append(
             (
@@ -2425,6 +2645,9 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 "long_return_pct": sample.get("long_return_pct"),
                 "short_return_pct": sample.get("short_return_pct"),
                 "label_timestamp": sample.get("label_timestamp"),
+                "profit_supervision_fingerprint": (
+                    sample.get("profit_supervision") or {}
+                ).get("contract_fingerprint"),
             }
             for sample in (req.shadow_samples or [])
             if not bool(sample.get("exclude_from_training"))
@@ -2435,16 +2658,27 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 "position_id": sample.get("position_id"),
                 "realized_pnl": sample.get("realized_pnl"),
                 "net_return_after_cost_pct": sample.get("net_return_after_cost_pct"),
+                "profit_supervision_fingerprint": (
+                    sample.get("profit_supervision") or {}
+                ).get("contract_fingerprint"),
             }
             for sample in trainable_trade_samples
         ],
         "sequence": [
             {
                 "symbol": sample.get("symbol"),
+                "timeframe": sample.get("timeframe"),
+                "sequence_format": sample.get("sequence_format"),
+                "observation_count": sample.get("observation_count"),
+                "first_open_time": sample.get("first_open_time"),
+                "last_open_time": sample.get("last_open_time"),
                 "feature_timestamp": sample.get("feature_timestamp"),
                 "label_timestamp": sample.get("label_timestamp"),
                 "long_return_pct": sample.get("long_return_pct"),
                 "short_return_pct": sample.get("short_return_pct"),
+                "training_sample_fingerprint": (
+                    sample.get("training_sample_contract") or {}
+                ).get("sample_fingerprint"),
             }
             for sample in (req.sequence_samples or [])
             if not bool(sample.get("exclude_from_training"))
@@ -2474,6 +2708,10 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "source": req.source,
         "shadow_sample_count": len(rows),
+        "train_shadow_sample_count": len(train_rows),
+        "holdout_shadow_sample_count": len(holdout_rows),
+        "train_decision_group_count": len(train_groups),
+        "holdout_decision_group_count": len(holdout_groups),
         "completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows)),
         "last_trained_completed_shadow_sample_count": int(
             req.completed_shadow_sample_count or len(rows)
@@ -2493,7 +2731,9 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "feature_count": len(FEATURE_KEYS),
         "horizons": sorted(horizon_models),
         "profile_count": len(profiles),
-        "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "profit_supervision_report": req.profit_supervision_report or {},
         "tail_loss_policy": {
             "long": {"source": "cost_complete_training_negative_return_lower_hinge", "value": long_tail_boundary},
             "short": {"source": "cost_complete_training_negative_return_lower_hinge", "value": short_tail_boundary},
@@ -2505,7 +2745,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "cost_model_version": COST_MODEL_VERSION,
         "training_data_sha256": training_data_sha256,
         "source_code_sha256": source_code_sha256,
-        "time_split_policy": "chronological_features_before_labels",
+        "time_split_policy": "chronological_disjoint_decision_groups",
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
         "return_objective_report": req.return_objective_report or {},
@@ -2520,11 +2760,13 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild),
         "promotion_recommendation": req.promotion_recommendation or {},
         "training_objective": (
-            "Directly predict side-specific fee-after net return and tail loss; "
-            "classification metrics are diagnostics only."
+            "Predict shadow market opportunity and counterfactual execution cost as "
+            "separate tasks; calibrate realized net return and slippage only from "
+            "authoritative OKX lifecycles."
         ),
         "models": {
-            "profit": "ExtraTreesRegressor long/short expected return",
+            "profit": "ExtraTreesRegressor long/short gross market opportunity",
+            "execution_cost": "ExtraTreesRegressor long/short counterfactual execution cost",
             "loss_filter": "ExtraTreesClassifier side-specific loss probability",
             "timeseries": "Per-horizon long/short ExtraTreesRegressor return distributions",
             "deep_timeseries": (
@@ -2547,6 +2789,8 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "feature_keys": FEATURE_KEYS,
         "long_return_model": long_return_model,
         "short_return_model": short_return_model,
+        "long_cost_model": long_cost_model,
+        "short_cost_model": short_cost_model,
         "long_loss_model": long_loss_model,
         "short_loss_model": short_loss_model,
         "horizon_models": horizon_models,
@@ -2582,20 +2826,33 @@ def train(req: TrainRequest) -> dict[str, Any]:
 def profit_predict(req: FeatureRequest) -> dict[str, Any]:
     features = req.features or {}
     bundle = load_bundle()
-    profile_key_long = f"{symbol_key(req.symbol or features.get('symbol'))}|long"
-    profile_key_short = f"{symbol_key(req.symbol or features.get('symbol'))}|short"
     if bundle:
         try:
             x = [model_x(features)]
             long_distribution = regression_prediction_distribution(bundle["long_return_model"], x)
             short_distribution = regression_prediction_distribution(bundle["short_return_model"], x)
+            long_cost_distribution = regression_prediction_distribution(
+                bundle["long_cost_model"], x
+            )
+            short_cost_distribution = regression_prediction_distribution(
+                bundle["short_cost_model"], x
+            )
             long_expected = float(long_distribution["expected"])
             short_expected = float(short_distribution["expected"])
             long_loss_prob = predict_proba_positive(bundle["long_loss_model"], x)
             short_loss_prob = predict_proba_positive(bundle["short_loss_model"], x)
             profiles = bundle.get("profiles") or {}
-            long_profile = profiles.get(profile_key_long, {})
-            short_profile = profiles.get(profile_key_short, {})
+            profile_symbol = req.symbol or features.get("symbol") or ""
+            long_profile = _profile_for_side(
+                profiles,
+                symbol=profile_symbol,
+                side="long",
+            )
+            short_profile = _profile_for_side(
+                profiles,
+                symbol=profile_symbol,
+                side="short",
+            )
             long_lower_bound = float(long_distribution["lower_bound"])
             short_lower_bound = float(short_distribution["lower_bound"])
             best_side = "long" if long_expected >= short_expected else "short"
@@ -2606,12 +2863,19 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 long_lower_bound if best_side == "long" else short_lower_bound
             )
             quality = best_lower_bound
+            actual_calibration_ready = all(
+                int((profile.get("net_return_after_cost_pct") or {}).get("count") or 0) > 0
+                and int((profile.get("slippage_pct") or {}).get("count") or 0) > 0
+                for profile in (long_profile, short_profile)
+            )
             return _attach_baseline_only_shadow("profit_prediction", {
                 "available": True,
                 "trained": True,
                 "model": "local-profit-trained-v2",
                 "symbol": req.symbol,
                 "best_side": best_side,
+                "long_market_expected_return_pct": round(long_expected, 4),
+                "short_market_expected_return_pct": round(short_expected, 4),
                 "long_expected_return_pct": round(long_expected, 4),
                 "short_expected_return_pct": round(short_expected, 4),
                 "adjusted_long_return_pct": round(long_expected, 4),
@@ -2623,6 +2887,22 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "adjusted_expected_return_pct": round(best_expected, 4),
                 "profit_edge_pct": round(edge, 4),
                 "profit_quality_score": round(quality, 4),
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "counterfactual_execution_cost_distribution": {
+                    "long": execution_cost_distribution_contract(
+                        long_cost_distribution
+                    ),
+                    "short": execution_cost_distribution_contract(
+                        short_cost_distribution
+                    ),
+                    "source_authority": "shadow_counterfactual_live_microstructure",
+                },
+                "actual_trade_calibration": {
+                    "long": long_profile,
+                    "short": short_profile,
+                    "source_authority": "okx_position_history",
+                },
                 "long_loss_probability": round(long_loss_prob, 4),
                 "short_loss_probability": round(short_loss_prob, 4),
                 "loss_probability": round(loss_prob, 4),
@@ -2630,6 +2910,9 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "production_eligible": bool(
                         long_distribution["distribution_ready"]
                         and short_distribution["distribution_ready"]
+                        and long_cost_distribution["distribution_ready"]
+                        and short_cost_distribution["distribution_ready"]
+                        and actual_calibration_ready
                         and all(
                             math.isfinite(value)
                             for value in (
@@ -2643,6 +2926,9 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "anomalous": not bool(
                         long_distribution["distribution_ready"]
                         and short_distribution["distribution_ready"]
+                        and long_cost_distribution["distribution_ready"]
+                        and short_cost_distribution["distribution_ready"]
+                        and actual_calibration_ready
                         and all(
                             math.isfinite(value)
                             for value in (
@@ -2654,9 +2940,12 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                         )
                     ),
                     "reason": (
-                        "current_tree_prediction_distribution_ready"
+                        "separated_market_cost_and_actual_calibration_ready"
                         if long_distribution["distribution_ready"]
                         and short_distribution["distribution_ready"]
+                        and long_cost_distribution["distribution_ready"]
+                        and short_cost_distribution["distribution_ready"]
+                        and actual_calibration_ready
                         else (
                             "current_tree_prediction_distribution_degenerate"
                             if long_distribution["sample_count"] > 0
@@ -2672,7 +2961,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "long": long_profile,
                     "short": short_profile,
                 },
-                "note": "Trained fee-after-return distribution is authoritative; loss probability, profiles, and win rate are diagnostics only.",
+                "note": "Shadow models predict gross market opportunity and counterfactual cost separately; only OKX lifecycles calibrate realized return and slippage.",
             }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
         except Exception as exc:
             fallback_error = safe_error(exc)
@@ -2721,16 +3010,41 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     if bundle:
         predictions = []
         try:
+            profiles = bundle.get("profiles") or {}
+            profile_symbol = req.symbol or features.get("symbol") or ""
+            actual_calibration = {
+                "long": _profile_for_side(
+                    profiles,
+                    symbol=profile_symbol,
+                    side="long",
+                ),
+                "short": _profile_for_side(
+                    profiles,
+                    symbol=profile_symbol,
+                    side="short",
+                ),
+                "source_authority": "okx_position_history",
+            }
             for horizon, item in (bundle.get("horizon_models") or {}).items():
                 x = [model_x(features, horizon_minutes=int(horizon))]
                 long_distribution = regression_prediction_distribution(item["long_model"], x)
                 short_distribution = regression_prediction_distribution(item["short_model"], x)
+                long_cost_distribution = regression_prediction_distribution(
+                    bundle["long_cost_model"],
+                    x,
+                )
+                short_cost_distribution = regression_prediction_distribution(
+                    bundle["short_cost_model"],
+                    x,
+                )
                 long_return = float(long_distribution["expected"])
                 short_return = float(short_distribution["expected"])
                 best_side = "long" if long_return >= short_return else "short"
                 best_return = long_return if best_side == "long" else short_return
                 predictions.append({
                     "horizon_minutes": int(horizon),
+                    "long_market_expected_return_pct": round(long_return, 4),
+                    "short_market_expected_return_pct": round(short_return, 4),
                     "long_expected_return_pct": round(long_return, 4),
                     "short_expected_return_pct": round(short_return, 4),
                     "long_lower_bound_return_pct": round(
@@ -2749,11 +3063,24 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                         long_distribution["distribution_ready"]
                         and short_distribution["distribution_ready"]
                     ),
+                    "counterfactual_execution_cost_distribution": {
+                        "long": execution_cost_distribution_contract(
+                            long_cost_distribution
+                        ),
+                        "short": execution_cost_distribution_contract(
+                            short_cost_distribution
+                        ),
+                        "source_authority": (
+                            "shadow_counterfactual_live_microstructure"
+                        ),
+                    },
+                    "actual_trade_calibration": actual_calibration,
                     "best_side": best_side,
                     "expected_return_pct": round(best_return, 4),
                     "expected_move_pct": round(best_return, 4),
                     "direction": "up" if best_side == "long" else "down",
                     "samples": int(item.get("samples") or 0),
+                    "return_semantics": "gross_market_opportunity_before_execution",
                 })
             if predictions:
                 primary = max(
@@ -2769,6 +3096,29 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     - float(primary["short_expected_return_pct"])
                 )
                 confidence = clamp(edge / 0.8, 0.0, 1.0)
+                primary_cost_distribution = primary[
+                    "counterfactual_execution_cost_distribution"
+                ]
+                actual_calibration_ready = all(
+                    int(
+                        (profile.get("net_return_after_cost_pct") or {}).get("count")
+                        or 0
+                    )
+                    > 0
+                    and int((profile.get("slippage_pct") or {}).get("count") or 0)
+                    > 0
+                    for profile in (
+                        actual_calibration["long"],
+                        actual_calibration["short"],
+                    )
+                )
+                cost_distribution_ready = all(
+                    (primary_cost_distribution.get(side) or {}).get(
+                        "distribution_ready"
+                    )
+                    is True
+                    for side in ("long", "short")
+                )
                 payload = with_model_metadata("time_series_prediction", {
                     "available": True,
                     "trained": True,
@@ -2780,6 +3130,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "direction": primary["direction"],
                     "expected_move_pct": primary["expected_move_pct"],
                     "expected_return_pct": primary["expected_return_pct"],
+                    "market_expected_return_pct": primary["expected_return_pct"],
                     "long_expected_return_pct": primary["long_expected_return_pct"],
                     "short_expected_return_pct": primary["short_expected_return_pct"],
                     "long_lower_bound_return_pct": primary[
@@ -2790,16 +3141,30 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     ],
                     "horizon_minutes": primary["horizon_minutes"],
                     "profit_edge_pct": round(edge, 4),
+                    "return_semantics": "gross_market_opportunity_before_execution",
+                    "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                    "counterfactual_execution_cost_distribution": (
+                        primary_cost_distribution
+                    ),
+                    "actual_trade_calibration": actual_calibration,
                     "confidence": round(confidence, 4),
                     "predictions": predictions,
                     "prediction_quality": {
                         "production_eligible": primary[
                             "prediction_distribution_ready"
-                        ],
-                        "anomalous": not primary["prediction_distribution_ready"],
+                        ]
+                        and cost_distribution_ready
+                        and actual_calibration_ready,
+                        "anomalous": not (
+                            primary["prediction_distribution_ready"]
+                            and cost_distribution_ready
+                            and actual_calibration_ready
+                        ),
                         "reason": (
-                            "current_tree_prediction_distribution_ready"
+                            "separated_market_cost_and_actual_calibration_ready"
                             if primary["prediction_distribution_ready"]
+                            and cost_distribution_ready
+                            and actual_calibration_ready
                             else (
                                 "current_tree_prediction_distribution_degenerate"
                                 if primary["prediction_sample_count"] > 0

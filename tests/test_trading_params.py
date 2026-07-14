@@ -27,7 +27,7 @@ def test_training_data_quality_uses_the_current_snapshot() -> None:
     assert training_data_quality._QUALITY_PARAMS == DEFAULT_TRADING_PARAMS.training_data_quality
     assert (
         training_data_quality.DATA_QUALITY_VERSION
-        == "2026-07-14.immutable-shadow-label.v3"
+        == "2026-07-14.separated-profit-supervision.v4"
     )
 
 

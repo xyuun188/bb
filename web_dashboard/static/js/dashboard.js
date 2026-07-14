@@ -4141,6 +4141,13 @@ function mlSampleCounts() {
     const ml = state.mlSignalStatus || {};
     const local = state.localAIToolsStatus || {};
     const autoLast = ml.auto_train_last_result || {};
+    const mlSupervision = ml.profit_supervision_report || {};
+    const localSupervision = local.profit_supervision_report || {};
+    const supervisionCount = (report, key) => {
+        if (!Object.prototype.hasOwnProperty.call(report, key)) return null;
+        const value = Number(report[key]);
+        return Number.isFinite(value) ? value : null;
+    };
     const trainingMl = Number(ml.phase3_clean_trainable_shadow_sample_count || 0);
     const completedMl = Number(
         ml.phase3_clean_completed_shadow_sample_count
@@ -4165,12 +4172,12 @@ function mlSampleCounts() {
         || local.completed_trade_sample_count
         || trainingLocalTrade
     );
-    const defaultTrainingWindow = 20000;
-    const limit = Number(
-        ml.training_shadow_sample_limit
-        || local.training_shadow_sample_limit
-        || defaultTrainingWindow
+    const configuredLimit = Number(
+        ml.training_shadow_sample_limit || local.training_shadow_sample_limit
     );
+    const limit = Number.isFinite(configuredLimit) && configuredLimit > 0
+        ? configuredLimit
+        : null;
     const newCount = Number(
         ml.phase3_new_shadow_sample_count
         || local.phase3_new_shadow_sample_count
@@ -4183,9 +4190,34 @@ function mlSampleCounts() {
         completedLocal,
         trainingLocalTrade,
         completedLocalTrade,
+        mlShadowMarket: supervisionCount(mlSupervision, 'shadow_market_sample_count'),
+        mlShadowCost: supervisionCount(
+            mlSupervision,
+            'shadow_counterfactual_cost_sample_count'
+        ),
+        mlActualReturn: supervisionCount(
+            mlSupervision,
+            'actual_realized_return_sample_count'
+        ),
+        localShadowMarket: supervisionCount(
+            localSupervision,
+            'shadow_market_sample_count'
+        ),
+        localShadowCost: supervisionCount(
+            localSupervision,
+            'shadow_counterfactual_cost_sample_count'
+        ),
+        localActualReturn: supervisionCount(
+            localSupervision,
+            'actual_realized_return_sample_count'
+        ),
         limit,
         newCount,
     };
+}
+
+function mlSampleCountLabel(value) {
+    return Number.isFinite(value) ? String(value) : '缺失 / 未评估';
 }
 
 function mlWinBar(label, value, tone = 'muted') {
@@ -4211,15 +4243,15 @@ function renderMLSignalMetrics() {
 
     container.innerHTML = `
         <div class="ml-metrics-grid">
-            ${mlMetricCard('做多费后收益下界', signedPctValueLabel(metrics.top_long_return_lcb_pct), '置信下界必须大于 0 才能进入 ready', Number(metrics.top_long_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('做空费后收益下界', signedPctValueLabel(metrics.top_short_return_lcb_pct), '置信下界必须大于 0 才能进入 ready', Number(metrics.top_short_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('做多 Profit Factor', Number(metrics.top_long_profit_factor || 0).toFixed(2), '必须大于 1，且结合回撤和尾部损失验收', Number(metrics.top_long_profit_factor || 0) > 1 ? 'good' : 'warn')}
-            ${mlMetricCard('做空 Profit Factor', Number(metrics.top_short_profit_factor || 0).toFixed(2), '必须大于 1，且结合回撤和尾部损失验收', Number(metrics.top_short_profit_factor || 0) > 1 ? 'good' : 'warn')}
+            ${mlMetricCard('做多影子市场收益下界', signedPctValueLabel(metrics.top_long_return_lcb_pct), '毛市场机会诊断；生产端仍需独立扣除成本和实际滑点尾部', Number(metrics.top_long_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
+            ${mlMetricCard('做空影子市场收益下界', signedPctValueLabel(metrics.top_short_return_lcb_pct), '毛市场机会诊断；生产端仍需独立扣除成本和实际滑点尾部', Number(metrics.top_short_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
+            ${mlMetricCard('做多影子市场 Profit Factor', Number(metrics.top_long_profit_factor || 0).toFixed(2), '仅评估影子市场机会分层，不等于实际成交 Profit Factor', Number(metrics.top_long_profit_factor || 0) > 1 ? 'good' : 'warn')}
+            ${mlMetricCard('做空影子市场 Profit Factor', Number(metrics.top_short_profit_factor || 0).toFixed(2), '仅评估影子市场机会分层，不等于实际成交 Profit Factor', Number(metrics.top_short_profit_factor || 0) > 1 ? 'good' : 'warn')}
         </div>
         <div class="ml-panel">
-            <div class="ml-panel-title">分层收益质量</div>
-            ${mlMetricCard('做多高分组平均收益', signedPctValueLabel(metrics.top_long_avg_return_pct), '收益越高越说明模型能筛出赚钱机会', Number(metrics.top_long_avg_return_pct || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('做空高分组平均收益', signedPctValueLabel(metrics.top_short_avg_return_pct), '收益越高越说明模型能筛出赚钱机会', Number(metrics.top_short_avg_return_pct || 0) > 0 ? 'good' : 'warn')}
+            <div class="ml-panel-title">影子市场机会分层质量</div>
+            ${mlMetricCard('做多高分组毛市场收益', signedPctValueLabel(metrics.top_long_avg_return_pct), '成本和实际滑点在生产组合层单独处理', Number(metrics.top_long_avg_return_pct || 0) > 0 ? 'good' : 'warn')}
+            ${mlMetricCard('做空高分组毛市场收益', signedPctValueLabel(metrics.top_short_avg_return_pct), '成本和实际滑点在生产组合层单独处理', Number(metrics.top_short_avg_return_pct || 0) > 0 ? 'good' : 'warn')}
             ${mlWinBar('做多高分组胜率', metrics.top_long_win_rate, mlSignalToneByRate(metrics.top_long_win_rate))}
             ${mlWinBar('做多低分组胜率', metrics.bottom_long_win_rate, 'muted')}
             ${mlWinBar('做空高分组胜率', metrics.top_short_win_rate, mlSignalToneByRate(metrics.top_short_win_rate))}
@@ -9077,7 +9109,7 @@ function renderMLSignalOverview() {
 
     if (updatedEl) {
         updatedEl.textContent = ready
-            ? `三期完成 ${samples.completedMl} 条，训练窗口 ${samples.trainingMl} 条 · ${influenceEnabled ? '已介入' : '学习中'}`
+            ? `影子市场 ${mlSampleCountLabel(samples.mlShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.mlShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.mlActualReturn)} 条 · ${influenceEnabled ? '已介入' : '学习中'}`
             : `模型不可用 · ${unavailableReason}`;
     }
 
@@ -9085,35 +9117,37 @@ function renderMLSignalOverview() {
         <div class="ml-flow">
             <div class="ml-flow-step">
                 <div class="ml-flow-index">1</div>
-                <div><strong>三期影子复盘样本</strong><span>${samples.completedMl} 条三期 completed 样本，旧数据不参与训练</span></div>
+                <div><strong>影子市场机会样本</strong><span>${mlSampleCountLabel(samples.mlShadowMarket)} 条，只监督同 horizon 的行情方向和幅度</span></div>
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">2</div>
-                <div><strong>本次训练使用样本</strong><span>${samples.trainingMl} 条三期样本；窗口上限 ${samples.limit} 条</span></div>
+                <div><strong>影子反事实成本样本</strong><span>${mlSampleCountLabel(samples.mlShadowCost)} 条，只监督当时可执行成本和滑点</span></div>
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">3</div>
-                <div><strong>训练目标</strong><span>直接最大化费后预期收益，并惩罚不确定性、尾部损失和成本；胜率只做诊断</span></div>
+                <div><strong>OKX 实际费后收益样本</strong><span>${mlSampleCountLabel(samples.mlActualReturn)} 条，唯一监督真实成交收益与滑点尾部</span></div>
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">4</div>
-                <div><strong>${influenceEnabled ? '参与开仓过滤' : '学习观察中'}</strong><span>${influenceEnabled ? '负预期机会会降权或拦截，高质量机会会加分' : '指标未达标时继续训练，不强行影响交易'}</span></div>
+                <div><strong>${influenceEnabled ? '参与开仓过滤' : '学习观察中'}</strong><span>${influenceEnabled ? '生产端组合毛市场收益、实时成本与 OKX 实际滑点尾部' : '任一监督分布不完整时不影响生产交易'}</span></div>
             </div>
         </div>
         <div class="ml-overview-grid">
             ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
             ${mlMetricCard('Readiness', readinessDisplayState, readinessReasonText, readinessTone)}
             ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
-            ${mlMetricCard('三期完成样本', String(samples.completedMl), '只统计三期干净影子复盘', samples.completedMl > samples.trainingMl ? 'good' : 'muted')}
-            ${mlMetricCard('训练窗口样本', String(samples.trainingMl), `训练 ${Number(status.train_count || 0)} / 测试 ${Number(status.test_count || 0)}；窗口上限 ${samples.limit}`, 'good')}
+            ${mlMetricCard('影子市场机会样本', mlSampleCountLabel(samples.mlShadowMarket), '不代表实际成交或真实费后收益', Number.isFinite(samples.mlShadowMarket) ? 'good' : 'warn')}
+            ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
+            ${mlMetricCard('OKX 实际费后收益样本', mlSampleCountLabel(samples.mlActualReturn), '只统计可信已平仓生命周期', Number.isFinite(samples.mlActualReturn) ? 'good' : 'warn')}
+            ${mlMetricCard('训练/留出分组', `${Number(status.train_decision_group_count || 0)} / ${Number(status.test_decision_group_count || 0)}`, '同一 decision 不得跨训练和留出集', 'good')}
             ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, readinessTone)}
             ${mlMetricCard('PR-AUC 多/空（诊断）', prAucText, '仅观察分类器，不参与 ready、评分或晋升', 'muted')}
-            ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', samples.newCount >= Number(status.auto_train_min_new_samples || 500) ? 'good' : 'muted')}
+            ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', 'muted')}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
             ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近记录里预期收益为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
             ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || '-', `要求 ${readinessMetrics.required_training_data_version || '-'}`, readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
-            ${mlMetricCard('显示说明', `${samples.limit} 是窗口`, '页面只显示三期干净训练窗口，旧样本不再展示为训练来源', 'warn')}
+            ${mlMetricCard('训练窗口配置', samples.limit === null ? '未公开' : String(samples.limit), '这是训练数据窗口，不是收益、仓位或生产准入阈值', 'muted')}
         </div>`;
 }
 
@@ -9132,7 +9166,7 @@ function renderLocalAIToolsStatus() {
     const childTotalCount = Object.keys(childEndpoints).length;
     if (updatedEl) {
         updatedEl.textContent = serviceAvailable
-            ? `三期完成 ${samples.completedLocal} 条影子 / ${samples.completedLocalTrade} 条交易；训练窗口 ${samples.trainingLocal} / ${samples.trainingLocalTrade} 条；子接口 ${childAvailableCount}/${childTotalCount || 4}`
+            ? `影子市场 ${mlSampleCountLabel(samples.localShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.localShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.localActualReturn)} 条 · 子接口 ${childAvailableCount}/${childTotalCount || 4}`
             : '服务不可用';
     }
 
@@ -9150,22 +9184,22 @@ function renderLocalAIToolsStatus() {
             tone: childAvailableCount >= Math.max(childTotalCount, 1) ? 'good' : (childAvailableCount > 0 ? 'warn' : 'bad'),
         },
         {
-            label: '三期影子复盘样本',
-            value: String(samples.completedLocal),
-            subtitle: '只统计三期干净窗口，旧数据不参与训练',
-            tone: samples.completedLocal > 0 ? 'good' : 'warn',
+            label: '影子市场机会样本',
+            value: mlSampleCountLabel(samples.localShadowMarket),
+            subtitle: '只监督行情方向和幅度，不冒充实际收益',
+            tone: Number.isFinite(samples.localShadowMarket) ? 'good' : 'warn',
         },
         {
-            label: '本次训练使用样本',
-            value: String(samples.trainingLocal),
-            subtitle: `只取最新窗口训练，上限 ${Number(status.training_shadow_sample_limit || samples.limit)} 条`,
-            tone: samples.trainingLocal > 0 ? 'good' : 'warn',
+            label: '影子反事实成本样本',
+            value: mlSampleCountLabel(samples.localShadowCost),
+            subtitle: '独立学习费用、资金费和盘口滑点分布',
+            tone: Number.isFinite(samples.localShadowCost) ? 'good' : 'warn',
         },
         {
-            label: '交易/平仓样本',
-            value: `${samples.trainingLocalTrade} / ${samples.completedLocalTrade}`,
-            subtitle: '三期训练窗口 / 三期完成去重样本；已按仓位去重，手动平仓不参与训练',
-            tone: samples.completedLocalTrade > 0 ? 'good' : 'warn',
+            label: 'OKX 实际费后收益样本',
+            value: mlSampleCountLabel(samples.localActualReturn),
+            subtitle: '只来自可信已平仓生命周期，并用于实际收益与滑点校准',
+            tone: Number.isFinite(samples.localActualReturn) ? 'good' : 'warn',
         },
         {
             label: '序列样本',
@@ -9188,7 +9222,7 @@ function renderLocalAIToolsStatus() {
         <div class="ml-purpose-grid">
             <div class="ml-purpose-card ml-purpose-good">
                 <div class="ml-purpose-title">盈利预测</div>
-                <div class="ml-purpose-desc">判断扣除成本后的预期收益是不是值得开仓。</div>
+                <div class="ml-purpose-desc">先预测毛市场机会，再由生产组合层独立扣除实时成本和实际滑点尾部。</div>
                 <div class="ml-purpose-tech">${escHtml(models.profit || 'ExtraTrees / CatBoost-style')}</div>
             </div>
             <div class="ml-purpose-card ml-purpose-warn">

@@ -1,4 +1,4 @@
-"""Observation of long-vs-short returns from production-governed models only."""
+"""Observation of long-vs-short gross market opportunity from governed models."""
 
 from __future__ import annotations
 
@@ -45,10 +45,10 @@ def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
 
 @dataclass(frozen=True, slots=True)
 class EntryDirectionCompetitionPolicy:
-    """Compare only governed expected-return observations.
+    """Compare only governed gross market-opportunity observations.
 
     This context may guide the model toward the better side, but it cannot grant
-    execution permission. The selected side must still pass the live fee-after
+    execution permission. The selected side must still pass the live realized-net
     return, cost, validity, sizing, account, and exchange contracts.
     """
 
@@ -103,12 +103,12 @@ class EntryDirectionCompetitionPolicy:
             "short": short_side,
             "production_source_count": source_count,
             "production_permission": False,
-            "policy": "production_governed_expected_returns_only_no_fixed_gap",
+            "policy": "governed_gross_market_observation_only_no_fixed_gap",
             "policy_provenance": {
-                "source": "live_influence_return_models",
+                "source": "live_influence_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
-                "strategy_version": "2026-07-12.return-direction-observation.v1",
+                "strategy_version": "2026-07-14.gross-market-direction-observation.v2",
                 "fallback_reason": "" if source_count else "governed_return_models_unavailable",
             },
         }
@@ -125,7 +125,7 @@ class EntryDirectionCompetitionPolicy:
         eligibility = signal_production_eligibility(signal)
         for side in ("long", "short"):
             side_policy = _safe_dict(influence.get(side))
-            value = _safe_float(primary.get(f"{side}_expected_return_pct"))
+            value = _safe_float(primary.get(f"{side}_market_expected_return_pct"))
             eligible = bool(
                 eligibility.get("eligible") is True
                 and side_policy.get("enabled") is True

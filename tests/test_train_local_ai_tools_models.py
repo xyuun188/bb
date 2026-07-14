@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -11,6 +11,7 @@ import pytest
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
+from models.market_data import Kline
 from scripts import train_local_ai_tools_models as train_script
 from scripts.train_local_ai_tools_models import (
     _build_auth_headers,
@@ -34,6 +35,60 @@ def test_local_ai_tools_autotrain_task_persists_artifacts() -> None:
 
     assert "--persist-artifact" in command
     assert "--confirm-phase3-rebuild" in command
+
+
+def test_local_ai_tools_training_lock_rejects_concurrent_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        train_script,
+        "_TRAINING_LOCK_PATH",
+        tmp_path / "local-ai-tools-training.lock",
+    )
+    monkeypatch.setattr(
+        train_script,
+        "_lock_file",
+        lambda _handle: (_ for _ in ()).throw(BlockingIOError()),
+    )
+
+    assert train_script._try_acquire_training_lock() is None
+
+
+@pytest.mark.asyncio
+async def test_sequence_loader_transports_native_series_without_expanded_window_copies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    start = datetime(2026, 7, 14, tzinfo=UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                Kline(
+                    symbol="BTC/USDT",
+                    timeframe="1m",
+                    open_time=start + timedelta(minutes=index),
+                    open=100.0 + index,
+                    high=101.0 + index,
+                    low=99.0 + index,
+                    close=100.0 + index,
+                    volume=10.0 + index,
+                )
+                for index in range(33)
+            ]
+        )
+        await session.commit()
+
+    samples = await train_script._load_sequence_samples()
+
+    assert len(samples) == 1
+    assert samples[0]["sequence_format"] == (
+        train_script.COMPACT_SEQUENCE_SERIES_FORMAT
+    )
+    assert samples[0]["observation_count"] == 2
+    assert len(samples[0]["close_sequence"]) == 33
+    assert len(samples[0]["volume_sequence"]) == 33
 
 
 @pytest.mark.asyncio
@@ -64,6 +119,8 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
                 ShadowBacktest(
                     model_name="ensemble_trader",
                     execution_mode="paper",
+                    decision_id=101,
+                    label_version="native-label-v1",
                     symbol="BTC/USDT",
                     analysis_type="market",
                     decision_action="long",
@@ -73,6 +130,11 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
                             "rsi_14": 53.0,
                             "returns_1": 0.01,
                             "taker_fee_rate": 0.0004,
+                            "training_market_fact_contract": {"version": "native-fact-v1"},
+                            "training_label_contract": {
+                                "version": "native-label-v1",
+                                "identity": {"decision_id": 101, "horizon_minutes": 10},
+                            },
                             "unused_llm_context": {"transcript": "x" * 100_000},
                     },
                     raw_llm_response={"unused_full_response": "x" * 100_000},
@@ -116,6 +178,14 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
     assert samples[0]["symbol"] == "BTC/USDT"
     assert samples[0]["features"]["current_price"] == 100.0
     assert samples[0]["features"]["rsi_14"] == 53.0
+    assert samples[0]["decision_id"] == 101
+    assert samples[0]["label_version"] == "native-label-v1"
+    assert samples[0]["features"]["training_market_fact_contract"] == {
+        "version": "native-fact-v1"
+    }
+    assert samples[0]["features"]["training_label_contract"]["version"] == (
+        "native-label-v1"
+    )
     assert "unused_llm_context" not in samples[0]["features"]
     assert samples[1]["symbol"] == "ETH/USDT"
 

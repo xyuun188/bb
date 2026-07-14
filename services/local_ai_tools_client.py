@@ -199,18 +199,20 @@ class LocalAIToolsClient:
             if side not in {"long", "short"}:
                 long_expected = self._to_float(
                     normalized.get(
-                        "adjusted_long_return_pct",
+                        "long_market_expected_return_pct",
                         normalized.get(
-                            "long_expected_return_pct", normalized.get("expected_long_return_pct")
+                            "long_expected_return_pct",
+                            normalized.get("expected_long_return_pct"),
                         ),
                     ),
                     0.0,
                 )
                 short_expected = self._to_float(
                     normalized.get(
-                        "adjusted_short_return_pct",
+                        "short_market_expected_return_pct",
                         normalized.get(
-                            "short_expected_return_pct", normalized.get("expected_short_return_pct")
+                            "short_expected_return_pct",
+                            normalized.get("expected_short_return_pct"),
                         ),
                     ),
                     0.0,
@@ -389,7 +391,19 @@ class LocalAIToolsClient:
             status["health_error"] = health_error
         for key in (
             "trained_at",
+            "objective_name",
+            "objective_version",
+            "label_name",
+            "label_version",
+            "cost_model_version",
+            "training_cost_policy",
+            "profit_supervision_version",
+            "profit_supervision_report",
             "shadow_sample_count",
+            "train_shadow_sample_count",
+            "holdout_shadow_sample_count",
+            "train_decision_group_count",
+            "holdout_decision_group_count",
             "trade_sample_count",
             "sequence_sample_count",
             "text_sentiment_sample_count",
@@ -397,6 +411,10 @@ class LocalAIToolsClient:
             "completed_trade_sample_count",
             "training_mode",
             "model_stage",
+            "route_mode",
+            "live_mutation",
+            "live_trading_mutation",
+            "artifact_persisted",
             "evaluation_policy",
             "promotion_recommendation",
             "governance_report",
@@ -552,6 +570,11 @@ class LocalAIToolsClient:
             trade_samples=trade_samples,
             shadow_samples=shadow_samples,
         )
+        profit_supervision_report = (
+            quality_report.get("profit_supervision", {})
+            if isinstance(quality_report, dict)
+            else {}
+        )
         effective_promotion = promotion_recommendation or build_phase3_promotion_recommendation(
             training_mode=training_mode,
             model_stage=model_stage,
@@ -582,6 +605,7 @@ class LocalAIToolsClient:
             "evaluation_policy": effective_evaluation_policy,
             "paper_observation_report": effective_paper_observation,
             "return_objective_report": return_objective_report,
+            "profit_supervision_report": profit_supervision_report,
             "promotion_recommendation": effective_promotion,
             "persist_artifact": bool(persist_artifact),
             "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),

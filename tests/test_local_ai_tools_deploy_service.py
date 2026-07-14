@@ -56,6 +56,38 @@ def test_text_sentiment_training_uses_available_distribution_without_fixed_sampl
     assert result["samples"] == 2
 
 
+def test_compact_native_sequence_transport_expands_all_windows_lazily() -> None:
+    module = ModuleType("local_ai_tools_compact_sequence_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    closes = [100.0 + index for index in range(33)]
+    sample = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1m",
+        "sequence_format": module.COMPACT_SEQUENCE_SERIES_FORMAT,
+        "close_sequence": closes,
+        "volume_sequence": [10.0 + index for index in range(33)],
+        "observation_count": 2,
+        "label_name": "gross_market_move_pct",
+        "label_version": "test-observation-label",
+    }
+
+    windows = list(module._iter_sequence_training_windows([sample]))
+
+    assert len(windows) == 2
+    assert windows[0]["close_sequence"] == closes[:31]
+    assert windows[1]["close_sequence"] == closes[:32]
+    assert windows[0]["long_return_pct"] == pytest.approx((131.0 - 130.0) / 130.0 * 100.0)
+    assert windows[0]["short_return_pct"] == pytest.approx(
+        -windows[0]["long_return_pct"]
+    )
+    assert list(
+        module._iter_sequence_training_windows(
+            [{**sample, "observation_count": 1}]
+        )
+    ) == []
+
+
 def test_training_upload_uses_scheduler_deadline_instead_of_http_write_timeout() -> None:
     source = (ROOT / "scripts" / "train_local_ai_tools_models.py").read_text(
         encoding="utf-8"
@@ -158,6 +190,49 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert payload["shadow_payload"]["loss_probability"] == 0.18
 
 
+def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> None:
+    module = ModuleType("local_ai_tools_health_supervision_contract_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    supervision = {
+        "version": module.PROFIT_SUPERVISION_VERSION,
+        "shadow_market_sample_count": 14,
+        "shadow_counterfactual_cost_sample_count": 14,
+        "actual_execution_cost_sample_count": 1,
+        "actual_realized_return_sample_count": 61,
+    }
+    monkeypatch.setattr(
+        module,
+        "_read_metadata_file",
+        lambda: {
+            "objective_name": module.RETURN_OBJECTIVE_NAME,
+            "objective_version": module.RETURN_OBJECTIVE_VERSION,
+            "label_name": module.RETURN_LABEL_NAME,
+            "label_version": module.RETURN_LABEL_VERSION,
+            "cost_model_version": module.COST_MODEL_VERSION,
+            "training_cost_policy": (
+                "separated_market_opportunity_and_execution_cost_tasks"
+            ),
+            "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
+            "profit_supervision_report": supervision,
+            "train_shadow_sample_count": 7,
+            "holdout_shadow_sample_count": 7,
+            "train_decision_group_count": 7,
+            "holdout_decision_group_count": 7,
+        },
+    )
+
+    metadata = module._status_metadata()
+
+    assert metadata["objective_version"] == module.RETURN_OBJECTIVE_VERSION
+    assert metadata["label_version"] == module.RETURN_LABEL_VERSION
+    assert metadata["cost_model_version"] == module.COST_MODEL_VERSION
+    assert metadata["profit_supervision_report"] == supervision
+    assert metadata["train_decision_group_count"] == 7
+    assert metadata["holdout_decision_group_count"] == 7
+    assert "round_trip_cost_pct" not in module._STATUS_METADATA_KEYS
+    assert "tail_loss_threshold_pct" not in module._STATUS_METADATA_KEYS
+
+
 def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -> None:
     module = ModuleType("local_ai_tools_api_return_contract_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
@@ -170,7 +245,10 @@ def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -
                 "objective_version": module.RETURN_OBJECTIVE_VERSION,
                 "label_name": module.RETURN_LABEL_NAME,
                 "label_version": module.RETURN_LABEL_VERSION,
-                "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+                "training_cost_policy": (
+                    "separated_market_opportunity_and_execution_cost_tasks"
+                ),
+                "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
                 "artifact_persisted": True,
                 "model_stage": "shadow",
                 "training_mode": "shadow",
@@ -184,6 +262,7 @@ def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -
             "available": True,
             "trained": True,
             "model": "trained-test-model",
+            "return_semantics": "gross_market_opportunity_before_execution",
             "prediction_quality": {
                 "production_eligible": True,
                 "anomalous": False,
@@ -196,8 +275,9 @@ def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -
     assert payload["objective_name"] == module.RETURN_OBJECTIVE_NAME
     assert payload["label_name"] == module.RETURN_LABEL_NAME
     assert payload["training_cost_policy"] == (
-        "per_sample_live_spread_fee_and_funding_complete"
+        "separated_market_opportunity_and_execution_cost_tasks"
     )
+    assert payload["profit_supervision_version"] == module.PROFIT_SUPERVISION_VERSION
     assert payload["prediction_quality"]["production_eligible"] is True
 
 
@@ -1029,22 +1109,43 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
     short_model = object()
     long_loss_model = object()
     short_loss_model = object()
+    long_cost_model = object()
+    short_cost_model = object()
     bundle = {
         "metadata": {
             "objective_name": module.RETURN_OBJECTIVE_NAME,
             "objective_version": module.RETURN_OBJECTIVE_VERSION,
             "label_name": module.RETURN_LABEL_NAME,
             "label_version": module.RETURN_LABEL_VERSION,
-            "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+            "training_cost_policy": (
+                "separated_market_opportunity_and_execution_cost_tasks"
+            ),
+            "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
             "artifact_persisted": True,
         },
         "long_return_model": long_model,
         "short_return_model": short_model,
+        "long_cost_model": long_cost_model,
+        "short_cost_model": short_cost_model,
         "long_loss_model": long_loss_model,
         "short_loss_model": short_loss_model,
         "profiles": {
-            "BTC/USDT|long": {"loss_pressure": 100.0},
-            "BTC/USDT|short": {"loss_pressure": 100.0},
+            f"BTC/USDT|{side}": {
+                "source_authority": "okx_position_history",
+                "symbol": "BTC/USDT",
+                "side": side,
+                "net_return_after_cost_pct": {
+                    "count": 2,
+                    "expected": 0.3,
+                    "lower_hinge": 0.1,
+                },
+                "slippage_pct": {
+                    "count": 2,
+                    "expected": 0.02,
+                    "upper_hinge": 0.04,
+                },
+            }
+            for side in ("long", "short")
         },
     }
     module.load_bundle = lambda: bundle
@@ -1052,6 +1153,7 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
         "expected": 0.4 if model is long_model else 0.2,
         "median": 0.4 if model is long_model else 0.2,
         "lower_bound": 0.1 if model is long_model else 0.05,
+        "upper_bound": 0.5 if model is long_model else 0.3,
         "std": 0.03,
         "spread": 0.08,
         "sample_count": 260,
@@ -1187,7 +1289,7 @@ def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_ta
     assert '"short_expected_return_pct": round(short_return, 4)' in SERVICE_CODE
     assert '"training_data_sha256": training_data_sha256' in SERVICE_CODE
     assert '"source_code_sha256": source_code_sha256' in SERVICE_CODE
-    assert '"time_split_policy": "chronological_features_before_labels"' in SERVICE_CODE
+    assert '"time_split_policy": "chronological_disjoint_decision_groups"' in SERVICE_CODE
     assert "write_json_atomic(METADATA_PATH, metadata)" in SERVICE_CODE
 
 
@@ -1223,6 +1325,7 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
         samples.append(
             {
                 "id": index + 1,
+                "decision_id": index + 1,
                 "symbol": "BTC/USDT",
                 "horizon_minutes": 10,
                 "features": {
@@ -1242,6 +1345,27 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
                 "long_return_pct": 0.45,
                 "short_return_pct": -0.15,
                 "sample_weight": 1.0,
+                "correlation_weight": {
+                    "correlation_group": f"shadow_decision:{index + 1}",
+                },
+                "profit_supervision": {
+                    "version": "2026-07-14.separated-profit-supervision.v1",
+                    "tasks": {
+                        "market_opportunity_distribution": {
+                            "eligible": True,
+                            "long_gross_market_return_pct": 0.45,
+                            "short_gross_market_return_pct": -0.15,
+                        },
+                        "execution_cost_and_slippage_distribution": {
+                            "eligible": True,
+                            "long_total_cost_pct": 0.12,
+                            "short_total_cost_pct": 0.08,
+                        },
+                        "authoritative_realized_return_distribution": {
+                            "eligible": False,
+                        },
+                    },
+                },
             }
         )
     return samples
@@ -1337,7 +1461,7 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
 
 
 def test_local_ai_tools_generated_service_uses_quality_weights() -> None:
-    assert '"sample_weight": max(0.0, min(f(sample, "sample_weight", 1.0), 1.0))' in SERVICE_CODE
+    assert '"sample_weight": max(0.0, f(sample, "sample_weight", 1.0))' in SERVICE_CODE
     assert "model__sample_weight=sample_weights" in SERVICE_CODE
     assert '"quality_report": req.quality_report or {}' in SERVICE_CODE
     assert "trainable_trade_samples = [" in SERVICE_CODE

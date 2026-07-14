@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
@@ -270,6 +271,10 @@ def build_ml_readiness_report(
     objective_version = metadata.get("objective_version")
     label_version = metadata.get("label_version")
     training_cost_policy = str(metadata.get("training_cost_policy") or "")
+    profit_supervision_version = metadata.get("profit_supervision_version")
+    profit_supervision_report = _safe_dict(metadata.get("profit_supervision_report"))
+    actual_trade_calibration = _safe_dict(metadata.get("actual_trade_calibration"))
+    actual_trade_profiles = _safe_dict(actual_trade_calibration.get("profiles"))
     tail_loss_policy = _safe_dict(metadata.get("tail_loss_policy"))
     tail_loss_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
 
@@ -292,15 +297,44 @@ def build_ml_readiness_report(
                 required=RETURN_LABEL_VERSION,
             )
         )
-    if training_cost_policy != "per_sample_live_spread_fee_and_funding_complete":
+    if training_cost_policy != "separated_market_opportunity_and_execution_cost_tasks":
         global_blockers.append(
             _reason(
                 "artifact_cost_policy_incomplete",
-                "Artifact was not trained from per-sample live spread, fee, and funding costs.",
+                "Artifact does not separate market opportunity from execution cost.",
                 actual=training_cost_policy or "missing",
-                required="per_sample_live_spread_fee_and_funding_complete",
+                required="separated_market_opportunity_and_execution_cost_tasks",
             )
         )
+    if (
+        profit_supervision_version != PROFIT_SUPERVISION_VERSION
+        or profit_supervision_report.get("version") != PROFIT_SUPERVISION_VERSION
+    ):
+        global_blockers.append(
+            _reason(
+                "profit_supervision_contract_missing",
+                "Artifact does not carry the separated profit supervision contract.",
+                actual=profit_supervision_version or "missing",
+                required=PROFIT_SUPERVISION_VERSION,
+            )
+        )
+    for field, code in (
+        ("shadow_market_sample_count", "shadow_market_supervision_missing"),
+        (
+            "shadow_counterfactual_cost_sample_count",
+            "counterfactual_cost_supervision_missing",
+        ),
+        ("actual_realized_return_sample_count", "authoritative_return_supervision_missing"),
+    ):
+        if int(_safe_float(profit_supervision_report.get(field), 0.0) or 0) <= 0:
+            global_blockers.append(
+                _reason(
+                    code,
+                    f"Separated supervision report is missing {field}.",
+                    actual=profit_supervision_report.get(field),
+                    required="non-empty authoritative distribution",
+                )
+            )
     for side in ("long", "short"):
         side_policy = _safe_dict(tail_loss_policy.get(side))
         scale = _safe_float(tail_loss_scales.get(side), None)
@@ -338,6 +372,24 @@ def build_ml_readiness_report(
             )
         )
     side_blockers = {side: _side_metric_blockers(metrics, side) for side in ("long", "short")}
+    for side in ("long", "short"):
+        profile = _safe_dict(actual_trade_profiles.get(f"*|{side}"))
+        actual_return = _safe_dict(profile.get("net_return_after_cost_pct"))
+        actual_slippage = _safe_dict(profile.get("slippage_pct"))
+        if int(_safe_float(actual_return.get("count"), 0.0) or 0) <= 0:
+            side_blockers[side].append(
+                _reason(
+                    f"{side}_authoritative_realized_return_calibration_missing",
+                    f"{side} authoritative realized-return calibration is missing.",
+                )
+            )
+        if int(_safe_float(actual_slippage.get("count"), 0.0) or 0) <= 0:
+            side_blockers[side].append(
+                _reason(
+                    f"{side}_authoritative_slippage_calibration_missing",
+                    f"{side} authoritative slippage calibration is missing.",
+                )
+            )
     profit_quality_diagnostics = {
         side: _side_profit_quality_diagnostics(metadata, metrics, side)
         for side in ("long", "short")
@@ -407,12 +459,12 @@ def build_ml_readiness_report(
             "threshold_policy": "profitability_math_boundaries_and_empirical_confidence_intervals",
         },
         "policy_provenance": {
-            "source": "artifact_holdout_fee_after_return_distribution",
-            "observation_window": "artifact_train_and_holdout_windows",
+            "source": "separated_market_cost_and_authoritative_trade_distributions",
+            "observation_window": "artifact_train_holdout_and_okx_trade_calibration",
             "sample_count": sample_count,
             "test_sample_count": test_count,
             "generated_at": (now or datetime.now(UTC)).isoformat(),
-            "strategy_version": "2026-07-12.ml-readiness-return-lcb.v1",
+            "strategy_version": "2026-07-14.separated-ml-readiness.v2",
             "fallback_reason": "" if sample_count > 0 and test_count > 0 else "distribution_missing",
         },
         "metrics": {
@@ -475,6 +527,8 @@ def build_ml_readiness_report(
             "required_objective_version": RETURN_OBJECTIVE_VERSION,
             "label_version": label_version,
             "required_label_version": RETURN_LABEL_VERSION,
+            "profit_supervision_version": profit_supervision_version,
+            "required_profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         },
     }
 

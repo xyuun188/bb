@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.return_objective import (
+    RETURN_LABEL_NAME,
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_NAME,
+    RETURN_OBJECTIVE_VERSION,
+)
 
 LEGACY_MOJIBAKE_LONG_LABELS = ("\u934b\u6c2c\ue63f",)
 LEGACY_MOJIBAKE_SHORT_LABELS = ("\u934b\u6c31\u2516",)
@@ -57,6 +63,10 @@ _WRAPPER_METADATA_KEYS = (
     "training_cost_policy",
     "label_name",
     "label_version",
+    "profit_supervision_version",
+    "return_semantics",
+    "counterfactual_execution_cost_distribution",
+    "actual_trade_calibration",
     "prediction_quality",
     "fallback_reason",
     "feature_coverage",
@@ -99,7 +109,7 @@ def enrich_signal_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
         if side not in {"long", "short"}:
             long_expected = safe_float(
                 normalized.get(
-                    "adjusted_long_return_pct",
+                    "long_market_expected_return_pct",
                     normalized.get(
                         "long_expected_return_pct",
                         normalized.get("expected_long_return_pct"),
@@ -109,7 +119,7 @@ def enrich_signal_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
             )
             short_expected = safe_float(
                 normalized.get(
-                    "adjusted_short_return_pct",
+                    "short_market_expected_return_pct",
                     normalized.get(
                         "short_expected_return_pct",
                         normalized.get("expected_short_return_pct"),
@@ -240,6 +250,11 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
     quality_approved = False
     objective_approved = False
     objective_version_approved = False
+    label_approved = False
+    label_version_approved = False
+    cost_policy_approved = False
+    supervision_approved = False
+    return_semantics_approved = False
     for node in _signal_governance_nodes(payload):
         route_mode = str(node.get("route_mode") or "").strip().lower()
         if route_mode:
@@ -340,6 +355,47 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"eligible": False, "reason": "artifact_objective_version_mismatch"}
             objective_version_approved = True
 
+        label_name = str(node.get("label_name") or "").strip()
+        if label_name:
+            governance_seen = True
+            if label_name != RETURN_LABEL_NAME:
+                return {"eligible": False, "reason": "artifact_return_label_mismatch"}
+            label_approved = True
+
+        label_version = str(node.get("label_version") or "").strip()
+        if label_version:
+            governance_seen = True
+            if label_version != RETURN_LABEL_VERSION:
+                return {
+                    "eligible": False,
+                    "reason": "artifact_return_label_version_mismatch",
+                }
+            label_version_approved = True
+
+        cost_policy = str(node.get("training_cost_policy") or "").strip()
+        if cost_policy:
+            governance_seen = True
+            if cost_policy != "separated_market_opportunity_and_execution_cost_tasks":
+                return {"eligible": False, "reason": "artifact_cost_policy_incomplete"}
+            cost_policy_approved = True
+
+        supervision_version = str(node.get("profit_supervision_version") or "").strip()
+        if supervision_version:
+            governance_seen = True
+            if supervision_version != PROFIT_SUPERVISION_VERSION:
+                return {
+                    "eligible": False,
+                    "reason": "artifact_profit_supervision_version_mismatch",
+                }
+            supervision_approved = True
+
+        return_semantics = str(node.get("return_semantics") or "").strip()
+        if return_semantics:
+            governance_seen = True
+            if return_semantics != "gross_market_opportunity_before_execution":
+                return {"eligible": False, "reason": "artifact_return_semantics_mismatch"}
+            return_semantics_approved = True
+
     required = {
         "governance_metadata": governance_seen,
         "live_route": route_live,
@@ -348,6 +404,11 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
         "prediction_quality": quality_approved,
         "return_objective": objective_approved,
         "return_objective_version": objective_version_approved,
+        "return_label": label_approved,
+        "return_label_version": label_version_approved,
+        "separated_cost_policy": cost_policy_approved,
+        "profit_supervision": supervision_approved,
+        "gross_market_return_semantics": return_semantics_approved,
     }
     missing = [name for name, present in required.items() if not present]
     if missing:
@@ -357,105 +418,6 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
             "missing_governance": missing,
         }
     return {"eligible": True, "reason": "governance_allows_live_influence"}
-
-
-def signal_runtime_recovery_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
-    """Allow trained shadow output only when its return-quality contract is intact."""
-
-    if not signal_available(payload):
-        return {"eligible": False, "reason": "signal_unavailable"}
-
-    trained = False
-    quality_approved = False
-    objective_approved = False
-    objective_version_approved = False
-    label_approved = False
-    label_version_approved = False
-    cost_policy_approved = False
-    artifact_persisted = False
-    for node in _signal_governance_nodes(payload):
-        trained = trained or node.get("trained") is True
-        artifact_persisted = artifact_persisted or node.get("artifact_persisted") is True
-
-        training_cost_policy = str(node.get("training_cost_policy") or "").strip()
-        if training_cost_policy:
-            if training_cost_policy != "per_sample_live_spread_fee_and_funding_complete":
-                return {"eligible": False, "reason": "artifact_cost_policy_incomplete"}
-            cost_policy_approved = True
-
-        prediction_quality = safe_dict(node.get("prediction_quality"))
-        if prediction_quality:
-            if prediction_quality.get("production_eligible") is not True:
-                return {
-                    "eligible": False,
-                    "reason": str(
-                        prediction_quality.get("reason") or "prediction_quality_blocked"
-                    ),
-                }
-            if prediction_quality.get("anomalous") is True:
-                return {
-                    "eligible": False,
-                    "reason": str(
-                        prediction_quality.get("reason") or "prediction_quality_anomalous"
-                    ),
-                }
-            quality_approved = True
-
-        objective_name = str(
-            node.get("artifact_objective")
-            or node.get("objective_name")
-            or node.get("objective")
-            or ""
-        ).strip()
-        if objective_name:
-            if objective_name != RETURN_OBJECTIVE_NAME:
-                return {"eligible": False, "reason": "artifact_objective_mismatch"}
-            objective_approved = True
-
-        objective_version = str(
-            node.get("artifact_objective_version") or node.get("objective_version") or ""
-        ).strip()
-        if objective_version:
-            if objective_version != RETURN_OBJECTIVE_VERSION:
-                return {
-                    "eligible": False,
-                    "reason": "artifact_objective_version_mismatch",
-                }
-            objective_version_approved = True
-
-        label_name = str(node.get("label_name") or "").strip()
-        if label_name:
-            if label_name != "net_return_after_cost_pct":
-                return {"eligible": False, "reason": "artifact_return_label_mismatch"}
-            label_approved = True
-
-        label_version = str(node.get("label_version") or "").strip()
-        if label_version:
-            if label_version != RETURN_OBJECTIVE_VERSION:
-                return {
-                    "eligible": False,
-                    "reason": "artifact_return_label_version_mismatch",
-                }
-            label_version_approved = True
-
-    required = {
-        "trained_model": trained,
-        "prediction_quality": quality_approved,
-        "return_objective": objective_approved,
-        "return_objective_version": objective_version_approved,
-        "return_label": label_approved,
-        "return_label_version": label_version_approved,
-        "cost_policy": cost_policy_approved,
-        "persisted_artifact": artifact_persisted,
-    }
-    missing = [name for name, present in required.items() if not present]
-    if missing:
-        return {
-            "eligible": False,
-            "reason": "runtime_recovery_contract_incomplete",
-            "missing_governance": missing,
-        }
-    return {"eligible": True, "reason": "trained_shadow_return_contract_intact"}
 
 
 def signal_production_eligible(payload: dict[str, Any]) -> bool:
@@ -575,6 +537,7 @@ def expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
     if side in {"long", "short"}:
         keys.extend(
             [
+                f"{side}_market_expected_return_pct",
                 f"adjusted_{side}_return_pct",
                 f"{side}_expected_return_pct",
                 f"expected_{side}_return_pct",
@@ -612,6 +575,7 @@ def directional_expected_return_pct(payload: dict[str, Any], side: str = "") -> 
     if side not in {"long", "short"}:
         return expected_return_pct(payload, side)
     for key in (
+        f"{side}_market_expected_return_pct",
         f"adjusted_{side}_return_pct",
         f"{side}_expected_return_pct",
         f"expected_{side}_return_pct",

@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services.ml_signal_service import (
     build_training_frame,
     count_shadow_training_rows,
+    load_authoritative_trade_training_samples,
     load_shadow_training_rows,
     shadow_training_quality_report,
     train_from_frame,
@@ -52,11 +53,13 @@ async def run_training(
     rows = await load_shadow_training_rows()
     quality_state = shadow_training_quality_report(rows)
     frame = build_training_frame(rows)
+    trade_samples = await load_authoritative_trade_training_samples()
     completed_count = await count_shadow_training_rows()
     metadata = train_from_frame(
         frame,
         completed_sample_count=completed_count,
         training_quality_report=quality_state["quality_report"],
+        trade_samples=trade_samples,
         persist_artifact=persist_artifact,
     )
     return {
@@ -70,6 +73,7 @@ async def run_training(
         "frame_sample_count": int(len(frame)),
         "loaded_row_count": int(len(rows)),
         "completed_shadow_sample_count": int(completed_count),
+        "authoritative_trade_sample_count": len(trade_samples),
     }
 
 

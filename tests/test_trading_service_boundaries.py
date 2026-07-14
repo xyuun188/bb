@@ -1640,35 +1640,30 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
         "services.training_data_quality.annotate_training_payload",
         annotate_payload,
     )
-    monkeypatch.setattr(
-        trading_service,
-        "load_latest_paper_observation_report",
-        lambda: {
-            "available": True,
-            "status": "ok",
-            "can_use_for_promotion": True,
-            "starts_trading_service": False,
-            "submits_orders": False,
-            "changes_model_routing": False,
-        },
-    )
     service.local_ai_tools = FakeLocalAITools()
     service._completed_shadow_backtest_total = lambda: _async_value(9999)  # type: ignore[method-assign]
+    service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "trained": True,
+            "shadow_sample_count": 2,
+            "completed_shadow_sample_count": 9999,
+            "completed_trade_sample_count": 33,
+        }
+    )
 
     result = await service._maybe_train_local_ai_tools(force=True)
 
     assert result["trained"] is True
     assert result["completed_shadow_sample_count"] == 9999
     assert result["completed_trade_sample_count"] == 33
-    assert captured["kwargs"]["persist_artifact"] is True
-    assert captured["kwargs"]["confirm_phase3_rebuild"] is True
-    assert captured["kwargs"]["training_mode"] == "shadow"
-    assert captured["kwargs"]["model_stage"] == "shadow"
-    assert captured["kwargs"]["evaluation_policy"]["live_mutation"] is False
-    assert captured["kwargs"]["raw_trade_sample_count"] == 1
-    assert captured["kwargs"]["trainable_trade_sample_count"] == 1
-    assert captured["kwargs"]["trade_sample_cursor_policy"] == "clean_training_view_only"
-    assert result["training_policy"]["status_probe_fallback"] == "train_when_due_from_local_counts"
+    assert result["training_process_isolated"] is True
+    assert result["training_policy"]["concurrency_policy"] == (
+        "exclusive_local_ai_tools_training_process_lock"
+    )
+    assert result["training_policy"]["status_probe_fallback"] == (
+        "train_in_isolated_process"
+    )
+    assert captured == {}
 
 
 @pytest.mark.asyncio

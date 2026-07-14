@@ -19,13 +19,19 @@ from core.training_contracts import (
 )
 from services.dynamic_policy_values import empirical_policy_value
 from services.execution_cost_model import execution_cost_estimate
+from services.profit_supervision import (
+    PROFIT_SUPERVISION_VERSION,
+    apply_correlation_group_weights,
+    build_profit_supervision_contract,
+    profit_supervision_report,
+)
 from services.return_loss_attribution import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-07-14.immutable-shadow-label.v3"
-PROFIT_LEARNING_VERSION = "fee-after-return-training-v3"
+DATA_QUALITY_VERSION = "2026-07-14.separated-profit-supervision.v4"
+PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
@@ -34,6 +40,7 @@ _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
 }
 QualityStatus = Literal["included", "downweighted", "excluded"]
 SampleKind = Literal["shadow", "trade", "sequence", "text_sentiment"]
+COMPACT_SEQUENCE_SERIES_FORMAT = "compact_native_kline_series.v1"
 _RETRAIN_TARGETS = (
     "local_ml_signal",
     "local_ai_tools",
@@ -536,6 +543,43 @@ def assess_sequence_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     numeric_closes = [_safe_float(value, None) for value in closes]
     if any(value is None or value <= 0 for value in numeric_closes):
         return _final_assessment(0.0, ["invalid_price_sequence"], exclude=True)
+    if sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
+        volumes = sample.get("volume_sequence") or []
+        if not isinstance(volumes, list) or len(volumes) != len(closes):
+            return _final_assessment(
+                0.0,
+                ["compact_sequence_volume_alignment_invalid"],
+                exclude=True,
+            )
+        numeric_volumes = [_safe_float(value, None) for value in volumes]
+        if any(value is None or value < 0 for value in numeric_volumes):
+            return _final_assessment(
+                0.0,
+                ["compact_sequence_volume_invalid"],
+                exclude=True,
+            )
+        observation_count = int(
+            _safe_float(sample.get("observation_count"), 0.0) or 0
+        )
+        if observation_count != max(len(closes) - 31, 0):
+            return _final_assessment(
+                0.0,
+                ["compact_sequence_observation_count_mismatch"],
+                exclude=True,
+            )
+        if (
+            _safe_str(sample.get("label_name")) != "gross_market_move_pct"
+            or not _safe_str(sample.get("label_version"))
+        ):
+            return _final_assessment(
+                0.0,
+                ["compact_sequence_label_contract_missing"],
+                exclude=True,
+            )
+        timeframe = _safe_str(sample.get("timeframe"))
+        if timeframe not in set(_QUALITY_PARAMS.allowed_sequence_timeframes):
+            return _final_assessment(0.0, ["unknown_timeframe"], exclude=True)
+        return _final_assessment(score, reasons)
     future_return = _safe_float(sample.get("future_return_pct"), None)
     if future_return is None:
         return _final_assessment(0.0, ["missing_future_return"], exclude=True)
@@ -930,6 +974,11 @@ def annotate_sample(sample: dict[str, Any], kind: SampleKind) -> dict[str, Any]:
     if labels:
         annotated["profit_learning_labels"] = labels
         _apply_profit_learning_aliases(annotated, kind=kind, labels=labels)
+    if kind in {"shadow", "trade"}:
+        annotated["profit_supervision"] = build_profit_supervision_contract(
+            annotated,
+            kind=kind,
+        )
     annotated["training_sample_contract"] = _training_sample_contract(
         annotated,
         kind=kind,
@@ -966,7 +1015,19 @@ def annotate_samples(samples: list[dict[str, Any]], kind: SampleKind) -> list[di
                 }
             else:
                 seen[key] = int(_safe_float(sample.get("id"), 0.0) or len(seen) + 1)
-    return [annotate_sample(sample, kind) for sample in prepared]
+    annotated = [annotate_sample(sample, kind) for sample in prepared]
+    apply_correlation_group_weights(annotated, kind=kind)
+    if kind in {"shadow", "trade"}:
+        for sample in annotated:
+            sample["profit_supervision"] = build_profit_supervision_contract(
+                sample,
+                kind=kind,
+            )
+            sample["training_sample_contract"] = _training_sample_contract(
+                sample,
+                kind=kind,
+            )
+    return annotated
 
 
 def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> dict[str, Any]:
@@ -993,6 +1054,35 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
             features.get("training_label_contract")
         ).get("label_fingerprint"),
     }
+    if kind == "sequence" and sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
+        sequence_facts = {
+            "sequence_format": COMPACT_SEQUENCE_SERIES_FORMAT,
+            "symbol": _safe_str(sample.get("symbol")),
+            "timeframe": _safe_str(sample.get("timeframe")),
+            "first_open_time": sample.get("first_open_time"),
+            "last_open_time": sample.get("last_open_time"),
+            "observation_count": int(
+                _safe_float(sample.get("observation_count"), 0.0) or 0
+            ),
+            "label_name": _safe_str(sample.get("label_name")),
+            "label_version": _safe_str(sample.get("label_version")),
+            "close_sequence": sample.get("close_sequence") or [],
+            "volume_sequence": sample.get("volume_sequence") or [],
+        }
+        label.update(
+            {
+                "label_name": sequence_facts["label_name"],
+                "label_version": sequence_facts["label_version"],
+                "observation_count": sequence_facts["observation_count"],
+                "sequence_series_fingerprint": hashlib.sha256(
+                    json.dumps(
+                        sequence_facts,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
     cost = {
         key: features.get(key)
         for key in (
@@ -1009,6 +1099,14 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
     }
     fingerprint_payload = {
         "data_quality_version": DATA_QUALITY_VERSION,
+        "profit_supervision_version": (
+            PROFIT_SUPERVISION_VERSION if kind in {"shadow", "trade"} else None
+        ),
+        "profit_supervision_fingerprint": (
+            _safe_dict(sample.get("profit_supervision")).get("contract_fingerprint")
+            if kind in {"shadow", "trade"}
+            else None
+        ),
         "lineage": lineage,
         "market_fact_data_fingerprint": _safe_dict(
             market_contract.get("provenance")
@@ -1021,12 +1119,20 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
     return {
         "version": DATA_QUALITY_VERSION,
         "immutable": True,
+        "profit_supervision_version": (
+            PROFIT_SUPERVISION_VERSION if kind in {"shadow", "trade"} else None
+        ),
         "required_label_version": SHADOW_LABEL_VERSION if kind == "shadow" else None,
         "lineage": lineage,
         "market_fact_contract": market_contract,
         "shadow_label_contract": _safe_dict(features.get("training_label_contract")),
         "cost_facts": cost,
         "label": label,
+        "profit_supervision": (
+            _safe_dict(sample.get("profit_supervision"))
+            if kind in {"shadow", "trade"}
+            else {}
+        ),
         "quality": {
             "status": sample.get("data_quality_status"),
             "score": sample.get("data_quality_score"),
@@ -1953,6 +2059,10 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
     return {
         "data_quality_version": DATA_QUALITY_VERSION,
         "market_fact_contract": _aggregate_market_fact_contract(samples_by_kind),
+        "profit_supervision": profit_supervision_report(
+            samples_by_kind.get("shadow", []),
+            samples_by_kind.get("trade", []),
+        ),
         "policy": asdict(DEFAULT_TRADING_PARAMS.training_data_quality),
         "by_kind": by_kind,
         "profit_learning_summary": {

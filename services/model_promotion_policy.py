@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import settings
+from services.profit_supervision import (
+    AUTHORITATIVE_REALIZED_RETURN_TASK,
+    COUNTERFACTUAL_EXECUTION_COST_TASK,
+    MARKET_OPPORTUNITY_TASK,
+    PRODUCTION_RETURN_COMBINATION_VERSION,
+    PROFIT_SUPERVISION_VERSION,
+    weighted_distribution,
+)
 from services.return_objective import (
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
@@ -18,7 +26,7 @@ from services.return_objective import (
 )
 
 PAPER_OBSERVATION_REPORT_REL_PATH = "phase3_paper_resume_observation_reports/latest.json"
-RETURN_PROMOTION_POLICY_VERSION = "2026-07-12.return-distribution-promotion.v1"
+RETURN_PROMOTION_POLICY_VERSION = "2026-07-14.separated-return-promotion.v2"
 logger = logging.getLogger(__name__)
 
 
@@ -70,66 +78,6 @@ def load_latest_paper_observation_report(root: Path | None = None) -> dict[str, 
     }
 
 
-def _canonical_return(sample: dict[str, Any]) -> float | None:
-    keys = (
-        "net_return_after_cost_pct",
-        "realized_net_return_after_cost_pct",
-        "realized_net_return_pct",
-        "label_net_return_after_cost_pct",
-        "target_net_return_after_cost_pct",
-    )
-    for source in (sample, _safe_dict(sample.get("profit_learning_labels"))):
-        for key in keys:
-            value = _safe_float(source.get(key), None)
-            if value is not None:
-                return value
-    return None
-
-
-def _cost_complete(sample: dict[str, Any]) -> bool:
-    explicit = sample.get("cost_complete")
-    if explicit is None:
-        explicit = sample.get("training_cost_complete")
-    if explicit is not None:
-        return explicit is True
-
-    labels = _safe_dict(sample.get("profit_learning_labels"))
-    label_explicit = labels.get("cost_complete")
-    if label_explicit is None:
-        label_explicit = labels.get("training_cost_complete")
-    if label_explicit is not None:
-        return label_explicit is True
-
-    # Authoritative closed-trade labels carry their cost evidence inside the
-    # unified profit-learning contract. Realized execution prices already
-    # incorporate fill quality; fee and funding remain separately attested.
-    if (
-        str(labels.get("sample_kind") or "").strip().lower() == "trade"
-        and labels.get("training_supervision_ready") is True
-        and str(labels.get("cost_basis_label") or "").strip().lower()
-        == "fee_plus_funding"
-        and sample.get("exclude_from_training") is not True
-    ):
-        notional = _safe_float(labels.get("notional_usdt"), None)
-        required_cost_values = (
-            labels.get("realized_net_pnl_usdt"),
-            labels.get("fee_estimate_usdt"),
-            labels.get("funding_fee_usdt"),
-        )
-        return bool(
-            notional is not None
-            and notional > 0
-            and all(_safe_float(value, None) is not None for value in required_cost_values)
-        )
-
-    components = (
-        sample.get("fee_return_pct"),
-        sample.get("slippage_return_pct"),
-        sample.get("funding_return_pct"),
-    )
-    return all(_safe_float(value, None) is not None for value in components)
-
-
 def _median(values: list[float]) -> float | None:
     if not values:
         return None
@@ -150,17 +98,70 @@ def build_return_objective_report(
     trade_samples: list[dict[str, Any]] | None = None,
     shadow_samples: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    candidates = [
-        _safe_dict(sample)
-        for sample in [*(trade_samples or []), *(shadow_samples or [])]
-        if isinstance(sample, dict)
+    shadow_candidates = [
+        _safe_dict(sample) for sample in (shadow_samples or []) if isinstance(sample, dict)
     ]
-    eligible_samples = [
-        sample
-        for sample in candidates
-        if _canonical_return(sample) is not None and _cost_complete(sample)
+    trade_candidates = [
+        _safe_dict(sample) for sample in (trade_samples or []) if isinstance(sample, dict)
     ]
-    returns = [float(_canonical_return(sample)) for sample in eligible_samples]
+
+    def task(sample: dict[str, Any], name: str) -> dict[str, Any]:
+        supervision = _safe_dict(sample.get("profit_supervision"))
+        if supervision.get("version") != PROFIT_SUPERVISION_VERSION:
+            return {}
+        return _safe_dict(_safe_dict(supervision.get("tasks")).get(name))
+
+    def weighted_pairs(
+        samples: list[dict[str, Any]],
+        task_name: str,
+        field: str,
+    ) -> list[tuple[Any, Any]]:
+        return [
+            (current.get(field), sample.get("sample_weight", 1.0))
+            for sample in samples
+            if (current := task(sample, task_name)).get("eligible") is True
+        ]
+
+    market_long = weighted_pairs(
+        shadow_candidates,
+        MARKET_OPPORTUNITY_TASK,
+        "long_gross_market_return_pct",
+    )
+    market_short = weighted_pairs(
+        shadow_candidates,
+        MARKET_OPPORTUNITY_TASK,
+        "short_gross_market_return_pct",
+    )
+    shadow_cost_long = weighted_pairs(
+        shadow_candidates,
+        COUNTERFACTUAL_EXECUTION_COST_TASK,
+        "long_total_cost_pct",
+    )
+    shadow_cost_short = weighted_pairs(
+        shadow_candidates,
+        COUNTERFACTUAL_EXECUTION_COST_TASK,
+        "short_total_cost_pct",
+    )
+    actual_return_pairs = weighted_pairs(
+        trade_candidates,
+        AUTHORITATIVE_REALIZED_RETURN_TASK,
+        "realized_net_return_pct",
+    )
+    actual_cost_pairs = weighted_pairs(
+        trade_candidates,
+        COUNTERFACTUAL_EXECUTION_COST_TASK,
+        "total_cost_pct",
+    )
+    actual_slippage_pairs = weighted_pairs(
+        trade_candidates,
+        COUNTERFACTUAL_EXECUTION_COST_TASK,
+        "slippage_pct",
+    )
+    returns = [
+        float(value)
+        for value, weight in actual_return_pairs
+        if _safe_float(value, None) is not None and (_safe_float(weight, 0.0) or 0.0) > 0
+    ]
     lower = _lower_half(returns) if returns else []
     profit = sum(max(value, 0.0) for value in returns)
     loss = abs(sum(min(value, 0.0) for value in returns))
@@ -174,8 +175,16 @@ def build_return_objective_report(
     )
     profit_factor = profit / loss if loss > 0 else None
     blockers: list[str] = []
+    if not market_long or not market_short:
+        blockers.append("shadow_market_opportunity_distribution_missing")
+    if not shadow_cost_long or not shadow_cost_short:
+        blockers.append("counterfactual_execution_cost_distribution_missing")
     if not returns:
-        blockers.append("cost_complete_return_distribution_missing")
+        blockers.append("authoritative_realized_return_distribution_missing")
+    if not actual_cost_pairs:
+        blockers.append("authoritative_execution_cost_distribution_missing")
+    if not actual_slippage_pairs:
+        blockers.append("authoritative_slippage_distribution_missing")
     if avg_return is None or avg_return <= 0:
         blockers.append("average_fee_after_return_not_positive")
     if lower_hinge is None or lower_hinge <= 0:
@@ -192,7 +201,41 @@ def build_return_objective_report(
         "label_version": RETURN_LABEL_VERSION,
         "optimization_target": "realized_fee_after_return",
         "sample_count": len(returns),
-        "excluded_cost_incomplete_count": len(candidates) - len(returns),
+        "actual_realized_return_sample_count": len(actual_return_pairs),
+        "shadow_market_opportunity_sample_count": min(len(market_long), len(market_short)),
+        "shadow_counterfactual_cost_sample_count": min(
+            len(shadow_cost_long), len(shadow_cost_short)
+        ),
+        "shadow_samples_are_actual_returns": False,
+        "excluded_cost_incomplete_count": len(trade_candidates) - len(actual_cost_pairs),
+        "separated_distributions": {
+            "market_opportunity": {
+                "source_authority": "shadow_native_market_path",
+                "long_gross_return_pct": weighted_distribution(market_long),
+                "short_gross_return_pct": weighted_distribution(market_short),
+            },
+            "counterfactual_execution_cost": {
+                "source_authority": "shadow_live_microstructure",
+                "long_total_cost_pct": weighted_distribution(shadow_cost_long),
+                "short_total_cost_pct": weighted_distribution(shadow_cost_short),
+            },
+            "authoritative_realized_trade": {
+                "source_authority": "okx_position_history",
+                "net_return_after_cost_pct": weighted_distribution(actual_return_pairs),
+                "execution_cost_pct": weighted_distribution(actual_cost_pairs),
+                "slippage_pct": weighted_distribution(actual_slippage_pairs),
+            },
+        },
+        "production_combination": {
+            "version": PRODUCTION_RETURN_COMBINATION_VERSION,
+            "formula": (
+                "market_opportunity_distribution-live_execution_cost_distribution-"
+                "authoritative_slippage_tail_excess"
+            ),
+            "ready": not any(
+                reason.endswith("distribution_missing") for reason in blockers
+            ),
+        },
         "average_net_return_after_cost_pct": (
             round(avg_return, 8) if avg_return is not None else None
         ),
@@ -208,12 +251,14 @@ def build_return_objective_report(
         "gross_negative_return_pct": round(loss, 8),
         "blocking_reasons": blockers,
         "policy_provenance": {
-            "source": "cost_complete_trade_and_shadow_fee_after_returns",
+            "source": (
+                "shadow_market_and_cost_observation_plus_authoritative_okx_trade_returns"
+            ),
             "observation_window": "provided_non_overlapping_training_evaluation_samples",
             "sample_count": len(returns),
             "generated_at": generated_at,
             "strategy_version": RETURN_PROMOTION_POLICY_VERSION,
-            "fallback_reason": "" if returns else "cost_complete_return_distribution_missing",
+            "fallback_reason": "" if not blockers else ";".join(blockers),
         },
     }
 

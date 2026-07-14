@@ -38,7 +38,13 @@ from services.ml_signal_service import (
 )
 from services.model_artifact_registry import ModelArtifactRegistry
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+from services.profit_supervision import (
+    AUTHORITATIVE_REALIZED_RETURN_TASK,
+    COUNTERFACTUAL_EXECUTION_COST_TASK,
+    PROFIT_SUPERVISION_VERSION,
+)
 from services.return_objective import (
+    RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
@@ -54,10 +60,47 @@ def _with_return_objective(metadata: dict) -> dict:
     metadata = dict(metadata)
     metadata.setdefault("objective_name", RETURN_OBJECTIVE_NAME)
     metadata.setdefault("objective_version", RETURN_OBJECTIVE_VERSION)
+    metadata.setdefault("label_name", RETURN_LABEL_NAME)
     metadata.setdefault("label_version", RETURN_LABEL_VERSION)
     metadata.setdefault(
         "training_cost_policy",
-        "per_sample_live_spread_fee_and_funding_complete",
+        "separated_market_opportunity_and_execution_cost_tasks",
+    )
+    metadata.setdefault("profit_supervision_version", PROFIT_SUPERVISION_VERSION)
+    metadata.setdefault(
+        "profit_supervision_report",
+        {
+            "version": PROFIT_SUPERVISION_VERSION,
+            "shadow_market_sample_count": int(metadata.get("sample_count") or 1),
+            "shadow_counterfactual_cost_sample_count": int(
+                metadata.get("sample_count") or 1
+            ),
+            "actual_realized_return_sample_count": 2,
+        },
+    )
+    metadata.setdefault(
+        "actual_trade_calibration",
+        {
+            "version": PROFIT_SUPERVISION_VERSION,
+            "profiles": {
+                f"*|{side}": {
+                    "source_authority": "okx_position_history",
+                    "symbol": "*",
+                    "side": side,
+                    "net_return_after_cost_pct": {
+                        "count": 2,
+                        "expected": 0.4,
+                        "lower_hinge": 0.2,
+                    },
+                    "slippage_pct": {
+                        "count": 2,
+                        "expected": 0.02,
+                        "upper_hinge": 0.04,
+                    },
+                }
+                for side in ("long", "short")
+            },
+        },
     )
     metadata.setdefault("legacy_fixed_training_thresholds_enabled", False)
     metadata.setdefault(
@@ -296,6 +339,24 @@ class _Classifier:
 class _Regressor:
     def __init__(self, prediction: float) -> None:
         self.prediction = prediction
+        spread = max(abs(prediction) * 0.01, 0.001)
+        self.named_steps = {
+            "imputer": SimpleNamespace(transform=lambda values: values),
+            "model": SimpleNamespace(
+                estimators_=[
+                    SimpleNamespace(
+                        predict=lambda _values, value=prediction - spread: np.array(
+                            [value]
+                        )
+                    ),
+                    SimpleNamespace(
+                        predict=lambda _values, value=prediction + spread: np.array(
+                            [value]
+                        )
+                    ),
+                ]
+            ),
+        }
 
     def predict(self, values: object) -> np.ndarray:
         return np.array([self.prediction])
@@ -360,11 +421,15 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
         row.update(
             {
                 "id": idx + 1,
+                "decision_group": f"shadow_decision:{idx + 1}",
+                "horizon_minutes": 30,
                 "symbol": "BTC/USDT" if idx % 2 == 0 else "ETH/USDT",
                 "long_return_pct": 0.2 if idx % 4 == 0 else -0.05,
                 "short_return_pct": 0.18 if idx % 4 == 1 else -0.04,
                 "long_win": int(idx % 4 == 0),
                 "short_win": int(idx % 4 == 1),
+                "long_execution_cost_pct": 0.08,
+                "short_execution_cost_pct": 0.08,
                 "sample_weight": 1.0,
                 "data_quality_status": "included",
                 "data_quality_score": 1.0,
@@ -373,6 +438,30 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
         )
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _authoritative_trade_sample() -> dict[str, object]:
+    return {
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "sample_weight": 1.0,
+        "profit_supervision": {
+            "version": PROFIT_SUPERVISION_VERSION,
+            "tasks": {
+                COUNTERFACTUAL_EXECUTION_COST_TASK: {
+                    "eligible": True,
+                    "total_cost_pct": 0.08,
+                    "slippage_pct": 0.03,
+                },
+                AUTHORITATIVE_REALIZED_RETURN_TASK: {
+                    "eligible": True,
+                    "side": "long",
+                    "realized_net_return_pct": 0.4,
+                    "hold_minutes": 30.0,
+                },
+            },
+        },
+    }
 
 
 def _ml_training_metadata(
@@ -432,6 +521,7 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     metadata = train_from_frame(
         _training_frame(),
         completed_sample_count=80,
+        trade_samples=[_authoritative_trade_sample()],
         persist_artifact=False,
     )
 
@@ -443,6 +533,9 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["trade_sample_cursor_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
     assert metadata["training_mode"] == "walk_forward"
     assert metadata["model_stage"] == "shadow"
+    assert metadata["profit_supervision_report"][
+        "actual_execution_cost_sample_count"
+    ] == 1
     assert metadata["evaluation_policy"]["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
     assert metadata["evaluation_policy"]["live_mutation"] is False
     assert not model_path.exists()
@@ -1266,6 +1359,8 @@ def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration
         "short_classifier": _Classifier(0.2),
         "long_regressor": _Regressor(-9.0),
         "short_regressor": _Regressor(9.0),
+        "long_cost_regressor": _Regressor(0.08),
+        "short_cost_regressor": _Regressor(0.08),
         "feature_keys": FEATURE_KEYS,
     }
     service._ensure_loaded = lambda: None  # type: ignore[method-assign]
@@ -1329,6 +1424,8 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
         "short_tail_classifier": _Classifier(0.55),
         "long_regressor": _Regressor(0.3),
         "short_regressor": _Regressor(0.3),
+        "long_cost_regressor": _Regressor(0.08),
+        "short_cost_regressor": _Regressor(0.08),
         "feature_keys": FEATURE_KEYS,
     }
     service._ensure_loaded = lambda: None  # type: ignore[method-assign]
@@ -1337,8 +1434,14 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
     primary = prediction["predictions"][0]
 
     assert primary["best_side"] == "long"
-    assert primary["long_expected_return_pct"] == pytest.approx(0.282)
-    assert primary["short_expected_return_pct"] == pytest.approx(0.201)
+    assert primary["long_expected_return_pct"] == pytest.approx(0.3)
+    assert primary["short_expected_return_pct"] == pytest.approx(0.3)
+    assert primary["long_risk_adjusted_market_opportunity_pct"] == pytest.approx(
+        0.279
+    )
+    assert primary["short_risk_adjusted_market_opportunity_pct"] == pytest.approx(
+        0.198
+    )
     assert primary["short_tail_loss_probability"] == pytest.approx(0.55)
     assert primary["best_tail_loss_probability"] == pytest.approx(0.10)
 
@@ -1732,6 +1835,8 @@ def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> No
             "short_classifier": _Classifier(0.20),
             "long_regressor": _Regressor(0.24),
             "short_regressor": _Regressor(0.02),
+            "long_cost_regressor": _Regressor(0.08),
+            "short_cost_regressor": _Regressor(0.08),
         }
     )
 
@@ -1778,6 +1883,8 @@ def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_infl
             "short_classifier": _Classifier(0.24),
             "long_regressor": _Regressor(0.24),
             "short_regressor": _Regressor(0.02),
+            "long_cost_regressor": _Regressor(0.08),
+            "short_cost_regressor": _Regressor(0.08),
         }
     )
 

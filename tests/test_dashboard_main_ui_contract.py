@@ -202,7 +202,7 @@ def test_opportunity_score_ui_prefers_expected_net_return() -> None:
     assert "function opportunityScorePrimaryReturn" in script
     assert "completedLocalTrade" in script
     assert "fetchJSON('/api/model-training/registry')" in script
-    assert "手动平仓不参与训练" in script
+    assert "OKX 实际费后收益样本" in script
     assert "const net = Number(score.expected_net_return_pct);" in script
     assert "if (Number.isFinite(net)) return { label: '预期净收益', value: net };" in script
     assert "function opportunityScoreFormulaItems" in script
@@ -920,6 +920,27 @@ def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
     assert "dirty_sample_ratio" in overview_block
     assert "long_pr_auc" in overview_block
     assert "short_pr_auc" in overview_block
+
+
+def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+    counts_block = script[
+        script.index("function mlSampleCounts") : script.index("function mlWinBar")
+    ]
+    overview_block = script[
+        script.index("function renderMLSignalOverview") : script.index(
+            "function renderTrainableModels"
+        )
+    ]
+
+    assert "shadow_market_sample_count" in counts_block
+    assert "shadow_counterfactual_cost_sample_count" in counts_block
+    assert "actual_realized_return_sample_count" in counts_block
+    assert "OKX 实际费后收益样本" in overview_block
+    assert "只监督行情方向和幅度，不冒充实际收益" in overview_block
+    assert "先预测毛市场机会" in overview_block
 
 
 def test_server_monitor_gpu_summary_uses_all_cards() -> None:

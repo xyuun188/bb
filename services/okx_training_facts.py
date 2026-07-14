@@ -78,6 +78,62 @@ def _entry_fill_contracts(entry_orders: Iterable[Any]) -> float | None:
     return sum(valid) if valid else None
 
 
+def _iter_raw_nodes(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _iter_raw_nodes(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _iter_raw_nodes(nested)
+
+
+def _is_stop_loss_fill(order: Any) -> bool:
+    order_type = _text(_value(order, "order_type")).lower()
+    if order_type in {"stop", "stop_loss", "stop-loss", "oco", "conditional"}:
+        return True
+    raw = _value(order, "okx_raw_fills", {})
+    for node in _iter_raw_nodes(raw):
+        algo_id = _text(
+            node.get("algoId")
+            or node.get("algoClOrdId")
+            or node.get("attachAlgoId")
+            or node.get("attachAlgoClOrdId")
+        )
+        trigger = _safe_float(
+            node.get("slTriggerPx") or node.get("triggerPx"),
+            None,
+        )
+        reduce_only = str(node.get("reduceOnly") or "").strip().lower() in {
+            "true",
+            "1",
+        }
+        if algo_id and (trigger is not None or reduce_only):
+            return True
+    return False
+
+
+def _stop_loss_slippage_pct(
+    *,
+    side: str,
+    stop_loss_price: float | None,
+    exit_price: float,
+    confirmed_stop_fill: bool,
+) -> float | None:
+    if (
+        not confirmed_stop_fill
+        or stop_loss_price is None
+        or stop_loss_price <= 0
+        or exit_price <= 0
+    ):
+        return None
+    if side == "long":
+        return max((stop_loss_price - exit_price) / stop_loss_price * 100.0, 0.0)
+    if side == "short":
+        return max((exit_price - stop_loss_price) / stop_loss_price * 100.0, 0.0)
+    return None
+
+
 def _official_ratio_pct(raw: dict[str, Any], fallback: Any) -> float | None:
     ratio = _safe_float(raw.get("pnlRatio"), None)
     if ratio is None:
@@ -109,6 +165,11 @@ def build_okx_history_training_sample(
     close_order_ids = _list(_value(history, "close_order_ids"))
     linked_order_ids = list(dict.fromkeys([*entry_order_ids, *close_order_ids]))
     entry_orders = [orders_by_exchange_id[value] for value in entry_order_ids if value in orders_by_exchange_id]
+    close_orders = [
+        orders_by_exchange_id[value]
+        for value in close_order_ids
+        if value in orders_by_exchange_id
+    ]
     linked_orders = [orders_by_exchange_id[value] for value in linked_order_ids if value in orders_by_exchange_id]
     local_positions = [positions_by_id[value] for value in position_ids if value in positions_by_id]
     local_position = local_positions[0] if local_positions else None
@@ -205,6 +266,14 @@ def build_okx_history_training_sample(
 
     stop_loss_price = _safe_float(_value(local_position, "stop_loss_price"), None)
     take_profit_price = _safe_float(_value(local_position, "take_profit_price"), None)
+    side = _text(_value(history, "side")).lower()
+    stop_loss_fill_confirmed = any(_is_stop_loss_fill(order) for order in close_orders)
+    stop_loss_slippage_pct = _stop_loss_slippage_pct(
+        side=side,
+        stop_loss_price=stop_loss_price,
+        exit_price=exit_price,
+        confirmed_stop_fill=stop_loss_fill_confirmed,
+    )
     lineage_gaps: list[str] = []
     if not entry_order_ids:
         lineage_gaps.append("missing_position_history_entry_orders")
@@ -245,7 +314,7 @@ def build_okx_history_training_sample(
         "execution_mode": _text(_value(history, "mode")),
         "symbol": _text(_value(history, "symbol")),
         "inst_id": _text(_value(history, "inst_id")),
-        "side": _text(_value(history, "side")).lower(),
+        "side": side,
         "close_status": _text(_value(history, "close_status")).lower(),
         "entry_price": entry_price,
         "exit_price": exit_price,
@@ -268,6 +337,15 @@ def build_okx_history_training_sample(
         "leverage": _safe_float(_value(history, "leverage"), 1.0) or 1.0,
         "planned_stop_loss_price": stop_loss_price,
         "planned_take_profit_price": take_profit_price,
+        "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
+        "stop_loss_slippage_pct": stop_loss_slippage_pct,
+        "close_order_types": sorted(
+            {
+                _text(_value(order, "order_type")).lower()
+                for order in close_orders
+                if _text(_value(order, "order_type"))
+            }
+        ),
         "raw_llm_response": raw_llm_response,
         "outcome": "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat",
         "pnl_source": "okx_position_history_realized_pnl",

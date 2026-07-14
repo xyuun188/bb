@@ -752,7 +752,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert captured["kwargs"]["confirm_phase3_rebuild"] is True
     assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
     assert captured["kwargs"]["promotion_recommendation"]["policy"] == (
-        "2026-07-12.return-distribution-promotion.v1"
+        "2026-07-14.separated-return-promotion.v2"
     )
     assert result["return_objective_report"]["objective_name"] == (
         "maximize_expected_realized_net_return_after_cost"
@@ -760,7 +760,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is True
     assert result["promotion_recommendation"]["policy"] == (
-        "2026-07-12.return-distribution-promotion.v1"
+        "2026-07-14.separated-return-promotion.v2"
     )
     assert result["promotion_recommendation"]["live_ready"] is False
 

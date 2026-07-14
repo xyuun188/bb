@@ -4,7 +4,13 @@ from types import SimpleNamespace
 import pytest
 
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
-from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.return_objective import (
+    RETURN_LABEL_NAME,
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_NAME,
+    RETURN_OBJECTIVE_VERSION,
+)
 
 
 def _governed_payload(long_return: float, short_return: float) -> dict:
@@ -15,12 +21,17 @@ def _governed_payload(long_return: float, short_return: float) -> dict:
         "promotion_ready": True,
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "return_semantics": "gross_market_opportunity_before_execution",
         "prediction_quality": {
             "production_eligible": True,
             "anomalous": False,
         },
-        "long_expected_return_pct": long_return,
-        "short_expected_return_pct": short_return,
+        "long_market_expected_return_pct": long_return,
+        "short_market_expected_return_pct": short_return,
     }
 
 
@@ -35,8 +46,8 @@ def _governed_ml(long_return: float, short_return: float) -> dict:
         },
         "predictions": [
             {
-                "long_expected_return_pct": long_return,
-                "short_expected_return_pct": short_return,
+                "long_market_expected_return_pct": long_return,
+                "short_market_expected_return_pct": short_return,
             }
         ],
     }
@@ -63,7 +74,7 @@ def test_only_governed_return_models_choose_observed_side() -> None:
     assert context["short"]["expected_return_pct"] == pytest.approx(-0.15)
     assert context["production_source_count"] == 4
     assert context["production_permission"] is False
-    assert context["policy"] == "production_governed_expected_returns_only_no_fixed_gap"
+    assert context["policy"] == "governed_gross_market_observation_only_no_fixed_gap"
 
 
 def test_missing_governance_cannot_enter_direction_scores() -> None:

@@ -1,10 +1,20 @@
 from copy import deepcopy
+from math import isinf
 
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
-from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
+from services.profit_supervision import (
+    PRODUCTION_RETURN_COMBINATION_VERSION,
+    PROFIT_SUPERVISION_VERSION,
+)
+from services.return_objective import (
+    RETURN_LABEL_NAME,
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_NAME,
+    RETURN_OBJECTIVE_VERSION,
+)
 
 
 def _scorer() -> EntryOpportunityScoringPolicy:
@@ -23,15 +33,63 @@ def _live_payload(*, side: str, long_return: float, short_return: float) -> dict
         "horizon_minutes": 30,
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
         "prediction_quality": {
             "production_eligible": True,
             "anomalous": False,
         },
         "best_side": side,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "long_market_expected_return_pct": long_return,
+        "short_market_expected_return_pct": short_return,
         "long_expected_return_pct": long_return,
         "short_expected_return_pct": short_return,
+        "long_lower_bound_return_pct": long_return - 0.1,
+        "short_lower_bound_return_pct": short_return - 0.1,
+        "counterfactual_execution_cost_distribution": {
+            "long": _cost_distribution(),
+            "short": _cost_distribution(),
+            "source_authority": "shadow_counterfactual_live_microstructure",
+        },
+        "actual_trade_calibration": {
+            "long": _trade_calibration("long"),
+            "short": _trade_calibration("short"),
+            "source_authority": "okx_position_history",
+        },
         "long_loss_probability": 0.2,
         "short_loss_probability": 0.3,
+    }
+
+
+def _cost_distribution() -> dict:
+    return {
+        "expected_pct": 0.09,
+        "upper_tail_pct": 0.10,
+        "uncertainty_pct": 0.01,
+        "distribution_ready": True,
+        "source_authority": "shadow_counterfactual_live_microstructure",
+    }
+
+
+def _trade_calibration(side: str) -> dict:
+    return {
+        "source_authority": "okx_position_history",
+        "symbol": "BTC/USDT",
+        "side": side,
+        "profile_source": "symbol_side",
+        "net_return_after_cost_pct": {
+            "count": 12,
+            "expected": 0.7,
+            "lower_hinge": 0.6,
+        },
+        "slippage_pct": {
+            "count": 12,
+            "expected": 0.012,
+            "upper_hinge": 0.02,
+        },
     }
 
 
@@ -44,15 +102,33 @@ def _live_ml() -> dict:
         "influence_policy": {"long": {"enabled": True}, "short": {"enabled": True}},
         "predictions": [
             {
+                "long_market_expected_return_pct": 0.8,
+                "short_market_expected_return_pct": -0.2,
                 "long_expected_return_pct": 0.8,
                 "short_expected_return_pct": -0.2,
-                "long_lower_quantile_return_pct": 0.4,
-                "short_lower_quantile_return_pct": -0.5,
+                "long_market_lower_hinge_return_pct": 0.7,
+                "short_market_lower_hinge_return_pct": -0.3,
+                "long_market_distribution_ready": True,
+                "short_market_distribution_ready": True,
                 "long_tail_loss_probability": 0.1,
                 "short_tail_loss_probability": 0.4,
                 "horizon_minutes": 30,
                 "long_win_rate": 0.9,
                 "short_win_rate": 0.1,
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "counterfactual_execution_cost_distribution": {
+                    "long": _cost_distribution(),
+                    "short": _cost_distribution(),
+                    "source_authority": (
+                        "shadow_counterfactual_live_microstructure"
+                    ),
+                },
+                "actual_trade_calibration": {
+                    "long": _trade_calibration("long"),
+                    "short": _trade_calibration("short"),
+                    "source_authority": "okx_position_history",
+                },
             }
         ],
     }
@@ -108,7 +184,15 @@ def test_live_models_use_equal_empirical_observations_and_live_cost() -> None:
     assert score == pytest.approx(
         opportunity["return_lcb_pct"] - opportunity["expected_loss_pct"]
     )
-    assert opportunity["score_policy"] == "fee_after_return_lcb_minus_expected_downside"
+    assert opportunity["score_policy"] == "realized_net_lcb_minus_calibrated_downside"
+    assert opportunity["return_combination_version"] == PRODUCTION_RETURN_COMBINATION_VERSION
+    breakdown = opportunity["expected_net_breakdown"]
+    assert breakdown["cost_deduction_count"] == 1
+    assert opportunity["expected_net_return_pct"] == pytest.approx(
+        opportunity["expected_gross_return_pct"]
+        - breakdown["live_execution_cost_pct"]
+        - breakdown["authoritative_slippage_tail_excess_pct"]
+    )
     assert opportunity["policy_provenance"]["valid_for_seconds"] > 0
     assert opportunity["policy_provenance"]["fallback_reason"] == ""
 
@@ -179,7 +263,7 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
         }
     )
     decision.raw_response["ml_signal"]["predictions"][0][
-        "long_expected_return_pct"
+        "long_market_expected_return_pct"
     ] = 1000.0
 
     _scorer().score_candidate(decision)
@@ -194,7 +278,7 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
     assert opportunity["expected_gross_return_pct"] == pytest.approx(0.8)
 
 
-def test_trained_runtime_predictions_form_recovery_distribution_when_live_sources_absent() -> None:
+def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"].update(
         {
@@ -228,19 +312,21 @@ def test_trained_runtime_predictions_form_recovery_distribution_when_live_source
             }
         )
 
-    _scorer().score_candidate(decision)
+    score = _scorer().score_candidate(decision)
 
     opportunity = decision.raw_response["opportunity_score"]
     components = opportunity["expected_net_breakdown"]["components"]
-    assert opportunity["return_distribution_mode"] == "runtime_recovery"
-    assert opportunity["production_eligible"] is True
-    assert opportunity["return_lcb_pct"] > 0
+    assert opportunity["return_distribution_mode"] == "unavailable"
+    assert opportunity["production_eligible"] is False
+    assert opportunity["return_lcb_pct"] is None
+    assert isinf(score) and score < 0
     assert all(component["production_eligible"] is False for component in components)
-    assert all(component["included_in_return_distribution"] is True for component in components)
-    assert opportunity["policy_provenance"]["fallback_reason"] == ""
+    assert all(component["included_in_return_distribution"] is False for component in components)
+    assert all(component["production_weight"] == 0.0 for component in components)
+    assert opportunity["policy_provenance"]["fallback_reason"]
 
 
-def test_runtime_recovery_excludes_anomalous_trained_server_prediction() -> None:
+def test_observation_only_anomalous_server_prediction_cannot_enter_distribution() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}
     for payload in decision.raw_response["local_ai_tools"].values():
@@ -269,6 +355,71 @@ def test_runtime_recovery_excludes_anomalous_trained_server_prediction() -> None
     )
 
 
+def test_missing_authoritative_slippage_distribution_blocks_production() -> None:
+    decision = _decision()
+    for payload in decision.raw_response["local_ai_tools"].values():
+        payload["actual_trade_calibration"]["long"]["slippage_pct"] = {
+            "count": 0,
+            "expected": None,
+            "upper_hinge": None,
+        }
+    decision.raw_response["ml_signal"]["predictions"][0][
+        "actual_trade_calibration"
+    ]["long"]["slippage_pct"] = {
+        "count": 0,
+        "expected": None,
+        "upper_hinge": None,
+    }
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["production_eligible"] is False
+    assert opportunity["expected_net_return_pct"] is None
+    assert "authoritative_realized_return_or_slippage_distribution_missing" in (
+        opportunity["policy_provenance"]["fallback_reason"]
+    )
+    assert isinf(score) and score < 0
+
+
+def test_mismatched_symbol_trade_calibration_blocks_production() -> None:
+    decision = _decision()
+    for payload in decision.raw_response["local_ai_tools"].values():
+        payload["actual_trade_calibration"]["long"]["symbol"] = "ETH/USDT"
+    decision.raw_response["ml_signal"]["predictions"][0][
+        "actual_trade_calibration"
+    ]["long"]["symbol"] = "ETH/USDT"
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["production_eligible"] is False
+    assert opportunity["expected_net_breakdown"][
+        "authoritative_trade_calibration_count"
+    ] == 0
+    assert isinf(score) and score < 0
+
+
+def test_degenerate_counterfactual_cost_distribution_blocks_production() -> None:
+    decision = _decision()
+    for payload in decision.raw_response["local_ai_tools"].values():
+        payload["counterfactual_execution_cost_distribution"]["long"][
+            "distribution_ready"
+        ] = False
+    decision.raw_response["ml_signal"]["predictions"][0][
+        "counterfactual_execution_cost_distribution"
+    ]["long"]["distribution_ready"] = False
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["production_eligible"] is False
+    assert opportunity["expected_net_breakdown"][
+        "counterfactual_cost_distribution_count"
+    ] == 0
+    assert isinf(score) and score < 0
+
+
 def test_missing_live_spread_fails_closed_without_cost_fallback() -> None:
     decision = _decision()
     decision.feature_snapshot = {"current_price": 100.0}
@@ -293,5 +444,5 @@ def test_missing_production_return_models_fails_closed() -> None:
     opportunity = decision.raw_response["opportunity_score"]
     assert score <= 0.0
     assert opportunity["production_eligible"] is False
-    assert opportunity["expected_net_return_pct"] == 0.0
+    assert opportunity["expected_net_return_pct"] is None
     assert opportunity["policy_provenance"]["sample_count"] == 0

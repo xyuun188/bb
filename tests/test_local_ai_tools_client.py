@@ -263,9 +263,9 @@ async def test_local_ai_tools_train_builds_default_promotion_recommendation(
 
     recommendation = captured["payload"]["promotion_recommendation"]
     return_objective_report = captured["payload"]["return_objective_report"]
-    assert recommendation["policy"] == "2026-07-12.return-distribution-promotion.v1"
+    assert recommendation["policy"] == "2026-07-14.separated-return-promotion.v2"
     assert recommendation["canary_ready"] is False
-    assert "cost_complete_return_distribution_missing" in recommendation[
+    assert "authoritative_realized_return_distribution_missing" in recommendation[
         "canary_blocking_reasons"
     ]
     assert recommendation["live_ready"] is False
@@ -642,6 +642,56 @@ async def test_local_ai_tools_status_defaults_ready_when_bundle_is_available(
     assert result["status"] == "ready"
     assert result["trained_at"] == "2026-06-23T16:58:10+00:00"
     assert result["health_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_preserves_health_supervision_and_route_contract(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    supervision = {
+        "shadow_market_sample_count": 14,
+        "shadow_counterfactual_cost_sample_count": 14,
+        "actual_execution_cost_sample_count": 1,
+        "actual_realized_return_sample_count": 61,
+    }
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        if path == "/models/status":
+            return {"available": True, "status": "ready"}
+        return {
+            "ok": True,
+            "service": "phase3_quant_api",
+            "objective_version": "separated-objective-v2",
+            "label_version": "separated-label-v2",
+            "cost_model_version": "authoritative-cost-v2",
+            "profit_supervision_version": "separated-supervision-v1",
+            "profit_supervision_report": supervision,
+            "route_mode": "shadow_observation",
+            "live_mutation": False,
+            "artifact_persisted": True,
+        }
+
+    async def post_probe(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return {"available": True, "path": path}
+
+    monkeypatch.setattr(client, "_get", get_status)
+    monkeypatch.setattr(client, "_post", post_probe)
+
+    result = await client.status()
+
+    assert result["profit_supervision_report"] == supervision
+    assert result["objective_version"] == "separated-objective-v2"
+    assert result["label_version"] == "separated-label-v2"
+    assert result["cost_model_version"] == "authoritative-cost-v2"
+    assert result["route_mode"] == "shadow_observation"
+    assert result["live_mutation"] is False
+    assert result["artifact_persisted"] is True
 
 
 @pytest.mark.asyncio

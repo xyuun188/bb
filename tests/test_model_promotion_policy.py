@@ -4,6 +4,12 @@ from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
 )
+from services.profit_supervision import (
+    AUTHORITATIVE_REALIZED_RETURN_TASK,
+    COUNTERFACTUAL_EXECUTION_COST_TASK,
+    MARKET_OPPORTUNITY_TASK,
+    PROFIT_SUPERVISION_VERSION,
+)
 
 
 def _cost_complete_sample(net_return: float) -> dict[str, object]:
@@ -13,7 +19,52 @@ def _cost_complete_sample(net_return: float) -> dict[str, object]:
         "fee_return_pct": 0.04,
         "slippage_return_pct": 0.03,
         "funding_return_pct": 0.01,
+        "sample_weight": 1.0,
+        "profit_supervision": {
+            "version": PROFIT_SUPERVISION_VERSION,
+            "tasks": {
+                MARKET_OPPORTUNITY_TASK: {"eligible": False},
+                COUNTERFACTUAL_EXECUTION_COST_TASK: {
+                    "eligible": True,
+                    "total_cost_pct": 0.08,
+                    "slippage_pct": 0.03,
+                },
+                AUTHORITATIVE_REALIZED_RETURN_TASK: {
+                    "eligible": True,
+                    "realized_net_return_pct": net_return,
+                },
+            },
+        },
     }
+
+
+def _shadow_sample() -> dict[str, object]:
+    return {
+        "sample_weight": 1.0,
+        "profit_supervision": {
+            "version": PROFIT_SUPERVISION_VERSION,
+            "tasks": {
+                MARKET_OPPORTUNITY_TASK: {
+                    "eligible": True,
+                    "long_gross_market_return_pct": 0.5,
+                    "short_gross_market_return_pct": -0.5,
+                },
+                COUNTERFACTUAL_EXECUTION_COST_TASK: {
+                    "eligible": True,
+                    "long_total_cost_pct": 0.08,
+                    "short_total_cost_pct": 0.08,
+                },
+                AUTHORITATIVE_REALIZED_RETURN_TASK: {"eligible": False},
+            },
+        },
+    }
+
+
+def _return_report(values: tuple[float, ...]) -> dict[str, object]:
+    return build_return_objective_report(
+        shadow_samples=[_shadow_sample()],
+        trade_samples=[_cost_complete_sample(value) for value in values],
+    )
 
 
 def _healthy_paper_observation() -> dict[str, object]:
@@ -39,9 +90,7 @@ def _recommendation(return_report: dict[str, object]) -> dict[str, object]:
 
 
 def test_return_objective_promotes_positive_fee_after_distribution() -> None:
-    report = build_return_objective_report(
-        trade_samples=[_cost_complete_sample(value) for value in (0.8, 0.7, 0.6, 0.5)]
-    )
+    report = _return_report((0.8, 0.7, 0.6, 0.5))
 
     assert report["promotion_ready"] is True
     assert report["optimization_target"] == "realized_fee_after_return"
@@ -51,10 +100,11 @@ def test_return_objective_promotes_positive_fee_after_distribution() -> None:
 
 def test_high_win_rate_negative_expectancy_cannot_promote() -> None:
     report = build_return_objective_report(
+        shadow_samples=[_shadow_sample()],
         trade_samples=[
             *[_cost_complete_sample(0.1) for _ in range(9)],
             _cost_complete_sample(-2.0),
-        ]
+        ],
     )
 
     assert report["promotion_ready"] is False
@@ -64,6 +114,7 @@ def test_high_win_rate_negative_expectancy_cannot_promote() -> None:
 
 def test_low_win_rate_positive_payoff_still_requires_positive_lower_half() -> None:
     report = build_return_objective_report(
+        shadow_samples=[_shadow_sample()],
         trade_samples=[
             _cost_complete_sample(4.0),
             _cost_complete_sample(-0.2),
@@ -86,7 +137,7 @@ def test_cost_incomplete_returns_are_excluded_and_fail_closed() -> None:
     assert report["policy_provenance"]["fallback_reason"]
 
 
-def test_return_objective_reads_unified_profit_learning_labels() -> None:
+def test_legacy_profit_learning_labels_cannot_bypass_supervision_contract() -> None:
     report = build_return_objective_report(
         trade_samples=[
             {
@@ -106,11 +157,11 @@ def test_return_objective_reads_unified_profit_learning_labels() -> None:
         ]
     )
 
-    assert report["available"] is True
-    assert report["sample_count"] == 1
-    assert report["average_net_return_after_cost_pct"] == -1.25
-    assert "cost_complete_return_distribution_missing" not in report["blocking_reasons"]
-    assert "average_fee_after_return_not_positive" in report["blocking_reasons"]
+    assert report["available"] is False
+    assert report["sample_count"] == 0
+    assert "authoritative_realized_return_distribution_missing" in report[
+        "blocking_reasons"
+    ]
 
 
 def test_unified_profit_learning_labels_fail_closed_without_funding_cost() -> None:
@@ -135,13 +186,13 @@ def test_unified_profit_learning_labels_fail_closed_without_funding_cost() -> No
 
     assert report["available"] is False
     assert report["sample_count"] == 0
-    assert "cost_complete_return_distribution_missing" in report["blocking_reasons"]
+    assert "authoritative_execution_cost_distribution_missing" in report[
+        "blocking_reasons"
+    ]
 
 
 def test_phase3_promotion_uses_return_report_not_sample_count_or_win_rate() -> None:
-    report = build_return_objective_report(
-        trade_samples=[_cost_complete_sample(value) for value in (0.8, 0.7, 0.6, 0.5)]
-    )
+    report = _return_report((0.8, 0.7, 0.6, 0.5))
     recommendation = _recommendation(report)
 
     assert recommendation["live_ready"] is True

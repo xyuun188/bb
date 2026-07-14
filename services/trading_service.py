@@ -122,7 +122,6 @@ from services.ml_signal_service import (
     MLSignalService,
 )
 from services.model_contribution_performance import ModelContributionPerformanceService
-from services.model_promotion_policy import load_latest_paper_observation_report
 from services.model_training_state import (
     ALL_TRAINABLE_MODEL_IDS,
     LOCAL_AI_TOOL_MODEL_IDS,
@@ -6575,190 +6574,18 @@ class TradingService:
                 self._local_tools_last_completed_shadow_count = authoritative_shadow_total
             return result
 
-        try:
-            from scripts.train_local_ai_tools_models import (
-                _completed_trade_sample_count,
-                _load_authoritative_trade_samples,
-                _load_sequence_samples,
-                _load_shadow_samples,
-                _load_text_sentiment_samples,
-                _load_trade_reflection_samples,
-                _merge_trade_samples,
-            )
-            from services.training_data_quality import annotate_training_payload
-
-            shadow_samples = await _load_shadow_samples()
-            trade_reflection_samples = await _load_trade_reflection_samples()
-            authoritative_samples = await _load_authoritative_trade_samples()
-            trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
-            sequence_samples = await _load_sequence_samples()
-            text_sentiment_samples = await _load_text_sentiment_samples()
-            training_payload = annotate_training_payload(
-                shadow_samples=shadow_samples,
-                trade_samples=trade_samples,
-                sequence_samples=sequence_samples,
-                text_sentiment_samples=text_sentiment_samples,
-            )
-            completed_trade_total = await _completed_trade_sample_count()
-        except Exception as exc:
-            return {
-                "trained": False,
-                "reason": "load_samples_error",
-                "error": safe_error_text(exc, limit=180),
-            }
-
-        training_shadow_count = len(shadow_samples)
-        quality_report = training_payload["quality_report"]
-        governance_report = training_payload["governance_report"]
-        trainable_shadow_count = len(training_payload["shadow_samples"])
-        raw_trade_sample_count = len(trade_samples)
-        trainable_trade_count = len(training_payload["trade_samples"])
-        quarantined_trade_count = max(raw_trade_sample_count - trainable_trade_count, 0)
-        new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
-        shadow_training_view_rebased = completed_shadow_total < previous_completed_shadow_total
-        previous_completed_trade_total = int(
-            (status or {}).get("last_trained_completed_trade_sample_count")
-            or (status or {}).get("completed_trade_sample_count")
-            or server_trade_count
-            or 0
-        )
-        new_trade = max(completed_trade_total - previous_completed_trade_total, 0)
-        learning_only = not bool(
-            (status or {}).get("model_bundle_available", (status or {}).get("available"))
-        )
-        training_policy = {
-            "learning_only": learning_only,
-            "trigger": "new_clean_cost_complete_sample_or_training_view_rebase",
-            "distribution_requirement": "non_empty_train_and_holdout",
-            "training_window_policy": "all_current_clean_cost_complete_samples",
-            "cursor_source": "last_trained_completed_shadow_sample_count",
-            "trade_cursor_source": "last_trained_completed_trade_sample_count",
-            "trade_cursor_policy": "clean_training_view_only",
-            "shadow_training_view_rebased": shadow_training_view_rebased,
+        result = await self._run_local_ai_tools_training_subprocess()
+        result["training_process_isolated"] = True
+        result["training_policy"] = {
+            "trigger": "forced",
+            "process_boundary": "dedicated_training_subprocess",
+            "concurrency_policy": "exclusive_local_ai_tools_training_process_lock",
+            "training_window_policy": "all_current_clean_samples",
         }
         if status_probe_error:
-            training_policy["status_probe_error"] = status_probe_error
-            training_policy["status_probe_fallback"] = "train_when_due_from_local_counts"
-        if trainable_shadow_count <= 1:
-            return {
-                "trained": False,
-                "reason": "clean_training_distribution_unavailable",
-                "server_shadow_sample_count": server_shadow_count,
-                "local_shadow_sample_count": training_shadow_count,
-                "trainable_shadow_sample_count": trainable_shadow_count,
-                "raw_trade_sample_count": raw_trade_sample_count,
-                "trainable_trade_sample_count": trainable_trade_count,
-                "quarantined_trade_sample_count": quarantined_trade_count,
-                "trade_sample_cursor_policy": "clean_training_view_only",
-                "quality_report": quality_report,
-                "governance_report": governance_report,
-                "completed_shadow_sample_count": completed_shadow_total,
-                "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
-                "completed_trade_sample_count": completed_trade_total,
-                "last_trained_completed_trade_sample_count": previous_completed_trade_total,
-                "new_shadow_sample_count": new_shadow,
-                "new_trade_sample_count": new_trade,
-                "training_policy": training_policy,
-            }
-        should_train = (
-            force
-            or learning_only
-            or shadow_training_view_rebased
-            or new_shadow > 0
-            or new_trade > 0
-        )
-        if not should_train:
-            return {
-                "trained": False,
-                "reason": "not_due",
-                "server_shadow_sample_count": server_shadow_count,
-                "local_shadow_sample_count": training_shadow_count,
-                "completed_shadow_sample_count": completed_shadow_total,
-                "trainable_shadow_sample_count": trainable_shadow_count,
-                "raw_trade_sample_count": raw_trade_sample_count,
-                "trainable_trade_sample_count": trainable_trade_count,
-                "quarantined_trade_sample_count": quarantined_trade_count,
-                "trade_sample_cursor_policy": "clean_training_view_only",
-                "quality_report": quality_report,
-                "governance_report": governance_report,
-                "last_trained_completed_shadow_sample_count": previous_completed_shadow_total,
-                "completed_trade_sample_count": completed_trade_total,
-                "last_trained_completed_trade_sample_count": previous_completed_trade_total,
-                "new_shadow_sample_count": new_shadow,
-                "new_trade_sample_count": new_trade,
-                "training_policy": training_policy,
-            }
-
-        self._local_tools_last_train_started_at = datetime.now(UTC)
-        if self._local_tools_active_training_run_id:
-            self._model_training_state().start_run(
-                scheduler_id="local_ai_tools_auto_train",
-                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
-                run_id=self._local_tools_active_training_run_id,
-                trigger_reason="forced" if force else "training_due",
-                sample_cursor={
-                    "shadow": completed_shadow_total,
-                    "trade": completed_trade_total,
-                },
-                timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
-            )
-        paper_observation_report = load_latest_paper_observation_report()
-        result = await self.local_ai_tools.train(
-            training_payload["shadow_samples"],
-            training_payload["trade_samples"],
-            training_payload["sequence_samples"],
-            training_payload["text_sentiment_samples"],
-            source="local_trading_system_auto",
-            completed_shadow_sample_count=completed_shadow_total,
-            completed_trade_sample_count=completed_trade_total,
-            raw_trade_sample_count=raw_trade_sample_count,
-            trainable_trade_sample_count=trainable_trade_count,
-            quarantined_trade_sample_count=quarantined_trade_count,
-            trade_sample_cursor_policy="clean_training_view_only",
-            quality_report=quality_report,
-            governance_report=governance_report,
-            training_mode="shadow",
-            model_stage="shadow",
-            evaluation_policy={
-                "promotion_flow": "shadow_to_canary_to_live",
-                "live_mutation": False,
-                "requires_walk_forward": True,
-                "requires_paper_observation": True,
-                "phase": "phase3_model_factory",
-            },
-            paper_observation_report=paper_observation_report,
-            persist_artifact=True,
-            confirm_phase3_rebuild=True,
-        )
-        if result.get("trained"):
-            result["completed_shadow_sample_count"] = completed_shadow_total
-            result["last_trained_completed_shadow_sample_count"] = completed_shadow_total
-            result["completed_trade_sample_count"] = completed_trade_total
-            result["last_trained_completed_trade_sample_count"] = completed_trade_total
-            result["training_shadow_sample_count"] = training_shadow_count
-            result["trainable_shadow_sample_count"] = trainable_shadow_count
-            result["raw_trade_sample_count"] = raw_trade_sample_count
-            result["trainable_trade_sample_count"] = trainable_trade_count
-            result["quarantined_trade_sample_count"] = quarantined_trade_count
-            result["trade_sample_cursor_policy"] = "clean_training_view_only"
-            result["quality_report"] = quality_report
-            result["governance_report"] = governance_report
-            result["paper_observation_report"] = paper_observation_report
-            result["training_policy"] = training_policy
-            self._local_tools_last_completed_shadow_count = completed_shadow_total
-            logger.info(
-                "server-side local AI tools auto-trained",
-                shadow_sample_count=result.get("shadow_sample_count"),
-                trade_sample_count=result.get("trade_sample_count"),
-                trained_at=result.get("trained_at"),
-            )
-        else:
-            logger.warning(
-                "server-side local AI tools auto-train skipped",
-                reason=result.get("reason"),
-                message=result.get("message"),
-                error=result.get("error"),
-                failure_count=result.get("failure_count"),
+            result["training_policy"]["status_probe_error"] = status_probe_error
+            result["training_policy"]["status_probe_fallback"] = (
+                "train_in_isolated_process"
             )
         return result
 

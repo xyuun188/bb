@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from math import isfinite, sqrt
+from math import isclose, isfinite
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.profit_supervision import (
+    PRODUCTION_RETURN_COMBINATION_VERSION,
+    PROFIT_SUPERVISION_VERSION,
+)
 
-RETURN_EXECUTION_POLICY_VERSION = "2026-07-12.return-execution.v1"
+RETURN_EXECUTION_POLICY_VERSION = "2026-07-14.separated-return-execution.v2"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -68,47 +72,28 @@ class ReturnExecutionAssessment:
 
 
 def _production_return_observations(opportunity: dict[str, Any]) -> list[float]:
+    if (
+        opportunity.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION
+        or opportunity.get("return_combination_version")
+        != PRODUCTION_RETURN_COMBINATION_VERSION
+        or opportunity.get("return_distribution_mode")
+        != "governed_market_opportunity"
+    ):
+        return []
     breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
-    distribution_mode = str(opportunity.get("return_distribution_mode") or "").strip()
     observations: list[float] = []
     for component in _safe_list(breakdown.get("components")):
         item = _safe_dict(component)
-        included = item.get("included_in_return_distribution")
-        if included is not True and not (
-            included is None and item.get("production_eligible") is True
-        ):
-            continue
-        if distribution_mode == "governed_models" and item.get("production_eligible") is not True:
-            continue
         if (
-            distribution_mode == "runtime_recovery"
-            and item.get("recovery_observation_eligible") is not True
+            item.get("included_in_return_distribution") is not True
+            or item.get("production_eligible") is not True
+            or _safe_float(item.get("production_weight"), 0.0) <= 0
         ):
             continue
-        if distribution_mode not in {"", "governed_models", "runtime_recovery"}:
-            continue
-        value = _safe_float(item.get("raw_return_pct"), float("nan"))
+        value = _safe_float(item.get("raw_market_return_pct"), float("nan"))
         if isfinite(value):
             observations.append(value)
     return observations
-
-
-def _return_uncertainty(
-    observations: list[float],
-    *,
-    expected_net: float,
-    expected_loss: float,
-    execution_cost: float,
-) -> float:
-    if len(observations) > 1:
-        center = sum(observations) / len(observations)
-        variance = sum((value - center) ** 2 for value in observations) / (len(observations) - 1)
-        sampling_uncertainty = sqrt(max(variance, 0.0) / len(observations))
-    elif observations:
-        sampling_uncertainty = abs(observations[0] - expected_net)
-    else:
-        sampling_uncertainty = abs(expected_net)
-    return max(sampling_uncertainty, expected_loss, execution_cost)
 
 
 def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessment:
@@ -116,17 +101,23 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     opportunity = _safe_dict(raw.get("opportunity_score"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
     expected_net = _safe_float(opportunity.get("expected_net_return_pct"), float("nan"))
-    expected_loss = max(_safe_float(opportunity.get("expected_loss_pct"), 0.0), 0.0)
+    expected_loss = _safe_float(opportunity.get("expected_loss_pct"), float("nan"))
     cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
-    observations = _production_return_observations(opportunity)
-    uncertainty = _return_uncertainty(
-        observations,
-        expected_net=expected_net if isfinite(expected_net) else 0.0,
-        expected_loss=expected_loss,
-        execution_cost=cost_pct,
+    combined_cost_pct = _safe_float(
+        breakdown.get("live_execution_cost_pct"),
+        float("nan"),
     )
-    return_lcb = expected_net - uncertainty if isfinite(expected_net) else float("-inf")
+    observations = _production_return_observations(opportunity)
+    uncertainty = _safe_float(
+        opportunity.get("return_uncertainty_pct"),
+        float("nan"),
+    )
+    return_lcb = _safe_float(
+        opportunity.get("realized_net_lcb_pct", opportunity.get("return_lcb_pct")),
+        float("nan"),
+    )
 
     leverage = max(_safe_float(decision.suggested_leverage, 1.0), 1.0)
     balance = max(_safe_float(sizing.get("account_balance_usdt"), 0.0), 0.0)
@@ -153,14 +144,22 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     )
     sizing_provenance_complete = _complete_provenance(sizing.get("policy_provenance"))
     provenance = {
-        "source": "selected_runtime_return_distribution_and_account_stop_budget",
-        "observation_window": "current_decision_plus_active_model_return_observations",
+        "source": "separated_realized_net_distribution_and_account_stop_budget",
+        "observation_window": (
+            "current_governed_market_live_cost_and_authoritative_trade_calibration"
+        ),
         "sample_count": len(observations),
         "generated_at": generated_at,
         "strategy_version": RETURN_EXECUTION_POLICY_VERSION,
         "fallback_reason": "",
         "upstream_provenance": {
             "return_distribution_mode": opportunity.get("return_distribution_mode"),
+            "profit_supervision_version": opportunity.get(
+                "profit_supervision_version"
+            ),
+            "return_combination_version": opportunity.get(
+                "return_combination_version"
+            ),
             "opportunity": opportunity_provenance,
             "execution_cost": execution_cost.get("policy_provenance"),
             "sizing": sizing.get("policy_provenance"),
@@ -172,6 +171,15 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         reasons.append("opportunity_return_distribution_missing")
     if opportunity.get("production_eligible") is not True:
         reasons.append("opportunity_not_production_eligible")
+    if opportunity.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION:
+        reasons.append("profit_supervision_version_mismatch")
+    if (
+        opportunity.get("return_combination_version")
+        != PRODUCTION_RETURN_COMBINATION_VERSION
+    ):
+        reasons.append("production_return_combination_version_mismatch")
+    if opportunity.get("return_distribution_mode") != "governed_market_opportunity":
+        reasons.append("non_governed_market_distribution_mode")
     if not opportunity_provenance_complete:
         reasons.append("opportunity_policy_provenance_incomplete")
     if not observations:
@@ -186,10 +194,37 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         reasons.append("live_spread_observation_missing")
     if not cost_provenance_complete:
         reasons.append("execution_cost_policy_provenance_incomplete")
+    if (
+        not isfinite(combined_cost_pct)
+        or not isclose(cost_pct, combined_cost_pct, rel_tol=1e-9, abs_tol=1e-8)
+    ):
+        reasons.append("live_execution_cost_combination_mismatch")
+    if int(_safe_float(breakdown.get("counterfactual_cost_distribution_count"), 0.0)) <= 0:
+        reasons.append("counterfactual_cost_distribution_missing")
+    if int(_safe_float(breakdown.get("authoritative_trade_calibration_count"), 0.0)) <= 0:
+        reasons.append("authoritative_trade_calibration_missing")
+    if int(_safe_float(breakdown.get("cost_deduction_count"), 0.0)) != 1:
+        reasons.append("execution_cost_deduction_count_invalid")
     if not isfinite(expected_net) or expected_net <= 0:
         reasons.append("fee_after_expected_return_not_positive")
+    if not isfinite(uncertainty) or uncertainty < 0:
+        reasons.append("realized_net_uncertainty_missing")
     if not isfinite(return_lcb) or return_lcb <= 0:
         reasons.append("fee_after_return_lcb_not_positive")
+    if (
+        isfinite(expected_net)
+        and isfinite(uncertainty)
+        and isfinite(return_lcb)
+        and not isclose(
+            expected_net - uncertainty,
+            return_lcb,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        )
+    ):
+        reasons.append("realized_net_lcb_algebra_mismatch")
+    if not isfinite(expected_loss) or expected_loss < 0:
+        reasons.append("calibrated_downside_missing")
     if sizing.get("production_eligible") is not True:
         reasons.append("dynamic_entry_risk_budget_ineligible")
     if not sizing_provenance_complete:
@@ -206,8 +241,8 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         reason="production_return_policy_passed" if eligible else ",".join(reasons),
         expected_net_return_pct=round(expected_net, 8) if isfinite(expected_net) else 0.0,
         return_lcb_pct=round(return_lcb, 8) if isfinite(return_lcb) else 0.0,
-        uncertainty_pct=round(uncertainty, 8),
-        expected_loss_pct=round(expected_loss, 8),
+        uncertainty_pct=round(uncertainty, 8) if isfinite(uncertainty) else 0.0,
+        expected_loss_pct=round(expected_loss, 8) if isfinite(expected_loss) else 0.0,
         execution_cost_pct=round(cost_pct, 8),
         production_source_count=len(observations),
         position_size_pct=round(position_size, 8),

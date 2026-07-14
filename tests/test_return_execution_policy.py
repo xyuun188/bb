@@ -3,6 +3,10 @@ from copy import deepcopy
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.profit_supervision import (
+    PRODUCTION_RETURN_COMBINATION_VERSION,
+    PROFIT_SUPERVISION_VERSION,
+)
 from services.return_execution_policy import apply_production_entry_policy
 
 
@@ -29,7 +33,13 @@ def _decision() -> DecisionOutput:
             "opportunity_score": {
                 "production_eligible": True,
                 "policy_provenance": provenance,
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_combination_version": PRODUCTION_RETURN_COMBINATION_VERSION,
+                "return_distribution_mode": "governed_market_opportunity",
                 "expected_net_return_pct": 0.8,
+                "realized_net_lcb_pct": 0.7,
+                "return_lcb_pct": 0.7,
+                "return_uncertainty_pct": 0.1,
                 "expected_loss_pct": 0.1,
                 "execution_cost": {
                     "total_pct": 0.05,
@@ -38,16 +48,24 @@ def _decision() -> DecisionOutput:
                     "policy_provenance": provenance,
                 },
                 "expected_net_breakdown": {
+                    "live_execution_cost_pct": 0.05,
+                    "counterfactual_cost_distribution_count": 1,
+                    "authoritative_trade_calibration_count": 1,
+                    "cost_deduction_count": 1,
                     "components": [
                         {
                             "key": "server_profit",
                             "production_eligible": True,
-                            "raw_return_pct": 1.2,
+                            "included_in_return_distribution": True,
+                            "production_weight": 0.5,
+                            "raw_market_return_pct": 1.2,
                         },
                         {
                             "key": "timeseries",
                             "production_eligible": True,
-                            "raw_return_pct": 1.1,
+                            "included_in_return_distribution": True,
+                            "production_weight": 0.5,
+                            "raw_market_return_pct": 1.1,
                         },
                     ]
                 },
@@ -90,21 +108,23 @@ def test_return_policy_rejects_shadow_only_or_missing_production_observations() 
     assert decision.position_size_pct == 0.0
 
 
-def test_return_policy_accepts_audited_runtime_recovery_distribution() -> None:
+def test_return_policy_rejects_runtime_recovery_distribution() -> None:
     decision = _decision()
     components = decision.raw_response["opportunity_score"]["expected_net_breakdown"]["components"]
     for component in components:
         component["production_eligible"] = False
-        component["recovery_observation_eligible"] = True
+        component["observation_only"] = True
         component["included_in_return_distribution"] = True
+        component["production_weight"] = 1.0
     decision.raw_response["opportunity_score"]["return_distribution_mode"] = (
         "runtime_recovery"
     )
 
     result = apply_production_entry_policy(decision)
 
-    assert result.eligible is True
-    assert result.production_source_count == 2
+    assert result.eligible is False
+    assert result.production_source_count == 0
+    assert "non_governed_market_distribution_mode" in result.reason
 
 
 def test_return_policy_rejects_unverified_recovery_inclusion_flag() -> None:
@@ -112,7 +132,7 @@ def test_return_policy_rejects_unverified_recovery_inclusion_flag() -> None:
     components = decision.raw_response["opportunity_score"]["expected_net_breakdown"]["components"]
     for component in components:
         component["production_eligible"] = False
-        component["recovery_observation_eligible"] = False
+        component["observation_only"] = True
         component["included_in_return_distribution"] = True
     decision.raw_response["opportunity_score"]["return_distribution_mode"] = (
         "runtime_recovery"

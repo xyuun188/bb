@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
+import os
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import httpx
 from sqlalchemy import func, select
@@ -37,6 +39,7 @@ from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import (
+    COMPACT_SEQUENCE_SERIES_FORMAT,
     annotate_training_payload,
     artifact_bound_governance_report,
 )
@@ -98,6 +101,9 @@ _LOCAL_AI_TOOLS_MAX_SEQUENCE_LENGTH = 80
 _LOCAL_AI_TOOLS_MAX_TEXT_ITEMS = 12
 _LOCAL_AI_TOOLS_MAX_TEXT_CHARS = 220
 _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE = 500
+_TRAINING_LOCK_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "local_ai_tools_training.lock"
+)
 _LOCAL_AI_TOOLS_SHADOW_TOOL_KEYS = {
     "available",
     "status",
@@ -258,6 +264,10 @@ def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]
     shadow = _compact_local_ai_tools_shadow(features.get("local_ai_tools_shadow"))
     if shadow:
         compact["local_ai_tools_shadow"] = shadow
+    for contract_key in ("training_market_fact_contract", "training_label_contract"):
+        contract = features.get(contract_key)
+        if isinstance(contract, dict) and contract:
+            compact[contract_key] = dict(contract)
     return compact
 
 
@@ -508,6 +518,8 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
             samples.append(
                 {
                     "id": int(row.get("id") or 0),
+                    "decision_id": int(row.get("decision_id") or 0) or None,
+                    "label_version": str(row.get("label_version") or ""),
                     "symbol": row.get("symbol"),
                     "analysis_type": row.get("analysis_type"),
                     "decision_action": row.get("decision_action"),
@@ -813,53 +825,99 @@ async def _completed_trade_sample_count() -> int:
 
 
 async def _load_sequence_samples() -> list[dict[str, Any]]:
-    async with get_session_ctx() as session:
-        stmt = select(Kline).where(
-            Kline.timeframe.in_(("1m", "5m", "15m", "1h"))
-        ).order_by(Kline.symbol.asc(), Kline.timeframe.asc(), Kline.open_time.desc())
-        result = await session.execute(stmt)
-        rows = list(result.scalars().all())
-
-    grouped: dict[tuple[str, str], list[Kline]] = {}
-    for row in rows:
-        grouped.setdefault((row.symbol, row.timeframe), []).append(row)
-
     samples: list[dict[str, Any]] = []
-    for (symbol, timeframe), items in grouped.items():
-        ordered = sorted(items, key=lambda r: r.open_time)
-        if len(ordered) < 32:
-            continue
-        closes = [_as_float(r.close) for r in ordered]
-        volumes = [_as_float(r.volume) for r in ordered]
-        for idx in range(30, len(ordered) - 1):
-            start = max(0, idx - 59)
-            base = closes[start : idx + 1]
-            if len(base) < 30 or base[-1] <= 0:
-                continue
-            future = closes[idx + 1]
-            move_pct = (future - base[-1]) / base[-1] * 100.0
-            feature_timestamp = ordered[idx].open_time
-            label_timestamp = ordered[idx + 1].open_time
+    current_key: tuple[str, str] | None = None
+    closes: list[float] = []
+    volumes: list[float] = []
+    first_open_time: datetime | None = None
+    last_open_time: datetime | None = None
+
+    def flush_series() -> None:
+        nonlocal closes, volumes, first_open_time, last_open_time
+        if current_key is None:
+            return
+        observation_count = max(len(closes) - 31, 0)
+        if observation_count > 0:
+            symbol, timeframe = current_key
             samples.append(
                 {
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "open_time": feature_timestamp.isoformat() if feature_timestamp else None,
-                    "feature_timestamp": (
-                        feature_timestamp.isoformat() if feature_timestamp else None
+                    "sequence_format": COMPACT_SEQUENCE_SERIES_FORMAT,
+                    "first_open_time": (
+                        first_open_time.isoformat() if first_open_time else None
                     ),
-                    "label_timestamp": label_timestamp.isoformat() if label_timestamp else None,
-                    "close_sequence": base,
-                    "volume_sequence": volumes[start : idx + 1],
-                    "future_return_pct": move_pct,
-                    "long_return_pct": move_pct,
-                    "short_return_pct": -move_pct,
+                    "last_open_time": (
+                        last_open_time.isoformat() if last_open_time else None
+                    ),
+                    "close_sequence": closes,
+                    "volume_sequence": volumes,
+                    "observation_count": observation_count,
                     "label_name": "gross_market_move_pct",
                     "label_version": "2026-07-12.observation-only.v1",
                     "production_eligible": False,
                 }
             )
+        closes = []
+        volumes = []
+        first_open_time = None
+        last_open_time = None
+
+    async with get_read_session_ctx() as session:
+        stmt = (
+            select(
+                Kline.symbol,
+                Kline.timeframe,
+                Kline.open_time,
+                Kline.close,
+                Kline.volume,
+            )
+            .where(Kline.timeframe.in_(("1m", "5m", "15m", "1h")))
+            .order_by(Kline.symbol.asc(), Kline.timeframe.asc(), Kline.open_time.asc())
+        )
+        result = await session.stream(stmt)
+        async for row in result.mappings():
+            key = (str(row.get("symbol") or ""), str(row.get("timeframe") or ""))
+            if current_key is not None and key != current_key:
+                flush_series()
+            if key != current_key:
+                current_key = key
+            open_time = row.get("open_time")
+            if isinstance(open_time, datetime):
+                first_open_time = first_open_time or open_time
+                last_open_time = open_time
+            closes.append(_as_float(row.get("close")))
+            volumes.append(_as_float(row.get("volume")))
+    flush_series()
     return samples
+
+
+def _lock_file(handle: TextIO) -> None:
+    """Acquire the training process lock without a polling threshold."""
+
+    if os.name == "nt":
+        msvcrt = importlib.import_module("msvcrt")
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    fcntl = importlib.import_module("fcntl")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _try_acquire_training_lock() -> TextIO | None:
+    """Prevent manual and scheduled rebuilds from expanding the same data twice."""
+
+    _TRAINING_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(_TRAINING_LOCK_PATH, "a+", encoding="utf-8")
+    try:
+        _lock_file(handle)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
 def _symbols_from_json(value: Any) -> list[str]:
@@ -1032,6 +1090,10 @@ async def _main() -> None:
         },
         "paper_observation_report": paper_observation_report,
         "return_objective_report": return_objective_report,
+        "profit_supervision_report": training_payload["quality_report"].get(
+            "profit_supervision",
+            {},
+        ),
     }
     payload["promotion_recommendation"] = build_phase3_promotion_recommendation(
         training_mode=args.training_mode,
@@ -1053,4 +1115,20 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    training_lock = _try_acquire_training_lock()
+    if training_lock is None:
+        safe_print(
+            json.dumps(
+                {
+                    "trained": False,
+                    "reason": "local_ai_tools_training_already_running",
+                    "training_process_isolated": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        try:
+            asyncio.run(_main())
+        finally:
+            training_lock.close()

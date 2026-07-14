@@ -38,7 +38,6 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.dynamic_policy_values import empirical_policy_value
-from services.execution_cost_model import execution_cost_estimate
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
 from services.model_training_state import (
@@ -46,6 +45,13 @@ from services.model_training_state import (
     ModelTrainingStateStore,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+from services.profit_supervision import (
+    COUNTERFACTUAL_EXECUTION_COST_TASK,
+    MARKET_OPPORTUNITY_TASK,
+    PROFIT_SUPERVISION_VERSION,
+    authoritative_trade_calibration,
+    select_trade_calibration,
+)
 from services.return_objective import (
     COST_MODEL_VERSION,
     RETURN_LABEL_NAME,
@@ -394,6 +400,7 @@ def _regression_prediction_distribution(
             "expected": expected,
             "median": expected.copy(),
             "lower_quantile": expected.copy(),
+            "upper_quantile": expected.copy(),
             "std": np.zeros(len(expected), dtype=float),
         }
     transformed = imputer.transform(x)
@@ -404,8 +411,29 @@ def _regression_prediction_distribution(
         "expected": expected,
         "median": np.median(tree_predictions, axis=0),
         "lower_quantile": np.median(ordered_tree_predictions[:lower_tail_count], axis=0),
+        "upper_quantile": np.median(ordered_tree_predictions[-lower_tail_count:], axis=0),
         "std": np.std(tree_predictions, axis=0),
     }
+
+
+def _distribution_ready_at(
+    distribution: dict[str, np.ndarray],
+    index: int,
+) -> bool:
+    expected = float(distribution["expected"][index])
+    lower = float(distribution["lower_quantile"][index])
+    upper = float(distribution["upper_quantile"][index])
+    std = float(distribution["std"][index])
+    numerical_resolution = float(np.finfo(float).eps) * max(
+        abs(expected),
+        abs(lower),
+        abs(upper),
+        1.0,
+    )
+    return bool(
+        all(math.isfinite(value) for value in (expected, lower, upper, std))
+        and (upper - lower > numerical_resolution or std > numerical_resolution)
+    )
 
 
 def _risk_adjusted_expected_scores(
@@ -449,49 +477,6 @@ def _net_return_pct(raw_return_pct: float) -> float:
     return _safe_float(raw_return_pct)
 
 
-def _cost_complete_shadow_returns(
-    snapshot: dict[str, Any],
-    *,
-    horizon_minutes: int,
-    long_gross_return_pct: float,
-    short_gross_return_pct: float,
-) -> tuple[float, float, dict[str, Any]] | None:
-    execution_cost = execution_cost_estimate(snapshot)
-    funding_rate = _safe_float(snapshot.get("funding_rate"), float("nan"))
-    funding_interval_minutes = _safe_float(
-        snapshot.get("funding_interval_minutes"),
-        float("nan"),
-    )
-    if not math.isfinite(funding_interval_minutes):
-        funding_interval_hours = _safe_float(
-            snapshot.get("funding_interval_hours"),
-            float("nan"),
-        )
-        if math.isfinite(funding_interval_hours):
-            funding_interval_minutes = funding_interval_hours * 60.0
-    if (
-        not execution_cost.production_eligible
-        or not math.isfinite(funding_rate)
-        or not math.isfinite(funding_interval_minutes)
-        or funding_interval_minutes <= 0
-    ):
-        return None
-    funding_drag = funding_rate * 100.0 * horizon_minutes / funding_interval_minutes
-    long_net = (
-        long_gross_return_pct
-        - execution_cost.fee_pct
-        - execution_cost.slippage_pct
-        - funding_drag
-    )
-    short_net = (
-        short_gross_return_pct
-        - execution_cost.fee_pct
-        - execution_cost.slippage_pct
-        + funding_drag
-    )
-    return long_net, short_net, execution_cost.to_dict()
-
-
 def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any]:
     metrics = _safe_dict(metadata.get("metrics"))
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0)
@@ -508,6 +493,19 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         or metadata.get("label_version") != RETURN_LABEL_VERSION
     ):
         hard_reasons.append("artifact objective/label version is not fee-after-return v1")
+    if metadata.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION:
+        hard_reasons.append("artifact separated profit supervision contract is missing")
+    calibration = _safe_dict(metadata.get("actual_trade_calibration"))
+    profiles = _safe_dict(calibration.get("profiles"))
+    global_profile = _safe_dict(profiles.get(f"*|{side}"))
+    actual_return_distribution = _safe_dict(
+        global_profile.get("net_return_after_cost_pct")
+    )
+    slippage_distribution = _safe_dict(global_profile.get("slippage_pct"))
+    if int(actual_return_distribution.get("count") or 0) <= 0:
+        hard_reasons.append("authoritative realized return calibration is missing")
+    if int(slippage_distribution.get("count") or 0) <= 0:
+        hard_reasons.append("authoritative slippage tail calibration is missing")
     if top_return <= bottom_return:
         hard_reasons.append(
             f"高分组平均收益 {top_return:.3f}% 未优于低分组 {bottom_return:.3f}%"
@@ -744,6 +742,9 @@ def _shadow_is_trainable_trade_opportunity(row: Any) -> bool:
 
 def _shadow_quality_sample(row: Any) -> dict[str, Any]:
     return {
+        "id": int(getattr(row, "id", 0) or 0),
+        "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
+        "label_version": str(getattr(row, "label_version", "") or ""),
         "symbol": getattr(row, "symbol", ""),
         "analysis_type": getattr(row, "analysis_type", ""),
         "decision_action": getattr(row, "decision_action", ""),
@@ -809,8 +810,34 @@ def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _decision_group_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Chronologically split complete decision groups without horizon leakage."""
+
+    group_column = "decision_group"
+    if group_column not in frame:
+        raise ValueError("decision_group is required for leakage-free evaluation")
+    ordered_groups = list(dict.fromkeys(frame[group_column].astype(str).tolist()))
+    if len(ordered_groups) <= 1:
+        raise ValueError("at least two decision groups are required for holdout evaluation")
+    boundary = len(ordered_groups) // 2
+    train_groups = set(ordered_groups[:boundary])
+    test_groups = set(ordered_groups[boundary:])
+    train = frame[frame[group_column].astype(str).isin(train_groups)].copy()
+    test = frame[frame[group_column].astype(str).isin(test_groups)].copy()
+    if train.empty or test.empty or train_groups & test_groups:
+        raise ValueError("decision-group split could not form disjoint train and holdout sets")
+    return train, test
+
+
 def build_training_frame(rows: list[Any]) -> pd.DataFrame:
     data: list[dict[str, Any]] = []
+    annotated_by_id = {
+        int(sample.get("id") or 0): sample
+        for sample in annotate_samples(
+            [_shadow_quality_sample(row) for row in rows],
+            "shadow",
+        )
+    }
     for row in rows:
         snapshot = _parse_json(getattr(row, "feature_snapshot", None))
         if not snapshot:
@@ -819,35 +846,32 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         raw_short_return = getattr(row, "short_return_pct", None)
         if raw_long_return is None or raw_short_return is None:
             continue
-        quality_sample = {
-            "id": int(getattr(row, "id", 0) or 0),
-            "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
-            "label_version": str(getattr(row, "label_version", "") or ""),
-            "symbol": getattr(row, "symbol", ""),
-            "analysis_type": getattr(row, "analysis_type", ""),
-            "decision_action": getattr(row, "decision_action", ""),
-            "decision_confidence": _safe_float(getattr(row, "decision_confidence", 0.0)),
-            "horizon_minutes": int(getattr(row, "horizon_minutes", 10) or 10),
-            "features": snapshot,
-            "long_return_pct": _safe_float(raw_long_return),
-            "short_return_pct": _safe_float(raw_short_return),
-            "label_timestamp": getattr(row, "due_at", None),
-            "best_action": getattr(row, "best_action", ""),
-            "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
-        }
-        assessment = assess_shadow_sample(quality_sample)
-        if assessment.exclude_from_training:
+        sample_id = int(getattr(row, "id", 0) or 0)
+        quality_sample = annotated_by_id.get(sample_id, {})
+        if not quality_sample or quality_sample.get("exclude_from_training"):
             continue
         horizon_minutes = int(getattr(row, "horizon_minutes", 10) or 10)
-        cost_complete_returns = _cost_complete_shadow_returns(
-            snapshot,
-            horizon_minutes=horizon_minutes,
-            long_gross_return_pct=_safe_float(raw_long_return),
-            short_gross_return_pct=_safe_float(raw_short_return),
-        )
-        if cost_complete_returns is None:
+        supervision = _safe_dict(quality_sample.get("profit_supervision"))
+        tasks = _safe_dict(supervision.get("tasks"))
+        market_task = _safe_dict(tasks.get(MARKET_OPPORTUNITY_TASK))
+        cost_task = _safe_dict(tasks.get(COUNTERFACTUAL_EXECUTION_COST_TASK))
+        if market_task.get("eligible") is not True or cost_task.get("eligible") is not True:
             continue
-        long_return, short_return, execution_cost = cost_complete_returns
+        long_return = _safe_float(
+            market_task.get("long_gross_market_return_pct"),
+            float("nan"),
+        )
+        short_return = _safe_float(
+            market_task.get("short_gross_market_return_pct"),
+            float("nan"),
+        )
+        long_cost = _safe_float(cost_task.get("long_total_cost_pct"), float("nan"))
+        short_cost = _safe_float(cost_task.get("short_total_cost_pct"), float("nan"))
+        if not all(
+            math.isfinite(value)
+            for value in (long_return, short_return, long_cost, short_cost)
+        ):
+            continue
         feature_row: dict[str, Any] = dict(
             _feature_row_from_snapshot(
                 snapshot,
@@ -857,7 +881,11 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         )
         feature_row.update(
             {
-                "id": int(getattr(row, "id", 0) or 0),
+                "id": sample_id,
+                "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
+                "decision_group": _safe_dict(
+                    quality_sample.get("correlation_weight")
+                ).get("correlation_group"),
                 "symbol": str(getattr(row, "symbol", "") or ""),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
                 "best_action": str(getattr(row, "best_action", "") or ""),
@@ -866,11 +894,14 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "raw_short_return_pct": _safe_float(raw_short_return),
                 "long_return_pct": long_return,
                 "short_return_pct": short_return,
-                "execution_cost": execution_cost,
-                "sample_weight": assessment.weight,
-                "data_quality_status": assessment.status,
-                "data_quality_score": assessment.score,
-                "quality_reasons": list(assessment.reasons),
+                "long_execution_cost_pct": long_cost,
+                "short_execution_cost_pct": short_cost,
+                "execution_cost": cost_task,
+                "profit_supervision": supervision,
+                "sample_weight": _safe_float(quality_sample.get("sample_weight"), 0.0),
+                "data_quality_status": quality_sample.get("data_quality_status"),
+                "data_quality_score": quality_sample.get("data_quality_score"),
+                "quality_reasons": list(quality_sample.get("quality_reasons") or []),
             }
         )
         data.append(feature_row)
@@ -884,13 +915,14 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             f"{side}_tail_loss_boundary_pct",
             returns[returns < 0].tolist(),
             selector="lower_hinge",
-            observation_window="current_cost_complete_training_window",
+            observation_window="current_shadow_market_opportunity_training_window",
         )
         threshold = float(boundary.value) if boundary.value is not None else 0.0
         frame[f"{side}_tail_loss"] = (returns < threshold).astype(int)
         frame[f"{side}_win"] = (returns > 0.0).astype(int)
         tail_policy[side] = boundary.to_dict()
     frame.attrs["tail_loss_policy"] = tail_policy
+    frame.attrs["profit_supervision_version"] = PROFIT_SUPERVISION_VERSION
     return frame
 
 
@@ -932,6 +964,7 @@ def train_from_frame(
     *,
     completed_sample_count: int | None = None,
     training_quality_report: dict[str, Any] | None = None,
+    trade_samples: list[dict[str, Any]] | None = None,
     persist_artifact: bool = True,
 ) -> dict[str, Any]:
     if len(frame) <= 1:
@@ -960,10 +993,7 @@ def train_from_frame(
         ).astype(int)
         frame[f"{side}_win"] = (frame[f"{side}_return_pct"].astype(float) > 0.0).astype(int)
         tail_scales[side] = max(abs(boundary), 1e-12)
-    split = len(frame) // 2
-
-    train = frame.iloc[:split].copy()
-    test = frame.iloc[split:].copy()
+    train, test = _decision_group_split(frame)
     x_train = train[FEATURE_KEYS]
     x_test = test[FEATURE_KEYS]
     train_weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
@@ -974,6 +1004,8 @@ def train_from_frame(
     short_tail_classifier = _make_classifier(train["short_tail_loss"])
     long_regressor = _make_regressor(train["long_return_pct"])
     short_regressor = _make_regressor(train["short_return_pct"])
+    long_cost_regressor = _make_regressor(train["long_execution_cost_pct"])
+    short_cost_regressor = _make_regressor(train["short_execution_cost_pct"])
 
     long_classifier.fit(x_train, train["long_win"], model__sample_weight=train_weights)
     short_classifier.fit(x_train, train["short_win"], model__sample_weight=train_weights)
@@ -985,6 +1017,16 @@ def train_from_frame(
     )
     long_regressor.fit(x_train, train["long_return_pct"], model__sample_weight=train_weights)
     short_regressor.fit(x_train, train["short_return_pct"], model__sample_weight=train_weights)
+    long_cost_regressor.fit(
+        x_train,
+        train["long_execution_cost_pct"],
+        model__sample_weight=train_weights,
+    )
+    short_cost_regressor.fit(
+        x_train,
+        train["short_execution_cost_pct"],
+        model__sample_weight=train_weights,
+    )
 
     long_scores = _positive_proba(long_classifier, x_test)
     short_scores = _positive_proba(short_classifier, x_test)
@@ -992,6 +1034,14 @@ def train_from_frame(
     short_tail_scores = _positive_proba(short_tail_classifier, x_test)
     long_distribution = _regression_prediction_distribution(long_regressor, x_test)
     short_distribution = _regression_prediction_distribution(short_regressor, x_test)
+    long_cost_distribution = _regression_prediction_distribution(
+        long_cost_regressor,
+        x_test,
+    )
+    short_cost_distribution = _regression_prediction_distribution(
+        short_cost_regressor,
+        x_test,
+    )
     long_expected_scores = _risk_adjusted_expected_scores(
         long_distribution,
         long_tail_scores,
@@ -1047,6 +1097,28 @@ def train_from_frame(
             ]
         }
     )
+    actual_trade_calibration = authoritative_trade_calibration(trade_samples or [])
+    actual_execution_cost_sample_count = sum(
+        1
+        for sample in (trade_samples or [])
+        if _safe_dict(
+            _safe_dict(
+                _safe_dict(sample.get("profit_supervision")).get("tasks")
+            ).get(COUNTERFACTUAL_EXECUTION_COST_TASK)
+        ).get("eligible")
+        is True
+    )
+    supervision_report = _safe_dict(frame_quality_report.get("profit_supervision"))
+    supervision_report = {
+        **supervision_report,
+        "actual_execution_cost_sample_count": actual_execution_cost_sample_count,
+        "actual_realized_return_sample_count": int(
+            actual_trade_calibration.get("actual_realized_return_sample_count") or 0
+        ),
+        "actual_trade_calibration_fingerprint": actual_trade_calibration.get(
+            "data_fingerprint"
+        ),
+    }
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "phase": "phase3_model_factory",
@@ -1058,6 +1130,9 @@ def train_from_frame(
         "last_trained_completed_shadow_sample_count": completed_count,
         "last_trained_phase3_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
+        "training_trade_sample_count": len(trade_samples or []),
+        "completed_trade_sample_count": len(trade_samples or []),
+        "last_trained_completed_trade_sample_count": len(trade_samples or []),
         "training_window_composition": _training_window_composition(frame),
         "quality_report": frame_quality_report,
         "market_fact_contract": _safe_dict(
@@ -1067,7 +1142,7 @@ def train_from_frame(
             frame_quality_report,
             persist_artifact=persist_artifact,
         ),
-        "training_window_policy": "all_current_clean_cost_complete_samples",
+        "training_window_policy": "all_current_clean_separated_supervision_samples",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
         "train_count": int(len(train)),
         "test_count": int(len(test)),
@@ -1078,21 +1153,37 @@ def train_from_frame(
         "label_name": RETURN_LABEL_NAME,
         "label_version": RETURN_LABEL_VERSION,
         "cost_model_version": COST_MODEL_VERSION,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "profit_supervision_report": supervision_report,
+        "actual_trade_calibration": actual_trade_calibration,
         "positive_net_return_boundary_pct": 0.0,
         "positive_return_boundary_policy": "fee_after_profitability_math_boundary",
         "tail_loss_policy": tail_policy,
         "tail_loss_scale_pct": tail_scales,
-        "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
+        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "evaluation_group_policy": "chronological_disjoint_decision_groups",
+        "train_decision_group_count": int(train["decision_group"].nunique()),
+        "test_decision_group_count": int(test["decision_group"].nunique()),
         "prediction_distribution": {
             "lower_bound": "tree_prediction_lower_hinge",
             "uncertainty_source": "random_forest_tree_empirical_order_statistics",
             "tail_risk_source": "tail_loss_classifier_diagnostic_risk_penalty",
         },
         "training_objective": (
-            "Directly regress executable fee-after net return by side. Rank with the "
-            "conditional expected return minus model-disagreement and tail-loss "
-            "penalties. Classification metrics are diagnostics only."
+            "Regress shadow gross market opportunity and counterfactual execution cost "
+            "as separate tasks. Authoritative OKX trade outcomes calibrate realized net "
+            "return and slippage; classification metrics are diagnostics only."
         ),
+        "counterfactual_cost_holdout": {
+            "long_expected_pct": float(long_cost_distribution["expected"].mean()),
+            "long_lower_quantile_pct": float(
+                long_cost_distribution["lower_quantile"].mean()
+            ),
+            "short_expected_pct": float(short_cost_distribution["expected"].mean()),
+            "short_lower_quantile_pct": float(
+                short_cost_distribution["lower_quantile"].mean()
+            ),
+        },
         "metrics": {
             "long_auc": _safe_auc(test["long_win"], long_scores),
             "short_auc": _safe_auc(test["short_win"], short_scores),
@@ -1148,6 +1239,8 @@ def train_from_frame(
         "short_tail_classifier": short_tail_classifier,
         "long_regressor": long_regressor,
         "short_regressor": short_regressor,
+        "long_cost_regressor": long_cost_regressor,
+        "short_cost_regressor": short_cost_regressor,
         "metadata": metadata,
         "feature_keys": FEATURE_KEYS,
     }
@@ -1405,11 +1498,16 @@ class MLSignalService:
             self._next_check_at = None
             try:
                 completed_count = await self._completed_shadow_sample_count()
+                trade_samples = await load_authoritative_trade_training_samples()
+                completed_trade_count = len(trade_samples)
                 metadata = self._current_metadata()
                 last_sample_count = int(metadata.get("sample_count") or 0)
                 last_completed_count = self._phase3_cursor_from_metadata(
                     metadata,
                     completed_count,
+                )
+                last_completed_trade_count = int(
+                    metadata.get("last_trained_completed_trade_sample_count") or 0
                 )
                 influence = _influence_policy(metadata) if metadata else {"enabled": False}
                 readiness = (
@@ -1422,6 +1520,10 @@ class MLSignalService:
                 )
                 learning_only = not bool(readiness.get("allow_live_position_influence"))
                 new_samples = max(completed_count - last_completed_count, 0)
+                new_trade_samples = max(
+                    completed_trade_count - last_completed_trade_count,
+                    0,
+                )
                 training_policy = {
                     "learning_only": learning_only,
                     "readiness_state": readiness.get("state"),
@@ -1441,13 +1543,20 @@ class MLSignalService:
                         "last_trained_sample_count": last_sample_count,
                         "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
+                        "completed_trade_sample_count": completed_trade_count,
+                        "new_trade_sample_count": new_trade_samples,
                         "training_policy": training_policy,
                         "message": "本地 ML 尚无法形成非空训练集和留出集，继续收集成本完整样本。",
                     }
                     self._last_train_result = result
                     return result
 
-                should_train = force or not metadata or new_samples > 0
+                should_train = (
+                    force
+                    or not metadata
+                    or new_samples > 0
+                    or new_trade_samples > 0
+                )
                 if not should_train:
                     result = {
                         "trained": False,
@@ -1456,6 +1565,8 @@ class MLSignalService:
                         "last_trained_sample_count": last_sample_count,
                         "last_trained_completed_sample_count": last_completed_count,
                         "new_sample_count": new_samples,
+                        "completed_trade_sample_count": completed_trade_count,
+                        "new_trade_sample_count": new_trade_samples,
                         "training_policy": training_policy,
                         "message": "没有新增成本完整权威样本，当前 artifact 无需重复训练。",
                     }
@@ -1470,7 +1581,10 @@ class MLSignalService:
                         model_ids=LOCAL_ML_MODEL_IDS,
                         run_id=self._active_training_run_id,
                         trigger_reason="forced" if force else "training_due",
-                        sample_cursor={"shadow": completed_count},
+                        sample_cursor={
+                            "shadow": completed_count,
+                            "trade": completed_trade_count,
+                        },
                         timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
                     )
                 quarantine_result = await self._quarantine_dirty_training_samples()
@@ -1510,6 +1624,7 @@ class MLSignalService:
                     frame,
                     completed_sample_count=completed_count,
                     training_quality_report=quality_state["quality_report"],
+                    trade_samples=trade_samples,
                     persist_artifact=False,
                 )
                 candidate_influence = _influence_policy(candidate_metadata)
@@ -1536,6 +1651,7 @@ class MLSignalService:
                     frame,
                     completed_sample_count=completed_count,
                     training_quality_report=quality_state["quality_report"],
+                    trade_samples=trade_samples,
                     persist_artifact=True,
                 )
                 trained_influence = _influence_policy(trained_metadata)
@@ -1558,6 +1674,9 @@ class MLSignalService:
                     "previous_sample_count": last_sample_count,
                     "previous_completed_sample_count": last_completed_count,
                     "new_sample_count": new_samples,
+                    "completed_trade_sample_count": completed_trade_count,
+                    "previous_completed_trade_sample_count": last_completed_trade_count,
+                    "new_trade_sample_count": new_trade_samples,
                     "sample_count": int(trained_metadata.get("sample_count") or 0),
                     "last_trained_completed_sample_count": int(
                         trained_metadata.get("last_trained_completed_shadow_sample_count")
@@ -1632,6 +1751,11 @@ class MLSignalService:
         tail_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
         long_tail_scale = max(_safe_float(tail_scales.get("long"), 0.0), 0.0)
         short_tail_scale = max(_safe_float(tail_scales.get("short"), 0.0), 0.0)
+        feature_symbol = (
+            str(features.get("symbol") or "")
+            if isinstance(features, dict)
+            else str(getattr(features, "symbol", "") or "")
+        )
 
         predictions = []
         for horizon in horizons:
@@ -1645,10 +1769,32 @@ class MLSignalService:
             short_distribution = _regression_prediction_distribution(
                 self._bundle["short_regressor"], x
             )
+            long_cost_distribution = _regression_prediction_distribution(
+                self._bundle["long_cost_regressor"], x
+            )
+            short_cost_distribution = _regression_prediction_distribution(
+                self._bundle["short_cost_regressor"], x
+            )
             raw_long_expected = float(long_distribution["expected"][0])
             raw_short_expected = float(short_distribution["expected"][0])
             long_lower_quantile = float(long_distribution["lower_quantile"][0])
             short_lower_quantile = float(short_distribution["lower_quantile"][0])
+            long_market_distribution_ready = _distribution_ready_at(
+                long_distribution,
+                0,
+            )
+            short_market_distribution_ready = _distribution_ready_at(
+                short_distribution,
+                0,
+            )
+            long_cost_distribution_ready = _distribution_ready_at(
+                long_cost_distribution,
+                0,
+            )
+            short_cost_distribution_ready = _distribution_ready_at(
+                short_cost_distribution,
+                0,
+            )
             long_tail_model = self._bundle.get("long_tail_classifier")
             short_tail_model = self._bundle.get("short_tail_classifier")
             long_tail_loss_probability = (
@@ -1698,6 +1844,28 @@ class MLSignalService:
             best_lower_quantile = (
                 long_lower_quantile if best_side == "long" else short_lower_quantile
             )
+            selected_market_distribution_ready = (
+                long_market_distribution_ready
+                if best_side == "long"
+                else short_market_distribution_ready
+            )
+            selected_cost_distribution_ready = (
+                long_cost_distribution_ready
+                if best_side == "long"
+                else short_cost_distribution_ready
+            )
+            actual_calibration = {
+                "long": select_trade_calibration(
+                    _safe_dict(metadata.get("actual_trade_calibration")),
+                    symbol=feature_symbol,
+                    side="long",
+                ),
+                "short": select_trade_calibration(
+                    _safe_dict(metadata.get("actual_trade_calibration")),
+                    symbol=feature_symbol,
+                    side="short",
+                ),
+            }
             profit_edge = abs(long_expected - short_expected)
             profit_quality = _profit_quality_score(
                 best_expected,
@@ -1734,6 +1902,54 @@ class MLSignalService:
                     ),
                     "long_raw_expected_return_pct": round(raw_long_expected, 4),
                     "short_raw_expected_return_pct": round(raw_short_expected, 4),
+                    "long_market_expected_return_pct": round(raw_long_expected, 4),
+                    "short_market_expected_return_pct": round(raw_short_expected, 4),
+                    "long_market_lower_hinge_return_pct": round(
+                        long_lower_quantile,
+                        4,
+                    ),
+                    "short_market_lower_hinge_return_pct": round(
+                        short_lower_quantile,
+                        4,
+                    ),
+                    "long_market_distribution_ready": long_market_distribution_ready,
+                    "short_market_distribution_ready": short_market_distribution_ready,
+                    "counterfactual_execution_cost_distribution": {
+                        "long": {
+                            "expected_pct": round(
+                                float(long_cost_distribution["expected"][0]), 4
+                            ),
+                            "upper_tail_pct": round(
+                                float(long_cost_distribution["upper_quantile"][0]), 4
+                            ),
+                            "uncertainty_pct": round(
+                                float(long_cost_distribution["std"][0]), 4
+                            ),
+                            "source_authority": (
+                                "shadow_counterfactual_live_microstructure"
+                            ),
+                            "distribution_ready": long_cost_distribution_ready,
+                        },
+                        "short": {
+                            "expected_pct": round(
+                                float(short_cost_distribution["expected"][0]), 4
+                            ),
+                            "upper_tail_pct": round(
+                                float(short_cost_distribution["upper_quantile"][0]), 4
+                            ),
+                            "uncertainty_pct": round(
+                                float(short_cost_distribution["std"][0]), 4
+                            ),
+                            "source_authority": (
+                                "shadow_counterfactual_live_microstructure"
+                            ),
+                            "distribution_ready": short_cost_distribution_ready,
+                        },
+                        "source_authority": "shadow_counterfactual_live_microstructure",
+                    },
+                    "actual_trade_calibration": actual_calibration,
+                    "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                    "return_semantics": "gross_market_opportunity_before_execution",
                     "long_lower_quantile_return_pct": round(long_lower_quantile, 4),
                     "short_lower_quantile_return_pct": round(short_lower_quantile, 4),
                     "long_uncertainty_penalty_pct": round(
@@ -1748,8 +1964,16 @@ class MLSignalService:
                     "short_tail_loss_penalty_pct": round(
                         short_objective["tail_loss_penalty_pct"], 4
                     ),
-                    "long_expected_return_pct": round(long_expected, 4),
-                    "short_expected_return_pct": round(short_expected, 4),
+                    "long_expected_return_pct": round(raw_long_expected, 4),
+                    "short_expected_return_pct": round(raw_short_expected, 4),
+                    "long_risk_adjusted_market_opportunity_pct": round(
+                        long_expected,
+                        4,
+                    ),
+                    "short_risk_adjusted_market_opportunity_pct": round(
+                        short_expected,
+                        4,
+                    ),
                     "best_side": best_side,
                     "best_win_rate": round(best_win, 4),
                     "best_tail_loss_probability": (
@@ -1757,29 +1981,83 @@ class MLSignalService:
                         if best_tail_loss_probability is None
                         else round(best_tail_loss_probability, 4)
                     ),
-                    "best_expected_return_pct": round(best_expected, 4),
+                    "best_expected_return_pct": round(
+                        raw_long_expected if best_side == "long" else raw_short_expected,
+                        4,
+                    ),
+                    "best_market_expected_return_pct": round(
+                        raw_long_expected if best_side == "long" else raw_short_expected,
+                        4,
+                    ),
+                    "best_risk_adjusted_market_opportunity_pct": round(
+                        best_expected,
+                        4,
+                    ),
+                    "best_expected_realized_net_return_pct": None,
                     "profit_edge_pct": round(profit_edge, 4),
                     "profit_quality_score": round(profit_quality, 4),
                     "profit_signal": bool(
                         allow_live_position_influence
                         and side_influence.get("enabled")
+                        and selected_market_distribution_ready
+                        and selected_cost_distribution_ready
                         and best_expected > 0.0
                         and best_lower_quantile > 0.0
                         and profit_edge > 0.0
                     ),
                     "risk_score": round(risk_score, 4),
                     "ml_influence_enabled": bool(
-                        allow_live_position_influence and side_influence.get("enabled")
+                        allow_live_position_influence
+                        and side_influence.get("enabled")
+                        and selected_market_distribution_ready
+                        and selected_cost_distribution_ready
                     ),
                 }
             )
 
         primary = predictions[0] if predictions else {}
+        primary_side = str(primary.get("best_side") or "")
+        primary_cost_distribution = _safe_dict(
+            _safe_dict(primary.get("counterfactual_execution_cost_distribution")).get(
+                primary_side
+            )
+        )
+        current_prediction_ready = bool(
+            primary
+            and primary_side in {"long", "short"}
+            and primary.get(f"{primary_side}_market_distribution_ready") is True
+            and primary_cost_distribution.get("distribution_ready") is True
+        )
+        live_prediction_influence = bool(
+            allow_live_position_influence and current_prediction_ready
+        )
         return {
             "available": True,
+            "route_mode": (
+                "live" if live_prediction_influence else "shadow_observation"
+            ),
+            "live_influence": live_prediction_influence,
+            "promotion_ready": allow_live_position_influence,
+            "objective_name": metadata.get("objective_name"),
+            "objective_version": metadata.get("objective_version"),
+            "label_name": metadata.get("label_name"),
+            "label_version": metadata.get("label_version"),
+            "training_cost_policy": metadata.get("training_cost_policy"),
+            "artifact_persisted": metadata.get("artifact_persisted") is True,
+            "prediction_quality": {
+                "production_eligible": live_prediction_influence,
+                "anomalous": not live_prediction_influence,
+                "reason": (
+                    "separated_market_cost_and_actual_calibration_ready"
+                    if live_prediction_influence
+                    else "current_prediction_distribution_degenerate"
+                    if allow_live_position_influence
+                    else "ml_readiness_blocks_live_influence"
+                ),
+            },
             "status": (
                 "entry_profit_filter"
-                if allow_live_position_influence
+                if live_prediction_influence
                 else (
                     "advisory"
                     if advisory_enabled
@@ -1788,7 +2066,7 @@ class MLSignalService:
             ),
             "mode": (
                 "entry_profit_filter"
-                if allow_live_position_influence
+                if live_prediction_influence
                 else (
                     "advisory"
                     if advisory_enabled
@@ -1797,8 +2075,8 @@ class MLSignalService:
             ),
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
-            "allow_live_position_influence": allow_live_position_influence,
-            "influence_enabled": allow_live_position_influence,
+            "allow_live_position_influence": live_prediction_influence,
+            "influence_enabled": live_prediction_influence,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_version": metadata.get("version"),
@@ -1807,6 +2085,10 @@ class MLSignalService:
             "long_win_rate": primary.get("long_win_rate"),
             "short_win_rate": primary.get("short_win_rate"),
             "expected_return_pct": primary.get("best_expected_return_pct"),
+            "market_expected_return_pct": primary.get("best_market_expected_return_pct"),
+            "expected_realized_net_return_pct": None,
+            "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+            "return_semantics": "gross_market_opportunity_before_execution",
             "profit_edge_pct": primary.get("profit_edge_pct"),
             "profit_quality_score": primary.get("profit_quality_score"),
             "profit_signal": primary.get("profit_signal"),
@@ -1870,9 +2152,20 @@ class MLSignalService:
                 metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
                 or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
                 or metadata.get("label_version") != RETURN_LABEL_VERSION
+                or metadata.get("profit_supervision_version")
+                != PROFIT_SUPERVISION_VERSION
+                or not all(
+                    key in self._bundle
+                    for key in (
+                        "long_regressor",
+                        "short_regressor",
+                        "long_cost_regressor",
+                        "short_cost_regressor",
+                    )
+                )
             ):
                 raise ValueError(
-                    "refusing local ML artifact with legacy or unknown return objective"
+                    "refusing local ML artifact without separated profit supervision"
                 )
             self._loaded_mtime = mtime
         except Exception as exc:
@@ -2038,6 +2331,24 @@ async def count_shadow_training_rows() -> int:
             )
         )
         return int(result.scalar() or 0)
+
+
+async def load_authoritative_trade_training_samples() -> list[dict[str, Any]]:
+    """Load the clean OKX lifecycle view used only for realized calibration."""
+
+    from scripts.train_local_ai_tools_models import (
+        _load_authoritative_trade_samples,
+        _load_trade_reflection_samples,
+        _merge_trade_samples,
+    )
+
+    reflections = await _load_trade_reflection_samples()
+    authoritative = await _load_authoritative_trade_samples()
+    annotated = annotate_samples(
+        _merge_trade_samples(reflections, authoritative),
+        "trade",
+    )
+    return [sample for sample in annotated if not sample.get("exclude_from_training")]
 
 
 def _top_counts(values: list[Any], *, limit: int = 8) -> dict[str, int]:

@@ -398,7 +398,7 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
 
     trade = payload["trade_samples"][0]
     labels = trade["profit_learning_labels"]
-    assert labels["version"] == "fee-after-return-training-v3"
+    assert labels["version"] == "separated-profit-supervision-v4"
     assert labels["training_supervision_ready"] is True
     assert labels["losing_exit_attribution"] == "position_too_small_fee_drag"
     assert labels["trade_profit_class"] == "cost_drag_loss"
@@ -440,7 +440,14 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
 def test_training_payload_trade_contract_feeds_return_objective_report() -> None:
     payload = annotate_training_payload(
         shadow_samples=[],
-        trade_samples=[_trade_sample()],
+        trade_samples=[
+            _trade_sample(
+                source="okx_position_history",
+                trade_fact_trusted=True,
+                lifecycle_key="okx-position:test-1",
+                execution_slippage_usdt=0.0,
+            )
+        ],
         sequence_samples=[],
         text_sentiment_samples=[],
     )
@@ -450,7 +457,9 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
     assert report["available"] is True
     assert report["sample_count"] == 1
     assert report["average_net_return_after_cost_pct"] == 10.0
-    assert "cost_complete_return_distribution_missing" not in report["blocking_reasons"]
+    assert "authoritative_realized_return_distribution_missing" not in report[
+        "blocking_reasons"
+    ]
 
 
 def test_training_payload_enriches_shadow_missed_opportunity_labels() -> None:
