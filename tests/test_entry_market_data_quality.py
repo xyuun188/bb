@@ -2,10 +2,66 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.market_facts import MARKET_SOURCE_CONSISTENCY_VERSION, build_market_fact
 from services.entry_market_data_quality import (
     EntryMarketDataQualityPolicy,
     MarketValueReader,
 )
+
+
+def _contract_spec(inst_id: str = "BTC-USDT-SWAP") -> dict[str, str]:
+    return {
+        "instId": inst_id,
+        "instType": "SWAP",
+        "uly": inst_id.removesuffix("-SWAP"),
+        "instFamily": inst_id.removesuffix("-SWAP"),
+        "ctType": "linear",
+        "ctVal": "0.01",
+        "ctMult": "1",
+        "ctValCcy": inst_id.split("-")[0],
+        "settleCcy": "USDT",
+        "lotSz": "0.01",
+        "minSz": "0.01",
+        "tickSz": "0.1",
+        "state": "live",
+    }
+
+
+def _clean_market_fact() -> dict:
+    source_consistency = {
+        "version": MARKET_SOURCE_CONSISTENCY_VERSION,
+        "status": "clean",
+        "reasons": [],
+        "assertions": {
+            "native_identity_verified": True,
+            "executable_quotes_verified": True,
+            "tick_alignment_verified": True,
+            "reference_prices_verified": True,
+            "one_minute_path_verified": True,
+        },
+    }
+    return build_market_fact(
+        "BTC/USDT",
+        {
+            "symbol": "BTC/USDT",
+            "inst_id": "BTC-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source": "rest",
+            "source_endpoint": "okx_rest_market_ticker",
+            "source_channel": "tickers",
+            "timestamp": 1_784_000_000_000,
+            "last_price": 100.0,
+            "bid": 99.9,
+            "ask": 100.1,
+            "notional_24h_usdt": 1_000_000.0,
+            "volume_24h_contracts": 10_000.0,
+            "volume_24h_base": 100.0,
+            "orderbook_bid_depth": 1000.0,
+            "orderbook_ask_depth": 1000.0,
+            "market_source_consistency": source_consistency,
+        },
+        contract_spec=_contract_spec(),
+    )
 
 
 def _valid_snapshot(**kwargs):
@@ -26,6 +82,7 @@ def _valid_snapshot(**kwargs):
         "orderbook_imbalance": 0.1,
         "abnormal_wick_count_72h": 0,
         "abnormal_wick_max_pct": 0.0,
+        "market_fact": _clean_market_fact(),
     }
     snapshot.update(kwargs)
     return snapshot
@@ -43,7 +100,7 @@ def test_market_value_reader_supports_dicts_and_objects():
     ("snapshot", "expected", "code"),
     [
         (
-            {"current_price": 0, "close": 0, "bid": 0, "ask": 0},
+            _valid_snapshot(current_price=0, close=0, bid=0, ask=0),
             "没有有效价格",
             "missing_valid_price",
         ),
@@ -85,6 +142,91 @@ def test_entry_market_data_quality_policy_blocks_unusable_market_data(snapshot, 
 
 def test_entry_market_data_quality_policy_allows_consistent_market_data():
     assert EntryMarketDataQualityPolicy().reason(_valid_snapshot()) is None
+
+
+def test_entry_market_data_quality_policy_fails_closed_without_native_fact():
+    issue = EntryMarketDataQualityPolicy().issue(
+        {key: value for key, value in _valid_snapshot().items() if key != "market_fact"}
+    )
+
+    assert issue is not None
+    assert issue.code == "native_market_fact_missing"
+
+
+def test_zero_turnover_robo_native_fact_cannot_reach_production_entry():
+    snapshot = _valid_snapshot()
+    snapshot["market_fact"] = build_market_fact(
+        "ROBO/USDT",
+        {
+            "symbol": "ROBO/USDT",
+            "inst_id": "ROBO-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source": "rest",
+            "source_endpoint": "okx_rest_market_ticker",
+            "source_channel": "tickers",
+            "timestamp": 1_784_000_000_000,
+            "last_price": 0.10834,
+            "bid": 0.08172,
+            "ask": 0.10834,
+            "notional_24h_usdt": 0.0,
+            "orderbook_bid_depth": 1000.0,
+            "orderbook_ask_depth": 1000.0,
+        },
+        contract_spec=_contract_spec("ROBO-USDT-SWAP"),
+    )
+
+    issue = EntryMarketDataQualityPolicy().issue(snapshot)
+
+    assert issue is not None
+    assert issue.code == "native_market_fact_invalid"
+    assert "zero_notional_turnover" in issue.reason
+    assert "zero_notional_turnover" in issue.details["market_fact_reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "inst_id", "spec", "expected_reason"),
+    [
+        (
+            "BTC/USDT",
+            "ETH-USDT-SWAP",
+            _contract_spec("ETH-USDT-SWAP"),
+            "native_instrument_symbol_mismatch",
+        ),
+        ("BTC/USDT", "BTC-USDT-SWAP", None, "native_identity_missing:uly"),
+    ],
+)
+def test_native_identity_or_contract_spec_failure_blocks_entry(
+    symbol,
+    inst_id,
+    spec,
+    expected_reason,
+):
+    snapshot = _valid_snapshot()
+    snapshot["market_fact"] = build_market_fact(
+        symbol,
+        {
+            "symbol": symbol,
+            "inst_id": inst_id,
+            "inst_type": "SWAP",
+            "source": "rest",
+            "source_endpoint": "okx_rest_market_ticker",
+            "source_channel": "tickers",
+            "timestamp": 1_784_000_000_000,
+            "last_price": 100.0,
+            "bid": 99.9,
+            "ask": 100.1,
+            "notional_24h_usdt": 1_000_000.0,
+            "orderbook_bid_depth": 1000.0,
+            "orderbook_ask_depth": 1000.0,
+        },
+        contract_spec=spec,
+    )
+
+    issue = EntryMarketDataQualityPolicy().issue(snapshot)
+
+    assert issue is not None
+    assert issue.code == "native_market_fact_invalid"
+    assert expected_reason in issue.reason
 
 
 def test_wide_spread_is_priced_by_execution_cost_instead_of_fixed_data_gate():

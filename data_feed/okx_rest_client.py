@@ -12,6 +12,7 @@ from typing import Any
 import structlog
 
 from config.settings import settings
+from core.market_facts import normalize_okx_contract_spec
 from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
 from core.symbols import (
@@ -123,6 +124,47 @@ class OKXRestClient:
         if not rows:
             return {}
         return self._native_ticker_to_ccxt_shape(rows[0])
+
+    async def fetch_instrument_spec(self, symbol: str) -> dict[str, Any]:
+        """Return the exact OKX-native contract identity for one swap symbol."""
+
+        inst_id = okx_inst_id_from_symbol(symbol)
+        if not inst_id:
+            return {}
+        response = await self._ccxt_call(
+            "publicGetPublicInstruments",
+            {"instType": "SWAP", "instId": inst_id},
+        )
+        rows = response.get("data", []) if isinstance(response, dict) else []
+        supported = supported_usdt_swap_instruments(rows)
+        row = next(
+            (
+                item
+                for item in supported
+                if str(item.get("instId") or "").strip().upper() == inst_id
+            ),
+            None,
+        )
+        if not isinstance(row, dict):
+            return {}
+        return {
+            key: row.get(key)
+            for key in (
+                "instId",
+                "instType",
+                "uly",
+                "instFamily",
+                "ctType",
+                "ctVal",
+                "ctMult",
+                "ctValCcy",
+                "settleCcy",
+                "lotSz",
+                "minSz",
+                "tickSz",
+                "state",
+            )
+        } | {"source": "okx_public_instruments"}
 
     async def fetch_tickers(self, symbols: list[str] | None = None) -> dict:
         target_inst_ids = {
@@ -237,7 +279,13 @@ class OKXRestClient:
             "open_interest_value": value,
         }
 
-    async def fetch_order_book_metrics(self, symbol: str, limit: int = 20) -> dict[str, Any]:
+    async def fetch_order_book_metrics(
+        self,
+        symbol: str,
+        limit: int = 20,
+        *,
+        contract_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return top-book spread, depth and imbalance for the USDT swap."""
         try:
             book = await self._ccxt_call(
@@ -272,28 +320,108 @@ class OKXRestClient:
         )
         total_depth = bid_depth + ask_depth
         imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0.0
+        normalized_spec = normalize_okx_contract_spec(contract_spec)
+        contract_value = self._safe_float(normalized_spec.get("contract_value"))
+        contract_multiplier = self._safe_float(
+            normalized_spec.get("contract_multiplier") or 1.0
+        )
+        contract_base_size = contract_value * contract_multiplier
+        bid_depth_usdt = bid_depth * contract_base_size if contract_base_size > 0 else 0.0
+        ask_depth_usdt = ask_depth * contract_base_size if contract_base_size > 0 else 0.0
+        info = book.get("info") if isinstance(book.get("info"), dict) else {}
+        source_timestamp_ms = int(
+            self._safe_float(book.get("timestamp") or info.get("ts"))
+        )
+        inst_id = okx_inst_id_from_symbol(symbol)
         return {
             "spread_pct": spread_pct,
-            "orderbook_bid_depth": bid_depth,
-            "orderbook_ask_depth": ask_depth,
+            "orderbook_bid_depth": bid_depth_usdt,
+            "orderbook_ask_depth": ask_depth_usdt,
             "orderbook_imbalance": imbalance,
+            "orderbook_fact": {
+                "inst_id": inst_id,
+                "inst_type": "SWAP",
+                "source_endpoint": "okx_rest_market_books",
+                "source_channel": "books",
+                "source_timestamp_ms": source_timestamp_ms,
+                "bid": bid,
+                "ask": ask,
+                "bid_depth_usdt": bid_depth_usdt,
+                "ask_depth_usdt": ask_depth_usdt,
+                "contract_spec_version": normalized_spec.get("spec_version"),
+            },
         }
 
-    async def fetch_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
+    async def fetch_reference_prices(
+        self,
+        symbol: str,
+        *,
+        contract_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_spec = normalize_okx_contract_spec(contract_spec)
+        inst_id = okx_inst_id_from_symbol(symbol)
+        uly = str(normalized_spec.get("uly") or inst_id.removesuffix("-SWAP")).upper()
+        mark_result, index_result = await asyncio.gather(
+            self._ccxt_call(
+                "publicGetPublicMarkPrice",
+                {"instType": "SWAP", "instId": inst_id},
+            ),
+            self._ccxt_call("publicGetMarketIndexTickers", {"instId": uly}),
+            return_exceptions=True,
+        )
+        mark_rows = (
+            mark_result.get("data", []) if isinstance(mark_result, dict) else []
+        )
+        index_rows = (
+            index_result.get("data", []) if isinstance(index_result, dict) else []
+        )
+        mark_row = mark_rows[0] if mark_rows and isinstance(mark_rows[0], dict) else {}
+        index_row = index_rows[0] if index_rows and isinstance(index_rows[0], dict) else {}
+        mark_price = self._safe_float(mark_row.get("markPx"))
+        index_price = self._safe_float(index_row.get("idxPx"))
+        return {
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "mark_price_fact": {
+                "inst_id": str(mark_row.get("instId") or inst_id).upper(),
+                "inst_type": str(mark_row.get("instType") or "SWAP").upper(),
+                "source_endpoint": "okx_rest_public_mark_price",
+                "source_channel": "mark-price",
+                "source_timestamp_ms": int(self._safe_float(mark_row.get("ts"))),
+                "price": mark_price,
+            },
+            "index_price_fact": {
+                "inst_id": str(index_row.get("instId") or uly).upper(),
+                "inst_type": "INDEX",
+                "source_endpoint": "okx_rest_market_index_tickers",
+                "source_channel": "index-tickers",
+                "source_timestamp_ms": int(self._safe_float(index_row.get("ts"))),
+                "price": index_price,
+            },
+        }
+
+    async def fetch_derivatives_snapshot(
+        self,
+        symbol: str,
+        *,
+        contract_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Fetch compact perpetual-swap features used by AI experts."""
         results = await asyncio.gather(
             self.fetch_funding_rate(symbol),
             self.fetch_open_interest(symbol),
-            self.fetch_order_book_metrics(symbol),
+            self.fetch_order_book_metrics(symbol, contract_spec=contract_spec),
+            self.fetch_reference_prices(symbol, contract_spec=contract_spec),
             return_exceptions=True,
         )
-        funding, open_interest, orderbook = (
+        funding, open_interest, orderbook, reference_prices = (
             item if isinstance(item, dict) else {} for item in results
         )
         return {
             **funding,
             **open_interest,
             **orderbook,
+            **reference_prices,
         }
 
     async def fetch_balance(self) -> dict:

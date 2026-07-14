@@ -42,6 +42,10 @@ class _PublicApi:
         self.calls.append(("get_position_tiers", dict(kwargs)))
         return {"code": "0", "data": [{"maxLever": "20"}]}
 
+    def get_mark_price(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_mark_price", dict(kwargs)))
+        return {"code": "0", "data": [{"markPx": "0.0129"}]}
+
 
 class _MarketApi:
     def __init__(self) -> None:
@@ -50,6 +54,10 @@ class _MarketApi:
     def get_tickers(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get_tickers", dict(kwargs)))
         return {"code": "0", "data": []}
+
+    def get_index_tickers(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_index_tickers", dict(kwargs)))
+        return {"code": "0", "data": [{"idxPx": "0.0129"}]}
 
 
 class _TradeApi:
@@ -116,6 +124,16 @@ def test_sdk_adapter_enables_cached_okx_server_time_for_private_api(
     assert api.urls == [f"{okx_perpetual_sdk.OKX_DOMAIN}{okx_perpetual_sdk.OKX_SERVER_TIME_PATH}"]
 
 
+def test_public_market_data_stays_live_when_private_paper_account_is_demo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(okx_perpetual_sdk, "okx_sdk_flag_for_mode", lambda _mode: "1")
+    exchange = OkxPerpetualSdkExchange("paper")
+
+    assert okx_perpetual_sdk.okx_sdk_flag_for_mode("paper") == "1"
+    assert exchange._public_kwargs()["flag"] == "0"
+
+
 @pytest.mark.asyncio
 async def test_sdk_adapter_forces_public_tickers_to_swap() -> None:
     exchange = OkxPerpetualSdkExchange("paper")
@@ -134,6 +152,37 @@ async def test_sdk_adapter_rejects_non_swap_public_tickers() -> None:
 
     with pytest.raises(ExchangeAPIError, match="Only OKX SWAP"):
         await exchange.publicGetMarketTickers({"instType": "SPOT"})
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_exposes_native_mark_and_index_price_calls() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    market_api = _MarketApi()
+    public_api = _PublicApi()
+    exchange._market_api = market_api
+    exchange._public_api = public_api
+
+    mark = await exchange.publicGetPublicMarkPrice(
+        {"instType": "SWAP", "instId": "ROBO-USDT-SWAP"}
+    )
+    index = await exchange.publicGetMarketIndexTickers({"instId": "ROBO-USDT"})
+
+    assert mark["data"][0]["markPx"] == "0.0129"
+    assert index["data"][0]["idxPx"] == "0.0129"
+    assert public_api.calls == [
+        (
+            "get_mark_price",
+            {
+                "instType": "SWAP",
+                "uly": "",
+                "instFamily": "",
+                "instId": "ROBO-USDT-SWAP",
+            },
+        )
+    ]
+    assert market_api.calls == [
+        ("get_index_tickers", {"quoteCcy": "", "instId": "ROBO-USDT"})
+    ]
 
 
 @pytest.mark.asyncio

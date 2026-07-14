@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from core.market_facts import build_market_fact
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
 
 
@@ -71,6 +72,12 @@ class FeatureVector:
     indicator_close_price: float = 0.0
     indicator_price_gap_pct: float = 0.0
     price_reconciliation_warning: str = ""
+    market_fact: dict[str, Any] = field(default_factory=dict)
+    mark_price: float = 0.0
+    index_price: float = 0.0
+    mark_price_fact: dict[str, Any] = field(default_factory=dict)
+    index_price_fact: dict[str, Any] = field(default_factory=dict)
+    orderbook_fact: dict[str, Any] = field(default_factory=dict)
     indicator_snapshot_available: bool = False
     indicator_snapshot_stale: bool = False
     indicator_snapshot_refresh_in_background: bool = False
@@ -335,6 +342,34 @@ def build_feature_vector(
         for key, value in derivatives.items():
             if hasattr(fv, key):
                 setattr(fv, key, value)
+
+    ticker_fact_input = dict(ticker or {})
+    ticker_fact_input.update(
+        {
+            "symbol": fv.symbol,
+            "current_price": fv.current_price,
+            "last_price": fv.current_price,
+            "bid": fv.bid,
+            "ask": fv.ask,
+            "notional_24h_usdt": fv.notional_24h_usdt,
+            "volume_24h_contracts": fv.volume_24h_contracts,
+            "volume_24h_base": fv.volume_24h_base,
+            "orderbook_bid_depth": fv.orderbook_bid_depth,
+            "orderbook_ask_depth": fv.orderbook_ask_depth,
+            "price_reconciliation_warning": fv.price_reconciliation_warning,
+            "mark_price": fv.mark_price,
+            "index_price": fv.index_price,
+            "stale": bool(
+                ticker_fact_input.get("stale") or fv.derivatives_snapshot_stale
+            ),
+        }
+    )
+    fv.market_fact = build_market_fact(
+        fv.symbol,
+        ticker_fact_input,
+        contract_spec=ticker_fact_input.get("contract_spec"),
+        received_at=ticker_fact_input.get("received_at"),
+    )
 
     fv.liquidation_risk_score = _derive_liquidation_risk_score(fv)
     fv.sector_relative_strength = _derive_sector_relative_strength(fv)

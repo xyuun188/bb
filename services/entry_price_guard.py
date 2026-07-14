@@ -33,10 +33,10 @@ def _feature_snapshot(value: Any) -> dict[str, Any]:
 class EntryPriceGuardPolicy:
     """Require current adverse drift to fit inside authoritative return budget."""
 
-    latest_price_provider: Callable[[str], Awaitable[float]]
     fresh_feature_provider: Callable[[str], Awaitable[Any]]
     market_data_quality_reason_provider: Callable[..., str | None]
     decision_age_seconds_provider: Callable[[DecisionOutput], float]
+
     async def guard_reason(self, decision: DecisionOutput) -> str | None:
         if not decision.is_entry:
             return None
@@ -47,17 +47,18 @@ class EntryPriceGuardPolicy:
             stage_label="pre-order analysis snapshot",
         )
         if quality_reason:
-            snapshot = await self._fresh_valid_snapshot(decision.symbol)
-            if not snapshot:
-                return "Pre-order market data is incomplete; entry fails closed."
-            decision.feature_snapshot = snapshot
+            return f"Pre-order analysis market fact is invalid; entry fails closed: {quality_reason}"
+
+        fresh = await self._fresh_valid_snapshot(decision.symbol)
+        if not fresh:
+            return "Fresh pre-order native market fact is incomplete; entry fails closed."
 
         snapshot_price = _safe_float(snapshot.get("current_price") or snapshot.get("close"))
         if snapshot_price <= 0:
             return "Pre-order analysis price is missing; entry fails closed."
-        latest_price = await self.latest_price_provider(decision.symbol)
+        latest_price = _safe_float(fresh.get("current_price") or fresh.get("close"))
         if latest_price <= 0:
-            return "Latest pre-order price is unavailable; entry fails closed."
+            return "Fresh pre-order native price is unavailable; entry fails closed."
 
         return_budget = self._return_budget_fraction(decision)
         allowed = return_budget
@@ -67,6 +68,8 @@ class EntryPriceGuardPolicy:
         move = (latest_price - snapshot_price) / snapshot_price
         adverse = self._adverse_move(decision.action, move)
         raw = _safe_dict(decision.raw_response)
+        analysis_fact = _safe_dict(snapshot.get("market_fact"))
+        fresh_fact = _safe_dict(fresh.get("market_fact"))
         raw["pre_execution_price_check"] = {
             "snapshot_price": snapshot_price,
             "latest_price": latest_price,
@@ -82,26 +85,22 @@ class EntryPriceGuardPolicy:
                 "strategy_version": "2026-07-12.dynamic-price-budget.v1",
                 "fallback_reason": "",
             },
+            "native_market_fact_proof": {
+                "analysis_fact_id": analysis_fact.get("fact_id"),
+                "fresh_fact_id": fresh_fact.get("fact_id"),
+                "analysis_inst_id": _safe_dict(
+                    analysis_fact.get("native_identity")
+                ).get("inst_id"),
+                "fresh_inst_id": _safe_dict(fresh_fact.get("native_identity")).get(
+                    "inst_id"
+                ),
+                "fresh_source_timestamp_ms": fresh_fact.get("source_timestamp_ms"),
+                "fresh_source_interface": fresh_fact.get("source_interface"),
+            },
         }
         decision.raw_response = raw
         if adverse <= allowed:
             return None
-
-        fresh = await self._fresh_valid_snapshot(decision.symbol)
-        fresh_price = _safe_float(fresh.get("current_price") or fresh.get("close"))
-        if fresh_price > 0:
-            refreshed_gap = abs(latest_price - fresh_price) / fresh_price
-            raw["pre_execution_price_recheck"] = {
-                "fresh_price": fresh_price,
-                "latest_price": latest_price,
-                "fresh_gap_fraction": round(refreshed_gap, 8),
-                "allowed_adverse_move_fraction": round(allowed, 8),
-                "accepted": refreshed_gap <= allowed,
-            }
-            decision.raw_response = raw
-            if refreshed_gap <= allowed:
-                decision.feature_snapshot = fresh
-                return None
 
         return (
             "Current adverse price movement exceeds the authoritative fee-after return "

@@ -8,6 +8,15 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from core.market_facts import (
+    MARKET_FACT_CONTRACT_VERSION,
+    compact_market_fact_contract,
+    market_fact_contract_reasons,
+)
+from core.training_contracts import (
+    SHADOW_LABEL_VERSION,
+    shadow_label_contract_reasons,
+)
 from services.dynamic_policy_values import empirical_policy_value
 from services.execution_cost_model import execution_cost_estimate
 from services.return_loss_attribution import normalize_losing_exit_attribution
@@ -15,8 +24,7 @@ from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-07-12.v1"
-MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
+DATA_QUALITY_VERSION = "2026-07-14.immutable-shadow-label.v3"
 PROFIT_LEARNING_VERSION = "fee-after-return-training-v3"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 MAX_WORST_SAMPLE_COUNT = 8
@@ -129,6 +137,11 @@ def _features(sample: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _shadow_market_fact_contract(features: dict[str, Any]) -> dict[str, Any]:
+    compact = _safe_dict(features.get("training_market_fact_contract"))
+    return compact or _safe_dict(features.get("market_fact_contract"))
+
+
 def _iter_text_values(value: Any) -> Any:
     if isinstance(value, str):
         yield value
@@ -149,7 +162,11 @@ def _sample_guard_reasons(sample: dict[str, Any], *text_values: Any) -> list[str
     if _has_mojibake_text(sample, *text_values):
         reasons.append("mojibake_text")
     if _is_duplicate_sample(sample):
-        reasons.append("duplicate_sample")
+        reasons.append(
+            "duplicate_decision_horizon_label_version"
+            if sample.get("duplicate_label_identity")
+            else "duplicate_sample"
+        )
     if _has_future_leakage(sample, *text_values):
         reasons.append("future_leakage")
     return reasons
@@ -374,9 +391,32 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if horizon <= 0:
         return _final_assessment(0.0, ["invalid_horizon_minutes"], exclude=True)
 
+    label_contract_reasons = shadow_label_contract_reasons(
+        features.get("training_label_contract"),
+        decision_id=sample.get("decision_id"),
+        horizon_minutes=horizon,
+        label_version=sample.get("label_version"),
+    )
+    if label_contract_reasons:
+        return _final_assessment(
+            0.0,
+            [f"shadow_label_contract:{reason}" for reason in label_contract_reasons],
+            exclude=True,
+        )
+
     cost_reasons = _shadow_cost_completeness_reasons(features)
     if cost_reasons:
         return _final_assessment(0.0, cost_reasons, exclude=True)
+
+    fact_contract_reasons = market_fact_contract_reasons(
+        _shadow_market_fact_contract(features)
+    )
+    if fact_contract_reasons:
+        return _final_assessment(
+            0.0,
+            [f"market_fact_contract:{reason}" for reason in fact_contract_reasons],
+            exclude=True,
+        )
 
     return _final_assessment(score, reasons, exclude=exclude)
 
@@ -890,11 +930,196 @@ def annotate_sample(sample: dict[str, Any], kind: SampleKind) -> dict[str, Any]:
     if labels:
         annotated["profit_learning_labels"] = labels
         _apply_profit_learning_aliases(annotated, kind=kind, labels=labels)
+    annotated["training_sample_contract"] = _training_sample_contract(
+        annotated,
+        kind=kind,
+    )
     return annotated
 
 
 def annotate_samples(samples: list[dict[str, Any]], kind: SampleKind) -> list[dict[str, Any]]:
-    return [annotate_sample(sample, kind) for sample in samples]
+    prepared = [dict(sample) for sample in samples]
+    if kind == "shadow":
+        seen: dict[tuple[int, int, str], int] = {}
+        for sample in prepared:
+            features = _features(sample)
+            label_contract = _safe_dict(features.get("training_label_contract"))
+            identity = _safe_dict(label_contract.get("identity"))
+            decision_id = int(
+                _safe_float(sample.get("decision_id") or identity.get("decision_id"), 0.0)
+                or 0
+            )
+            horizon = int(_safe_float(sample.get("horizon_minutes"), 0.0) or 0)
+            version = _safe_str(
+                sample.get("label_version") or label_contract.get("version")
+            )
+            if decision_id <= 0 or horizon <= 0 or not version:
+                continue
+            key = (decision_id, horizon, version)
+            if key in seen:
+                sample["is_duplicate"] = True
+                sample["duplicate_of"] = seen[key]
+                sample["duplicate_label_identity"] = {
+                    "decision_id": decision_id,
+                    "horizon_minutes": horizon,
+                    "label_version": version,
+                }
+            else:
+                seen[key] = int(_safe_float(sample.get("id"), 0.0) or len(seen) + 1)
+    return [annotate_sample(sample, kind) for sample in prepared]
+
+
+def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> dict[str, Any]:
+    features = _features(sample)
+    market_contract = compact_market_fact_contract(_shadow_market_fact_contract(features))
+    lineage = {
+        "sample_kind": kind,
+        "source": _sample_source(sample, kind),
+        "symbol": _safe_str(sample.get("symbol") or features.get("symbol")),
+        "decision_id": sample.get("decision_id"),
+        "horizon_minutes": sample.get("horizon_minutes"),
+        "label_version": sample.get("label_version")
+        or _safe_dict(features.get("training_label_contract")).get("version"),
+        "feature_timestamp": sample.get("feature_timestamp") or features.get("timestamp"),
+        "label_timestamp": sample.get("label_timestamp"),
+    }
+    label = {
+        "long_return_pct": _safe_float(sample.get("long_return_pct"), None),
+        "short_return_pct": _safe_float(sample.get("short_return_pct"), None),
+        "realized_pnl": _safe_float(sample.get("realized_pnl"), None),
+        "outcome": _safe_str(sample.get("outcome")),
+        "best_action": _safe_str(sample.get("best_action")),
+        "label_fingerprint": _safe_dict(
+            features.get("training_label_contract")
+        ).get("label_fingerprint"),
+    }
+    cost = {
+        key: features.get(key)
+        for key in (
+            "bid",
+            "ask",
+            "spread_pct",
+            "taker_fee_rate",
+            "entry_fee_rate",
+            "exit_fee_rate",
+            "funding_rate",
+            "funding_interval_minutes",
+        )
+        if key in features
+    }
+    fingerprint_payload = {
+        "data_quality_version": DATA_QUALITY_VERSION,
+        "lineage": lineage,
+        "market_fact_data_fingerprint": _safe_dict(
+            market_contract.get("provenance")
+        ).get("data_fingerprint"),
+        "cost": cost,
+        "label": label,
+        "quality_status": sample.get("data_quality_status"),
+        "quality_reasons": sample.get("quality_reasons") or [],
+    }
+    return {
+        "version": DATA_QUALITY_VERSION,
+        "immutable": True,
+        "required_label_version": SHADOW_LABEL_VERSION if kind == "shadow" else None,
+        "lineage": lineage,
+        "market_fact_contract": market_contract,
+        "shadow_label_contract": _safe_dict(features.get("training_label_contract")),
+        "cost_facts": cost,
+        "label": label,
+        "quality": {
+            "status": sample.get("data_quality_status"),
+            "score": sample.get("data_quality_score"),
+            "weight": sample.get("sample_weight"),
+            "reasons": sample.get("quality_reasons") or [],
+        },
+        "sample_fingerprint": hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _aggregate_market_fact_contract(
+    samples_by_kind: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    shadow_samples = samples_by_kind.get("shadow", [])
+    trainable = [
+        sample
+        for sample in shadow_samples
+        if _safe_str(sample.get("data_quality_status")) != "excluded"
+    ]
+    contracts = [
+        _shadow_market_fact_contract(_features(sample)) for sample in trainable
+    ]
+    reasons = [reason for contract in contracts for reason in market_fact_contract_reasons(contract)]
+    clean = bool(contracts) and not reasons
+    assertions = (
+        {
+            name: bool(
+                contracts
+                and all(
+                    (
+                        _safe_dict(contract.get("assertions")).get(name)
+                        if _safe_dict(contract.get("assertions"))
+                        else contract.get(name)
+                    )
+                    is True
+                    for contract in contracts
+                )
+            )
+            for name in (
+                "native_instrument_identity_verified",
+                "same_contract_price_path_verified",
+                "executable_market_fact_verified",
+            )
+        }
+    )
+    fingerprints = sorted(
+        _safe_str(
+            _safe_dict(contract.get("provenance")).get("data_fingerprint")
+            or contract.get("data_fingerprint")
+        )
+        for contract in contracts
+        if _safe_str(
+            _safe_dict(contract.get("provenance")).get("data_fingerprint")
+            or contract.get("data_fingerprint")
+        )
+    )
+    effective_sample_size = sum(
+        float(_safe_float(sample.get("sample_weight"), 0.0) or 0.0) for sample in trainable
+    )
+    generated_at = datetime.now(UTC).isoformat()
+    data_fingerprint = hashlib.sha256(
+        json.dumps(fingerprints, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "clean" if clean else "quarantined" if contracts else "missing",
+        "violation_count": len(reasons),
+        "violation_reasons": list(dict.fromkeys(reasons)),
+        "assertions": assertions,
+        "quarantined_raw_sample_count": sum(
+            1
+            for sample in shadow_samples
+            if _safe_str(sample.get("data_quality_status")) == "excluded"
+        ),
+        "provenance": {
+            "source": "immutable_shadow_training_view_market_fact_contracts",
+            "observation_window": "current_immutable_shadow_training_view",
+            "sample_count": len(contracts),
+            "effective_sample_size": round(effective_sample_size, 8),
+            "generated_at": generated_at,
+            "strategy_version": MARKET_FACT_CONTRACT_VERSION,
+            "fallback_reason": "" if clean else "clean_market_fact_training_view_missing",
+            "data_fingerprint": data_fingerprint,
+        },
+    }
 
 
 def trainable_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1476,6 +1701,181 @@ def _shadow_model_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return rows
 
 
+def _weighted_mean(
+    samples: list[dict[str, Any]],
+    value_key: str,
+) -> float | None:
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for sample in samples:
+        value = _safe_float(sample.get(value_key), None)
+        weight = _safe_float(sample.get("sample_weight"), 0.0) or 0.0
+        if value is None or weight <= 0:
+            continue
+        weighted_sum += value * weight
+        weight_sum += weight
+    return weighted_sum / weight_sum if weight_sum > 0 else None
+
+
+def _shadow_training_view_diagnostics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    trainable = [sample for sample in samples if not sample.get("exclude_from_training")]
+    projected: list[dict[str, Any]] = []
+    for sample in trainable:
+        long_return = _safe_float(sample.get("long_return_pct"), None)
+        short_return = _safe_float(sample.get("short_return_pct"), None)
+        if long_return is None or short_return is None:
+            continue
+        projected.append(
+            {
+                **sample,
+                "best_return_pct": max(long_return, short_return),
+            }
+        )
+
+    overall = {
+        "long_return_pct": _weighted_mean(projected, "long_return_pct"),
+        "short_return_pct": _weighted_mean(projected, "short_return_pct"),
+        "best_return_pct": _weighted_mean(projected, "best_return_pct"),
+    }
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for sample in projected:
+        symbol = _safe_str(sample.get("symbol") or _features(sample).get("symbol"))
+        by_symbol.setdefault(symbol or "unknown", []).append(sample)
+
+    leave_one_symbol_out: list[dict[str, Any]] = []
+    for symbol, symbol_samples in by_symbol.items():
+        without_symbol = [
+            sample
+            for sample in projected
+            if _safe_str(sample.get("symbol") or _features(sample).get("symbol"))
+            != symbol
+        ]
+        without = {
+            "long_return_pct": _weighted_mean(without_symbol, "long_return_pct"),
+            "short_return_pct": _weighted_mean(without_symbol, "short_return_pct"),
+            "best_return_pct": _weighted_mean(without_symbol, "best_return_pct"),
+        }
+        best_delta = (
+            float(without["best_return_pct"]) - float(overall["best_return_pct"])
+            if without["best_return_pct"] is not None
+            and overall["best_return_pct"] is not None
+            else None
+        )
+        leave_one_symbol_out.append(
+            {
+                "symbol": symbol,
+                "sample_count": len(symbol_samples),
+                "effective_sample_size": round(
+                    sum(
+                        float(_safe_float(sample.get("sample_weight"), 0.0) or 0.0)
+                        for sample in symbol_samples
+                    ),
+                    8,
+                ),
+                "sample_share": round(len(symbol_samples) / max(len(projected), 1), 8),
+                "symbol_best_return_pct": _weighted_mean(
+                    symbol_samples,
+                    "best_return_pct",
+                ),
+                "without_symbol": without,
+                "best_return_mean_delta_pct": best_delta,
+                "absolute_influence_pct": abs(best_delta) if best_delta is not None else None,
+            }
+        )
+    leave_one_symbol_out.sort(
+        key=lambda item: float(item.get("absolute_influence_pct") or 0.0),
+        reverse=True,
+    )
+
+    time_buckets: dict[str, list[dict[str, Any]]] = {}
+    for sample in projected:
+        timestamp = _parse_datetime(
+            sample.get("label_timestamp")
+            or _safe_dict(
+                _safe_dict(_features(sample).get("training_label_contract")).get(
+                    "labels"
+                )
+            ).get("label_timestamp")
+            or _safe_dict(_features(sample).get("training_label_contract")).get(
+                "label_timestamp"
+            )
+        )
+        bucket = timestamp.date().isoformat() if timestamp else "unknown"
+        time_buckets.setdefault(bucket, []).append(sample)
+    time_influence = [
+        {
+            "date": date,
+            "sample_count": len(bucket_samples),
+            "effective_sample_size": round(
+                sum(
+                    float(_safe_float(sample.get("sample_weight"), 0.0) or 0.0)
+                    for sample in bucket_samples
+                ),
+                8,
+            ),
+            "long_return_pct": _weighted_mean(bucket_samples, "long_return_pct"),
+            "short_return_pct": _weighted_mean(bucket_samples, "short_return_pct"),
+            "best_return_pct": _weighted_mean(bucket_samples, "best_return_pct"),
+        }
+        for date, bucket_samples in sorted(time_buckets.items())
+    ]
+    fingerprints = sorted(
+        _safe_str(
+            _safe_dict(sample.get("training_sample_contract")).get(
+                "sample_fingerprint"
+            )
+        )
+        for sample in samples
+        if _safe_str(
+            _safe_dict(sample.get("training_sample_contract")).get(
+                "sample_fingerprint"
+            )
+        )
+    )
+    return {
+        "raw_sample_count": len(samples),
+        "trainable_sample_count": len(trainable),
+        "quarantined_sample_count": sum(
+            1 for sample in samples if sample.get("exclude_from_training")
+        ),
+        "effective_sample_size": round(
+            sum(
+                float(_safe_float(sample.get("sample_weight"), 0.0) or 0.0)
+                for sample in trainable
+            ),
+            8,
+        ),
+        "overall_return_distribution": overall,
+        "leave_one_symbol_out": leave_one_symbol_out,
+        "max_single_symbol_influence": (
+            leave_one_symbol_out[0] if leave_one_symbol_out else None
+        ),
+        "time_influence": time_influence,
+        "provenance": {
+            "source": "immutable_clean_shadow_training_view",
+            "observation_window": "all_supplied_shadow_samples",
+            "sample_count": len(samples),
+            "effective_sample_size": round(
+                sum(
+                    float(_safe_float(sample.get("sample_weight"), 0.0) or 0.0)
+                    for sample in trainable
+                ),
+                8,
+            ),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "strategy_version": DATA_QUALITY_VERSION,
+            "fallback_reason": "" if trainable else "clean_training_view_empty",
+            "data_fingerprint": hashlib.sha256(
+                json.dumps(
+                    fingerprints,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        },
+    }
+
+
 def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     by_kind: dict[str, Any] = {}
     totals = Counter()
@@ -1552,12 +1952,16 @@ def quality_report(samples_by_kind: dict[str, list[dict[str, Any]]]) -> dict[str
     total_count = sum(len(samples) for samples in samples_by_kind.values())
     return {
         "data_quality_version": DATA_QUALITY_VERSION,
+        "market_fact_contract": _aggregate_market_fact_contract(samples_by_kind),
         "policy": asdict(DEFAULT_TRADING_PARAMS.training_data_quality),
         "by_kind": by_kind,
         "profit_learning_summary": {
             kind: _profit_learning_report(samples) for kind, samples in samples_by_kind.items()
         },
         "specialist_shadow_models": _shadow_model_report(samples_by_kind.get("shadow", [])),
+        "training_view_diagnostics": _shadow_training_view_diagnostics(
+            samples_by_kind.get("shadow", [])
+        ),
         "training_label_consistency": _training_label_consistency(
             samples_by_kind.get("trade", [])
         ),

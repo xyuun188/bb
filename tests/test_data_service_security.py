@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from data_feed.feature_vector import build_feature_vector
 from services import data_service as data_service_module
 from services.data_service import DataService
 
@@ -1030,6 +1031,119 @@ async def test_ticker_snapshot_refreshes_fresh_but_inconsistent_ws_cache() -> No
     assert snapshot["last_price"] == pytest.approx(0.5531)
     assert snapshot["source"] == "rest"
     assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5531)
+
+
+@pytest.mark.asyncio
+async def test_feature_market_fact_proves_rest_ws_book_reference_and_native_path() -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    minute_open = timestamp - timestamp % 60_000
+    spec = {
+        "instId": "PROS-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "PROS-USDT",
+        "instFamily": "PROS-USDT",
+        "ctType": "linear",
+        "ctVal": "1",
+        "ctMult": "1",
+        "ctValCcy": "PROS",
+        "settleCcy": "USDT",
+        "lotSz": "1",
+        "minSz": "1",
+        "tickSz": "0.0001",
+        "state": "live",
+    }
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "inst_id": "PROS-USDT-SWAP",
+                "inst_type": "SWAP",
+                "last_price": 0.5531,
+                "bid": 0.5530,
+                "ask": 0.5532,
+                "high_24h": 0.56,
+                "low_24h": 0.54,
+                "notional_24h_usdt": 1_000_000.0,
+                "volume_24h_contracts": 2_000_000.0,
+                "volume_24h_base": 2_000_000.0,
+                "timestamp": timestamp,
+                "source": "websocket",
+                "source_endpoint": "okx_ws_public",
+                "source_channel": "tickers",
+            }
+        }
+
+    class FakeRestClient:
+        async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "last": 0.5531,
+                "bid": 0.5530,
+                "ask": 0.5532,
+                "high": 0.56,
+                "low": 0.54,
+                "baseVolume": 2_000_000.0,
+                "quoteVolume": 1_106_200.0,
+                "percentage": 1.0,
+                "timestamp": timestamp,
+                "info": {
+                    "instId": "PROS-USDT-SWAP",
+                    "ts": str(timestamp),
+                    "vol24h": "2000000",
+                    "volCcy24h": "2000000",
+                },
+            }
+
+        async def fetch_instrument_spec(self, _symbol: str) -> dict[str, Any]:
+            return spec
+
+        async def fetch_ohlcv(self, _symbol: str, **_kwargs) -> list[list[float]]:
+            return [[minute_open, 0.5528, 0.5534, 0.5527, 0.5531, 10_000.0]]
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+    ticker = await service._get_ticker_snapshot("PROS/USDT")
+    derivatives = {
+        "orderbook_bid_depth": 50_000.0,
+        "orderbook_ask_depth": 49_000.0,
+        "mark_price": 0.5531,
+        "index_price": 0.5530,
+        "orderbook_fact": {
+            "inst_id": "PROS-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source_timestamp_ms": timestamp,
+            "bid": 0.5530,
+            "ask": 0.5532,
+            "bid_depth_usdt": 50_000.0,
+            "ask_depth_usdt": 49_000.0,
+        },
+        "mark_price_fact": {
+            "inst_id": "PROS-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source_timestamp_ms": timestamp,
+            "price": 0.5531,
+        },
+        "index_price_fact": {
+            "inst_id": "PROS-USDT",
+            "inst_type": "INDEX",
+            "source_timestamp_ms": timestamp,
+            "price": 0.5530,
+        },
+    }
+
+    enriched = service._attach_market_source_consistency(
+        "PROS/USDT", ticker, derivatives
+    )
+    vector = build_feature_vector(
+        "PROS/USDT",
+        ticker=enriched,
+        derivatives=derivatives,
+    )
+
+    assert len(ticker["market_source_snapshots"]) == 2
+    assert vector.market_fact["source_consistency"]["status"] == "clean"
+    assert vector.market_fact["quality"]["status"] == "clean"
 
 
 def test_news_item_summary_keeps_safe_external_url() -> None:

@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import func, or_, select
 
+from core.training_contracts import SHADOW_LABEL_VERSION
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
@@ -147,6 +148,23 @@ class MemoryRepository(BaseRepository):
 
     async def create_shadow_backtest(self, data: dict[str, Any]) -> ShadowBacktest:
         data = _normalize_shadow_backtest_payload(dict(data or {}))
+        data["label_version"] = str(data.get("label_version") or SHADOW_LABEL_VERSION)
+        decision_id = int(data.get("decision_id") or 0)
+        horizon_minutes = int(data.get("horizon_minutes") or 0)
+        if decision_id > 0 and horizon_minutes > 0:
+            existing = (
+                await self.session.execute(
+                    select(ShadowBacktest)
+                    .where(
+                        ShadowBacktest.decision_id == decision_id,
+                        ShadowBacktest.horizon_minutes == horizon_minutes,
+                        ShadowBacktest.label_version == data["label_version"],
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
         row = ShadowBacktest(**data)
         self.session.add(row)
         await self.session.flush()

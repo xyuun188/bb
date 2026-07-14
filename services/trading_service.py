@@ -641,6 +641,8 @@ class TradingService:
             symbol_normalizer=self._normalize_position_symbol,
             float_parser=self._safe_float,
             execution_cost_facts_provider=self._shadow_execution_cost_facts,
+            latest_market_fact_provider=self.data_service.get_latest_market_fact,
+            price_path_provider=self.data_service.verify_market_fact_path,
         )
         self.stale_entry_candidate_expirer = StaleEntryCandidateExpirer(self._safe_float)
         self.decision_final_state_ensurer = DecisionFinalStateEnsurer(
@@ -649,7 +651,6 @@ class TradingService:
             model_execution_mode_provider=self._get_model_execution_mode,
         )
         self.entry_price_guard = EntryPriceGuardPolicy(
-            latest_price_provider=self._latest_price_for_symbol,
             fresh_feature_provider=self._fresh_feature_vector_for_price_recheck,
             market_data_quality_reason_provider=self.entry_market_data_quality.reason,
             decision_age_seconds_provider=self.decision_freshness.decision_age_seconds,
@@ -3596,7 +3597,7 @@ class TradingService:
                     symbol,
                     wait_for_sentiment=False,
                     block_on_remote_indicators=False,
-                    block_on_remote_derivatives=False,
+                    block_on_remote_derivatives=True,
                 ),
                 timeout=8.0,
             )

@@ -601,6 +601,8 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
 async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
     """Store a bounded training feature view beside every large shadow payload."""
 
+    from core.training_contracts import SHADOW_LABEL_VERSION
+
     if "postgresql" in settings.database_url:
         await conn.execute(
             text(
@@ -612,6 +614,39 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
             text(
                 "ALTER TABLE shadow_backtests "
                 "ADD COLUMN IF NOT EXISTS training_feature_snapshot_version INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE shadow_backtests "
+                "ADD COLUMN IF NOT EXISTS label_version VARCHAR(80)"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE shadow_backtests "
+                "SET label_version = 'legacy-row-' || id::text "
+                "WHERE label_version IS NULL OR label_version = ''"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE shadow_backtests "
+                f"ALTER COLUMN label_version SET DEFAULT '{SHADOW_LABEL_VERSION}'"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE shadow_backtests "
+                "ALTER COLUMN label_version SET NOT NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_shadow_decision_horizon_label_version "
+                "ON shadow_backtests (decision_id, horizon_minutes, label_version) "
+                "WHERE decision_id IS NOT NULL"
             )
         )
         await conn.execute(
@@ -689,9 +724,25 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
     for name, column_type in (
         ("training_feature_snapshot", "JSON"),
         ("training_feature_snapshot_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("label_version", "VARCHAR(80)"),
     ):
         if name not in existing:
             await conn.execute(text(f"ALTER TABLE shadow_backtests ADD COLUMN {name} {column_type}"))
+    await conn.execute(
+        text(
+            "UPDATE shadow_backtests "
+            "SET label_version = 'legacy-row-' || id "
+            "WHERE label_version IS NULL OR label_version = ''"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_shadow_decision_horizon_label_version "
+            "ON shadow_backtests (decision_id, horizon_minutes, label_version) "
+            "WHERE decision_id IS NOT NULL"
+        )
+    )
 
 
 async def _ensure_okx_account_bill_indexes(conn: Any) -> None:

@@ -11,7 +11,18 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from config.settings import FIXED_AI_MODEL_SLOTS, settings
+from core.market_facts import (
+    build_market_fact,
+    build_shadow_market_fact_contract,
+    compact_market_fact_contract,
+    verify_market_fact_path,
+)
 from core.safe_output import safe_error_text
+from core.training_contracts import (
+    SHADOW_LABEL_VERSION,
+    build_shadow_label_contract,
+    compact_shadow_label_contract,
+)
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from services.execution_cost_model import execution_cost_estimate
@@ -23,6 +34,8 @@ logger = structlog.get_logger(__name__)
 SHADOW_BACKTEST_HORIZONS_MINUTES = (10, 30, 60)
 
 LatestPriceProvider = Callable[[str], Awaitable[float]]
+LatestMarketFactProvider = Callable[[str], Awaitable[dict[str, Any]]]
+PricePathProvider = Callable[[dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any]]]
 SymbolNormalizer = Callable[[str | None], str]
 FloatParser = Callable[[Any, float], float]
 SessionFactory = Callable[[], Any]
@@ -284,6 +297,8 @@ class ShadowBacktestService:
     session_factory: SessionFactory = get_session_ctx
     repository_factory: RepositoryFactory = MemoryRepository
     execution_cost_facts_provider: ExecutionCostFactsProvider | None = None
+    latest_market_fact_provider: LatestMarketFactProvider | None = None
+    price_path_provider: PricePathProvider | None = None
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
     fixed_model_slots: list[dict[str, Any]] = field(
         default_factory=lambda: list(FIXED_AI_MODEL_SLOTS)
@@ -324,6 +339,23 @@ class ShadowBacktestService:
                 local_ai_shadow = compact_local_ai_tools_shadow(local_ai_tools_context)
                 if local_ai_shadow:
                     feature_snapshot["local_ai_tools_shadow"] = local_ai_shadow
+                entry_fact = feature_snapshot.get("market_fact")
+                if not isinstance(entry_fact, dict):
+                    entry_fact = build_market_fact(
+                        decision.symbol,
+                        {
+                            **feature_snapshot,
+                            "last_price": entry_price,
+                            "source": "legacy_shadow_entry_snapshot",
+                        },
+                        contract_spec=feature_snapshot.get("contract_spec"),
+                    )
+                    feature_snapshot["market_fact"] = entry_fact
+                market_contract = build_shadow_market_fact_contract(entry_fact, None, None)
+                feature_snapshot["market_fact_contract"] = market_contract
+                feature_snapshot["training_market_fact_contract"] = (
+                    compact_market_fact_contract(market_contract)
+                )
                 for horizon in self.horizons_minutes:
                     await repo.create_shadow_backtest(
                         {
@@ -344,6 +376,7 @@ class ShadowBacktestService:
                             "status": "pending",
                             "due_at": now + timedelta(minutes=int(horizon)),
                             "horizon_minutes": int(horizon),
+                            "label_version": SHADOW_LABEL_VERSION,
                         }
                     )
         except Exception as exc:
@@ -388,16 +421,46 @@ class ShadowBacktestService:
 
             # Price collection can wait on an exchange request.  Keep it outside the
             # ORM context so low-priority shadow maintenance cannot exhaust the pool.
-            price_cache: dict[str, float] = {}
+            market_fact_cache: dict[str, dict[str, Any]] = {}
             completions: dict[int, dict[str, Any]] = {}
             for row in rows:
                 row_id = int(getattr(row, "id", 0) or 0)
                 if row_id <= 0:
                     continue
                 symbol = self.symbol_normalizer(row.symbol) or row.symbol
-                if symbol not in price_cache:
-                    price_cache[symbol] = await self.latest_price_provider(symbol)
-                actual_price = self.float_parser(price_cache.get(symbol), 0.0)
+                if symbol not in market_fact_cache:
+                    if self.latest_market_fact_provider is not None:
+                        try:
+                            fact = await self.latest_market_fact_provider(symbol)
+                        except Exception as exc:
+                            logger.warning(
+                                "shadow result market fact unavailable",
+                                symbol=symbol,
+                                error=safe_error_text(exc),
+                            )
+                            fact = {}
+                    else:
+                        price = await self.latest_price_provider(symbol)
+                        fact = build_market_fact(
+                            symbol,
+                            {
+                                "last_price": price,
+                                "bid": price,
+                                "ask": price,
+                                "timestamp": datetime.now(UTC),
+                                "source": "legacy_price_only_observation",
+                                "source_endpoint": "legacy_latest_price_provider",
+                                "source_channel": "price_only",
+                            },
+                        )
+                    market_fact_cache[symbol] = dict(fact) if isinstance(fact, dict) else {}
+                result_fact = market_fact_cache.get(symbol, {})
+                result_prices = (
+                    result_fact.get("prices")
+                    if isinstance(result_fact.get("prices"), dict)
+                    else {}
+                )
+                actual_price = self.float_parser(result_prices.get("last"), 0.0)
                 entry_price = self.float_parser(row.entry_price, 0.0)
                 if actual_price <= 0 or entry_price <= 0:
                     continue
@@ -410,6 +473,39 @@ class ShadowBacktestService:
                 feature_snapshot = getattr(row, "feature_snapshot", None)
                 feature_snapshot = (
                     dict(feature_snapshot) if isinstance(feature_snapshot, dict) else {}
+                )
+                entry_fact = feature_snapshot.get("market_fact")
+                if not isinstance(entry_fact, dict):
+                    entry_fact = build_market_fact(
+                        symbol,
+                        {
+                            **feature_snapshot,
+                            "last_price": entry_price,
+                            "source": "legacy_shadow_entry_snapshot",
+                        },
+                        contract_spec=feature_snapshot.get("contract_spec"),
+                    )
+                    feature_snapshot["market_fact"] = entry_fact
+                if self.price_path_provider is not None:
+                    try:
+                        price_path = await self.price_path_provider(entry_fact, result_fact)
+                    except Exception as exc:
+                        logger.warning(
+                            "shadow native price path unavailable",
+                            symbol=symbol,
+                            error=safe_error_text(exc),
+                        )
+                        price_path = verify_market_fact_path(entry_fact, result_fact, [])
+                else:
+                    price_path = verify_market_fact_path(entry_fact, result_fact, [])
+                market_contract = build_shadow_market_fact_contract(
+                    entry_fact,
+                    result_fact,
+                    price_path,
+                )
+                feature_snapshot["market_fact_contract"] = market_contract
+                feature_snapshot["training_market_fact_contract"] = (
+                    compact_market_fact_contract(market_contract)
                 )
                 current_cost_facts = execution_cost_facts.get(execution_mode, {})
                 if _safe_shadow_number(current_cost_facts.get("taker_fee_rate")):
@@ -434,6 +530,21 @@ class ShadowBacktestService:
 
                 decision_action = str(row.decision_action or "hold")
                 missed = decision_action == "hold" and best_action in {"long", "short"}
+                feature_snapshot["training_label_contract"] = compact_shadow_label_contract(
+                    build_shadow_label_contract(
+                        shadow_backtest_id=row_id,
+                        decision_id=getattr(row, "decision_id", None),
+                        horizon_minutes=int(row.horizon_minutes),
+                        long_return_pct=long_return * 100.0,
+                        short_return_pct=short_return * 100.0,
+                        best_action=best_action,
+                        market_fact_contract=feature_snapshot.get(
+                            "training_market_fact_contract"
+                        ),
+                        cost_facts=fee_after_outcome,
+                        label_timestamp=getattr(row, "due_at", None),
+                    )
+                )
                 completions[row_id] = {
                     "actual_price": actual_price,
                     "long_return": long_return,

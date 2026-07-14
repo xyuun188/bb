@@ -138,6 +138,122 @@ async def test_fetch_ticker_uses_okx_native_inst_id(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_instrument_spec_keeps_native_contract_identity(monkeypatch) -> None:
+    client = OKXRestClient()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "publicGetPublicInstruments"
+        assert args == ({"instType": "SWAP", "instId": "ROBO-USDT-SWAP"},)
+        return {
+            "data": [
+                {
+                    "instId": "ROBO-USDT-SWAP",
+                    "instType": "SWAP",
+                    "uly": "ROBO-USDT",
+                    "instFamily": "ROBO-USDT",
+                    "instCategory": "1",
+                    "ctType": "linear",
+                    "ctVal": "1",
+                    "ctMult": "1",
+                    "ctValCcy": "ROBO",
+                    "settleCcy": "USDT",
+                    "lotSz": "1",
+                    "minSz": "1",
+                    "tickSz": "0.00001",
+                    "state": "live",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    spec = await client.fetch_instrument_spec("ROBO/USDT")
+
+    assert spec["instId"] == "ROBO-USDT-SWAP"
+    assert spec["uly"] == "ROBO-USDT"
+    assert spec["ctVal"] == "1"
+    assert spec["source"] == "okx_public_instruments"
+
+
+@pytest.mark.asyncio
+async def test_reference_prices_keep_swap_and_index_native_identities(monkeypatch) -> None:
+    client = OKXRestClient()
+    calls: list[tuple[str, tuple]] = []
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        calls.append((method_name, args))
+        if method_name == "publicGetPublicMarkPrice":
+            return {
+                "data": [
+                    {
+                        "instId": "ROBO-USDT-SWAP",
+                        "instType": "SWAP",
+                        "markPx": "0.01291",
+                        "ts": "1783990800000",
+                    }
+                ]
+            }
+        return {
+            "data": [
+                {
+                    "instId": "ROBO-USDT",
+                    "idxPx": "0.01290",
+                    "ts": "1783990800000",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    prices = await client.fetch_reference_prices(
+        "ROBO/USDT",
+        contract_spec={"instId": "ROBO-USDT-SWAP", "uly": "ROBO-USDT"},
+    )
+
+    assert calls == [
+        (
+            "publicGetPublicMarkPrice",
+            ({"instType": "SWAP", "instId": "ROBO-USDT-SWAP"},),
+        ),
+        ("publicGetMarketIndexTickers", ({"instId": "ROBO-USDT"},)),
+    ]
+    assert prices["mark_price_fact"]["inst_id"] == "ROBO-USDT-SWAP"
+    assert prices["index_price_fact"]["inst_id"] == "ROBO-USDT"
+    assert prices["mark_price"] == pytest.approx(0.01291)
+    assert prices["index_price"] == pytest.approx(0.01290)
+
+
+@pytest.mark.asyncio
+async def test_orderbook_depth_uses_native_contract_value(monkeypatch) -> None:
+    client = OKXRestClient()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "fetch_order_book"
+        return {
+            "timestamp": 1_783_990_800_000,
+            "bids": [[100.0, 2.0]],
+            "asks": [[100.1, 3.0]],
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    metrics = await client.fetch_order_book_metrics(
+        "BTC/USDT",
+        contract_spec={
+            "instId": "BTC-USDT-SWAP",
+            "instType": "SWAP",
+            "uly": "BTC-USDT",
+            "ctVal": "0.01",
+            "ctMult": "1",
+        },
+    )
+
+    assert metrics["orderbook_bid_depth"] == pytest.approx(2.0)
+    assert metrics["orderbook_ask_depth"] == pytest.approx(3.003)
+    assert metrics["orderbook_fact"]["source_timestamp_ms"] == 1_783_990_800_000
+
+
+@pytest.mark.asyncio
 async def test_funding_snapshot_derives_interval_from_okx_times(monkeypatch) -> None:
     client = OKXRestClient()
 

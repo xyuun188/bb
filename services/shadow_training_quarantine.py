@@ -13,7 +13,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import load_only
 
 from db.session import get_session_ctx
@@ -48,6 +48,9 @@ def shadow_quality_sample(row: Any) -> dict[str, Any]:
         else getattr(row, "feature_snapshot", None)
     )
     return {
+        "id": int(getattr(row, "id", 0) or 0),
+        "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
+        "label_version": str(getattr(row, "label_version", "") or ""),
         "symbol": getattr(row, "symbol", ""),
         "analysis_type": getattr(row, "analysis_type", ""),
         "decision_action": getattr(row, "decision_action", ""),
@@ -131,18 +134,36 @@ async def quarantine_dirty_shadow_samples(
     batches = max(int(max_batches or _LOCAL_ML_PARAMS.auto_quarantine_max_batches), 1)
     scanned = 0
     quarantined = 0
+    newly_quarantined = 0
+    already_quarantined = 0
+    trainable = 0
     cursor_id: int | None = None
     reason_counts: Counter[str] = Counter()
+    source_status_counts: Counter[str] = Counter()
 
     async with get_session_ctx() as session:
+        audited_statuses = ("completed", "quarantined") if dry_run else ("completed",)
+        total_candidate_count = int(
+            (
+                await session.execute(
+                    select(func.count(ShadowBacktest.id)).where(
+                        ShadowBacktest.status.in_(audited_statuses),
+                        ShadowBacktest.long_return_pct.is_not(None),
+                        ShadowBacktest.short_return_pct.is_not(None),
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
         for _batch_index in range(batches):
             stmt = select(ShadowBacktest).where(
-                ShadowBacktest.status == "completed",
+                ShadowBacktest.status.in_(audited_statuses),
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
             ).options(
                 load_only(
                     ShadowBacktest.id,
+                    ShadowBacktest.decision_id,
                     ShadowBacktest.symbol,
                     ShadowBacktest.analysis_type,
                     ShadowBacktest.decision_action,
@@ -150,6 +171,7 @@ async def quarantine_dirty_shadow_samples(
                     ShadowBacktest.training_feature_snapshot,
                     ShadowBacktest.due_at,
                     ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.label_version,
                     ShadowBacktest.long_return_pct,
                     ShadowBacktest.short_return_pct,
                     ShadowBacktest.best_action,
@@ -183,10 +205,17 @@ async def quarantine_dirty_shadow_samples(
                     else (min(cursor_id, row_id) if newest_first else max(cursor_id, row_id))
                 )
                 scanned += 1
+                source_status = str(getattr(row, "status", "") or "unknown")
+                source_status_counts[source_status] += 1
                 outcome = quarantine_completed_shadow_row(row, dry_run=dry_run)
                 if not outcome["applied"]:
+                    trainable += 1
                     continue
                 quarantined += 1
+                if source_status == QUARANTINE_STATUS:
+                    already_quarantined += 1
+                else:
+                    newly_quarantined += 1
                 reason_counts.update(outcome.get("reasons") or ["unknown"])
 
             if not dry_run:
@@ -199,7 +228,13 @@ async def quarantine_dirty_shadow_samples(
         "max_batches": batches,
         "only_newer_than_id": only_newer_than_id,
         "scanned": scanned,
+        "total_candidate_count": total_candidate_count,
+        "coverage_complete": scanned >= total_candidate_count,
+        "source_status_counts": dict(source_status_counts),
+        "trainable": trainable,
         "quarantined": quarantined,
+        "already_quarantined": already_quarantined,
+        "new_quarantine_candidates": newly_quarantined,
         "last_scanned_id": cursor_id,
         "top_reasons": [
             {"reason": reason, "count": count} for reason, count in reason_counts.most_common(20)

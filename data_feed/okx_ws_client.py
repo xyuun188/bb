@@ -11,6 +11,7 @@ import asyncio
 import json
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -136,6 +137,8 @@ class OKXWebSocketClient:
                 volume_fields = okx_swap_volume_fields(ticker, last)
                 parsed = {
                     "symbol": symbol,
+                    "inst_id": inst_id,
+                    "inst_type": "SWAP",
                     "last_price": last,
                     "bid": safe_float(ticker.get("bidPx"), 0.0),
                     "ask": safe_float(ticker.get("askPx"), 0.0),
@@ -146,7 +149,13 @@ class OKXWebSocketClient:
                     **volume_fields,
                     "change_24h_pct": change_pct,
                     "timestamp": int(safe_float(ticker.get("ts"), 0.0)),
-                    "inst_type": "SWAP",
+                    "source_timestamp_ms": int(safe_float(ticker.get("ts"), 0.0)),
+                    "source_sequence": ticker.get("seqId"),
+                    "received_at": datetime.now(UTC).isoformat(),
+                    "source": "websocket",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": channel,
+                    "info": {"instId": inst_id, "instType": "SWAP", **dict(ticker)},
                 }
                 self._latest_tickers[symbol] = parsed
                 for cb in self._ticker_callbacks:

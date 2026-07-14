@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from core.market_facts import MARKET_FACT_CONTRACT_VERSION
+from core.training_contracts import (
+    SHADOW_LABEL_VERSION,
+    build_shadow_label_contract,
+    compact_shadow_label_contract,
+)
 from services import training_data_quality
 from services.model_promotion_policy import build_return_objective_report
 from services.training_data_quality import (
@@ -15,8 +21,24 @@ from services.training_data_quality import (
 )
 
 
+def _clean_market_fact_contract() -> dict:
+    return {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "clean",
+        "violation_count": 0,
+        "violation_reason_codes": "",
+        "native_instrument_identity_verified": True,
+        "same_contract_price_path_verified": True,
+        "executable_market_fact_verified": True,
+        "data_fingerprint": "test-shadow-market-facts",
+    }
+
+
 def _shadow_sample(**overrides):
     sample = {
+        "id": 1,
+        "decision_id": 1001,
+        "label_version": SHADOW_LABEL_VERSION,
         "symbol": "BTC/USDT",
         "decision_action": "long",
         "decision_confidence": 0.72,
@@ -28,13 +50,39 @@ def _shadow_sample(**overrides):
             "round_trip_fee_pct": 0.08,
             "funding_rate": 0.0,
             "funding_interval_minutes": 480.0,
+            "training_market_fact_contract": _clean_market_fact_contract(),
         },
         "long_return_pct": 0.42,
         "short_return_pct": -0.31,
         "best_action": "long",
         "missed_opportunity": False,
+        "label_timestamp": datetime(2026, 7, 14, 0, 30, tzinfo=UTC),
     }
+    override_features = overrides.pop("features", None) if "features" in overrides else None
     sample.update(overrides)
+    if override_features is not None:
+        features = dict(override_features)
+        if features:
+            features.setdefault(
+                "training_market_fact_contract",
+                _clean_market_fact_contract(),
+            )
+        sample["features"] = features
+    features = sample.get("features")
+    if isinstance(features, dict) and features and "training_label_contract" not in features:
+        features["training_label_contract"] = compact_shadow_label_contract(
+            build_shadow_label_contract(
+                shadow_backtest_id=int(sample.get("id") or 0),
+                decision_id=int(sample.get("decision_id") or 0) or None,
+                horizon_minutes=int(sample.get("horizon_minutes") or 0),
+                long_return_pct=float(sample.get("long_return_pct") or 0.0),
+                short_return_pct=float(sample.get("short_return_pct") or 0.0),
+                best_action=str(sample.get("best_action") or "hold"),
+                market_fact_contract=features.get("training_market_fact_contract"),
+                cost_facts={"round_trip_fee_pct": features.get("round_trip_fee_pct")},
+                label_timestamp=sample.get("label_timestamp"),
+            )
+        )
     return sample
 
 
@@ -299,6 +347,14 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     assert report["by_kind"]["text_sentiment"]["sources"]["scrapling:ethereum_blog"] == 1
     assert report["by_kind"]["text_sentiment"]["trainable_sources"]["scrapling:ethereum_blog"] == 1
     assert report["specialist_shadow_models"] == {}
+    market_contract = report["market_fact_contract"]
+    assert market_contract["status"] == "clean"
+    assert market_contract["violation_count"] == 0
+    assert market_contract["assertions"]["native_instrument_identity_verified"] is True
+    shadow_contract = payload["shadow_samples"][0]["training_sample_contract"]
+    assert shadow_contract["immutable"] is True
+    assert len(shadow_contract["sample_fingerprint"]) == 64
+    assert shadow_contract["market_fact_contract"]["status"] == "clean"
     assert "hold_observation_penalty" not in report["policy"]
     assert "include_score_threshold" not in report["policy"]
     governance = payload["governance_report"]
@@ -683,6 +739,109 @@ def test_shadow_market_data_quality_issue_is_excluded_from_training() -> None:
     assert assessment.status == "excluded"
     assert assessment.weight == 0.0
     assert "market_data_quality:price_source_split" in assessment.reasons
+
+
+def test_shadow_label_contract_is_required_and_tamper_evident() -> None:
+    missing = _shadow_sample()
+    missing["features"]["training_label_contract"] = {}
+
+    missing_assessment = assess_shadow_sample(missing)
+
+    assert missing_assessment.status == "excluded"
+    assert (
+        "shadow_label_contract:shadow_label_contract_missing"
+        in missing_assessment.reasons
+    )
+
+    tampered = _shadow_sample(id=2, decision_id=1002)
+    tampered["features"]["training_label_contract"]["long_return_pct"] = 99.0
+
+    tampered_assessment = assess_shadow_sample(tampered)
+
+    assert tampered_assessment.status == "excluded"
+    assert (
+        "shadow_label_contract:shadow_label_compact_fingerprint_mismatch"
+        in tampered_assessment.reasons
+    )
+
+    stale_row_version = _shadow_sample(id=3, decision_id=1003)
+    stale_row_version["label_version"] = "legacy-row-3"
+
+    stale_assessment = assess_shadow_sample(stale_row_version)
+
+    assert stale_assessment.status == "excluded"
+    assert (
+        "shadow_label_contract:shadow_label_row_version_mismatch"
+        in stale_assessment.reasons
+    )
+
+
+def test_same_decision_horizon_label_version_has_one_trainable_identity() -> None:
+    first = _shadow_sample(id=11, decision_id=5011)
+    second = _shadow_sample(id=12, decision_id=5011)
+
+    payload = annotate_training_payload(
+        shadow_samples=[first, second],
+        trade_samples=[],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert len(payload["shadow_samples"]) == 1
+    diagnostics = payload["quality_report"]["training_view_diagnostics"]
+    assert diagnostics["raw_sample_count"] == 2
+    assert diagnostics["trainable_sample_count"] == 1
+    assert diagnostics["quarantined_sample_count"] == 1
+    assert payload["quality_report"]["top_reasons"][0] == {
+        "reason": "shadow:duplicate_decision_horizon_label_version",
+        "count": 1,
+    }
+
+
+def test_training_view_reports_leave_one_symbol_out_and_time_influence() -> None:
+    samples = [
+        _shadow_sample(
+            id=21,
+            decision_id=6021,
+            symbol="ROBO/USDT",
+            long_return_pct=-95.0,
+            short_return_pct=95.0,
+            best_action="short",
+        ),
+        _shadow_sample(
+            id=22,
+            decision_id=6022,
+            symbol="BTC/USDT",
+            long_return_pct=0.4,
+            short_return_pct=-0.3,
+            best_action="long",
+        ),
+        _shadow_sample(
+            id=23,
+            decision_id=6023,
+            symbol="ETH/USDT",
+            long_return_pct=0.2,
+            short_return_pct=-0.1,
+            best_action="long",
+            label_timestamp=datetime(2026, 7, 15, 0, 30, tzinfo=UTC),
+        ),
+    ]
+
+    payload = annotate_training_payload(
+        shadow_samples=samples,
+        trade_samples=[],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+    diagnostics = payload["quality_report"]["training_view_diagnostics"]
+
+    assert diagnostics["raw_sample_count"] == 3
+    assert diagnostics["effective_sample_size"] == 3.0
+    assert diagnostics["max_single_symbol_influence"]["symbol"] == "ROBO/USDT"
+    assert {item["date"] for item in diagnostics["time_influence"]} == {
+        "2026-07-14",
+        "2026-07-15",
+    }
 
 
 def test_shadow_price_reconciliation_warning_is_excluded_from_training() -> None:

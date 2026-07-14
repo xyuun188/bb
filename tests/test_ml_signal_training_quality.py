@@ -9,6 +9,12 @@ import pandas as pd
 import pytest
 
 from config.settings import settings
+from core.training_contracts import (
+    SHADOW_LABEL_VERSION,
+    build_shadow_label_contract,
+    compact_shadow_label_contract,
+)
+from db.repositories.memory_repo import MemoryRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
 from scripts import evaluate_ml_training_windows as ml_window_eval
@@ -102,6 +108,44 @@ def _with_return_objective(metadata: dict) -> dict:
     return metadata
 
 
+def _clean_training_market_fact_contract() -> dict[str, object]:
+    return {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "clean",
+        "violation_count": 0,
+        "violation_reason_codes": "",
+        "native_instrument_identity_verified": True,
+        "same_contract_price_path_verified": True,
+        "executable_market_fact_verified": True,
+        "data_fingerprint": "test-shadow-market-facts",
+    }
+
+
+def _clean_training_label_contract(
+    row_id: int,
+    due_at: datetime,
+    *,
+    decision_id: int | None = None,
+    horizon_minutes: int = 30,
+    long_return_pct: float = 0.1,
+    short_return_pct: float = -0.1,
+    best_action: str = "hold",
+) -> dict[str, object]:
+    return compact_shadow_label_contract(
+        build_shadow_label_contract(
+            shadow_backtest_id=row_id,
+            decision_id=decision_id or row_id + 10_000,
+            horizon_minutes=horizon_minutes,
+            long_return_pct=long_return_pct,
+            short_return_pct=short_return_pct,
+            best_action=best_action,
+            market_fact_contract=_clean_training_market_fact_contract(),
+            cost_facts={"round_trip_fee_pct": 0.08},
+            label_timestamp=due_at,
+        )
+    )
+
+
 def _service_with_metadata(metadata: dict) -> MLSignalService:
     service = MLSignalService()
     service._bundle = {"metadata": _with_return_objective(metadata)}
@@ -149,6 +193,45 @@ async def test_local_ml_training_counts_only_phase3_clean_shadow_rows(
     assert 1 not in {row.id for row in selected}
 
 
+@pytest.mark.asyncio
+async def test_shadow_label_identity_is_idempotent_and_new_version_is_append_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    due_at = datetime(2026, 7, 14, 1, 0, tzinfo=UTC)
+    payload = {
+        "decision_id": 7001,
+        "model_name": "ensemble_trader",
+        "execution_mode": "paper",
+        "symbol": "BTC/USDT",
+        "analysis_type": "market",
+        "decision_action": "hold",
+        "decision_confidence": 0.7,
+        "entry_price": 100.0,
+        "feature_snapshot": {},
+        "raw_llm_response": {},
+        "status": "pending",
+        "due_at": due_at,
+        "horizon_minutes": 30,
+    }
+    try:
+        async with get_session_ctx() as session:
+            repo = MemoryRepository(session)
+            first = await repo.create_shadow_backtest(dict(payload))
+            duplicate = await repo.create_shadow_backtest(dict(payload))
+            next_version = await repo.create_shadow_backtest(
+                {**payload, "label_version": "future-shadow-label.v2"}
+            )
+
+            assert duplicate.id == first.id
+            assert duplicate.label_version == SHADOW_LABEL_VERSION
+            assert next_version.id != first.id
+            assert next_version.label_version == "future-shadow-label.v2"
+    finally:
+        await close_db()
+
+
 def _db_shadow_row(
     row_id: int,
     created_at: datetime,
@@ -159,8 +242,12 @@ def _db_shadow_row(
     long_return_pct: float | None = 0.1,
     short_return_pct: float | None = -0.1,
 ) -> ShadowBacktest:
+    due_at = created_at + timedelta(minutes=30)
+    decision_id = row_id + 10_000
     return ShadowBacktest(
         id=row_id,
+        decision_id=decision_id,
+        label_version=SHADOW_LABEL_VERSION,
         model_name="ensemble",
         execution_mode="paper",
         symbol=f"TEST{row_id}/USDT",
@@ -174,9 +261,18 @@ def _db_shadow_row(
             "round_trip_fee_pct": 0.08,
             "funding_rate": 0.0,
             "funding_interval_minutes": 480.0,
+            "training_market_fact_contract": _clean_training_market_fact_contract(),
+            "training_label_contract": _clean_training_label_contract(
+                row_id,
+                due_at,
+                decision_id=decision_id,
+                long_return_pct=float(long_return_pct or 0.0),
+                short_return_pct=float(short_return_pct or 0.0),
+                best_action=best_action,
+            ),
         },
         status=status,
-        due_at=created_at + timedelta(minutes=30),
+        due_at=due_at,
         horizon_minutes=30,
         actual_price=101.0,
         long_return_pct=long_return_pct,
@@ -222,10 +318,26 @@ def _shadow_row(
         "round_trip_fee_pct": 0.08,
         "funding_rate": 0.0,
         "funding_interval_minutes": 480.0,
+        "training_market_fact_contract": _clean_training_market_fact_contract(),
     }
     cost_complete_features.update(feature_snapshot or {})
+    due_at = row_created_at + timedelta(minutes=30)
+    decision_id = row_id + 10_000
+    cost_complete_features.setdefault(
+        "training_label_contract",
+        _clean_training_label_contract(
+            row_id,
+            due_at,
+            decision_id=decision_id,
+            long_return_pct=0.16 if best_action == "long" else -0.06,
+            short_return_pct=0.14 if best_action == "short" else -0.05,
+            best_action=best_action,
+        ),
+    )
     return SimpleNamespace(
         id=row_id,
+        decision_id=decision_id,
+        label_version=SHADOW_LABEL_VERSION,
         created_at=row_created_at,
         symbol=f"TEST{row_id}/USDT",
         analysis_type="market",
@@ -237,7 +349,7 @@ def _shadow_row(
         short_return_pct=0.14 if best_action == "short" else -0.05,
         best_action=best_action,
         missed_opportunity=missed,
-        due_at=row_created_at + timedelta(minutes=30),
+        due_at=due_at,
     )
 
 
@@ -367,6 +479,36 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
     assert governance["requires_artifact_refresh"] is False
 
 
+def test_train_from_frame_binds_exact_market_fact_training_view_contract() -> None:
+    report = quality_report(
+        {
+            "shadow": [
+                {
+                    "data_quality_status": "included",
+                    "sample_weight": 1.0,
+                    "quality_reasons": [],
+                    "features": {
+                        "training_market_fact_contract": (
+                            _clean_training_market_fact_contract()
+                        )
+                    },
+                }
+            ]
+        }
+    )
+
+    metadata = train_from_frame(
+        _training_frame(),
+        completed_sample_count=80,
+        training_quality_report=report,
+        persist_artifact=False,
+    )
+
+    assert metadata["market_fact_contract"] == report["market_fact_contract"]
+    assert metadata["market_fact_contract"]["status"] == "clean"
+    assert metadata["market_fact_contract"]["provenance"]["data_fingerprint"]
+
+
 def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
     frame = _training_frame(120)
     frame["decision_action"] = ["hold", "long", "short"] * 40
@@ -403,8 +545,11 @@ def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
 
 
 def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
+    due_at = datetime(2026, 6, 23, 1, 0, tzinfo=UTC)
     row = SimpleNamespace(
         id=7,
+        decision_id=10007,
+        label_version=SHADOW_LABEL_VERSION,
         symbol="BTC/USDT",
         analysis_type="market",
         decision_action="short",
@@ -422,12 +567,21 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
             "liquidation_risk_score": 0.42,
             "direct_sentiment_data_available": True,
             "direct_news_item_count": 3,
+            "training_market_fact_contract": _clean_training_market_fact_contract(),
+            "training_label_contract": _clean_training_label_contract(
+                7,
+                due_at,
+                decision_id=10007,
+                long_return_pct=-0.12,
+                short_return_pct=0.18,
+                best_action="short",
+            ),
         },
         long_return_pct=-0.12,
         short_return_pct=0.18,
         best_action="short",
         missed_opportunity=False,
-        due_at=datetime(2026, 6, 23, 1, 0, tzinfo=UTC),
+        due_at=due_at,
     )
 
     frame = build_training_frame([row])
@@ -1293,6 +1447,15 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
         "funding_interval_minutes": 480.0,
         "feature_timestamp": created_at.isoformat(),
         "market_data_quality": {"code": ""},
+        "training_market_fact_contract": _clean_training_market_fact_contract(),
+        "training_label_contract": _clean_training_label_contract(
+            77,
+            row.due_at,
+            decision_id=row.decision_id,
+            long_return_pct=float(row.long_return_pct or 0.0),
+            short_return_pct=float(row.short_return_pct or 0.0),
+            best_action=str(row.best_action or "hold"),
+        ),
         "unused_llm_context": {"transcript": "x" * 100_000},
     }
     async with get_session_ctx() as session:

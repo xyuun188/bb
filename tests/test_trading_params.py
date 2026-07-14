@@ -25,7 +25,10 @@ def test_training_data_quality_uses_the_current_snapshot() -> None:
     from services import training_data_quality
 
     assert training_data_quality._QUALITY_PARAMS == DEFAULT_TRADING_PARAMS.training_data_quality
-    assert training_data_quality.DATA_QUALITY_VERSION == "2026-07-12.v1"
+    assert (
+        training_data_quality.DATA_QUALITY_VERSION
+        == "2026-07-14.immutable-shadow-label.v3"
+    )
 
 
 def test_auto_scan_snapshot_is_operational_not_entry_permission() -> None:

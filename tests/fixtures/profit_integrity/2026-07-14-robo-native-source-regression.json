@@ -1,0 +1,106 @@
+{
+  "schema_version": "2026-07-14.robo-native-source-regression.v1",
+  "symbol": "ROBO/USDT",
+  "inst_id": "ROBO-USDT-SWAP",
+  "root_cause": {
+    "public_rest_mode_before_fix": "paper_demo_flag_1",
+    "public_websocket_mode": "live_public",
+    "failure": "demo REST ticker was merged with live WebSocket and live candle outcomes",
+    "repair": "public REST market facts always use OKX live flag 0; private account and order APIs retain mode-specific demo/live selection"
+  },
+  "instrument_response": {
+    "instId": "ROBO-USDT-SWAP",
+    "instType": "SWAP",
+    "uly": "ROBO-USDT",
+    "instFamily": "ROBO-USDT",
+    "state": "live",
+    "listTime": "1772206200000",
+    "tickSz": "0.00001",
+    "lotSz": "1",
+    "minSz": "1",
+    "ctVal": "100",
+    "ctMult": "1",
+    "ctValCcy": "ROBO",
+    "settleCcy": "USDT"
+  },
+  "incident_rest_snapshots": [
+    {
+      "decision_id": 79757,
+      "observed_at": "2026-07-14T00:50:35.078685+00:00",
+      "source_timestamp_ms": 1783990235078,
+      "last": 0.10834,
+      "bid": 0.08172,
+      "ask": 0.10834,
+      "notional_24h_usdt": 0.0
+    },
+    {
+      "decision_id": 80207,
+      "observed_at": "2026-07-14T02:05:19.381033+00:00",
+      "source_timestamp_ms": 1783994719381,
+      "last": 0.10834,
+      "bid": 0.08172,
+      "ask": 0.10834,
+      "notional_24h_usdt": 0.0
+    },
+    {
+      "decision_id": 80213,
+      "observed_at": "2026-07-14T02:06:35.101363+00:00",
+      "source_timestamp_ms": 1783994795101,
+      "last": 0.10834,
+      "bid": 0.08172,
+      "ask": 0.10834,
+      "notional_24h_usdt": 0.0
+    },
+    {
+      "decision_id": 80325,
+      "observed_at": "2026-07-14T02:24:37.882749+00:00",
+      "source_timestamp_ms": 1783995877882,
+      "last": 0.10834,
+      "bid": 0.08172,
+      "ask": 0.10834,
+      "notional_24h_usdt": 0.0
+    },
+    {
+      "decision_id": 80426,
+      "observed_at": "2026-07-14T02:54:39.049999+00:00",
+      "source_timestamp_ms": 1783997679049,
+      "last": 0.10834,
+      "bid": 0.08172,
+      "ask": 0.10834,
+      "notional_24h_usdt": 0.0
+    },
+    {
+      "decision_id": 80855,
+      "observed_at": "2026-07-14T04:21:00.102450+00:00",
+      "source_timestamp_ms": 1784002860102,
+      "last": 0.10834,
+      "bid": 0.08172,
+      "ask": 0.10834,
+      "notional_24h_usdt": 0.0
+    }
+  ],
+  "okx_live_history_candles_1m": [
+    [1783990140000, 0.01305, 0.01305, 0.01305, 0.01305, 0],
+    [1783990200000, 0.01305, 0.01305, 0.01304, 0.01304, 47],
+    [1783990260000, 0.01306, 0.01306, 0.01306, 0.01306, 596],
+    [1783994640000, 0.01299, 0.01299, 0.01299, 0.01299, 5],
+    [1783994700000, 0.01299, 0.01299, 0.01299, 0.01299, 269],
+    [1783994760000, 0.01299, 0.01299, 0.01298, 0.01299, 90],
+    [1783994820000, 0.01298, 0.01298, 0.01298, 0.01298, 14],
+    [1783995780000, 0.01295, 0.01295, 0.01295, 0.01295, 135],
+    [1783995840000, 0.01296, 0.01296, 0.01295, 0.01295, 314],
+    [1783995900000, 0.01296, 0.01296, 0.01295, 0.01295, 307],
+    [1783997580000, 0.01289, 0.01290, 0.01288, 0.01288, 126],
+    [1783997640000, 0.01288, 0.01288, 0.01282, 0.01285, 5227],
+    [1783997700000, 0.01286, 0.01287, 0.01285, 0.01287, 780],
+    [1784002800000, 0.01293, 0.01293, 0.01292, 0.01292, 750],
+    [1784002860000, 0.01294, 0.01294, 0.01294, 0.01294, 222],
+    [1784002920000, 0.01293, 0.01294, 0.01293, 0.01294, 56]
+  ],
+  "provenance": {
+    "incident_source": "tests/fixtures/profit_integrity/2026-07-14-root-cause-baseline.json",
+    "native_history_endpoint": "/api/v5/market/history-candles",
+    "instrument_endpoint": "/api/v5/public/instruments",
+    "captured_at": "2026-07-14T08:45:00+00:00"
+  }
+}

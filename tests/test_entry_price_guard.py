@@ -39,14 +39,14 @@ def _decision(*, return_lcb: float = 0.6, expected_net: float = 0.8) -> Decision
 
 
 def _policy(*, latest: float, fresh: dict[str, Any] | None = None) -> EntryPriceGuardPolicy:
-    async def latest_price(_symbol: str) -> float:
-        return latest
-
     async def fresh_feature(_symbol: str) -> Any:
-        return fresh
+        return (
+            {"current_price": latest, "close": latest}
+            if fresh is None
+            else fresh
+        )
 
     return EntryPriceGuardPolicy(
-        latest_price_provider=latest_price,
         fresh_feature_provider=fresh_feature,
         market_data_quality_reason_provider=lambda _snapshot, **_kwargs: None,
         decision_age_seconds_provider=lambda _decision: 12.0,
@@ -66,14 +66,37 @@ async def test_adverse_move_must_fit_return_lcb() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fresh_snapshot_can_rebase_stale_analysis_without_fixed_rescue_threshold() -> None:
+async def test_fresh_snapshot_cannot_rebase_a_decision_past_its_return_budget() -> None:
     decision = _decision(return_lcb=0.2)
     reason = await _policy(
         latest=101.0,
         fresh={"current_price": 101.0, "close": 101.0},
     ).guard_reason(decision)
-    assert reason is None
-    assert decision.feature_snapshot["current_price"] == 101.0
+    assert "exceeds" in reason
+    assert decision.feature_snapshot["current_price"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_every_entry_requires_a_fresh_native_market_snapshot() -> None:
+    reason = await _policy(latest=100.0, fresh={}).guard_reason(_decision())
+
+    assert "Fresh pre-order native market fact is incomplete" in reason
+
+
+@pytest.mark.asyncio
+async def test_invalid_analysis_fact_cannot_be_rescued_by_a_fresh_snapshot() -> None:
+    async def fresh_feature(_symbol: str) -> Any:
+        raise AssertionError("dirty analysis must be blocked before refresh")
+
+    policy = EntryPriceGuardPolicy(
+        fresh_feature_provider=fresh_feature,
+        market_data_quality_reason_provider=lambda _snapshot, **_kwargs: "dirty fact",
+        decision_age_seconds_provider=lambda _decision: 12.0,
+    )
+
+    reason = await policy.guard_reason(_decision())
+
+    assert "analysis market fact is invalid" in reason
 
 
 @pytest.mark.asyncio

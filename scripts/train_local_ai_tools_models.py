@@ -432,12 +432,14 @@ async def _post_training_payload(
 def _shadow_sample_columns() -> tuple[Any, ...]:
     return (
         ShadowBacktest.id,
+        ShadowBacktest.decision_id,
         ShadowBacktest.symbol,
         ShadowBacktest.analysis_type,
         ShadowBacktest.decision_action,
         ShadowBacktest.decision_confidence,
         ShadowBacktest.due_at,
         ShadowBacktest.horizon_minutes,
+        ShadowBacktest.label_version,
         ShadowBacktest.long_return_pct,
         ShadowBacktest.short_return_pct,
         ShadowBacktest.best_action,
@@ -451,6 +453,8 @@ def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     due_at = mapping.get("due_at")
     return {
         "id": int(mapping.get("id") or 0),
+        "decision_id": int(mapping.get("decision_id") or 0) or None,
+        "label_version": str(mapping.get("label_version") or ""),
         "symbol": str(mapping.get("symbol") or ""),
         "analysis_type": str(mapping.get("analysis_type") or ""),
         "decision_action": str(mapping.get("decision_action") or ""),

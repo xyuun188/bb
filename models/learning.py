@@ -4,6 +4,7 @@ from datetime import datetime
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, event, inspect
 from sqlalchemy.orm import Mapped, mapped_column
 
+from core.training_contracts import SHADOW_LABEL_VERSION
 from models.base import Base, TimestampMixin
 
 
@@ -83,6 +84,11 @@ class ShadowBacktest(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     horizon_minutes: Mapped[int] = mapped_column(Integer, default=10, index=True)
+    label_version: Mapped[str] = mapped_column(
+        String(80),
+        default=SHADOW_LABEL_VERSION,
+        index=True,
+    )
     actual_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     long_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     short_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)

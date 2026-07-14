@@ -17,6 +17,13 @@ import structlog
 from sqlalchemy import select
 
 from config.settings import settings
+from core.market_facts import (
+    build_market_fact,
+    build_market_source_consistency,
+)
+from core.market_facts import (
+    verify_market_fact_path as verify_native_market_fact_path,
+)
 from core.safe_output import safe_error_text
 from core.url_safety import normalize_external_http_url
 from data_feed.feature_vector import FeatureVector, build_feature_vector
@@ -135,6 +142,8 @@ class DataService:
         self._available_symbols_cache: list[dict[str, Any]] = []
         self._available_symbols_cache_updated_at: datetime | None = None
         self._available_symbols_refresh_task: asyncio.Task | None = None
+        self._instrument_spec_cache: dict[str, dict[str, Any]] = {}
+        self._instrument_spec_tasks: dict[str, asyncio.Task] = {}
 
         # Register ticker callback for real-time price updates
         self.ws_client.on_ticker(self._on_ticker_update)
@@ -190,6 +199,13 @@ class DataService:
                         "timestamp": timestamp,
                         "source": source,
                         "inst_type": data.get("inst_type") or "SWAP",
+                        "inst_id": data.get("inst_id"),
+                        "source_endpoint": data.get("source_endpoint"),
+                        "source_channel": data.get("source_channel"),
+                        "source_sequence": data.get("source_sequence"),
+                        "received_at": data.get("received_at"),
+                        "contract_spec": data.get("contract_spec"),
+                        "market_fact": data.get("market_fact"),
                         **volume_fields,
                     },
                     ensure_ascii=False,
@@ -670,6 +686,7 @@ class DataService:
         ticker = ticker_result if isinstance(ticker_result, dict) else {}
         indicators = indicators_result if isinstance(indicators_result, dict) else {}
         derivatives = derivatives_result if isinstance(derivatives_result, dict) else {}
+        ticker = self._attach_market_source_consistency(symbol, ticker, derivatives)
 
         # Get sentiment
         sentiment = self._sentiment_cache.get(symbol, {})
@@ -747,7 +764,10 @@ class DataService:
             or {}
         )
         ticker_consistency_issue = self._ticker_snapshot_consistency_issue(ticker)
-        if ticker and self._is_fresh_ticker_snapshot(ticker) and not ticker_consistency_issue:
+        ticker_fresh = bool(ticker and self._is_fresh_ticker_snapshot(ticker))
+        ticker_source = str(ticker.get("source") or "websocket").lower()
+        websocket_candidate = bool(ticker_fresh and ticker_source == "websocket")
+        if ticker_fresh and not ticker_consistency_issue:
             bid = self._safe_float(ticker.get("bid"), 0.0)
             ask = self._safe_float(ticker.get("ask"), 0.0)
             mid = (bid + ask) / 2 if bid and ask else 0.0
@@ -755,7 +775,12 @@ class DataService:
                 ticker["spread_pct"] = (ask - bid) / mid * 100 if ask >= bid else 0.0
             ticker["source"] = ticker.get("source") or "websocket"
             ticker["inst_type"] = ticker.get("inst_type") or "SWAP"
-            return ticker
+            if not block_on_remote:
+                return await self._attach_native_market_fact(
+                    normalized,
+                    ticker,
+                    block_on_remote=False,
+                )
         if ticker and ticker_consistency_issue:
             logger.warning(
                 "ticker cache inconsistent; refreshing from OKX REST",
@@ -777,7 +802,11 @@ class DataService:
                 ticker["age_seconds"] = self._ticker_snapshot_age_seconds(ticker)
                 if ticker_consistency_issue:
                     ticker["market_data_quality_issue"] = ticker_consistency_issue
-                return ticker
+                return await self._attach_native_market_fact(
+                    normalized,
+                    ticker,
+                    block_on_remote=False,
+                )
             return {
                 "ticker_snapshot_available": False,
                 "ticker_remote_refresh_deferred": True,
@@ -792,6 +821,7 @@ class DataService:
             volume_fields = okx_swap_volume_fields(raw_ticker, last_price)
             snapshot = {
                 "symbol": normalized,
+                "inst_id": ticker_info.get("instId"),
                 "last_price": last_price,
                 "bid": bid,
                 "ask": ask,
@@ -803,12 +833,50 @@ class DataService:
                 "change_24h_pct": raw_ticker.get("percentage", 0),
                 "spread_pct": ((ask - bid) / mid * 100) if mid and ask and bid else 0,
                 "timestamp": self._ticker_timestamp_from_raw(raw_ticker),
+                "source_timestamp_ms": self._ticker_timestamp_from_raw(raw_ticker),
+                "source_sequence": ticker_info.get("seqId"),
+                "received_at": datetime.now(UTC).isoformat(),
                 "source": "rest",
+                "source_endpoint": "okx_rest_market_ticker",
+                "source_channel": "tickers",
                 "inst_type": "SWAP",
+                "info": ticker_info,
             }
-            self.ws_client.latest_tickers[normalized] = dict(snapshot)
-            self._on_ticker_update(normalized, snapshot)
-            return snapshot
+            rest_snapshot = await self._attach_native_market_fact(
+                normalized,
+                snapshot,
+                block_on_remote=True,
+            )
+            source_snapshots = [rest_snapshot]
+            selected = rest_snapshot
+            if websocket_candidate:
+                websocket_snapshot = dict(ticker)
+                if ticker_consistency_issue:
+                    websocket_snapshot["market_data_quality_issue"] = (
+                        ticker_consistency_issue
+                    )
+                websocket_snapshot = await self._attach_native_market_fact(
+                    normalized,
+                    websocket_snapshot,
+                    block_on_remote=True,
+                )
+                if ticker_consistency_issue:
+                    source_snapshots.append(websocket_snapshot)
+                else:
+                    selected = websocket_snapshot
+                    source_snapshots = [websocket_snapshot, rest_snapshot]
+
+            selected = dict(selected)
+            selected["market_source_snapshots"] = [
+                self._market_source_snapshot_payload(item) for item in source_snapshots
+            ]
+            selected["native_consistency_bars_1m"] = (
+                await self._fetch_native_consistency_bars(normalized, source_snapshots)
+            )
+            if selected.get("source") == "rest":
+                self.ws_client.latest_tickers[normalized] = dict(selected)
+                self._on_ticker_update(normalized, selected)
+            return selected
         except Exception as e:
             logger.debug("failed to fetch ticker", symbol=symbol, error=safe_error_text(e))
             if ticker:
@@ -817,8 +885,218 @@ class DataService:
                 ticker["age_seconds"] = self._ticker_snapshot_age_seconds(ticker)
                 if ticker_consistency_issue:
                     ticker["market_data_quality_issue"] = ticker_consistency_issue
-                return ticker
+                return await self._attach_native_market_fact(
+                    normalized,
+                    ticker,
+                    block_on_remote=False,
+                )
             return {}
+
+    @staticmethod
+    def _market_source_snapshot_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(snapshot)
+        for key in (
+            "market_fact",
+            "market_source_snapshots",
+            "native_consistency_bars_1m",
+            "market_source_consistency",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    async def _fetch_native_consistency_bars(
+        self,
+        symbol: str,
+        source_snapshots: list[dict[str, Any]],
+    ) -> list[Any]:
+        timestamps = [
+            self._ticker_timestamp_from_raw(snapshot)
+            for snapshot in source_snapshots
+            if self._ticker_timestamp_from_raw(snapshot) > 0
+        ]
+        elapsed_minutes = (
+            max((max(timestamps) - min(timestamps)) // 60_000, 0) + 1
+            if timestamps
+            else 1
+        )
+        limit = min(elapsed_minutes + 2, 300)
+        fetcher = getattr(self.rest_client, "fetch_ohlcv", None)
+        if not callable(fetcher):
+            return []
+        try:
+            rows = await fetcher(symbol, timeframe="1m", limit=limit)
+        except Exception as exc:
+            logger.warning(
+                "OKX native 1m consistency path unavailable",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+            return []
+        return rows if isinstance(rows, list) else []
+
+    async def _attach_native_market_fact(
+        self,
+        symbol: str,
+        snapshot: dict[str, Any],
+        *,
+        block_on_remote: bool,
+    ) -> dict[str, Any]:
+        enriched = dict(snapshot)
+        spec = await self._get_instrument_spec(symbol, block_on_remote=block_on_remote)
+        if spec:
+            enriched["contract_spec"] = spec
+            enriched["uly"] = spec.get("uly")
+        info = enriched.get("info") if isinstance(enriched.get("info"), dict) else {}
+        enriched["inst_id"] = (
+            enriched.get("inst_id")
+            or info.get("instId")
+            or spec.get("instId")
+        )
+        enriched["received_at"] = enriched.get("received_at") or datetime.now(UTC).isoformat()
+        enriched["market_fact"] = build_market_fact(
+            symbol,
+            enriched,
+            contract_spec=spec,
+            received_at=enriched["received_at"],
+        )
+        return enriched
+
+    async def _get_instrument_spec(
+        self,
+        symbol: str,
+        *,
+        block_on_remote: bool,
+    ) -> dict[str, Any]:
+        normalized = self._normalize_symbols([symbol])[0]
+        cache = getattr(self, "_instrument_spec_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._instrument_spec_cache = cache
+        tasks = getattr(self, "_instrument_spec_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._instrument_spec_tasks = tasks
+        cached = cache.get(normalized)
+        if isinstance(cached, dict) and cached:
+            return dict(cached)
+        task = tasks.get(normalized)
+        if task and not task.done():
+            if not block_on_remote:
+                return {}
+            result = await asyncio.shield(task)
+            return dict(result or {})
+        if not block_on_remote:
+            return {}
+
+        async def fetch() -> dict[str, Any]:
+            try:
+                result = await self.rest_client.fetch_instrument_spec(normalized)
+            except Exception as exc:
+                logger.warning(
+                    "OKX native instrument identity unavailable",
+                    symbol=normalized,
+                    error=safe_error_text(exc),
+                )
+                return {}
+            value = dict(result) if isinstance(result, dict) else {}
+            if value:
+                cache[normalized] = value
+            return value
+
+        task = asyncio.create_task(fetch())
+        tasks[normalized] = task
+        try:
+            return dict(await asyncio.shield(task) or {})
+        finally:
+            if tasks.get(normalized) is task:
+                tasks.pop(normalized, None)
+
+    async def get_latest_market_fact(self, symbol: str) -> dict[str, Any]:
+        """Return one executable, native-instrument-bound OKX market fact."""
+
+        ticker_result, derivatives_result = await asyncio.gather(
+            self._get_ticker_snapshot(symbol, block_on_remote=True),
+            self._get_derivatives_snapshot(symbol, block_on_remote=True),
+            return_exceptions=True,
+        )
+        ticker = ticker_result if isinstance(ticker_result, dict) else {}
+        derivatives = derivatives_result if isinstance(derivatives_result, dict) else {}
+        ticker = self._attach_market_source_consistency(symbol, ticker, derivatives)
+        merged = {**ticker, **derivatives}
+        merged["stale"] = bool(
+            ticker.get("stale") or derivatives.get("derivatives_snapshot_stale")
+        )
+        return build_market_fact(
+            symbol,
+            merged,
+            contract_spec=ticker.get("contract_spec"),
+            received_at=ticker.get("received_at"),
+        )
+
+    def _attach_market_source_consistency(
+        self,
+        symbol: str,
+        ticker: dict[str, Any],
+        derivatives: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not ticker:
+            return {}
+        enriched = {**ticker, **derivatives}
+        raw_sources = ticker.get("market_source_snapshots")
+        source_snapshots = (
+            [dict(item) for item in raw_sources if isinstance(item, dict)]
+            if isinstance(raw_sources, list)
+            else [dict(ticker)]
+        )
+        facts = [
+            build_market_fact(
+                symbol,
+                {**snapshot, **derivatives},
+                contract_spec=snapshot.get("contract_spec") or ticker.get("contract_spec"),
+                received_at=snapshot.get("received_at"),
+            )
+            for snapshot in source_snapshots
+        ]
+        primary_fact = facts[0] if facts else {}
+        enriched["market_source_consistency"] = build_market_source_consistency(
+            primary_fact,
+            facts[1:],
+            orderbook_fact=derivatives.get("orderbook_fact"),
+            mark_price_fact=derivatives.get("mark_price_fact"),
+            index_price_fact=derivatives.get("index_price_fact"),
+            bars=ticker.get("native_consistency_bars_1m") or [],
+        )
+        return enriched
+
+    async def verify_market_fact_path(
+        self,
+        entry_fact: dict[str, Any],
+        result_fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry_ms = int(entry_fact.get("source_timestamp_ms") or 0)
+        result_ms = int(result_fact.get("source_timestamp_ms") or 0)
+        elapsed_minutes = (
+            max((result_ms - entry_ms) // 60_000, 0) + 1
+            if entry_ms > 0 and result_ms >= entry_ms
+            else 1
+        )
+        # OKX's public candle API caps a single response; this is an exchange boundary,
+        # while the requested window is derived from the actual fact timestamps.
+        limit = min(elapsed_minutes + 2, 300)
+        try:
+            rows = await self.rest_client.fetch_ohlcv(
+                str(entry_fact.get("symbol") or ""),
+                timeframe="1m",
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OKX native 1m path unavailable for shadow outcome",
+                symbol=entry_fact.get("symbol"),
+                error=safe_error_text(exc),
+            )
+            rows = []
+        return verify_native_market_fact_path(entry_fact, result_fact, rows)
 
     @staticmethod
     def _ticker_timestamp_from_raw(raw_ticker: dict[str, Any]) -> int:
@@ -1675,8 +1953,15 @@ class DataService:
             result = await existing_task
             return dict(result or {})
         try:
+            contract_spec = await self._get_instrument_spec(
+                normalized,
+                block_on_remote=True,
+            )
             data = await asyncio.wait_for(
-                self.rest_client.fetch_derivatives_snapshot(normalized),
+                self.rest_client.fetch_derivatives_snapshot(
+                    normalized,
+                    contract_spec=contract_spec,
+                ),
                 timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
             )
         except Exception as e:

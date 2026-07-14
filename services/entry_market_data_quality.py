@@ -4,6 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from core.market_facts import market_fact_reasons, market_source_consistency_reasons
+
 
 @dataclass(frozen=True, slots=True)
 class MarketDataQualityIssue:
@@ -53,6 +55,7 @@ class EntryMarketDataQualityPolicy:
 
     def issue(self, source: Any, *, stage_label: str = "下单前") -> MarketDataQualityIssue | None:
         try:
+            market_fact_issue = self._market_fact_issue(source, stage_label)
             snapshot = self._snapshot(source)
         except (TypeError, ValueError, AttributeError):
             return self._issue(
@@ -61,6 +64,9 @@ class EntryMarketDataQualityPolicy:
                 "行情数据异常，无法确认真实价格和盘口，本次不执行新开仓。",
                 {},
             )
+
+        if market_fact_issue:
+            return market_fact_issue
 
         price = self._reference_price(snapshot)
         if price <= 0:
@@ -132,6 +138,74 @@ class EntryMarketDataQualityPolicy:
         # belong to the live quote. Their ordinary time-basis difference is priced
         # by the live spread and pre-order refresh, not treated as corrupted data.
         return None
+
+    def _market_fact_issue(
+        self,
+        source: Any,
+        stage_label: str,
+    ) -> MarketDataQualityIssue | None:
+        fact = self.market_value_reader(source, "market_fact", None)
+        if not isinstance(fact, dict):
+            return self._issue(
+                "native_market_fact_missing",
+                stage_label,
+                "缺少绑定 OKX 原生合约身份的市场事实，本次不执行新开仓。",
+                {"market_fact_present": False},
+            )
+
+        quality = fact.get("quality")
+        quality = quality if isinstance(quality, dict) else {}
+        declared_status = str(quality.get("status") or "").strip().lower()
+        declared_reasons = [
+            str(reason).strip()
+            for reason in quality.get("reasons") or []
+            if str(reason).strip()
+        ]
+        verified_reasons = market_fact_reasons(fact)
+        source_consistency = fact.get("source_consistency")
+        if not isinstance(source_consistency, dict):
+            verified_reasons.append("source_consistency_contract_missing")
+        else:
+            verified_reasons.extend(
+                f"source_consistency:{reason}"
+                for reason in market_source_consistency_reasons(source_consistency)
+            )
+        if not str(fact.get("fact_id") or "").startswith("sha256:"):
+            verified_reasons.append("market_fact_id_missing")
+        if not quality:
+            verified_reasons.append("market_fact_quality_missing")
+        reasons = list(dict.fromkeys([*verified_reasons, *declared_reasons]))
+        if declared_status == "clean" and not reasons:
+            return None
+        if not reasons:
+            reasons.append("market_fact_quality_not_clean")
+
+        identity = fact.get("native_identity")
+        identity = identity if isinstance(identity, dict) else {}
+        return self._issue(
+            "native_market_fact_invalid",
+            stage_label,
+            (
+                "OKX 原生市场事实未通过执行资格校验："
+                f"{', '.join(reasons)}。本次不执行新开仓。"
+            ),
+            {
+                "market_fact_id": str(fact.get("fact_id") or ""),
+                "market_fact_schema_version": str(fact.get("schema_version") or ""),
+                "market_fact_quality_status": declared_status,
+                "market_fact_reason_codes": ";".join(reasons),
+                "inst_id": str(identity.get("inst_id") or ""),
+                "inst_type": str(identity.get("inst_type") or ""),
+                "uly": str(identity.get("uly") or ""),
+                "contract_spec_version": str(
+                    identity.get("contract_spec_version") or ""
+                ),
+                "source_interface": str(fact.get("source_interface") or ""),
+                "source_endpoint": str(fact.get("source_endpoint") or ""),
+                "source_channel": str(fact.get("source_channel") or ""),
+                "source_timestamp_ms": int(fact.get("source_timestamp_ms") or 0),
+            },
+        )
 
     def _outside_24h_range_issue(
         self,

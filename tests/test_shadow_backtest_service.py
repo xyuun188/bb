@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.market_facts import build_market_fact, verify_market_fact_path
+from core.training_contracts import SHADOW_LABEL_VERSION, shadow_label_contract_reasons
 from services.shadow_backtest_service import ShadowBacktestService, side_label
 
 
@@ -40,6 +44,56 @@ class _FakeRepo:
         self.memories.append(data)
 
 
+_ENTRY_TIMESTAMP_MS = 1_783_990_800_000
+_RESULT_TIMESTAMP_MS = _ENTRY_TIMESTAMP_MS + 60 * 60_000
+
+
+def _market_fact(
+    symbol: str,
+    price: float,
+    timestamp_ms: int,
+    *,
+    notional_24h_usdt: float = 100_000.0,
+) -> dict[str, Any]:
+    normalized = symbol.upper()
+    base = normalized.split("/")[0]
+    return build_market_fact(
+        normalized,
+        {
+            "symbol": normalized,
+            "inst_id": f"{base}-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source": "websocket",
+            "source_endpoint": "okx_ws_public",
+            "source_channel": "tickers",
+            "timestamp": timestamp_ms,
+            "last_price": price,
+            "bid": price * 0.9999,
+            "ask": price * 1.0001,
+            "notional_24h_usdt": notional_24h_usdt,
+            "volume_24h_contracts": 100_000.0,
+            "volume_24h_base": 100_000.0,
+            "orderbook_bid_depth": 100_000.0,
+            "orderbook_ask_depth": 100_000.0,
+        },
+        contract_spec={
+            "instId": f"{base}-USDT-SWAP",
+            "instType": "SWAP",
+            "uly": f"{base}-USDT",
+            "instFamily": f"{base}-USDT",
+            "ctType": "linear",
+            "ctVal": "1",
+            "ctMult": "1",
+            "ctValCcy": base,
+            "settleCcy": "USDT",
+            "lotSz": "0.1",
+            "minSz": "0.1",
+            "tickSz": "0.0001",
+            "state": "live",
+        },
+    )
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -55,6 +109,41 @@ def _service(
     async def latest(_symbol: str) -> float:
         return latest_price
 
+    for row in repo.due_rows:
+        if getattr(row, "due_at", None) is None:
+            row.due_at = datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC)
+        snapshot = dict(getattr(row, "feature_snapshot", None) or {})
+        snapshot.setdefault(
+            "market_fact",
+            _market_fact(
+                str(row.symbol),
+                float(row.entry_price),
+                _ENTRY_TIMESTAMP_MS,
+            ),
+        )
+        row.feature_snapshot = snapshot
+
+    async def latest_fact(symbol: str) -> dict[str, Any]:
+        return _market_fact(symbol, latest_price, _RESULT_TIMESTAMP_MS)
+
+    async def price_path(
+        entry_fact: dict[str, Any],
+        result_fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry_price = float(entry_fact["prices"]["last"])
+        result_price = float(result_fact["prices"]["last"])
+        low = min(entry_price, result_price) * 0.999
+        high = max(entry_price, result_price) * 1.001
+        bars = [
+            [timestamp, entry_price, high, low, result_price, 1000.0]
+            for timestamp in range(
+                _ENTRY_TIMESTAMP_MS,
+                _RESULT_TIMESTAMP_MS + 1,
+                60_000,
+            )
+        ]
+        return verify_market_fact_path(entry_fact, result_fact, bars)
+
     return ShadowBacktestService(
         latest_price_provider=latest,
         symbol_normalizer=lambda symbol: str(symbol or "").upper(),
@@ -62,6 +151,8 @@ def _service(
         session_factory=_SessionCtx,
         repository_factory=lambda _session: repo,
         execution_cost_facts_provider=execution_cost_facts_provider,
+        latest_market_fact_provider=latest_fact,
+        price_path_provider=price_path,
         horizons_minutes=(10, 30),
     )
 
@@ -74,7 +165,11 @@ def _decision() -> DecisionOutput:
         reasoning="test shadow backtest",
         position_size_pct=0.05,
         model_name="ensemble_trader",
-        feature_snapshot={"current_price": 100.0, "adx_14": 28.0},
+        feature_snapshot={
+            "current_price": 100.0,
+            "adx_14": 28.0,
+            "market_fact": _market_fact("BTC/USDT", 100.0, _ENTRY_TIMESTAMP_MS),
+        },
         raw_response={"reason": "test"},
     )
 
@@ -91,6 +186,16 @@ async def test_shadow_backtest_service_creates_pending_horizons() -> None:
     assert repo.created[0]["decision_id"] == 123
     assert repo.created[0]["decision_action"] == "long"
     assert repo.created[0]["entry_price"] == 100.0
+    assert repo.created[0]["feature_snapshot"]["market_fact"]["fact_id"].startswith(
+        "sha256:"
+    )
+    assert repo.created[0]["feature_snapshot"]["training_market_fact_contract"][
+        "status"
+    ] == "quarantined"
+    compact_contract = repo.created[0]["feature_snapshot"][
+        "training_market_fact_contract"
+    ]
+    assert len(json.dumps(compact_contract).encode("utf-8")) < 2048
 
 
 @pytest.mark.asyncio
@@ -266,6 +371,15 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
 
     await _service(repo, latest_price=101.0).update_due()
 
+    label_contract = row.feature_snapshot["training_label_contract"]
+    assert label_contract["version"] == SHADOW_LABEL_VERSION
+    assert label_contract["decision_id"] == 123
+    assert label_contract["horizon_minutes"] == 10
+    assert shadow_label_contract_reasons(
+        label_contract,
+        decision_id=123,
+        horizon_minutes=10,
+    ) == []
     assert len(repo.memories) == 4
     assert {item["expert_name"] for item in repo.memories} == {
         "trend_expert",
@@ -538,6 +652,51 @@ async def test_shadow_backtest_service_does_not_apply_fixed_price_range_toleranc
     assert "price_outside_24h_range" not in row.note
     assert repo.memories == []
     assert repo.completed[0]["actual_price"] == pytest.approx(0.3910)
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_quarantines_zero_turnover_robo_entry_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=88,
+        decision_id=79757,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ROBO/USDT",
+        decision_action="short",
+        entry_price=0.10834,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={
+            "market_fact": _market_fact(
+                "ROBO/USDT",
+                0.10834,
+                _ENTRY_TIMESTAMP_MS,
+                notional_24h_usdt=0.0,
+            ),
+            "bid": 0.01293,
+            "ask": 0.01295,
+            "orderbook_bid_depth": 100_000.0,
+            "orderbook_ask_depth": 100_000.0,
+            "taker_fee_rate": 0.0005,
+            "funding_rate": 0.0,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+        },
+    )
+    repo.due_rows = [row]
+
+    await _service(repo, latest_price=0.01294).update_due()
+
+    assert row.status == "quarantined"
+    assert "entry:zero_notional_turnover" in row.note
+    assert repo.memories == []
 
 
 def test_shadow_backtest_side_label() -> None:

@@ -345,7 +345,11 @@ class OkxPerpetualSdkExchange:
     def _public_kwargs(self) -> dict[str, Any]:
         proxy = okx_proxy_url()
         return {
-            "flag": okx_sdk_flag_for_mode(self.mode),
+            # Public market facts must share the live OKX identity used by the
+            # public WebSocket. Demo selection belongs only to private account
+            # and order APIs; mixing demo REST with live WS created ROBO's
+            # unreachable 0.10834 vs 0.0129 price history.
+            "flag": "0",
             "domain": OKX_DOMAIN,
             "debug": False,
             "proxy": proxy,
@@ -542,6 +546,29 @@ class OkxPerpetualSdkExchange:
             instType=OKX_SWAP_INST_TYPE,
             uly=str(params.get("uly") or ""),
             instFamily=str(params.get("instFamily") or ""),
+        )
+
+    async def publicGetPublicMarkPrice(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.public_api,
+            "get_mark_price",
+            instType=OKX_SWAP_INST_TYPE,
+            uly=str(params.get("uly") or ""),
+            instFamily=str(params.get("instFamily") or ""),
+            instId=str(params.get("instId") or ""),
+        )
+
+    async def publicGetMarketIndexTickers(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        source = dict(params or {})
+        return await self._call_sdk(
+            lambda: self.market_api,
+            "get_index_tickers",
+            quoteCcy=str(source.get("quoteCcy") or ""),
+            instId=str(source.get("instId") or ""),
         )
 
     async def privateGetAccountBalance(self, params: Mapping[str, Any]) -> dict[str, Any]:

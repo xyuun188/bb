@@ -590,6 +590,7 @@ def _influence_policy(metadata: dict[str, Any]) -> dict[str, Any]:
 @dataclass(frozen=True)
 class ShadowTrainingRow:
     id: int
+    decision_id: int | None
     created_at: datetime | None
     symbol: str
     analysis_type: str
@@ -598,6 +599,7 @@ class ShadowTrainingRow:
     feature_snapshot: Any
     due_at: datetime | None
     horizon_minutes: int
+    label_version: str
     long_return_pct: float | None
     short_return_pct: float | None
     best_action: str | None
@@ -659,6 +661,8 @@ _TRAINING_FEATURE_SNAPSHOT_KEYS = (
     "stoch_k",
     "ticker_stale",
     "training_quality_reason",
+    "training_market_fact_contract",
+    "training_label_contract",
     "volatility_20",
     "volume_24h",
     "volume_ratio",
@@ -668,6 +672,7 @@ _TRAINING_FEATURE_COLUMN_PREFIX = "training_feature__"
 def _shadow_training_columns() -> tuple[Any, ...]:
     return (
         ShadowBacktest.id,
+        ShadowBacktest.decision_id,
         ShadowBacktest.created_at,
         ShadowBacktest.symbol,
         ShadowBacktest.analysis_type,
@@ -676,6 +681,7 @@ def _shadow_training_columns() -> tuple[Any, ...]:
         ShadowBacktest.training_feature_snapshot,
         ShadowBacktest.due_at,
         ShadowBacktest.horizon_minutes,
+        ShadowBacktest.label_version,
         ShadowBacktest.long_return_pct,
         ShadowBacktest.short_return_pct,
         ShadowBacktest.best_action,
@@ -687,6 +693,7 @@ def _shadow_training_row_from_mapping(mapping: Any) -> ShadowTrainingRow:
     feature_snapshot = _parse_json(mapping.get("training_feature_snapshot"))
     return ShadowTrainingRow(
         id=int(mapping.get("id") or 0),
+        decision_id=int(mapping.get("decision_id") or 0) or None,
         created_at=mapping.get("created_at"),
         symbol=str(mapping.get("symbol") or ""),
         analysis_type=str(mapping.get("analysis_type") or ""),
@@ -695,6 +702,7 @@ def _shadow_training_row_from_mapping(mapping: Any) -> ShadowTrainingRow:
         feature_snapshot=feature_snapshot,
         due_at=mapping.get("due_at"),
         horizon_minutes=int(mapping.get("horizon_minutes") or 10),
+        label_version=str(mapping.get("label_version") or ""),
         long_return_pct=mapping.get("long_return_pct"),
         short_return_pct=mapping.get("short_return_pct"),
         best_action=mapping.get("best_action"),
@@ -812,6 +820,9 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         if raw_long_return is None or raw_short_return is None:
             continue
         quality_sample = {
+            "id": int(getattr(row, "id", 0) or 0),
+            "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
+            "label_version": str(getattr(row, "label_version", "") or ""),
             "symbol": getattr(row, "symbol", ""),
             "analysis_type": getattr(row, "analysis_type", ""),
             "decision_action": getattr(row, "decision_action", ""),
@@ -892,6 +903,9 @@ def shadow_training_quality_report(rows: list[Any]) -> dict[str, Any]:
         raw_long_return = getattr(row, "long_return_pct", None)
         raw_short_return = getattr(row, "short_return_pct", None)
         sample = {
+            "id": int(getattr(row, "id", 0) or 0),
+            "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
+            "label_version": str(getattr(row, "label_version", "") or ""),
             "symbol": getattr(row, "symbol", ""),
             "analysis_type": getattr(row, "analysis_type", ""),
             "decision_action": getattr(row, "decision_action", ""),
@@ -1046,6 +1060,9 @@ def train_from_frame(
         "training_shadow_sample_count": int(len(frame)),
         "training_window_composition": _training_window_composition(frame),
         "quality_report": frame_quality_report,
+        "market_fact_contract": _safe_dict(
+            frame_quality_report.get("market_fact_contract")
+        ),
         "governance_report": artifact_bound_governance_report(
             frame_quality_report,
             persist_artifact=persist_artifact,
