@@ -6520,6 +6520,7 @@ async def _strategy_learning_watermark_for_request(
     from sqlalchemy import func, select
 
     from db.session import get_read_session_ctx
+    from models.decision import AIDecision
     from models.learning import ShadowBacktest, StrategyLearningEvent
     from models.trade import Position
 
@@ -6540,6 +6541,12 @@ async def _strategy_learning_watermark_for_request(
     event_filters = (
         StrategyLearningEvent.execution_mode == selected_mode,
         StrategyLearningEvent.created_at >= since.replace(tzinfo=None),
+    )
+    decision_filters = (
+        AIDecision.model_name == ENSEMBLE_TRADER_NAME,
+        AIDecision.is_paper.is_(selected_mode == "paper"),
+        AIDecision.analysis_type == "market",
+        AIDecision.created_at >= since.replace(tzinfo=None),
     )
     async with get_read_session_ctx() as session:
         row = (
@@ -6571,6 +6578,15 @@ async def _strategy_learning_watermark_for_request(
                     .scalar_subquery(),
                     select(func.max(StrategyLearningEvent.updated_at))
                     .where(*event_filters)
+                    .scalar_subquery(),
+                    select(func.count(AIDecision.id))
+                    .where(*decision_filters)
+                    .scalar_subquery(),
+                    select(func.max(AIDecision.id))
+                    .where(*decision_filters)
+                    .scalar_subquery(),
+                    select(func.max(AIDecision.updated_at))
+                    .where(*decision_filters)
                     .scalar_subquery(),
                 )
             )

@@ -19,7 +19,7 @@
         })();
     </script>
     <link rel="stylesheet" href="/static/css/dashboard.css?v=20260705-official-settlement-badge">
-    <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260713-scheduler-state-clarity">
+    <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260714-runtime-prior-clarity">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
@@ -765,14 +765,14 @@
                         <div class="strategy-learning-stage-head">
                             <div>
                                 <span class="strategy-learning-stage-kicker">02 · Candidate Governance</span>
-                                <strong>已生成候选策略</strong>
+                                <strong>历史收益分区</strong>
                             </div>
-                            <p>按全市场方向、行情状态方向和币种方向分组，分别显示治理与生产状态。</p>
+                            <p>这些是自动形成的历史样本分组，不是按币种配置的独立执行策略。</p>
                         </div>
                         <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel strategy-learning-panel-candidates">
                         <div class="analysis-section-head">
-                            <span class="analysis-section-title">候选策略与生产状态</span>
-                            <span class="analysis-section-subtitle">排名不等于生效，缺失证据保持为空</span>
+                            <span class="analysis-section-title">历史收益分区与治理状态</span>
+                            <span class="analysis-section-subtitle">分区排名不等于使用，缺失证据保持为空</span>
                         </div>
                         <div id="strategy-learning-profiles" class="strategy-learning-profile-list"></div>
                     </div>
@@ -803,8 +803,8 @@
                     </div>
                     <div class="opening-funnel-panel opening-funnel-panel-full strategy-learning-panel strategy-learning-panel-recent-events">
                         <div class="analysis-section-head">
-                            <span class="analysis-section-title">候选状态索引</span>
-                            <span class="analysis-section-subtitle">生成、治理、生产和排名使用不同口径</span>
+                            <span class="analysis-section-title">运行与分区状态索引</span>
+                            <span class="analysis-section-subtitle">执行规则、治理、实际匹配和排名使用不同口径</span>
                         </div>
                         <div id="strategy-learning-recent-events" class="strategy-learning-event-list"></div>
                     </div>
@@ -1785,7 +1785,7 @@
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
     <script src="/static/js/dashboard.js?v=20260705-official-settlement-badge"></script>
-    <script src="/static/js/strategy_learning_view.js?v=20260713-scheduler-state-clarity"></script>
+    <script src="/static/js/strategy_learning_view.js?v=20260714-runtime-prior-clarity"></script>
 </body>
 </html>
 

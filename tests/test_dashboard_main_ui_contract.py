@@ -777,7 +777,7 @@ def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:
     assert "/* Strategy learning console */" not in dashboard_style
     assert ".strategy-learning-profile-list {" not in dashboard_style
     assert ".strategy-learning-event-list {" not in dashboard_style
-    assert "strategy_learning.css?v=20260713-scheduler-state-clarity" in (
+    assert "strategy_learning.css?v=20260714-runtime-prior-clarity" in (
         PROJECT_ROOT / "web_dashboard/static/index.html"
     ).read_text(encoding="utf-8")
     assert (

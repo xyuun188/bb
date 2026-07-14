@@ -15,6 +15,7 @@ from sqlalchemy import select
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
 from db.session import get_read_session_ctx, get_session_ctx
+from models.decision import AIDecision
 from models.learning import ShadowBacktest, StrategyLearningEvent
 from models.trade import Position
 from services.shadow_backtest_service import shadow_fee_after_outcome
@@ -91,6 +92,67 @@ def _regime_label(value: Any) -> str:
             if label:
                 return label
     return ""
+
+
+def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
+    """Summarize which governed historical priors recent decisions actually matched."""
+
+    latest_by_symbol_side: dict[tuple[str, str], dict[str, Any]] = {}
+    matched_decision_ids: set[int] = set()
+    matched_profile_ids: set[str] = set()
+    evaluated_side_count = 0
+    matched_evaluation_count = 0
+
+    for decision in decisions:
+        evidence = _safe_dict(getattr(decision, "entry_candidate_evidence", None))
+        if not evidence:
+            raw = _safe_dict(getattr(decision, "raw_llm_response", None))
+            evidence = _safe_dict(raw.get("entry_candidate_evidence"))
+        decision_id = _safe_int(getattr(decision, "id", None))
+        symbol = str(getattr(decision, "symbol", "") or "").upper()
+        for side in ("long", "short"):
+            side_evidence = _safe_dict(evidence.get(side))
+            if side_evidence:
+                evaluated_side_count += 1
+            prior = _safe_dict(side_evidence.get("scheduled_return_prior"))
+            if prior.get("available") is not True:
+                continue
+
+            matched_evaluation_count += 1
+            if decision_id:
+                matched_decision_ids.add(decision_id)
+            profile_id = str(prior.get("profile_id") or "").strip()
+            if profile_id:
+                matched_profile_ids.add(profile_id)
+            route_key = (symbol, side)
+            if route_key in latest_by_symbol_side:
+                continue
+            latest_by_symbol_side[route_key] = {
+                "decision_id": decision_id or None,
+                "matched_at": _timestamp_text(getattr(decision, "created_at", None)),
+                "symbol": symbol,
+                "decision_action": str(getattr(decision, "action", "") or ""),
+                "evaluated_side": side,
+                "profile_id": profile_id or None,
+                "profile_version": prior.get("profile_version"),
+                "rank": prior.get("rank"),
+                "selector": _safe_dict(prior.get("selector")),
+                "role": "historical_prior_only",
+                "can_authorize_entry": False,
+            }
+
+    latest_matches = list(latest_by_symbol_side.values())
+    return {
+        "role": "historical_prior_only",
+        "inspected_decision_count": len(decisions),
+        "evaluated_side_count": evaluated_side_count,
+        "matched_decision_count": len(matched_decision_ids),
+        "matched_evaluation_count": matched_evaluation_count,
+        "matched_profile_count": len(matched_profile_ids),
+        "latest_match_at": latest_matches[0]["matched_at"] if latest_matches else None,
+        "latest_matches": latest_matches,
+        "can_authorize_entry": False,
+    }
 
 
 def _dynamic_blocks(samples: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -266,6 +328,7 @@ class StrategyFeedback:
     problems: list[dict[str, Any]]
     root_causes: list[str]
     training_policy: dict[str, Any]
+    runtime_prior_usage: dict[str, Any] = field(default_factory=dict)
     authoritative_return_samples: list[dict[str, Any]] = field(default_factory=list)
     shadow_return_samples: list[dict[str, Any]] = field(default_factory=list)
 
@@ -772,6 +835,30 @@ class StrategyLearningService:
                 .scalars()
                 .all()
             )
+            decisions = list(
+                (
+                    await session.execute(
+                        select(
+                            AIDecision.id,
+                            AIDecision.symbol,
+                            AIDecision.action,
+                            AIDecision.created_at,
+                            AIDecision.raw_llm_response[
+                                "entry_candidate_evidence"
+                            ].label("entry_candidate_evidence"),
+                        )
+                        .where(
+                            AIDecision.model_name == ENSEMBLE_TRADER_NAME,
+                            AIDecision.is_paper.is_(selected_mode == "paper"),
+                            AIDecision.analysis_type == "market",
+                            AIDecision.created_at >= since_naive,
+                        )
+                        .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
+                        .limit(effective_limit)
+                    )
+                )
+                .all()
+            )
 
         regime_by_position: dict[int, str] = {}
         for event in events:
@@ -926,6 +1013,7 @@ class StrategyLearningService:
                 "win_rate_role": "diagnostic_only",
                 "fixed_strategy_thresholds_allowed": False,
             },
+            runtime_prior_usage=_runtime_prior_usage(decisions),
             authoritative_return_samples=authoritative_samples,
             shadow_return_samples=shadow_samples,
         )

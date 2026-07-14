@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import ast
 from dataclasses import fields
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from services.strategy_learning import (
     StrategyCandidateGenerator,
     StrategyFeedback,
     StrategyLearningEngine,
     StrategyProfile,
+    _runtime_prior_usage,
 )
 
 
@@ -92,6 +95,67 @@ def test_strategy_candidates_are_generated_from_observed_partitions() -> None:
     assert {selector["side"] for selector in selectors} == {"long", "short"}
     assert all(profile.params["objective"] == "maximize_authoritative_fee_after_return_rate" for profile in profiles)
     assert all(profile.params["current_return_contract_required"] is True for profile in profiles)
+
+
+def test_runtime_prior_usage_reports_actual_matches_not_ranked_candidates() -> None:
+    entry_candidate_evidence = {
+        "long": {
+            "scheduled_return_prior": {
+                "available": True,
+                "profile_id": "btc_long_prior",
+                "profile_version": 7,
+                "rank": 2,
+                "selector": {
+                    "scope": "symbol_side",
+                    "symbol": "BTC/USDT",
+                    "side": "long",
+                },
+                "can_authorize_entry": False,
+            }
+        },
+        "short": {"scheduled_return_prior": {"available": False}},
+    }
+    newer = SimpleNamespace(
+        id=12,
+        symbol="BTC/USDT",
+        action="hold",
+        created_at=datetime(2026, 7, 14, 5, 0, tzinfo=UTC),
+        entry_candidate_evidence=entry_candidate_evidence,
+        raw_llm_response={},
+    )
+    older_same_route = SimpleNamespace(
+        id=11,
+        symbol="BTC/USDT",
+        action="short",
+        created_at=datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+        raw_llm_response={"entry_candidate_evidence": entry_candidate_evidence},
+    )
+
+    usage = _runtime_prior_usage([newer, older_same_route])
+
+    assert usage["inspected_decision_count"] == 2
+    assert usage["matched_decision_count"] == 2
+    assert usage["matched_evaluation_count"] == 2
+    assert usage["matched_profile_count"] == 1
+    assert usage["latest_matches"] == [
+        {
+            "decision_id": 12,
+            "matched_at": "2026-07-14T05:00:00+00:00",
+            "symbol": "BTC/USDT",
+            "decision_action": "hold",
+            "evaluated_side": "long",
+            "profile_id": "btc_long_prior",
+            "profile_version": 7,
+            "rank": 2,
+            "selector": {
+                "scope": "symbol_side",
+                "symbol": "BTC/USDT",
+                "side": "long",
+            },
+            "role": "historical_prior_only",
+            "can_authorize_entry": False,
+        }
+    ]
 
 
 def test_scheduler_uses_walk_forward_and_cost_complete_shadow_governance() -> None:
@@ -283,6 +347,7 @@ def test_feedback_contract_carries_authoritative_audit_and_evaluation_samples() 
         "trade_fact_quarantine",
         "reflection_feedback",
         "training_policy",
+        "runtime_prior_usage",
         "authoritative_return_samples",
         "shadow_return_samples",
     } <= names
