@@ -90,12 +90,20 @@ def _recommendation(return_report: dict[str, object]) -> dict[str, object]:
 
 
 def test_return_objective_promotes_positive_fee_after_distribution() -> None:
-    report = _return_report((0.8, 0.7, 0.6, 0.5))
+    report = _return_report((0.8, 0.7, 0.6, -0.1))
 
     assert report["promotion_ready"] is True
     assert report["optimization_target"] == "realized_fee_after_return"
     assert report["empirical_return_lower_hinge_pct"] > 0
     assert report["policy_provenance"]["sample_count"] == 4
+
+
+def test_return_objective_blocks_undefined_profit_factor() -> None:
+    report = _return_report((0.8, 0.7, 0.6, 0.5))
+
+    assert report["profit_factor"] is None
+    assert report["promotion_ready"] is False
+    assert "profit_factor_undefined" in report["blocking_reasons"]
 
 
 def test_high_win_rate_negative_expectancy_cannot_promote() -> None:
@@ -192,7 +200,7 @@ def test_unified_profit_learning_labels_fail_closed_without_funding_cost() -> No
 
 
 def test_phase3_promotion_uses_return_report_not_sample_count_or_win_rate() -> None:
-    report = _return_report((0.8, 0.7, 0.6, 0.5))
+    report = _return_report((0.8, 0.7, 0.6, -0.1))
     recommendation = _recommendation(report)
 
     assert recommendation["live_ready"] is True

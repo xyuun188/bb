@@ -558,7 +558,7 @@ def profit_factor(returns: Iterable[float]) -> float | None:
     gross_profit = float(values[values > 0].sum())
     gross_loss = abs(float(values[values < 0].sum()))
     if gross_loss <= 1e-12:
-        return None if gross_profit <= 1e-12 else 1_000_000.0
+        return None
     return gross_profit / gross_loss
 
 

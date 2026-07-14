@@ -650,7 +650,7 @@ def build_profit_attribution(
         "win_rate": round(wins / trade_count, 4) if trade_count else 0.0,
         "avg_win": round(profit / wins, 6) if wins else 0.0,
         "avg_loss": round(loss / losses, 6) if losses else 0.0,
-        "profit_factor": round(profit / loss, 4) if loss > 0 else (999.0 if profit > 0 else 0.0),
+        "profit_factor": round(profit / loss, 4) if loss > 0 else None,
         "direction_error_count": sum(1 for row in records if row["bucket"] == "ai_direction_error"),
         "execution_issue_count": sum(
             1 for row in records if row["bucket"] in {"stop_loss_or_fast_risk", "flat_or_fee_churn"}

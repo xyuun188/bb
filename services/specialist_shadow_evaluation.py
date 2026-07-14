@@ -692,7 +692,9 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         blockers.append("authoritative_return_distribution_missing")
     if authoritative_return_lcb is None or authoritative_return_lcb <= 0.0:
         blockers.append("authoritative_fee_after_return_lcb_not_positive")
-    if authoritative_gross_profit <= authoritative_gross_loss:
+    if authoritative_profit_factor is None:
+        blockers.append("authoritative_profit_factor_undefined")
+    elif authoritative_profit_factor <= 1.0:
         blockers.append("authoritative_profit_factor_below_unity")
     authoritative_worst = metric.get("authoritative_worst_return_pct")
     blockers = list(dict.fromkeys(blockers))

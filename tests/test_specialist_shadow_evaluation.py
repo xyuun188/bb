@@ -221,7 +221,13 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
             _row(index=index, realized=0.20 + index / 100)
             for index in range(1, 35)
         ],
-        authoritative_trade_samples=[_authoritative_sample(index) for index in range(1, 35)],
+        authoritative_trade_samples=[
+            _authoritative_sample(
+                index,
+                pnl_ratio_pct=-0.01 if index == 17 else 0.25,
+            )
+            for index in range(1, 35)
+        ],
     )
 
     assert report["ok"] is True
@@ -236,7 +242,7 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
     assert model["avg_realized_return_pct"] > 0.2
     assert model["profit_factor"] is None
     assert model["authoritative_direction_aligned_count"] == 34
-    assert model["authoritative_profit_factor"] is None
+    assert model["authoritative_profit_factor"] > 1.0
     assert model["walk_forward"]["status"] == "stable"
     assert model["market_regime_stability"]["status"] == "stable"
     assert model["rolling_distribution"]["status"] == "stable"
@@ -248,6 +254,21 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
     assert report["summary"]["promotion_ready_count"] == 2
     assert report["authoritative_eligible_count"] == 34
     assert report["promotion_gate"]["requires_at_least_one_promotion_ready_model"] is True
+
+
+def test_specialist_shadow_evaluation_blocks_undefined_authoritative_profit_factor() -> None:
+    report = summarize_specialist_shadow_evaluation(
+        [_row(index=index, realized=0.3) for index in range(1, 35)],
+        authoritative_trade_samples=[
+            _authoritative_sample(index, pnl_ratio_pct=0.25)
+            for index in range(1, 35)
+        ],
+    )
+    model = report["models"][0]
+
+    assert model["authoritative_profit_factor"] is None
+    assert model["promotion_ready"] is False
+    assert "authoritative_profit_factor_undefined" in model["promotion_blockers"]
 
 
 def test_specialist_shadow_evaluation_blocks_false_signal_losses() -> None:

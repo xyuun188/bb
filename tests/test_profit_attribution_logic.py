@@ -262,6 +262,7 @@ def test_profit_attribution_excludes_untrusted_closed_position_facts():
 
     assert result["summary"]["trade_count"] == 1
     assert result["summary"]["total_closed_pnl"] == 4.0
+    assert result["summary"]["profit_factor"] is None
     assert result["trade_fact_quarantine"]["quarantined"] == 1
     assert [row["position_id"] for row in result["records"]] == [901]
 

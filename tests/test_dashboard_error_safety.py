@@ -556,6 +556,7 @@ async def test_model_contribution_stats_uses_okx_authoritative_order_decision_li
     assert len(nonzero_rows) == 1
     assert nonzero_rows[0]["count"] == 1
     assert nonzero_rows[0]["pnl"] == pytest.approx(2.5)
+    assert nonzero_rows[0]["profit_factor"] is None
 
 
 @pytest.mark.asyncio

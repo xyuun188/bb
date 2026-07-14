@@ -41,9 +41,9 @@ def _feedback(
     shadow_long_returns: list[float] | None = None,
     shadow_short_returns: list[float] | None = None,
 ) -> StrategyFeedback:
-    long_returns = long_returns or [4.0, -1.0, 5.0]
+    long_returns = long_returns or [4.0, -1.0, 5.0, -0.5, 4.0, 5.0]
     short_returns = short_returns or [0.1, 0.1, -2.0]
-    shadow_long_returns = shadow_long_returns or [3.0, 2.0]
+    shadow_long_returns = shadow_long_returns or [3.0, -0.1, 2.0, 3.0]
     shadow_short_returns = shadow_short_returns or [0.1, -2.0]
     authoritative = [
         _sample(index, side="long", return_pct=value)
@@ -213,6 +213,28 @@ def test_low_win_high_return_policy_outranks_high_win_negative_return_policy() -
     assert side_candidates["long"]["rank"] < side_candidates["short"]["rank"]
     assert side_candidates["long"]["promotion"]["production_influence_eligible"] is True
     assert side_candidates["short"]["promotion"]["production_influence_eligible"] is False
+
+
+def test_strategy_candidate_cannot_promote_with_undefined_profit_factor() -> None:
+    all_win = [1.0, 1.2, 0.8, 1.1]
+    payload = StrategyLearningEngine().build_from_feedback(
+        _feedback(long_returns=all_win, shadow_long_returns=all_win)
+    )
+    long_candidate = next(
+        row
+        for row in payload["schedule"]["candidates"]
+        if row["params"]["selector"] == {"scope": "side", "side": "long"}
+    )
+
+    assert long_candidate["backtest"]["metrics"]["profit_factor"] is None
+    assert long_candidate["shadow_validation"]["metrics"]["profit_factor"] is None
+    assert long_candidate["promotion"]["production_influence_eligible"] is False
+    assert "walk_forward_profit_factor_undefined" in long_candidate["promotion"][
+        "rejection_reasons"
+    ]
+    assert "shadow_profit_factor_undefined" in long_candidate["promotion"][
+        "rejection_reasons"
+    ]
 
 
 def test_missing_shadow_evidence_fails_closed_without_numeric_fallback() -> None:

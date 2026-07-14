@@ -241,6 +241,196 @@ def _side_profit_quality_diagnostics(
     }
 
 
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for field in ("training_data_sha256", "source_code_sha256"):
+        if not _is_sha256(metadata.get(field)):
+            blockers.append(
+                _reason(
+                    f"artifact_{field}_missing_or_invalid",
+                    f"Artifact {field} is missing or invalid.",
+                    actual=metadata.get(field) or "missing",
+                    required="sha256",
+                )
+            )
+    if metadata.get("evaluation_group_policy") != "chronological_disjoint_decision_groups":
+        blockers.append(
+            _reason(
+                "artifact_evaluation_group_policy_invalid",
+                "Artifact evaluation does not use chronological disjoint decision groups.",
+                actual=metadata.get("evaluation_group_policy") or "missing",
+                required="chronological_disjoint_decision_groups",
+            )
+        )
+    for field in ("train_decision_group_count", "test_decision_group_count"):
+        if int(_safe_float(metadata.get(field), 0.0) or 0) <= 0:
+            blockers.append(
+                _reason(
+                    f"artifact_{field}_missing",
+                    f"Artifact {field} does not describe a non-empty partition.",
+                )
+            )
+    governance = _safe_dict(metadata.get("governance_report"))
+    if (
+        not governance.get("quality_fingerprint")
+        or governance.get("artifact_quality_fingerprint")
+        != governance.get("quality_fingerprint")
+        or governance.get("artifact_matches_quality") is not True
+    ):
+        blockers.append(
+            _reason(
+                "artifact_quality_fingerprint_mismatch",
+                "Artifact is not bound to the exact governed clean training view.",
+                actual={
+                    "quality_fingerprint": governance.get("quality_fingerprint"),
+                    "artifact_quality_fingerprint": governance.get(
+                        "artifact_quality_fingerprint"
+                    ),
+                    "artifact_matches_quality": governance.get(
+                        "artifact_matches_quality"
+                    ),
+                },
+            )
+        )
+    walk_forward = _safe_dict(metadata.get("walk_forward_report"))
+    if (
+        walk_forward.get("status") != "complete"
+        or walk_forward.get("decision_group_disjoint") is not True
+        or walk_forward.get("chronological_label_disjoint") is not True
+        or walk_forward.get("model_refit_per_fold") is not True
+        or not list(walk_forward.get("folds") or [])
+    ):
+        blockers.append(
+            _reason(
+                "artifact_walk_forward_incomplete",
+                "Artifact lacks complete refitted chronological walk-forward evidence.",
+            )
+        )
+    authoritative = _safe_dict(metadata.get("authoritative_trade_return_evidence"))
+    if (
+        authoritative.get("version")
+        != "2026-07-15.authoritative-trade-return-evidence.v1"
+        or not _is_sha256(authoritative.get("data_fingerprint"))
+    ):
+        blockers.append(
+            _reason(
+                "authoritative_trade_return_evidence_missing",
+                "Artifact lacks fingerprinted authoritative trade-return evidence.",
+            )
+        )
+    return blockers
+
+
+def _side_artifact_evidence_blockers(
+    metadata: dict[str, Any],
+    side: str,
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    walk_forward = _safe_dict(metadata.get("walk_forward_report"))
+    walk_side = _safe_dict(_safe_dict(walk_forward.get("sides")).get(side))
+    folds = list(walk_forward.get("folds") or [])
+    fold_side_evidence = [
+        _safe_dict(_safe_dict(fold).get("sides")).get(side)
+        for fold in folds
+        if isinstance(fold, dict)
+    ]
+    if (
+        walk_side.get("promotion_math_ready") is not True
+        or not fold_side_evidence
+        or any(
+            not isinstance(evidence, dict)
+            or evidence.get("promotion_math_ready") is not True
+            for evidence in fold_side_evidence
+        )
+    ):
+        blockers.append(
+            _reason(
+                f"{side}_walk_forward_return_stability_failed",
+                f"{side} fee-after return evidence is not stable across walk-forward folds.",
+            )
+        )
+    loso = _safe_dict(
+        _safe_dict(metadata.get("leave_one_symbol_out_report")).get(side)
+    )
+    if loso.get("stable") is not True:
+        blockers.append(
+            _reason(
+                f"{side}_leave_one_symbol_out_stability_failed",
+                f"{side} return evidence depends on at least one removed symbol.",
+            )
+        )
+    oos = _safe_dict(_safe_dict(metadata.get("oos_return_evaluation")).get(side))
+    oos_profit_factor = _safe_float(oos.get("profit_factor"), None)
+    if oos_profit_factor is None:
+        blockers.append(
+            _reason(
+                f"{side}_oos_profit_factor_undefined",
+                f"{side} OOS Profit Factor is undefined without a loss denominator.",
+            )
+        )
+    elif oos_profit_factor <= 1.0:
+        blockers.append(
+            _reason(
+                f"{side}_oos_profit_factor_not_above_break_even",
+                f"{side} OOS Profit Factor is not above natural break-even.",
+                actual=oos_profit_factor,
+                required=1.0,
+            )
+        )
+    if (
+        oos.get("promotion_math_ready") is not True
+        or _safe_float(oos.get("return_lcb_pct"), None) is None
+        or _safe_float(oos.get("cvar_10_pct"), None) is None
+        or _safe_float(oos.get("max_drawdown_pct"), None) is None
+    ):
+        blockers.append(
+            _reason(
+                f"{side}_oos_return_tail_evidence_incomplete",
+                f"{side} OOS return LCB, CVaR, or drawdown evidence is incomplete.",
+            )
+        )
+    authoritative = _safe_dict(
+        _safe_dict(
+            _safe_dict(metadata.get("authoritative_trade_return_evidence")).get("sides")
+        ).get(side)
+    )
+    authoritative_profit_factor = _safe_float(authoritative.get("profit_factor"), None)
+    if authoritative_profit_factor is None:
+        blockers.append(
+            _reason(
+                f"{side}_authoritative_profit_factor_undefined",
+                f"{side} actual-trade Profit Factor is undefined without losses.",
+            )
+        )
+    elif authoritative_profit_factor <= 1.0:
+        blockers.append(
+            _reason(
+                f"{side}_authoritative_profit_factor_not_above_break_even",
+                f"{side} actual-trade Profit Factor is not above natural break-even.",
+                actual=authoritative_profit_factor,
+                required=1.0,
+            )
+        )
+    if (
+        authoritative.get("promotion_math_ready") is not True
+        or _safe_float(authoritative.get("return_lcb_pct"), None) is None
+        or _safe_float(authoritative.get("cvar_10_pct"), None) is None
+        or _safe_float(authoritative.get("max_drawdown_pct"), None) is None
+    ):
+        blockers.append(
+            _reason(
+                f"{side}_authoritative_return_tail_evidence_incomplete",
+                f"{side} actual-trade return LCB, CVaR, or drawdown evidence is incomplete.",
+            )
+        )
+    return blockers
+
+
 def build_ml_readiness_report(
     metadata: dict[str, Any],
     influence: dict[str, Any],
@@ -278,7 +468,10 @@ def build_ml_readiness_report(
     tail_loss_policy = _safe_dict(metadata.get("tail_loss_policy"))
     tail_loss_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
 
-    global_blockers: list[dict[str, Any]] = _market_fact_contract_blockers(metadata)
+    global_blockers: list[dict[str, Any]] = [
+        *_market_fact_contract_blockers(metadata),
+        *_artifact_evidence_blockers(metadata),
+    ]
     if objective_name != RETURN_OBJECTIVE_NAME or objective_version != RETURN_OBJECTIVE_VERSION:
         global_blockers.append(
             _reason(
@@ -371,7 +564,13 @@ def build_ml_readiness_report(
                 actual=test_count,
             )
         )
-    side_blockers = {side: _side_metric_blockers(metrics, side) for side in ("long", "short")}
+    side_blockers = {
+        side: [
+            *_side_metric_blockers(metrics, side),
+            *_side_artifact_evidence_blockers(metadata, side),
+        ]
+        for side in ("long", "short")
+    }
     for side in ("long", "short"):
         profile = _safe_dict(actual_trade_profiles.get(f"*|{side}"))
         actual_return = _safe_dict(profile.get("net_return_after_cost_pct"))

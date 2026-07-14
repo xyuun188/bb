@@ -1287,7 +1287,7 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 counters.setdefault(key, Counter())[value] += 1
     avg_win = gross_profit / max(win_count, 1)
     avg_loss = gross_loss / max(loss_count, 1)
-    profit_factor = 999.0 if gross_loss <= 0 and gross_profit > 0 else gross_profit / max(gross_loss, 1e-9)
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
     small_win_big_loss_ratio = avg_loss / max(avg_win, 1e-9) if win_count and loss_count else 0.0
     quality_warnings: list[str] = []
     if supervision_ready == 0:
@@ -1296,6 +1296,8 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
         quality_warnings.append("gross_loss_not_covered_by_profit")
     if win_count and loss_count and avg_loss > avg_win:
         quality_warnings.append("avg_loss_larger_than_avg_win")
+    if gross_profit > 0 and gross_loss <= 0:
+        quality_warnings.append("profit_factor_undefined_without_losses")
     return {
         "supervision_ready_count": supervision_ready,
         "after_fee_quality": {
@@ -1307,7 +1309,9 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "net_realized_pnl_usdt": round(sum(trade_pnls), 6),
             "gross_profit_usdt": round(gross_profit, 6),
             "gross_loss_usdt": round(gross_loss, 6),
-            "profit_factor": round(profit_factor, 6),
+            "profit_factor": (
+                round(profit_factor, 6) if profit_factor is not None else None
+            ),
             "avg_net_pnl_usdt": round(sum(trade_pnls) / max(len(trade_pnls), 1), 6),
             "avg_win_usdt": round(avg_win, 6),
             "avg_loss_usdt": round(avg_loss, 6),

@@ -109,6 +109,25 @@ def _trade_sample(**overrides):
     return sample
 
 
+def test_profit_learning_report_does_not_invent_profit_factor_without_losses() -> None:
+    report = training_data_quality._profit_learning_report(
+        [
+            {
+                "profit_learning_labels": {
+                    "sample_kind": "trade",
+                    "training_supervision_ready": True,
+                    "realized_net_pnl_usdt": 2.5,
+                    "net_return_after_cost_pct": 0.4,
+                }
+            }
+        ]
+    )["after_fee_quality"]
+
+    assert report["net_realized_pnl_usdt"] == 2.5
+    assert report["profit_factor"] is None
+    assert "profit_factor_undefined_without_losses" in report["quality_warnings"]
+
+
 def test_shadow_hold_samples_are_not_penalized_by_action_type() -> None:
     assessment = assess_shadow_sample(_shadow_sample(decision_action="hold"))
 

@@ -221,7 +221,7 @@ def _return_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "gross_loss_usdt": round(gross_loss, 8),
         "profit_factor": round(gross_profit / gross_loss, 8) if gross_loss else None,
         "profit_factor_above_break_even": bool(
-            gross_profit > 0 and (gross_loss == 0 or gross_profit > gross_loss)
+            gross_loss > 0 and gross_profit > gross_loss
         ),
         "max_drawdown": round(_max_drawdown(drawdown_values), 8),
         "tail_loss_pct": round(min(returns), 8) if returns else None,
@@ -495,13 +495,17 @@ def _candidate_rejections(
         reasons.append(str(backtest.get("status") or "walk_forward_incomplete"))
     if (_optional_float(backtest_metrics.get("return_lcb_pct")) or 0.0) <= 0:
         reasons.append("walk_forward_fee_after_return_lcb_not_positive")
-    if backtest_metrics.get("profit_factor_above_break_even") is not True:
+    if backtest_metrics.get("profit_factor") is None:
+        reasons.append("walk_forward_profit_factor_undefined")
+    elif backtest_metrics.get("profit_factor_above_break_even") is not True:
         reasons.append("walk_forward_profit_factor_not_above_break_even")
     if shadow.get("status") != "complete":
         reasons.append(str(shadow.get("status") or "shadow_validation_incomplete"))
     if (_optional_float(shadow_metrics.get("return_lcb_pct")) or 0.0) <= 0:
         reasons.append("shadow_fee_after_return_lcb_not_positive")
-    if shadow_metrics.get("profit_factor_above_break_even") is not True:
+    if shadow_metrics.get("profit_factor") is None:
+        reasons.append("shadow_profit_factor_undefined")
+    elif shadow_metrics.get("profit_factor_above_break_even") is not True:
         reasons.append("shadow_profit_factor_not_above_break_even")
     return list(dict.fromkeys(reasons))
 

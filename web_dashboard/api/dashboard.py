@@ -6743,7 +6743,7 @@ async def get_profit_attribution(
                     "win_rate": 0.0,
                     "avg_win": 0.0,
                     "avg_loss": 0.0,
-                    "profit_factor": 0.0,
+                    "profit_factor": None,
                 },
                 "buckets": [],
                 "records": [],
@@ -6997,7 +6997,7 @@ async def get_model_contribution_stats(
         item["profit_factor"] = (
             round(item["profit"] / item["loss"], 4)
             if item["loss"] > 0
-            else (999.0 if item["profit"] > 0 else 0.0)
+            else None
         )
         result.append(item)
 

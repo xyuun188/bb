@@ -29,6 +29,8 @@ from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
+    _leave_one_symbol_out_stability,
+    _training_data_sha256,
     build_training_frame,
     count_shadow_training_rows,
     load_shadow_training_rows,
@@ -36,7 +38,7 @@ from services.ml_signal_service import (
     shadow_training_quality_report,
     train_from_frame,
 )
-from services.model_artifact_registry import ModelArtifactRegistry
+from services.model_artifact_registry import ARTIFACT_REGISTRY_VERSION, ModelArtifactRegistry
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
@@ -140,6 +142,76 @@ def _with_return_objective(metadata: dict) -> dict:
         },
     )
     metadata.setdefault("tail_loss_scale_pct", {"long": 0.18, "short": 0.18})
+    metadata.setdefault("training_data_sha256", "a" * 64)
+    metadata.setdefault("source_code_sha256", "b" * 64)
+    metadata.setdefault(
+        "evaluation_group_policy",
+        "chronological_disjoint_decision_groups",
+    )
+    metadata.setdefault("train_decision_group_count", 2)
+    metadata.setdefault("test_decision_group_count", 2)
+    metadata.setdefault(
+        "governance_report",
+        {
+            "quality_fingerprint": "test-quality-fingerprint",
+            "artifact_quality_fingerprint": "test-quality-fingerprint",
+            "artifact_matches_quality": True,
+        },
+    )
+    ready_return_evidence = {
+        "count": 4,
+        "avg_return_pct": 0.4,
+        "return_lcb_pct": 0.2,
+        "profit_factor": 4.0,
+        "cvar_10_pct": -0.05,
+        "max_drawdown_pct": 0.05,
+        "promotion_math_ready": True,
+    }
+    metadata.setdefault(
+        "walk_forward_report",
+        {
+            "status": "complete",
+            "decision_group_disjoint": True,
+            "chronological_label_disjoint": True,
+            "model_refit_per_fold": True,
+            "folds": [
+                {
+                    "fold": 1,
+                    "decision_group_overlap_count": 0,
+                    "sides": {
+                        side: dict(ready_return_evidence)
+                        for side in ("long", "short")
+                    },
+                }
+            ],
+            "sides": {
+                side: dict(ready_return_evidence) for side in ("long", "short")
+            },
+        },
+    )
+    metadata.setdefault(
+        "leave_one_symbol_out_report",
+        {
+            side: {"stable": True, "rows": []}
+            for side in ("long", "short")
+        },
+    )
+    metadata.setdefault(
+        "oos_return_evaluation",
+        {
+            side: dict(ready_return_evidence) for side in ("long", "short")
+        },
+    )
+    metadata.setdefault(
+        "authoritative_trade_return_evidence",
+        {
+            "version": "2026-07-15.authoritative-trade-return-evidence.v1",
+            "data_fingerprint": "c" * 64,
+            "sides": {
+                side: dict(ready_return_evidence) for side in ("long", "short")
+            },
+        },
+    )
     metrics = dict(metadata.get("metrics") or {})
     for side in ("long", "short"):
         top_return = float(metrics.get(f"top_{side}_avg_return_pct") or 0.0)
@@ -192,6 +264,18 @@ def _clean_training_label_contract(
 def _service_with_metadata(metadata: dict) -> MLSignalService:
     service = MLSignalService()
     service._bundle = {"metadata": _with_return_objective(metadata)}
+    service._resolved_artifact = SimpleNamespace(
+        activation_manifest={
+            "activation_stage": "live",
+            "readiness_state": "ready",
+            "production_influence_authorized": True,
+            "blocking_reasons": [],
+        }
+    )
+    service._artifact_registry_status = lambda: {  # type: ignore[method-assign]
+        "available": True,
+        "activation_manifest": service._resolved_artifact.activation_manifest,
+    }
     service._ensure_loaded = lambda: None  # type: ignore[method-assign]
     return service
 
@@ -425,6 +509,10 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
             {
                 "id": idx + 1,
                 "decision_group": f"shadow_decision:{idx + 1}",
+                "label_timestamp": (
+                    datetime(2026, 7, 14, tzinfo=UTC)
+                    + timedelta(minutes=idx * 61)
+                ).isoformat(),
                 "horizon_minutes": 30,
                 "symbol": "BTC/USDT" if idx % 2 == 0 else "ETH/USDT",
                 "long_return_pct": 0.2 if idx % 4 == 0 else -0.05,
@@ -535,7 +623,25 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["training_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
     assert metadata["trade_sample_cursor_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
     assert metadata["training_mode"] == "walk_forward"
-    assert metadata["model_stage"] == "shadow"
+    assert metadata["model_stage"] == "candidate"
+    assert len(metadata["training_data_sha256"]) == 64
+    assert len(metadata["source_code_sha256"]) == 64
+    assert metadata["walk_forward_report"]["status"] == "complete"
+    assert metadata["walk_forward_report"]["model_refit_per_fold"] is True
+    assert metadata["walk_forward_report"]["decision_group_disjoint"] is True
+    assert metadata["walk_forward_report"]["chronological_label_disjoint"] is True
+    assert all(
+        fold["decision_group_overlap_count"] == 0
+        for fold in metadata["walk_forward_report"]["folds"]
+    )
+    assert all(
+        fold["training_label_end"] < fold["validation_decision_start"]
+        for fold in metadata["walk_forward_report"]["folds"]
+    )
+    assert metadata["artifact_activation_manifest"][
+        "production_influence_authorized"
+    ] is False
+    assert metadata["live_promotion_manifest"]["status"] == "not_issued"
     assert metadata["profit_supervision_report"][
         "actual_execution_cost_sample_count"
     ] == 1
@@ -560,13 +666,25 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
         completed_sample_count=80,
         persist_artifact=True,
     )
+    assert metadata["artifact_registry_version"] == ARTIFACT_REGISTRY_VERSION
+    assert metadata["artifact_sha256"]
+    assert registry.candidate_path.exists()
+    assert not registry.current_path.exists()
+
+    registry.promote_candidate(
+        {
+            "activation_stage": "shadow",
+            "readiness_state": "degraded",
+            "production_influence_authorized": False,
+            "blocking_reasons": ["test_shadow_activation"],
+        }
+    )
     service = MLSignalService(artifact_registry=registry)
     status = service.status()
 
-    assert metadata["artifact_registry_version"] == "2026-07-11.v1"
-    assert metadata["artifact_sha256"]
     assert registry.current_path.exists()
     assert status["available"] is True
+    assert status["allow_live_position_influence"] is False
     assert status["artifact_registry"]["available"] is True
     assert status["artifact_registry"]["sha256"] == metadata["artifact_sha256"]
     governance = status["governance_report"]
@@ -638,6 +756,119 @@ def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
             assert summary["horizon_counts"]
             assert summary["data_quality_status_counts"]
             assert isinstance(summary["top_quality_reasons"], list)
+
+
+def test_training_data_fingerprint_is_order_independent_and_content_bound() -> None:
+    frame = _training_frame(12)
+    shuffled = frame.sample(frac=1.0, random_state=7).reset_index(drop=True)
+
+    original = _training_data_sha256(frame)
+    assert _training_data_sha256(shuffled) == original
+
+    changed = frame.copy()
+    changed.loc[0, "long_return_pct"] = 9.0
+    assert _training_data_sha256(changed) != original
+
+
+def test_tail_policy_is_derived_only_from_chronological_training_partition() -> None:
+    baseline = _training_frame(20)
+    changed_holdout = baseline.copy()
+    changed_holdout.loc[10:, "long_return_pct"] = -999.0
+    changed_holdout.loc[10:, "short_return_pct"] = -777.0
+
+    baseline_metadata = train_from_frame(baseline, persist_artifact=False)
+    changed_metadata = train_from_frame(changed_holdout, persist_artifact=False)
+
+    for side in ("long", "short"):
+        assert {
+            key: value
+            for key, value in changed_metadata["tail_loss_policy"][side].items()
+            if key != "generated_at"
+        } == {
+            key: value
+            for key, value in baseline_metadata["tail_loss_policy"][side].items()
+            if key != "generated_at"
+        }
+    assert all(
+        side_report["training_tail_loss_policy"]["observation_window"]
+        == "walk_forward_training_groups_only"
+        for fold in changed_metadata["walk_forward_report"]["folds"]
+        for side_report in fold["sides"].values()
+    )
+
+
+def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None:
+    rows: list[dict[str, object]] = []
+    decision_start = datetime(2026, 7, 14, tzinfo=UTC)
+    row_id = 0
+    for decision_index in range(30):
+        decision_at = decision_start + timedelta(minutes=decision_index * 5)
+        for horizon in (10, 60):
+            row_id += 1
+            row: dict[str, object] = {key: 0.0 for key in FEATURE_KEYS}
+            row.update(
+                {
+                    "id": row_id,
+                    "decision_group": f"shadow_decision:{decision_index + 1}",
+                    "decision_timestamp": decision_at.isoformat(),
+                    "label_timestamp": (
+                        decision_at + timedelta(minutes=horizon)
+                    ).isoformat(),
+                    "horizon_minutes": horizon,
+                    "symbol": "BTC/USDT" if decision_index % 2 == 0 else "ETH/USDT",
+                    "long_return_pct": 0.3 if decision_index % 3 == 0 else -0.1,
+                    "short_return_pct": 0.25 if decision_index % 3 == 1 else -0.08,
+                    "long_execution_cost_pct": 0.05,
+                    "short_execution_cost_pct": 0.05,
+                    "sample_weight": 1.0,
+                }
+            )
+            rows.append(row)
+
+    report = ml_signal_module._walk_forward_return_report(pd.DataFrame(rows))
+
+    assert report["status"] == "complete"
+    assert report["chronological_label_disjoint"] is True
+    assert any(
+        fold["purged_training_decision_group_count"] > 0
+        for fold in report["folds"]
+    )
+    assert all(
+        fold["training_label_end"] < fold["validation_decision_start"]
+        and fold["decision_group_overlap_count"] == 0
+        for fold in report["folds"]
+    )
+
+
+def test_leave_one_symbol_out_detects_single_symbol_profit_support() -> None:
+    rows = [
+        {
+            "symbol": "ROBO/USDT",
+            "decision_group": f"robo:{index}",
+            "label_timestamp": f"2026-07-14T00:{index:02d}:00+00:00",
+            "return_pct": -0.1 if index == 0 else 2.0,
+            "score": 100.0 + index,
+        }
+        for index in range(10)
+    ] + [
+        {
+            "symbol": "BTC/USDT",
+            "decision_group": f"btc:{index}",
+            "label_timestamp": f"2026-07-14T01:{index % 60:02d}:00+00:00",
+            "return_pct": -1.0,
+            "score": float(index),
+        }
+        for index in range(90)
+    ]
+
+    report = _leave_one_symbol_out_stability(rows)
+    robo_removed = next(
+        row for row in report["rows"] if row["excluded_symbol"] == "ROBO/USDT"
+    )
+
+    assert report["stable"] is False
+    assert robo_removed["evidence"]["promotion_math_ready"] is False
+    assert robo_removed["evidence"]["return_lcb_pct"] < 0.0
 
 
 def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
@@ -865,6 +1096,9 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     }
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
     service._ensure_loaded = lambda: ensure_load_calls.append("load")  # type: ignore[method-assign]
+    service.artifact_registry = SimpleNamespace(
+        promote_candidate=lambda _evidence: SimpleNamespace(version="candidate-v1")
+    )
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
@@ -875,11 +1109,12 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert calls == [False, True]
     assert ensure_load_calls == ["load"]
     assert result["trained"] is True
-    assert result["reason"] == "trained_learning_only"
+    assert result["reason"] == "trained_shadow_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["allow_live_position_influence"] is False
     assert result["allow_live_position_influence"] is False
+    assert result["artifact_activation_stage"] == "shadow"
     assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_lcb_not_positive" in reason_codes
@@ -925,6 +1160,9 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     }
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
     service._ensure_loaded = lambda: ensure_load_calls.append("load")  # type: ignore[method-assign]
+    service.artifact_registry = SimpleNamespace(
+        promote_candidate=lambda _evidence: SimpleNamespace(version="candidate-v1")
+    )
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
@@ -935,10 +1173,12 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     assert calls == [False, True]
     assert ensure_load_calls == ["load"]
     assert result["trained"] is True
-    assert result["reason"] == "trained"
+    assert result["reason"] == "trained_shadow_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["allow_live_position_influence"] is True
+    assert result["allow_live_position_influence"] is False
+    assert result["artifact_activation_stage"] == "shadow"
 
 
 def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -> None:
@@ -1762,6 +2002,73 @@ def test_ml_signal_status_marks_ready_only_when_all_readiness_metrics_pass() -> 
     assert status["readiness"]["metrics"]["long_pr_auc"] == 0.58
 
 
+def test_live_activation_auto_degrades_when_training_fingerprint_is_invalid() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metadata["training_data_sha256"] = "invalid"
+    service = _service_with_metadata(metadata)
+
+    status = service.status()
+    codes = {item["code"] for item in status["readiness"]["blocking_reasons"]}
+
+    assert status["allow_live_position_influence"] is False
+    assert status["influence_policy"]["enabled"] is False
+    assert "artifact_training_data_sha256_missing_or_invalid" in codes
+    assert "artifact_current_readiness_revalidation_failed" in codes
+
+
+def test_actual_trade_profit_factor_must_be_defined_for_each_live_side() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    long_evidence = metadata["authoritative_trade_return_evidence"]["sides"]["long"]
+    long_evidence["profit_factor"] = None
+    long_evidence["promotion_math_ready"] = False
+    service = _service_with_metadata(metadata)
+
+    status = service.status()
+    long_codes = {
+        item["code"]
+        for item in status["readiness"]["side_blocking_reasons"]["long"]
+    }
+
+    assert status["readiness_state"] == "partial_ready"
+    assert status["readiness"]["live_enabled_sides"] == ["short"]
+    assert status["influence_policy"]["long"]["enabled"] is False
+    assert status["influence_policy"]["short"]["enabled"] is True
+    assert "long_authoritative_profit_factor_undefined" in long_codes
+
+
+def test_symbol_removal_instability_blocks_that_prediction_side() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metadata["leave_one_symbol_out_report"]["long"]["stable"] = False
+    service = _service_with_metadata(metadata)
+    service._bundle.update(
+        {
+            "long_classifier": _Classifier(0.84),
+            "short_classifier": _Classifier(0.20),
+            "long_tail_classifier": _Classifier(0.10),
+            "short_tail_classifier": _Classifier(0.10),
+            "long_regressor": _Regressor(0.24),
+            "short_regressor": _Regressor(0.02),
+            "long_cost_regressor": _Regressor(0.08),
+            "short_cost_regressor": _Regressor(0.08),
+        }
+    )
+
+    prediction = service.predict(
+        {"current_price": 100.0, "atr_14": 1.0},
+        horizons=(10,),
+    )
+    long_codes = {
+        item["code"]
+        for item in prediction["readiness"]["side_blocking_reasons"]["long"]
+    }
+
+    assert prediction["readiness"]["live_enabled_sides"] == ["short"]
+    assert prediction["predictions"][0]["best_side"] == "long"
+    assert prediction["allow_live_position_influence"] is False
+    assert prediction["influence_policy"]["long"]["enabled"] is False
+    assert "long_leave_one_symbol_out_stability_failed" in long_codes
+
+
 def test_ml_signal_status_allows_directional_partial_live_influence() -> None:
     service = _service_with_metadata(
         {
@@ -1936,7 +2243,7 @@ def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_infl
 
     assert prediction["readiness_state"] == "degraded"
     assert prediction["allow_live_position_influence"] is False
-    assert prediction["influence_policy"]["enabled"] is True
+    assert prediction["influence_policy"]["enabled"] is False
     assert prediction["influence_enabled"] is False
     assert prediction["profit_signal"] is False
     assert prediction["predictions"][0]["ml_influence_enabled"] is False

@@ -189,7 +189,9 @@ def build_return_objective_report(
         blockers.append("average_fee_after_return_not_positive")
     if lower_hinge is None or lower_hinge <= 0:
         blockers.append("empirical_return_lower_hinge_not_positive")
-    if profit <= loss:
+    if profit_factor is None:
+        blockers.append("profit_factor_undefined")
+    elif profit_factor <= 1.0:
         blockers.append("profit_factor_not_above_break_even")
     generated_at = datetime.now(UTC).isoformat()
     return {

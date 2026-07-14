@@ -46,6 +46,7 @@ from services.model_training_state import (
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.profit_supervision import (
+    AUTHORITATIVE_REALIZED_RETURN_TASK,
     COUNTERFACTUAL_EXECUTION_COST_TASK,
     MARKET_OPPORTUNITY_TASK,
     PROFIT_SUPERVISION_VERSION,
@@ -636,6 +637,95 @@ def _influence_policy(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _activation_gated_policy(
+    influence: dict[str, Any],
+    readiness: dict[str, Any],
+    artifact: ResolvedModelArtifact | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    activation = _safe_dict(artifact.activation_manifest if artifact is not None else None)
+    stage = str(activation.get("activation_stage") or "unregistered")
+    activation_blockers = activation.get("blocking_reasons")
+    activation_blockers = (
+        activation_blockers if isinstance(activation_blockers, list) else []
+    )
+    manifest_authorized = bool(
+        stage in {"canary", "live"}
+        and activation.get("production_influence_authorized") is True
+        and activation.get("readiness_state") in {"ready", "partial_ready"}
+        and not activation_blockers
+    )
+    if manifest_authorized and readiness.get("allow_live_position_influence") is True:
+        live_sides = set(readiness.get("live_enabled_sides") or [])
+        effective_influence = {
+            **influence,
+            "enabled": bool(live_sides),
+            "live_enabled_sides": sorted(live_sides),
+        }
+        for side in ("long", "short"):
+            side_policy = _safe_dict(influence.get(side))
+            if side_policy:
+                side_enabled = bool(side in live_sides and side_policy.get("enabled"))
+                effective_influence[side] = {
+                    **side_policy,
+                    "enabled": side_enabled,
+                    "advisory_enabled": False,
+                    "influence_weight": 1.0 if side_enabled else 0.0,
+                }
+        return effective_influence, readiness
+
+    gated_influence = {
+        **influence,
+        "enabled": False,
+        "advisory_enabled": False,
+        "influence_weight": 0.0,
+        "activation_stage": stage,
+        "production_influence_authorized": False,
+        "ungated_return_evidence_enabled": bool(influence.get("enabled")),
+    }
+    for side in ("long", "short"):
+        side_policy = _safe_dict(influence.get(side))
+        if side_policy:
+            gated_influence[side] = {
+                **side_policy,
+                "enabled": False,
+                "advisory_enabled": False,
+                "influence_weight": 0.0,
+            }
+    gated_blockers = list(readiness.get("blocking_reasons") or [])
+    activation_blocker = {
+        "code": (
+            "artifact_current_readiness_revalidation_failed"
+            if manifest_authorized
+            else "artifact_activation_not_production_authorized"
+        ),
+        "message": (
+            "The current artifact no longer passes production readiness revalidation."
+            if manifest_authorized
+            else "The atomic artifact activation manifest does not authorize production influence."
+        ),
+        "actual": stage,
+        "required": "canary_or_live_activation_with_ready_return_evidence",
+    }
+    if not any(
+        isinstance(item, dict) and item.get("code") == activation_blocker["code"]
+        for item in gated_blockers
+    ):
+        gated_blockers.append(activation_blocker)
+    gated_readiness = {
+        **readiness,
+        "state": (
+            "shadow_ready"
+            if stage == "shadow" and readiness.get("allow_live_position_influence")
+            else readiness.get("state") or "promotion_blocked"
+        ),
+        "allow_live_position_influence": False,
+        "live_enabled_sides": [],
+        "blocking_reasons": gated_blockers,
+        "artifact_activation": activation,
+    }
+    return gated_influence, gated_readiness
+
+
 @dataclass(frozen=True)
 class ShadowTrainingRow:
     id: int
@@ -861,18 +951,526 @@ def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _fingerprint_value(value: Any) -> Any:
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, dict):
+        return {
+            str(key): _fingerprint_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_fingerprint_value(item) for item in value]
+    if isinstance(value, datetime):
+        normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return normalized.astimezone(UTC).isoformat()
+    if isinstance(value, np.generic):
+        return _fingerprint_value(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _training_data_sha256(frame: pd.DataFrame) -> str:
+    columns = sorted(str(column) for column in frame.columns)
+    records = [
+        {column: _fingerprint_value(row.get(column)) for column in columns}
+        for row in frame.to_dict("records")
+    ]
+    records.sort(
+        key=lambda row: (
+            str(row.get("label_timestamp") or ""),
+            str(row.get("decision_group") or ""),
+            int(_safe_float(row.get("horizon_minutes"), 0.0) or 0),
+            int(_safe_float(row.get("id"), 0.0) or 0),
+        )
+    )
+    encoded = json.dumps(
+        records,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _chronological_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    ordered = frame.copy()
+    if ordered["decision_group"].isna().any():
+        raise ValueError("decision_group cannot be missing for chronological evaluation")
+    if "label_timestamp" in ordered:
+        ordered["_evaluation_timestamp"] = pd.to_datetime(
+            ordered["label_timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+    else:
+        ordered["_evaluation_timestamp"] = pd.NaT
+    if ordered["_evaluation_timestamp"].isna().any():
+        raise ValueError("label_timestamp is required for chronological evaluation")
+    ordered["_evaluation_id"] = pd.to_numeric(
+        ordered.get("id", pd.Series(range(len(ordered)))),
+        errors="coerce",
+    ).fillna(0)
+    return ordered.sort_values(
+        ["_evaluation_timestamp", "_evaluation_id"],
+        na_position="last",
+        kind="stable",
+    ).drop(columns=["_evaluation_timestamp", "_evaluation_id"])
+
+
+def _decision_group_availability(
+    frame: pd.DataFrame,
+) -> tuple[list[str], dict[str, dict[str, pd.Timestamp]]]:
+    ordered = _chronological_frame(frame)
+    label_timestamps = pd.to_datetime(
+        ordered["label_timestamp"],
+        utc=True,
+        errors="raise",
+    )
+    horizons = pd.to_numeric(ordered["horizon_minutes"], errors="coerce")
+    if horizons.isna().any() or (horizons <= 0).any():
+        raise ValueError("positive horizon is required for chronological evaluation")
+    inferred_decisions = label_timestamps - pd.to_timedelta(horizons, unit="m")
+    if "decision_timestamp" in ordered:
+        explicit_decisions = pd.to_datetime(
+            ordered["decision_timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+        decision_timestamps = explicit_decisions.fillna(inferred_decisions)
+    else:
+        decision_timestamps = inferred_decisions
+    working = ordered.assign(
+        _label_timestamp=label_timestamps,
+        _decision_timestamp=decision_timestamps,
+    )
+    bounds: dict[str, dict[str, pd.Timestamp]] = {}
+    for group, rows in working.groupby(working["decision_group"].astype(str)):
+        bounds[str(group)] = {
+            "start": rows["_label_timestamp"].min(),
+            "end": rows["_label_timestamp"].max(),
+            "decision_start": rows["_decision_timestamp"].min(),
+            "decision_end": rows["_decision_timestamp"].max(),
+        }
+    groups = sorted(
+        bounds,
+        key=lambda group: (
+            bounds[group]["decision_start"],
+            bounds[group]["decision_end"],
+            group,
+        ),
+    )
+    return groups, bounds
+
+
+def _walk_forward_side_scores(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    *,
+    side: str,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    x_train = train[FEATURE_KEYS]
+    x_validation = validation[FEATURE_KEYS]
+    weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
+    return_column = f"{side}_return_pct"
+    cost_column = f"{side}_execution_cost_pct"
+    net_training_returns = (
+        train[return_column].astype(float) - train[cost_column].astype(float)
+    )
+    tail_policy = empirical_policy_value(
+        f"{side}_walk_forward_tail_loss_boundary_pct",
+        net_training_returns[net_training_returns < 0].tolist(),
+        selector="lower_hinge",
+        observation_window="walk_forward_training_groups_only",
+    )
+    tail_boundary = float(tail_policy.value) if tail_policy.value is not None else 0.0
+    tail_scale = max(abs(tail_boundary), float(np.finfo(float).eps))
+    tail_labels = (net_training_returns < tail_boundary).astype(int)
+    market_model = _make_regressor(train[return_column])
+    cost_model = _make_regressor(train[cost_column])
+    tail_model = _make_classifier(tail_labels)
+    market_model.fit(x_train, train[return_column], model__sample_weight=weights)
+    cost_model.fit(x_train, train[cost_column], model__sample_weight=weights)
+    tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
+    scores = np.asarray(market_model.predict(x_validation), dtype=float) - np.asarray(
+        cost_model.predict(x_validation), dtype=float
+    ) - _positive_proba(tail_model, x_validation) * tail_scale
+    return scores, {
+        **tail_policy.to_dict(),
+        "scale_pct": tail_scale,
+        "training_decision_group_count": int(train["decision_group"].nunique()),
+    }
+
+
+def _top_scored_return_rows(
+    frame: pd.DataFrame,
+    scores: np.ndarray,
+    *,
+    side: str,
+) -> list[dict[str, Any]]:
+    if not len(scores):
+        return []
+    rows = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "decision_group": str(row.get("decision_group") or ""),
+            "label_timestamp": _fingerprint_value(row.get("label_timestamp")),
+            "return_pct": float(row[f"{side}_return_pct"])
+            - float(row[f"{side}_execution_cost_pct"]),
+            "gross_market_return_pct": float(row[f"{side}_return_pct"]),
+            "execution_cost_pct": float(row[f"{side}_execution_cost_pct"]),
+            "score": float(scores[index]),
+        }
+        for index, (_, row) in enumerate(frame.iterrows())
+    ]
+    return _select_top_return_rows(rows)
+
+
+def _all_scored_return_rows(
+    frame: pd.DataFrame,
+    scores: np.ndarray,
+    *,
+    side: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "decision_group": str(row.get("decision_group") or ""),
+            "label_timestamp": _fingerprint_value(row.get("label_timestamp")),
+            "return_pct": float(row[f"{side}_return_pct"])
+            - float(row[f"{side}_execution_cost_pct"]),
+            "gross_market_return_pct": float(row[f"{side}_return_pct"]),
+            "execution_cost_pct": float(row[f"{side}_execution_cost_pct"]),
+            "score": float(scores[index]),
+        }
+        for index, (_, row) in enumerate(frame.iterrows())
+    ]
+
+
+def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    count = max(int(math.sqrt(len(rows))), 1)
+    return sorted(rows, key=lambda row: float(row["score"]))[-count:]
+
+
+def _max_drawdown(returns: list[float]) -> float | None:
+    if not returns:
+        return None
+    equity = 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for value in returns:
+        equity += float(value)
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+    return float(drawdown)
+
+
+def _return_evidence(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("label_timestamp") or ""),
+            str(row.get("decision_group") or ""),
+        ),
+    )
+    returns = [float(row["return_pct"]) for row in ordered]
+    tail_policy = empirical_policy_value(
+        "oos_tail_loss_boundary_pct",
+        [value for value in returns if value < 0],
+        selector="lower_hinge",
+        observation_window="current_oos_evidence_only",
+    )
+    tail_boundary = float(tail_policy.value) if tail_policy.value is not None else 0.0
+    summary = return_distribution_summary(
+        returns,
+        tail_loss_threshold_pct=abs(tail_boundary),
+    )
+    profit_factor_value = _safe_float(summary.get("profit_factor"), None)
+    return_lcb = _safe_float(summary.get("return_lcb_pct"), None)
+    cvar_value = _safe_float(summary.get("cvar_10_pct"), None)
+    max_drawdown = _max_drawdown(returns)
+    return {
+        **summary,
+        "tail_loss_policy": tail_policy.to_dict(),
+        "tail_loss_scale_pct": abs(tail_boundary),
+        "max_drawdown_pct": max_drawdown,
+        "promotion_math_ready": bool(
+            return_lcb is not None
+            and return_lcb > 0.0
+            and profit_factor_value is not None
+            and profit_factor_value > 1.0
+            and cvar_value is not None
+            and max_drawdown is not None
+        ),
+    }
+
+
+def _authoritative_trade_return_evidence(
+    trade_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    side_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    for sample in trade_samples:
+        tasks = _safe_dict(
+            _safe_dict(sample.get("profit_supervision")).get("tasks")
+        )
+        realized = _safe_dict(tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK))
+        side = str(realized.get("side") or sample.get("side") or "").lower()
+        value = _safe_float(realized.get("realized_net_return_pct"), float("nan"))
+        if (
+            realized.get("eligible") is not True
+            or side not in side_rows
+            or not math.isfinite(value)
+        ):
+            continue
+        side_rows[side].append(
+            {
+                "symbol": str(sample.get("symbol") or ""),
+                "decision_group": str(
+                    sample.get("lifecycle_key")
+                    or sample.get("position_id")
+                    or sample.get("id")
+                    or ""
+                ),
+                "label_timestamp": _fingerprint_value(
+                    sample.get("label_timestamp")
+                    or sample.get("closed_at")
+                    or sample.get("updated_at")
+                ),
+                "return_pct": float(value),
+                "score": float(value),
+            }
+        )
+    sides = {
+        side: _return_evidence(rows)
+        for side, rows in side_rows.items()
+    }
+    fingerprint_payload = {
+        side: [
+            {
+                key: row.get(key)
+                for key in ("symbol", "decision_group", "label_timestamp", "return_pct")
+            }
+            for row in rows
+        ]
+        for side, rows in side_rows.items()
+    }
+    return {
+        "version": "2026-07-15.authoritative-trade-return-evidence.v1",
+        "source_authority": "okx_position_history_profit_supervision",
+        "sides": sides,
+        "sample_count": sum(len(rows) for rows in side_rows.values()),
+        "data_fingerprint": hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _leave_one_symbol_out_stability(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    symbols = sorted({str(row.get("symbol") or "") for row in rows if row.get("symbol")})
+    reports = []
+    for symbol in symbols:
+        remaining = [row for row in rows if str(row.get("symbol") or "") != symbol]
+        selected = _select_top_return_rows(remaining)
+        reports.append(
+            {
+                "excluded_symbol": symbol,
+                "remaining_symbol_count": len(
+                    {str(row.get("symbol") or "") for row in remaining if row.get("symbol")}
+                ),
+                "evidence": _return_evidence(selected),
+            }
+        )
+    return {
+        "version": "2026-07-15.leave-one-symbol-out.v1",
+        "evaluated_symbol_count": len(symbols),
+        "rows": reports,
+        "stable": bool(reports)
+        and all(row["evidence"]["promotion_math_ready"] for row in reports),
+        "policy": "recompute_oos_fee_after_return_evidence_after_each_symbol_removal",
+    }
+
+
+def _walk_forward_return_report(
+    frame: pd.DataFrame,
+) -> dict[str, Any]:
+    ordered = _chronological_frame(frame)
+    groups, group_bounds = _decision_group_availability(ordered)
+    version = "2026-07-15.expanding-decision-group-walk-forward.v1"
+    if len(groups) <= 1:
+        return {
+            "version": version,
+            "status": "insufficient_chronological_decision_groups",
+            "folds": [],
+            "decision_group_disjoint": False,
+            "chronological_label_disjoint": False,
+            "model_refit_per_fold": True,
+        }
+    validation_candidates = [
+        group
+        for group in groups
+        if any(
+            group_bounds[prior]["end"]
+            < group_bounds[group]["decision_start"]
+            for prior in groups
+            if group_bounds[prior]["decision_start"]
+            < group_bounds[group]["decision_start"]
+        )
+    ]
+    if not validation_candidates:
+        return {
+            "version": version,
+            "status": "insufficient_purged_chronological_decision_groups",
+            "folds": [],
+            "decision_group_count": len(groups),
+            "decision_group_disjoint": False,
+            "chronological_label_disjoint": False,
+            "model_refit_per_fold": True,
+            "chronological": True,
+        }
+    validation_fold_count = max(
+        int(math.ceil(math.log10(len(validation_candidates) + 1))),
+        1,
+    )
+    group_blocks = [
+        [str(value) for value in block.tolist()]
+        for block in np.array_split(
+            np.asarray(validation_candidates, dtype=object),
+            validation_fold_count,
+        )
+        if len(block)
+    ]
+    folds: list[dict[str, Any]] = []
+    oos_rows = {"long": [], "short": []}
+    for index, validation_groups in enumerate(group_blocks, start=1):
+        validation_decision_start = min(
+            group_bounds[group]["decision_start"]
+            for group in validation_groups
+        )
+        training_set = {
+            group
+            for group in groups
+            if group_bounds[group]["end"] < validation_decision_start
+        }
+        validation_set = set(validation_groups)
+        if training_set & validation_set:
+            raise ValueError("walk-forward decision groups overlap")
+        train = ordered[ordered["decision_group"].astype(str).isin(training_set)].copy()
+        validation = ordered[
+            ordered["decision_group"].astype(str).isin(validation_set)
+        ].copy()
+        side_reports: dict[str, Any] = {}
+        for side in ("long", "short"):
+            scores, fold_tail_policy = _walk_forward_side_scores(
+                train,
+                validation,
+                side=side,
+            )
+            selected_rows = _top_scored_return_rows(
+                validation,
+                scores,
+                side=side,
+            )
+            oos_rows[side].extend(
+                _all_scored_return_rows(validation, scores, side=side)
+            )
+            side_reports[side] = {
+                **_return_evidence(selected_rows),
+                "training_tail_loss_policy": fold_tail_policy,
+            }
+        folds.append(
+            {
+                "fold": index,
+                "training_decision_group_count": len(training_set),
+                "validation_decision_group_count": len(validation_set),
+                "validation_start": _fingerprint_value(
+                    validation.iloc[0].get("label_timestamp")
+                ),
+                "validation_end": _fingerprint_value(
+                    validation.iloc[-1].get("label_timestamp")
+                ),
+                "training_label_end": _fingerprint_value(
+                    max(group_bounds[group]["end"] for group in training_set)
+                ),
+                "validation_decision_start": _fingerprint_value(
+                    validation_decision_start
+                ),
+                "label_timestamp_overlap_count": 0,
+                "purged_training_decision_group_count": sum(
+                    1
+                    for group in groups
+                    if group_bounds[group]["decision_start"]
+                    < validation_decision_start
+                    and group not in training_set
+                ),
+                "decision_group_overlap_count": 0,
+                "sides": side_reports,
+            }
+        )
+    side_reports = {}
+    for side in ("long", "short"):
+        evidence = _return_evidence(_select_top_return_rows(oos_rows[side]))
+        side_reports[side] = {
+            **evidence,
+            "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
+        }
+    return {
+        "version": version,
+        "status": "complete" if folds else "insufficient_chronological_decision_groups",
+        "folds": folds,
+        "fold_count": len(folds),
+        "decision_group_count": len(groups),
+        "decision_group_disjoint": all(
+            row["decision_group_overlap_count"] == 0 for row in folds
+        ),
+        "chronological_label_disjoint": all(
+            row["label_timestamp_overlap_count"] == 0
+            and row["training_label_end"] < row["validation_decision_start"]
+            for row in folds
+        ),
+        "model_refit_per_fold": True,
+        "chronological": True,
+        "sides": side_reports,
+        "stable": bool(folds)
+        and all(
+            evidence["promotion_math_ready"]
+            and evidence["leave_one_symbol_out"]["stable"]
+            for evidence in side_reports.values()
+        ),
+    }
+
+
 def _decision_group_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Chronologically split complete decision groups without horizon leakage."""
 
     group_column = "decision_group"
     if group_column not in frame:
         raise ValueError("decision_group is required for leakage-free evaluation")
-    ordered_groups = list(dict.fromkeys(frame[group_column].astype(str).tolist()))
+    frame = _chronological_frame(frame)
+    ordered_groups, group_bounds = _decision_group_availability(frame)
     if len(ordered_groups) <= 1:
         raise ValueError("at least two decision groups are required for holdout evaluation")
     boundary = len(ordered_groups) // 2
-    train_groups = set(ordered_groups[:boundary])
     test_groups = set(ordered_groups[boundary:])
+    holdout_decision_start = min(
+        group_bounds[group]["decision_start"] for group in test_groups
+    )
+    train_groups = {
+        group
+        for group in ordered_groups[:boundary]
+        if group_bounds[group]["end"] < holdout_decision_start
+    }
     train = frame[frame[group_column].astype(str).isin(train_groups)].copy()
     test = frame[frame[group_column].astype(str).isin(test_groups)].copy()
     if train.empty or test.empty or train_groups & test_groups:
@@ -937,6 +1535,8 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "decision_group": _safe_dict(
                     quality_sample.get("correlation_weight")
                 ).get("correlation_group"),
+                "label_timestamp": getattr(row, "due_at", None)
+                or getattr(row, "created_at", None),
                 "symbol": str(getattr(row, "symbol", "") or ""),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
                 "best_action": str(getattr(row, "best_action", "") or ""),
@@ -961,7 +1561,10 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         return frame
     tail_policy: dict[str, Any] = {}
     for side in ("long", "short"):
-        returns = frame[f"{side}_return_pct"].astype(float)
+        returns = (
+            frame[f"{side}_return_pct"].astype(float)
+            - frame[f"{side}_execution_cost_pct"].astype(float)
+        )
         boundary = empirical_policy_value(
             f"{side}_tail_loss_boundary_pct",
             returns[returns < 0].tolist(),
@@ -1021,29 +1624,35 @@ def train_from_frame(
     if len(frame) <= 1:
         raise ValueError("训练收益分布不足，无法形成非空训练集和留出集")
 
-    tail_policy = dict(frame.attrs.get("tail_loss_policy") or {})
-    frame = frame.sort_values("id").reset_index(drop=True)
+    frame = _chronological_frame(frame).reset_index(drop=True)
+    training_partition, _ = _decision_group_split(frame)
+    tail_policy: dict[str, Any] = {}
     tail_scales: dict[str, float] = {}
     for side in ("long", "short"):
-        boundary = _safe_float(_safe_dict(tail_policy.get(side)).get("value"), float("nan"))
-        if not math.isfinite(boundary):
-            negatives = frame.loc[
-                frame[f"{side}_return_pct"].astype(float) < 0,
-                f"{side}_return_pct",
-            ].tolist()
-            generated = empirical_policy_value(
-                f"{side}_tail_loss_boundary_pct",
-                negatives,
-                selector="lower_hinge",
-                observation_window="current_cost_complete_training_window",
-            )
-            tail_policy[side] = generated.to_dict()
-            boundary = float(generated.value) if generated.value is not None else 0.0
-        frame[f"{side}_tail_loss"] = (
-            frame[f"{side}_return_pct"].astype(float) < boundary
-        ).astype(int)
-        frame[f"{side}_win"] = (frame[f"{side}_return_pct"].astype(float) > 0.0).astype(int)
-        tail_scales[side] = max(abs(boundary), 1e-12)
+        training_net_returns = (
+            training_partition[f"{side}_return_pct"].astype(float)
+            - training_partition[f"{side}_execution_cost_pct"].astype(float)
+        )
+        negatives = training_net_returns[training_net_returns < 0].tolist()
+        generated = empirical_policy_value(
+            f"{side}_tail_loss_boundary_pct",
+            negatives,
+            selector="lower_hinge",
+            observation_window="chronological_training_partition_only",
+        )
+        tail_policy[side] = generated.to_dict()
+        boundary = float(generated.value) if generated.value is not None else 0.0
+        net_returns = (
+            frame[f"{side}_return_pct"].astype(float)
+            - frame[f"{side}_execution_cost_pct"].astype(float)
+        )
+        frame[f"{side}_tail_loss"] = (net_returns < boundary).astype(int)
+        frame[f"{side}_win"] = (net_returns > 0.0).astype(int)
+        tail_scales[side] = max(abs(boundary), float(np.finfo(float).eps))
+    training_data_sha256 = _training_data_sha256(frame)
+    source_code_version = _training_source_code_version()
+    source_code_sha256 = source_code_version.removeprefix("source-sha256:")
+    walk_forward_report = _walk_forward_return_report(frame)
     train, test = _decision_group_split(frame)
     x_train = train[FEATURE_KEYS]
     x_test = test[FEATURE_KEYS]
@@ -1149,6 +1758,9 @@ def train_from_frame(
         }
     )
     actual_trade_calibration = authoritative_trade_calibration(trade_samples or [])
+    authoritative_return_evidence = _authoritative_trade_return_evidence(
+        trade_samples or []
+    )
     actual_execution_cost_sample_count = sum(
         1
         for sample in (trade_samples or [])
@@ -1207,12 +1819,32 @@ def train_from_frame(
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "profit_supervision_report": supervision_report,
         "actual_trade_calibration": actual_trade_calibration,
+        "authoritative_trade_return_evidence": authoritative_return_evidence,
         "positive_net_return_boundary_pct": 0.0,
         "positive_return_boundary_policy": "fee_after_profitability_math_boundary",
         "tail_loss_policy": tail_policy,
         "tail_loss_scale_pct": tail_scales,
         "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
         "evaluation_group_policy": "chronological_disjoint_decision_groups",
+        "training_data_sha256": training_data_sha256,
+        "source_code_sha256": source_code_sha256,
+        "walk_forward_report": walk_forward_report,
+        "leave_one_symbol_out_report": {
+            side: _safe_dict(_safe_dict(walk_forward_report.get("sides")).get(side)).get(
+                "leave_one_symbol_out"
+            )
+            for side in ("long", "short")
+        },
+        "oos_return_evaluation": {
+            side: {
+                key: value
+                for key, value in _safe_dict(
+                    _safe_dict(walk_forward_report.get("sides")).get(side)
+                ).items()
+                if key != "leave_one_symbol_out"
+            }
+            for side in ("long", "short")
+        },
         "train_decision_group_count": int(train["decision_group"].nunique()),
         "test_decision_group_count": int(test["decision_group"].nunique()),
         "prediction_distribution": {
@@ -1271,7 +1903,7 @@ def train_from_frame(
         "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": "walk_forward",
-        "model_stage": "shadow",
+        "model_stage": "candidate",
         "evaluation_policy": {
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
             "live_mutation": False,
@@ -1280,6 +1912,16 @@ def train_from_frame(
         },
         "training_run_mode": "persist" if persist_artifact else "dry_run",
         "artifact_persisted": bool(persist_artifact),
+        "artifact_activation_manifest": {
+            "status": "not_activated",
+            "activation_stage": "candidate",
+            "production_influence_authorized": False,
+        },
+        "live_promotion_manifest": {
+            "status": "not_issued",
+            "reason": "candidate_requires_independent_shadow_and_return_readiness",
+            "production_influence_authorized": False,
+        },
         "note": "本地 ML 直接优化费后预期收益及左尾风险；胜率仅作为诊断，不参与开仓、评分、权重或晋升。",
     }
 
@@ -1305,13 +1947,13 @@ def train_from_frame(
                 encoding="utf-8",
             )
         else:
-            resolved = ML_SIGNAL_ARTIFACT_REGISTRY.persist_joblib(
+            resolved = ML_SIGNAL_ARTIFACT_REGISTRY.persist_candidate_joblib(
                 bundle,
                 metadata,
                 parent_model_identity=(
                     "sklearn RandomForest/Dummy classifier-regressor pipelines"
                 ),
-                code_version=_training_source_code_version(),
+                code_version=source_code_version,
             )
             metadata.clear()
             metadata.update(resolved.manifest)
@@ -1372,6 +2014,11 @@ class MLSignalService:
         metadata = _safe_dict(self._bundle.get("metadata"))
         influence = _influence_policy(metadata)
         readiness = build_ml_readiness_report(metadata, influence)
+        influence, readiness = _activation_gated_policy(
+            influence,
+            readiness,
+            self._resolved_artifact,
+        )
         allow_live_position_influence = bool(readiness.get("allow_live_position_influence"))
         advisory_enabled = bool(
             influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
@@ -1379,11 +2026,18 @@ class MLSignalService:
         model_note = metadata.get("note")
         training_count = int(metadata.get("sample_count") or 0)
         phase3_counts = self._phase3_sample_count_status(metadata)
+        activation = _safe_dict(
+            self._resolved_artifact.activation_manifest
+            if self._resolved_artifact is not None
+            else None
+        )
         return {
             "available": True,
             "model_path": str(self.model_path),
             "artifact_registry": self._artifact_registry_status(),
             **metadata,
+            "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
+            "artifact_activation_manifest": activation,
             "training_shadow_sample_count": int(
                 metadata.get("training_shadow_sample_count") or training_count
             ),
@@ -1710,17 +2364,23 @@ class MLSignalService:
                     trained_metadata,
                     trained_influence,
                 )
+                activated_artifact = self.artifact_registry.promote_candidate(
+                    {
+                        "activation_stage": "shadow",
+                        "readiness_state": trained_readiness.get("state"),
+                        "production_influence_authorized": False,
+                        "blocking_reasons": trained_readiness.get("blocking_reasons") or [],
+                        "return_evidence_report": trained_readiness,
+                        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+                    }
+                )
                 self._bundle = None
                 self._loaded_mtime = None
                 self._ensure_loaded()
-                allow_live_position_influence = bool(
-                    trained_readiness.get("allow_live_position_influence")
-                )
+                allow_live_position_influence = False
                 result = {
                     "trained": True,
-                    "reason": (
-                        "trained" if allow_live_position_influence else "trained_learning_only"
-                    ),
+                    "reason": "trained_shadow_activated",
                     "completed_sample_count": completed_count,
                     "previous_sample_count": last_sample_count,
                     "previous_completed_sample_count": last_completed_count,
@@ -1744,15 +2404,12 @@ class MLSignalService:
                     "influence_enabled": allow_live_position_influence,
                     "influence_policy": trained_influence,
                     "artifact_persisted": bool(trained_metadata.get("artifact_persisted")),
+                    "artifact_version": activated_artifact.version,
+                    "artifact_activation_stage": "shadow",
                     "trained_at": trained_metadata.get("trained_at"),
                     "message": (
-                        "本地 ML 盈亏质量模型已自动完成训练、替换为最新 artifact 并热加载；"
-                        "当前已允许参与开仓过滤与收益排序。"
-                        if allow_live_position_influence
-                        else (
-                            "本地 ML 盈亏质量模型已自动完成训练、替换为最新 artifact 并热加载；"
-                            "当前仍处于学习观察/降级状态，暂不参与实盘影响。"
-                        )
+                        "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
+                        "生产影响保持关闭，等待独立晋升证据。"
                     ),
                 }
                 self._last_train_result = result
@@ -1795,6 +2452,11 @@ class MLSignalService:
         metadata = _safe_dict(self._bundle.get("metadata"))
         influence = _influence_policy(metadata)
         readiness = build_ml_readiness_report(metadata, influence)
+        influence, readiness = _activation_gated_policy(
+            influence,
+            readiness,
+            self._resolved_artifact,
+        )
         allow_live_position_influence = bool(readiness.get("allow_live_position_influence"))
         advisory_enabled = bool(
             influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
@@ -2082,6 +2744,7 @@ class MLSignalService:
         current_prediction_ready = bool(
             primary
             and primary_side in {"long", "short"}
+            and primary_side in set(readiness.get("live_enabled_sides") or [])
             and primary_return_distribution.get("version")
             == RETURN_DISTRIBUTION_CONTRACT_VERSION
             and primary_return_distribution.get("production_eligible") is True
@@ -2104,6 +2767,12 @@ class MLSignalService:
             "label_version": metadata.get("label_version"),
             "training_cost_policy": metadata.get("training_cost_policy"),
             "artifact_persisted": metadata.get("artifact_persisted") is True,
+            "artifact_lifecycle": _safe_dict(
+                self._resolved_artifact.activation_manifest
+                if self._resolved_artifact is not None
+                else None
+            ).get("activation_stage")
+            or "unregistered",
             "return_distribution_contract_version": (
                 RETURN_DISTRIBUTION_CONTRACT_VERSION
             ),
@@ -2268,6 +2937,7 @@ class MLSignalService:
             "manifest_path": str(current.manifest_path),
             "sha256": current.sha256,
             "manifest": current.manifest,
+            "activation_manifest": current.activation_manifest,
         }
 
     def _auto_train_status(self) -> dict[str, Any]:

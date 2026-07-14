@@ -43,14 +43,22 @@ def _fee_after_evaluation(
             "blocking_reasons": [missing_reason],
             "realized_net_pnl_usdt": 0.0,
             "avg_realized_net_pnl_usdt": 0.0,
-            "profit_factor": 0.0,
+            "profit_factor": None,
         }
     pnl = float(evidence.get("pnl") or 0.0)
-    profit_factor = float(evidence.get("profit_factor") or 0.0)
+    profit_factor_raw = evidence.get("profit_factor")
+    try:
+        profit_factor = (
+            float(profit_factor_raw) if profit_factor_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        profit_factor = None
     blockers = []
     if pnl <= 0:
         blockers.append("realized_net_pnl_non_positive")
-    if profit_factor < 1.0:
+    if profit_factor is None:
+        blockers.append("profit_factor_undefined")
+    elif profit_factor < 1.0:
         blockers.append("profit_factor_below_unity")
     return {
         "evaluation_mode": "fee_after_shadow_evaluated",
@@ -60,7 +68,9 @@ def _fee_after_evaluation(
         "blocking_reasons": blockers,
         "realized_net_pnl_usdt": round(pnl, 6),
         "avg_realized_net_pnl_usdt": round(float(evidence.get("avg_pnl") or 0.0), 6),
-        "profit_factor": round(profit_factor, 6),
+        "profit_factor": (
+            round(profit_factor, 6) if profit_factor is not None else None
+        ),
     }
 
 

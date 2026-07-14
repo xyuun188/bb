@@ -265,6 +265,25 @@ def test_registry_evaluates_inference_only_llms_by_fee_after_contribution() -> N
     assert decision["quality_state"] == "promotion_blocked"
 
 
+def test_registry_blocks_positive_pnl_when_profit_factor_is_undefined() -> None:
+    payload = build_model_training_registry(
+        contribution_performance={
+            "decision_llm": {
+                "count": 4,
+                "pnl": 9.5,
+                "avg_pnl": 2.375,
+                "profit_factor": None,
+            }
+        }
+    )
+
+    decision = _by_id(payload)["deepseek_online_decision"]
+    assert decision["realized_net_pnl_usdt"] == 9.5
+    assert decision["profit_factor"] is None
+    assert decision["quality_state"] == "promotion_blocked"
+    assert decision["blocking_reasons"] == ["profit_factor_undefined"]
+
+
 def test_dashboard_renders_model_cards_from_canonical_registry() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     render_block = script[

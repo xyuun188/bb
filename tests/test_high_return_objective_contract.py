@@ -130,3 +130,8 @@ def test_low_win_high_payoff_beats_high_win_negative_expectancy() -> None:
     assert profit_factor(low_win_returns) == pytest.approx(35 * 4.0 / 65)
     assert sum(high_win_returns) / len(high_win_returns) == pytest.approx(-0.32)
     assert profit_factor(high_win_returns) == pytest.approx(0.2)
+
+
+def test_profit_factor_is_undefined_without_a_loss_denominator() -> None:
+    assert profit_factor([0.8, 0.3, 1.1]) is None
+    assert profit_factor([0.0, 0.0]) is None

@@ -39,7 +39,8 @@ import math
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,8 +64,13 @@ MODEL_DIR = Path(
         str(PHASE3_ROOT / "models" / "local_ai_tools"),
     )
 )
-BUNDLE_PATH = MODEL_DIR / "local_quant_models.joblib"
-METADATA_PATH = MODEL_DIR / "local_quant_models_metadata.json"
+ARTIFACT_REGISTRY_VERSION = "2026-07-15.local-ai-tools.v2"
+ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-15.local-ai-tools-activation.v2"
+ARTIFACT_MODEL_ID = "local_ai_tools_quant_bundle"
+VERSIONS_ROOT = MODEL_DIR / "versions"
+CANDIDATE_POINTER_PATH = MODEL_DIR / "candidate.json"
+CURRENT_POINTER_PATH = MODEL_DIR / "current.json"
+ROLLBACK_POINTER_PATH = MODEL_DIR / "rollback.json"
 PHASE3_VALIDATION_REPORT_PATH = (
     PHASE3_ROOT / "reports" / "inventory" / "phase3_model_validation_latest.json"
 )
@@ -99,6 +105,12 @@ RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
+EVALUATION_REPORT_FIELDS = (
+    "walk_forward_report",
+    "leave_one_symbol_out_report",
+    "oos_return_evaluation",
+    "authoritative_trade_return_evidence",
+)
 COMPACT_SEQUENCE_SERIES_FORMAT = "compact_native_kline_series.v1"
 TIMESERIES_MODEL_INPUT_ROWS = int(
     os.environ.get("LOCAL_AI_TOOLS_TIMESERIES_MODEL_INPUT_ROWS", "30")
@@ -132,7 +144,8 @@ ALLOW_UNAUTHENTICATED_LOOPBACK = os.environ.get(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 _BUNDLE_CACHE: dict[str, Any] | None = None
-_BUNDLE_MTIME: float | None = None
+_CURRENT_POINTER_MTIME_NS: int | None = None
+_CURRENT_MODEL_MTIME_NS: int | None = None
 _TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
 _STATUS_METADATA_KEYS = (
     "artifact_policy_id",
@@ -144,6 +157,7 @@ _STATUS_METADATA_KEYS = (
     "holdout_shadow_sample_count",
     "train_decision_group_count",
     "holdout_decision_group_count",
+    "purged_holdout_decision_group_count",
     "completed_shadow_sample_count",
     "last_trained_completed_shadow_sample_count",
     "trade_sample_count",
@@ -167,12 +181,14 @@ _STATUS_METADATA_KEYS = (
     "training_cost_policy",
     "profit_supervision_version",
     "profit_supervision_report",
+    "market_fact_contract",
     "quality_report",
     "governance_report",
     "return_objective_report",
     "training_policy",
     "trade_sample_cursor_policy",
     "training_mode",
+    "requested_model_stage",
     "model_stage",
     "evaluation_policy",
     "artifact_persisted",
@@ -183,6 +199,19 @@ _STATUS_METADATA_KEYS = (
     "training_objective",
     "models",
     "objective",
+    "artifact_registry_version",
+    "artifact_model_id",
+    "artifact_version",
+    "artifact_lifecycle",
+    "production_influence_authorized",
+    "artifact_activation_manifest",
+    "live_promotion_manifest",
+    "walk_forward_report",
+    "leave_one_symbol_out_report",
+    "oos_return_evaluation",
+    "authoritative_trade_return_evidence",
+    "evaluation_report_hashes",
+    "artifact_return_evidence_sha256",
 )
 
 
@@ -338,6 +367,619 @@ def empirical_lower_hinge(values: list[float]) -> float:
     return (lower[middle - 1] + lower[middle]) / 2.0
 
 
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _parsed_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_text(value: Any) -> str:
+    parsed = _parsed_timestamp(value)
+    return parsed.isoformat() if parsed is not None else ""
+
+
+def _chronological_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if any(_parsed_timestamp(row.get("label_timestamp")) is None for row in rows):
+        raise ValueError("label_timestamp is required for chronological evaluation")
+    if any(not str(row.get("decision_group") or "").strip() for row in rows):
+        raise ValueError("decision_group is required for chronological evaluation")
+    if any(not str(row.get("symbol") or "").strip() for row in rows):
+        raise ValueError("native symbol identity is required for evaluation")
+    return sorted(
+        rows,
+        key=lambda row: (
+            _parsed_timestamp(row.get("label_timestamp")),
+            str(row.get("decision_group") or ""),
+            int(row.get("id") or 0),
+            int(row.get("horizon") or 0),
+        ),
+    )
+
+
+def _decision_group_availability(
+    rows: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, dict[str, datetime]]]:
+    bounds: dict[str, dict[str, datetime]] = {}
+    for row in _chronological_rows(rows):
+        group = str(row["decision_group"])
+        timestamp = _parsed_timestamp(row["label_timestamp"])
+        if timestamp is None:
+            raise ValueError("label_timestamp is required for group availability")
+        horizon_minutes = int(row.get("horizon") or 0)
+        if horizon_minutes <= 0:
+            raise ValueError("positive horizon is required for group availability")
+        decision_timestamp = _parsed_timestamp(row.get("decision_timestamp"))
+        if decision_timestamp is None:
+            decision_timestamp = timestamp - timedelta(minutes=horizon_minutes)
+        current = bounds.setdefault(
+            group,
+            {
+                "start": timestamp,
+                "end": timestamp,
+                "decision_start": decision_timestamp,
+                "decision_end": decision_timestamp,
+            },
+        )
+        current["start"] = min(current["start"], timestamp)
+        current["end"] = max(current["end"], timestamp)
+        current["decision_start"] = min(
+            current["decision_start"],
+            decision_timestamp,
+        )
+        current["decision_end"] = max(
+            current["decision_end"],
+            decision_timestamp,
+        )
+    groups = sorted(
+        bounds,
+        key=lambda group: (
+            bounds[group]["decision_start"],
+            bounds[group]["decision_end"],
+            group,
+        ),
+    )
+    return groups, bounds
+
+
+def _predict_positive_probabilities(model: Pipeline, x: list[list[float]]) -> np.ndarray:
+    try:
+        probabilities = np.asarray(model.predict_proba(x), dtype=float)
+        named_steps = getattr(model, "named_steps", {})
+        estimator = named_steps.get("model") if hasattr(named_steps, "get") else model
+        classes = list(getattr(estimator, "classes_", []))
+        if probabilities.ndim == 2 and 1 in classes:
+            return probabilities[:, classes.index(1)]
+    except Exception:
+        pass
+    return np.zeros(len(x), dtype=float)
+
+
+def _max_drawdown(returns: list[float]) -> float | None:
+    if not returns:
+        return None
+    equity = 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for value in returns:
+        equity += float(value)
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+    return float(drawdown)
+
+
+def _profit_factor(returns: list[float]) -> float | None:
+    values = np.asarray(returns, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    gross_loss = abs(float(values[values < 0].sum()))
+    if gross_loss <= np.finfo(float).eps:
+        return None
+    return float(values[values > 0].sum()) / gross_loss
+
+
+def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("label_timestamp") or ""),
+            str(row.get("decision_group") or ""),
+        ),
+    )
+    values = np.asarray(
+        [float(row["return_pct"]) for row in ordered],
+        dtype=float,
+    )
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            "count": 0,
+            "avg_return_pct": None,
+            "median_return_pct": None,
+            "return_lcb_pct": None,
+            "profit_factor": None,
+            "cvar_10_pct": None,
+            "max_drawdown_pct": None,
+            "tail_loss_rate": None,
+            "tail_loss_policy": {
+                "source": "oos_negative_return_lower_hinge",
+                "value": None,
+                "observation_window": "current_oos_evidence_only",
+            },
+            "promotion_math_ready": False,
+            "return_semantics": "net_return_after_counterfactual_execution_cost",
+        }
+    negatives = values[values < 0].tolist()
+    tail_boundary = empirical_lower_hinge(negatives) if negatives else None
+    mean = float(values.mean())
+    if values.size == 1:
+        return_lcb = mean
+    else:
+        standard_error = float(values.std(ddof=1)) / math.sqrt(values.size)
+        return_lcb = mean - 1.645 * standard_error
+    tail_cutoff = float(np.quantile(values, 0.10))
+    cvar_values = values[values <= tail_cutoff]
+    cvar_value = float(cvar_values.mean()) if cvar_values.size else tail_cutoff
+    profit_factor_value = _profit_factor(values.tolist())
+    max_drawdown = _max_drawdown(values.tolist())
+    return {
+        "count": int(values.size),
+        "avg_return_pct": mean,
+        "median_return_pct": float(np.median(values)),
+        "return_lcb_pct": return_lcb,
+        "profit_factor": profit_factor_value,
+        "cvar_10_pct": cvar_value,
+        "max_drawdown_pct": max_drawdown,
+        "tail_loss_rate": (
+            float((values < float(tail_boundary)).mean())
+            if tail_boundary is not None
+            else None
+        ),
+        "tail_loss_policy": {
+            "source": "oos_negative_return_lower_hinge",
+            "value": tail_boundary,
+            "observation_window": "current_oos_evidence_only",
+        },
+        "promotion_math_ready": bool(
+            return_lcb > 0.0
+            and profit_factor_value is not None
+            and profit_factor_value > 1.0
+            and math.isfinite(cvar_value)
+            and max_drawdown is not None
+        ),
+        "return_semantics": "net_return_after_counterfactual_execution_cost",
+        "cost_deduction_count": 1,
+    }
+
+
+def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    selected_count = max(int(math.sqrt(len(rows))), 1)
+    return sorted(rows, key=lambda row: float(row["score"]))[-selected_count:]
+
+
+def _leave_one_symbol_out_stability(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    symbols = sorted(
+        {str(row.get("symbol") or "") for row in rows if row.get("symbol")}
+    )
+    reports = []
+    for symbol in symbols:
+        remaining = [
+            row for row in rows if str(row.get("symbol") or "") != symbol
+        ]
+        reports.append(
+            {
+                "excluded_symbol": symbol,
+                "remaining_symbol_count": len(
+                    {
+                        str(row.get("symbol") or "")
+                        for row in remaining
+                        if row.get("symbol")
+                    }
+                ),
+                "evidence": _return_evidence(_select_top_return_rows(remaining)),
+            }
+        )
+    return {
+        "version": "2026-07-15.leave-one-symbol-out.v1",
+        "evaluated_symbol_count": len(symbols),
+        "rows": reports,
+        "stable": bool(reports)
+        and all(row["evidence"]["promotion_math_ready"] for row in reports),
+        "policy": "recompute_oos_fee_after_return_evidence_after_each_symbol_removal",
+    }
+
+
+def _fit_walk_forward_side(
+    train_rows: list[dict[str, Any]],
+    validation_rows: list[dict[str, Any]],
+    *,
+    side: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    net_key = f"{side}_net_return"
+    return_key = f"{side}_return"
+    cost_key = f"{side}_execution_cost"
+    negatives = [float(row[net_key]) for row in train_rows if row[net_key] < 0]
+    tail_boundary = empirical_lower_hinge(negatives) if negatives else 0.0
+    tail_scale = abs(float(tail_boundary))
+    x_train = [row["x"] for row in train_rows]
+    x_validation = [row["x"] for row in validation_rows]
+    weights = [float(row["sample_weight"]) for row in train_rows]
+    market_model = _make_regressor(len(train_rows))
+    cost_model = _make_regressor(len(train_rows))
+    tail_labels = [int(row[net_key] < tail_boundary) for row in train_rows]
+    tail_model = _make_classifier(tail_labels)
+    market_model.fit(
+        x_train,
+        [row[return_key] for row in train_rows],
+        model__sample_weight=weights,
+    )
+    cost_model.fit(
+        x_train,
+        [row[cost_key] for row in train_rows],
+        model__sample_weight=weights,
+    )
+    tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
+    scores = (
+        np.asarray(market_model.predict(x_validation), dtype=float)
+        - np.asarray(cost_model.predict(x_validation), dtype=float)
+        - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
+    )
+    evaluated_rows = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "decision_group": str(row.get("decision_group") or ""),
+            "label_timestamp": str(row.get("label_timestamp") or ""),
+            "return_pct": float(row[net_key]),
+            "gross_market_return_pct": float(row[return_key]),
+            "execution_cost_pct": float(row[cost_key]),
+            "score": float(scores[index]),
+        }
+        for index, row in enumerate(validation_rows)
+    ]
+    return evaluated_rows, {
+        "source": "walk_forward_training_net_negative_return_lower_hinge",
+        "value": tail_boundary if negatives else None,
+        "scale_pct": tail_scale,
+        "observation_window": "walk_forward_training_groups_only",
+        "training_decision_group_count": len(
+            {str(row["decision_group"]) for row in train_rows}
+        ),
+    }
+
+
+def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = _chronological_rows(rows)
+    groups, group_bounds = _decision_group_availability(ordered)
+    version = "2026-07-15.expanding-decision-group-walk-forward.v1"
+    if len(groups) <= 1:
+        return {
+            "version": version,
+            "status": "insufficient_chronological_decision_groups",
+            "folds": [],
+            "decision_group_disjoint": False,
+            "model_refit_per_fold": True,
+            "chronological": True,
+        }
+    validation_candidates = [
+        group
+        for group in groups
+        if any(
+            group_bounds[prior]["end"]
+            < group_bounds[group]["decision_start"]
+            for prior in groups
+            if group_bounds[prior]["decision_start"]
+            < group_bounds[group]["decision_start"]
+        )
+    ]
+    if not validation_candidates:
+        return {
+            "version": version,
+            "status": "insufficient_purged_chronological_decision_groups",
+            "folds": [],
+            "decision_group_count": len(groups),
+            "decision_group_disjoint": False,
+            "chronological_label_disjoint": False,
+            "model_refit_per_fold": True,
+            "chronological": True,
+        }
+    validation_fold_count = max(
+        int(math.ceil(math.log10(len(validation_candidates) + 1))),
+        1,
+    )
+    blocks = [
+        [str(value) for value in block.tolist()]
+        for block in np.array_split(
+            np.asarray(validation_candidates, dtype=object),
+            validation_fold_count,
+        )
+        if len(block)
+    ]
+    folds = []
+    oos_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    for fold_number, validation_groups in enumerate(blocks, start=1):
+        validation_decision_start = min(
+            group_bounds[group]["decision_start"]
+            for group in validation_groups
+        )
+        training_set = {
+            group
+            for group in groups
+            if group_bounds[group]["end"] < validation_decision_start
+        }
+        training_label_end = max(
+            group_bounds[group]["end"] for group in training_set
+        )
+        purged_training_groups = [
+            group
+            for group in groups
+            if group_bounds[group]["decision_start"] < validation_decision_start
+            and group not in training_set
+        ]
+        validation_set = set(validation_groups)
+        if training_set & validation_set:
+            raise ValueError("walk-forward decision groups overlap")
+        train_rows = [
+            row for row in ordered if str(row["decision_group"]) in training_set
+        ]
+        validation_rows = [
+            row for row in ordered if str(row["decision_group"]) in validation_set
+        ]
+        side_reports = {}
+        for side in ("long", "short"):
+            evaluated, tail_policy = _fit_walk_forward_side(
+                train_rows,
+                validation_rows,
+                side=side,
+            )
+            oos_rows[side].extend(evaluated)
+            side_reports[side] = {
+                **_return_evidence(_select_top_return_rows(evaluated)),
+                "training_tail_loss_policy": tail_policy,
+            }
+        folds.append(
+            {
+                "fold": fold_number,
+                "training_decision_group_count": len(training_set),
+                "validation_decision_group_count": len(validation_set),
+                "validation_start": validation_rows[0]["label_timestamp"],
+                "validation_end": validation_rows[-1]["label_timestamp"],
+                "training_label_end": training_label_end.isoformat(),
+                "validation_decision_start": validation_decision_start.isoformat(),
+                "label_timestamp_overlap_count": 0,
+                "purged_training_decision_group_count": len(
+                    purged_training_groups
+                ),
+                "decision_group_overlap_count": 0,
+                "sides": side_reports,
+            }
+        )
+    side_reports = {}
+    for side in ("long", "short"):
+        evidence = _return_evidence(_select_top_return_rows(oos_rows[side]))
+        side_reports[side] = {
+            **evidence,
+            "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
+        }
+    return {
+        "version": version,
+        "status": "complete" if folds else "insufficient_chronological_decision_groups",
+        "folds": folds,
+        "fold_count": len(folds),
+        "decision_group_count": len(groups),
+        "decision_group_disjoint": all(
+            fold["decision_group_overlap_count"] == 0 for fold in folds
+        ),
+        "chronological_label_disjoint": all(
+            fold["label_timestamp_overlap_count"] == 0
+            and fold["training_label_end"] < fold["validation_decision_start"]
+            for fold in folds
+        ),
+        "model_refit_per_fold": True,
+        "chronological": True,
+        "sides": side_reports,
+        "stable": bool(folds)
+        and all(
+            report["promotion_math_ready"]
+            and report["leave_one_symbol_out"]["stable"]
+            and all(
+                fold["sides"][side]["promotion_math_ready"]
+                for fold in folds
+            )
+            for side, report in side_reports.items()
+        ),
+    }
+
+
+def _authoritative_trade_return_evidence(
+    trade_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    side_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    for sample in trade_samples:
+        supervision = sample.get("profit_supervision") or {}
+        tasks = supervision.get("tasks") or {}
+        realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
+        side = str(realized.get("side") or sample.get("side") or "").lower()
+        value = f(realized, "realized_net_return_pct", float("nan"))
+        if (
+            supervision.get("version") != PROFIT_SUPERVISION_VERSION
+            or realized.get("eligible") is not True
+            or side not in side_rows
+            or not math.isfinite(value)
+        ):
+            continue
+        side_rows[side].append(
+            {
+                "symbol": symbol_key(sample.get("symbol")),
+                "decision_group": str(
+                    sample.get("lifecycle_key")
+                    or sample.get("position_id")
+                    or sample.get("id")
+                    or ""
+                ),
+                "label_timestamp": _timestamp_text(
+                    sample.get("label_timestamp")
+                    or sample.get("closed_at")
+                    or sample.get("updated_at")
+                ),
+                "return_pct": float(value),
+                "score": float(value),
+            }
+        )
+    sides = {side: _return_evidence(rows) for side, rows in side_rows.items()}
+    fingerprint_payload = {
+        side: [
+            {
+                key: row.get(key)
+                for key in (
+                    "symbol",
+                    "decision_group",
+                    "label_timestamp",
+                    "return_pct",
+                )
+            }
+            for row in rows
+        ]
+        for side, rows in side_rows.items()
+    }
+    return {
+        "version": "2026-07-15.authoritative-trade-return-evidence.v1",
+        "source_authority": "okx_position_history_profit_supervision",
+        "sides": sides,
+        "sample_count": sum(len(rows) for rows in side_rows.values()),
+        "data_fingerprint": canonical_sha256(fingerprint_payload),
+    }
+
+
+def _evaluation_report_hashes(metadata: dict[str, Any]) -> dict[str, str]:
+    return {
+        field: canonical_sha256(metadata.get(field) or {})
+        for field in EVALUATION_REPORT_FIELDS
+    }
+
+
+def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
+    blockers = []
+    if not _is_sha256(metadata.get("training_data_sha256")):
+        blockers.append("training_data_fingerprint_invalid")
+    if not _is_sha256(metadata.get("source_code_sha256")):
+        blockers.append("source_code_fingerprint_invalid")
+    if metadata.get("time_split_policy") != "chronological_disjoint_decision_groups":
+        blockers.append("chronological_decision_group_policy_missing")
+    governance = metadata.get("governance_report") or {}
+    if (
+        not str(governance.get("quality_fingerprint") or "")
+        or governance.get("artifact_quality_fingerprint")
+        != governance.get("quality_fingerprint")
+        or governance.get("artifact_matches_quality") is not True
+        or governance.get("requires_artifact_refresh") is True
+    ):
+        blockers.append("artifact_quality_fingerprint_mismatch")
+    market_fact_contract = metadata.get("market_fact_contract") or {}
+    market_fact_provenance = market_fact_contract.get("provenance") or {}
+    market_fact_assertions = market_fact_contract.get("assertions") or {}
+    try:
+        market_fact_violation_count = int(
+            market_fact_contract.get("violation_count")
+        )
+    except (TypeError, ValueError):
+        market_fact_violation_count = None
+    if (
+        market_fact_contract.get("status") != "clean"
+        or market_fact_violation_count != 0
+        or not _is_sha256(market_fact_provenance.get("data_fingerprint"))
+        or any(
+            market_fact_assertions.get(name) is not True
+            for name in (
+                "native_instrument_identity_verified",
+                "same_contract_price_path_verified",
+                "executable_market_fact_verified",
+            )
+        )
+    ):
+        blockers.append("market_fact_contract_not_clean")
+    expected_hashes = _evaluation_report_hashes(metadata)
+    if metadata.get("evaluation_report_hashes") != expected_hashes:
+        blockers.append("evaluation_report_hash_mismatch")
+    if metadata.get("artifact_return_evidence_sha256") != canonical_sha256(
+        expected_hashes
+    ):
+        blockers.append("artifact_return_evidence_hash_mismatch")
+    walk_forward = metadata.get("walk_forward_report") or {}
+    folds = list(walk_forward.get("folds") or [])
+    if (
+        walk_forward.get("status") != "complete"
+        or walk_forward.get("decision_group_disjoint") is not True
+        or walk_forward.get("chronological_label_disjoint") is not True
+        or walk_forward.get("model_refit_per_fold") is not True
+        or not folds
+    ):
+        blockers.append("walk_forward_evidence_incomplete")
+    loso_report = metadata.get("leave_one_symbol_out_report") or {}
+    oos_report = metadata.get("oos_return_evaluation") or {}
+    authoritative_sides = (
+        (metadata.get("authoritative_trade_return_evidence") or {}).get("sides")
+        or {}
+    )
+    walk_sides = walk_forward.get("sides") or {}
+    for side in ("long", "short"):
+        if (walk_sides.get(side) or {}).get("promotion_math_ready") is not True:
+            blockers.append(f"{side}_walk_forward_return_evidence_not_ready")
+        if any(
+            ((fold.get("sides") or {}).get(side) or {}).get(
+                "promotion_math_ready"
+            )
+            is not True
+            for fold in folds
+        ):
+            blockers.append(f"{side}_walk_forward_fold_not_ready")
+        if (loso_report.get(side) or {}).get("stable") is not True:
+            blockers.append(f"{side}_leave_one_symbol_out_not_stable")
+        for scope, evidence in (
+            ("oos", oos_report.get(side) or {}),
+            ("authoritative", authoritative_sides.get(side) or {}),
+        ):
+            if evidence.get("profit_factor") is None:
+                blockers.append(f"{side}_{scope}_profit_factor_undefined")
+            if evidence.get("promotion_math_ready") is not True:
+                blockers.append(f"{side}_{scope}_return_evidence_not_ready")
+            if any(
+                evidence.get(field) is None
+                for field in (
+                    "return_lcb_pct",
+                    "cvar_10_pct",
+                    "max_drawdown_pct",
+                )
+            ):
+                blockers.append(f"{side}_{scope}_tail_evidence_incomplete")
+    return list(dict.fromkeys(blockers))
+
+
 def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None) -> dict[str, float]:
     price = f(features, "current_price", f(features, "close", 0.0))
     atr = f(features, "atr_14")
@@ -488,19 +1130,398 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             temporary.unlink()
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Artifact registry JSON must be an object: {path}")
+    return value
+
+
+def _required_text(payload: dict[str, Any], key: str) -> str:
+    value = str(payload.get(key) or "").strip()
+    if not value:
+        raise ValueError(f"{key} is required")
+    return value
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def _resolve_artifact_pointer(
+    pointer_path: Path,
+    *,
+    role: str,
+    deserialize_bundle: bool = False,
+) -> dict[str, Any] | None:
+    if not pointer_path.exists():
+        return None
+    pointer = read_json_object(pointer_path)
+    if pointer.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION:
+        raise ValueError("Unsupported local AI artifact registry pointer version.")
+    if pointer.get("pointer_role") != role:
+        raise ValueError("Local AI artifact pointer role mismatch.")
+    if pointer.get("model_id") != ARTIFACT_MODEL_ID:
+        raise ValueError("Local AI artifact pointer model identity mismatch.")
+    version = _required_text(pointer, "version")
+    version_root = (VERSIONS_ROOT / version).resolve(strict=True)
+    manifest_path = (MODEL_DIR / _required_text(pointer, "manifest_path")).resolve(
+        strict=True
+    )
+    manifest_path.relative_to(version_root)
+    if sha256_file(manifest_path) != _required_text(pointer, "manifest_sha256"):
+        raise ValueError("Local AI artifact manifest hash verification failed.")
+    manifest = read_json_object(manifest_path)
+    if manifest.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION:
+        raise ValueError("Local AI artifact manifest registry version mismatch.")
+    if manifest.get("artifact_model_id") != ARTIFACT_MODEL_ID:
+        raise ValueError("Local AI artifact manifest model identity mismatch.")
+    if manifest.get("artifact_version") != version:
+        raise ValueError("Local AI artifact manifest version mismatch.")
+    model_path = (version_root / _required_text(manifest, "model_relative_path")).resolve(
+        strict=True
+    )
+    metadata_path = (
+        version_root / _required_text(manifest, "metadata_relative_path")
+    ).resolve(strict=True)
+    model_path.relative_to(version_root)
+    metadata_path.relative_to(version_root)
+    artifact_hash = _required_text(pointer, "artifact_sha256")
+    if artifact_hash != manifest.get("artifact_sha256") or sha256_file(model_path) != artifact_hash:
+        raise ValueError("Local AI artifact model hash verification failed.")
+    metadata_hash = _required_text(pointer, "metadata_sha256")
+    if metadata_hash != manifest.get("metadata_sha256") or sha256_file(metadata_path) != metadata_hash:
+        raise ValueError("Local AI artifact metadata hash verification failed.")
+    metadata = read_json_object(metadata_path)
+    expected_report_hashes = _evaluation_report_hashes(metadata)
+    if metadata.get("evaluation_report_hashes") != expected_report_hashes:
+        raise ValueError("Local AI artifact evaluation report hash mismatch.")
+    if metadata.get("artifact_return_evidence_sha256") != canonical_sha256(
+        expected_report_hashes
+    ):
+        raise ValueError("Local AI artifact return evidence hash mismatch.")
+    for field, expected in (
+        ("artifact_registry_version", ARTIFACT_REGISTRY_VERSION),
+        ("artifact_model_id", ARTIFACT_MODEL_ID),
+        ("artifact_version", version),
+        ("artifact_sha256", artifact_hash),
+    ):
+        if metadata.get(field) != expected:
+            raise ValueError(f"Local AI artifact metadata {field} mismatch.")
+    for field in (
+        "training_data_sha256",
+        "source_code_sha256",
+        "objective_name",
+        "objective_version",
+        "label_name",
+        "label_version",
+        "cost_model_version",
+        "profit_supervision_version",
+        "time_split_policy",
+        "model_stage",
+        "market_fact_contract",
+        "governance_report",
+        "evaluation_report_hashes",
+        "artifact_return_evidence_sha256",
+    ):
+        if metadata.get(field) != manifest.get(field):
+            raise ValueError(f"Local AI artifact metadata/manifest {field} mismatch.")
+    activation = None
+    if role in {"current", "rollback"}:
+        activation_path = (
+            MODEL_DIR / _required_text(pointer, "activation_manifest_path")
+        ).resolve(strict=True)
+        activation_path.relative_to(version_root)
+        if sha256_file(activation_path) != _required_text(
+            pointer, "activation_manifest_sha256"
+        ):
+            raise ValueError("Local AI activation manifest hash verification failed.")
+        activation = read_json_object(activation_path)
+        if (
+            activation.get("activation_manifest_version")
+            != ARTIFACT_ACTIVATION_MANIFEST_VERSION
+            or activation.get("artifact_model_id") != ARTIFACT_MODEL_ID
+            or activation.get("artifact_version") != version
+            or activation.get("artifact_sha256") != artifact_hash
+        ):
+            raise ValueError("Local AI activation identity mismatch.")
+        if activation.get("training_data_sha256") != manifest.get(
+            "training_data_sha256"
+        ):
+            raise ValueError("Local AI activation training-data identity mismatch.")
+        if activation.get("source_code_sha256") != manifest.get("source_code_sha256"):
+            raise ValueError("Local AI activation source-code identity mismatch.")
+        if activation.get("artifact_return_evidence_sha256") != metadata.get(
+            "artifact_return_evidence_sha256"
+        ):
+            raise ValueError("Local AI activation return-evidence identity mismatch.")
+        stage = activation.get("activation_stage")
+        production_authorized = activation.get("production_influence_authorized") is True
+        if stage == "shadow" and production_authorized:
+            raise ValueError("Shadow local AI artifact has production authorization.")
+        if stage in {"canary", "live"} and not production_authorized:
+            raise ValueError("Production local AI activation is not authorized.")
+        if stage in {"canary", "live"}:
+            evidence_blockers = _production_return_evidence_blockers(metadata)
+            if evidence_blockers:
+                raise ValueError(
+                    "Production local AI activation return evidence is not ready: "
+                    + ",".join(evidence_blockers)
+                )
+            if activation.get("return_evidence_ready") is not True:
+                raise ValueError("Production local AI activation evidence was not authorized.")
+        if stage not in {"shadow", "canary", "live"}:
+            raise ValueError("Local AI activation stage is invalid.")
+    bundle = None
+    if deserialize_bundle:
+        bundle = load_trusted_joblib_bundle(model_path)
+        embedded = bundle.get("metadata") if isinstance(bundle, dict) else None
+        if not isinstance(embedded, dict):
+            raise ValueError("Local AI artifact bundle metadata is missing.")
+        for field in (
+            "artifact_registry_version",
+            "artifact_model_id",
+            "artifact_version",
+            "training_data_sha256",
+            "source_code_sha256",
+            "objective_version",
+            "label_version",
+            "profit_supervision_version",
+        ):
+            if embedded.get(field) != metadata.get(field):
+                raise ValueError(f"Local AI artifact bundle {field} mismatch.")
+    return {
+        "role": role,
+        "pointer": pointer,
+        "version": version,
+        "version_root": version_root,
+        "manifest_path": manifest_path,
+        "manifest": manifest,
+        "model_path": model_path,
+        "metadata_path": metadata_path,
+        "metadata": metadata,
+        "activation_manifest": activation,
+        "bundle": bundle,
+    }
+
+
+def persist_candidate_bundle(
+    bundle: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    if not _is_sha256(metadata.get("training_data_sha256")):
+        raise ValueError("Local AI training_data_sha256 is invalid.")
+    if not _is_sha256(metadata.get("source_code_sha256")):
+        raise ValueError("Local AI source_code_sha256 is invalid.")
+    for field in (
+        "objective_name",
+        "objective_version",
+        "label_name",
+        "label_version",
+        "cost_model_version",
+        "profit_supervision_version",
+        "time_split_policy",
+    ):
+        _required_text(metadata, field)
+    for field in EVALUATION_REPORT_FIELDS:
+        if not isinstance(metadata.get(field), dict):
+            raise ValueError(f"Local AI {field} is required for candidate persistence.")
+    expected_report_hashes = _evaluation_report_hashes(metadata)
+    if metadata.get("evaluation_report_hashes") != expected_report_hashes:
+        raise ValueError("Local AI evaluation report hashes are invalid.")
+    if metadata.get("artifact_return_evidence_sha256") != canonical_sha256(
+        expected_report_hashes
+    ):
+        raise ValueError("Local AI combined return-evidence hash is invalid.")
+    created_at = datetime.now(timezone.utc)
+    version = f"{created_at.strftime('%Y%m%dT%H%M%S%fZ')}-{uuid.uuid4().hex[:8]}"
+    version_root = VERSIONS_ROOT / version
+    version_root.mkdir(parents=True, exist_ok=False)
+    model_path = version_root / "model.joblib"
+    metadata_path = version_root / "model_metadata.json"
+    manifest_path = version_root / "manifest.json"
+    registry_metadata = {
+        **metadata,
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": version,
+        "artifact_lifecycle": "candidate",
+        "model_stage": "candidate",
+        "production_influence_authorized": False,
+    }
+    persisted_bundle = dict(bundle)
+    persisted_bundle["metadata"] = registry_metadata
+    dump_trusted_joblib_bundle(persisted_bundle, model_path)
+    artifact_hash = sha256_file(model_path)
+    registry_metadata["artifact_sha256"] = artifact_hash
+    registry_metadata["artifact_size_bytes"] = model_path.stat().st_size
+    write_json_atomic(metadata_path, registry_metadata)
+    metadata_hash = sha256_file(metadata_path)
+    manifest = {
+        **registry_metadata,
+        "created_at": created_at.isoformat(),
+        "artifact_sha256": artifact_hash,
+        "metadata_sha256": metadata_hash,
+        "model_relative_path": "model.joblib",
+        "metadata_relative_path": "model_metadata.json",
+    }
+    write_json_atomic(manifest_path, manifest)
+    write_json_atomic(
+        CANDIDATE_POINTER_PATH,
+        {
+            "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+            "pointer_role": "candidate",
+            "model_id": ARTIFACT_MODEL_ID,
+            "version": version,
+            "manifest_path": str(manifest_path.relative_to(MODEL_DIR)),
+            "artifact_sha256": artifact_hash,
+            "metadata_sha256": metadata_hash,
+            "manifest_sha256": sha256_file(manifest_path),
+            "updated_at": created_at.isoformat(),
+        },
+    )
+    candidate = _resolve_artifact_pointer(
+        CANDIDATE_POINTER_PATH,
+        role="candidate",
+        deserialize_bundle=True,
+    )
+    if candidate is None:
+        raise ValueError("Local AI candidate artifact did not resolve after persistence.")
+    return candidate
+
+
+def activate_candidate_shadow(return_evidence: dict[str, Any]) -> dict[str, Any]:
+    candidate = _resolve_artifact_pointer(
+        CANDIDATE_POINTER_PATH,
+        role="candidate",
+        deserialize_bundle=False,
+    )
+    if candidate is None:
+        raise ValueError("Local AI candidate artifact is not registered.")
+    activation_path = candidate["version_root"] / "activation-shadow.json"
+    evidence_blockers = _production_return_evidence_blockers(candidate["metadata"])
+    activation = {
+        "activation_manifest_version": ARTIFACT_ACTIVATION_MANIFEST_VERSION,
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": candidate["version"],
+        "artifact_sha256": candidate["manifest"]["artifact_sha256"],
+        "training_data_sha256": candidate["manifest"].get("training_data_sha256"),
+        "source_code_sha256": candidate["manifest"].get("source_code_sha256"),
+        "artifact_return_evidence_sha256": candidate["metadata"].get(
+            "artifact_return_evidence_sha256"
+        ),
+        "activation_stage": "shadow",
+        "production_influence_authorized": False,
+        "return_evidence_report": return_evidence,
+        "return_evidence_ready": not evidence_blockers,
+        "return_evidence_blockers": evidence_blockers,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json_atomic(activation_path, activation)
+    if CURRENT_POINTER_PATH.exists():
+        current = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
+        if current is None:
+            raise ValueError("Local AI current pointer disappeared during activation.")
+        write_json_atomic(
+            ROLLBACK_POINTER_PATH,
+            {
+                **current["pointer"],
+                "pointer_role": "rollback",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        _resolve_artifact_pointer(ROLLBACK_POINTER_PATH, role="rollback")
+    write_json_atomic(
+        CURRENT_POINTER_PATH,
+        {
+            **candidate["pointer"],
+            "pointer_role": "current",
+            "activation_manifest_path": str(activation_path.relative_to(MODEL_DIR)),
+            "activation_manifest_sha256": sha256_file(activation_path),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    current = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=True,
+    )
+    if current is None:
+        raise ValueError("Local AI shadow activation did not produce a current artifact.")
+    CANDIDATE_POINTER_PATH.unlink(missing_ok=True)
+    return current
+
+
+def rollback_current_artifact() -> dict[str, Any]:
+    rollback = _resolve_artifact_pointer(ROLLBACK_POINTER_PATH, role="rollback")
+    if rollback is None:
+        raise ValueError("Local AI rollback artifact is not registered.")
+    current_pointer = read_json_object(CURRENT_POINTER_PATH)
+    write_json_atomic(
+        CURRENT_POINTER_PATH,
+        {
+            **rollback["pointer"],
+            "pointer_role": "current",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    restored = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
+    if restored is None:
+        raise ValueError("Local AI rollback did not restore a current artifact.")
+    write_json_atomic(
+        ROLLBACK_POINTER_PATH,
+        {
+            **current_pointer,
+            "pointer_role": "rollback",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _resolve_artifact_pointer(ROLLBACK_POINTER_PATH, role="rollback")
+    return restored
+
+
 def load_bundle() -> dict[str, Any] | None:
-    global _BUNDLE_CACHE, _BUNDLE_MTIME
-    mtime: float | None = None
+    global _BUNDLE_CACHE, _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+    model_mtime_ns: int | None = None
+    pointer_mtime_ns = (
+        CURRENT_POINTER_PATH.stat().st_mtime_ns
+        if CURRENT_POINTER_PATH.exists()
+        else None
+    )
     try:
-        if not BUNDLE_PATH.exists():
+        current = _resolve_artifact_pointer(
+            CURRENT_POINTER_PATH,
+            role="current",
+            deserialize_bundle=False,
+        )
+        if current is None:
             _BUNDLE_CACHE = None
-            _BUNDLE_MTIME = None
+            _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
+            _CURRENT_MODEL_MTIME_NS = None
             return None
-        mtime = BUNDLE_PATH.stat().st_mtime
-        if _BUNDLE_MTIME == mtime:
+        model_mtime_ns = current["model_path"].stat().st_mtime_ns
+        if (
+            _CURRENT_POINTER_MTIME_NS == pointer_mtime_ns
+            and _CURRENT_MODEL_MTIME_NS == model_mtime_ns
+        ):
             return _BUNDLE_CACHE
-        candidate = load_trusted_joblib_bundle(BUNDLE_PATH)
-        metadata = candidate.get("metadata") if isinstance(candidate, dict) else {}
+        current = _resolve_artifact_pointer(
+            CURRENT_POINTER_PATH,
+            role="current",
+            deserialize_bundle=True,
+        )
+        candidate = current["bundle"] if current else None
+        metadata = candidate.get("metadata") if isinstance(candidate, dict) else None
         if not isinstance(metadata, dict) or (
             metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
             or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
@@ -517,14 +1538,25 @@ def load_bundle() -> dict[str, Any] | None:
             )
         ):
             raise ValueError("local quant artifact separated supervision rejected")
+        activation = current.get("activation_manifest") or {}
+        runtime_metadata = {
+            **metadata,
+            "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
+            "model_stage": activation.get("activation_stage") or "unregistered",
+            "production_influence_authorized": bool(
+                activation.get("production_influence_authorized")
+            ),
+            "artifact_activation_manifest": activation,
+        }
+        candidate = {**candidate, "metadata": runtime_metadata}
         _BUNDLE_CACHE = candidate
-        _BUNDLE_MTIME = mtime
+        _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
+        _CURRENT_MODEL_MTIME_NS = model_mtime_ns
         return _BUNDLE_CACHE
     except Exception:
         _BUNDLE_CACHE = None
-        # Remember the inspected file version so a rejected legacy bundle is
-        # not deserialized again on every live prediction request.
-        _BUNDLE_MTIME = mtime
+        _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
+        _CURRENT_MODEL_MTIME_NS = model_mtime_ns if model_mtime_ns is not None else -1
         return None
 
 
@@ -545,12 +1577,8 @@ def _file_stat(path: Path) -> dict[str, Any]:
 
 def _read_metadata_file() -> dict[str, Any]:
     try:
-        if not METADATA_PATH.exists():
-            return {}
-        parsed = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
-        if not isinstance(parsed, dict):
-            return {}
-        return parsed
+        current = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
+        return current["metadata"] if current else {}
     except Exception:
         return {}
 
@@ -567,29 +1595,63 @@ def _status_metadata() -> dict[str, Any]:
 
 
 def _model_artifact_status() -> dict[str, Any]:
-    bundle_stat = _file_stat(BUNDLE_PATH)
-    metadata_stat = _file_stat(METADATA_PATH)
-    metadata = _status_metadata()
-    bundle_exists = bool(bundle_stat.get("exists"))
-    metadata_exists = bool(metadata_stat.get("exists"))
-    metadata_ready = bool(metadata)
-    model_bundle_available = bool(bundle_exists and metadata_ready)
-    status = "ready" if model_bundle_available else "artifact_unavailable"
-    if bundle_exists and not metadata_ready:
-        status = "metadata_missing"
+    pointer_rows = {}
+    resolved_rows = {}
+    for role, path in (
+        ("candidate", CANDIDATE_POINTER_PATH),
+        ("current", CURRENT_POINTER_PATH),
+        ("rollback", ROLLBACK_POINTER_PATH),
+    ):
+        try:
+            resolved = _resolve_artifact_pointer(path, role=role)
+            resolved_rows[role] = resolved
+            pointer_rows[role] = {
+                "available": resolved is not None,
+                "version": resolved.get("version") if resolved else None,
+                "error": None if resolved else f"{role}_artifact_not_registered",
+            }
+        except Exception as exc:
+            resolved_rows[role] = None
+            pointer_rows[role] = {
+                "available": False,
+                "version": None,
+                "error": safe_error(exc),
+            }
+    current = resolved_rows["current"]
+    metadata = current["metadata"] if current else {}
+    activation = current["activation_manifest"] if current else {}
+    model_bundle_available = current is not None and bool(metadata)
+    activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
     return {
         "available": model_bundle_available,
         "model_bundle_available": model_bundle_available,
         "trained_models_available": model_bundle_available,
-        "status": status,
+        "status": activation_stage if model_bundle_available else "artifact_unavailable",
         "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
-        "model_path": str(BUNDLE_PATH),
-        "metadata_path": str(METADATA_PATH),
-        "bundle_file": bundle_stat,
-        "metadata_file": metadata_stat,
-        "metadata_loaded": metadata_ready,
-        "metadata_source": "metadata_file" if metadata_exists else ("bundle_cache" if metadata_ready else "missing"),
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": current.get("version") if current else None,
+        "artifact_lifecycle": activation_stage,
+        "production_influence_authorized": bool(
+            (activation or {}).get("production_influence_authorized")
+        ),
+        "model_path": str(current["model_path"]) if current else None,
+        "metadata_path": str(current["metadata_path"]) if current else None,
+        "bundle_file": _file_stat(current["model_path"]) if current else {"exists": False},
+        "metadata_file": (
+            _file_stat(current["metadata_path"]) if current else {"exists": False}
+        ),
+        "metadata_loaded": bool(metadata),
+        "metadata_source": "verified_current_pointer" if metadata else "missing",
+        "activation_manifest": activation or {},
+        "artifact_pointers": pointer_rows,
         **metadata,
+        "artifact_lifecycle": activation_stage,
+        "model_stage": activation_stage if model_bundle_available else "candidate",
+        "artifact_activation_manifest": activation or {},
+        "production_influence_authorized": bool(
+            (activation or {}).get("production_influence_authorized")
+        ),
     }
 
 
@@ -2005,9 +3067,11 @@ def with_model_metadata(
             "label_version",
             "training_cost_policy",
             "artifact_persisted",
+            "artifact_lifecycle",
             "model_stage",
             "training_mode",
             "profit_supervision_version",
+            "production_influence_authorized",
         ):
             if key in metadata:
                 payload.setdefault(key, metadata.get(key))
@@ -2015,6 +3079,35 @@ def with_model_metadata(
         distribution_inputs = (
             distribution_inputs if isinstance(distribution_inputs, dict) else {}
         )
+        activation_stage = str(
+            metadata.get("artifact_lifecycle")
+            or metadata.get("model_stage")
+            or "candidate"
+        ).lower()
+        live_authorized = bool(
+            activation_stage == "live"
+            and metadata.get("production_influence_authorized") is True
+            and not _production_return_evidence_blockers(metadata)
+        )
+        if not live_authorized:
+            for side in ("long", "short"):
+                distribution_input = distribution_inputs.get(side)
+                if not isinstance(distribution_input, dict):
+                    continue
+                blockers = list(distribution_input.get("blockers") or [])
+                blockers.append("artifact_activation_not_production_authorized")
+                distribution_input["blockers"] = list(dict.fromkeys(blockers))
+                distribution_input["production_eligible"] = False
+            payload["route_mode"] = f"{activation_stage}_observation"
+            payload["live_mutation"] = False
+            payload["production_permission"] = False
+            payload["promotion_ready"] = False
+        else:
+            payload["route_mode"] = "live"
+            payload["live_mutation"] = True
+            payload["live_influence"] = True
+            payload["production_permission"] = True
+            payload["promotion_ready"] = True
         distribution_inputs_ready = all(
             isinstance(distribution_inputs.get(side), dict)
             and distribution_inputs[side].get("production_eligible") is True
@@ -2051,6 +3144,11 @@ def with_model_metadata(
                 dict.fromkeys(
                     [
                         *(prediction_quality.get("blockers") or []),
+                        *(
+                            ["artifact_activation_not_production_authorized"]
+                            if not live_authorized
+                            else []
+                        ),
                         "runtime_return_artifact_contract_incomplete",
                     ]
                 )
@@ -2626,25 +3724,36 @@ def train(req: TrainRequest) -> dict[str, Any]:
             for value in (long_return, short_return, long_cost, short_cost)
         ):
             continue
+        sample_weight = max(0.0, f(sample, "sample_weight", 1.0))
+        if sample_weight <= 0.0:
+            continue
         correlation = sample.get("correlation_weight") or {}
+        decision_group = str(correlation.get("correlation_group") or "").strip()
+        if not decision_group:
+            decision_identity = sample.get("decision_id") or sample.get("id")
+            decision_group = (
+                f"shadow_decision:{decision_identity}" if decision_identity else ""
+            )
         rows.append({
             "x": model_x(features, horizon_minutes=horizon),
+            "id": int(sample.get("id") or 0),
             "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
             "horizon": horizon,
-            "decision_group": str(
-                correlation.get("correlation_group")
-                or f"shadow_decision:{sample.get('decision_id') or sample.get('id')}"
-            ),
+            "decision_group": decision_group,
+            "decision_timestamp": _timestamp_text(sample.get("decision_timestamp")),
+            "label_timestamp": _timestamp_text(sample.get("label_timestamp")),
             "raw_long_return": long_return,
             "raw_short_return": short_return,
             "long_return": long_return,
             "short_return": short_return,
             "long_execution_cost": long_cost,
             "short_execution_cost": short_cost,
+            "long_net_return": long_return - long_cost,
+            "short_net_return": short_return - short_cost,
             "best_side": "long" if long_return >= short_return else "short",
             "execution_cost": cost_task,
             "features": features,
-            "sample_weight": max(0.0, f(sample, "sample_weight", 1.0)),
+            "sample_weight": sample_weight,
         })
     if len(rows) <= 1:
         return {
@@ -2654,7 +3763,16 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "message": "Need market-opportunity and execution-cost tasks from separate decision groups.",
         }
 
-    ordered_groups = list(dict.fromkeys(str(row["decision_group"]) for row in rows))
+    try:
+        rows = _chronological_rows(rows)
+    except ValueError as exc:
+        return {
+            "trained": False,
+            "reason": "chronological_training_identity_incomplete",
+            "shadow_sample_count": len(rows),
+            "message": str(exc),
+        }
+    ordered_groups, group_bounds = _decision_group_availability(rows)
     if len(ordered_groups) <= 1:
         return {
             "trained": False,
@@ -2663,8 +3781,17 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "decision_group_count": len(ordered_groups),
         }
     split = len(ordered_groups) // 2
-    train_groups = set(ordered_groups[:split])
-    holdout_groups = set(ordered_groups[split:])
+    holdout_candidates = ordered_groups[split:]
+    holdout_decision_start = min(
+        group_bounds[group]["decision_start"] for group in holdout_candidates
+    )
+    train_groups = {
+        group
+        for group in ordered_groups[:split]
+        if group_bounds[group]["end"] < holdout_decision_start
+    }
+    holdout_groups = set(holdout_candidates)
+    purged_holdout_group_count = split - len(train_groups)
     train_rows = [row for row in rows if str(row["decision_group"]) in train_groups]
     holdout_rows = [row for row in rows if str(row["decision_group"]) in holdout_groups]
     if not train_rows or not holdout_rows or train_groups & holdout_groups:
@@ -2675,14 +3802,14 @@ def train(req: TrainRequest) -> dict[str, Any]:
         }
 
     long_tail_boundary = empirical_lower_hinge(
-        [row["long_return"] for row in train_rows if row["long_return"] < 0]
+        [row["long_net_return"] for row in train_rows if row["long_net_return"] < 0]
     )
     short_tail_boundary = empirical_lower_hinge(
-        [row["short_return"] for row in train_rows if row["short_return"] < 0]
+        [row["short_net_return"] for row in train_rows if row["short_net_return"] < 0]
     )
     for row in rows:
-        row["lossy_long"] = int(row["long_return"] < long_tail_boundary)
-        row["lossy_short"] = int(row["short_return"] < short_tail_boundary)
+        row["lossy_long"] = int(row["long_net_return"] < long_tail_boundary)
+        row["lossy_short"] = int(row["short_net_return"] < short_tail_boundary)
 
     X = [r["x"] for r in train_rows]
     long_y = [r["long_return"] for r in train_rows]
@@ -2775,6 +3902,28 @@ def train(req: TrainRequest) -> dict[str, Any]:
     trainable_trade_samples = [
         sample for sample in (req.trade_samples or []) if not bool(sample.get("exclude_from_training"))
     ]
+    walk_forward_report = _walk_forward_return_report(rows)
+    leave_one_symbol_out_report = {
+        side: (walk_forward_report.get("sides") or {}).get(side, {}).get(
+            "leave_one_symbol_out",
+            {},
+        )
+        for side in ("long", "short")
+    }
+    oos_return_evaluation = {
+        side: {
+            key: value
+            for key, value in (walk_forward_report.get("sides") or {}).get(
+                side,
+                {},
+            ).items()
+            if key != "leave_one_symbol_out"
+        }
+        for side in ("long", "short")
+    }
+    authoritative_trade_return_evidence = _authoritative_trade_return_evidence(
+        trainable_trade_samples
+    )
     profiles = _train_profiles(trainable_trade_samples)
     evaluation_policy = req.evaluation_policy or {
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -2789,31 +3938,32 @@ def train(req: TrainRequest) -> dict[str, Any]:
     fingerprint_payload = {
         "shadow": [
             {
-                "id": sample.get("id"),
-                "symbol": sample.get("symbol"),
-                "long_return_pct": sample.get("long_return_pct"),
-                "short_return_pct": sample.get("short_return_pct"),
-                "label_timestamp": sample.get("label_timestamp"),
-                "profit_supervision_fingerprint": (
-                    sample.get("profit_supervision") or {}
-                ).get("contract_fingerprint"),
+                "id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "decision_group": row.get("decision_group"),
+                "label_timestamp": row.get("label_timestamp"),
+                "horizon": row.get("horizon"),
+                "long_return_pct": row.get("long_return"),
+                "short_return_pct": row.get("short_return"),
+                "long_execution_cost_pct": row.get("long_execution_cost"),
+                "short_execution_cost_pct": row.get("short_execution_cost"),
+                "sample_weight": row.get("sample_weight"),
+                "feature_vector": row.get("x"),
             }
-            for sample in (req.shadow_samples or [])
-            if not bool(sample.get("exclude_from_training"))
+            for row in rows
         ],
-        "trades": [
+        "trades": sorted([
             {
                 "id": sample.get("id"),
                 "position_id": sample.get("position_id"),
                 "realized_pnl": sample.get("realized_pnl"),
                 "net_return_after_cost_pct": sample.get("net_return_after_cost_pct"),
-                "profit_supervision_fingerprint": (
-                    sample.get("profit_supervision") or {}
-                ).get("contract_fingerprint"),
+                "sample_weight": sample.get("sample_weight"),
+                "profit_supervision": sample.get("profit_supervision") or {},
             }
             for sample in trainable_trade_samples
-        ],
-        "sequence": [
+        ], key=lambda row: (str(row.get("position_id") or ""), str(row.get("id") or ""))),
+        "sequence": sorted([
             {
                 "symbol": sample.get("symbol"),
                 "timeframe": sample.get("timeframe"),
@@ -2825,32 +3975,59 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 "label_timestamp": sample.get("label_timestamp"),
                 "long_return_pct": sample.get("long_return_pct"),
                 "short_return_pct": sample.get("short_return_pct"),
+                "close_sequence": sample.get("close_sequence"),
+                "volume_sequence": sample.get("volume_sequence"),
                 "training_sample_fingerprint": (
                     sample.get("training_sample_contract") or {}
                 ).get("sample_fingerprint"),
             }
             for sample in (req.sequence_samples or [])
             if not bool(sample.get("exclude_from_training"))
-        ],
+        ], key=lambda row: (
+            str(row.get("label_timestamp") or ""),
+            str(row.get("symbol") or ""),
+            str(row.get("timeframe") or ""),
+        )),
+        "text_sentiment": sorted(
+            [
+                {
+                    "id": sample.get("id"),
+                    "label_timestamp": sample.get("label_timestamp"),
+                    "text": _text_value(sample),
+                    "sentiment_score": f(sample, "sentiment_score"),
+                    "sample_weight": sample.get("sample_weight"),
+                }
+                for sample in (req.text_sentiment_samples or [])
+                if not bool(sample.get("exclude_from_training"))
+                and _text_value(sample)
+            ],
+            key=lambda row: (
+                str(row.get("label_timestamp") or ""),
+                str(row.get("id") or ""),
+                str(row.get("text") or ""),
+            ),
+        ),
     }
-    training_data_sha256 = hashlib.sha256(
-        json.dumps(
-            fingerprint_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    source_digest = hashlib.sha256()
-    for function in (
-        train,
-        timeseries_predict,
-        deep_timeseries_predict,
-        sentiment_analyze,
-        profit_predict,
-    ):
-        source_digest.update(function.__code__.co_code)
-    source_code_sha256 = source_digest.hexdigest()
+    training_data_sha256 = canonical_sha256(fingerprint_payload)
+    source_path = Path(str(globals().get("__file__") or ""))
+    if source_path.is_file():
+        source_code_sha256 = sha256_file(source_path)
+    else:
+        source_digest = hashlib.sha256()
+        for function in (
+            train,
+            _walk_forward_return_report,
+            _fit_walk_forward_side,
+            _return_evidence,
+            _leave_one_symbol_out_stability,
+            _authoritative_trade_return_evidence,
+            timeseries_predict,
+            deep_timeseries_predict,
+            sentiment_analyze,
+            profit_predict,
+        ):
+            source_digest.update(function.__code__.co_code)
+        source_code_sha256 = source_digest.hexdigest()
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "phase": "phase3_model_factory",
@@ -2861,6 +4038,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "holdout_shadow_sample_count": len(holdout_rows),
         "train_decision_group_count": len(train_groups),
         "holdout_decision_group_count": len(holdout_groups),
+        "purged_holdout_decision_group_count": purged_holdout_group_count,
         "completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows)),
         "last_trained_completed_shadow_sample_count": int(
             req.completed_shadow_sample_count or len(rows)
@@ -2883,9 +4061,21 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "profit_supervision_report": req.profit_supervision_report or {},
+        "market_fact_contract": (req.quality_report or {}).get(
+            "market_fact_contract",
+            {},
+        ),
         "tail_loss_policy": {
-            "long": {"source": "cost_complete_training_negative_return_lower_hinge", "value": long_tail_boundary},
-            "short": {"source": "cost_complete_training_negative_return_lower_hinge", "value": short_tail_boundary},
+            "long": {
+                "source": "chronological_training_net_negative_return_lower_hinge",
+                "value": long_tail_boundary,
+                "observation_window": "chronological_training_groups_only",
+            },
+            "short": {
+                "source": "chronological_training_net_negative_return_lower_hinge",
+                "value": short_tail_boundary,
+                "observation_window": "chronological_training_groups_only",
+            },
         },
         "tail_loss_scale_pct": {
             "long": abs(float(long_tail_boundary)),
@@ -2899,19 +4089,34 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "training_data_sha256": training_data_sha256,
         "source_code_sha256": source_code_sha256,
         "time_split_policy": "chronological_disjoint_decision_groups",
+        "walk_forward_report": walk_forward_report,
+        "leave_one_symbol_out_report": leave_one_symbol_out_report,
+        "oos_return_evaluation": oos_return_evaluation,
+        "authoritative_trade_return_evidence": authoritative_trade_return_evidence,
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
         "return_objective_report": req.return_objective_report or {},
         "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": str(req.training_mode or "shadow"),
-        "model_stage": str(req.model_stage or "shadow"),
+        "requested_model_stage": str(req.model_stage or "shadow"),
+        "model_stage": "candidate",
         "evaluation_policy": evaluation_policy,
         "artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild),
         "preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild),
         "persist_artifact_requested": bool(req.persist_artifact),
         "confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild),
         "promotion_recommendation": req.promotion_recommendation or {},
+        "artifact_activation_manifest": {
+            "status": "not_activated",
+            "activation_stage": "candidate",
+            "production_influence_authorized": False,
+        },
+        "live_promotion_manifest": {
+            "status": "not_issued",
+            "reason": "candidate_requires_independent_shadow_and_return_readiness",
+            "production_influence_authorized": False,
+        },
         "training_objective": (
             "Predict shadow market opportunity and counterfactual execution cost as "
             "separate tasks; calibrate realized net return and slippage only from "
@@ -2936,6 +4141,21 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "exit": "trade-profile plus live pnl rules",
         },
         "objective": RETURN_OBJECTIVE_NAME,
+    }
+    metadata["evaluation_report_hashes"] = _evaluation_report_hashes(metadata)
+    metadata["artifact_return_evidence_sha256"] = canonical_sha256(
+        metadata["evaluation_report_hashes"]
+    )
+    return_evidence_blockers = _production_return_evidence_blockers(metadata)
+    metadata["live_promotion_manifest"] = {
+        "status": "not_issued",
+        "reason": (
+            "candidate_return_evidence_not_ready"
+            if return_evidence_blockers
+            else "candidate_requires_independent_shadow_activation"
+        ),
+        "blocking_reasons": return_evidence_blockers,
+        "production_influence_authorized": False,
     }
     bundle = {
         "metadata": metadata,
@@ -2966,13 +4186,34 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "reason": "phase3_rebuild_confirmation_required",
             **metadata,
         }
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    dump_trusted_joblib_bundle(bundle, BUNDLE_PATH)
-    write_json_atomic(METADATA_PATH, metadata)
-    global _BUNDLE_CACHE, _BUNDLE_MTIME
-    _BUNDLE_CACHE = bundle
-    _BUNDLE_MTIME = BUNDLE_PATH.stat().st_mtime
-    return {"trained": True, **metadata}
+    candidate = persist_candidate_bundle(bundle, metadata)
+    current = activate_candidate_shadow(
+        {
+            "walk_forward_report": walk_forward_report,
+            "leave_one_symbol_out_report": leave_one_symbol_out_report,
+            "oos_return_evaluation": oos_return_evaluation,
+            "authoritative_trade_return_evidence": authoritative_trade_return_evidence,
+            "evaluation_report_hashes": metadata["evaluation_report_hashes"],
+            "blocking_reasons": return_evidence_blockers,
+            "promotion_recommendation": req.promotion_recommendation or {},
+            "training_mode": str(req.training_mode or "shadow"),
+        }
+    )
+    global _BUNDLE_CACHE, _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+    _BUNDLE_CACHE = None
+    _CURRENT_POINTER_MTIME_NS = None
+    _CURRENT_MODEL_MTIME_NS = None
+    loaded = load_bundle()
+    if loaded is None:
+        raise ValueError("Local AI shadow artifact failed post-activation load verification.")
+    return {
+        "trained": True,
+        **current["metadata"],
+        "artifact_version": current["version"],
+        "artifact_activation_stage": "shadow",
+        "production_influence_authorized": False,
+        "candidate_version": candidate["version"],
+    }
 
 
 @app.post("/profit/predict")
@@ -3986,21 +5227,39 @@ def _remote_smoke_command() -> str:
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
         "assert health.get('live_mutation') is False, health\n"
+        "assert health.get('artifact_lifecycle') == 'shadow', health\n"
+        "assert health.get('production_influence_authorized') is False, health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') == 'shadow', health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('production_influence_authorized') is False, health\n"
         "assert profit.get('trained') is True, profit\n"
         "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"
         "assert profit.get('live_mutation') is False, profit\n"
+        "assert profit.get('production_permission') is False, profit\n"
+        "assert profit.get('promotion_ready') is False, profit\n"
+        "assert profit.get('prediction_quality', {}).get('production_eligible') is False, profit\n"
         "assert profit.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', profit\n"
         "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
+        "assert all(item.get('production_eligible') is False for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
         "assert 'loss_probability' in profit, profit\n"
         "assert exit_advice.get('action') == 'hold', exit_advice\n"
         "assert exit_advice.get('no_matching_position') is True, exit_advice\n"
         "print(json.dumps({\n"
         "    'event': 'phase3_quant_api_smoke_ok',\n"
-        "    'health': health,\n"
+        "    'health_contract': {\n"
+        "        'artifact_version': health.get('artifact_version'),\n"
+        "        'artifact_lifecycle': health.get('artifact_lifecycle'),\n"
+        "        'production_influence_authorized': health.get('production_influence_authorized'),\n"
+        "        'training_data_sha256': health.get('training_data_sha256'),\n"
+        "        'source_code_sha256': health.get('source_code_sha256'),\n"
+        "        'return_evidence_ready': health.get('artifact_activation_manifest', {}).get('return_evidence_ready'),\n"
+        "        'return_evidence_blockers': health.get('artifact_activation_manifest', {}).get('return_evidence_blockers'),\n"
+        "    },\n"
         "    'profit_contract': {\n"
         "        'shadow_payload': bool(profit.get('shadow_payload')),\n"
         "        'live_mutation': profit.get('live_mutation'),\n"
         "        'promotion_flow': profit.get('promotion_flow'),\n"
+        "        'production_eligible': profit.get('prediction_quality', {}).get('production_eligible'),\n"
+        "        'production_permission': profit.get('production_permission'),\n"
         "    },\n"
         "    'exit_contract': {\n"
         "        'action': exit_advice.get('action'),\n"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
@@ -15,6 +15,143 @@ from scripts.fix_local_ai_tools_service_path import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _configure_local_ai_registry(module: ModuleType, root: Path) -> None:
+    module.MODEL_DIR = root
+    module.VERSIONS_ROOT = root / "versions"
+    module.CANDIDATE_POINTER_PATH = root / "candidate.json"
+    module.CURRENT_POINTER_PATH = root / "current.json"
+    module.ROLLBACK_POINTER_PATH = root / "rollback.json"
+
+
+def _persist_test_shadow_artifact(
+    module: ModuleType,
+    root: Path,
+    **metadata_overrides: object,
+) -> dict[str, object]:
+    _configure_local_ai_registry(module, root)
+    metadata = _test_artifact_metadata(module, **metadata_overrides)
+    bundle = _test_artifact_bundle()
+    module.persist_candidate_bundle(bundle, metadata)
+    return module.activate_candidate_shadow({"test": "shadow"})
+
+
+def _test_artifact_metadata(
+    module: ModuleType,
+    **metadata_overrides: object,
+) -> dict[str, object]:
+    ready_evidence = {
+        "count": 4,
+        "avg_return_pct": 0.4,
+        "median_return_pct": 0.3,
+        "return_lcb_pct": 0.1,
+        "profit_factor": 2.0,
+        "cvar_10_pct": -0.1,
+        "max_drawdown_pct": 0.1,
+        "promotion_math_ready": True,
+    }
+    ready_loso = {
+        "version": "2026-07-15.leave-one-symbol-out.v1",
+        "evaluated_symbol_count": 2,
+        "rows": [],
+        "stable": True,
+    }
+    walk_forward_report = {
+        "version": "2026-07-15.expanding-decision-group-walk-forward.v1",
+        "status": "complete",
+        "decision_group_disjoint": True,
+        "chronological_label_disjoint": True,
+        "model_refit_per_fold": True,
+        "folds": [
+            {
+                "decision_group_overlap_count": 0,
+                "sides": {
+                    side: dict(ready_evidence) for side in ("long", "short")
+                },
+            }
+        ],
+        "sides": {
+            side: {
+                **ready_evidence,
+                "leave_one_symbol_out": dict(ready_loso),
+            }
+            for side in ("long", "short")
+        },
+    }
+    metadata: dict[str, object] = {
+        "trained_at": "2026-07-14T00:00:00+00:00",
+        "shadow_sample_count": 222,
+        "trade_sample_count": 33,
+        "profile_count": 7,
+        "artifact_persisted": True,
+        "training_data_sha256": "a" * 64,
+        "source_code_sha256": "b" * 64,
+        "objective_name": module.RETURN_OBJECTIVE_NAME,
+        "objective_version": module.RETURN_OBJECTIVE_VERSION,
+        "label_name": module.RETURN_LABEL_NAME,
+        "label_version": module.RETURN_LABEL_VERSION,
+        "cost_model_version": module.COST_MODEL_VERSION,
+        "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
+        "time_split_policy": "chronological_disjoint_decision_groups",
+        "quality_report": {
+            "market_fact_contract": {
+                "status": "clean",
+                "violation_count": 0,
+                "assertions": {
+                    "native_instrument_identity_verified": True,
+                    "same_contract_price_path_verified": True,
+                    "executable_market_fact_verified": True,
+                },
+                "provenance": {"data_fingerprint": "e" * 64},
+            }
+        },
+        "market_fact_contract": {
+            "status": "clean",
+            "violation_count": 0,
+            "assertions": {
+                "native_instrument_identity_verified": True,
+                "same_contract_price_path_verified": True,
+                "executable_market_fact_verified": True,
+            },
+            "provenance": {"data_fingerprint": "e" * 64},
+        },
+        "governance_report": {
+            "quality_fingerprint": "quality-fingerprint",
+            "artifact_quality_fingerprint": "quality-fingerprint",
+            "artifact_matches_quality": True,
+            "requires_artifact_refresh": False,
+        },
+        "walk_forward_report": walk_forward_report,
+        "leave_one_symbol_out_report": {
+            side: dict(ready_loso) for side in ("long", "short")
+        },
+        "oos_return_evaluation": {
+            side: dict(ready_evidence) for side in ("long", "short")
+        },
+        "authoritative_trade_return_evidence": {
+            "version": "2026-07-15.authoritative-trade-return-evidence.v1",
+            "data_fingerprint": "d" * 64,
+            "sides": {
+                side: dict(ready_evidence) for side in ("long", "short")
+            },
+        },
+    }
+    metadata.update(metadata_overrides)
+    metadata["evaluation_report_hashes"] = module._evaluation_report_hashes(metadata)
+    metadata["artifact_return_evidence_sha256"] = module.canonical_sha256(
+        metadata["evaluation_report_hashes"]
+    )
+    return metadata
+
+
+def _test_artifact_bundle() -> dict[str, object]:
+    return {
+        "long_return_model": "long-return",
+        "short_return_model": "short-return",
+        "long_cost_model": "long-cost",
+        "short_cost_model": "short-cost",
+    }
 
 
 def test_local_ai_tools_generated_service_requires_api_key_or_loopback() -> None:
@@ -237,9 +374,7 @@ def test_generated_service_status_does_not_advertise_heuristic_fallback(
 ) -> None:
     module = ModuleType("local_ai_tools_api_no_artifact_status_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
-    module.MODEL_DIR = tmp_path
-    module.BUNDLE_PATH = tmp_path / "missing.joblib"
-    module.METADATA_PATH = tmp_path / "missing.json"
+    _configure_local_ai_registry(module, tmp_path)
 
     status = module._model_artifact_status()
     endpoint = module.local_models_status()
@@ -296,7 +431,7 @@ def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> 
     assert "tail_loss_threshold_pct" not in module._STATUS_METADATA_KEYS
 
 
-def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -> None:
+def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch) -> None:
     module = ModuleType("local_ai_tools_api_return_contract_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
     monkeypatch.setattr(
@@ -348,28 +483,22 @@ def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -
         "separated_market_opportunity_and_execution_cost_tasks"
     )
     assert payload["profit_supervision_version"] == module.PROFIT_SUPERVISION_VERSION
-    assert payload["prediction_quality"]["production_eligible"] is True
+    assert payload["model_stage"] == "shadow"
+    assert payload["route_mode"] == "shadow_observation"
+    assert payload["production_permission"] is False
+    assert payload["promotion_ready"] is False
+    assert payload["prediction_quality"]["production_eligible"] is False
+    assert all(
+        item["production_eligible"] is False
+        and "artifact_activation_not_production_authorized" in item["blockers"]
+        for item in payload["return_distribution_inputs"].values()
+    )
 
 
 def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Path) -> None:
     module = ModuleType("local_ai_tools_api_metadata_status_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
-    module.MODEL_DIR = tmp_path
-    module.BUNDLE_PATH = tmp_path / "local_quant_models.joblib"
-    module.METADATA_PATH = tmp_path / "local_quant_models_metadata.json"
-    module.BUNDLE_PATH.write_bytes(b"not-a-joblib-bundle")
-    module.METADATA_PATH.write_text(
-        json.dumps(
-            {
-                "trained_at": "2026-06-30T08:00:00+00:00",
-                "shadow_sample_count": 222,
-                "trade_sample_count": 33,
-                "profile_count": 7,
-                "artifact_persisted": True,
-            }
-        ),
-        encoding="utf-8",
-    )
+    _persist_test_shadow_artifact(module, tmp_path)
 
     def fail_load_bundle() -> None:
         raise AssertionError("status endpoints must not deserialize model bundles")
@@ -388,13 +517,19 @@ def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Pat
     assert status["profile_count"] == 7
     assert status["metadata_loaded"] is True
     assert status["status_endpoint_uses_metadata_only"] is True
+    assert status["artifact_activation_manifest"]["activation_stage"] == "shadow"
+    assert status["artifact_activation_manifest"][
+        "production_influence_authorized"
+    ] is False
 
 
-def test_rejected_legacy_bundle_is_not_reloaded_until_file_changes(tmp_path: Path) -> None:
+def test_rejected_current_bundle_is_not_reloaded_until_pointer_changes(tmp_path: Path) -> None:
     module = ModuleType("local_ai_tools_api_rejected_bundle_cache_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
-    module.BUNDLE_PATH = tmp_path / "local_quant_models.joblib"
-    module.BUNDLE_PATH.write_bytes(b"legacy-bundle")
+    current = _persist_test_shadow_artifact(module, tmp_path)
+    module._BUNDLE_CACHE = None
+    module._CURRENT_POINTER_MTIME_NS = None
+    module._CURRENT_MODEL_MTIME_NS = None
     load_count = 0
 
     def load_legacy_bundle(_path: Path) -> dict:
@@ -407,7 +542,115 @@ def test_rejected_legacy_bundle_is_not_reloaded_until_file_changes(tmp_path: Pat
     assert module.load_bundle() is None
     assert module.load_bundle() is None
     assert load_count == 1
-    assert module._BUNDLE_MTIME == module.BUNDLE_PATH.stat().st_mtime
+    assert module._CURRENT_MODEL_MTIME_NS == current["model_path"].stat().st_mtime_ns
+
+
+def test_local_ai_candidate_activation_is_atomic_and_rollbackable(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_registry_lifecycle_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    first = _persist_test_shadow_artifact(module, tmp_path, training_data_sha256="a" * 64)
+    second_candidate = module.persist_candidate_bundle(
+        _test_artifact_bundle(),
+        _test_artifact_metadata(module, training_data_sha256="c" * 64),
+    )
+
+    assert module._resolve_artifact_pointer(
+        module.CURRENT_POINTER_PATH,
+        role="current",
+    )["version"] == first["version"]
+    assert second_candidate["version"] != first["version"]
+
+    second = module.activate_candidate_shadow({"test": "second-shadow"})
+
+    assert second["version"] == second_candidate["version"]
+    module._BUNDLE_CACHE = None
+    module._CURRENT_POINTER_MTIME_NS = None
+    module._CURRENT_MODEL_MTIME_NS = None
+    runtime_bundle = module.load_bundle()
+    assert runtime_bundle["metadata"]["artifact_lifecycle"] == "shadow"
+    assert runtime_bundle["metadata"]["model_stage"] == "shadow"
+    assert runtime_bundle["metadata"]["production_influence_authorized"] is False
+    assert runtime_bundle["metadata"]["artifact_version"] == second["version"]
+    assert module._resolve_artifact_pointer(
+        module.ROLLBACK_POINTER_PATH,
+        role="rollback",
+    )["version"] == first["version"]
+    restored = module.rollback_current_artifact()
+    assert restored["version"] == first["version"]
+    assert module._resolve_artifact_pointer(
+        module.ROLLBACK_POINTER_PATH,
+        role="rollback",
+    )["version"] == second["version"]
+
+
+def test_local_ai_registry_rejects_tampered_candidate_manifest(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_registry_tamper_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    candidate = module.persist_candidate_bundle(
+        _test_artifact_bundle(),
+        _test_artifact_metadata(module),
+    )
+    candidate["manifest_path"].write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest hash verification failed"):
+        module._resolve_artifact_pointer(
+            module.CANDIDATE_POINTER_PATH,
+            role="candidate",
+        )
+    assert not module.CURRENT_POINTER_PATH.exists()
+
+
+def test_local_ai_registry_rejects_stale_evaluation_report_hashes(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_registry_evidence_hash_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    metadata = _test_artifact_metadata(module)
+    metadata["oos_return_evaluation"]["long"]["return_lcb_pct"] = -5.0
+
+    with pytest.raises(ValueError, match="evaluation report hashes are invalid"):
+        module.persist_candidate_bundle(_test_artifact_bundle(), metadata)
+
+    assert not module.CANDIDATE_POINTER_PATH.exists()
+    assert not module.CURRENT_POINTER_PATH.exists()
+
+
+def test_local_ai_registry_rejects_live_activation_without_return_readiness(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_registry_live_evidence_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    metadata = _test_artifact_metadata(module)
+    metadata["oos_return_evaluation"]["long"]["profit_factor"] = None
+    metadata["oos_return_evaluation"]["long"]["promotion_math_ready"] = False
+    metadata["evaluation_report_hashes"] = module._evaluation_report_hashes(metadata)
+    metadata["artifact_return_evidence_sha256"] = module.canonical_sha256(
+        metadata["evaluation_report_hashes"]
+    )
+    module.persist_candidate_bundle(_test_artifact_bundle(), metadata)
+    current = module.activate_candidate_shadow({"test": "shadow"})
+    activation_path = current["version_root"] / "activation-shadow.json"
+    activation = module.read_json_object(activation_path)
+    activation.update(
+        {
+            "activation_stage": "live",
+            "production_influence_authorized": True,
+            "return_evidence_ready": True,
+        }
+    )
+    module.write_json_atomic(activation_path, activation)
+    pointer = module.read_json_object(module.CURRENT_POINTER_PATH)
+    pointer["activation_manifest_sha256"] = module.sha256_file(activation_path)
+    module.write_json_atomic(module.CURRENT_POINTER_PATH, pointer)
+
+    with pytest.raises(ValueError, match="return evidence is not ready"):
+        module._resolve_artifact_pointer(
+            module.CURRENT_POINTER_PATH,
+            role="current",
+        )
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -1352,9 +1595,12 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
     assert missing_calibration["prediction_quality"]["reason"] == (
         "actual_trade_calibration_not_ready"
     )
-    assert missing_calibration["prediction_quality"]["blockers"] == [
-        "actual_trade_calibration_not_ready"
-    ]
+    assert "actual_trade_calibration_not_ready" in missing_calibration[
+        "prediction_quality"
+    ]["blockers"]
+    assert "artifact_activation_not_production_authorized" in missing_calibration[
+        "prediction_quality"
+    ]["blockers"]
 
 
 def test_local_ai_tools_generated_exit_contract_uses_only_phase3_actions() -> None:
@@ -1387,8 +1633,11 @@ def test_local_ai_tools_generated_service_uses_trusted_model_artifact_boundary()
     )
     assert "tempfile.NamedTemporaryFile" in SERVICE_CODE
     assert "os.replace(tmp_path, target)" in SERVICE_CODE
-    assert "joblib.load(BUNDLE_PATH)" not in SERVICE_CODE
-    assert "joblib.dump(bundle, BUNDLE_PATH)" not in SERVICE_CODE
+    assert "local_quant_models.joblib" not in SERVICE_CODE
+    assert "local_quant_models_metadata.json" not in SERVICE_CODE
+    assert "def persist_candidate_bundle(" in SERVICE_CODE
+    assert "def activate_candidate_shadow(" in SERVICE_CODE
+    assert "def rollback_current_artifact(" in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
@@ -1404,7 +1653,8 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
     assert 'model_stage: str = "shadow"' in SERVICE_CODE
     assert "promotion_recommendation: dict[str, Any] = {}" in SERVICE_CODE
     assert '"training_mode": str(req.training_mode or "shadow")' in SERVICE_CODE
-    assert '"model_stage": str(req.model_stage or "shadow")' in SERVICE_CODE
+    assert '"requested_model_stage": str(req.model_stage or "shadow")' in SERVICE_CODE
+    assert '"model_stage": "candidate"' in SERVICE_CODE
     assert '"promotion_recommendation": req.promotion_recommendation or {}' in SERVICE_CODE
     assert 'PHASE3_REQUIRED_PROMOTION_FLOW = "shadow_to_canary_to_live"' in SERVICE_CODE
     assert 'evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)' in SERVICE_CODE
@@ -1448,7 +1698,10 @@ def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_ta
     assert '"training_data_sha256": training_data_sha256' in SERVICE_CODE
     assert '"source_code_sha256": source_code_sha256' in SERVICE_CODE
     assert '"time_split_policy": "chronological_disjoint_decision_groups"' in SERVICE_CODE
-    assert "write_json_atomic(METADATA_PATH, metadata)" in SERVICE_CODE
+    assert "persist_candidate_bundle(bundle, metadata)" in SERVICE_CODE
+    assert "activate_candidate_shadow(" in SERVICE_CODE
+    assert "local_quant_models.joblib" not in SERVICE_CODE
+    assert "local_quant_models_metadata.json" not in SERVICE_CODE
 
 
 def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
@@ -1462,6 +1715,16 @@ def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
         def fit(self, *_args: object, **_kwargs: object) -> DummyModel:
             return self
 
+        def predict(self, rows: list[list[float]]) -> list[float]:
+            return [0.0] * len(rows)
+
+        def predict_proba(self, rows: list[list[float]]) -> list[list[float]]:
+            return [[1.0, 0.0] for _ in rows]
+
+        @property
+        def classes_(self) -> list[int]:
+            return [0, 1]
+
     module._make_regressor = lambda _sample_count: DummyModel()
     module._make_classifier = lambda _y: DummyModel()
     module._train_sequence_model = lambda _samples: None
@@ -1471,14 +1734,13 @@ def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
         "available": False,
         "reason": "test",
     }
-    module.MODEL_DIR = tmp_path
-    module.BUNDLE_PATH = tmp_path / "local_quant_models.joblib"
-    module.METADATA_PATH = tmp_path / "local_quant_models_metadata.json"
+    _configure_local_ai_registry(module, tmp_path)
     return module
 
 
 def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
     samples: list[dict[str, object]] = []
+    first_label_at = datetime(2026, 7, 14, tzinfo=UTC)
     for index in range(count):
         samples.append(
             {
@@ -1486,6 +1748,9 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
                 "decision_id": index + 1,
                 "symbol": "BTC/USDT",
                 "horizon_minutes": 10,
+                "label_timestamp": (
+                    first_label_at + timedelta(minutes=index * 11)
+                ).isoformat(),
                 "features": {
                     "symbol": "BTC/USDT",
                     "current_price": 100.0 + index * 0.01,
@@ -1545,8 +1810,8 @@ def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
     assert result["preflight_only"] is True
     assert result["persist_artifact_requested"] is False
     assert result["confirm_phase3_rebuild"] is False
-    assert not module.BUNDLE_PATH.exists()
-    assert not module.METADATA_PATH.exists()
+    assert not module.CANDIDATE_POINTER_PATH.exists()
+    assert not module.CURRENT_POINTER_PATH.exists()
 
 
 def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
@@ -1559,6 +1824,241 @@ def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
     )
 
     assert result["horizons"] == [10]
+
+
+def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+
+    result = module.train(
+        module.TrainRequest(shadow_samples=_training_shadow_samples(count=20))
+    )
+
+    report = result["walk_forward_report"]
+    assert report["status"] == "complete"
+    assert report["model_refit_per_fold"] is True
+    assert report["decision_group_disjoint"] is True
+    assert report["chronological_label_disjoint"] is True
+    assert report["chronological"] is True
+    assert report["folds"]
+    assert all(
+        fold["decision_group_overlap_count"] == 0 for fold in report["folds"]
+    )
+    assert all(
+        fold["training_label_end"] < fold["validation_decision_start"]
+        and fold["label_timestamp_overlap_count"] == 0
+        for fold in report["folds"]
+    )
+    assert all(
+        side_report["training_tail_loss_policy"]["observation_window"]
+        == "walk_forward_training_groups_only"
+        for fold in report["folds"]
+        for side_report in fold["sides"].values()
+    )
+    assert result["evaluation_report_hashes"] == module._evaluation_report_hashes(
+        result
+    )
+    assert result["artifact_return_evidence_sha256"] == module.canonical_sha256(
+        result["evaluation_report_hashes"]
+    )
+
+
+def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    decision_start = datetime(2026, 7, 14, tzinfo=UTC)
+    samples: list[dict[str, object]] = []
+    sample_id = 0
+    for decision_index in range(30):
+        decision_at = decision_start + timedelta(minutes=decision_index * 5)
+        for horizon in (10, 60):
+            sample_id += 1
+            sample = _training_shadow_samples(count=1)[0]
+            sample.update(
+                {
+                    "id": sample_id,
+                    "decision_id": decision_index + 1,
+                    "horizon_minutes": horizon,
+                    "decision_timestamp": decision_at.isoformat(),
+                    "label_timestamp": (
+                        decision_at + timedelta(minutes=horizon)
+                    ).isoformat(),
+                    "correlation_weight": {
+                        "correlation_group": f"shadow_decision:{decision_index + 1}"
+                    },
+                }
+            )
+            samples.append(sample)
+
+    result = module.train(module.TrainRequest(shadow_samples=samples))
+    report = result["walk_forward_report"]
+
+    assert report["status"] == "complete"
+    assert report["chronological_label_disjoint"] is True
+    assert any(
+        fold["purged_training_decision_group_count"] > 0
+        for fold in report["folds"]
+    )
+    assert all(
+        fold["training_label_end"] < fold["validation_decision_start"]
+        and fold["decision_group_overlap_count"] == 0
+        for fold in report["folds"]
+    )
+
+
+def test_local_ai_training_rejects_missing_label_or_decision_identity(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    missing_label = _training_shadow_samples(count=2)
+    missing_label[0]["label_timestamp"] = None
+    missing_decision = _training_shadow_samples(count=2)
+    missing_decision[0]["id"] = 0
+    missing_decision[0]["decision_id"] = None
+    missing_decision[0]["correlation_weight"] = {}
+
+    for samples in (missing_label, missing_decision):
+        result = module.train(module.TrainRequest(shadow_samples=samples))
+        assert result["trained"] is False
+        assert result["reason"] == "chronological_training_identity_incomplete"
+
+
+def test_local_ai_walk_forward_tail_policy_ignores_future_extreme_returns(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    baseline = _training_shadow_samples(count=18)
+    for index, sample in enumerate(baseline):
+        market_task = sample["profit_supervision"]["tasks"][
+            module.MARKET_OPPORTUNITY_TASK
+        ]
+        market_task["long_gross_market_return_pct"] = -0.4 if index < 6 else 0.5
+    changed = [
+        {
+            **sample,
+            "features": dict(sample["features"]),
+            "profit_supervision": {
+                **sample["profit_supervision"],
+                "tasks": {
+                    key: dict(value)
+                    for key, value in sample["profit_supervision"]["tasks"].items()
+                },
+            },
+        }
+        for sample in baseline
+    ]
+    for sample in changed[12:]:
+        sample["profit_supervision"]["tasks"][module.MARKET_OPPORTUNITY_TASK][
+            "long_gross_market_return_pct"
+        ] = -999.0
+
+    baseline_report = module.train(
+        module.TrainRequest(shadow_samples=baseline)
+    )["walk_forward_report"]
+    changed_report = module.train(
+        module.TrainRequest(shadow_samples=changed)
+    )["walk_forward_report"]
+
+    assert (
+        baseline_report["folds"][0]["sides"]["long"][
+            "training_tail_loss_policy"
+        ]
+        == changed_report["folds"][0]["sides"]["long"][
+            "training_tail_loss_policy"
+        ]
+    )
+
+
+def test_local_ai_training_data_hash_binds_features_and_text_inputs(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    baseline = _training_shadow_samples(count=2)
+    changed_features = _training_shadow_samples(count=2)
+    changed_features[0]["features"]["returns_1"] = 9.5
+
+    baseline_hash = module.train(
+        module.TrainRequest(
+            shadow_samples=baseline,
+            text_sentiment_samples=[
+                {"id": 1, "text": "cost is controlled", "sentiment_score": 0.2}
+            ],
+        )
+    )["training_data_sha256"]
+    feature_hash = module.train(
+        module.TrainRequest(
+            shadow_samples=changed_features,
+            text_sentiment_samples=[
+                {"id": 1, "text": "cost is controlled", "sentiment_score": 0.2}
+            ],
+        )
+    )["training_data_sha256"]
+    text_hash = module.train(
+        module.TrainRequest(
+            shadow_samples=baseline,
+            text_sentiment_samples=[
+                {"id": 1, "text": "tail loss expanded", "sentiment_score": -0.2}
+            ],
+        )
+    )["training_data_sha256"]
+
+    assert feature_hash != baseline_hash
+    assert text_hash != baseline_hash
+
+
+def test_local_ai_profit_factor_is_undefined_without_loss_denominator() -> None:
+    module = ModuleType("local_ai_tools_api_profit_factor_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    evidence = module._return_evidence(
+        [
+            {
+                "decision_group": f"decision:{index}",
+                "label_timestamp": f"2026-07-14T00:0{index}:00+00:00",
+                "return_pct": value,
+            }
+            for index, value in enumerate((0.2, 0.4, 0.1))
+        ]
+    )
+
+    assert module._profit_factor([0.2, 0.4, 0.1]) is None
+    assert evidence["profit_factor"] is None
+    assert evidence["promotion_math_ready"] is False
+
+
+def test_local_ai_leave_one_symbol_out_blocks_single_symbol_profit_support() -> None:
+    module = ModuleType("local_ai_tools_api_loso_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    rows = [
+        {
+            "symbol": "ROBO/USDT",
+            "decision_group": f"robo:{index}",
+            "label_timestamp": f"2026-07-14T00:{index:02d}:00+00:00",
+            "return_pct": -0.1 if index == 0 else 2.0,
+            "score": 100.0 + index,
+        }
+        for index in range(10)
+    ] + [
+        {
+            "symbol": "BTC/USDT",
+            "decision_group": f"btc:{index}",
+            "label_timestamp": f"2026-07-14T01:{index % 60:02d}:00+00:00",
+            "return_pct": -1.0,
+            "score": float(index),
+        }
+        for index in range(90)
+    ]
+
+    report = module._leave_one_symbol_out_stability(rows)
+    robo_removed = next(
+        row for row in report["rows"] if row["excluded_symbol"] == "ROBO/USDT"
+    )
+
+    assert report["stable"] is False
+    assert robo_removed["evidence"]["promotion_math_ready"] is False
+    assert robo_removed["evidence"]["return_lcb_pct"] < 0.0
 
 
 def test_local_ai_tools_generated_service_requires_confirmed_phase3_rebuild(
@@ -1582,8 +2082,8 @@ def test_local_ai_tools_generated_service_requires_confirmed_phase3_rebuild(
     assert result["preflight_only"] is True
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is False
-    assert not module.BUNDLE_PATH.exists()
-    assert not module.METADATA_PATH.exists()
+    assert not module.CANDIDATE_POINTER_PATH.exists()
+    assert not module.CURRENT_POINTER_PATH.exists()
 
 
 def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
@@ -1591,13 +2091,17 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
 ) -> None:
     module = _local_ai_tools_training_module(tmp_path)
 
+    stored: dict[str, object] = {}
+
     def dump_bundle(bundle: dict[str, object], path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"test-bundle")
         assert bundle["metadata"]["artifact_persisted"] is True
+        stored["bundle"] = bundle
         return path
 
     module.dump_trusted_joblib_bundle = dump_bundle
+    module.load_trusted_joblib_bundle = lambda _path: stored["bundle"]
 
     result = module.train(
         module.TrainRequest(
@@ -1612,14 +2116,33 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
     assert result["preflight_only"] is False
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is True
-    metadata = json.loads(module.METADATA_PATH.read_text(encoding="utf-8"))
+    current = module._resolve_artifact_pointer(
+        module.CURRENT_POINTER_PATH,
+        role="current",
+    )
+    metadata = current["metadata"]
     assert metadata["artifact_policy_id"] == "phase3_clean_training_artifact_v1"
     assert metadata["artifact_persisted"] is True
     assert metadata["preflight_only"] is False
+    assert metadata["walk_forward_report"]["status"] == "complete"
+    assert metadata["walk_forward_report"]["model_refit_per_fold"] is True
+    assert metadata["walk_forward_report"]["decision_group_disjoint"] is True
+    assert set(metadata["leave_one_symbol_out_report"]) == {"long", "short"}
+    assert set(metadata["oos_return_evaluation"]) == {"long", "short"}
+    assert metadata["authoritative_trade_return_evidence"]["sample_count"] == 0
+    assert metadata["evaluation_report_hashes"] == module._evaluation_report_hashes(
+        metadata
+    )
+    assert current["activation_manifest"]["activation_stage"] == "shadow"
+    assert current["activation_manifest"]["production_influence_authorized"] is False
+    assert current["activation_manifest"]["return_evidence_ready"] is False
+    assert current["activation_manifest"]["return_evidence_blockers"]
+    assert not module.CANDIDATE_POINTER_PATH.exists()
 
 
 def test_local_ai_tools_generated_service_uses_quality_weights() -> None:
-    assert '"sample_weight": max(0.0, f(sample, "sample_weight", 1.0))' in SERVICE_CODE
+    assert 'sample_weight = max(0.0, f(sample, "sample_weight", 1.0))' in SERVICE_CODE
+    assert "if sample_weight <= 0.0:" in SERVICE_CODE
     assert "model__sample_weight=sample_weights" in SERVICE_CODE
     assert '"quality_report": req.quality_report or {}' in SERVICE_CODE
     assert "trainable_trade_samples = [" in SERVICE_CODE
@@ -1675,10 +2198,14 @@ def test_phase3_quant_api_remote_smoke_checks_shadow_contract() -> None:
     assert "health.get('service') == 'phase3_quant_api'" in command
     assert "health.get('root') == '/data/BB'" in command
     assert "health.get('live_mutation') is False" in command
+    assert "health.get('artifact_lifecycle') == 'shadow'" in command
+    assert "health.get('production_influence_authorized') is False" in command
     assert "profit.get('trained') is True" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command
     assert "profit.get('return_distribution_input_version')" in command
     assert "profit.get('return_distribution_inputs')" in command
+    assert "profit.get('production_permission') is False" in command
+    assert "item.get('production_eligible') is False" in command
     assert "'loss_probability' in profit" in command
 
 

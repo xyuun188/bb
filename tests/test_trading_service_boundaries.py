@@ -3644,6 +3644,9 @@ async def test_ml_signal_auto_train_quarantines_before_training(
     service._current_metadata = current_metadata  # type: ignore[method-assign]
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
     service._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    service.artifact_registry = SimpleNamespace(
+        promote_candidate=lambda _evidence: SimpleNamespace(version="candidate-v1")
+    )
     monkeypatch.setattr(trading_service, "datetime", datetime)
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
