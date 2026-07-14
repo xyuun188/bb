@@ -8,7 +8,10 @@ from services.return_objective import (
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
 )
-from services.training_data_quality import DATA_QUALITY_VERSION
+from services.training_data_quality import (
+    DATA_QUALITY_VERSION,
+    MARKET_FACT_CONTRACT_VERSION,
+)
 
 
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -60,6 +63,77 @@ def _reason(
 def _quality_totals(metadata: dict[str, Any]) -> dict[str, Any]:
     quality = _safe_dict(metadata.get("quality_report"))
     return _safe_dict(quality.get("totals"))
+
+
+def _market_fact_contract_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    contract = _safe_dict(metadata.get("market_fact_contract"))
+    blockers: list[dict[str, Any]] = []
+    if contract.get("version") != MARKET_FACT_CONTRACT_VERSION:
+        blockers.append(
+            _reason(
+                "artifact_market_fact_contract_missing_or_stale",
+                "Artifact is not bound to the required native market-fact contract.",
+                actual=contract.get("version") or "missing",
+                required=MARKET_FACT_CONTRACT_VERSION,
+            )
+        )
+        return blockers
+
+    status = str(contract.get("status") or "").strip().lower()
+    violation_count = contract.get("violation_count")
+    if status != "clean" or violation_count != 0:
+        blockers.append(
+            _reason(
+                "artifact_market_fact_contract_violated",
+                "Artifact training data contains unresolved native market-fact violations.",
+                actual={"status": status or "missing", "violation_count": violation_count},
+                required={"status": "clean", "violation_count": 0},
+            )
+        )
+
+    assertions = _safe_dict(contract.get("assertions"))
+    required_assertions = (
+        "native_instrument_identity_verified",
+        "same_contract_price_path_verified",
+        "executable_market_fact_verified",
+    )
+    failed_assertions = [name for name in required_assertions if assertions.get(name) is not True]
+    if failed_assertions:
+        blockers.append(
+            _reason(
+                "artifact_market_fact_assertions_incomplete",
+                "Artifact market-fact assertions are incomplete.",
+                actual=failed_assertions,
+                required=list(required_assertions),
+            )
+        )
+
+    provenance = _safe_dict(contract.get("provenance"))
+    required_provenance = (
+        "source",
+        "observation_window",
+        "generated_at",
+        "strategy_version",
+        "fallback_reason",
+        "data_fingerprint",
+    )
+    missing_provenance = [
+        name
+        for name in required_provenance
+        if name not in provenance or (name != "fallback_reason" and not provenance.get(name))
+    ]
+    if not any(name in provenance for name in ("sample_count", "effective_sample_size")):
+        missing_provenance.append("sample_count/effective_sample_size")
+    if missing_provenance:
+        blockers.append(
+            _reason(
+                "artifact_market_fact_provenance_incomplete",
+                "Artifact market-fact provenance is incomplete.",
+                actual=missing_provenance,
+                required=list(required_provenance) + ["sample_count/effective_sample_size"],
+            )
+        )
+    return blockers
 
 
 def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, Any]]:
@@ -199,7 +273,7 @@ def build_ml_readiness_report(
     tail_loss_policy = _safe_dict(metadata.get("tail_loss_policy"))
     tail_loss_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
 
-    global_blockers: list[dict[str, Any]] = []
+    global_blockers: list[dict[str, Any]] = _market_fact_contract_blockers(metadata)
     if objective_name != RETURN_OBJECTIVE_NAME or objective_version != RETURN_OBJECTIVE_VERSION:
         global_blockers.append(
             _reason(

@@ -16,6 +16,7 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
 DATA_QUALITY_VERSION = "2026-07-12.v1"
+MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
 PROFIT_LEARNING_VERSION = "fee-after-return-training-v3"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 MAX_WORST_SAMPLE_COUNT = 8

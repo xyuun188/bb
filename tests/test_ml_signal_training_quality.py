@@ -37,7 +37,11 @@ from services.return_objective import (
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
 )
-from services.training_data_quality import DATA_QUALITY_VERSION, quality_report
+from services.training_data_quality import (
+    DATA_QUALITY_VERSION,
+    MARKET_FACT_CONTRACT_VERSION,
+    quality_report,
+)
 
 
 def _with_return_objective(metadata: dict) -> dict:
@@ -50,6 +54,28 @@ def _with_return_objective(metadata: dict) -> dict:
         "per_sample_live_spread_fee_and_funding_complete",
     )
     metadata.setdefault("legacy_fixed_training_thresholds_enabled", False)
+    metadata.setdefault(
+        "market_fact_contract",
+        {
+            "version": MARKET_FACT_CONTRACT_VERSION,
+            "status": "clean",
+            "violation_count": 0,
+            "assertions": {
+                "native_instrument_identity_verified": True,
+                "same_contract_price_path_verified": True,
+                "executable_market_fact_verified": True,
+            },
+            "provenance": {
+                "source": "test_native_market_facts",
+                "observation_window": "test_fixture_window",
+                "sample_count": int(metadata.get("sample_count") or 1),
+                "generated_at": "2026-07-14T00:00:00+00:00",
+                "strategy_version": "test.native-market-fact.v1",
+                "fallback_reason": "",
+                "data_fingerprint": "test-market-fact-fingerprint",
+            },
+        },
+    )
     metadata.setdefault(
         "tail_loss_policy",
         {
@@ -993,6 +1019,33 @@ def test_ml_readiness_allows_low_win_rate_high_fee_after_return() -> None:
     assert readiness["state"] == "ready"
     assert readiness["allow_live_position_influence"] is True
     assert readiness["blocking_reasons"] == []
+
+
+def test_ml_readiness_blocks_artifact_without_native_market_fact_contract() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metadata.pop("market_fact_contract")
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    codes = {item["code"] for item in readiness["blocking_reasons"]}
+
+    assert readiness["state"] == "degraded"
+    assert readiness["allow_live_position_influence"] is False
+    assert "artifact_market_fact_contract_missing_or_stale" in codes
+
+
+def test_ml_readiness_blocks_artifact_with_market_fact_contract_violation() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    contract = metadata["market_fact_contract"]
+    assert isinstance(contract, dict)
+    contract["status"] = "quarantined"
+    contract["violation_count"] = 71
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    codes = {item["code"] for item in readiness["blocking_reasons"]}
+
+    assert readiness["state"] == "degraded"
+    assert readiness["allow_live_position_influence"] is False
+    assert "artifact_market_fact_contract_violated" in codes
 
 
 def test_ml_readiness_blocks_high_win_rate_negative_fee_after_return() -> None:
