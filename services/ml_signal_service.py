@@ -54,12 +54,14 @@ from services.profit_supervision import (
 )
 from services.return_objective import (
     COST_MODEL_VERSION,
+    RETURN_DISTRIBUTION_CONTRACT_VERSION,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
     return_distribution_summary,
     risk_adjusted_expected_return,
+    standardized_return_distribution,
 )
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -388,7 +390,7 @@ def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float |
 def _regression_prediction_distribution(
     model: Pipeline,
     x: pd.DataFrame,
-) -> dict[str, np.ndarray]:
+) -> dict[str, Any]:
     expected = np.asarray(model.predict(x), dtype=float)
     named_steps = getattr(model, "named_steps", {})
     getter = getattr(named_steps, "get", None)
@@ -402,6 +404,8 @@ def _regression_prediction_distribution(
             "lower_quantile": expected.copy(),
             "upper_quantile": expected.copy(),
             "std": np.zeros(len(expected), dtype=float),
+            "member_count": 0,
+            "source_authority": "regressor_point_prediction_without_members",
         }
     transformed = imputer.transform(x)
     tree_predictions = np.asarray([tree.predict(transformed) for tree in trees], dtype=float)
@@ -413,7 +417,54 @@ def _regression_prediction_distribution(
         "lower_quantile": np.median(ordered_tree_predictions[:lower_tail_count], axis=0),
         "upper_quantile": np.median(ordered_tree_predictions[-lower_tail_count:], axis=0),
         "std": np.std(tree_predictions, axis=0),
+        "member_count": len(trees),
+        "source_authority": "random_forest_tree_empirical_distribution",
     }
+
+
+def _standardized_model_return_distribution(
+    distribution: dict[str, Any],
+    index: int,
+    *,
+    side: str,
+    horizon_minutes: int,
+    tail_loss_probability: float | None,
+    tail_loss_scale_pct: float,
+) -> dict[str, Any]:
+    return standardized_return_distribution(
+        side=side,
+        horizon_minutes=horizon_minutes,
+        raw_expected_return_pct=distribution["expected"][index],
+        median_return_pct=distribution["median"][index],
+        lower_quantile_return_pct=distribution["lower_quantile"][index],
+        upper_quantile_return_pct=distribution["upper_quantile"][index],
+        dispersion_pct=distribution["std"][index],
+        tail_loss_probability=tail_loss_probability,
+        tail_loss_scale_pct=tail_loss_scale_pct,
+        distribution_member_count=distribution.get("member_count"),
+        return_semantics="gross_market_opportunity_before_execution",
+        source_authority=str(distribution.get("source_authority") or ""),
+        objective_version=RETURN_OBJECTIVE_VERSION,
+        label_version=RETURN_LABEL_VERSION,
+        cost_model_version=COST_MODEL_VERSION,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+
+
+def _actual_calibration_ready(profile: dict[str, Any]) -> bool:
+    realized = _safe_dict(profile.get("net_return_after_cost_pct"))
+    slippage = _safe_dict(profile.get("slippage_pct"))
+    required_values = (
+        realized.get("expected"),
+        realized.get("lower_hinge"),
+        slippage.get("expected"),
+        slippage.get("upper_hinge"),
+    )
+    return bool(
+        int(_safe_float(realized.get("count"), 0.0) or 0) > 0
+        and int(_safe_float(slippage.get("count"), 0.0) or 0) > 0
+        and all(math.isfinite(_safe_float(value, float("nan"))) for value in required_values)
+    )
 
 
 def _distribution_ready_at(
@@ -1779,14 +1830,6 @@ class MLSignalService:
             raw_short_expected = float(short_distribution["expected"][0])
             long_lower_quantile = float(long_distribution["lower_quantile"][0])
             short_lower_quantile = float(short_distribution["lower_quantile"][0])
-            long_market_distribution_ready = _distribution_ready_at(
-                long_distribution,
-                0,
-            )
-            short_market_distribution_ready = _distribution_ready_at(
-                short_distribution,
-                0,
-            )
             long_cost_distribution_ready = _distribution_ready_at(
                 long_cost_distribution,
                 0,
@@ -1819,23 +1862,64 @@ class MLSignalService:
                 if short_tail_model is not None
                 else None
             )
-            long_objective = risk_adjusted_expected_return(
-                expected_return_pct=raw_long_expected,
-                lower_quantile_return_pct=long_lower_quantile,
+            long_return_contract = _standardized_model_return_distribution(
+                long_distribution,
+                0,
+                side="long",
+                horizon_minutes=int(horizon),
                 tail_loss_probability=long_tail_loss_probability,
                 tail_loss_scale_pct=long_tail_scale,
             )
-            short_objective = risk_adjusted_expected_return(
-                expected_return_pct=raw_short_expected,
-                lower_quantile_return_pct=short_lower_quantile,
+            short_return_contract = _standardized_model_return_distribution(
+                short_distribution,
+                0,
+                side="short",
+                horizon_minutes=int(horizon),
                 tail_loss_probability=short_tail_loss_probability,
                 tail_loss_scale_pct=short_tail_scale,
             )
-            long_expected = long_objective["objective_net_return_pct"]
-            short_expected = short_objective["objective_net_return_pct"]
-            best_side = "long" if long_expected >= short_expected else "short"
+            long_market_distribution_ready = bool(
+                long_return_contract.get("production_eligible")
+            )
+            short_market_distribution_ready = bool(
+                short_return_contract.get("production_eligible")
+            )
+            long_objective_expected = _safe_float(
+                long_return_contract.get("objective_expected_return_pct"),
+                float("nan"),
+            )
+            short_objective_expected = _safe_float(
+                short_return_contract.get("objective_expected_return_pct"),
+                float("nan"),
+            )
+            long_rank = (
+                long_objective_expected
+                if long_market_distribution_ready
+                else float("-inf")
+            )
+            short_rank = (
+                short_objective_expected
+                if short_market_distribution_ready
+                else float("-inf")
+            )
+            if not math.isfinite(long_rank) and not math.isfinite(short_rank):
+                long_rank = raw_long_expected
+                short_rank = raw_short_expected
+            best_side = "long" if long_rank >= short_rank else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
-            best_expected = long_expected if best_side == "long" else short_expected
+            best_objective_expected = (
+                long_objective_expected
+                if best_side == "long"
+                else short_objective_expected
+            )
+            best_raw_expected = (
+                raw_long_expected if best_side == "long" else raw_short_expected
+            )
+            best_scoring_expected = (
+                best_objective_expected
+                if math.isfinite(best_objective_expected)
+                else best_raw_expected
+            )
             best_tail_loss_probability = (
                 long_tail_loss_probability
                 if best_side == "long"
@@ -1866,17 +1950,39 @@ class MLSignalService:
                     side="short",
                 ),
             }
-            profit_edge = abs(long_expected - short_expected)
+            selected_actual_calibration_ready = _actual_calibration_ready(
+                _safe_dict(actual_calibration.get(best_side))
+            )
+            selected_return_contract = (
+                long_return_contract
+                if best_side == "long"
+                else short_return_contract
+            )
+            profit_edge = abs(
+                (
+                    long_objective_expected
+                    if math.isfinite(long_objective_expected)
+                    else raw_long_expected
+                )
+                - (
+                    short_objective_expected
+                    if math.isfinite(short_objective_expected)
+                    else raw_short_expected
+                )
+            )
             profit_quality = _profit_quality_score(
-                best_expected,
+                best_scoring_expected,
                 best_lower_quantile,
                 profit_edge,
                 float(best_tail_loss_probability or 0.0),
                 long_tail_scale if best_side == "long" else short_tail_scale,
             )
             side_influence = _safe_dict(influence.get(best_side))
-            downside = max(-best_expected, 0.0) + max(-best_lower_quantile, 0.0)
-            return_scale = abs(best_expected) + abs(best_lower_quantile)
+            downside = max(-best_scoring_expected, 0.0) + max(
+                -best_lower_quantile,
+                0.0,
+            )
+            return_scale = abs(best_scoring_expected) + abs(best_lower_quantile)
             risk_score = _clamp(
                 downside / max(return_scale, 1e-9)
                 + float(best_tail_loss_probability or 0.0)
@@ -1886,34 +1992,14 @@ class MLSignalService:
                     "horizon_minutes": int(horizon),
                     "long_win_rate": round(long_win_rate, 4),
                     "short_win_rate": round(short_win_rate, 4),
-                    "long_tail_loss_probability": (
-                        None
-                        if long_tail_loss_probability is None
-                        else round(long_tail_loss_probability, 4)
+                    "return_distribution_contract_version": (
+                        RETURN_DISTRIBUTION_CONTRACT_VERSION
                     ),
-                    "short_tail_loss_probability": (
-                        None
-                        if short_tail_loss_probability is None
-                        else round(short_tail_loss_probability, 4)
-                    ),
-                    "tail_loss_threshold_pct": round(
-                        long_tail_scale if best_side == "long" else short_tail_scale,
-                        4,
-                    ),
-                    "long_raw_expected_return_pct": round(raw_long_expected, 4),
-                    "short_raw_expected_return_pct": round(raw_short_expected, 4),
-                    "long_market_expected_return_pct": round(raw_long_expected, 4),
-                    "short_market_expected_return_pct": round(raw_short_expected, 4),
-                    "long_market_lower_hinge_return_pct": round(
-                        long_lower_quantile,
-                        4,
-                    ),
-                    "short_market_lower_hinge_return_pct": round(
-                        short_lower_quantile,
-                        4,
-                    ),
-                    "long_market_distribution_ready": long_market_distribution_ready,
-                    "short_market_distribution_ready": short_market_distribution_ready,
+                    "return_distribution_contract": {
+                        "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+                        "long": long_return_contract,
+                        "short": short_return_contract,
+                    },
                     "counterfactual_execution_cost_distribution": {
                         "long": {
                             "expected_pct": round(
@@ -1950,50 +2036,8 @@ class MLSignalService:
                     "actual_trade_calibration": actual_calibration,
                     "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
                     "return_semantics": "gross_market_opportunity_before_execution",
-                    "long_lower_quantile_return_pct": round(long_lower_quantile, 4),
-                    "short_lower_quantile_return_pct": round(short_lower_quantile, 4),
-                    "long_uncertainty_penalty_pct": round(
-                        long_objective["uncertainty_penalty_pct"], 4
-                    ),
-                    "short_uncertainty_penalty_pct": round(
-                        short_objective["uncertainty_penalty_pct"], 4
-                    ),
-                    "long_tail_loss_penalty_pct": round(
-                        long_objective["tail_loss_penalty_pct"], 4
-                    ),
-                    "short_tail_loss_penalty_pct": round(
-                        short_objective["tail_loss_penalty_pct"], 4
-                    ),
-                    "long_expected_return_pct": round(raw_long_expected, 4),
-                    "short_expected_return_pct": round(raw_short_expected, 4),
-                    "long_risk_adjusted_market_opportunity_pct": round(
-                        long_expected,
-                        4,
-                    ),
-                    "short_risk_adjusted_market_opportunity_pct": round(
-                        short_expected,
-                        4,
-                    ),
                     "best_side": best_side,
                     "best_win_rate": round(best_win, 4),
-                    "best_tail_loss_probability": (
-                        None
-                        if best_tail_loss_probability is None
-                        else round(best_tail_loss_probability, 4)
-                    ),
-                    "best_expected_return_pct": round(
-                        raw_long_expected if best_side == "long" else raw_short_expected,
-                        4,
-                    ),
-                    "best_market_expected_return_pct": round(
-                        raw_long_expected if best_side == "long" else raw_short_expected,
-                        4,
-                    ),
-                    "best_risk_adjusted_market_opportunity_pct": round(
-                        best_expected,
-                        4,
-                    ),
-                    "best_expected_realized_net_return_pct": None,
                     "profit_edge_pct": round(profit_edge, 4),
                     "profit_quality_score": round(profit_quality, 4),
                     "profit_signal": bool(
@@ -2001,7 +2045,8 @@ class MLSignalService:
                         and side_influence.get("enabled")
                         and selected_market_distribution_ready
                         and selected_cost_distribution_ready
-                        and best_expected > 0.0
+                        and selected_actual_calibration_ready
+                        and best_objective_expected > 0.0
                         and best_lower_quantile > 0.0
                         and profit_edge > 0.0
                     ),
@@ -2011,6 +2056,13 @@ class MLSignalService:
                         and side_influence.get("enabled")
                         and selected_market_distribution_ready
                         and selected_cost_distribution_ready
+                        and selected_actual_calibration_ready
+                    ),
+                    "selected_return_distribution_blockers": list(
+                        selected_return_contract.get("blockers") or []
+                    ),
+                    "actual_trade_calibration_ready": (
+                        selected_actual_calibration_ready
                     ),
                 }
             )
@@ -2022,11 +2074,19 @@ class MLSignalService:
                 primary_side
             )
         )
+        primary_return_distribution = _safe_dict(
+            _safe_dict(primary.get("return_distribution_contract")).get(
+                primary_side
+            )
+        )
         current_prediction_ready = bool(
             primary
             and primary_side in {"long", "short"}
-            and primary.get(f"{primary_side}_market_distribution_ready") is True
+            and primary_return_distribution.get("version")
+            == RETURN_DISTRIBUTION_CONTRACT_VERSION
+            and primary_return_distribution.get("production_eligible") is True
             and primary_cost_distribution.get("distribution_ready") is True
+            and primary.get("actual_trade_calibration_ready") is True
         )
         live_prediction_influence = bool(
             allow_live_position_influence and current_prediction_ready
@@ -2044,16 +2104,32 @@ class MLSignalService:
             "label_version": metadata.get("label_version"),
             "training_cost_policy": metadata.get("training_cost_policy"),
             "artifact_persisted": metadata.get("artifact_persisted") is True,
+            "return_distribution_contract_version": (
+                RETURN_DISTRIBUTION_CONTRACT_VERSION
+            ),
             "prediction_quality": {
                 "production_eligible": live_prediction_influence,
                 "anomalous": not live_prediction_influence,
                 "reason": (
                     "separated_market_cost_and_actual_calibration_ready"
                     if live_prediction_influence
-                    else "current_prediction_distribution_degenerate"
+                    else "current_prediction_contract_incomplete"
                     if allow_live_position_influence
                     else "ml_readiness_blocks_live_influence"
                 ),
+                "blockers": [
+                    *list(primary_return_distribution.get("blockers") or []),
+                    *(
+                        []
+                        if primary_cost_distribution.get("distribution_ready") is True
+                        else ["counterfactual_execution_cost_distribution_incomplete"]
+                    ),
+                    *(
+                        []
+                        if primary.get("actual_trade_calibration_ready") is True
+                        else ["authoritative_actual_trade_calibration_incomplete"]
+                    ),
+                ],
             },
             "status": (
                 "entry_profit_filter"
@@ -2084,11 +2160,11 @@ class MLSignalService:
             "primary_horizon_minutes": primary.get("horizon_minutes"),
             "long_win_rate": primary.get("long_win_rate"),
             "short_win_rate": primary.get("short_win_rate"),
-            "expected_return_pct": primary.get("best_expected_return_pct"),
-            "market_expected_return_pct": primary.get("best_market_expected_return_pct"),
-            "expected_realized_net_return_pct": None,
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
             "return_semantics": "gross_market_opportunity_before_execution",
+            "return_distribution_contract": primary.get(
+                "return_distribution_contract"
+            ),
             "profit_edge_pct": primary.get("profit_edge_pct"),
             "profit_quality_score": primary.get("profit_quality_score"),
             "profit_signal": primary.get("profit_signal"),
@@ -2273,12 +2349,23 @@ class MLSignalService:
             if influence.get("advisory_enabled"):
                 return "ML 样本成熟度不足但排序有效，当前仅按小权重辅助收益解释。"
             return "ML 当前评估未达标，自动降级为学习观察；继续训练，暂不介入交易决策。"
-        expected = float(primary.get("best_expected_return_pct") or 0.0)
-        edge = float(primary.get("profit_edge_pct") or 0.0)
-        lower_quantile = float(
-            primary.get(f"{primary.get('best_side')}_lower_quantile_return_pct") or 0.0
+        side_key = str(primary.get("best_side") or "")
+        distribution = _safe_dict(
+            _safe_dict(primary.get("return_distribution_contract")).get(side_key)
         )
-        tail_probability = float(primary.get("best_tail_loss_probability") or 0.0)
+        expected = _safe_float(
+            distribution.get("objective_expected_return_pct"),
+            0.0,
+        )
+        edge = float(primary.get("profit_edge_pct") or 0.0)
+        lower_quantile = _safe_float(
+            distribution.get("lower_quantile_return_pct"),
+            0.0,
+        )
+        tail_probability = _safe_float(
+            distribution.get("tail_loss_probability"),
+            0.0,
+        )
         side = "做多" if primary.get("best_side") == "long" else "做空"
         if expected > 0.0 and edge > 0.0 and lower_quantile > 0.0:
             return f"ML 费后收益分布支持{side}，可作为开仓收益质量证据。"

@@ -154,7 +154,7 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
                 "truncated": False,
                 "data": {
                     "available": False,
-                    "message": "No trained local quant bundle found; heuristic fallback is active.",
+                    "message": "No trained local quant bundle found; return inference is unavailable.",
                     "shadow_sample_count": 0,
                     "completed_shadow_sample_count": 0,
                 },
@@ -193,7 +193,7 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
     assert tools["endpoint"] == "127.0.0.1:8101"
     assert tools["service_role"] == "phase3_quant_api"
     assert tools["model_bundle_available"] is False
-    assert tools["status"] == "heuristic_fallback_available"
+    assert tools["status"] == "artifact_unavailable"
     assert cast(dict[str, object], tools["status_health"])["status_code"] == 200
     assert cast(dict[str, object], tools["health"])["ok"] is True
 

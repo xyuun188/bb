@@ -19,7 +19,6 @@ from core.safe_output import safe_error_text, safe_response_error_text
 from core.url_safety import normalize_http_base_url
 from services.entry_signal_extraction import (
     enrich_signal_payload,
-    expected_return_pct,
     payload_side,
     unwrap_tool_payload,
 )
@@ -27,6 +26,13 @@ from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
     load_latest_paper_observation_report,
+)
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.return_objective import (
+    RETURN_DISTRIBUTION_CONTRACT_VERSION,
+    RETURN_DISTRIBUTION_INPUT_VERSION,
+    standardized_return_distribution,
+    validate_return_distribution_contract,
 )
 
 logger = structlog.get_logger(__name__)
@@ -195,56 +201,9 @@ class LocalAIToolsClient:
             return {"value": item}
         normalized = enrich_signal_payload(name, unwrap_tool_payload(item) or dict(item))
         if name == "profit_prediction":
-            side = payload_side(normalized)
-            if side not in {"long", "short"}:
-                long_expected = self._to_float(
-                    normalized.get(
-                        "long_market_expected_return_pct",
-                        normalized.get(
-                            "long_expected_return_pct",
-                            normalized.get("expected_long_return_pct"),
-                        ),
-                    ),
-                    0.0,
-                )
-                short_expected = self._to_float(
-                    normalized.get(
-                        "short_market_expected_return_pct",
-                        normalized.get(
-                            "short_expected_return_pct",
-                            normalized.get("expected_short_return_pct"),
-                        ),
-                    ),
-                    0.0,
-                )
-                side = "long" if long_expected >= short_expected else "short"
-            if side in {"long", "short"}:
-                normalized["best_side"] = side
-                normalized["side"] = side
-            if "expected_return_pct" not in normalized:
-                normalized["expected_return_pct"] = expected_return_pct(normalized, side)
-            if "profit_edge_pct" not in normalized:
-                long_value = expected_return_pct(normalized, "long")
-                short_value = expected_return_pct(normalized, "short")
-                normalized["profit_edge_pct"] = round(abs(long_value - short_value), 6)
+            normalized = self._attach_return_distribution_contract(normalized)
         elif name == "time_series_prediction":
-            side = str(normalized.get("best_side") or normalized.get("side") or "").lower()
-            direction = str(
-                normalized.get("direction")
-                or normalized.get("forecast_direction")
-                or normalized.get("trend")
-                or ""
-            ).lower()
-            if side not in {"long", "short"}:
-                if direction == "up":
-                    side = "long"
-                elif direction == "down":
-                    side = "short"
-            if side in {"long", "short"}:
-                normalized["best_side"] = side
-                normalized["side"] = side
-            if "expected_return_pct" not in normalized and "expected_move_pct" in normalized:
-                normalized["expected_return_pct"] = normalized.get("expected_move_pct")
+            normalized = self._attach_return_distribution_contract(normalized)
         elif name == "sentiment_analysis":
             side = str(normalized.get("best_side") or normalized.get("side") or "").lower()
             label = str(normalized.get("label") or normalized.get("sentiment") or "").lower()
@@ -257,13 +216,6 @@ class LocalAIToolsClient:
             if side in {"long", "short"}:
                 normalized["best_side"] = side
                 normalized["side"] = side
-            if (
-                "expected_return_pct" not in normalized
-                and "expected_return_from_sentiment_pct" in normalized
-            ):
-                normalized["expected_return_pct"] = normalized.get(
-                    "expected_return_from_sentiment_pct"
-                )
         elif name == "exit_advice":
             reported_action = str(
                 normalized.get("action") or normalized.get("recommendation") or "hold"
@@ -275,6 +227,156 @@ class LocalAIToolsClient:
             normalized["production_permission"] = False
             normalized["live_mutation"] = False
         return self._attach_model_metadata(name, normalized)
+
+    def _attach_return_distribution_contract(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(payload)
+        input_version = str(normalized.get("return_distribution_input_version") or "")
+        raw_inputs = normalized.get("return_distribution_inputs")
+        inputs = raw_inputs if isinstance(raw_inputs, dict) else {}
+        contracts: dict[str, dict[str, Any]] = {}
+        boundary_blockers: list[str] = []
+        if input_version != RETURN_DISTRIBUTION_INPUT_VERSION:
+            boundary_blockers.append("return_distribution_input_version_mismatch")
+        for side in ("long", "short"):
+            item = inputs.get(side)
+            distribution_input = item if isinstance(item, dict) else {}
+            if not distribution_input:
+                boundary_blockers.append(f"{side}_return_distribution_input_missing")
+                continue
+            contract = standardized_return_distribution(
+                side=side,
+                horizon_minutes=distribution_input.get("horizon_minutes"),
+                raw_expected_return_pct=distribution_input.get(
+                    "raw_expected_return_pct"
+                ),
+                median_return_pct=distribution_input.get("median_return_pct"),
+                lower_quantile_return_pct=distribution_input.get(
+                    "lower_quantile_return_pct"
+                ),
+                upper_quantile_return_pct=distribution_input.get(
+                    "upper_quantile_return_pct"
+                ),
+                dispersion_pct=distribution_input.get("dispersion_pct"),
+                tail_loss_probability=distribution_input.get(
+                    "tail_loss_probability"
+                ),
+                tail_loss_scale_pct=distribution_input.get("tail_loss_scale_pct"),
+                distribution_member_count=distribution_input.get(
+                    "distribution_member_count"
+                ),
+                return_semantics=str(
+                    distribution_input.get("return_semantics") or ""
+                ),
+                source_authority=str(
+                    distribution_input.get("source_authority") or ""
+                ),
+                objective_version=str(
+                    distribution_input.get("objective_version") or ""
+                ),
+                label_version=str(distribution_input.get("label_version") or ""),
+                cost_model_version=str(
+                    distribution_input.get("cost_model_version") or ""
+                ),
+                profit_supervision_version=str(
+                    distribution_input.get("profit_supervision_version") or ""
+                ),
+            )
+            if input_version != RETURN_DISTRIBUTION_INPUT_VERSION:
+                contract["blockers"] = list(
+                    dict.fromkeys(
+                        [
+                            *(contract.get("blockers") or []),
+                            "return_distribution_input_version_mismatch",
+                        ]
+                    )
+                )
+                contract["production_eligible"] = False
+            contracts[side] = contract
+
+        normalized["return_distribution_contract_version"] = (
+            RETURN_DISTRIBUTION_CONTRACT_VERSION
+        )
+        normalized["return_distribution_contract"] = {
+            "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+            **contracts,
+        }
+        validations = {
+            side: validate_return_distribution_contract(
+                contract,
+                side=side,
+                return_semantics="gross_market_opportunity_before_execution",
+                profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+            )
+            for side, contract in contracts.items()
+        }
+        ready_sides = [
+            side
+            for side, validation in validations.items()
+            if validation.get("eligible") is True
+        ]
+        reported_side = payload_side(normalized)
+        selected_side = reported_side if reported_side in ready_sides else ""
+        if not selected_side and ready_sides:
+            selected_side = max(
+                ready_sides,
+                key=lambda side: self._to_float(
+                    contracts[side].get("objective_expected_return_pct"),
+                    float("-inf"),
+                ),
+            )
+        if selected_side:
+            normalized["best_side"] = selected_side
+            normalized["side"] = selected_side
+            normalized["raw_expected_return_pct"] = contracts[selected_side].get(
+                "raw_expected_return_pct"
+            )
+            normalized["objective_expected_return_pct"] = contracts[
+                selected_side
+            ].get("objective_expected_return_pct")
+
+        quality = normalized.get("prediction_quality")
+        quality = dict(quality) if isinstance(quality, dict) else {}
+        remote_ready = bool(
+            quality.get("production_eligible") is True
+            and quality.get("anomalous") is not True
+        )
+        contract_ready = len(ready_sides) == 2
+        remote_blockers = quality.get("blockers")
+        remote_blockers = remote_blockers if isinstance(remote_blockers, list) else []
+        all_blockers = [
+            *boundary_blockers,
+            *remote_blockers,
+        ]
+        for validation in validations.values():
+            all_blockers.extend(validation.get("blockers") or [])
+        all_blockers = list(dict.fromkeys(str(item) for item in all_blockers if item))
+        production_eligible = bool(remote_ready and contract_ready and not all_blockers)
+        normalized["prediction_quality"] = {
+            **quality,
+            "production_eligible": production_eligible,
+            "anomalous": not production_eligible,
+            "reason": (
+                "standardized_return_distribution_ready"
+                if production_eligible
+                else all_blockers[0]
+                if all_blockers
+                else str(quality.get("reason") or "remote_prediction_quality_blocked")
+            ),
+            "blockers": all_blockers,
+        }
+        predictions = normalized.get("predictions")
+        if isinstance(predictions, list):
+            normalized["predictions"] = [
+                self._attach_return_distribution_contract(item)
+                if isinstance(item, dict)
+                and item.get("return_distribution_inputs")
+                else item
+                for item in predictions
+            ]
+        return normalized
 
     def _attach_model_metadata(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         defaults = {
@@ -381,8 +483,7 @@ class LocalAIToolsClient:
         status["health"] = health
         status["child_endpoints"] = child_endpoints
         # Phase 3 separates service reachability from persisted model-bundle readiness.
-        # A reachable quant API with no persisted bundle is still connected and may run
-        # shadow/heuristic endpoints; promotion gates decide whether artifacts can be used.
+        # Reachability and persisted artifact readiness are separate states.
         status["available"] = bool(service_available)
         status.setdefault("api_base", self._public_api_base())
         if status_error:
@@ -415,6 +516,9 @@ class LocalAIToolsClient:
             "live_mutation",
             "live_trading_mutation",
             "artifact_persisted",
+            "training_data_sha256",
+            "source_code_sha256",
+            "return_distribution_input_version",
             "evaluation_policy",
             "promotion_recommendation",
             "governance_report",
@@ -434,7 +538,7 @@ class LocalAIToolsClient:
                 "message",
                 "Local AI tools service is available; trained bundle is not ready yet.",
             )
-            status["status"] = "heuristic_fallback_available"
+            status["status"] = "artifact_unavailable"
         if service_available and not enabled_for_trading:
             status.setdefault(
                 "message",

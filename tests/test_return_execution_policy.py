@@ -8,6 +8,35 @@ from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
 )
 from services.return_execution_policy import apply_production_entry_policy
+from services.return_objective import (
+    COST_MODEL_VERSION,
+    standardized_return_distribution,
+)
+
+
+def _return_distribution(
+    *,
+    side: str = "long",
+    expected: float = 0.8,
+    lower: float = 0.7,
+    semantics: str = "gross_market_opportunity_before_execution",
+) -> dict:
+    return standardized_return_distribution(
+        side=side,
+        horizon_minutes=30,
+        raw_expected_return_pct=expected,
+        median_return_pct=expected,
+        lower_quantile_return_pct=lower,
+        upper_quantile_return_pct=expected + 0.2,
+        dispersion_pct=expected - lower,
+        tail_loss_probability=0.1,
+        tail_loss_scale_pct=0.0,
+        distribution_member_count=32,
+        return_semantics=semantics,
+        source_authority="test_tree_empirical_distribution",
+        cost_model_version=COST_MODEL_VERSION,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
 
 
 def _decision() -> DecisionOutput:
@@ -31,6 +60,7 @@ def _decision() -> DecisionOutput:
         take_profit_pct=0.08,
         raw_response={
             "opportunity_score": {
+                "side": "long",
                 "production_eligible": True,
                 "policy_provenance": provenance,
                 "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
@@ -41,6 +71,11 @@ def _decision() -> DecisionOutput:
                 "return_lcb_pct": 0.7,
                 "return_uncertainty_pct": 0.1,
                 "expected_loss_pct": 0.1,
+                "return_distribution_contract": _return_distribution(
+                    semantics=(
+                        "realized_net_return_after_live_cost_and_authoritative_slippage"
+                    )
+                ),
                 "execution_cost": {
                     "total_pct": 0.05,
                     "spread_source": "bid_ask",
@@ -59,6 +94,10 @@ def _decision() -> DecisionOutput:
                             "included_in_return_distribution": True,
                             "production_weight": 0.5,
                             "raw_market_return_pct": 1.2,
+                            "return_distribution_contract": _return_distribution(
+                                expected=1.2,
+                                lower=1.1,
+                            ),
                         },
                         {
                             "key": "timeseries",
@@ -66,6 +105,10 @@ def _decision() -> DecisionOutput:
                             "included_in_return_distribution": True,
                             "production_weight": 0.5,
                             "raw_market_return_pct": 1.1,
+                            "return_distribution_contract": _return_distribution(
+                                expected=1.1,
+                                lower=1.0,
+                            ),
                         },
                     ]
                 },

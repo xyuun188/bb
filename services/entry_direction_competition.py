@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from services.entry_signal_extraction import (
-    directional_expected_return_pct,
     first_tool_payload,
     signal_available,
     signal_production_eligibility,
+    signal_return_distribution,
+    signal_return_distribution_eligibility,
 )
 
 
@@ -29,18 +30,75 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
 
 
 def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
-    eligible = [
-        float(item["expected_return_pct"])
+    eligible_objective = [
+        float(item["objective_expected_return_pct"])
         for item in values
         if item.get("production_eligible") is True
-        and _safe_float(item.get("expected_return_pct")) is not None
+        and _safe_float(item.get("objective_expected_return_pct")) is not None
+    ]
+    eligible_raw = [
+        float(item["raw_expected_return_pct"])
+        for item in values
+        if item.get("production_eligible") is True
+        and _safe_float(item.get("raw_expected_return_pct")) is not None
     ]
     return {
-        "score": sum(eligible) / len(eligible) if eligible else 0.0,
-        "expected_return_pct": sum(eligible) / len(eligible) if eligible else 0.0,
-        "production_source_count": len(eligible),
+        "score": (
+            sum(eligible_objective) / len(eligible_objective)
+            if eligible_objective
+            else 0.0
+        ),
+        "raw_expected_return_pct": (
+            sum(eligible_raw) / len(eligible_raw) if eligible_raw else None
+        ),
+        "objective_expected_return_pct": (
+            sum(eligible_objective) / len(eligible_objective)
+            if eligible_objective
+            else None
+        ),
+        "production_source_count": len(eligible_objective),
         "evidence": values,
     }
+
+
+def _enforce_aggregate_contract_consistency(
+    evidence: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    eligible = [
+        item
+        for side in ("long", "short")
+        for item in evidence[side]
+        if item.get("production_eligible") is True
+    ]
+    signatures = {
+        (
+            item.get("objective_version"),
+            item.get("label_version"),
+            item.get("cost_model_version"),
+            item.get("profit_supervision_version"),
+            item.get("horizon_minutes"),
+        )
+        for item in eligible
+    }
+    if len(signatures) <= 1:
+        return []
+    fields = (
+        "objective_version",
+        "label_version",
+        "cost_model_version",
+        "profit_supervision_version",
+        "horizon_minutes",
+    )
+    blockers = [
+        f"direction_competition_{field}_mismatch"
+        for index, field in enumerate(fields)
+        if len({signature[index] for signature in signatures}) > 1
+    ]
+    for item in eligible:
+        item["production_eligible"] = False
+        item["observation_only"] = True
+        item["eligibility_reason"] = blockers[0]
+    return blockers
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +139,7 @@ class EntryDirectionCompetitionPolicy:
                 "time_series",
             ),
         )
+        aggregate_blockers = _enforce_aggregate_contract_consistency(evidence)
         long_side = _side_summary(evidence["long"])
         short_side = _side_summary(evidence["short"])
         long_score = float(long_side["score"])
@@ -104,6 +163,7 @@ class EntryDirectionCompetitionPolicy:
             "production_source_count": source_count,
             "production_permission": False,
             "policy": "governed_gross_market_observation_only_no_fixed_gap",
+            "aggregate_blockers": aggregate_blockers,
             "policy_provenance": {
                 "source": "live_influence_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
@@ -125,11 +185,15 @@ class EntryDirectionCompetitionPolicy:
         eligibility = signal_production_eligibility(signal)
         for side in ("long", "short"):
             side_policy = _safe_dict(influence.get(side))
-            value = _safe_float(primary.get(f"{side}_market_expected_return_pct"))
+            distribution_eligibility = signal_return_distribution_eligibility(
+                signal,
+                side,
+            )
+            contract = signal_return_distribution(signal, side)
             eligible = bool(
                 eligibility.get("eligible") is True
                 and side_policy.get("enabled") is True
-                and value is not None
+                and distribution_eligibility.get("eligible") is True
             )
             evidence[side].append(
                 {
@@ -137,6 +201,7 @@ class EntryDirectionCompetitionPolicy:
                     "side": side,
                     "available": bool(primary),
                     "production_eligible": eligible,
+                    "observation_only": bool(contract and not eligible),
                     "eligibility_reason": (
                         "live_influence_and_side_readiness_confirmed"
                         if eligible
@@ -145,7 +210,20 @@ class EntryDirectionCompetitionPolicy:
                             or "local_ml_production_governance_incomplete"
                         )
                     ),
-                    "expected_return_pct": value,
+                    "raw_expected_return_pct": contract.get(
+                        "raw_expected_return_pct"
+                    ),
+                    "objective_expected_return_pct": contract.get(
+                        "objective_expected_return_pct"
+                    ),
+                    "horizon_minutes": contract.get("horizon_minutes"),
+                    "objective_version": contract.get("objective_version"),
+                    "label_version": contract.get("label_version"),
+                    "cost_model_version": contract.get("cost_model_version"),
+                    "profit_supervision_version": contract.get(
+                        "profit_supervision_version"
+                    ),
+                    "return_distribution_contract": contract,
                 }
             )
 
@@ -161,16 +239,37 @@ class EntryDirectionCompetitionPolicy:
         payload = first_tool_payload({"local_ai_tools": tools}, *aliases)
         eligibility = signal_production_eligibility(payload)
         for side in ("long", "short"):
-            value = _safe_float(directional_expected_return_pct(payload, side))
-            eligible = bool(eligibility.get("eligible") and value is not None)
+            distribution_eligibility = signal_return_distribution_eligibility(
+                payload,
+                side,
+            )
+            contract = signal_return_distribution(payload, side)
+            eligible = bool(
+                eligibility.get("eligible") is True
+                and distribution_eligibility.get("eligible") is True
+            )
             evidence[side].append(
                 {
                     "source": key,
                     "side": side,
                     "available": signal_available(payload),
                     "production_eligible": eligible,
+                    "observation_only": bool(contract and not eligible),
                     "eligibility_reason": eligibility.get("reason"),
-                    "expected_return_pct": value,
+                    "raw_expected_return_pct": contract.get(
+                        "raw_expected_return_pct"
+                    ),
+                    "objective_expected_return_pct": contract.get(
+                        "objective_expected_return_pct"
+                    ),
+                    "horizon_minutes": contract.get("horizon_minutes"),
+                    "objective_version": contract.get("objective_version"),
+                    "label_version": contract.get("label_version"),
+                    "cost_model_version": contract.get("cost_model_version"),
+                    "profit_supervision_version": contract.get(
+                        "profit_supervision_version"
+                    ),
+                    "return_distribution_contract": contract,
                     "route_mode": payload.get("route_mode"),
                     "model": payload.get("primary_model") or payload.get("model"),
                 }

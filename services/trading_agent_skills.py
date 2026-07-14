@@ -14,13 +14,10 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 from services.entry_signal_extraction import (
-    expected_return_pct as signal_expected_return_pct,
-)
-from services.entry_signal_extraction import (
     first_tool_payload,
-    has_signal_evidence,
     payload_side,
     signal_production_eligible,
+    signal_return_distribution,
 )
 
 
@@ -239,24 +236,27 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到本地 ML 盈亏质量预测。",
             )
-        ready = bool(signal.get("ready") or signal.get("available"))
-        side = str(
-            signal.get("best_side") or signal.get("side") or signal.get("direction") or ""
-        ).lower()
-        expected = self._first_number(
-            signal, "expected_return_pct", "expected_pct", "profit_edge_pct"
+        predictions = signal.get("predictions")
+        first = (
+            predictions[0]
+            if isinstance(predictions, list)
+            and predictions
+            and isinstance(predictions[0], dict)
+            else {}
         )
-        if side not in {"long", "short"} or expected is None:
-            predictions = signal.get("predictions")
-            if isinstance(predictions, list) and predictions:
-                first = predictions[0] if isinstance(predictions[0], dict) else {}
-                if side not in {"long", "short"}:
-                    side = str(first.get("best_side") or first.get("side") or "").lower()
-                if expected is None:
-                    expected = self._first_number(
-                        first, "best_expected_return_pct", "expected_return_pct", "profit_edge_pct"
-                    )
-        decision = side if side in {"long", "short"} else "neutral"
+        side = str(
+            first.get("best_side")
+            or signal.get("best_side")
+            or signal.get("side")
+            or ""
+        ).lower()
+        distribution = signal_return_distribution(signal, side)
+        expected = self._first_number(
+            distribution,
+            "objective_expected_return_pct",
+        )
+        ready = signal_production_eligible(signal)
+        decision = side if ready and side in {"long", "short"} else "neutral"
         if not ready:
             status = "learning"
             reason = "本地 ML 仍在学习或样本不足，只作为观察证据。"
@@ -280,7 +280,9 @@ class TradingAgentSkillBook:
                     "available",
                     "best_side",
                     "side",
-                    "expected_return_pct",
+                    "raw_expected_return_pct",
+                    "objective_expected_return_pct",
+                    "return_distribution_contract",
                     "profit_edge_pct",
                     "loss_probability",
                     "confidence",
@@ -308,11 +310,11 @@ class TradingAgentSkillBook:
             )
         available = signal_production_eligible(profit)
         side = payload_side(profit)
+        distribution = signal_return_distribution(profit, side)
         expected = self._first_number(
-            profit, "expected_return_pct", "expected_net_return_pct", "profit_edge_pct"
+            distribution,
+            "objective_expected_return_pct",
         )
-        if expected is None and has_signal_evidence(profit):
-            expected = signal_expected_return_pct(profit, side)
         status = (
             "supported"
             if available and expected is not None and expected > 0
@@ -344,8 +346,9 @@ class TradingAgentSkillBook:
                     "endpoint",
                     "best_side",
                     "side",
-                    "expected_return_pct",
-                    "expected_net_return_pct",
+                    "raw_expected_return_pct",
+                    "objective_expected_return_pct",
+                    "return_distribution_contract",
                     "profit_edge_pct",
                     "loss_probability",
                     "confidence",
@@ -373,9 +376,11 @@ class TradingAgentSkillBook:
             )
         available = signal_production_eligible(series)
         side = payload_side(series)
-        expected = self._first_number(series, "expected_return_pct", "expected_move_pct")
-        if expected is None and has_signal_evidence(series):
-            expected = signal_expected_return_pct(series, side)
+        distribution = signal_return_distribution(series, side)
+        expected = self._first_number(
+            distribution,
+            "objective_expected_return_pct",
+        )
         return SkillResult(
             name="time_series_model",
             label="时序预测",
@@ -406,8 +411,9 @@ class TradingAgentSkillBook:
                     "best_side",
                     "side",
                     "direction",
-                    "expected_return_pct",
-                    "expected_move_pct",
+                    "raw_expected_return_pct",
+                    "objective_expected_return_pct",
+                    "return_distribution_contract",
                     "confidence",
                 ],
             ),

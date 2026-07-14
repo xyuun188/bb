@@ -9,6 +9,35 @@ import pytest
 from config.settings import settings
 from data_feed.feature_vector import FeatureVector
 from services.local_ai_tools_client import LocalAIToolsClient
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.return_objective import (
+    COST_MODEL_VERSION,
+    RETURN_DISTRIBUTION_CONTRACT_VERSION,
+    RETURN_DISTRIBUTION_INPUT_VERSION,
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_VERSION,
+)
+
+
+def _distribution_input(side: str, expected: float, lower: float) -> dict[str, Any]:
+    return {
+        "side": side,
+        "horizon_minutes": 30,
+        "raw_expected_return_pct": expected,
+        "median_return_pct": expected,
+        "lower_quantile_return_pct": lower,
+        "upper_quantile_return_pct": expected + 0.2,
+        "dispersion_pct": abs(expected - lower),
+        "tail_loss_probability": 0.1,
+        "tail_loss_scale_pct": 0.3,
+        "distribution_member_count": 64,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "source_authority": "extra_trees_empirical_distribution",
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_version": RETURN_LABEL_VERSION,
+        "cost_model_version": COST_MODEL_VERSION,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+    }
 
 
 @pytest.fixture
@@ -380,9 +409,11 @@ def test_local_ai_tools_normalizes_wrapped_prediction_payloads(
 
     assert profit["available"] is True
     assert profit["best_side"] == "short"
-    assert profit["expected_return_pct"] == 0.42
+    assert "expected_return_pct" not in profit
+    assert profit["prediction_quality"]["production_eligible"] is False
     assert timeseries["side"] == "long"
-    assert timeseries["expected_return_pct"] == 0.16
+    assert "expected_return_pct" not in timeseries
+    assert timeseries["prediction_quality"]["production_eligible"] is False
     assert sentiment["side"] == "short"
     assert sentiment["available"] is True
     assert profit["primary_model"] == "profit_v1_baseline"
@@ -391,6 +422,132 @@ def test_local_ai_tools_normalizes_wrapped_prediction_payloads(
     assert profit["feature_coverage"] == {"ratio": None, "status": "not_reported"}
     assert timeseries["primary_model"] == "timeseries_v1_baseline"
     assert sentiment["primary_model"] == "sentiment_v1_baseline"
+
+
+def test_local_ai_tools_builds_standard_contract_from_remote_distribution_inputs(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "available": True,
+            "best_side": "long",
+            "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+            "return_distribution_inputs": {
+                "long": _distribution_input("long", 0.8, 0.5),
+                "short": _distribution_input("short", 0.2, 0.1),
+            },
+            "prediction_quality": {
+                "production_eligible": True,
+                "anomalous": False,
+            },
+        },
+    )
+
+    contract = profit["return_distribution_contract"]["long"]
+    assert profit["return_distribution_contract_version"] == (
+        RETURN_DISTRIBUTION_CONTRACT_VERSION
+    )
+    assert contract["raw_expected_return_pct"] == pytest.approx(0.8)
+    assert contract["lower_quantile_return_pct"] == pytest.approx(0.5)
+    assert contract["objective_expected_return_pct"] == pytest.approx(0.47)
+    assert contract["production_eligible"] is True
+    assert profit["prediction_quality"]["production_eligible"] is True
+
+
+def test_local_ai_tools_blocks_remote_lower_above_expected_without_clamping(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "available": True,
+            "best_side": "long",
+            "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+            "return_distribution_inputs": {
+                "long": _distribution_input("long", 0.46, 0.496),
+                "short": _distribution_input("short", 0.2, 0.1),
+            },
+            "prediction_quality": {
+                "production_eligible": True,
+                "anomalous": False,
+            },
+        },
+    )
+
+    contract = profit["return_distribution_contract"]["long"]
+    assert contract["raw_expected_return_pct"] == pytest.approx(0.46)
+    assert contract["lower_quantile_return_pct"] == pytest.approx(0.496)
+    assert "lower_quantile_above_raw_expected" in contract["blockers"]
+    assert contract["production_eligible"] is False
+    assert profit["prediction_quality"]["production_eligible"] is False
+
+
+def test_local_ai_tools_preserves_remote_distribution_blockers(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "available": True,
+            "best_side": "long",
+            "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+            "return_distribution_inputs": {
+                "long": _distribution_input("long", 0.8, 0.5),
+                "short": _distribution_input("short", 0.2, 0.1),
+            },
+            "prediction_quality": {
+                "production_eligible": False,
+                "anomalous": True,
+                "reason": "actual_trade_calibration_not_ready",
+                "blockers": ["actual_trade_calibration_not_ready"],
+            },
+        },
+    )
+
+    assert profit["prediction_quality"]["production_eligible"] is False
+    assert profit["prediction_quality"]["reason"] == (
+        "actual_trade_calibration_not_ready"
+    )
+    assert profit["prediction_quality"]["blockers"] == [
+        "actual_trade_calibration_not_ready"
+    ]
+
+
+def test_local_ai_tools_blocks_obsolete_distribution_provenance(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+    long_input = _distribution_input("long", 0.8, 0.5)
+    long_input["cost_model_version"] = "obsolete-cost-model"
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "available": True,
+            "best_side": "long",
+            "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+            "return_distribution_inputs": {
+                "long": long_input,
+                "short": _distribution_input("short", 0.2, 0.1),
+            },
+            "prediction_quality": {
+                "production_eligible": True,
+                "anomalous": False,
+            },
+        },
+    )
+
+    assert profit["prediction_quality"]["production_eligible"] is False
+    assert "return_distribution_cost_model_version_mismatch" in profit[
+        "prediction_quality"
+    ]["blockers"]
 
 
 def test_local_ai_tools_preserves_server_reported_model_metadata(
@@ -571,7 +728,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     assert result["service_available"] is True
     assert result["api_base"] == "http://local-ai-tools.test"
     assert result["enabled_for_trading"] is True
-    assert result["status"] == "heuristic_fallback_available"
+    assert result["status"] == "artifact_unavailable"
     assert result["child_endpoints"]["profit_prediction"]["available"] is True
 
 
@@ -724,7 +881,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
     assert result["available"] is True
     assert result["service_available"] is True
     assert result["model_bundle_available"] is False
-    assert result["status"] == "heuristic_fallback_available"
+    assert result["status"] == "artifact_unavailable"
     assert result["status_error"] == "models status endpoint unavailable"
     assert result["health_available"] is True
     assert result["child_endpoints"]["profit_prediction"]["available"] is True
@@ -767,7 +924,7 @@ async def test_local_ai_tools_status_uses_health_when_status_and_bundle_missing(
     assert result["available"] is True
     assert result["service_available"] is True
     assert result["model_bundle_available"] is False
-    assert result["status"] == "heuristic_fallback_available"
+    assert result["status"] == "artifact_unavailable"
     assert result["health_available"] is True
     assert result["failure_count"] == 0
 

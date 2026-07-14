@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from models.trade import Order, Position
@@ -9,28 +11,75 @@ from services.profit_attribution import (
     extract_signal_sides,
     match_entry_decisions_for_positions,
 )
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.return_objective import (
+    COST_MODEL_VERSION,
+    RETURN_DISTRIBUTION_CONTRACT_VERSION,
+    standardized_return_distribution,
+)
+
+
+def _distribution(side: str, expected: float) -> dict:
+    return standardized_return_distribution(
+        side=side,
+        horizon_minutes=30,
+        raw_expected_return_pct=expected,
+        median_return_pct=expected,
+        lower_quantile_return_pct=expected - 0.1,
+        upper_quantile_return_pct=expected + 0.1,
+        dispersion_pct=0.1,
+        tail_loss_probability=0.1,
+        tail_loss_scale_pct=0.2,
+        distribution_member_count=32,
+        return_semantics="gross_market_opportunity_before_execution",
+        source_authority="test_tree_empirical_distribution",
+        cost_model_version=COST_MODEL_VERSION,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+
+
+def _model_payload(side: str, expected: float) -> dict:
+    opposite = "short" if side == "long" else "long"
+    return {
+        "available": True,
+        "trained": True,
+        "best_side": side,
+        "side": side,
+        "return_distribution_contract_version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+        "return_distribution_contract": {
+            "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+            side: _distribution(side, expected),
+            opposite: _distribution(opposite, -abs(expected)),
+        },
+    }
+
+
+def _ml_payload(side: str, expected: float) -> dict:
+    payload = _model_payload(side, expected)
+    payload["predictions"] = [
+        {
+            "best_side": side,
+            "return_distribution_contract": payload[
+                "return_distribution_contract"
+            ],
+        }
+    ]
+    return payload
 
 
 def test_extract_signal_sides_reads_current_quant_tool_keys():
     signals = extract_signal_sides(
         {
             "ml_signal": {
-                "predictions": [{"best_side": "short", "best_expected_return_pct": 0.4235}],
+                **_ml_payload("short", 0.4235),
             },
             "local_ai_tools": {
                 "profit_prediction": {
-                    "available": True,
-                    "trained": True,
-                    "best_side": "short",
-                    "expected_return_pct": 0.3566,
+                    **_model_payload("short", 0.3566),
                 },
                 "time_series_prediction": {
-                    "available": True,
-                    "trained": True,
-                    "best_side": "short",
-                    "side": "short",
+                    **_model_payload("short", -0.094),
                     "direction": "down",
-                    "expected_return_pct": -0.094,
                 },
                 "sentiment_analysis": {
                     "available": True,
@@ -38,6 +87,7 @@ def test_extract_signal_sides_reads_current_quant_tool_keys():
                     "best_side": "long",
                     "side": "long",
                     "expected_return_pct": 0.5803,
+                    "score": 0.7,
                 },
             },
         }
@@ -47,13 +97,17 @@ def test_extract_signal_sides_reads_current_quant_tool_keys():
     assert signals["ml"]["side"] == "short"
     assert signals["server_profit"]["available"] is True
     assert signals["server_profit"]["side"] == "short"
-    assert signals["server_profit"]["expected_return_pct"] == 0.3566
+    assert signals["server_profit"]["raw_expected_return_pct"] == 0.3566
+    assert signals["server_profit"]["objective_expected_return_pct"] == pytest.approx(
+        0.2366
+    )
     assert signals["timeseries"]["available"] is True
     assert signals["timeseries"]["side"] == "short"
-    assert signals["timeseries"]["expected_return_pct"] == -0.094
+    assert signals["timeseries"]["raw_expected_return_pct"] == -0.094
     assert signals["sentiment"]["available"] is True
     assert signals["sentiment"]["side"] == "long"
-    assert signals["sentiment"]["expected_return_pct"] == 0.5803
+    assert signals["sentiment"]["score"] == 0.7
+    assert "expected_return_pct" not in signals["sentiment"]
 
 
 def test_extract_signal_sides_reads_chinese_side_labels():
@@ -78,7 +132,7 @@ def test_extract_signal_sides_reads_chinese_side_labels():
     assert signals["timeseries"]["side"] == "long"
 
 
-def test_extract_signal_sides_reads_wrapped_server_quant_tools_payloads():
+def test_legacy_wrapped_server_quant_tools_are_observation_only_without_contracts():
     signals = extract_signal_sides(
         {
             "server_quant_tools": {
@@ -106,18 +160,18 @@ def test_extract_signal_sides_reads_wrapped_server_quant_tools_payloads():
         }
     )
 
-    assert signals["server_profit"]["available"] is True
+    assert signals["server_profit"]["available"] is False
     assert signals["server_profit"]["side"] == "long"
-    assert signals["server_profit"]["expected_return_pct"] == 0.48
-    assert signals["timeseries"]["available"] is True
+    assert signals["server_profit"]["objective_expected_return_pct"] is None
+    assert signals["timeseries"]["available"] is False
     assert signals["timeseries"]["side"] == "short"
-    assert signals["timeseries"]["expected_return_pct"] == -0.22
+    assert signals["timeseries"]["objective_expected_return_pct"] is None
     assert signals["sentiment"]["available"] is True
     assert signals["sentiment"]["side"] == "long"
     assert signals["sentiment"]["score"] == 0.36
 
 
-def test_extract_signal_sides_falls_back_to_opportunity_score_fields():
+def test_obsolete_opportunity_source_aliases_cannot_fabricate_model_signals():
     signals = extract_signal_sides(
         {
             "opportunity_score": {
@@ -134,18 +188,12 @@ def test_extract_signal_sides_falls_back_to_opportunity_score_fields():
         }
     )
 
-    assert signals["ml"]["available"] is True
-    assert signals["ml"]["side"] == "long"
-    assert signals["ml"]["expected_return_pct"] == 0.42
-    assert signals["server_profit"]["available"] is True
-    assert signals["server_profit"]["side"] == "short"
-    assert signals["server_profit"]["expected_return_pct"] == 0.31
-    assert signals["timeseries"]["available"] is True
-    assert signals["timeseries"]["side"] == "long"
-    assert signals["timeseries"]["expected_return_pct"] == 0.18
+    assert signals["ml"]["available"] is False
+    assert signals["server_profit"]["available"] is False
+    assert signals["timeseries"]["available"] is False
 
 
-def test_extract_signal_sides_keeps_observe_only_ml_prediction_available():
+def test_obsolete_opportunity_alias_cannot_recover_observe_only_ml_prediction():
     signals = extract_signal_sides(
         {
             "opportunity_score": {
@@ -157,23 +205,14 @@ def test_extract_signal_sides_keeps_observe_only_ml_prediction_available():
         }
     )
 
-    assert signals["ml"]["available"] is True
-    assert signals["ml"]["influence_enabled"] is False
-    assert signals["ml"]["side"] == "long"
-    assert signals["ml"]["expected_return_pct"] == 0.25
+    assert signals["ml"]["available"] is False
+    assert signals["ml"]["influence_enabled"] is True
 
 
 def test_extract_signal_sides_keeps_ml_prediction_visible_when_influence_disabled():
     signals = extract_entry_signal_sides(
         {
-            "ml_signal": {
-                "predictions": [
-                    {
-                        "best_side": "short",
-                        "best_expected_return_pct": 0.73,
-                    }
-                ]
-            }
+            "ml_signal": _ml_payload("short", 0.73)
         },
         ml_influence_enabled=False,
     )
@@ -181,7 +220,7 @@ def test_extract_signal_sides_keeps_ml_prediction_visible_when_influence_disable
     assert signals["ml"]["available"] is True
     assert signals["ml"]["influence_enabled"] is False
     assert signals["ml"]["side"] == "short"
-    assert signals["ml"]["expected_return_pct"] == 0.73
+    assert signals["ml"]["raw_expected_return_pct"] == 0.73
 
 
 def test_profit_attribution_excludes_untrusted_closed_position_facts():
@@ -450,10 +489,7 @@ def test_profit_attribution_matches_decision_and_shadow_across_symbol_formats():
         take_profit_pct=0.06,
         raw_llm_response={
             "local_ai_tools": {
-                "profit_prediction": {
-                    "best_side": "long",
-                    "expected_return_pct": 0.42,
-                }
+                "profit_prediction": _model_payload("long", 0.42)
             }
         },
         analysis_type="market",

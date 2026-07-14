@@ -44,12 +44,10 @@ from core.model_runtime import (
 )
 from core.safe_output import safe_error_text
 from services.entry_signal_extraction import (
-    expected_return_pct as signal_expected_return_pct,
-)
-from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
     signal_production_eligible,
+    signal_return_distribution,
 )
 
 logger = structlog.get_logger(__name__)
@@ -104,7 +102,8 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
     )
     if signal_production_eligible(profit):
         best_side = payload_side(profit) or profit.get("direction")
-        expected = signal_expected_return_pct(profit, str(best_side or ""))
+        distribution = signal_return_distribution(profit, str(best_side or ""))
+        expected = distribution.get("objective_expected_return_pct")
         edge = profit.get("profit_edge_pct", profit.get("edge_pct"))
         quality = profit.get("profit_quality_score", profit.get("score"))
         parts.append(
@@ -130,14 +129,13 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
             or ts.get("direction")
             or ts.get("forecast_direction")
         )
-        move = ts.get("expected_move_pct", ts.get("forecast_return_pct"))
-        if move is None:
-            move = signal_expected_return_pct(ts, str(trend or ""))
+        distribution = signal_return_distribution(ts, str(trend or ""))
+        move = distribution.get("objective_expected_return_pct")
         confidence = ts.get("confidence", ts.get("score"))
         parts.append(
             "Time-series model: "
             f"direction={trend or 'unknown'}, "
-            f"expected_move_pct={_fmt_num(move, 4)}, "
+            f"objective_expected_return_pct={_fmt_num(move, 4)}, "
             f"confidence={_fmt_num(confidence, 3)}."
         )
 

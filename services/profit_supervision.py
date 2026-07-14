@@ -24,7 +24,7 @@ MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 COUNTERFACTUAL_EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
 PRODUCTION_RETURN_COMBINATION_VERSION = (
-    "2026-07-14.market-minus-cost-minus-slippage-tail.v1"
+    "2026-07-15.standardized-return-distribution.v2"
 )
 
 

@@ -12,8 +12,9 @@ from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
 )
+from services.return_objective import validate_return_distribution_contract
 
-RETURN_EXECUTION_POLICY_VERSION = "2026-07-14.separated-return-execution.v2"
+RETURN_EXECUTION_POLICY_VERSION = "2026-07-15.standardized-return-execution.v3"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -90,7 +91,11 @@ def _production_return_observations(opportunity: dict[str, Any]) -> list[float]:
             or _safe_float(item.get("production_weight"), 0.0) <= 0
         ):
             continue
-        value = _safe_float(item.get("raw_market_return_pct"), float("nan"))
+        distribution = _safe_dict(item.get("return_distribution_contract"))
+        value = _safe_float(
+            distribution.get("raw_expected_return_pct"),
+            float("nan"),
+        )
         if isfinite(value):
             observations.append(value)
     return observations
@@ -102,8 +107,23 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
     breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
-    expected_net = _safe_float(opportunity.get("expected_net_return_pct"), float("nan"))
-    expected_loss = _safe_float(opportunity.get("expected_loss_pct"), float("nan"))
+    distribution = _safe_dict(opportunity.get("return_distribution_contract"))
+    distribution_validation = validate_return_distribution_contract(
+        distribution,
+        side=str(opportunity.get("side") or ""),
+        return_semantics=(
+            "realized_net_return_after_live_cost_and_authoritative_slippage"
+        ),
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+    expected_net = _safe_float(
+        distribution.get("raw_expected_return_pct"),
+        float("nan"),
+    )
+    expected_loss = _safe_float(
+        distribution.get("tail_loss_penalty_pct"),
+        float("nan"),
+    )
     cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
     combined_cost_pct = _safe_float(
         breakdown.get("live_execution_cost_pct"),
@@ -111,11 +131,11 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     )
     observations = _production_return_observations(opportunity)
     uncertainty = _safe_float(
-        opportunity.get("return_uncertainty_pct"),
+        distribution.get("uncertainty_penalty_pct"),
         float("nan"),
     )
     return_lcb = _safe_float(
-        opportunity.get("realized_net_lcb_pct", opportunity.get("return_lcb_pct")),
+        distribution.get("objective_expected_return_pct"),
         float("nan"),
     )
 
@@ -171,6 +191,8 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         reasons.append("opportunity_return_distribution_missing")
     if opportunity.get("production_eligible") is not True:
         reasons.append("opportunity_not_production_eligible")
+    if distribution_validation.get("eligible") is not True:
+        reasons.extend(distribution_validation.get("blockers") or [])
     if opportunity.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION:
         reasons.append("profit_supervision_version_mismatch")
     if (
@@ -216,13 +238,13 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         and isfinite(uncertainty)
         and isfinite(return_lcb)
         and not isclose(
-            expected_net - uncertainty,
+            expected_net - uncertainty - expected_loss,
             return_lcb,
             rel_tol=1e-9,
             abs_tol=1e-8,
         )
     ):
-        reasons.append("realized_net_lcb_algebra_mismatch")
+        reasons.append("standardized_objective_return_algebra_mismatch")
     if not isfinite(expected_loss) or expected_loss < 0:
         reasons.append("calibrated_downside_missing")
     if sizing.get("production_eligible") is not True:

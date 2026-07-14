@@ -10,6 +10,7 @@ from services.return_objective import (
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
+    validate_return_distribution_contract,
 )
 
 LEGACY_MOJIBAKE_LONG_LABELS = ("\u934b\u6c2c\ue63f",)
@@ -65,6 +66,8 @@ _WRAPPER_METADATA_KEYS = (
     "label_version",
     "profit_supervision_version",
     "return_semantics",
+    "return_distribution_contract",
+    "return_distribution_contract_version",
     "counterfactual_execution_cost_distribution",
     "actual_trade_calibration",
     "prediction_quality",
@@ -106,55 +109,27 @@ def enrich_signal_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
         normalized["available"] = bool(normalized.get("ok"))
     if name == "profit_prediction":
         side = payload_side(normalized)
-        if side not in {"long", "short"}:
-            long_expected = safe_float(
-                normalized.get(
-                    "long_market_expected_return_pct",
-                    normalized.get(
-                        "long_expected_return_pct",
-                        normalized.get("expected_long_return_pct"),
-                    ),
-                ),
-                0.0,
-            )
-            short_expected = safe_float(
-                normalized.get(
-                    "short_market_expected_return_pct",
-                    normalized.get(
-                        "short_expected_return_pct",
-                        normalized.get("expected_short_return_pct"),
-                    ),
-                ),
-                0.0,
-            )
-            if long_expected or short_expected:
-                side = "long" if long_expected >= short_expected else "short"
         if side in {"long", "short"}:
             normalized["best_side"] = side
             normalized["side"] = side
-        if "expected_return_pct" not in normalized:
-            normalized["expected_return_pct"] = expected_return_pct(normalized, side)
-        if "profit_edge_pct" not in normalized:
-            long_value = expected_return_pct(normalized, "long")
-            short_value = expected_return_pct(normalized, "short")
-            normalized["profit_edge_pct"] = round(abs(long_value - short_value), 6)
     elif name == "time_series_prediction":
         side = payload_side(normalized)
         if side in {"long", "short"}:
             normalized["best_side"] = side
             normalized["side"] = side
-        if "expected_return_pct" not in normalized and "expected_move_pct" in normalized:
-            normalized["expected_return_pct"] = normalized.get("expected_move_pct")
     elif name == "sentiment_analysis":
         side = payload_side(normalized)
         if side in {"long", "short"}:
             normalized["best_side"] = side
             normalized["side"] = side
-        if (
-            "expected_return_pct" not in normalized
-            and "expected_return_from_sentiment_pct" in normalized
+        for legacy_return_field in (
+            "expected_return_pct",
+            "expected_return_from_sentiment_pct",
+            "long_expected_return_pct",
+            "short_expected_return_pct",
+            "adjusted_expected_return_pct",
         ):
-            normalized["expected_return_pct"] = normalized.get("expected_return_from_sentiment_pct")
+            normalized.pop(legacy_return_field, None)
     return normalized
 
 
@@ -235,6 +210,53 @@ def _signal_governance_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
             break
         current = child
     return nodes
+
+
+def signal_return_distribution(
+    payload: dict[str, Any] | None,
+    side: str,
+) -> dict[str, Any]:
+    """Return one side's standardized distribution without legacy aliases."""
+
+    if not isinstance(payload, dict) or side not in {"long", "short"}:
+        return {}
+    for node in _signal_governance_nodes(payload):
+        container = safe_dict(node.get("return_distribution_contract"))
+        contract = safe_dict(container.get(side))
+        if contract:
+            return contract
+    return {}
+
+
+def signal_return_distribution_eligibility(
+    payload: dict[str, Any] | None,
+    side: str,
+) -> dict[str, Any]:
+    """Validate the full production distribution contract at the app boundary."""
+
+    contract = signal_return_distribution(payload, side)
+    if not contract:
+        return {
+            "eligible": False,
+            "reason": "return_distribution_contract_missing",
+            "side": side,
+        }
+
+    return validate_return_distribution_contract(
+        contract,
+        side=side,
+        return_semantics="gross_market_opportunity_before_execution",
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+
+
+def _signal_contract_side(payload: dict[str, Any]) -> str:
+    side = payload_side(payload)
+    if side in {"long", "short"}:
+        return side
+    predictions = safe_list(payload.get("predictions"))
+    primary = safe_dict(predictions[0] if predictions else {})
+    return payload_side(primary)
 
 
 def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
@@ -417,7 +439,19 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
             "reason": "production_governance_incomplete",
             "missing_governance": missing,
         }
-    return {"eligible": True, "reason": "governance_allows_live_influence"}
+    contract_side = _signal_contract_side(payload)
+    distribution_eligibility = signal_return_distribution_eligibility(
+        payload,
+        contract_side,
+    )
+    if distribution_eligibility.get("eligible") is not True:
+        return distribution_eligibility
+    return {
+        "eligible": True,
+        "reason": "governance_and_return_distribution_allow_live_influence",
+        "side": contract_side,
+        "return_distribution": distribution_eligibility.get("contract"),
+    }
 
 
 def signal_production_eligible(payload: dict[str, Any]) -> bool:
@@ -483,31 +517,6 @@ def payload_side(payload: dict[str, Any] | None, side_key: str = "best_side") ->
     return ""
 
 
-def opposite_side(side: str) -> str:
-    if side == "long":
-        return "short"
-    if side == "short":
-        return "long"
-    return ""
-
-
-def mark_signal_from_opportunity(
-    signal: dict[str, Any],
-    *,
-    side: str = "",
-    expected_return_pct: Any = None,
-    available: bool = True,
-) -> None:
-    if not available:
-        return
-    if side in {"long", "short"} and not signal.get("side"):
-        signal["side"] = side
-    if expected_return_pct is not None and not signal.get("expected_return_pct"):
-        signal["expected_return_pct"] = safe_float(expected_return_pct, 0.0)
-    if signal.get("side") or expected_return_pct is not None:
-        signal["available"] = True
-
-
 def has_any_key(payload: dict[str, Any], *keys: str) -> bool:
     return any(key in payload for key in keys)
 
@@ -518,10 +527,11 @@ def has_signal_evidence(payload: dict[str, Any]) -> bool:
         return False
     if payload_side(payload) in {"long", "short"}:
         return True
+    if safe_dict(payload.get("return_distribution_contract")):
+        return True
     return has_any_key(
         payload,
         "expected_return_pct",
-        "best_expected_return_pct",
         "expected_move_pct",
         "forecast_return_pct",
         "return_pct",
@@ -529,69 +539,6 @@ def has_signal_evidence(payload: dict[str, Any]) -> bool:
         "score",
         "sentiment_score",
     )
-
-
-def expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
-    side = str(side or "").lower()
-    keys: list[str] = []
-    if side in {"long", "short"}:
-        keys.extend(
-            [
-                f"{side}_market_expected_return_pct",
-                f"adjusted_{side}_return_pct",
-                f"{side}_expected_return_pct",
-                f"expected_{side}_return_pct",
-                f"{side}_return_pct",
-            ]
-        )
-    keys.extend(
-        [
-            "expected_return_pct",
-            "expected_net_return_pct",
-            "best_expected_return_pct",
-            "expected_move_pct",
-            "expected_return_from_sentiment_pct",
-            "forecast_return_pct",
-            "return_pct",
-            "expected_profit_pct",
-        ]
-    )
-    for key in keys:
-        if key in payload:
-            return safe_float(payload.get(key), 0.0)
-    return 0.0
-
-
-def directional_expected_return_pct(payload: dict[str, Any], side: str = "") -> float:
-    """Return expected return from the perspective of the requested trade side.
-
-    Directional models often report price movement: a negative move is adverse for
-    long entries but favorable for short entries. Profit models already expose
-    side-adjusted fields such as ``short_expected_return_pct``; this helper only
-    flips generic movement fields for short-side directional signals.
-    """
-
-    side = str(side or "").lower()
-    if side not in {"long", "short"}:
-        return expected_return_pct(payload, side)
-    for key in (
-        f"{side}_market_expected_return_pct",
-        f"adjusted_{side}_return_pct",
-        f"{side}_expected_return_pct",
-        f"expected_{side}_return_pct",
-        f"{side}_return_pct",
-    ):
-        if key in payload:
-            return safe_float(payload.get(key), 0.0)
-    move = expected_return_pct(payload, side)
-    if side == "short":
-        return -move
-    return move
-
-
-def side_has_positive_expected_return(payload: dict[str, Any], side: str) -> bool:
-    """True when a side has positive adjusted/side expected return evidence."""
-    return expected_return_pct(payload, side) > 0.0
 
 
 def entry_signal_payloads(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -647,104 +594,50 @@ def extract_entry_signal_sides(
     profit = payloads["server_profit"]
     timeseries = payloads["timeseries"]
     sentiment = payloads["sentiment"]
+    ml_side = payload_side(primary_ml)
     profit_side = payload_side(profit)
     timeseries_side = payload_side(timeseries)
     sentiment_side = payload_side(sentiment)
+
+    def distribution_signal(
+        payload: dict[str, Any],
+        side: str,
+    ) -> dict[str, Any]:
+        distribution = signal_return_distribution(payload, side)
+        eligibility = signal_return_distribution_eligibility(payload, side)
+        return {
+            "available": signal_available(payload) and bool(distribution),
+            "side": side,
+            "raw_expected_return_pct": distribution.get(
+                "raw_expected_return_pct"
+            ),
+            "objective_expected_return_pct": distribution.get(
+                "objective_expected_return_pct"
+            ),
+            "lower_quantile_return_pct": distribution.get(
+                "lower_quantile_return_pct"
+            ),
+            "dispersion_pct": distribution.get("dispersion_pct"),
+            "tail_loss_probability": distribution.get(
+                "tail_loss_probability"
+            ),
+            "tail_loss_scale_pct": distribution.get("tail_loss_scale_pct"),
+            "production_eligible": eligibility.get("eligible") is True,
+            "eligibility_reason": eligibility.get("reason"),
+            "return_distribution_contract": distribution,
+        }
+
     signals: dict[str, dict[str, Any]] = {
         "ml": {
-            "available": signal_available(primary_ml) and has_signal_evidence(primary_ml),
-            "side": payload_side(primary_ml),
-            "expected_return_pct": safe_float(
-                primary_ml.get("best_expected_return_pct", ml.get("expected_return_pct", 0.0)),
-                0.0,
-            ),
+            **distribution_signal(ml, ml_side),
             "influence_enabled": bool(ml_influence_enabled),
         },
-        "server_profit": {
-            "available": signal_available(profit),
-            "side": profit_side,
-            "expected_return_pct": expected_return_pct(profit, profit_side),
-        },
-        "timeseries": {
-            "available": signal_available(timeseries),
-            "side": timeseries_side,
-            "expected_return_pct": expected_return_pct(timeseries, timeseries_side),
-        },
+        "server_profit": distribution_signal(profit, profit_side),
+        "timeseries": distribution_signal(timeseries, timeseries_side),
         "sentiment": {
             "available": signal_available(sentiment),
             "side": sentiment_side,
-            "expected_return_pct": expected_return_pct(sentiment, sentiment_side),
             "score": safe_float(sentiment.get("score", sentiment.get("sentiment_score", 0.0)), 0.0),
         },
     }
-    opportunity = safe_dict(raw.get("opportunity_score"))
-    evidence_score = safe_dict(opportunity.get("evidence_score"))
-    components = safe_list(evidence_score.get("components"))
-    for component in components:
-        if not isinstance(component, dict):
-            continue
-        source = str(component.get("source") or "")
-        if source not in signals:
-            continue
-        current = signals[source]
-        component_side = payload_side(component, side_key="side")
-        if not current.get("side") and component_side in {"long", "short"}:
-            current["side"] = component_side
-        if not current.get("available") and component.get("status") != "missing":
-            current["available"] = bool(component.get("available", True))
-        if not current.get("expected_return_pct"):
-            current["expected_return_pct"] = safe_float(component.get("expected_return_pct"), 0.0)
-
-    entry_side = payload_side(opportunity, side_key="side")
-    ml_enabled = bool(opportunity.get("ml_influence_enabled", ml_influence_enabled))
-    signals["ml"]["influence_enabled"] = ml_enabled
-    has_ml_opportunity_data = has_any_key(
-        opportunity,
-        "expected_return_pct",
-        "ml_aligned",
-        "ml_profit_quality_score",
-        "ml_influence_enabled",
-    )
-    if entry_side:
-        mark_signal_from_opportunity(
-            signals["ml"],
-            side=entry_side if opportunity.get("ml_aligned", True) else opposite_side(entry_side),
-            expected_return_pct=opportunity.get("expected_return_pct"),
-            available=has_ml_opportunity_data,
-        )
-
-    server_side = payload_side({"best_side": opportunity.get("server_profit_best_side")})
-    if not server_side and entry_side and opportunity.get("local_profit_aligned"):
-        server_side = entry_side
-    mark_signal_from_opportunity(
-        signals["server_profit"],
-        side=server_side,
-        expected_return_pct=opportunity.get("server_profit_expected_return_pct"),
-        available=(
-            "server_profit_expected_return_pct" in opportunity
-            or "server_profit_best_side" in opportunity
-            or "server_profit_loss_probability" in opportunity
-        ),
-    )
-
-    timeseries_side = payload_side({"best_side": opportunity.get("timeseries_best_side")})
-    if not timeseries_side and entry_side and "timeseries_aligned" in opportunity:
-        timeseries_side = (
-            entry_side if opportunity.get("timeseries_aligned") else opposite_side(entry_side)
-        )
-    mark_signal_from_opportunity(
-        signals["timeseries"],
-        side=timeseries_side,
-        expected_return_pct=opportunity.get("timeseries_expected_return_pct"),
-        available="timeseries_expected_return_pct" in opportunity
-        or "timeseries_aligned" in opportunity,
-    )
-
-    sentiment_side = payload_side({"best_side": opportunity.get("sentiment_best_side")})
-    if sentiment_side or "sentiment_expected_return_pct" in opportunity:
-        mark_signal_from_opportunity(
-            signals["sentiment"],
-            side=sentiment_side,
-            expected_return_pct=opportunity.get("sentiment_expected_return_pct"),
-        )
     return signals

@@ -6,15 +6,50 @@ from services.entry_signal_extraction import (
 )
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
+    COST_MODEL_VERSION,
+    RETURN_DISTRIBUTION_CONTRACT_VERSION,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
+    standardized_return_distribution,
 )
+
+
+def _distribution(side: str = "long") -> dict:
+    return standardized_return_distribution(
+        side=side,
+        horizon_minutes=30,
+        raw_expected_return_pct=0.8,
+        median_return_pct=0.7,
+        lower_quantile_return_pct=0.4,
+        upper_quantile_return_pct=1.1,
+        dispersion_pct=0.2,
+        tail_loss_probability=0.1,
+        tail_loss_scale_pct=0.5,
+        distribution_member_count=32,
+        return_semantics="gross_market_opportunity_before_execution",
+        source_authority="test_tree_empirical_distribution",
+        cost_model_version=COST_MODEL_VERSION,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+
+
+def _contract_fields() -> dict:
+    return {
+        "best_side": "long",
+        "return_distribution_contract_version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+        "return_distribution_contract": {
+            "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+            "long": _distribution("long"),
+            "short": _distribution("short"),
+        },
+    }
 
 
 def test_shadow_signal_remains_observable_but_cannot_influence_production() -> None:
     payload = {
+        **_contract_fields(),
         "available": True,
         "route_mode": "shadow_candidate",
         "live_mutation": False,
@@ -61,6 +96,7 @@ def test_explicit_unpromoted_signal_cannot_use_live_route_label() -> None:
 
 def test_live_separated_supervision_signal_is_production_eligible() -> None:
     payload = {
+        **_contract_fields(),
         "available": True,
         "route_mode": "live",
         "live_mutation": True,
@@ -79,10 +115,12 @@ def test_live_separated_supervision_signal_is_production_eligible() -> None:
         },
     }
 
-    assert signal_production_eligibility(payload) == {
-        "eligible": True,
-        "reason": "governance_allows_live_influence",
-    }
+    result = signal_production_eligibility(payload)
+    assert result["eligible"] is True
+    assert result["reason"] == (
+        "governance_and_return_distribution_allow_live_influence"
+    )
+    assert result["side"] == "long"
 
 
 def test_dynamic_prediction_quality_block_overrides_live_route() -> None:
@@ -146,6 +184,7 @@ def test_signal_without_governance_metadata_is_observation_only() -> None:
 
 def test_each_required_live_governance_field_is_fail_closed() -> None:
     complete = {
+        **_contract_fields(),
         "available": True,
         "route_mode": "live",
         "live_mutation": True,
@@ -182,3 +221,29 @@ def test_each_required_live_governance_field_is_fail_closed() -> None:
         result = signal_production_eligibility(payload)
         assert result["eligible"] is False
         assert missing_name in result["missing_governance"]
+
+
+def test_live_governance_without_standard_distribution_is_observation_only() -> None:
+    payload = {
+        "available": True,
+        "route_mode": "live",
+        "live_mutation": True,
+        "promotion_ready": True,
+        "best_side": "long",
+        "artifact_objective": RETURN_OBJECTIVE_NAME,
+        "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "prediction_quality": {
+            "production_eligible": True,
+            "anomalous": False,
+        },
+    }
+
+    result = signal_production_eligibility(payload)
+
+    assert result["eligible"] is False
+    assert result["reason"] == "return_distribution_contract_missing"

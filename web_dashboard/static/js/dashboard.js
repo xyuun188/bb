@@ -1918,7 +1918,12 @@ function opportunityScorePrimaryReturn(score) {
     if (!score || typeof score !== 'object') return { label: '预期净收益', value: null };
     const net = Number(score.expected_net_return_pct);
     if (Number.isFinite(net)) return { label: '预期净收益', value: net };
-    return { label: '预期收益', value: Number(score.expected_return_pct) };
+    const contract = score.return_distribution_contract || {};
+    const observed = Number(contract.raw_expected_return_pct);
+    return {
+        label: '标准分布观察值',
+        value: Number.isFinite(observed) ? observed : null,
+    };
 }
 
 function opportunityScoreReturnDetail(score) {
@@ -1934,22 +1939,21 @@ function opportunityScoreFormulaItems(score) {
     const components = Array.isArray(breakdown.components) ? breakdown.components : [];
     if (components.length) {
         return components.map(component => {
-            const contribution = Number(component.contribution_pct);
-            const rawReturn = Number(component.raw_return_pct);
-            const weight = Number(component.weight);
+            const contract = component.return_distribution_contract || null;
+            const objective = Number(contract?.objective_expected_return_pct);
+            const weight = Number(component.production_weight);
             const available = component.available !== false;
             const pieces = [];
-            if (Number.isFinite(contribution)) pieces.push(signedPctValueLabel(contribution));
-            if (Number.isFinite(rawReturn) && Number.isFinite(weight)) {
-                pieces.push(`原始 ${signedPctValueLabel(rawReturn)} × 权重 ${opportunityScoreValue(weight, 2)}`);
-            }
+            pieces.push(distributionSummaryText(contract));
+            if (Number.isFinite(weight)) pieces.push(`生产权重 ${opportunityScoreValue(weight, 4)}`);
+            if (component.production_eligible !== true) pieces.push('仅观察');
             if (!available) pieces.push('当前未参与');
             return {
                 label: component.label || component.key || '收益来源',
-                value: Number.isFinite(contribution) ? contribution : 0,
+                value: Number.isFinite(objective) ? objective : 0,
                 text: pieces.join(' · ') || '-',
-                tone: !available ? 'muted' : (contribution > 0 ? 'good' : (contribution < 0 ? 'bad' : 'muted')),
-                note: component.note || '',
+                tone: component.production_eligible === true && objective > 0 ? 'good' : 'muted',
+                note: component.eligibility_reason || component.note || '',
             };
         });
     }
@@ -2616,6 +2620,39 @@ function signedPctValueLabel(value, digits = 2) {
     return `${sign}${num.toFixed(digits)}%`;
 }
 
+function standardizedReturnDistribution(payload, side = '') {
+    if (!payload || typeof payload !== 'object') return null;
+    const container = payload.return_distribution_contract;
+    if (!container || typeof container !== 'object') return null;
+    const selectedSide = String(side || payload.best_side || payload.side || '').toLowerCase();
+    const contract = container[selectedSide];
+    return contract && typeof contract === 'object' ? contract : null;
+}
+
+function distributionPctLabel(value, digits = 4) {
+    if (value === null || value === undefined || value === '') return '未评估';
+    const num = Number(value);
+    return Number.isFinite(num) ? signedPctValueLabel(num, digits) : '未评估';
+}
+
+function distributionProbabilityLabel(value, digits = 1) {
+    if (value === null || value === undefined || value === '') return '未评估';
+    const num = Number(value);
+    return Number.isFinite(num) ? `${(num * 100).toFixed(digits)}%` : '未评估';
+}
+
+function distributionSummaryText(contract) {
+    if (!contract) return '标准收益分布缺失';
+    return [
+        `原始期望 ${distributionPctLabel(contract.raw_expected_return_pct)}`,
+        `目标期望 ${distributionPctLabel(contract.objective_expected_return_pct)}`,
+        `收益下界 ${distributionPctLabel(contract.lower_quantile_return_pct)}`,
+        `离散度 ${distributionPctLabel(contract.dispersion_pct)}`,
+        `尾损概率 ${distributionProbabilityLabel(contract.tail_loss_probability)}`,
+        `尾损尺度 ${distributionPctLabel(contract.tail_loss_scale_pct)}`,
+    ].join(' · ');
+}
+
 function renderAnalysisMlSignal(signal) {
     if (!signal || signal.available === false) {
         return '<div class="analysis-empty">本轮没有可用的本地 ML 盈亏质量预测；AI 决策未受 ML 影响。</div>';
@@ -2623,17 +2660,16 @@ function renderAnalysisMlSignal(signal) {
     const predictions = Array.isArray(signal.predictions) ? signal.predictions : [];
     const rows = predictions.map(item => {
         const bestSide = item.best_side === 'long' ? '做多' : item.best_side === 'short' ? '做空' : '-';
-        const expected = Number(item.best_expected_return_pct || 0);
+        const distribution = standardizedReturnDistribution(item, item.best_side);
+        const expected = Number(distribution?.objective_expected_return_pct);
         const edge = Number(item.profit_edge_pct || 0);
-        const tone = expected > 0 && edge > 0 ? 'good' : Number(item.risk_score || 0) >= 0.55 ? 'warn' : 'muted';
+        const tone = Number.isFinite(expected) && expected > 0 && edge > 0 ? 'good' : 'warn';
         return `
             <div class="analysis-resolution-item">
                 <strong>${Number(item.horizon_minutes || 0)}分钟</strong>
                 <span>
-                    预期收益 ${signedPctValueLabel(item.best_expected_return_pct)}
-                    · 收益差 ${signedPctValueLabel(item.profit_edge_pct)}
-                    · ${bestSide}
-                    · 胜率辅助 ${pctLabel(item.best_win_rate)}
+                    ${bestSide} · ${distributionSummaryText(distribution)}
+                    · 收益差 ${distributionPctLabel(item.profit_edge_pct)}
                     · ${analysisPill(`风险 ${pctLabel(item.risk_score)}`, tone)}
                 </span>
             </div>`;
@@ -2912,7 +2948,7 @@ function analysisToolPlainStatus(payload) {
         active: '已参与',
         trained_torch_sequence_model: '已训练时序模型',
         trained_text_model: '已训练情绪模型',
-        heuristic_fallback_available: '启发式可用',
+        artifact_unavailable: '缺少模型产物',
         unavailable: '不可用',
         error: '错误',
         disabled: '已关闭',
@@ -2959,16 +2995,17 @@ function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
     }
     const isPositionAnalysis = ['position', 'position_review'].includes(String(analysisType || '').toLowerCase());
     const predictions = Array.isArray(ts.predictions) ? ts.predictions : [];
-    const predictionRows = predictions.map(item => `
-        <div class="analysis-resolution-item">
-            <strong>${Number(item.horizon_minutes || item.horizon || 0)}分钟</strong>
-            <span>
-                预期 ${signedPctValueLabel(item.expected_return_pct)}
-                ${item.direction ? ` · 方向 ${escHtml(String(item.direction))}` : ''}
-                ${item.downside_risk_pct !== undefined ? ` · 下行风险 ${signedPctValueLabel(item.downside_risk_pct)}` : ''}
-            </span>
-        </div>
-    `).join('') || (ts.available ? `
+    const predictionRows = predictions.map(item => {
+        const distribution = standardizedReturnDistribution(item, item.best_side || item.side);
+        return `
+            <div class="analysis-resolution-item">
+                <strong>${Number(item.horizon_minutes || item.horizon || 0)}分钟</strong>
+                <span>
+                    ${distributionSummaryText(distribution)}
+                    ${item.direction ? ` · 方向 ${escHtml(String(item.direction))}` : ''}
+                </span>
+            </div>`;
+    }).join('') || (ts.available ? `
         <div class="analysis-resolution-item">
             <strong>当前窗口</strong>
             <span>
@@ -2981,6 +3018,10 @@ function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
     ` : '');
     const profitStatus = analysisToolStatus(profit);
     const tsStatus = analysisToolStatus(ts);
+    const profitDistribution = standardizedReturnDistribution(
+        profit,
+        profit.best_side || profit.side,
+    );
     const sentimentStatus = analysisToolStatus(sentiment);
     const exitStatus = !isPositionAnalysis
         ? analysisPill('市场分析不适用', 'muted')
@@ -3002,7 +3043,7 @@ function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
                     ${analysisText([
                         analysisToolMetaText(profit),
                         `最佳方向 ${profit.best_side || '-'}`,
-                        `预期收益 ${signedPctValueLabel(profit.expected_return_pct)}`,
+                        distributionSummaryText(profitDistribution),
                         `收益优势 ${signedPctValueLabel(profit.profit_edge_pct)}`,
                         `质量分 ${profit.profit_quality_score ?? '-'}`,
                         `做多亏损概率 ${pctLabel(profit.long_loss_probability)}`,
@@ -3021,7 +3062,6 @@ function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
                         analysisToolMetaText(sentiment),
                         `结论 ${sentiment.label || '-'}`,
                         `情绪分 ${sentiment.score ?? '-'}`,
-                        `情绪预期收益 ${signedPctValueLabel(sentiment.expected_return_from_sentiment_pct)}`,
                         `风险 ${sentiment.risk_level || '-'}`,
                         `模型 ${sentiment.model || sentiment.backend || '-'}`
                     ].join('；'))}
@@ -3417,6 +3457,11 @@ function renderAnalysisReasonModal(record) {
         ? preExpertSkip.label
         : `发起 ${attemptedCount} 个，返回 ${expertCount} 个`;
     const mlSignal = record.ml_signal || null;
+    const mlSignalPrediction = mlPrimaryPrediction(mlSignal);
+    const mlSignalDistribution = standardizedReturnDistribution(
+        mlSignalPrediction,
+        mlSignalPrediction?.best_side,
+    );
     const localAiTools = record.local_ai_tools || null;
     const agentSkills = record.agent_skills || null;
     const newsContext = record.news_context || null;
@@ -3705,9 +3750,9 @@ function renderAnalysisReasonModal(record) {
             <div class="analysis-card-text">
                 <div class="analysis-resolution-list">
                     <div class="analysis-resolution-item"><strong>AI 专家</strong><span>${analysisText(attribution.ai_experts?.summary || '-')}</span></div>
-                    <div class="analysis-resolution-item"><strong>本地 ML</strong><span>${escHtml(attribution.local_ml?.available ? `${attribution.local_ml.side_label || '-'} / 预期 ${signedPctValueLabel(attribution.local_ml.expected_return_pct)} / 收益差 ${signedPctValueLabel(attribution.local_ml.profit_edge_pct)}` : '无可用预测')}</span></div>
-                    <div class="analysis-resolution-item"><strong>服务器盈利模型</strong><span>${escHtml(attribution.server_profit?.available ? `${attribution.server_profit.side_label || '-'} / 预期 ${signedPctValueLabel(attribution.server_profit.expected_return_pct)} / 亏损概率 ${pctLabel(attribution.server_profit.loss_probability)}` : '无可用预测')}</span></div>
-                    <div class="analysis-resolution-item"><strong>时序预测</strong><span>${escHtml(attribution.timeseries?.available ? `${attribution.timeseries.side_label || '-'} / 预期 ${signedPctValueLabel(attribution.timeseries.expected_return_pct)}` : '无可用预测')}</span></div>
+                    <div class="analysis-resolution-item"><strong>本地 ML</strong><span>${escHtml(attribution.local_ml?.available ? `${attribution.local_ml.side_label || '-'} / ${distributionSummaryText(attribution.local_ml.return_distribution_contract)} / 收益差 ${signedPctValueLabel(attribution.local_ml.profit_edge_pct)}` : '无可用预测')}</span></div>
+                    <div class="analysis-resolution-item"><strong>服务器盈利模型</strong><span>${escHtml(attribution.server_profit?.available ? `${attribution.server_profit.side_label || '-'} / ${distributionSummaryText(attribution.server_profit.return_distribution_contract)}` : '无可用预测')}</span></div>
+                    <div class="analysis-resolution-item"><strong>时序预测</strong><span>${escHtml(attribution.timeseries?.available ? `${attribution.timeseries.side_label || '-'} / ${distributionSummaryText(attribution.timeseries.return_distribution_contract)}` : '无可用预测')}</span></div>
                     <div class="analysis-resolution-item"><strong>情绪预测</strong><span>${escHtml(attribution.sentiment?.available ? `${attribution.sentiment.side_label || '-'} / 情绪分 ${Number(attribution.sentiment.score || 0).toFixed(3)}` : '无可用预测')}</span></div>
                     <div class="analysis-resolution-item"><strong>亏损修复评估</strong><span>${escHtml(lossRepairDetail)}</span></div>
                     <div class="analysis-resolution-item"><strong>机会评分</strong><span>${escHtml(attribution.opportunity_score ? `总分 ${Number(attribution.opportunity_score.score || 0).toFixed(4)} / 门槛 ${Number(attribution.opportunity_score.min_score_required || 0).toFixed(2)} / 净收益 ${signedPctValueLabel(attribution.opportunity_score.expected_net_return_pct)}` : '无评分')}</span></div>
@@ -3724,7 +3769,7 @@ function renderAnalysisReasonModal(record) {
         <div class="analysis-flow">
             <div class="analysis-summary">
                 ${analysisMetric('专家返回', preExpertSkip.skipped ? preExpertSkip.label : `${expertCount}/${expectedCount}`, preExpertSkip.skipped || expertCount === expectedCount ? 'good' : 'warn')}
-                ${mlSignal?.available ? analysisMetric('ML盈亏', `预期 ${signedPctValueLabel(mlSignal.expected_return_pct)}`, Number(mlSignal.expected_return_pct || 0) > 0 ? 'good' : 'warn') : ''}
+                ${mlSignal?.available ? analysisMetric('ML目标期望', distributionPctLabel(mlSignalDistribution?.objective_expected_return_pct), mlSignalDistribution && Number(mlSignalDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn') : ''}
                 ${analysisMetric('交叉验证', `${completedCross}/${Number(record.cross_requested || 0)}`, unavailableCross ? 'warn' : 'good')}
                 ${analysisMetric('分析耗时', analysisDurationLabel(totalDuration), totalDuration > 60 ? 'warn' : 'muted')}
                 ${analysisMetric('最终方向', analysisActionLabel(record.final_action, record), analysisTone(record.final_action))}
@@ -4394,19 +4439,20 @@ function renderMLSignalRecent() {
                         const pred = mlPrimaryPrediction(signal) || {};
                         const longRate = Number(pred.long_win_rate || 0);
                         const shortRate = Number(pred.short_win_rate || 0);
-                        const longExpected = Number(pred.long_expected_return_pct || 0);
-                        const shortExpected = Number(pred.short_expected_return_pct || 0);
-                        const bestRate = Number(pred.best_win_rate || 0);
-                        const tone = Number(pred.best_expected_return_pct || 0) > 0 ? 'good' : Number(pred.risk_score || 0) >= 0.55 ? 'warn' : 'muted';
+                        const longDistribution = standardizedReturnDistribution(pred, 'long');
+                        const shortDistribution = standardizedReturnDistribution(pred, 'short');
+                        const bestDistribution = standardizedReturnDistribution(pred, pred.best_side);
+                        const bestObjective = Number(bestDistribution?.objective_expected_return_pct);
+                        const tone = Number.isFinite(bestObjective) && bestObjective > 0 ? 'good' : 'warn';
                         return `
                             <tr>
                                 <td style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${toBeijingTime(record.created_at)}</td>
                                 <td>${escHtml(record.symbol || '-')}</td>
                                 <td><span class="badge badge-${record.final_action || 'hold'}">${escHtml(actionLabel(record.final_action))}</span></td>
-                                <td><span class="analysis-pill analysis-pill-${tone}">${mlSideLabel(pred.best_side)} ${signedPctValueLabel(pred.best_expected_return_pct)}</span></td>
-                                <td>${signedPctValueLabel(longExpected)}<div style="font-size:10px;color:var(--text-muted);">胜率 ${pctLabel(longRate)}</div></td>
-                                <td>${signedPctValueLabel(shortExpected)}<div style="font-size:10px;color:var(--text-muted);">胜率 ${pctLabel(shortRate)}</div></td>
-                                <td style="white-space:nowrap;">${signedPctValueLabel(pred.best_expected_return_pct)}</td>
+                                <td><span class="analysis-pill analysis-pill-${tone}">${mlSideLabel(pred.best_side)} ${distributionPctLabel(bestDistribution?.objective_expected_return_pct)}</span></td>
+                                <td>${distributionPctLabel(longDistribution?.raw_expected_return_pct)}<div style="font-size:10px;color:var(--text-muted);">目标 ${distributionPctLabel(longDistribution?.objective_expected_return_pct)} · 下界 ${distributionPctLabel(longDistribution?.lower_quantile_return_pct)} · 胜率诊断 ${pctLabel(longRate)}</div></td>
+                                <td>${distributionPctLabel(shortDistribution?.raw_expected_return_pct)}<div style="font-size:10px;color:var(--text-muted);">目标 ${distributionPctLabel(shortDistribution?.objective_expected_return_pct)} · 下界 ${distributionPctLabel(shortDistribution?.lower_quantile_return_pct)} · 胜率诊断 ${pctLabel(shortRate)}</div></td>
+                                <td style="white-space:nowrap;">${distributionPctLabel(bestDistribution?.objective_expected_return_pct)}</td>
                                 <td style="max-width:260px;">${escHtml(mlDecisionAlignment(record, pred))}<div style="font-size:10px;color:var(--text-muted);margin-top:4px;">${escHtml(signal.suggestion || signal.note || '盈亏质量过滤')}</div></td>
                             </tr>`;
                     }).join('')}
@@ -4449,7 +4495,7 @@ function collectionStatusTone(status, enabled = true) {
     const value = String(status || '').toLowerCase();
     if (!enabled || value === 'disabled' || value === 'not_configured') return 'muted';
     if (['active', 'ok', 'ready', 'running', 'unknown', 'learning_only'].includes(value)) return 'good';
-    if (['heuristic_fallback_available', 'shadow_ready', 'shadow', 'empty'].includes(value)) return 'warn';
+    if (['artifact_unavailable', 'shadow_ready', 'shadow', 'empty'].includes(value)) return 'warn';
     if (['missing_dependency', 'timeout', 'warning', 'degraded', 'invalid_config', 'quarantined', 'downweighted'].includes(value)) return 'warn';
     return 'bad';
 }
@@ -4468,7 +4514,7 @@ function collectionStatusLabel(status, enabled = true) {
         invalid_status: '状态异常',
         unknown: '已连接',
         learning_only: '学习中',
-        heuristic_fallback_available: '启发式可用',
+        artifact_unavailable: '缺少模型产物',
         shadow_ready: '影子可用',
         shadow: '影子观察',
         empty: '冷启动等待',
@@ -6474,7 +6520,7 @@ function renderPlatformRuntimeCard(platformRuntime) {
                 <div>健康接口：${escHtml(runtimeEndpointSummary(platformTools.health) || '-')}</div>
                 <div>状态接口：${escHtml(runtimeEndpointSummary(platformTools.status) || '-')}</div>
                 <div>子接口：${childRows.length ? `${childAvailable}/${childRows.length} 正常` : '-'}</div>
-                <div>训练模型：${escHtml(platformTools.model_bundle_available ? '已就绪' : '未就绪/启发式可用')}</div>
+<div>训练模型：${escHtml(platformTools.model_bundle_available ? '已就绪' : '缺少模型产物')}</div>
                 ${platformTools.status && platformTools.status.error ? `<div style="color:var(--red);">状态接口：${escHtml(platformTools.status.error)}</div>` : ''}
                 <div class="server-monitor-process-list">${childHtml}</div>
             </div>
@@ -6654,7 +6700,7 @@ function renderServerModelRuntime(data, container) {
                 <div>量化工具地址：${escHtml(platformTools.api_base || '-')}</div>
                 ${platformTools.expected_platform_api_base ? `<div>期望地址：${escHtml(platformTools.expected_platform_api_base)}</div>` : ''}
                 ${platformTools.config_issue ? `<div style="color:var(--red);">配置问题：${escHtml(platformTools.config_issue)}</div>` : ''}
-                <div>训练模型：${escHtml(platformTools.model_bundle_available ? '已就绪' : '未就绪/启发式可用')}</div>
+<div>训练模型：${escHtml(platformTools.model_bundle_available ? '已就绪' : '缺少模型产物')}</div>
                 ${platformTools.status && platformTools.status.error ? `<div style="color:var(--red);">状态接口：${escHtml(platformTools.status.error)}</div>` : ''}
                 ${platformToolChildEntries.length ? `<div class="server-monitor-process-list">${platformToolChildEntries.map(([name, item]) => `
                     <div class="server-monitor-process">
@@ -9081,6 +9127,10 @@ function renderMLSignalOverview() {
     const latestRecord = records[0] || null;
     const latestSignal = latestRecord?.ml_signal || null;
     const latestPrediction = mlPrimaryPrediction(latestSignal);
+    const latestDistribution = standardizedReturnDistribution(
+        latestPrediction,
+        latestPrediction?.best_side,
+    );
     const ready = status.available === true;
     const mode = status.mode || latestSignal?.mode || 'learning_only';
     const unavailableReason = status.message || status.error || '本地 ML 模型尚未返回可用状态';
@@ -9104,7 +9154,9 @@ function renderMLSignalOverview() {
         : '暂无最近预测';
     const strongSignals = records.filter(r => {
         const pred = mlPrimaryPrediction(r.ml_signal) || {};
-        return Number(pred.best_expected_return_pct || 0) > 0 && Number(pred.profit_edge_pct || 0) > 0;
+        const distribution = standardizedReturnDistribution(pred, pred.best_side);
+        const objective = Number(distribution?.objective_expected_return_pct);
+        return Number.isFinite(objective) && objective > 0 && Number(pred.profit_edge_pct || 0) > 0;
     }).length;
 
     if (updatedEl) {
@@ -9143,8 +9195,8 @@ function renderMLSignalOverview() {
             ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, readinessTone)}
             ${mlMetricCard('PR-AUC 多/空（诊断）', prAucText, '仅观察分类器，不参与 ready、评分或晋升', 'muted')}
             ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', 'muted')}
-            ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} 预期 ${signedPctValueLabel(latestPrediction.best_expected_return_pct)}` : '等待新分析', latestPrediction ? (Number(latestPrediction.best_expected_return_pct || 0) > 0 ? 'good' : 'warn') : 'muted')}
-            ${mlMetricCard('正期望数量', `${strongSignals} / ${records.length}`, '最近记录里预期收益为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
+            ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} ${distributionSummaryText(latestDistribution)}` : '等待新分析', latestDistribution && Number(latestDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn')}
+            ${mlMetricCard('正目标期望数量', `${strongSignals} / ${records.length}`, '最近记录里标准合同目标期望为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
             ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || '-', `要求 ${readinessMetrics.required_training_data_version || '-'}`, readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
             ${mlMetricCard('训练窗口配置', samples.limit === null ? '未公开' : String(samples.limit), '这是训练数据窗口，不是收益、仓位或生产准入阈值', 'muted')}
@@ -9767,7 +9819,10 @@ function renderProfitAttributionEvidence(record) {
         type: 'ml',
         side: signals?.ml?.side || evidence.ml?.side,
         main: profitAttributionSideLabel(signals?.ml?.side || evidence.ml?.side),
-        sub: signedPctValueLabel(signals?.ml?.expected_return_pct ?? evidence.ml?.expected_return_pct),
+        sub: distributionSummaryText(
+            signals?.ml?.return_distribution_contract
+            || evidence.ml?.return_distribution_contract,
+        ),
         available: signals?.ml?.available === true || evidence.ml?.available === true,
     });
     const shadowChip = profitAttributionEvidenceStatusChip('影子', evidence.shadow, {
@@ -9785,8 +9840,9 @@ function renderProfitAttributionEvidence(record) {
             type: 'server',
             side: signals?.server_profit?.side || evidence.server_profit?.side,
             main: profitAttributionSideLabel(signals?.server_profit?.side || evidence.server_profit?.side),
-            sub: signedPctValueLabel(
-                signals?.server_profit?.expected_return_pct ?? evidence.server_profit?.expected_return_pct
+            sub: distributionSummaryText(
+                signals?.server_profit?.return_distribution_contract
+                || evidence.server_profit?.return_distribution_contract,
             ),
             available: signals?.server_profit?.available === true
                 || evidence.server_profit?.available === true,
@@ -9795,8 +9851,9 @@ function renderProfitAttributionEvidence(record) {
             type: 'timeseries',
             side: signals?.timeseries?.side || evidence.timeseries?.side,
             main: profitAttributionSideLabel(signals?.timeseries?.side || evidence.timeseries?.side),
-            sub: signedPctValueLabel(
-                signals?.timeseries?.expected_return_pct ?? evidence.timeseries?.expected_return_pct
+            sub: distributionSummaryText(
+                signals?.timeseries?.return_distribution_contract
+                || evidence.timeseries?.return_distribution_contract,
             ),
             available: signals?.timeseries?.available === true
                 || evidence.timeseries?.available === true,

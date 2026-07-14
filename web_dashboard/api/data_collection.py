@@ -196,7 +196,6 @@ def _visible_local_ai_training_status(
         return "ready"
     if available and normalized in {
         "connected_trading_disabled",
-        "heuristic_fallback_available",
     }:
         return "learning_only"
     if normalized == "unknown" and available:

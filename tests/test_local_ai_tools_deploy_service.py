@@ -144,8 +144,8 @@ def test_local_ai_tools_generated_service_adds_phase3_model_metadata() -> None:
     assert 'with_model_metadata("sentiment_analysis"' in SERVICE_CODE
     assert 'with_model_metadata("exit_advice"' in SERVICE_CODE
     assert "def regression_prediction_distribution(" in SERVICE_CODE
-    assert '"long_lower_bound_return_pct"' in SERVICE_CODE
-    assert '"short_lower_bound_return_pct"' in SERVICE_CODE
+    assert '"lower_quantile_return_pct"' in SERVICE_CODE
+    assert '"return_distribution_inputs"' in SERVICE_CODE
     assert '"prediction_quality"' in SERVICE_CODE
     assert '"training_cost_policy"' in SERVICE_CODE
 
@@ -171,10 +171,13 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
         {
             "available": True,
             "trained": False,
-            "model": "local-profit-heuristic-v1",
-            "best_side": "long",
-            "expected_return_pct": 0.42,
-            "adjusted_expected_return_pct": 0.31,
+            "model": "local-profit-artifact-required-v3",
+            "best_side": "hold",
+            "return_semantics": "gross_market_opportunity_before_execution",
+            "return_distribution_input_version": (
+                module.RETURN_DISTRIBUTION_INPUT_VERSION
+            ),
+            "return_distribution_inputs": {"long": {"production_eligible": False}},
             "loss_probability": 0.18,
             "profit_quality_score": 0.25,
         },
@@ -185,9 +188,69 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert payload["live_mutation"] is False
     assert payload["shadow_payload"]["tool"] == "profit_prediction"
     assert payload["shadow_payload"]["live_mutation"] is False
-    assert payload["shadow_payload"]["expected_return_pct"] == 0.42
-    assert payload["shadow_payload"]["adjusted_expected_return_pct"] == 0.31
+    assert payload["shadow_payload"]["return_distribution_input_version"] == (
+        module.RETURN_DISTRIBUTION_INPUT_VERSION
+    )
+    assert payload["shadow_payload"]["return_distribution_inputs"] == {
+        "long": {"production_eligible": False}
+    }
+    assert "expected_return_pct" not in payload["shadow_payload"]
+    assert "adjusted_expected_return_pct" not in payload["shadow_payload"]
     assert payload["shadow_payload"]["loss_probability"] == 0.18
+
+
+def test_generated_service_without_artifact_fails_closed_without_heuristic_returns() -> None:
+    module = ModuleType("local_ai_tools_api_no_artifact_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.FeatureRequest.model_rebuild()
+    module.load_bundle = lambda: None
+    request = module.FeatureRequest(
+        symbol="BTC/USDT",
+        features={"symbol": "BTC/USDT", "current_price": 100.0},
+    )
+
+    for payload in (module.profit_predict(request), module.timeseries_predict(request)):
+        assert payload["available"] is False
+        assert payload["trained"] is False
+        assert payload["best_side"] == "hold"
+        assert payload["prediction_quality"]["production_eligible"] is False
+        assert payload["return_distribution_input_version"] == (
+            module.RETURN_DISTRIBUTION_INPUT_VERSION
+        )
+        assert set(payload["return_distribution_inputs"]) == {"long", "short"}
+        assert all(
+            item["production_eligible"] is False
+            for item in payload["return_distribution_inputs"].values()
+        )
+        for legacy_field in (
+            "expected_return_pct",
+            "adjusted_expected_return_pct",
+            "long_expected_return_pct",
+            "short_expected_return_pct",
+        ):
+            assert legacy_field not in payload
+
+
+def test_generated_service_status_does_not_advertise_heuristic_fallback(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_no_artifact_status_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.MODEL_DIR = tmp_path
+    module.BUNDLE_PATH = tmp_path / "missing.joblib"
+    module.METADATA_PATH = tmp_path / "missing.json"
+
+    status = module._model_artifact_status()
+    endpoint = module.local_models_status()
+
+    assert status["available"] is False
+    assert status["status"] == "artifact_unavailable"
+    assert status["return_distribution_input_version"] == (
+        module.RETURN_DISTRIBUTION_INPUT_VERSION
+    )
+    assert endpoint["status"] == "artifact_unavailable"
+    assert "heuristic" not in endpoint["message"].lower()
 
 
 def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> None:
@@ -263,6 +326,13 @@ def test_trained_model_metadata_preserves_runtime_return_contract(monkeypatch) -
             "trained": True,
             "model": "trained-test-model",
             "return_semantics": "gross_market_opportunity_before_execution",
+            "return_distribution_input_version": (
+                module.RETURN_DISTRIBUTION_INPUT_VERSION
+            ),
+            "return_distribution_inputs": {
+                side: {"production_eligible": True}
+                for side in ("long", "short")
+            },
             "prediction_quality": {
                 "production_eligible": True,
                 "anomalous": False,
@@ -1087,17 +1157,31 @@ def test_local_ai_tools_transformer_classifier_uses_bert_config_when_model_type_
 
 
 def test_local_ai_tools_generated_profit_contract_has_phase3_targets() -> None:
-    assert '"adjusted_expected_return_pct": round(best_expected, 4)' in SERVICE_CODE
     assert '"loss_probability": round(loss_prob, 4)' in SERVICE_CODE
     assert '"profit_quality_score": round(quality, 4)' in SERVICE_CODE
     assert '"long_loss_probability"' in SERVICE_CODE
     assert '"short_loss_probability"' in SERVICE_CODE
-    assert '"expected_return_pct": round(best_expected, 4)' in SERVICE_CODE
     assert "long_loss_prob * 0.22" not in SERVICE_CODE
     assert "short_loss_prob * 0.22" not in SERVICE_CODE
     assert "long_profile_penalty" not in SERVICE_CODE
     assert "short_profile_penalty" not in SERVICE_CODE
     assert "quality = best_lower_bound" in SERVICE_CODE
+
+
+def test_local_ai_tools_generated_model_distribution_inputs_are_complete() -> None:
+    assert "RETURN_DISTRIBUTION_INPUT_VERSION" in SERVICE_CODE
+    assert "def model_return_distribution_input(" in SERVICE_CODE
+    for field in (
+        "raw_expected_return_pct",
+        "median_return_pct",
+        "lower_quantile_return_pct",
+        "upper_quantile_return_pct",
+        "dispersion_pct",
+        "tail_loss_probability",
+        "tail_loss_scale_pct",
+        "distribution_member_count",
+    ):
+        assert f'"{field}"' in SERVICE_CODE
 
 
 def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penalties() -> None:
@@ -1117,10 +1201,12 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
             "objective_version": module.RETURN_OBJECTIVE_VERSION,
             "label_name": module.RETURN_LABEL_NAME,
             "label_version": module.RETURN_LABEL_VERSION,
+            "cost_model_version": module.COST_MODEL_VERSION,
             "training_cost_policy": (
                 "separated_market_opportunity_and_execution_cost_tasks"
             ),
             "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
+            "tail_loss_scale_pct": {"long": 0.4, "short": 0.3},
             "artifact_persisted": True,
         },
         "long_return_model": long_model,
@@ -1158,6 +1244,7 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
         "spread": 0.08,
         "sample_count": 260,
         "distribution_ready": True,
+        "source_authority": "extra_trees_empirical_distribution",
     }
     module.predict_proba_positive = lambda model, _x: (
         0.95 if model is long_loss_model else 0.85
@@ -1170,20 +1257,31 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
         )
     )
 
-    assert payload["long_expected_return_pct"] == 0.4
-    assert payload["adjusted_long_return_pct"] == 0.4
-    assert payload["long_lower_bound_return_pct"] == 0.1
     assert payload["profit_quality_score"] == 0.1
     assert payload["long_loss_probability"] == 0.95
+    assert payload["return_distribution_input_version"] == (
+        module.RETURN_DISTRIBUTION_INPUT_VERSION
+    )
+    long_input = payload["return_distribution_inputs"]["long"]
+    assert long_input["raw_expected_return_pct"] == 0.4
+    assert long_input["median_return_pct"] == 0.4
+    assert long_input["lower_quantile_return_pct"] == 0.1
+    assert long_input["upper_quantile_return_pct"] == 0.5
+    assert long_input["dispersion_pct"] == 0.03
+    assert long_input["tail_loss_probability"] == 0.95
+    assert long_input["tail_loss_scale_pct"] == 0.4
+    assert long_input["distribution_member_count"] == 260
 
     module.regression_prediction_distribution = lambda model, _x: {
         "expected": 0.4 if model is long_model else 0.2,
         "median": 0.4 if model is long_model else 0.2,
         "lower_bound": 0.4 if model is long_model else 0.2,
+        "upper_bound": 0.4 if model is long_model else 0.2,
         "std": 0.0,
         "spread": 0.0,
         "sample_count": 260,
         "distribution_ready": False,
+        "source_authority": "extra_trees_empirical_distribution",
     }
     degenerate = module.profit_predict(
         module.FeatureRequest(
@@ -1197,6 +1295,66 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
     assert degenerate["prediction_quality"]["reason"] == (
         "current_tree_prediction_distribution_degenerate"
     )
+
+    def lower_above_expected(model: object, _x: object) -> dict[str, object]:
+        expected = 0.46 if model is long_model else 0.2
+        lower = 0.496 if model is long_model else 0.05
+        return {
+            "expected": expected,
+            "median": expected,
+            "lower_bound": lower,
+            "upper_bound": 0.6 if model is long_model else 0.3,
+            "std": 0.03,
+            "spread": 0.08,
+            "sample_count": 260,
+            "distribution_ready": True,
+            "source_authority": "extra_trees_empirical_distribution",
+        }
+
+    module.regression_prediction_distribution = lower_above_expected
+    invalid_ordering = module.profit_predict(
+        module.FeatureRequest(
+            symbol="ICP/USDT",
+            features={"symbol": "ICP/USDT", "current_price": 2.2},
+        )
+    )
+
+    invalid_long = invalid_ordering["return_distribution_inputs"]["long"]
+    assert invalid_long["raw_expected_return_pct"] == 0.46
+    assert invalid_long["lower_quantile_return_pct"] == 0.496
+    assert invalid_long["production_eligible"] is False
+    assert "lower_quantile_above_raw_expected" in invalid_long["blockers"]
+    assert invalid_ordering["prediction_quality"]["production_eligible"] is False
+    assert invalid_ordering["prediction_quality"]["reason"] == (
+        "lower_quantile_above_raw_expected"
+    )
+
+    module.regression_prediction_distribution = lambda model, _x: {
+        "expected": 0.4 if model is long_model else 0.2,
+        "median": 0.35 if model is long_model else 0.15,
+        "lower_bound": 0.1 if model is long_model else 0.05,
+        "upper_bound": 0.5 if model is long_model else 0.3,
+        "std": 0.03,
+        "spread": 0.08,
+        "sample_count": 260,
+        "distribution_ready": True,
+        "source_authority": "extra_trees_empirical_distribution",
+    }
+    bundle["profiles"] = {}
+    missing_calibration = module.profit_predict(
+        module.FeatureRequest(
+            symbol="DOGE/USDT",
+            features={"symbol": "DOGE/USDT", "current_price": 0.2},
+        )
+    )
+
+    assert missing_calibration["prediction_quality"]["production_eligible"] is False
+    assert missing_calibration["prediction_quality"]["reason"] == (
+        "actual_trade_calibration_not_ready"
+    )
+    assert missing_calibration["prediction_quality"]["blockers"] == [
+        "actual_trade_calibration_not_ready"
+    ]
 
 
 def test_local_ai_tools_generated_exit_contract_uses_only_phase3_actions() -> None:
@@ -1285,8 +1443,8 @@ def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_ta
     )
     assert '"long_model": long_model' in SERVICE_CODE
     assert '"short_model": short_model' in SERVICE_CODE
-    assert '"long_expected_return_pct": round(long_return, 4)' in SERVICE_CODE
-    assert '"short_expected_return_pct": round(short_return, 4)' in SERVICE_CODE
+    assert '"raw_expected_return_pct": finite_or_none(distribution.get("expected"))' in SERVICE_CODE
+    assert '"return_distribution_inputs": return_distribution_inputs' in SERVICE_CODE
     assert '"training_data_sha256": training_data_sha256' in SERVICE_CODE
     assert '"source_code_sha256": source_code_sha256' in SERVICE_CODE
     assert '"time_split_policy": "chronological_disjoint_decision_groups"' in SERVICE_CODE
@@ -1517,8 +1675,10 @@ def test_phase3_quant_api_remote_smoke_checks_shadow_contract() -> None:
     assert "health.get('service') == 'phase3_quant_api'" in command
     assert "health.get('root') == '/data/BB'" in command
     assert "health.get('live_mutation') is False" in command
+    assert "profit.get('trained') is True" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command
-    assert "'adjusted_expected_return_pct' in profit" in command
+    assert "profit.get('return_distribution_input_version')" in command
+    assert "profit.get('return_distribution_inputs')" in command
     assert "'loss_probability' in profit" in command
 
 

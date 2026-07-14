@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import isfinite, sqrt
+from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -25,12 +25,15 @@ from services.entry_signal_extraction import (
     safe_list,
     signal_available,
     signal_production_eligibility,
+    signal_return_distribution,
+    signal_return_distribution_eligibility,
 )
 from services.execution_cost_model import execution_cost_estimate
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
 )
+from services.return_objective import combine_production_return_distribution
 
 NormalizeSymbol = Callable[[str | None], str]
 DecisionAnnotator = Callable[[DecisionOutput], None]
@@ -43,13 +46,6 @@ def _finite(value: Any) -> float | None:
 
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values)
-
-
-def _sampling_uncertainty(values: list[float], center: float) -> float:
-    if len(values) <= 1:
-        return abs(values[0] - center) if values else 0.0
-    variance = sum((value - center) ** 2 for value in values) / (len(values) - 1)
-    return sqrt(max(variance, 0.0) / len(values))
 
 
 def _distribution_ready(
@@ -78,19 +74,6 @@ def _unique_distribution_rows(
     return unique
 
 
-def _loss_probability(payload: dict[str, Any], side: str) -> float | None:
-    candidates = (
-        payload.get(f"{side}_loss_probability"),
-        payload.get("loss_probability"),
-        payload.get("tail_loss_probability"),
-    )
-    for value in candidates:
-        number = _finite(value)
-        if number is not None:
-            return min(max(number, 0.0), 1.0)
-    return None
-
-
 @dataclass(slots=True)
 class EntryOpportunityScoringPolicy:
     """Build and rank the current production return distribution."""
@@ -108,31 +91,23 @@ class EntryOpportunityScoringPolicy:
         primary = safe_dict(predictions[0] if predictions else {})
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
-        production_eligible = bool(
+        production_claimed = bool(
             signal.get("allow_live_position_influence") is True
             and signal.get("influence_enabled") is True
             and side_policy.get("enabled") is True
-            and primary
-            and primary.get("profit_supervision_version")
-            == PROFIT_SUPERVISION_VERSION
-            and primary.get("return_semantics")
-            == "gross_market_opportunity_before_execution"
-            and primary.get(f"{side}_market_distribution_ready") is True
         )
-        value = _finite(primary.get(f"{side}_market_expected_return_pct"))
-        lower_bound = _finite(
-            primary.get(
-                f"{side}_market_lower_hinge_return_pct",
-                primary.get(f"{side}_lower_quantile_return_pct"),
-            )
+        governance = signal_production_eligibility(signal)
+        distribution_eligibility = signal_return_distribution_eligibility(
+            signal,
+            side,
         )
-        tail_probability = _finite(primary.get(f"{side}_tail_loss_probability"))
-        horizon_minutes = _finite(
-            primary.get("horizon_minutes", signal.get("primary_horizon_minutes"))
+        contract = signal_return_distribution(signal, side)
+        production_eligible = bool(
+            production_claimed
+            and governance.get("eligible") is True
+            and distribution_eligibility.get("eligible") is True
         )
-        if value is None:
-            production_eligible = False
-        observation_only = bool(not production_eligible and primary and value is not None)
+        observation_only = bool(not production_eligible and primary and contract)
         cost_distribution = safe_dict(
             safe_dict(primary.get("counterfactual_execution_cost_distribution")).get(
                 side
@@ -146,25 +121,30 @@ class EntryOpportunityScoringPolicy:
         return {
             "key": "local_ml",
             "available": bool(primary),
+            "production_claimed": production_claimed,
             "production_eligible": production_eligible,
             "observation_only": observation_only,
             "eligibility_reason": (
-                "live_influence_and_side_readiness_confirmed"
+                "standardized_distribution_and_side_readiness_confirmed"
                 if production_eligible
-                else "runtime_prediction_observation_only"
-                if observation_only
-                else "local_ml_production_governance_incomplete"
+                else str(
+                    distribution_eligibility.get("reason")
+                    or governance.get("reason")
+                    or "local_ml_production_governance_incomplete"
+                )
             ),
             "side": side,
-            "raw_market_return_pct": value,
-            "raw_return_pct": value,
-            "lower_bound_return_pct": lower_bound,
-            "loss_probability": (
-                min(max(tail_probability, 0.0), 1.0)
-                if tail_probability is not None
-                else None
+            "return_distribution_contract": contract,
+            "raw_market_return_pct": contract.get("raw_expected_return_pct"),
+            "raw_return_pct": contract.get("raw_expected_return_pct"),
+            "objective_expected_return_pct": contract.get(
+                "objective_expected_return_pct"
             ),
-            "horizon_minutes": horizon_minutes,
+            "lower_bound_return_pct": contract.get(
+                "lower_quantile_return_pct"
+            ),
+            "loss_probability": contract.get("tail_loss_probability"),
+            "horizon_minutes": contract.get("horizon_minutes"),
             "counterfactual_execution_cost_distribution": cost_distribution,
             "actual_trade_calibration": actual_calibration,
             "profit_supervision_version": primary.get(
@@ -181,53 +161,59 @@ class EntryOpportunityScoringPolicy:
         aliases: tuple[str, ...],
     ) -> dict[str, Any]:
         payload = first_tool_payload(raw, *aliases)
-        eligibility = signal_production_eligibility(payload)
-        value = _finite(
-            payload.get(
-                f"{side}_market_expected_return_pct",
-                payload.get("market_expected_return_pct"),
-            )
+        governance = signal_production_eligibility(payload)
+        distribution_eligibility = signal_return_distribution_eligibility(
+            payload,
+            side,
         )
-        lower_bound = _finite(
-            payload.get(
-                f"{side}_lower_bound_return_pct",
-                payload.get(f"{side}_lower_quantile_return_pct"),
+        contract = signal_return_distribution(payload, side)
+        production_claimed = bool(
+            signal_available(payload)
+            and str(payload.get("route_mode") or "").lower() == "live"
+            and any(
+                payload.get(field) is True
+                for field in (
+                    "live_mutation",
+                    "live_influence",
+                    "influence_enabled",
+                    "allow_live_position_influence",
+                )
             )
-        )
-        horizon_minutes = _finite(
-            payload.get("horizon_minutes", payload.get("primary_horizon_minutes"))
         )
         production_eligible = bool(
-            eligibility.get("eligible")
-            and value is not None
-            and payload.get("profit_supervision_version")
-            == PROFIT_SUPERVISION_VERSION
-            and payload.get("return_semantics")
-            == "gross_market_opportunity_before_execution"
+            production_claimed
+            and governance.get("eligible") is True
+            and distribution_eligibility.get("eligible") is True
         )
         observation_only = bool(
             not production_eligible
             and signal_available(payload)
-            and value is not None
-            and horizon_minutes is not None
-            and horizon_minutes > 0
+            and contract
         )
         return {
             "key": key,
             "available": signal_available(payload),
+            "production_claimed": production_claimed,
             "production_eligible": production_eligible,
             "observation_only": observation_only,
-            "eligibility_reason": (
-                eligibility.get("reason")
-                if not observation_only
-                else "runtime_prediction_observation_only"
+            "eligibility_reason": str(
+                distribution_eligibility.get("reason")
+                or governance.get("reason")
+                or "server_model_production_governance_incomplete"
             ),
-            "side": payload_side(payload) or "unknown",
-            "raw_market_return_pct": value,
-            "raw_return_pct": value,
-            "lower_bound_return_pct": lower_bound,
-            "loss_probability": _loss_probability(payload, side),
-            "horizon_minutes": horizon_minutes,
+            "side": side,
+            "reported_best_side": payload_side(payload) or "unknown",
+            "return_distribution_contract": contract,
+            "raw_market_return_pct": contract.get("raw_expected_return_pct"),
+            "raw_return_pct": contract.get("raw_expected_return_pct"),
+            "objective_expected_return_pct": contract.get(
+                "objective_expected_return_pct"
+            ),
+            "lower_bound_return_pct": contract.get(
+                "lower_quantile_return_pct"
+            ),
+            "loss_probability": contract.get("tail_loss_probability"),
+            "horizon_minutes": contract.get("horizon_minutes"),
             "counterfactual_execution_cost_distribution": safe_dict(
                 safe_dict(
                     payload.get("counterfactual_execution_cost_distribution")
@@ -281,44 +267,20 @@ class EntryOpportunityScoringPolicy:
                 ),
             ),
         ]
-        governed_components = [
+        selected_components = [
             component for component in components if component["production_eligible"]
         ]
-        distribution_mode = (
-            "governed_market_opportunity"
-            if governed_components
-            else "unavailable"
-        )
-        selected_components = governed_components
-        production_weight = 1.0 / len(selected_components) if selected_components else 0.0
-        for component in components:
-            component["included_in_return_distribution"] = component in selected_components
-            component["production_weight"] = (
-                production_weight if component in selected_components else 0.0
-            )
-
-        observations = [
-            float(component["raw_market_return_pct"])
-            for component in selected_components
-            if component.get("raw_market_return_pct") is not None
+        claimed_components = [
+            component for component in components if component["production_claimed"]
         ]
-        lower_bounds = [
-            float(component["lower_bound_return_pct"])
-            for component in selected_components
-            if component.get("lower_bound_return_pct") is not None
+        claimed_contracts = [
+            safe_dict(component.get("return_distribution_contract"))
+            for component in claimed_components
+            if safe_dict(component.get("return_distribution_contract"))
         ]
-        loss_probabilities = [
-            float(component["loss_probability"])
-            for component in selected_components
-            if component.get("loss_probability") is not None
-        ]
-        horizons = [
-            float(component["horizon_minutes"])
-            for component in selected_components
-            if _finite(component.get("horizon_minutes")) is not None
-            and float(component["horizon_minutes"]) > 0
-        ]
-        valid_for_seconds = min(horizons) * 60.0 if horizons else 0.0
+        input_blockers = []
+        if len(claimed_contracts) != len(claimed_components):
+            input_blockers.append("claimed_production_return_distribution_missing")
         cost_distributions = _unique_distribution_rows(
             [
                 safe_dict(component.get("counterfactual_execution_cost_distribution"))
@@ -430,53 +392,9 @@ class EntryOpportunityScoringPolicy:
                 "_slippage_upper_hinge",
             ),
         )
-        valid_calibrations: list[dict[str, Any]] = []
-        for calibration in calibrations:
-            net_distribution = safe_dict(
-                calibration.get("net_return_after_cost_pct")
-            )
-            slippage_distribution = safe_dict(calibration.get("slippage_pct"))
-            if (
-                safe_float(net_distribution.get("count"), 0.0) > 0
-                and safe_float(slippage_distribution.get("count"), 0.0) > 0
-                and _distribution_ready(
-                    net_distribution,
-                    "expected",
-                    "lower_hinge",
-                )
-                and _distribution_ready(
-                    slippage_distribution,
-                    "expected",
-                    "upper_hinge",
-                )
-            ):
-                valid_calibrations.append(calibration)
-
-        gross_return = _mean(observations) if observations else None
-        market_uncertainty = (
-            _sampling_uncertainty(observations, gross_return)
-            if observations and gross_return is not None
-            else None
-        )
-        if market_uncertainty is not None and lower_bounds:
-            market_uncertainty = max(
-                market_uncertainty,
-                gross_return - min(lower_bounds),
-            )
+        valid_calibrations = calibrations
         historical_cost_expected = (
             _mean([float(row["expected_pct"]) for row in cost_distributions])
-            if cost_distributions
-            else None
-        )
-        historical_cost_uncertainty = (
-            max(
-                max(
-                    float(row["upper_tail_pct"]) - float(row["expected_pct"]),
-                    float(row["uncertainty_pct"]),
-                    0.0,
-                )
-                for row in cost_distributions
-            )
             if cost_distributions
             else None
         )
@@ -502,105 +420,91 @@ class EntryOpportunityScoringPolicy:
             if valid_calibrations
             else None
         )
-        authoritative_slippage_expected = (
-            _mean(
-                [
-                    float(safe_dict(row.get("slippage_pct"))["expected"])
-                    for row in valid_calibrations
-                ]
-            )
-            if valid_calibrations
-            else None
+        production_distribution = combine_production_return_distribution(
+            side=side,
+            model_contracts=claimed_contracts,
+            live_execution_cost_pct=(
+                execution_cost.total_pct
+                if execution_cost.production_eligible
+                else None
+            ),
+            live_slippage_pct=(
+                execution_cost.slippage_pct
+                if execution_cost.production_eligible
+                else None
+            ),
+            counterfactual_cost_distributions=cost_distributions,
+            actual_trade_calibrations=valid_calibrations,
+            profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+            source_authority=(
+                "governed_model_contracts_live_orderbook_and_okx_position_history"
+            ),
+            input_blockers=input_blockers,
         )
-        authoritative_slippage_upper_hinge = (
-            max(
-                float(safe_dict(row.get("slippage_pct"))["upper_hinge"])
-                for row in valid_calibrations
-            )
-            if valid_calibrations
-            else None
+        combination_ready = production_distribution.get("production_eligible") is True
+        distribution_mode = (
+            "governed_market_opportunity" if combination_ready else "unavailable"
         )
-        live_cost_pct = execution_cost.total_pct if execution_cost.production_eligible else None
-        slippage_tail_excess = (
-            max(authoritative_slippage_upper_hinge - execution_cost.slippage_pct, 0.0)
-            if authoritative_slippage_upper_hinge is not None
-            and execution_cost.production_eligible
-            else None
+        production_weight = (
+            1.0 / len(selected_components)
+            if combination_ready and selected_components
+            else 0.0
         )
-        actual_calibration_uncertainty = (
-            max(actual_net_expected - actual_net_lower_hinge, 0.0)
-            if actual_net_expected is not None and actual_net_lower_hinge is not None
-            else None
+        for component in components:
+            included = bool(combination_ready and component in selected_components)
+            component["included_in_return_distribution"] = included
+            component["production_weight"] = production_weight if included else 0.0
+            if component in selected_components and not combination_ready:
+                component["production_eligible"] = False
+                component["observation_only"] = True
+                component["eligibility_reason"] = (
+                    "aggregate_return_distribution_contract_blocked"
+                )
+
+        gross_distribution = safe_dict(
+            production_distribution.get("gross_market_distribution")
         )
-        combination_ready = bool(
-            observations
-            and valid_for_seconds > 0
-            and execution_cost.production_eligible
-            and cost_distributions
-            and valid_calibrations
-            and gross_return is not None
-            and market_uncertainty is not None
-            and historical_cost_uncertainty is not None
-            and slippage_tail_excess is not None
-            and actual_calibration_uncertainty is not None
+        transformations = safe_dict(production_distribution.get("transformations"))
+        gross_return = _finite(gross_distribution.get("raw_expected_return_pct"))
+        valid_for_seconds = (
+            float(production_distribution["horizon_minutes"]) * 60.0
+            if _finite(production_distribution.get("horizon_minutes")) is not None
+            else 0.0
         )
         expected_net = (
-            gross_return - live_cost_pct - slippage_tail_excess
+            _finite(production_distribution.get("raw_expected_return_pct"))
             if combination_ready
-            and gross_return is not None
-            and live_cost_pct is not None
-            and slippage_tail_excess is not None
-            else None
-        )
-        uncertainty = (
-            market_uncertainty
-            + historical_cost_uncertainty
-            + actual_calibration_uncertainty
-            if combination_ready
-            and market_uncertainty is not None
-            and historical_cost_uncertainty is not None
-            and actual_calibration_uncertainty is not None
             else None
         )
         return_lcb = (
-            expected_net - uncertainty
-            if expected_net is not None and uncertainty is not None
-            else None
-        )
-        downside_observations = [max(-value, 0.0) for value in observations]
-        expected_loss = (
-            _mean(downside_observations)
-            + max(-(actual_net_expected or 0.0), 0.0)
+            _finite(production_distribution.get("objective_expected_return_pct"))
             if combination_ready
             else None
         )
-        score = (
-            return_lcb - expected_loss
-            if return_lcb is not None and expected_loss is not None
-            else float("-inf")
+        uncertainty = (
+            _finite(production_distribution.get("uncertainty_penalty_pct"))
+            if combination_ready
+            else None
         )
-        loss_probability = _mean(loss_probabilities) if loss_probabilities else 1.0
-        tail_risk = max(loss_probabilities) if loss_probabilities else 1.0
+        expected_loss = (
+            _finite(production_distribution.get("tail_loss_penalty_pct"))
+            if combination_ready
+            else None
+        )
+        score = return_lcb if return_lcb is not None else float("-inf")
+        loss_probability = _finite(
+            production_distribution.get("tail_loss_probability")
+        )
+        tail_risk = loss_probability
         profit_quality = (
-            expected_net / max(expected_loss + uncertainty, 1e-12)
+            return_lcb / max((expected_loss or 0.0) + (uncertainty or 0.0), 1e-12)
             if expected_net is not None
-            and expected_loss is not None
-            and uncertainty is not None
-            and expected_net > 0
+            and return_lcb is not None
+            and return_lcb > 0
             else None
         )
         generated_at = datetime.now(UTC).isoformat()
-        blockers: list[str] = []
-        if not observations:
-            blockers.append("governed_market_opportunity_distribution_missing")
-        if valid_for_seconds <= 0:
-            blockers.append("governed_market_horizon_missing")
-        if not execution_cost.production_eligible:
-            blockers.append("live_execution_cost_distribution_missing")
-        if not cost_distributions:
-            blockers.append("counterfactual_execution_cost_distribution_missing")
-        if not valid_calibrations:
-            blockers.append("authoritative_realized_return_or_slippage_distribution_missing")
+        blockers = list(production_distribution.get("blockers") or [])
         provenance = {
             "source": (
                 "governed_market_live_cost_and_okx_trade_calibration"
@@ -610,7 +514,7 @@ class EntryOpportunityScoringPolicy:
             "observation_window": (
                 "current_governed_model_outputs_orderbook_and_authoritative_trade_history"
             ),
-            "sample_count": len(observations),
+            "sample_count": len(selected_components) if combination_ready else 0,
             "generated_at": generated_at,
             "strategy_version": PRODUCTION_RETURN_COMBINATION_VERSION,
             "fallback_reason": ",".join(blockers),
@@ -646,10 +550,15 @@ class EntryOpportunityScoringPolicy:
             "profit_quality_ratio": (
                 round(profit_quality, 8) if profit_quality is not None else None
             ),
-            "server_profit_loss_probability": round(loss_probability, 8),
-            "tail_risk_score": round(tail_risk, 8),
-            "score_policy": "realized_net_lcb_minus_calibrated_downside",
+            "server_profit_loss_probability": (
+                round(loss_probability, 8) if loss_probability is not None else None
+            ),
+            "tail_risk_score": (
+                round(tail_risk, 8) if tail_risk is not None else None
+            ),
+            "score_policy": "standardized_objective_expected_return",
             "return_distribution_mode": distribution_mode,
+            "return_distribution_contract": production_distribution,
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
             "return_combination_version": PRODUCTION_RETURN_COMBINATION_VERSION,
             "execution_cost": execution_cost.to_dict(),
@@ -664,33 +573,25 @@ class EntryOpportunityScoringPolicy:
                 "model_gross_pct": (
                     round(gross_return, 8) if gross_return is not None else None
                 ),
-                "live_execution_cost_pct": (
-                    round(live_cost_pct, 8) if live_cost_pct is not None else None
+                "live_execution_cost_pct": transformations.get(
+                    "live_execution_cost_pct"
                 ),
                 "historical_counterfactual_cost_expected_pct": (
                     round(historical_cost_expected, 8)
                     if historical_cost_expected is not None
                     else None
                 ),
-                "historical_counterfactual_cost_uncertainty_pct": (
-                    round(historical_cost_uncertainty, 8)
-                    if historical_cost_uncertainty is not None
-                    else None
+                "historical_counterfactual_cost_uncertainty_pct": transformations.get(
+                    "counterfactual_cost_uncertainty_pct"
                 ),
-                "authoritative_slippage_expected_pct": (
-                    round(authoritative_slippage_expected, 8)
-                    if authoritative_slippage_expected is not None
-                    else None
+                "authoritative_slippage_expected_pct": transformations.get(
+                    "authoritative_slippage_expected_pct"
                 ),
-                "authoritative_slippage_upper_hinge_pct": (
-                    round(authoritative_slippage_upper_hinge, 8)
-                    if authoritative_slippage_upper_hinge is not None
-                    else None
+                "authoritative_slippage_upper_hinge_pct": transformations.get(
+                    "authoritative_slippage_upper_hinge_pct"
                 ),
-                "authoritative_slippage_tail_excess_pct": (
-                    round(slippage_tail_excess, 8)
-                    if slippage_tail_excess is not None
-                    else None
+                "authoritative_slippage_tail_excess_pct": transformations.get(
+                    "authoritative_slippage_tail_excess_pct"
                 ),
                 "authoritative_realized_net_expected_pct": (
                     round(actual_net_expected, 8)
@@ -702,19 +603,18 @@ class EntryOpportunityScoringPolicy:
                     if actual_net_lower_hinge is not None
                     else None
                 ),
-                "market_uncertainty_pct": (
-                    round(market_uncertainty, 8)
-                    if market_uncertainty is not None
-                    else None
+                "market_uncertainty_pct": transformations.get(
+                    "market_dispersion_pct"
                 ),
-                "actual_trade_calibration_uncertainty_pct": (
-                    round(actual_calibration_uncertainty, 8)
-                    if actual_calibration_uncertainty is not None
-                    else None
+                "actual_trade_calibration_uncertainty_pct": transformations.get(
+                    "actual_trade_calibration_uncertainty_pct"
                 ),
                 "counterfactual_cost_distribution_count": len(cost_distributions),
                 "authoritative_trade_calibration_count": len(valid_calibrations),
-                "cost_deduction_count": 1 if combination_ready else 0,
+                "cost_deduction_count": transformations.get(
+                    "cost_deduction_count",
+                    0,
+                ),
                 "observed_not_in_formula": {
                     "ai_confidence": safe_float(decision.confidence, 0.0),
                     "experts": safe_list(raw.get("experts")),

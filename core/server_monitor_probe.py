@@ -479,7 +479,7 @@ def render_server_monitor_probe(
                 "status": (
                     "active"
                     if service_available and trained_models_available
-                    else "heuristic_fallback_available"
+                    else "artifact_unavailable"
                     if service_available
                     else "endpoint_unavailable"
                 ),

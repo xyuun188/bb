@@ -41,10 +41,8 @@ from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     first_tool_payload,
+    signal_return_distribution,
     unwrap_tool_payload,
-)
-from services.entry_signal_extraction import (
-    expected_return_pct as signal_expected_return_pct,
 )
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
@@ -845,14 +843,22 @@ def _extract_primary_ml(raw: dict[str, Any]) -> dict[str, Any]:
     predictions = _safe_list(ml.get("predictions"))
     primary = _safe_dict(predictions[0] if predictions else {})
     best_side = _model_side_from_payload(primary)
+    distribution = signal_return_distribution(ml, best_side)
     return {
         "available": bool(ml.get("available")) if ml else False,
         "side": best_side,
         "side_label": _side_label(best_side),
-        "expected_return_pct": _safe_float(
-            primary.get("best_expected_return_pct"), ml.get("expected_return_pct", 0.0)
-        )
-        or 0.0,
+        "raw_expected_return_pct": distribution.get("raw_expected_return_pct"),
+        "objective_expected_return_pct": distribution.get(
+            "objective_expected_return_pct"
+        ),
+        "lower_quantile_return_pct": distribution.get(
+            "lower_quantile_return_pct"
+        ),
+        "dispersion_pct": distribution.get("dispersion_pct"),
+        "tail_loss_probability": distribution.get("tail_loss_probability"),
+        "tail_loss_scale_pct": distribution.get("tail_loss_scale_pct"),
+        "return_distribution_contract": distribution,
         "profit_edge_pct": _safe_float(
             primary.get("profit_edge_pct"), ml.get("profit_edge_pct", 0.0)
         )
@@ -871,12 +877,30 @@ def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
     profit_side = signal_payload_side(profit)
     ts_side = signal_payload_side(ts)
     sentiment_side = signal_payload_side(sentiment)
+    profit_distribution = signal_return_distribution(profit, profit_side)
+    ts_distribution = signal_return_distribution(ts, ts_side)
     return {
         "profit": {
             "available": signal_payload_available(profit),
             "side": profit_side,
             "side_label": _side_label(profit_side),
-            "expected_return_pct": signal_expected_return_pct(profit, profit_side),
+            "raw_expected_return_pct": profit_distribution.get(
+                "raw_expected_return_pct"
+            ),
+            "objective_expected_return_pct": profit_distribution.get(
+                "objective_expected_return_pct"
+            ),
+            "lower_quantile_return_pct": profit_distribution.get(
+                "lower_quantile_return_pct"
+            ),
+            "dispersion_pct": profit_distribution.get("dispersion_pct"),
+            "tail_loss_probability": profit_distribution.get(
+                "tail_loss_probability"
+            ),
+            "tail_loss_scale_pct": profit_distribution.get(
+                "tail_loss_scale_pct"
+            ),
+            "return_distribution_contract": profit_distribution,
             "profit_quality_score": _safe_float(profit.get("profit_quality_score"), 0.0) or 0.0,
             "loss_probability": _safe_float(profit.get(f"{profit_side}_loss_probability"), 0.0)
             or 0.0,
@@ -886,7 +910,21 @@ def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
             "available": signal_payload_available(ts),
             "side": ts_side,
             "side_label": _side_label(ts_side),
-            "expected_return_pct": signal_expected_return_pct(ts, ts_side),
+            "raw_expected_return_pct": ts_distribution.get(
+                "raw_expected_return_pct"
+            ),
+            "objective_expected_return_pct": ts_distribution.get(
+                "objective_expected_return_pct"
+            ),
+            "lower_quantile_return_pct": ts_distribution.get(
+                "lower_quantile_return_pct"
+            ),
+            "dispersion_pct": ts_distribution.get("dispersion_pct"),
+            "tail_loss_probability": ts_distribution.get(
+                "tail_loss_probability"
+            ),
+            "tail_loss_scale_pct": ts_distribution.get("tail_loss_scale_pct"),
+            "return_distribution_contract": ts_distribution,
             "horizon_minutes": ts.get("horizon_minutes") or ts.get("primary_horizon_minutes"),
             "model": ts.get("model") or "",
         },
@@ -896,7 +934,6 @@ def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
             "side_label": _side_label(sentiment_side),
             "score": _safe_float(sentiment.get("score"), sentiment.get("sentiment_score", 0.0))
             or 0.0,
-            "expected_return_pct": signal_expected_return_pct(sentiment, sentiment_side),
             "summary": sentiment.get("summary") or sentiment.get("reason") or "",
             "model": sentiment.get("model") or "",
         },

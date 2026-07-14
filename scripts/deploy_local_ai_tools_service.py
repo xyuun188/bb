@@ -95,6 +95,7 @@ RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
 RETURN_LABEL_VERSION = "2026-07-14.separated-supervision.v2"
 COST_MODEL_VERSION = "okx_live_cost_and_authoritative_slippage_distribution_v2"
 PROFIT_SUPERVISION_VERSION = "2026-07-14.separated-profit-supervision.v1"
+RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
@@ -156,6 +157,8 @@ _STATUS_METADATA_KEYS = (
     "feature_count",
     "horizons",
     "profile_count",
+    "training_data_sha256",
+    "source_code_sha256",
     "objective_name",
     "objective_version",
     "label_name",
@@ -571,7 +574,7 @@ def _model_artifact_status() -> dict[str, Any]:
     metadata_exists = bool(metadata_stat.get("exists"))
     metadata_ready = bool(metadata)
     model_bundle_available = bool(bundle_exists and metadata_ready)
-    status = "ready" if model_bundle_available else "heuristic_fallback_available"
+    status = "ready" if model_bundle_available else "artifact_unavailable"
     if bundle_exists and not metadata_ready:
         status = "metadata_missing"
     return {
@@ -579,6 +582,7 @@ def _model_artifact_status() -> dict[str, Any]:
         "model_bundle_available": model_bundle_available,
         "trained_models_available": model_bundle_available,
         "status": status,
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
         "model_path": str(BUNDLE_PATH),
         "metadata_path": str(METADATA_PATH),
         "bundle_file": bundle_stat,
@@ -619,6 +623,7 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
             "spread": 0.0,
             "sample_count": 0,
             "distribution_ready": False,
+            "source_authority": "regressor_point_prediction_without_members",
         }
     transformed = imputer.transform(x)
     values = np.asarray([float(tree.predict(transformed)[0]) for tree in trees], dtype=float)
@@ -633,6 +638,7 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
             "spread": 0.0,
             "sample_count": 0,
             "distribution_ready": False,
+            "source_authority": "regressor_point_prediction_without_members",
         }
     ordered = np.sort(values)
     lower_tail_count = max(int(math.sqrt(ordered.size)), 1)
@@ -651,6 +657,7 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
         "spread": spread,
         "sample_count": int(values.size),
         "distribution_ready": spread > numerical_resolution,
+        "source_authority": "extra_trees_empirical_distribution",
     }
 
 
@@ -666,6 +673,126 @@ def execution_cost_distribution_contract(
         "distribution_member_count": distribution.get("sample_count"),
         "distribution_ready": distribution.get("distribution_ready") is True,
         "source_authority": "shadow_counterfactual_live_microstructure",
+    }
+
+
+def model_return_distribution_input(
+    distribution: dict[str, Any],
+    *,
+    side: str,
+    horizon_minutes: int,
+    tail_loss_probability: Any,
+    tail_loss_scale_pct: Any,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    def finite_or_none(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else None
+        except (TypeError, ValueError):
+            return None
+
+    values = {
+        "raw_expected_return_pct": finite_or_none(distribution.get("expected")),
+        "median_return_pct": finite_or_none(distribution.get("median")),
+        "lower_quantile_return_pct": finite_or_none(distribution.get("lower_bound")),
+        "upper_quantile_return_pct": finite_or_none(distribution.get("upper_bound")),
+        "dispersion_pct": finite_or_none(distribution.get("std")),
+        "tail_loss_probability": finite_or_none(tail_loss_probability),
+        "tail_loss_scale_pct": finite_or_none(tail_loss_scale_pct),
+    }
+    try:
+        member_count = int(distribution.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        member_count = 0
+    blockers: list[str] = []
+    if distribution.get("distribution_ready") is not True:
+        blockers.append(
+            "current_tree_prediction_distribution_degenerate"
+            if member_count > 0
+            else "current_tree_prediction_distribution_missing"
+        )
+    blockers.extend(
+        f"{field}_missing"
+        for field, value in values.items()
+        if value is None
+    )
+    if side not in {"long", "short"}:
+        blockers.append("distribution_side_invalid")
+    if int(horizon_minutes or 0) <= 0:
+        blockers.append("distribution_horizon_missing")
+    if member_count <= 0:
+        blockers.append("distribution_members_missing")
+    expected = values["raw_expected_return_pct"]
+    median = values["median_return_pct"]
+    lower = values["lower_quantile_return_pct"]
+    upper = values["upper_quantile_return_pct"]
+    dispersion = values["dispersion_pct"]
+    tail_probability = values["tail_loss_probability"]
+    tail_scale = values["tail_loss_scale_pct"]
+    if expected is not None and lower is not None and lower > expected:
+        blockers.append("lower_quantile_above_raw_expected")
+    if lower is not None and median is not None and lower > median:
+        blockers.append("lower_quantile_above_median")
+    if median is not None and upper is not None and median > upper:
+        blockers.append("median_above_upper_quantile")
+    if dispersion is not None and dispersion < 0:
+        blockers.append("return_dispersion_negative")
+    if tail_probability is not None and not 0.0 <= tail_probability <= 1.0:
+        blockers.append("tail_loss_probability_out_of_bounds")
+    if tail_scale is not None and tail_scale < 0:
+        blockers.append("tail_loss_scale_negative")
+    for field, expected_version in (
+        ("objective_version", RETURN_OBJECTIVE_VERSION),
+        ("label_version", RETURN_LABEL_VERSION),
+        ("cost_model_version", COST_MODEL_VERSION),
+        ("profit_supervision_version", PROFIT_SUPERVISION_VERSION),
+    ):
+        if str(metadata.get(field) or "") != expected_version:
+            blockers.append(f"return_distribution_{field}_mismatch")
+    if not str(distribution.get("source_authority") or "").strip():
+        blockers.append("return_distribution_source_authority_missing")
+    blockers = list(dict.fromkeys(blockers))
+    return {
+        "side": side,
+        "horizon_minutes": int(horizon_minutes),
+        **values,
+        "distribution_member_count": member_count,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "source_authority": distribution.get("source_authority"),
+        "objective_version": metadata.get("objective_version"),
+        "label_version": metadata.get("label_version"),
+        "cost_model_version": metadata.get("cost_model_version"),
+        "profit_supervision_version": metadata.get("profit_supervision_version"),
+        "production_eligible": not blockers,
+        "blockers": blockers,
+    }
+
+
+def unavailable_return_distribution_inputs(
+    *,
+    horizon_minutes: int,
+    source_authority: str,
+) -> dict[str, dict[str, Any]]:
+    missing_distribution = {
+        "expected": None,
+        "median": None,
+        "lower_bound": None,
+        "upper_bound": None,
+        "std": None,
+        "sample_count": 0,
+        "source_authority": source_authority,
+    }
+    return {
+        side: model_return_distribution_input(
+            missing_distribution,
+            side=side,
+            horizon_minutes=horizon_minutes,
+            tail_loss_probability=None,
+            tail_loss_scale_pct=None,
+            metadata={},
+        )
+        for side in ("long", "short")
     }
 
 
@@ -1808,12 +1935,13 @@ def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
         "training_cost_policy",
         "artifact_persisted",
         "prediction_quality",
+        "return_semantics",
+        "return_distribution_input_version",
+        "return_distribution_inputs",
         "fallback_reason",
         "best_side",
         "side",
         "action",
-        "expected_return_pct",
-        "adjusted_expected_return_pct",
         "loss_probability",
         "profit_quality_score",
         "expected_move_pct",
@@ -1883,6 +2011,15 @@ def with_model_metadata(
         ):
             if key in metadata:
                 payload.setdefault(key, metadata.get(key))
+        distribution_inputs = payload.get("return_distribution_inputs")
+        distribution_inputs = (
+            distribution_inputs if isinstance(distribution_inputs, dict) else {}
+        )
+        distribution_inputs_ready = all(
+            isinstance(distribution_inputs.get(side), dict)
+            and distribution_inputs[side].get("production_eligible") is True
+            for side in ("long", "short")
+        )
         contract_ready = bool(
             payload.get("objective_name") == RETURN_OBJECTIVE_NAME
             and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
@@ -1894,6 +2031,9 @@ def with_model_metadata(
             == PROFIT_SUPERVISION_VERSION
             and payload.get("return_semantics")
             == "gross_market_opportunity_before_execution"
+            and payload.get("return_distribution_input_version")
+            == RETURN_DISTRIBUTION_INPUT_VERSION
+            and distribution_inputs_ready
             and payload.get("artifact_persisted") is True
         )
         prediction_quality = payload.get("prediction_quality")
@@ -1907,7 +2047,16 @@ def with_model_metadata(
         if not contract_ready:
             prediction_quality["production_eligible"] = False
             prediction_quality["anomalous"] = True
-            prediction_quality["reason"] = "runtime_return_artifact_contract_incomplete"
+            contract_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(prediction_quality.get("blockers") or []),
+                        "runtime_return_artifact_contract_incomplete",
+                    ]
+                )
+            )
+            prediction_quality["blockers"] = contract_blockers
+            prediction_quality["reason"] = contract_blockers[0]
     if not isinstance(payload.get("shadow_payload"), dict):
         payload["shadow_payload"] = _shadow_payload(tool, payload)
     return payload
@@ -2428,7 +2577,7 @@ def local_models_status() -> dict[str, Any]:
         if artifact_status.get("status") == "metadata_missing":
             message = "Trained bundle exists but metadata is missing; rebuild training artifacts."
         else:
-            message = "No trained local quant bundle found; heuristic fallback is active."
+            message = "No trained local quant bundle found; return inference is unavailable."
     return {
         **artifact_status,
         "message": message,
@@ -2738,6 +2887,10 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "long": {"source": "cost_complete_training_negative_return_lower_hinge", "value": long_tail_boundary},
             "short": {"source": "cost_complete_training_negative_return_lower_hinge", "value": short_tail_boundary},
         },
+        "tail_loss_scale_pct": {
+            "long": abs(float(long_tail_boundary)),
+            "short": abs(float(short_tail_boundary)),
+        },
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "label_name": RETURN_LABEL_NAME,
@@ -2829,6 +2982,8 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
     if bundle:
         try:
             x = [model_x(features)]
+            metadata = bundle.get("metadata") or {}
+            horizon_minutes = int(feature_row(features)["horizon_minutes"])
             long_distribution = regression_prediction_distribution(bundle["long_return_model"], x)
             short_distribution = regression_prediction_distribution(bundle["short_return_model"], x)
             long_cost_distribution = regression_prediction_distribution(
@@ -2841,6 +2996,9 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             short_expected = float(short_distribution["expected"])
             long_loss_prob = predict_proba_positive(bundle["long_loss_model"], x)
             short_loss_prob = predict_proba_positive(bundle["short_loss_model"], x)
+            tail_scales = metadata.get("tail_loss_scale_pct") or {}
+            long_tail_scale = tail_scales.get("long")
+            short_tail_scale = tail_scales.get("short")
             profiles = bundle.get("profiles") or {}
             profile_symbol = req.symbol or features.get("symbol") or ""
             long_profile = _profile_for_side(
@@ -2855,6 +3013,30 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             )
             long_lower_bound = float(long_distribution["lower_bound"])
             short_lower_bound = float(short_distribution["lower_bound"])
+            long_return_input = model_return_distribution_input(
+                long_distribution,
+                side="long",
+                horizon_minutes=horizon_minutes,
+                tail_loss_probability=long_loss_prob,
+                tail_loss_scale_pct=long_tail_scale,
+                metadata=metadata,
+            )
+            short_return_input = model_return_distribution_input(
+                short_distribution,
+                side="short",
+                horizon_minutes=horizon_minutes,
+                tail_loss_probability=short_loss_prob,
+                tail_loss_scale_pct=short_tail_scale,
+                metadata=metadata,
+            )
+            return_input_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(long_return_input.get("blockers") or []),
+                        *(short_return_input.get("blockers") or []),
+                    ]
+                )
+            )
             best_side = "long" if long_expected >= short_expected else "short"
             best_expected = long_expected if best_side == "long" else short_expected
             edge = abs(long_expected - short_expected)
@@ -2868,27 +3050,45 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 and int((profile.get("slippage_pct") or {}).get("count") or 0) > 0
                 for profile in (long_profile, short_profile)
             )
+            prediction_blockers = list(return_input_blockers)
+            if not long_cost_distribution["distribution_ready"] or not short_cost_distribution[
+                "distribution_ready"
+            ]:
+                prediction_blockers.append(
+                    "counterfactual_execution_cost_distribution_not_ready"
+                )
+            if not actual_calibration_ready:
+                prediction_blockers.append("actual_trade_calibration_not_ready")
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    long_expected,
+                    short_expected,
+                    long_lower_bound,
+                    short_lower_bound,
+                )
+            ):
+                prediction_blockers.append("return_distribution_values_not_finite")
+            prediction_blockers = list(dict.fromkeys(prediction_blockers))
+            prediction_ready = not prediction_blockers
             return _attach_baseline_only_shadow("profit_prediction", {
                 "available": True,
                 "trained": True,
                 "model": "local-profit-trained-v2",
                 "symbol": req.symbol,
                 "best_side": best_side,
-                "long_market_expected_return_pct": round(long_expected, 4),
-                "short_market_expected_return_pct": round(short_expected, 4),
-                "long_expected_return_pct": round(long_expected, 4),
-                "short_expected_return_pct": round(short_expected, 4),
-                "adjusted_long_return_pct": round(long_expected, 4),
-                "adjusted_short_return_pct": round(short_expected, 4),
-                "long_lower_bound_return_pct": round(long_lower_bound, 4),
-                "short_lower_bound_return_pct": round(short_lower_bound, 4),
                 "horizon_minutes": int(feature_row(features)["horizon_minutes"]),
-                "expected_return_pct": round(best_expected, 4),
-                "adjusted_expected_return_pct": round(best_expected, 4),
                 "profit_edge_pct": round(edge, 4),
                 "profit_quality_score": round(quality, 4),
                 "return_semantics": "gross_market_opportunity_before_execution",
                 "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_distribution_input_version": (
+                    RETURN_DISTRIBUTION_INPUT_VERSION
+                ),
+                "return_distribution_inputs": {
+                    "long": long_return_input,
+                    "short": short_return_input,
+                },
                 "counterfactual_execution_cost_distribution": {
                     "long": execution_cost_distribution_contract(
                         long_cost_distribution
@@ -2907,53 +3107,15 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "short_loss_probability": round(short_loss_prob, 4),
                 "loss_probability": round(loss_prob, 4),
                 "prediction_quality": {
-                    "production_eligible": bool(
-                        long_distribution["distribution_ready"]
-                        and short_distribution["distribution_ready"]
-                        and long_cost_distribution["distribution_ready"]
-                        and short_cost_distribution["distribution_ready"]
-                        and actual_calibration_ready
-                        and all(
-                            math.isfinite(value)
-                            for value in (
-                                long_expected,
-                                short_expected,
-                                long_lower_bound,
-                                short_lower_bound,
-                            )
-                        )
-                    ),
-                    "anomalous": not bool(
-                        long_distribution["distribution_ready"]
-                        and short_distribution["distribution_ready"]
-                        and long_cost_distribution["distribution_ready"]
-                        and short_cost_distribution["distribution_ready"]
-                        and actual_calibration_ready
-                        and all(
-                            math.isfinite(value)
-                            for value in (
-                                long_expected,
-                                short_expected,
-                                long_lower_bound,
-                                short_lower_bound,
-                            )
-                        )
-                    ),
+                    "production_eligible": prediction_ready,
+                    "anomalous": not prediction_ready,
                     "reason": (
                         "separated_market_cost_and_actual_calibration_ready"
-                        if long_distribution["distribution_ready"]
-                        and short_distribution["distribution_ready"]
-                        and long_cost_distribution["distribution_ready"]
-                        and short_cost_distribution["distribution_ready"]
-                        and actual_calibration_ready
-                        else (
-                            "current_tree_prediction_distribution_degenerate"
-                            if long_distribution["sample_count"] > 0
-                            and short_distribution["sample_count"] > 0
-                            else "current_tree_prediction_distribution_missing"
-                        )
+                        if prediction_ready
+                        else prediction_blockers[0]
                     ),
                     "source": "current_extra_trees_prediction_distribution",
+                    "blockers": prediction_blockers,
                     "long": long_distribution,
                     "short": short_distribution,
                 },
@@ -2968,39 +3130,31 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
     else:
         fallback_error = None
 
-    long_score, short_score = side_scores(features)
-    atr_pct = abs(f(features, "atr_14")) / max(f(features, "current_price", f(features, "close", 0.0)), 1e-9)
-    volatility = abs(f(features, "volatility_20"))
-    spread = abs(f(features, "spread_pct"))
-    liquidity_penalty = max(0.0, spread - 0.03) * 0.8
-    risk_penalty = volatility * 0.45 + atr_pct * 0.35 + liquidity_penalty
-
-    long_expected = long_score - risk_penalty
-    short_expected = short_score - risk_penalty
-    best_side = "long" if long_expected >= short_expected else "short"
-    best_expected = long_expected if best_side == "long" else short_expected
-    edge = abs(long_expected - short_expected)
-    loss_prob = clamp((risk_penalty + max(-best_expected, 0.0)) / 2.0, 0.0, 1.0)
-    quality = max(best_expected, 0.0) + edge * 0.35 - risk_penalty * 0.5
+    fallback_reason = fallback_error or "trained_profit_model_unavailable"
+    horizon_minutes = int(feature_row(features)["horizon_minutes"])
     return _attach_baseline_only_shadow("profit_prediction", {
-        "available": True,
+        "available": False,
         "trained": False,
-        "model": "local-profit-heuristic-v1",
+        "model": "local-profit-artifact-required-v3",
         "symbol": req.symbol,
-        "best_side": best_side,
-        "long_expected_return_pct": round(long_expected, 4),
-        "short_expected_return_pct": round(short_expected, 4),
-        "expected_return_pct": round(best_expected, 4),
-        "adjusted_expected_return_pct": round(best_expected, 4),
-        "profit_edge_pct": round(edge, 4),
-        "profit_quality_score": round(quality, 4),
-        "loss_probability": round(loss_prob, 4),
-        "long_loss_probability": round(clamp((risk_penalty + max(-long_expected, 0.0)) / 2.0, 0.0, 1.0), 4),
-        "short_loss_probability": round(clamp((risk_penalty + max(-short_expected, 0.0)) / 2.0, 0.0, 1.0), 4),
-        "risk_penalty": round(risk_penalty, 4),
+        "best_side": "hold",
+        "side": "hold",
+        "horizon_minutes": horizon_minutes,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+        "return_distribution_inputs": unavailable_return_distribution_inputs(
+            horizon_minutes=horizon_minutes,
+            source_authority="artifact_unavailable",
+        ),
+        "prediction_quality": {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": fallback_reason,
+            "blockers": [fallback_reason],
+        },
         "fallback_error": fallback_error,
-        "note": "Fee-after-return local signal; win rate is diagnostic only.",
-    }, kind="profit", features=features, fallback_reason=fallback_error or "trained_profit_model_unavailable")
+        "note": "A persisted governed artifact is required before return inference.",
+    }, kind="profit", features=features, fallback_reason=fallback_reason)
 
 
 @app.post("/timeseries/predict")
@@ -3010,6 +3164,8 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     if bundle:
         predictions = []
         try:
+            metadata = bundle.get("metadata") or {}
+            tail_scales = metadata.get("tail_loss_scale_pct") or {}
             profiles = bundle.get("profiles") or {}
             profile_symbol = req.symbol or features.get("symbol") or ""
             actual_calibration = {
@@ -3039,30 +3195,64 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 )
                 long_return = float(long_distribution["expected"])
                 short_return = float(short_distribution["expected"])
+                long_loss_probability = predict_proba_positive(
+                    bundle["long_loss_model"],
+                    x,
+                )
+                short_loss_probability = predict_proba_positive(
+                    bundle["short_loss_model"],
+                    x,
+                )
                 best_side = "long" if long_return >= short_return else "short"
-                best_return = long_return if best_side == "long" else short_return
+                return_distribution_inputs = {
+                    "long": model_return_distribution_input(
+                        long_distribution,
+                        side="long",
+                        horizon_minutes=int(horizon),
+                        tail_loss_probability=long_loss_probability,
+                        tail_loss_scale_pct=tail_scales.get("long"),
+                        metadata=metadata,
+                    ),
+                    "short": model_return_distribution_input(
+                        short_distribution,
+                        side="short",
+                        horizon_minutes=int(horizon),
+                        tail_loss_probability=short_loss_probability,
+                        tail_loss_scale_pct=tail_scales.get("short"),
+                        metadata=metadata,
+                    ),
+                }
+                return_input_blockers = list(
+                    dict.fromkeys(
+                        [
+                            *(return_distribution_inputs["long"].get("blockers") or []),
+                            *(return_distribution_inputs["short"].get("blockers") or []),
+                        ]
+                    )
+                )
+                return_inputs_ready = bool(
+                    return_distribution_inputs["long"].get("production_eligible")
+                    is True
+                    and return_distribution_inputs["short"].get(
+                        "production_eligible"
+                    )
+                    is True
+                    and not return_input_blockers
+                )
                 predictions.append({
                     "horizon_minutes": int(horizon),
-                    "long_market_expected_return_pct": round(long_return, 4),
-                    "short_market_expected_return_pct": round(short_return, 4),
-                    "long_expected_return_pct": round(long_return, 4),
-                    "short_expected_return_pct": round(short_return, 4),
-                    "long_lower_bound_return_pct": round(
-                        float(long_distribution["lower_bound"]), 4
-                    ),
-                    "short_lower_bound_return_pct": round(
-                        float(short_distribution["lower_bound"]), 4
-                    ),
-                    "long_uncertainty_pct": round(float(long_distribution["std"]), 4),
-                    "short_uncertainty_pct": round(float(short_distribution["std"]), 4),
                     "prediction_sample_count": min(
                         int(long_distribution["sample_count"]),
                         int(short_distribution["sample_count"]),
                     ),
                     "prediction_distribution_ready": bool(
-                        long_distribution["distribution_ready"]
-                        and short_distribution["distribution_ready"]
+                        return_inputs_ready
                     ),
+                    "prediction_distribution_blockers": return_input_blockers,
+                    "return_distribution_input_version": (
+                        RETURN_DISTRIBUTION_INPUT_VERSION
+                    ),
+                    "return_distribution_inputs": return_distribution_inputs,
                     "counterfactual_execution_cost_distribution": {
                         "long": execution_cost_distribution_contract(
                             long_cost_distribution
@@ -3076,24 +3266,43 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     },
                     "actual_trade_calibration": actual_calibration,
                     "best_side": best_side,
-                    "expected_return_pct": round(best_return, 4),
-                    "expected_move_pct": round(best_return, 4),
                     "direction": "up" if best_side == "long" else "down",
                     "samples": int(item.get("samples") or 0),
                     "return_semantics": "gross_market_opportunity_before_execution",
                 })
-            if predictions:
+            eligible_predictions = [
+                item
+                for item in predictions
+                if item.get("prediction_distribution_ready") is True
+            ]
+            if eligible_predictions:
                 primary = max(
-                    predictions,
+                    eligible_predictions,
                     key=lambda r: max(
-                        float(r["long_lower_bound_return_pct"]),
-                        float(r["short_lower_bound_return_pct"]),
+                        float(
+                            r["return_distribution_inputs"]["long"][
+                                "lower_quantile_return_pct"
+                            ]
+                        ),
+                        float(
+                            r["return_distribution_inputs"]["short"][
+                                "lower_quantile_return_pct"
+                            ]
+                        ),
                     ),
                 )
                 best_side = str(primary["best_side"])
                 edge = abs(
-                    float(primary["long_expected_return_pct"])
-                    - float(primary["short_expected_return_pct"])
+                    float(
+                        primary["return_distribution_inputs"]["long"][
+                            "raw_expected_return_pct"
+                        ]
+                    )
+                    - float(
+                        primary["return_distribution_inputs"]["short"][
+                            "raw_expected_return_pct"
+                        ]
+                    )
                 )
                 confidence = clamp(edge / 0.8, 0.0, 1.0)
                 primary_cost_distribution = primary[
@@ -3119,6 +3328,16 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     is True
                     for side in ("long", "short")
                 )
+                prediction_blockers = list(
+                    primary.get("prediction_distribution_blockers") or []
+                )
+                if not cost_distribution_ready:
+                    prediction_blockers.append(
+                        "counterfactual_execution_cost_distribution_not_ready"
+                    )
+                if not actual_calibration_ready:
+                    prediction_blockers.append("actual_trade_calibration_not_ready")
+                prediction_blockers = list(dict.fromkeys(prediction_blockers))
                 payload = with_model_metadata("time_series_prediction", {
                     "available": True,
                     "trained": True,
@@ -3128,21 +3347,16 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "best_side": best_side,
                     "side": best_side,
                     "direction": primary["direction"],
-                    "expected_move_pct": primary["expected_move_pct"],
-                    "expected_return_pct": primary["expected_return_pct"],
-                    "market_expected_return_pct": primary["expected_return_pct"],
-                    "long_expected_return_pct": primary["long_expected_return_pct"],
-                    "short_expected_return_pct": primary["short_expected_return_pct"],
-                    "long_lower_bound_return_pct": primary[
-                        "long_lower_bound_return_pct"
-                    ],
-                    "short_lower_bound_return_pct": primary[
-                        "short_lower_bound_return_pct"
-                    ],
                     "horizon_minutes": primary["horizon_minutes"],
                     "profit_edge_pct": round(edge, 4),
                     "return_semantics": "gross_market_opportunity_before_execution",
                     "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                    "return_distribution_input_version": primary[
+                        "return_distribution_input_version"
+                    ],
+                    "return_distribution_inputs": primary[
+                        "return_distribution_inputs"
+                    ],
                     "counterfactual_execution_cost_distribution": (
                         primary_cost_distribution
                     ),
@@ -3154,17 +3368,22 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                             "prediction_distribution_ready"
                         ]
                         and cost_distribution_ready
-                        and actual_calibration_ready,
+                        and actual_calibration_ready
+                        and not prediction_blockers,
                         "anomalous": not (
                             primary["prediction_distribution_ready"]
                             and cost_distribution_ready
                             and actual_calibration_ready
+                            and not prediction_blockers
                         ),
                         "reason": (
                             "separated_market_cost_and_actual_calibration_ready"
                             if primary["prediction_distribution_ready"]
                             and cost_distribution_ready
                             and actual_calibration_ready
+                            and not prediction_blockers
+                            else prediction_blockers[0]
+                            if prediction_blockers
                             else (
                                 "current_tree_prediction_distribution_degenerate"
                                 if primary["prediction_sample_count"] > 0
@@ -3173,31 +3392,36 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                         ),
                         "source": "current_horizon_extra_trees_prediction_distribution",
                         "sample_count": primary["prediction_sample_count"],
+                        "blockers": prediction_blockers,
                     },
                 }, features=features)
                 return _attach_timeseries_specialist_shadow(payload, features=features)
         except Exception:
             pass
 
-    returns = np.array([f(features, "returns_1"), f(features, "returns_5"), f(features, "returns_20")], dtype=float)
-    weights = np.array([0.20, 0.35, 0.45], dtype=float)
-    forecast = float(np.dot(returns, weights))
-    vol = max(abs(f(features, "volatility_20")), 1e-6)
-    confidence = clamp(abs(forecast) / (vol * 1.8 + 1e-6), 0.0, 1.0)
-    direction = "up" if forecast > 0 else "down" if forecast < 0 else "flat"
-    best_side = "long" if direction == "up" else "short" if direction == "down" else "hold"
+    horizon_minutes = int(feature_row(features)["horizon_minutes"])
     return with_model_metadata("time_series_prediction", {
-        "available": True,
+        "available": False,
         "trained": False,
-        "model": "local-timeseries-ensemble-v1",
-        "architecture": "lightweight_momentum_fallback",
+        "model": "local-timeseries-artifact-required-v3",
+        "architecture": "persisted_distribution_artifact_required",
         "symbol": req.symbol,
-        "best_side": best_side,
-        "side": best_side,
-        "direction": direction,
-        "expected_move_pct": round(forecast * 100.0, 4),
-        "expected_return_pct": round(forecast * 100.0, 4),
-        "confidence": round(confidence, 4),
+        "best_side": "hold",
+        "side": "hold",
+        "direction": "flat",
+        "horizon_minutes": horizon_minutes,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+        "return_distribution_inputs": unavailable_return_distribution_inputs(
+            horizon_minutes=horizon_minutes,
+            source_authority="artifact_unavailable",
+        ),
+        "prediction_quality": {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": "trained_timeseries_model_unavailable",
+            "blockers": ["trained_timeseries_model_unavailable"],
+        },
     }, features=features, fallback_reason="trained_timeseries_model_unavailable")
 
 
@@ -3210,6 +3434,8 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     sequence_model = (bundle or {}).get("deep_sequence_model") or {}
     close_sequence, sequence_reason, sequence_source = _timeseries_close_sequence(features)
     volume_sequence = features.get("volume_sequence") or features.get("recent_volumes")
+    metadata = (bundle or {}).get("metadata") or {}
+    horizon_minutes = int(feature_row(features)["horizon_minutes"])
     try:
         torch_expected = (
             None
@@ -3219,10 +3445,48 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
         if torch_expected is not None:
             long_expected, short_expected = torch_expected
             best_side = "long" if long_expected >= short_expected else "short"
-            best_expected = long_expected if best_side == "long" else short_expected
             edge = abs(long_expected - short_expected)
             confidence = clamp(edge / 0.8, 0.0, 1.0)
             direction = "up" if best_side == "long" else "down"
+            point_distributions = {
+                "long": {
+                    "expected": long_expected,
+                    "median": long_expected,
+                    "lower_bound": None,
+                    "upper_bound": None,
+                    "std": None,
+                    "sample_count": 0,
+                    "source_authority": "torch_point_prediction_without_distribution",
+                },
+                "short": {
+                    "expected": short_expected,
+                    "median": short_expected,
+                    "lower_bound": None,
+                    "upper_bound": None,
+                    "std": None,
+                    "sample_count": 0,
+                    "source_authority": "torch_point_prediction_without_distribution",
+                },
+            }
+            return_distribution_inputs = {
+                side: model_return_distribution_input(
+                    point_distributions[side],
+                    side=side,
+                    horizon_minutes=horizon_minutes,
+                    tail_loss_probability=None,
+                    tail_loss_scale_pct=None,
+                    metadata=metadata,
+                )
+                for side in ("long", "short")
+            }
+            prediction_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(return_distribution_inputs["long"].get("blockers") or []),
+                        *(return_distribution_inputs["short"].get("blockers") or []),
+                    ]
+                )
+            )
             return _attach_timeseries_specialist_shadow({
                 "available": True,
                 "trained": True,
@@ -3232,10 +3496,13 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "best_side": best_side,
                 "side": best_side,
                 "direction": direction,
-                "expected_move_pct": round(best_expected, 4),
-                "expected_return_pct": round(best_expected, 4),
-                "long_expected_return_pct": round(long_expected, 4),
-                "short_expected_return_pct": round(short_expected, 4),
+                "horizon_minutes": horizon_minutes,
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_distribution_input_version": (
+                    RETURN_DISTRIBUTION_INPUT_VERSION
+                ),
+                "return_distribution_inputs": return_distribution_inputs,
                 "profit_edge_pct": round(edge, 4),
                 "confidence": round(confidence, 4),
                 "sample_count": int(torch_patch_model.get("samples") or 0),
@@ -3245,18 +3512,52 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "status": "trained_torch_sequence_model",
                 "sequence_length": len(close_sequence),
                 "sequence_source": sequence_source,
+                "prediction_quality": {
+                    "production_eligible": False,
+                    "anomalous": True,
+                    "reason": prediction_blockers[0],
+                    "blockers": prediction_blockers,
+                },
             }, features=features)
         long_model = sequence_model.get("long_model")
         short_model = sequence_model.get("short_model")
         if long_model and short_model and not sequence_reason:
             x = [sequence_features(close_sequence, volume_sequence)]
-            long_expected = float(long_model.predict(x)[0])
-            short_expected = float(short_model.predict(x)[0])
+            long_distribution = regression_prediction_distribution(long_model, x)
+            short_distribution = regression_prediction_distribution(short_model, x)
+            long_expected = float(long_distribution["expected"])
+            short_expected = float(short_distribution["expected"])
             best_side = "long" if long_expected >= short_expected else "short"
-            expected = long_expected if best_side == "long" else short_expected
             edge = abs(long_expected - short_expected)
             confidence = clamp(edge / 0.8, 0.0, 1.0)
             direction = "up" if best_side == "long" else "down"
+            tail_scales = metadata.get("tail_loss_scale_pct") or {}
+            return_distribution_inputs = {
+                "long": model_return_distribution_input(
+                    long_distribution,
+                    side="long",
+                    horizon_minutes=horizon_minutes,
+                    tail_loss_probability=None,
+                    tail_loss_scale_pct=tail_scales.get("long"),
+                    metadata=metadata,
+                ),
+                "short": model_return_distribution_input(
+                    short_distribution,
+                    side="short",
+                    horizon_minutes=horizon_minutes,
+                    tail_loss_probability=None,
+                    tail_loss_scale_pct=tail_scales.get("short"),
+                    metadata=metadata,
+                ),
+            }
+            prediction_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(return_distribution_inputs["long"].get("blockers") or []),
+                        *(return_distribution_inputs["short"].get("blockers") or []),
+                    ]
+                )
+            )
             return _attach_timeseries_specialist_shadow({
                 "available": True,
                 "trained": True,
@@ -3266,10 +3567,13 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "best_side": best_side,
                 "side": best_side,
                 "direction": direction,
-                "expected_move_pct": round(expected, 4),
-                "expected_return_pct": round(expected, 4),
-                "long_expected_return_pct": round(long_expected, 4),
-                "short_expected_return_pct": round(short_expected, 4),
+                "horizon_minutes": horizon_minutes,
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_distribution_input_version": (
+                    RETURN_DISTRIBUTION_INPUT_VERSION
+                ),
+                "return_distribution_inputs": return_distribution_inputs,
                 "profit_edge_pct": round(edge, 4),
                 "confidence": round(confidence, 4),
                 "sample_count": int(sequence_model.get("samples") or 0),
@@ -3279,6 +3583,12 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 "status": "trained_sequence_model",
                 "sequence_length": len(close_sequence),
                 "sequence_source": sequence_source,
+                "prediction_quality": {
+                    "production_eligible": False,
+                    "anomalous": True,
+                    "reason": prediction_blockers[0],
+                    "blockers": prediction_blockers,
+                },
             }, features=features)
     except Exception:
         pass
@@ -3355,15 +3665,7 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
     else:
         label = "neutral"
         risk = "normal"
-    if trained_expected is not None:
-        best_side = (
-            "long"
-            if float(trained_long_expected or 0.0) >= float(trained_short_expected or 0.0)
-            else "short"
-        )
-    else:
-        best_side = "long" if label == "positive" else "short" if label == "negative" else "hold"
-    expected_from_sentiment = round(trained_expected, 4) if trained_expected is not None else None
+    best_side = "long" if label == "positive" else "short" if label == "negative" else "hold"
     return with_model_metadata("sentiment_analysis", {
         "available": True,
         "trained": trained_expected is not None,
@@ -3374,18 +3676,7 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
         "side": best_side,
         "label": label,
         "score": round(score, 4),
-        "expected_return_pct": expected_from_sentiment,
-        "expected_return_from_sentiment_pct": expected_from_sentiment,
-        "long_expected_return_pct": (
-            round(float(trained_long_expected), 4)
-            if trained_long_expected is not None
-            else None
-        ),
-        "short_expected_return_pct": (
-            round(float(trained_short_expected), 4)
-            if trained_short_expected is not None
-            else None
-        ),
+        "return_calibration_observation_only": bool(trained_expected is not None),
         "text_sentiment_score": round(text_score, 4) if text_score is not None else None,
         "risk_level": risk,
         "mentions": int(mentions),
@@ -3695,9 +3986,11 @@ def _remote_smoke_command() -> str:
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
         "assert health.get('live_mutation') is False, health\n"
+        "assert profit.get('trained') is True, profit\n"
         "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"
         "assert profit.get('live_mutation') is False, profit\n"
-        "assert 'adjusted_expected_return_pct' in profit, profit\n"
+        "assert profit.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', profit\n"
+        "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
         "assert 'loss_probability' in profit, profit\n"
         "assert exit_advice.get('action') == 'hold', exit_advice\n"
         "assert exit_advice.get('no_matching_position') is True, exit_advice\n"

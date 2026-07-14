@@ -337,23 +337,26 @@ class _Classifier:
 
 
 class _Regressor:
-    def __init__(self, prediction: float) -> None:
+    def __init__(
+        self,
+        prediction: float,
+        *,
+        tree_predictions: tuple[float, ...] | None = None,
+    ) -> None:
         self.prediction = prediction
         spread = max(abs(prediction) * 0.01, 0.001)
+        member_predictions = tree_predictions or (
+            prediction - spread,
+            prediction + spread,
+        )
         self.named_steps = {
             "imputer": SimpleNamespace(transform=lambda values: values),
             "model": SimpleNamespace(
                 estimators_=[
                     SimpleNamespace(
-                        predict=lambda _values, value=prediction - spread: np.array(
-                            [value]
-                        )
-                    ),
-                    SimpleNamespace(
-                        predict=lambda _values, value=prediction + spread: np.array(
-                            [value]
-                        )
-                    ),
+                        predict=lambda _values, value=value: np.array([value])
+                    )
+                    for value in member_predictions
                 ]
             ),
         }
@@ -1367,10 +1370,11 @@ def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration
 
     prediction = service.predict({"current_price": 100.0, "spread_pct": 0.01}, horizons=(30,))
     primary = prediction["predictions"][0]
+    distributions = primary["return_distribution_contract"]
 
     assert primary["best_side"] == "short"
-    assert primary["long_expected_return_pct"] == pytest.approx(-9.0)
-    assert primary["short_expected_return_pct"] == pytest.approx(9.0)
+    assert distributions["long"]["raw_expected_return_pct"] == pytest.approx(-9.0)
+    assert distributions["short"]["raw_expected_return_pct"] == pytest.approx(9.0)
 
 
 def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
@@ -1432,18 +1436,19 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
 
     prediction = service.predict({"current_price": 100.0, "spread_pct": 0.01}, horizons=(30,))
     primary = prediction["predictions"][0]
+    distributions = primary["return_distribution_contract"]
 
     assert primary["best_side"] == "long"
-    assert primary["long_expected_return_pct"] == pytest.approx(0.3)
-    assert primary["short_expected_return_pct"] == pytest.approx(0.3)
-    assert primary["long_risk_adjusted_market_opportunity_pct"] == pytest.approx(
+    assert distributions["long"]["raw_expected_return_pct"] == pytest.approx(0.3)
+    assert distributions["short"]["raw_expected_return_pct"] == pytest.approx(0.3)
+    assert distributions["long"]["objective_expected_return_pct"] == pytest.approx(
         0.279
     )
-    assert primary["short_risk_adjusted_market_opportunity_pct"] == pytest.approx(
+    assert distributions["short"]["objective_expected_return_pct"] == pytest.approx(
         0.198
     )
-    assert primary["short_tail_loss_probability"] == pytest.approx(0.55)
-    assert primary["best_tail_loss_probability"] == pytest.approx(0.10)
+    assert distributions["short"]["tail_loss_probability"] == pytest.approx(0.55)
+    assert distributions["long"]["tail_loss_probability"] == pytest.approx(0.10)
 
 
 @pytest.mark.asyncio
@@ -1833,6 +1838,8 @@ def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> No
         {
             "long_classifier": _Classifier(0.84),
             "short_classifier": _Classifier(0.20),
+            "long_tail_classifier": _Classifier(0.10),
+            "short_tail_classifier": _Classifier(0.10),
             "long_regressor": _Regressor(0.24),
             "short_regressor": _Regressor(0.02),
             "long_cost_regressor": _Regressor(0.08),
@@ -1847,6 +1854,43 @@ def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> No
     assert prediction["predictions"][0]["best_side"] == "long"
     assert prediction["predictions"][0]["ml_influence_enabled"] is True
     assert prediction["predictions"][0]["profit_signal"] is True
+
+
+def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    service = _service_with_metadata(metadata)
+    service._bundle.update(
+        {
+            "long_classifier": _Classifier(0.8),
+            "short_classifier": _Classifier(0.2),
+            "long_tail_classifier": _Classifier(0.1),
+            "short_tail_classifier": _Classifier(0.1),
+            "long_regressor": _Regressor(
+                0.46,
+                tree_predictions=(0.496, 0.51),
+            ),
+            "short_regressor": _Regressor(
+                0.2,
+                tree_predictions=(0.22, 0.23),
+            ),
+            "long_cost_regressor": _Regressor(0.08),
+            "short_cost_regressor": _Regressor(0.08),
+        }
+    )
+
+    prediction = service.predict(
+        {"symbol": "ICP/USDT", "current_price": 5.0, "atr_14": 0.2},
+        horizons=(30,),
+    )
+    primary = prediction["predictions"][0]
+    long_distribution = primary["return_distribution_contract"]["long"]
+
+    assert long_distribution["raw_expected_return_pct"] == pytest.approx(0.46)
+    assert long_distribution["lower_quantile_return_pct"] == pytest.approx(0.496)
+    assert long_distribution["production_eligible"] is False
+    assert "lower_quantile_above_raw_expected" in long_distribution["blockers"]
+    assert prediction["allow_live_position_influence"] is False
+    assert prediction["prediction_quality"]["production_eligible"] is False
 
 
 def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_influence() -> None:

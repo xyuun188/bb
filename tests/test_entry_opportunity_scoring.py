@@ -10,10 +10,13 @@ from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
 )
 from services.return_objective import (
+    COST_MODEL_VERSION,
+    RETURN_DISTRIBUTION_CONTRACT_VERSION,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
+    standardized_return_distribution,
 )
 
 
@@ -21,6 +24,32 @@ def _scorer() -> EntryOpportunityScoringPolicy:
     return EntryOpportunityScoringPolicy(
         normalize_symbol=lambda value: str(value or ""),
         annotate_decision_source=lambda _decision: None,
+    )
+
+
+def _return_distribution(
+    side: str,
+    expected: float,
+    *,
+    horizon_minutes: int = 30,
+) -> dict:
+    return standardized_return_distribution(
+        side=side,
+        horizon_minutes=horizon_minutes,
+        raw_expected_return_pct=expected,
+        median_return_pct=expected,
+        lower_quantile_return_pct=expected - 0.1,
+        upper_quantile_return_pct=expected + 0.1,
+        dispersion_pct=0.1,
+        tail_loss_probability=0.2 if side == "long" else 0.3,
+        tail_loss_scale_pct=0.1,
+        distribution_member_count=32,
+        return_semantics="gross_market_opportunity_before_execution",
+        source_authority="test_tree_empirical_distribution",
+        objective_version=RETURN_OBJECTIVE_VERSION,
+        label_version=RETURN_LABEL_VERSION,
+        cost_model_version=COST_MODEL_VERSION,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
     )
 
 
@@ -43,6 +72,12 @@ def _live_payload(*, side: str, long_return: float, short_return: float) -> dict
         "best_side": side,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "return_semantics": "gross_market_opportunity_before_execution",
+        "return_distribution_contract_version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+        "return_distribution_contract": {
+            "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+            "long": _return_distribution("long", long_return),
+            "short": _return_distribution("short", short_return),
+        },
         "long_market_expected_return_pct": long_return,
         "short_market_expected_return_pct": short_return,
         "long_expected_return_pct": long_return,
@@ -96,12 +131,41 @@ def _trade_calibration(side: str) -> dict:
 def _live_ml() -> dict:
     return {
         "available": True,
+        "route_mode": "live",
+        "live_influence": True,
         "allow_live_position_influence": True,
         "influence_enabled": True,
+        "promotion_ready": True,
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "prediction_quality": {
+            "production_eligible": True,
+            "anomalous": False,
+        },
+        "return_distribution_contract_version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+        "return_distribution_contract": {
+            "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+            "long": _return_distribution("long", 0.8),
+            "short": _return_distribution("short", -0.2),
+        },
         "readiness": {"allow_live_position_influence": True},
         "influence_policy": {"long": {"enabled": True}, "short": {"enabled": True}},
         "predictions": [
             {
+                "best_side": "long",
+                "return_distribution_contract_version": (
+                    RETURN_DISTRIBUTION_CONTRACT_VERSION
+                ),
+                "return_distribution_contract": {
+                    "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+                    "long": _return_distribution("long", 0.8),
+                    "short": _return_distribution("short", -0.2),
+                },
                 "long_market_expected_return_pct": 0.8,
                 "short_market_expected_return_pct": -0.2,
                 "long_expected_return_pct": 0.8,
@@ -181,10 +245,8 @@ def test_live_models_use_equal_empirical_observations_and_live_cost() -> None:
     assert all(component["production_eligible"] for component in components)
     assert opportunity["expected_gross_return_pct"] == pytest.approx(0.8)
     assert opportunity["expected_net_return_pct"] < 0.8
-    assert score == pytest.approx(
-        opportunity["return_lcb_pct"] - opportunity["expected_loss_pct"]
-    )
-    assert opportunity["score_policy"] == "realized_net_lcb_minus_calibrated_downside"
+    assert score == pytest.approx(opportunity["return_lcb_pct"])
+    assert opportunity["score_policy"] == "standardized_objective_expected_return"
     assert opportunity["return_combination_version"] == PRODUCTION_RETURN_COMBINATION_VERSION
     breakdown = opportunity["expected_net_breakdown"]
     assert breakdown["cost_deduction_count"] == 1
@@ -446,3 +508,71 @@ def test_missing_production_return_models_fails_closed() -> None:
     assert opportunity["production_eligible"] is False
     assert opportunity["expected_net_return_pct"] is None
     assert opportunity["policy_provenance"]["sample_count"] == 0
+
+
+def test_icp_lower_quantile_above_point_blocks_entire_production_distribution() -> None:
+    decision = _decision()
+    decision.symbol = "ICP/USDT"
+    decision.raw_response["ml_signal"] = {}
+    profit = decision.raw_response["local_ai_tools"]["profit_prediction"]
+    timeseries = decision.raw_response["local_ai_tools"]["time_series_prediction"]
+    timeseries["route_mode"] = "shadow_observation"
+    contract = profit["return_distribution_contract"]["long"]
+    contract["raw_expected_return_pct"] = 0.46
+    contract["lower_quantile_return_pct"] = 0.496
+    contract["production_eligible"] = True
+    contract["blockers"] = []
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert isinf(score) and score < 0
+    assert opportunity["production_eligible"] is False
+    assert "lower_quantile_above_raw_expected" in opportunity[
+        "return_distribution_contract"
+    ]["blockers"]
+    assert all(
+        component["production_weight"] == 0.0
+        for component in opportunity["expected_net_breakdown"]["components"]
+    )
+
+
+def test_doge_single_governed_source_keeps_model_distribution_uncertainty() -> None:
+    decision = _decision()
+    decision.symbol = "DOGE/USDT"
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"]["time_series_prediction"][
+        "route_mode"
+    ] = "shadow_observation"
+    profit = decision.raw_response["local_ai_tools"]["profit_prediction"]
+    for side in ("long", "short"):
+        profit["actual_trade_calibration"][side]["symbol"] = "DOGE/USDT"
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    contract = opportunity["return_distribution_contract"]
+    assert score == pytest.approx(opportunity["return_lcb_pct"])
+    assert opportunity["production_eligible"] is True
+    assert contract["gross_market_distribution"]["model_count"] == 1
+    assert contract["gross_market_distribution"]["dispersion_pct"] > 0
+    assert opportunity["return_uncertainty_pct"] > 0
+
+
+def test_mismatched_model_horizons_make_all_sources_observation_only() -> None:
+    decision = _decision()
+    timeseries = decision.raw_response["local_ai_tools"]["time_series_prediction"]
+    timeseries["return_distribution_contract"]["long"]["horizon_minutes"] = 60
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert isinf(score) and score < 0
+    assert opportunity["production_eligible"] is False
+    assert "model_distribution_horizon_minutes_mismatch" in opportunity[
+        "return_distribution_contract"
+    ]["blockers"]
+    assert all(
+        component["production_eligible"] is False
+        for component in opportunity["expected_net_breakdown"]["components"]
+    )

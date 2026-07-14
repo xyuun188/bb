@@ -27,10 +27,8 @@ from services.dynamic_exit_policy import assess_dynamic_exit
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     signal_production_eligible,
+    signal_return_distribution,
     unwrap_tool_payload,
-)
-from services.entry_signal_extraction import (
-    expected_return_pct as signal_expected_return_pct,
 )
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
@@ -940,7 +938,11 @@ class EnsembleCoordinator:
     def _local_expected_return(self, payload: dict[str, Any], side: str) -> float:
         if not isinstance(payload, dict):
             return 0.0
-        return self._safe_float(signal_expected_return_pct(payload, side), 0.0)
+        distribution = signal_return_distribution(payload, side)
+        return self._safe_float(
+            distribution.get("objective_expected_return_pct"),
+            0.0,
+        )
 
 
 

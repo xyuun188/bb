@@ -216,6 +216,29 @@ def test_opportunity_score_ui_prefers_expected_net_return() -> None:
     assert "原始" in script
 
 
+def test_model_distribution_ui_reads_only_standardized_contract_fields() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function standardizedReturnDistribution" in script
+    assert "function distributionSummaryText" in script
+    for field in (
+        "raw_expected_return_pct",
+        "objective_expected_return_pct",
+        "lower_quantile_return_pct",
+        "dispersion_pct",
+        "tail_loss_probability",
+        "tail_loss_scale_pct",
+    ):
+        assert field in script
+    assert "best_expected_return_pct" not in script
+    assert "pred.long_expected_return_pct" not in script
+    assert "pred.short_expected_return_pct" not in script
+    assert "sentiment.expected_return_from_sentiment_pct" not in script
+    assert "heuristic_fallback_available" not in script
+
+
 def test_opportunity_score_execution_state_uses_final_status() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
