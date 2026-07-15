@@ -6357,7 +6357,7 @@ class TradingService:
             ml_result: dict[str, Any] = {}
             local_tools_result: dict[str, Any] = {}
             try:
-                ml_result = await self.ml_signal_service.maybe_auto_train()
+                ml_result = await self._run_local_ml_training_subprocess()
                 if ml_result.get("trained"):
                     logger.info(
                         "local ML signal model auto-trained",
@@ -6390,6 +6390,75 @@ class TradingService:
                 if retry_due
                 else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
             )
+
+    async def _run_local_ml_training_subprocess(
+        self,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "run_local_ml_auto_train.py"),
+        ]
+        if force:
+            command.append("--force")
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(PROJECT_ROOT),
+            env=os.environ.copy(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
+            )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return {
+                "trained": False,
+                "reason": "timeout",
+                "error": "isolated local ML training exceeded its scheduler lease",
+                "training_process_isolated": True,
+            }
+
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return {
+                "trained": False,
+                "reason": "error",
+                "error": (
+                    safe_error_text(stderr.decode("utf-8", errors="replace"), limit=180)
+                    or safe_error_text(exc, limit=180)
+                ),
+                "training_process_isolated": True,
+            }
+        result = dict(payload) if isinstance(payload, dict) else {
+            "trained": False,
+            "reason": "error",
+            "error": "isolated local ML training response was not an object",
+        }
+        if process.returncode != 0 and str(result.get("reason") or "") != "error":
+            result.update(
+                {
+                    "trained": False,
+                    "reason": "error",
+                    "error": safe_error_text(
+                        stderr.decode("utf-8", errors="replace"),
+                        limit=180,
+                    ),
+                }
+            )
+        result["training_process_isolated"] = True
+        return result
 
     async def _maybe_train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
         state_store = self._model_training_state()
@@ -6501,7 +6570,6 @@ class TradingService:
             )
         server_shadow_count = int((status or {}).get("shadow_sample_count") or 0)
         server_trade_count = int((status or {}).get("trade_sample_count") or 0)
-        completed_shadow_total = await self._completed_shadow_backtest_total()
         previous_completed_shadow_total = int(
             (status or {}).get("last_trained_completed_shadow_sample_count")
             or (status or {}).get("completed_shadow_sample_count")
@@ -6511,9 +6579,17 @@ class TradingService:
         )
 
         if not force:
-            from scripts.train_local_ai_tools_models import _completed_trade_sample_count
-
-            completed_trade_total = await _completed_trade_sample_count()
+            cursor_result = await self._run_local_ai_tools_training_cursor_subprocess()
+            if str(cursor_result.get("reason") or "") != "cursor_probe_complete":
+                return cursor_result
+            completed_shadow_total = self._safe_int(
+                cursor_result.get("completed_shadow_sample_count"),
+                0,
+            )
+            completed_trade_total = self._safe_int(
+                cursor_result.get("completed_trade_sample_count"),
+                0,
+            )
             previous_completed_trade_total = int(
                 (status or {}).get("last_trained_completed_trade_sample_count")
                 or (status or {}).get("completed_trade_sample_count")
@@ -6537,6 +6613,7 @@ class TradingService:
                 "trade_cursor_source": "last_trained_completed_trade_sample_count",
                 "trade_cursor_policy": "clean_training_view_only",
                 "process_boundary": "dedicated_training_subprocess",
+                "cursor_process_isolated": True,
                 "shadow_training_view_rebased": shadow_training_view_rebased,
             }
             if status_probe_error:
@@ -6650,6 +6727,11 @@ class TradingService:
                 process.communicate(),
                 timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
             )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
         except TimeoutError:
             process.kill()
             await process.wait()
@@ -6676,6 +6758,64 @@ class TradingService:
             "trained": False,
             "reason": "invalid_training_response",
         }
+
+    async def _run_local_ai_tools_training_cursor_subprocess(self) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "run_local_ai_tools_training_cursors.py"),
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(PROJECT_ROOT),
+            env=os.environ.copy(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
+            )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return {
+                "trained": False,
+                "reason": "timeout",
+                "error": "isolated Local AI cursor probe exceeded its scheduler lease",
+                "training_process_isolated": True,
+            }
+        if process.returncode != 0:
+            return {
+                "trained": False,
+                "reason": "error",
+                "error": safe_error_text(
+                    stderr.decode("utf-8", errors="replace"),
+                    limit=180,
+                ),
+                "training_process_isolated": True,
+            }
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return {
+                "trained": False,
+                "reason": "error",
+                "error": safe_error_text(exc, limit=180),
+                "training_process_isolated": True,
+            }
+        result = dict(payload) if isinstance(payload, dict) else {
+            "trained": False,
+            "reason": "error",
+            "error": "isolated Local AI cursor response was not an object",
+        }
+        result["training_process_isolated"] = True
+        return result
 
     async def _completed_shadow_backtest_total(self) -> int:
         async with get_session_ctx() as session:

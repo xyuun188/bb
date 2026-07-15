@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -20,6 +21,88 @@ def _report(status: str = "ok") -> dict:
         "requires_attention": status != "ok",
         "issue_ledger": {"summary": {"unresolved": 0 if status == "ok" else 1}},
     }
+
+
+@pytest.mark.asyncio
+async def test_async_main_persists_final_authoritative_reconciliation_report(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    generated_at = "2026-07-15T10:00:00+00:00"
+    final_report = {**_report(), "generated_at": generated_at}
+
+    async def fake_run(**_kwargs) -> dict:
+        return {
+            "after_reconciliation": {
+                "status": "ok",
+                "requires_attention": False,
+            },
+            "after_report": final_report,
+            "order_sync_error": None,
+        }
+
+    async def fake_close_db() -> None:
+        return None
+
+    monkeypatch.setattr(script, "run", fake_run)
+    monkeypatch.setattr(script, "close_db", fake_close_db)
+    monkeypatch.setattr(
+        script,
+        "_authoritative_report_output_dir",
+        lambda: tmp_path / script.DEFAULT_REPORT_DIR,
+    )
+
+    exit_code = await script.async_main(["--json-indent", "0"])
+
+    latest_path = (
+        tmp_path
+        / script.DEFAULT_REPORT_DIR
+        / "latest.json"
+    )
+    persisted = json.loads(latest_path.read_text(encoding="utf-8"))
+    stdout_payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert persisted["generated_at"] == generated_at
+    assert persisted["completed"] is True
+    assert persisted["artifacts"]["latest_path"] == str(latest_path)
+    assert stdout_payload["reconciliation_report_artifacts"]["latest_path"] == str(
+        latest_path
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_main_fails_visibly_when_authoritative_report_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fake_run(**_kwargs) -> dict:
+        return {
+            "after_reconciliation": {
+                "status": "ok",
+                "requires_attention": False,
+            },
+            "after_report": _report(),
+            "order_sync_error": None,
+        }
+
+    async def fake_close_db() -> None:
+        return None
+
+    def fail_write(*_args, **_kwargs) -> dict[str, str]:
+        raise OSError("report filesystem unavailable")
+
+    monkeypatch.setattr(script, "run", fake_run)
+    monkeypatch.setattr(script, "close_db", fake_close_db)
+    monkeypatch.setattr(script, "write_report", fail_write)
+
+    exit_code = await script.async_main(["--json-indent", "0"])
+
+    stdout_payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert stdout_payload["reconciliation_report_artifact_error"]["code"] == (
+        "authoritative_reconciliation_report_write_failed"
+    )
 
 
 @pytest.mark.asyncio

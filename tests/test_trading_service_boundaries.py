@@ -1550,6 +1550,139 @@ async def test_local_ai_tools_auto_train_blocks_when_okx_daily_training_gate_blo
 
 
 @pytest.mark.asyncio
+async def test_local_ml_auto_train_process_isolated_from_trading_database_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"trained":false,"reason":"not_due"}', b""
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_local_ml_training_subprocess()
+
+    assert result["reason"] == "not_due"
+    assert result["training_process_isolated"] is True
+    script_path = str(captured["args"][1]).replace("\\", "/")
+    assert script_path.endswith("scripts/run_local_ml_auto_train.py")
+    assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
+
+
+@pytest.mark.asyncio
+async def test_local_ai_cursor_probe_isolated_from_trading_database_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b'{"reason":"cursor_probe_complete",'
+                b'"completed_shadow_sample_count":14,'
+                b'"completed_trade_sample_count":61}',
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_local_ai_tools_training_cursor_subprocess()
+
+    assert result["reason"] == "cursor_probe_complete"
+    assert result["completed_shadow_sample_count"] == 14
+    assert result["completed_trade_sample_count"] == 61
+    assert result["training_process_isolated"] is True
+    script_path = str(captured["args"][1]).replace("\\", "/")
+    assert script_path.endswith("scripts/run_local_ai_tools_training_cursors.py")
+    assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
+
+
+@pytest.mark.asyncio
+async def test_local_ml_auto_train_failure_uses_retry_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    delays: list[float] = []
+    service._run_local_ml_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "trained": False,
+            "reason": "error",
+            "error": "QueuePool connection timed out",
+            "training_process_isolated": True,
+        }
+    )
+    service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
+        {"trained": False, "reason": "not_due"}
+    )
+
+    async def stop_after_sleep(delay: float) -> None:
+        delays.append(delay)
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", stop_after_sleep)
+
+    await service._ml_auto_train_loop()
+
+    assert delays == [trading_service.AUTO_TRAIN_RETRY_INTERVAL_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_local_ai_cursor_failure_uses_retry_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    delays: list[float] = []
+    service._run_local_ml_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {"trained": False, "reason": "not_due"}
+    )
+    service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "trained": False,
+            "reason": "error",
+            "error": "QueuePool connection timed out in isolated cursor probe",
+            "training_process_isolated": True,
+        }
+    )
+
+    async def stop_after_sleep(delay: float) -> None:
+        delays.append(delay)
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", stop_after_sleep)
+
+    await service._ml_auto_train_loop()
+
+    assert delays == [trading_service.AUTO_TRAIN_RETRY_INTERVAL_SECONDS]
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1701,7 +1834,13 @@ async def test_local_ai_tools_auto_train_checks_cursors_before_loading_training_
     )
     monkeypatch.setattr(train_script, "_load_sequence_samples", fail_heavy_load)
     service.local_ai_tools = FakeLocalAITools()
-    service._completed_shadow_backtest_total = lambda: _async_value(10)  # type: ignore[method-assign]
+    service._run_local_ai_tools_training_cursor_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "reason": "cursor_probe_complete",
+            "completed_shadow_sample_count": 10,
+            "completed_trade_sample_count": 3,
+        }
+    )
 
     result = await service._maybe_train_local_ai_tools_process(force=False)
 
@@ -1754,7 +1893,13 @@ async def test_local_ai_tools_auto_train_runs_due_training_outside_trading_proce
     monkeypatch.setattr(train_script, "_load_sequence_samples", fail_heavy_load)
     service.local_ai_tools = FakeLocalAITools()
     service.model_training_state_store = FakeTrainingState()
-    service._completed_shadow_backtest_total = lambda: _async_value(11)  # type: ignore[method-assign]
+    service._run_local_ai_tools_training_cursor_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "reason": "cursor_probe_complete",
+            "completed_shadow_sample_count": 11,
+            "completed_trade_sample_count": 3,
+        }
+    )
     service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
         {
             "trained": True,
@@ -1820,7 +1965,13 @@ async def test_local_ai_tools_auto_train_rebuilds_when_clean_view_rebases(
         lambda: _async_value(3),
     )
     service.local_ai_tools = FakeLocalAITools()
-    service._completed_shadow_backtest_total = lambda: _async_value(10)  # type: ignore[method-assign]
+    service._run_local_ai_tools_training_cursor_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "reason": "cursor_probe_complete",
+            "completed_shadow_sample_count": 10,
+            "completed_trade_sample_count": 3,
+        }
+    )
     service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
         {"trained": True, "shadow_sample_count": 4}
     )

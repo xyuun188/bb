@@ -30,13 +30,17 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from sqlalchemy import delete, or_, select  # noqa: E402
 
-from config.settings import ENSEMBLE_TRADER_NAME  # noqa: E402
+from config.settings import ENSEMBLE_TRADER_NAME, settings  # noqa: E402
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db, get_session_ctx  # noqa: E402
 from executor.okx_executor import OKXExecutor  # noqa: E402
 from models.account import ExecutionEquitySnapshot  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
-from scripts.run_okx_daily_reconciliation_report import collect_report  # noqa: E402
+from scripts.run_okx_daily_reconciliation_report import (  # noqa: E402
+    DEFAULT_REPORT_DIR,
+    collect_report,
+    write_report,
+)
 from services.okx_order_fact_sync import (  # noqa: E402
     PHASE3_DEFAULT_ORDER_SYNC_START,
     OkxOrderFactSyncService,
@@ -88,6 +92,10 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _authoritative_report_output_dir() -> Path:
+    return settings.data_dir / DEFAULT_REPORT_DIR
 
 
 async def run(
@@ -541,9 +549,27 @@ async def async_main(argv: list[str] | None = None) -> int:
     finally:
         await close_db()
     indent = None if int(args.json_indent or 0) <= 0 else int(args.json_indent)
+    artifact_error: dict[str, str] | None = None
+    after_report = result.get("after_report") if isinstance(result, dict) else None
+    report_output_dir = _authoritative_report_output_dir()
+    try:
+        if not isinstance(after_report, dict):
+            raise TypeError("final reconciliation report is not an object")
+        result["reconciliation_report_artifacts"] = write_report(
+            after_report,
+            report_output_dir,
+            indent=indent,
+        )
+    except Exception as exc:
+        artifact_error = {
+            "code": "authoritative_reconciliation_report_write_failed",
+            "message": safe_error_text(exc, limit=240),
+            "output_dir": str(report_output_dir),
+        }
+        result["reconciliation_report_artifact_error"] = artifact_error
     print(json.dumps(result, ensure_ascii=False, indent=indent, sort_keys=True))
     after = result.get("after_reconciliation") if isinstance(result, dict) else {}
-    if result.get("order_sync_error"):
+    if result.get("order_sync_error") or artifact_error:
         return 2
     if not isinstance(after, dict):
         return 2

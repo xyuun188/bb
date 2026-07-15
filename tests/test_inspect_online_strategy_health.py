@@ -3,6 +3,21 @@ import pytest
 from scripts import inspect_online_strategy_health
 
 
+def test_decode_remote_json_ignores_runtime_logs_before_final_payload() -> None:
+    output = (
+        "2026-07-15 10:20:00 [info] status probe started\n"
+        '{"event":"runtime_log","level":"info"}\n'
+        '{"generated_at":"2026-07-15T10:20:01+00:00","audit_only":true}\n'
+    )
+
+    payload = inspect_online_strategy_health._decode_remote_json(output)
+
+    assert payload == {
+        "generated_at": "2026-07-15T10:20:01+00:00",
+        "audit_only": True,
+    }
+
+
 def test_remote_template_compiles_and_uses_dynamic_return_contract() -> None:
     template = (
         inspect_online_strategy_health.REMOTE_SCRIPT_TEMPLATE.replace(
@@ -16,6 +31,13 @@ def test_remote_template_compiles_and_uses_dynamic_return_contract() -> None:
     compile(template, "<strategy-health>", "exec")
     assert "TradeExecutionContractService" in template
     assert "get_model_training_registry_status" in template
+    assert "okx_training_refresh_gate" in template
+    assert "get_data_collection_status" in template
+    assert "get_strategy_learning" in template
+    assert "get_expert_memories" in template
+    assert "get_shadow_backtests" in template
+    assert "audit_protection_order_integrity" in template
+    assert "get_positions_strict" in template
     assert "realized_fee_after_return" in template
     assert "timedelta(minutes=WINDOW_MINUTES)" in template
     assert 'APP_ROOT = Path("/data/bb/app")' in template
@@ -69,6 +91,19 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
             },
             "model_training_registry": {
                 "summary": {"trainable_count": 8},
+                "scheduler_state": {
+                    "status": "warning",
+                    "heartbeat_stale": True,
+                    "models": {
+                        "local_ml_profit_quality": {
+                            "state": "failed",
+                            "history": [
+                                {"event": "started"},
+                                {"event": "failed", "reason": "error"},
+                            ],
+                        }
+                    },
+                },
                 "models": [
                     {
                         "model_id": "local_ml_profit_quality",
@@ -77,6 +112,62 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
                     }
                 ],
             },
+            "okx_training_refresh_gate": {
+                "allowed": False,
+                "reason": "okx_daily_reconciliation_report_stale",
+            },
+            "data_collection": {
+                "checked_at": "2026-07-15T10:00:00+00:00",
+                "sources": [{"id": "market", "status": "ok"}],
+                "training": {
+                    "local_ai_tools": {"completed_trade_sample_count": 61},
+                    "governance": {"cleanup_effective": True},
+                },
+            },
+            "shadow_maturity": {
+                "count": 20,
+                "pending_count": 6,
+                "completed_count": 14,
+            },
+            "strategy_learning": {
+                "optimization_target": "maximize_authoritative_fee_after_return_rate",
+                "feedback": {"generated_at": "2026-07-15T10:00:00+00:00"},
+                "schedule": {
+                    "scheduler_mode": "shadow_validation",
+                    "candidate_count": 6,
+                    "governed_candidate_count": 0,
+                    "rejected_candidate_count": 6,
+                    "current_production_strategy": {"id": "dynamic-return-contract"},
+                    "runtime": {
+                        "production_influence_enabled": False,
+                        "can_authorize_entry": False,
+                    },
+                },
+            },
+            "expert_learning": {
+                "count": 30,
+                "reflection_count": 20,
+                "authoritative_outcome_contract": {
+                    "loaded_count": 497,
+                    "complete_count": 61,
+                    "actual_outcome_overrides_shadow": True,
+                    "shadow_production_weight": 0.0,
+                },
+                "reflections": [],
+            },
+            "open_positions": {
+                "total": 5,
+                "count": 5,
+                "protection_inventory": {"missing_keys": []},
+            },
+            "latest_okx_reconciliation": {
+                "generated_at": "2026-07-15T09:51:36+00:00",
+                "status": "warning",
+                "can_open_new_entries": True,
+                "can_refresh_training": True,
+                "requires_attention": False,
+                "issue_ledger": {"summary": {"unresolved": 1}},
+            },
         }
     )
 
@@ -84,4 +175,21 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
     assert summary["contract_summary"]["contract_violation_count"] == 2
     assert summary["ml_live_influence"] is False
     assert summary["model_training_summary"]["trainable_count"] == 8
+    assert summary["training_scheduler_state"]["heartbeat_stale"] is True
+    assert summary["training_scheduler_state"]["models"][
+        "local_ml_profit_quality"
+    ]["recent_history"][-1]["event"] == "failed"
+    assert summary["okx_training_refresh_gate"]["allowed"] is False
+    closed_loop = summary["profit_closed_loop"]
+    assert closed_loop["shadow_maturity"]["completed_total"] == 14
+    assert closed_loop["strategy_scheduler"]["candidate_count"] == 6
+    assert closed_loop["strategy_scheduler"]["production_influence_enabled"] is False
+    assert closed_loop["authoritative_settlement"]["outcome_contract"][
+        "actual_outcome_overrides_shadow"
+    ] is True
+    assert closed_loop["positions_and_protection"]["open_total"] == 5
+    assert closed_loop["positions_and_protection"]["protection_inventory"][
+        "missing_keys"
+    ] == []
+    assert closed_loop["okx_reconciliation"]["can_refresh_training"] is True
     assert summary["trainable_models"][0]["model_id"] == "local_ml_profit_quality"

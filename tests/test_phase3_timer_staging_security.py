@@ -5,6 +5,7 @@ import posixpath
 import pytest
 
 from scripts import (
+    install_okx_daily_reconciliation_timer,
     install_phase3_go_no_go_timer,
     install_phase3_market_data_warmup_timer,
     install_phase3_model_server_readiness_timer,
@@ -13,6 +14,7 @@ from scripts import (
 )
 
 TIMER_INSTALLERS = (
+    install_okx_daily_reconciliation_timer,
     install_phase3_go_no_go_timer,
     install_phase3_market_data_warmup_timer,
     install_phase3_model_server_readiness_timer,

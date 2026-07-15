@@ -55,8 +55,17 @@ def _inherit_dashboard_runtime_environment() -> None:
 _inherit_dashboard_runtime_environment()
 
 from services.ml_signal_service import MLSignalService
+from services.okx_training_gate import okx_training_refresh_gate
+from services.protection_order_integrity import audit_protection_order_integrity
 from services.trade_execution_contract import TradeExecutionContractService
-from web_dashboard.api.dashboard import get_model_training_registry_status
+from executor.okx_executor import OKXExecutor
+from web_dashboard.api.dashboard import (
+    get_expert_memories,
+    get_model_training_registry_status,
+    get_shadow_backtests,
+    get_strategy_learning,
+)
+from web_dashboard.api.data_collection import get_data_collection_status
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
@@ -67,6 +76,45 @@ SUMMARY_ONLY = __SUMMARY_ONLY__
 MARKET_SYMBOL_ONLY = __MARKET_SYMBOL_ONLY__
 ENTRY_ONLY = __ENTRY_ONLY__
 DECISION_ID = __DECISION_ID__
+
+
+async def _read_stage(name, awaitable):
+    try:
+        return await awaitable
+    except Exception as exc:
+        return {
+            "available": False,
+            "stage": name,
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        }
+
+
+async def _read_positions_and_protection():
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    try:
+        await executor.initialize()
+        positions = await executor.get_positions_strict()
+        protection_orders = await executor.get_position_protection_orders()
+        pending_orders = await executor.get_open_orders_strict()
+        protection = audit_protection_order_integrity(
+            positions,
+            protection_orders,
+            pending_orders,
+            {},
+            pending_snapshot_complete=True,
+        )
+        protection["available"] = True
+        protection["invalid_order_count"] = len(protection.get("invalid_orders") or [])
+        protection["inventory_fingerprint"] = protection.get("input_fingerprint")
+        protection["blockers"] = protection.get("repair_blockers") or []
+        return {
+            "available": True,
+            "count": len(positions),
+            "total": len(positions),
+            "protection_inventory": protection,
+        }
+    finally:
+        await executor.shutdown()
 
 
 async def main():
@@ -98,7 +146,39 @@ async def main():
         "trade_execution_contract": contract,
         "local_ml_readiness": ml_status,
         "model_training_registry": model_registry,
+        "okx_training_refresh_gate": okx_training_refresh_gate(),
     }
+    payload["data_collection"] = await _read_stage(
+        "data_collection",
+        get_data_collection_status(include_feature_coverage=False),
+    )
+    payload["shadow_maturity"] = await _read_stage(
+        "shadow_maturity",
+        get_shadow_backtests(page_size=1, page=1),
+    )
+    payload["strategy_learning"] = await _read_stage(
+        "strategy_learning",
+        get_strategy_learning(mode="paper", detail="full"),
+    )
+    payload["expert_learning"] = await _read_stage(
+        "expert_learning",
+        get_expert_memories(page_size=20, mode="paper"),
+    )
+    payload["open_positions"] = await _read_stage(
+        "open_positions",
+        _read_positions_and_protection(),
+    )
+    reconciliation_path = APP_ROOT / "data" / "okx_daily_reconciliation_reports" / "latest.json"
+    try:
+        payload["latest_okx_reconciliation"] = json.loads(
+            reconciliation_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        payload["latest_okx_reconciliation"] = {
+            "available": False,
+            "path": str(reconciliation_path),
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        }
     async with get_read_session_ctx() as session:
         schema_rows = (
             await session.execute(
@@ -272,6 +352,11 @@ def _summarize_report(report: dict) -> dict:
         "ml_readiness_state": ml_status.get("readiness_state") or ml_status.get("state"),
         "ml_live_influence": bool(ml_status.get("allow_live_position_influence")),
         "model_training_summary": registry.get("summary") or {},
+        "training_scheduler_state": _summarize_training_scheduler_state(
+            registry.get("scheduler_state")
+        ),
+        "okx_training_refresh_gate": report.get("okx_training_refresh_gate") or {},
+        "profit_closed_loop": _summarize_profit_closed_loop(report),
         "trainable_models": [
             {
                 key: row.get(key)
@@ -292,6 +377,350 @@ def _summarize_report(report: dict) -> dict:
         "selected_decision": report.get("selected_decision"),
         "expert_memory_schema": report.get("expert_memory_schema"),
     }
+
+
+def _summarize_profit_closed_loop(report: dict) -> dict:
+    collection = report.get("data_collection")
+    collection = collection if isinstance(collection, dict) else {}
+    collection_training = collection.get("training")
+    collection_training = collection_training if isinstance(collection_training, dict) else {}
+    local_ai_tools = collection_training.get("local_ai_tools")
+    local_ai_tools = local_ai_tools if isinstance(local_ai_tools, dict) else {}
+    promotion = local_ai_tools.get("promotion_recommendation")
+    promotion = promotion if isinstance(promotion, dict) else {}
+    governance = collection_training.get("governance")
+    governance = governance if isinstance(governance, dict) else {}
+    artifact_governance = local_ai_tools.get("governance_report")
+    artifact_governance = (
+        artifact_governance if isinstance(artifact_governance, dict) else {}
+    )
+    artifact_quality = local_ai_tools.get("quality_report")
+    artifact_quality = artifact_quality if isinstance(artifact_quality, dict) else {}
+    quality_totals = artifact_quality.get("totals")
+    quality_totals = quality_totals if isinstance(quality_totals, dict) else {}
+    shadow = report.get("shadow_maturity")
+    shadow = shadow if isinstance(shadow, dict) else {}
+    strategy = report.get("strategy_learning")
+    strategy = strategy if isinstance(strategy, dict) else {}
+    schedule = strategy.get("schedule")
+    schedule = schedule if isinstance(schedule, dict) else {}
+    runtime = schedule.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    feedback = strategy.get("feedback")
+    feedback = feedback if isinstance(feedback, dict) else {}
+    expert = report.get("expert_learning")
+    expert = expert if isinstance(expert, dict) else {}
+    positions = report.get("open_positions")
+    positions = positions if isinstance(positions, dict) else {}
+    reconciliation = report.get("latest_okx_reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+    source_rows = collection.get("sources")
+    source_rows = source_rows if isinstance(source_rows, list) else []
+    reflection_rows = expert.get("reflections")
+    reflection_rows = reflection_rows if isinstance(reflection_rows, list) else []
+    production_strategy = schedule.get("current_production_strategy")
+    production_strategy = production_strategy if isinstance(production_strategy, dict) else {}
+    protection = positions.get("protection_inventory")
+    protection = protection if isinstance(protection, dict) else {}
+    return {
+        "collection": {
+            "available": collection.get("available", True),
+            "checked_at": collection.get("checked_at"),
+            "sources": [
+                {
+                    key: row.get(key)
+                    for key in ("key", "group", "enabled", "status")
+                    if key in row
+                }
+                for row in source_rows
+                if isinstance(row, dict)
+            ],
+            "training": {
+                "local_ai_tools": {
+                    key: local_ai_tools.get(key)
+                    for key in (
+                        "available",
+                        "status",
+                        "trained_at",
+                        "training_mode",
+                        "model_stage",
+                        "model_bundle_available",
+                        "completed_shadow_sample_count",
+                        "completed_trade_sample_count",
+                        "shadow_sample_count",
+                        "trade_sample_count",
+                        "sequence_sample_count",
+                        "text_sentiment_sample_count",
+                        "objective_name",
+                        "objective_version",
+                        "label_version",
+                        "profit_supervision_version",
+                        "live_influence",
+                    )
+                    if key in local_ai_tools
+                },
+                "promotion": {
+                    key: promotion.get(key)
+                    for key in (
+                        "optimization_target",
+                        "current_stage",
+                        "recommended_stage",
+                        "canary_ready",
+                        "live_ready",
+                        "canary_blocking_reasons",
+                        "live_blocking_reasons",
+                    )
+                    if key in promotion
+                },
+                "artifact_governance": {
+                    key: artifact_governance.get(key)
+                    for key in (
+                        "status",
+                        "data_quality_version",
+                        "training_policy",
+                        "raw_records_preserved",
+                        "cleanup_mode",
+                        "quarantine_applied",
+                        "downweight_applied",
+                        "trainable_sample_count",
+                        "excluded_sample_count",
+                        "downweighted_sample_count",
+                        "effective_weight_ratio",
+                        "excluded_ratio",
+                        "blocked_reason_ratio",
+                        "contamination_risk",
+                        "blocked_reason_count",
+                        "requires_artifact_refresh",
+                        "quality_fingerprint",
+                        "artifact_quality_fingerprint",
+                        "artifact_matches_quality",
+                    )
+                    if key in artifact_governance
+                },
+                "quality_totals": {
+                    key: quality_totals.get(key)
+                    for key in (
+                        "total",
+                        "included",
+                        "downweighted",
+                        "excluded",
+                        "effective_weight",
+                        "effective_weight_ratio",
+                    )
+                    if key in quality_totals
+                },
+                "quality_reasons": list(artifact_quality.get("top_reasons") or [])[:20],
+                "governance": {
+                    key: governance.get(key)
+                    for key in (
+                        "status",
+                        "cleanup_effective",
+                        "trainable_sample_count",
+                        "contamination_risk",
+                        "quality_state",
+                        "training_data_version",
+                        "data_fingerprint",
+                        "blocking_reasons",
+                    )
+                    if key in governance
+                },
+            },
+            "error": collection.get("error"),
+        },
+        "shadow_maturity": {
+            "available": shadow.get("available", True),
+            "total": shadow.get("count"),
+            "pending_total": shadow.get("pending_count"),
+            "completed_total": shadow.get("completed_count"),
+            "error": shadow.get("error"),
+        },
+        "strategy_scheduler": {
+            "available": strategy.get("available", True),
+            "optimization_target": strategy.get("optimization_target"),
+            "scheduler_mode": schedule.get("scheduler_mode"),
+            "candidate_count": schedule.get("candidate_count"),
+            "governed_candidate_count": schedule.get("governed_candidate_count"),
+            "rejected_candidate_count": schedule.get("rejected_candidate_count"),
+            "current_production_strategy": {
+                key: production_strategy.get(key)
+                for key in (
+                    "id",
+                    "version",
+                    "name",
+                    "objective",
+                    "owner",
+                    "enabled",
+                    "status",
+                    "scope",
+                    "entry_permission_owner",
+                    "historical_prior_role",
+                    "historical_prior_can_authorize_entry",
+                    "historical_prior_can_change_size_or_leverage",
+                    "execution_owners",
+                    "data_sources",
+                    "historical_prior_matching_enabled",
+                )
+                if key in production_strategy
+            },
+            "production_influence_enabled": bool(
+                runtime.get("production_influence_enabled")
+            ),
+            "can_authorize_entry": runtime.get("can_authorize_entry"),
+            "policy_provenance": runtime.get("policy_provenance") or {},
+            "feedback_generated_at": feedback.get("generated_at"),
+            "error": strategy.get("error"),
+        },
+        "authoritative_settlement": {
+            "contract_summary": (
+                (report.get("trade_execution_contract") or {}).get("summary") or {}
+            ),
+            "outcome_contract": expert.get("authoritative_outcome_contract") or {},
+        },
+        "reflection_and_memory": {
+            "available": expert.get("available", True),
+            "memory_count": expert.get("count"),
+            "reflection_count": expert.get("reflection_count"),
+            "recent_reflections": [
+                {
+                    "id": row.get("id"),
+                    "position_id": row.get("position_id"),
+                    "symbol": row.get("symbol"),
+                    "side": row.get("side"),
+                    "closed_at": row.get("closed_at"),
+                    "evidence_precedence": row.get("evidence_precedence"),
+                    "authoritative_outcome": {
+                        key: (row.get("authoritative_outcome") or {}).get(key)
+                        for key in (
+                            "outcome_id",
+                            "outcome_version",
+                            "complete",
+                            "evidence_gaps",
+                            "decision_id",
+                            "realized_pnl",
+                            "authoritative_return_pct",
+                            "counterfactual_production_weight",
+                        )
+                    }
+                    if isinstance(row.get("authoritative_outcome"), dict)
+                    else None,
+                }
+                for row in reflection_rows
+                if isinstance(row, dict)
+            ],
+            "error": expert.get("error"),
+        },
+        "positions_and_protection": {
+            "available": positions.get("available", True),
+            "total": positions.get("total"),
+            "open_total": positions.get("count"),
+            "protection_inventory": {
+                key: protection.get(key)
+                for key in (
+                    "available",
+                    "contract_version",
+                    "position_count",
+                    "protection_order_count",
+                    "missing_keys",
+                    "orphan_keys",
+                    "split_coverage_keys",
+                    "coverage_mismatches",
+                    "invalid_order_count",
+                    "repair_blockers",
+                    "inventory_fingerprint",
+                    "blockers",
+                )
+                if key in protection
+            },
+            "error": positions.get("error"),
+        },
+        "okx_reconciliation": {
+            "available": reconciliation.get("available", True),
+            "generated_at": reconciliation.get("generated_at"),
+            "status": reconciliation.get("status"),
+            "can_open_new_entries": reconciliation.get("can_open_new_entries"),
+            "can_refresh_training": reconciliation.get("can_refresh_training"),
+            "requires_attention": reconciliation.get("requires_attention"),
+            "issue_summary": (reconciliation.get("issue_ledger") or {}).get("summary"),
+            "error": reconciliation.get("error"),
+        },
+    }
+
+
+def _summarize_training_scheduler_state(value: object) -> dict:
+    payload = value if isinstance(value, dict) else {}
+    raw_schedulers = payload.get("schedulers")
+    raw_schedulers = raw_schedulers if isinstance(raw_schedulers, dict) else {}
+    raw_models = payload.get("models")
+    raw_models = raw_models if isinstance(raw_models, dict) else {}
+    scheduler_fields = (
+        "heartbeat_at",
+        "heartbeat_age_seconds",
+        "heartbeat_stale_after_seconds",
+        "heartbeat_stale",
+        "interval_seconds",
+        "model_ids",
+    )
+    model_fields = (
+        "state",
+        "last_check_at",
+        "last_started_at",
+        "last_finished_at",
+        "last_error",
+        "last_result",
+        "next_check_at",
+        "retry_count",
+        "sample_cursor",
+        "training_timeout_exceeded",
+    )
+    return {
+        "status": payload.get("status"),
+        "updated_at": payload.get("updated_at"),
+        "heartbeat_stale": bool(payload.get("heartbeat_stale")),
+        "stale_scheduler_ids": payload.get("stale_scheduler_ids") or [],
+        "training_timeout_exceeded": bool(payload.get("training_timeout_exceeded")),
+        "timed_out_model_ids": payload.get("timed_out_model_ids") or [],
+        "schedulers": {
+            scheduler_id: {
+                field: row.get(field)
+                for field in scheduler_fields
+                if field in row
+            }
+            for scheduler_id, row in raw_schedulers.items()
+            if isinstance(row, dict)
+        },
+        "models": {
+            model_id: {
+                **{
+                    field: row.get(field)
+                    for field in model_fields
+                    if field in row
+                },
+                "recent_history": list(row.get("history") or [])[-5:],
+            }
+            for model_id, row in raw_models.items()
+            if isinstance(row, dict)
+        },
+    }
+
+
+def _decode_remote_json(output: str) -> dict:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as original_error:
+        for line in reversed(output.splitlines()):
+            candidate = line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise original_error
+    if not isinstance(payload, dict):
+        raise ValueError("online strategy health output must be a JSON object")
+    return payload
 
 
 def main() -> None:
@@ -327,7 +756,7 @@ def main() -> None:
                 pass
         finally:
             sftp.close()
-        payload = json.loads(output)
+        payload = _decode_remote_json(output)
         safe_print(
             json.dumps(
                 _summarize_report(payload) if args.summary else payload,
