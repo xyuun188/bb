@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from services.trade_execution_contract import validate_production_entry_contract
+
 ALL_ENTRY_EXPERTS = (
     "trend_expert",
     "momentum_expert",
@@ -147,11 +149,8 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
             "long",
             "short",
         }:
-            return_policy = _safe_dict(raw.get("production_return_policy"))
-            if (
-                return_policy.get("eligible") is not True
-                or _safe_float(return_policy.get("return_lcb_pct"), 0.0) <= 0
-            ):
+            _, contract_blockers = validate_production_entry_contract(raw)
+            if contract_blockers:
                 ineligible_return_contract_executed_count += 1
             if _safe_float(_row_get(decision, "outcome_pnl_pct"), 0.0) < 0:
                 negative_executed_count += 1

@@ -151,6 +151,59 @@ def test_dynamic_exit_requires_position_economics_and_filled_order() -> None:
     assert report["summary"]["contract_violation_count"] == 0
 
 
+def test_system_protection_exit_uses_okx_algo_fill_lifecycle() -> None:
+    raw = {
+        "system_sync": True,
+        "source": "okx_position_reconcile",
+        "reconcile_origin": "system_protection",
+        "close_fill": {"reconcile_origin": "system_protection"},
+    }
+    order = _filled_order(7)
+    order.exchange_order_id = "okx-close-7"
+    order.okx_raw_fills = {
+        "protection_execution": {
+            "version": "2026-07-15.okx-protection-execution.v1",
+            "source_authority": "okx_algo_history_plus_fills_history",
+            "lifecycle_complete": True,
+            "algo_id": "algo-7",
+            "generated_order_id": "okx-close-7",
+            "actual_side": "tp",
+            "contracts": 1.2,
+            "trigger_to_first_fill_ms": 1.0,
+        }
+    }
+
+    report = summarize_trade_execution_contract(
+        [_decision(7, "close_long", raw)],
+        orders=[order],
+    )
+
+    assert report["summary"]["exit_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["exit_contracts"][0]["contract_kind"] == "okx_exchange_protection"
+
+
+def test_system_protection_exit_without_authoritative_lifecycle_fails_closed() -> None:
+    raw = {
+        "system_sync": True,
+        "source": "okx_position_reconcile",
+        "reconcile_origin": "system_protection",
+    }
+
+    report = summarize_trade_execution_contract(
+        [_decision(8, "close_short", raw)],
+        orders=[_filled_order(8)],
+    )
+
+    assert report["summary"]["exit_contract_ready_count"] == 0
+    assert report["violation_reason_counts"][
+        "exchange_protection_lifecycle_not_unique"
+    ] == 1
+    assert report["violation_reason_counts"][
+        "exchange_protection_lifecycle_incomplete"
+    ] == 1
+
+
 def test_realized_pnl_summary_uses_closed_positions_only() -> None:
     report = summarize_trade_execution_contract(
         [],

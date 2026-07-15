@@ -389,8 +389,8 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     }
     assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
     assert repo.memories[0]["extra"]["actual_price"] == 101.0
-    assert all(item["confidence_adjustment"] == 0.0 for item in repo.memories)
-    assert all(item["position_size_multiplier"] == 1.0 for item in repo.memories)
+    assert all("confidence_adjustment" not in item for item in repo.memories)
+    assert all("position_size_multiplier" not in item for item in repo.memories)
     assert all(item["success_count"] == 0 for item in repo.memories)
     assert all(item["failure_count"] == 0 for item in repo.memories)
     assert all(item["extra"]["cost_complete"] is True for item in repo.memories)

@@ -681,12 +681,23 @@ class CrossValidator:
                     parsed["major_conflicts"] = major
                     parsed["consultation_attempts"] = attempts
                     parsed["fallback_used"] = candidate.get("source") != "primary" or attempt_no > 1
-                    for forbidden in (
-                        "recommended_action",
-                        "confidence_adjustment",
-                        "should_trade",
-                    ):
-                        parsed.pop(forbidden, None)
+                    parsed = {
+                        key: value
+                        for key, value in parsed.items()
+                        if key
+                        in {
+                            "conflict_note",
+                            "observation_summary",
+                            "model",
+                            "consultation_expert",
+                            "consultation_expert_label",
+                            "primary_consultation_expert",
+                            "status",
+                            "major_conflicts",
+                            "consultation_attempts",
+                            "fallback_used",
+                        }
+                    }
                     parsed["production_permission"] = False
                     return parsed
                 except Exception as exc:

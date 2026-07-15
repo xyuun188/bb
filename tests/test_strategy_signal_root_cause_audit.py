@@ -27,10 +27,12 @@ def _decision(*, complete: bool) -> SimpleNamespace:
                 "expected_net_return_pct": 0.8,
                 "return_lcb_pct": 0.2,
                 "production_source_count": 3,
+                "position_size_pct": 0.12,
                 "policy_provenance": provenance,
             },
             "opportunity_score": {
                 "production_eligible": complete,
+                "policy_provenance": provenance,
                 "execution_cost": {
                     "production_eligible": complete,
                     "total_pct": 0.08,
@@ -39,6 +41,11 @@ def _decision(*, complete: bool) -> SimpleNamespace:
             },
             "profit_risk_sizing": {
                 "production_eligible": complete,
+                "risk_budget_usdt": 3.0,
+                "planned_stressed_loss_usdt": 2.4,
+                "stressed_loss_fraction": 0.02,
+                "target_notional_usdt": 150.0,
+                "final_notional_usdt": 120.0,
                 "policy_provenance": provenance,
             },
         },

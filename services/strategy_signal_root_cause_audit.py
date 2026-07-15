@@ -14,18 +14,9 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from services.ml_signal_service import MLSignalService
+from services.trade_execution_contract import validate_production_entry_contract
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
-PROVENANCE_FIELDS = {
-    "source",
-    "observation_window",
-    "sample_count",
-    "generated_at",
-    "strategy_version",
-    "fallback_reason",
-}
-
-
 class StrategySignalRootCauseAuditService:
     """Explain return, cost, risk-budget and provenance gaps without mutation."""
 
@@ -93,16 +84,13 @@ class StrategySignalRootCauseAuditService:
         for row in entries:
             raw = _safe_dict(getattr(row, "raw_llm_response", None))
             policy = _safe_dict(raw.get("production_return_policy"))
-            opportunity = _safe_dict(raw.get("opportunity_score"))
-            cost = _safe_dict(opportunity.get("execution_cost"))
-            sizing = _safe_dict(raw.get("profit_risk_sizing"))
             expected = _maybe_float(policy.get("expected_net_return_pct"))
             lcb = _maybe_float(policy.get("return_lcb_pct"))
             if expected is not None:
                 expected_returns.append(expected)
             if lcb is not None:
                 return_lcbs.append(lcb)
-            reasons = _contract_blockers(policy, opportunity, cost, sizing)
+            _, reasons = validate_production_entry_contract(raw)
             blocker_counts.update(reasons)
             if not reasons:
                 ready_count += 1
@@ -172,49 +160,6 @@ class StrategySignalRootCauseAuditService:
         }
 
 
-def _contract_blockers(
-    policy: dict[str, Any],
-    opportunity: dict[str, Any],
-    cost: dict[str, Any],
-    sizing: dict[str, Any],
-) -> list[str]:
-    reasons: list[str] = []
-    if policy.get("eligible") is not True:
-        reasons.append("production_return_policy_ineligible")
-    if _safe_float(policy.get("expected_net_return_pct")) <= 0:
-        reasons.append("fee_after_expected_return_not_positive")
-    if _safe_float(policy.get("return_lcb_pct")) <= 0:
-        reasons.append("fee_after_return_lcb_not_positive")
-    if int(_safe_float(policy.get("production_source_count"))) <= 0:
-        reasons.append("production_return_distribution_missing")
-    if not _complete_provenance(policy.get("policy_provenance")):
-        reasons.append("production_return_provenance_incomplete")
-    if opportunity.get("production_eligible") is not True:
-        reasons.append("opportunity_distribution_ineligible")
-    if cost.get("production_eligible") is not True or _safe_float(cost.get("total_pct")) <= 0:
-        reasons.append("live_execution_cost_incomplete")
-    if not _complete_provenance(cost.get("policy_provenance")):
-        reasons.append("execution_cost_provenance_incomplete")
-    if sizing.get("production_eligible") is not True:
-        reasons.append("dynamic_risk_budget_ineligible")
-    if not _complete_provenance(sizing.get("policy_provenance")):
-        reasons.append("dynamic_risk_budget_provenance_incomplete")
-    return reasons
-
-
-def _complete_provenance(value: Any) -> bool:
-    payload = _safe_dict(value)
-    return bool(
-        PROVENANCE_FIELDS.issubset(payload)
-        and str(payload.get("source") or "")
-        and str(payload.get("observation_window") or "")
-        and _safe_float(payload.get("sample_count")) > 0
-        and str(payload.get("generated_at") or "")
-        and str(payload.get("strategy_version") or "")
-        and not str(payload.get("fallback_reason") or "")
-    )
-
-
 def _distribution(values: list[float]) -> dict[str, Any]:
     if not values:
         return {"count": 0}
@@ -230,16 +175,19 @@ def _distribution(values: list[float]) -> dict[str, Any]:
 
 def _cause_message(code: str) -> str:
     return {
-        "production_return_policy_ineligible": "The production return policy is absent or ineligible.",
+        "production_return_policy_missing_or_ineligible": "The production return policy is absent or ineligible.",
         "fee_after_expected_return_not_positive": "Fee-after expected return is not positive.",
         "fee_after_return_lcb_not_positive": "Fee-after return lower confidence bound is not positive.",
         "production_return_distribution_missing": "No production-eligible return observations are available.",
         "production_return_provenance_incomplete": "Return-policy provenance is incomplete.",
-        "opportunity_distribution_ineligible": "The opportunity return distribution is not production eligible.",
+        "opportunity_return_distribution_ineligible": "The opportunity return distribution is not production eligible.",
         "live_execution_cost_incomplete": "Live execution cost is unavailable or incomplete.",
         "execution_cost_provenance_incomplete": "Execution-cost provenance is incomplete.",
         "dynamic_risk_budget_ineligible": "The dynamic risk budget is ineligible.",
         "dynamic_risk_budget_provenance_incomplete": "Risk-budget provenance is incomplete.",
+        "dynamic_risk_budget_algebra_invalid": "The independent risk-budget algebra is invalid.",
+        "dynamic_stressed_loss_algebra_invalid": "The stressed-loss algebra is invalid.",
+        "dynamic_notional_target_invalid": "The final notional exceeds its dynamic target.",
     }.get(code, code)
 
 

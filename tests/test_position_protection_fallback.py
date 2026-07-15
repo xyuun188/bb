@@ -36,10 +36,30 @@ def _decision(**kwargs: Any) -> SimpleNamespace:
     defaults = {
         "id": 42,
         "raw_llm_response": {
-            "production_return_policy": {"eligible": True},
+            "production_return_policy": {
+                "eligible": True,
+                "expected_net_return_pct": 0.8,
+                "return_lcb_pct": 0.2,
+                "production_source_count": 3,
+                "position_size_pct": 0.12,
+                "policy_provenance": provenance,
+            },
+            "opportunity_score": {
+                "production_eligible": True,
+                "policy_provenance": provenance,
+                "execution_cost": {
+                    "production_eligible": True,
+                    "total_pct": 0.08,
+                    "policy_provenance": provenance,
+                },
+            },
             "profit_risk_sizing": {
                 "production_eligible": True,
                 "stressed_loss_fraction": 0.05,
+                "risk_budget_usdt": 6.0,
+                "planned_stressed_loss_usdt": 6.0,
+                "target_notional_usdt": 120.0,
+                "final_notional_usdt": 120.0,
                 "policy_provenance": provenance,
             },
         },

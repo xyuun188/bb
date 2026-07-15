@@ -22,6 +22,11 @@ class _FakeConnection:
             return _FakeResult([(name,) for name in self.table_columns.get(table_name, set())])
         if "pg_indexes" in statement_text:
             return _FakeResult([(name,) for name in self.index_names])
+        if statement_text.startswith("PRAGMA table_info("):
+            table_name = statement_text.removeprefix("PRAGMA table_info(").removesuffix(")")
+            return _FakeResult(
+                [(index, name) for index, name in enumerate(self.table_columns.get(table_name, set()))]
+            )
         return _FakeResult([])
 
 
@@ -119,7 +124,7 @@ async def test_sqlite_schema_init_does_not_use_advisory_lock(
 
 
 @pytest.mark.asyncio
-async def test_postgres_expert_memory_storage_contract_neutralizes_legacy_controls(
+async def test_postgres_drops_removed_expert_memory_policy_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -129,28 +134,16 @@ async def test_postgres_expert_memory_storage_contract_neutralizes_legacy_contro
     )
     fake_conn = _FakeConnection()
 
-    await session_module._ensure_expert_memory_storage_contract(fake_conn)
+    await session_module._drop_removed_expert_memory_policy_columns(fake_conn)
 
-    assert any(
-        "confidence_adjustment DOUBLE PRECISION NOT NULL DEFAULT 0.0" in statement
-        for statement in fake_conn.statements
-    )
-    assert any(
-        "position_size_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0" in statement
-        for statement in fake_conn.statements
-    )
-    update = next(
-        statement
-        for statement in fake_conn.statements
-        if statement.lstrip().startswith("UPDATE expert_memories")
-    )
-    assert "confidence_adjustment = 0.0" in update
-    assert "position_size_multiplier = 1.0" in update
-    assert "updated_at" not in update
+    assert fake_conn.statements == [
+        "ALTER TABLE expert_memories DROP COLUMN IF EXISTS confidence_adjustment",
+        "ALTER TABLE expert_memories DROP COLUMN IF EXISTS position_size_multiplier",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_sqlite_expert_memory_storage_contract_adds_neutral_columns(
+async def test_sqlite_drops_removed_expert_memory_policy_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -158,24 +151,23 @@ async def test_sqlite_expert_memory_storage_contract_adds_neutral_columns(
         "database_url",
         "sqlite+aiosqlite:///tmp/test.db",
     )
-    fake_conn = _FakeConnection()
+    fake_conn = _FakeConnection(
+        table_columns={
+            "expert_memories": {
+                "id",
+                "confidence_adjustment",
+                "position_size_multiplier",
+            }
+        }
+    )
 
-    await session_module._ensure_expert_memory_storage_contract(fake_conn)
+    await session_module._drop_removed_expert_memory_policy_columns(fake_conn)
 
-    assert any(
-        statement
-        == "ALTER TABLE expert_memories ADD COLUMN confidence_adjustment FLOAT NOT NULL DEFAULT 0.0"
-        for statement in fake_conn.statements
-    )
-    assert any(
-        statement
-        == "ALTER TABLE expert_memories ADD COLUMN position_size_multiplier FLOAT NOT NULL DEFAULT 1.0"
-        for statement in fake_conn.statements
-    )
-    assert any(
-        statement.lstrip().startswith("UPDATE expert_memories")
-        for statement in fake_conn.statements
-    )
+    assert fake_conn.statements[0] == "PRAGMA table_info(expert_memories)"
+    assert set(fake_conn.statements[1:]) == {
+        "ALTER TABLE expert_memories DROP COLUMN confidence_adjustment",
+        "ALTER TABLE expert_memories DROP COLUMN position_size_multiplier",
+    }
 
 
 @pytest.mark.asyncio

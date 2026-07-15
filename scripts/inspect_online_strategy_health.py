@@ -57,11 +57,16 @@ _inherit_dashboard_runtime_environment()
 from services.ml_signal_service import MLSignalService
 from services.trade_execution_contract import TradeExecutionContractService
 from web_dashboard.api.dashboard import get_model_training_registry_status
+from db.session import get_read_session_ctx
+from models.decision import AIDecision
+from models.trade import Order
+from sqlalchemy import select, text
 
 WINDOW_MINUTES = __WINDOW_MINUTES__
 SUMMARY_ONLY = __SUMMARY_ONLY__
 MARKET_SYMBOL_ONLY = __MARKET_SYMBOL_ONLY__
 ENTRY_ONLY = __ENTRY_ONLY__
+DECISION_ID = __DECISION_ID__
 
 
 async def main():
@@ -94,6 +99,73 @@ async def main():
         "local_ml_readiness": ml_status,
         "model_training_registry": model_registry,
     }
+    async with get_read_session_ctx() as session:
+        schema_rows = (
+            await session.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'expert_memories' ORDER BY column_name"
+                )
+            )
+        ).fetchall()
+    expert_memory_columns = [str(row[0]) for row in schema_rows]
+    removed_memory_policy_columns = sorted(
+        {
+            "confidence_adjustment",
+            "position_size_multiplier",
+        }.intersection(expert_memory_columns)
+    )
+    payload["expert_memory_schema"] = {
+        "column_count": len(expert_memory_columns),
+        "removed_policy_columns_present": removed_memory_policy_columns,
+        "migration_complete": not removed_memory_policy_columns,
+    }
+    if DECISION_ID > 0:
+        async with get_read_session_ctx() as session:
+            decision = await session.get(AIDecision, DECISION_ID)
+            order_rows = list(
+                (
+                    await session.execute(
+                        select(Order).where(Order.decision_id == DECISION_ID).order_by(Order.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        payload["selected_decision"] = (
+            {
+                "id": decision.id,
+                "model_name": decision.model_name,
+                "symbol": decision.symbol,
+                "action": decision.action,
+                "was_executed": decision.was_executed,
+                "execution_reason": decision.execution_reason,
+                "created_at": decision.created_at,
+                "executed_at": decision.executed_at,
+                "execution_price": decision.execution_price,
+                "raw_llm_response": decision.raw_llm_response,
+                "orders": [
+                    {
+                        "id": row.id,
+                        "status": row.status,
+                        "side": row.side,
+                        "quantity": row.quantity,
+                        "price": row.price,
+                        "exchange_order_id": row.exchange_order_id,
+                        "okx_inst_id": row.okx_inst_id,
+                        "okx_state": row.okx_state,
+                        "okx_sync_status": row.okx_sync_status,
+                        "okx_raw_fills": row.okx_raw_fills,
+                        "created_at": row.created_at,
+                        "filled_at": row.filled_at,
+                    }
+                    for row in order_rows
+                ],
+            }
+            if decision is not None
+            else None
+        )
     if SUMMARY_ONLY or MARKET_SYMBOL_ONLY or ENTRY_ONLY:
         payload = {
             **payload,
@@ -129,6 +201,7 @@ def _build_remote_command(
     summary: bool = False,
     market_symbol_only: bool = False,
     entry_only: bool = False,
+    decision_id: int = 0,
     output_path: str | None = None,
 ) -> str:
     safe_minutes = max(int(minutes or 480), 1)
@@ -143,6 +216,7 @@ def _build_remote_command(
         .replace("__SUMMARY_ONLY__", "True" if summary else "False")
         .replace("__MARKET_SYMBOL_ONLY__", "True" if market_symbol_only else "False")
         .replace("__ENTRY_ONLY__", "True" if entry_only else "False")
+        .replace("__DECISION_ID__", str(max(int(decision_id or 0), 0)))
     )
     quoted_sample = shlex.quote(sample_path)
     command = [
@@ -215,6 +289,8 @@ def _summarize_report(report: dict) -> dict:
             for row in models
             if isinstance(row, dict) and row.get("trainable") is True
         ],
+        "selected_decision": report.get("selected_decision"),
+        "expert_memory_schema": report.get("expert_memory_schema"),
     }
 
 
@@ -224,6 +300,7 @@ def main() -> None:
     parser.add_argument("--summary", action="store_true")
     parser.add_argument("--market-symbol-only", action="store_true")
     parser.add_argument("--entry-only", action="store_true")
+    parser.add_argument("--decision-id", type=int, default=0)
     args = parser.parse_args()
     minutes = max(int(args.minutes or 480), 1)
     token = secrets.token_hex(6)
@@ -234,6 +311,7 @@ def main() -> None:
         summary=args.summary,
         market_symbol_only=args.market_symbol_only,
         entry_only=args.entry_only,
+        decision_id=args.decision_id,
         output_path=result_path,
     )
     ssh = connect_remote_ssh(ROOT, timeout=25)

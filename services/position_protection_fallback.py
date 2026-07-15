@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from models.decision import AIDecision
 from models.trade import Order
+from services.trade_execution_contract import validate_production_entry_contract
 
 
 def _default_float_parser(value: Any, default: float = 0.0) -> float:
@@ -43,36 +44,13 @@ class PositionProtectionFallbackPolicy:
 
         raw = getattr(decision, "raw_llm_response", None)
         raw = raw if isinstance(raw, dict) else {}
-        return_policy = raw.get("production_return_policy")
-        return_policy = return_policy if isinstance(return_policy, dict) else {}
         sizing = raw.get("profit_risk_sizing")
         sizing = sizing if isinstance(sizing, dict) else {}
         provenance = sizing.get("policy_provenance")
         provenance = provenance if isinstance(provenance, dict) else {}
-        required_provenance = (
-            "source",
-            "observation_window",
-            "sample_count",
-            "generated_at",
-            "strategy_version",
-            "fallback_reason",
-        )
-        provenance_complete = bool(
-            all(key in provenance for key in required_provenance)
-            and str(provenance.get("source") or "").strip()
-            and str(provenance.get("observation_window") or "").strip()
-            and self.float_parser(provenance.get("sample_count"), 0.0) > 0
-            and str(provenance.get("generated_at") or "").strip()
-            and str(provenance.get("strategy_version") or "").strip()
-            and not str(provenance.get("fallback_reason") or "").strip()
-        )
+        _, contract_blockers = validate_production_entry_contract(raw)
         stop_loss_pct = self.float_parser(sizing.get("stressed_loss_fraction"), 0.0)
-        if (
-            return_policy.get("eligible") is not True
-            or sizing.get("production_eligible") is not True
-            or not provenance_complete
-            or stop_loss_pct <= 0
-        ):
+        if contract_blockers or stop_loss_pct <= 0:
             return {}
 
         stop_loss = self._price_from_pct(

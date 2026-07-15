@@ -739,8 +739,6 @@ class ShadowBacktestService:
                     "market_pattern": pattern,
                     "lesson": lesson,
                     "recommended_action": recommended,
-                    "confidence_adjustment": 0.0,
-                    "position_size_multiplier": 1.0,
                     "evidence_count": 1,
                     "success_count": success_count,
                     "failure_count": failure_count,

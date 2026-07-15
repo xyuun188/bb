@@ -167,45 +167,37 @@ async def test_upsert_memory_uses_unified_runtime_text_boundary(
     assert memory.market_pattern == "unified:raw pattern"
     assert memory.recommended_action == "unified:reduce_risk"
     assert memory.extra == {"unified": {"note": "raw extra"}}
-    assert memory.confidence_adjustment == 0.0
-    assert memory.position_size_multiplier == 1.0
+    assert "confidence_adjustment" not in memory.__table__.columns
+    assert "position_size_multiplier" not in memory.__table__.columns
     assert "raw lesson" in calls
     assert session.flush_count == 1
 
 
 @pytest.mark.asyncio
-async def test_upsert_memory_forces_legacy_policy_fields_to_neutral_storage_values() -> None:
+async def test_upsert_memory_rejects_removed_policy_fields() -> None:
     session = FakeSession()
     repo = MemoryRepository(session)  # type: ignore[arg-type]
 
-    memory = await repo.upsert_memory(
-        {
-            "expert_name": "risk_expert",
-            "expert_label": "Risk",
-            "symbol": "BTC/USDT",
-            "side": "long",
-            "memory_type": "lesson",
-            "market_pattern": "complete evidence",
-            "lesson": "observation only",
-            "recommended_action": "shadow_observation_only",
-            "memory_key": "risk:BTC:long",
-            "confidence_adjustment": 0.9,
-            "position_size_multiplier": 2.5,
-        }
-    )
+    with pytest.raises(ValueError, match="unsupported expert memory fields") as exc_info:
+        await repo.upsert_memory(
+            {
+                "expert_name": "risk_expert",
+                "memory_key": "risk:BTC:long",
+                "confidence_adjustment": 0.9,
+                "position_size_multiplier": 2.5,
+            }
+        )
 
-    assert memory.confidence_adjustment == 0.0
-    assert memory.position_size_multiplier == 1.0
+    assert "confidence_adjustment" in str(exc_info.value)
+    assert "position_size_multiplier" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
-async def test_upsert_memory_neutralizes_existing_legacy_policy_values() -> None:
+async def test_upsert_memory_updates_existing_observation_without_policy_fields() -> None:
     existing = SimpleNamespace(
         evidence_count=1,
         success_count=0,
         failure_count=0,
-        confidence_adjustment=0.75,
-        position_size_multiplier=2.0,
         confidence_score=0.5,
         lesson="old lesson",
         market_pattern="old pattern",
@@ -235,8 +227,9 @@ async def test_upsert_memory_neutralizes_existing_legacy_policy_values() -> None
     )
 
     assert updated is existing
-    assert existing.confidence_adjustment == 0.0
-    assert existing.position_size_multiplier == 1.0
+    assert existing.lesson == "new observation"
+    assert existing.market_pattern == "new pattern"
+    assert existing.evidence_count == 2
 
 
 @pytest.mark.asyncio

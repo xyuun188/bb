@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from math import isclose, isfinite
 from typing import Any
 
+from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
+
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
 FILLED_STATUSES = {"filled", "closed"}
@@ -195,6 +197,40 @@ def _entry_contract_row(
     orders: list[Any],
     executed: bool,
 ) -> tuple[dict[str, Any], list[str]]:
+    filled_notional = sum(
+        abs(_safe_float(_row_get(order, "quantity")) * _safe_float(_row_get(order, "price")))
+        for order in orders
+        if _order_status(order) in FILLED_STATUSES
+    )
+    contract, reasons = validate_production_entry_contract(
+        raw,
+        filled_notional_usdt=filled_notional,
+        executed=executed,
+        filled_order_present=_has_filled_order(orders),
+    )
+    row = {
+        "decision_id": _row_get(decision, "id"),
+        "symbol": _row_get(decision, "symbol"),
+        "action": _action(decision),
+        "executed": executed,
+        "filled_order_count": sum(
+            _order_status(order) in FILLED_STATUSES for order in orders
+        ),
+        **contract,
+        "reasons": reasons,
+    }
+    return row, reasons
+
+
+def validate_production_entry_contract(
+    raw: dict[str, Any],
+    *,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the persisted production-entry contract without mutating it."""
+
     policy = _safe_dict(raw.get("production_return_policy"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
     cost = _safe_dict(opportunity.get("execution_cost"))
@@ -240,11 +276,7 @@ def _entry_contract_row(
         reasons.append("dynamic_stressed_loss_algebra_invalid")
     if final_notional <= 0 or final_notional > target_notional + 1e-8:
         reasons.append("dynamic_notional_target_invalid")
-    filled_notional = sum(
-        abs(_safe_float(_row_get(order, "quantity")) * _safe_float(_row_get(order, "price")))
-        for order in orders
-        if _order_status(order) in FILLED_STATUSES
-    )
+    filled_notional = max(_safe_float(filled_notional_usdt), 0.0)
     if executed and filled_notional > 0 and not isclose(
         final_notional,
         filled_notional,
@@ -252,14 +284,9 @@ def _entry_contract_row(
         abs_tol=1e-8,
     ):
         reasons.append("filled_order_notional_differs_from_risk_contract")
-    if executed and not _has_filled_order(orders):
+    if executed and filled_order_present is not True:
         reasons.append("executed_entry_without_filled_order")
-    row = {
-        "decision_id": _row_get(decision, "id"),
-        "symbol": _row_get(decision, "symbol"),
-        "action": _action(decision),
-        "executed": executed,
-        "filled_order_count": sum(_order_status(order) in FILLED_STATUSES for order in orders),
+    contract = {
         "contract_complete": not reasons,
         "expected_net_return_pct": _safe_float(policy.get("expected_net_return_pct")),
         "return_lcb_pct": _safe_float(policy.get("return_lcb_pct")),
@@ -270,9 +297,8 @@ def _entry_contract_row(
         "final_notional_usdt": final_notional,
         "filled_order_notional_usdt": filled_notional,
         "production_source_count": _safe_int(policy.get("production_source_count")),
-        "reasons": reasons,
     }
-    return row, reasons
+    return contract, reasons
 
 
 def _exit_contract_row(
@@ -281,6 +307,25 @@ def _exit_contract_row(
     orders: list[Any],
     executed: bool,
 ) -> tuple[dict[str, Any], list[str]]:
+    protection_contract = _system_protection_exit_contract(raw, orders)
+    if protection_contract is not None:
+        reasons = list(protection_contract.pop("reasons"))
+        if executed and not _has_filled_order(orders):
+            reasons.append("executed_exit_without_filled_order")
+        row = {
+            "decision_id": _row_get(decision, "id"),
+            "symbol": _row_get(decision, "symbol"),
+            "action": _action(decision),
+            "executed": executed,
+            "filled_order_count": sum(
+                _order_status(order) in FILLED_STATUSES for order in orders
+            ),
+            "contract_complete": not reasons,
+            **protection_contract,
+            "reasons": reasons,
+        }
+        return row, reasons
+
     policy = _safe_dict(raw.get("dynamic_exit_policy"))
     reasons: list[str] = []
     if not policy or policy.get("eligible") is not True:
@@ -308,6 +353,66 @@ def _exit_contract_row(
         "reasons": reasons,
     }
     return row, reasons
+
+
+def _system_protection_exit_contract(
+    raw: dict[str, Any],
+    orders: list[Any],
+) -> dict[str, Any] | None:
+    close_fill = _safe_dict(raw.get("close_fill"))
+    identified = bool(
+        raw.get("system_sync") is True
+        and raw.get("source") == "okx_position_reconcile"
+        and (
+            raw.get("reconcile_origin") == "system_protection"
+            or close_fill.get("reconcile_origin") == "system_protection"
+        )
+    )
+    if not identified:
+        return None
+
+    lifecycles = [
+        _safe_dict(_safe_dict(_row_get(order, "okx_raw_fills")).get("protection_execution"))
+        for order in orders
+        if _safe_dict(_safe_dict(_row_get(order, "okx_raw_fills")).get("protection_execution"))
+    ]
+    lifecycle = lifecycles[0] if len(lifecycles) == 1 else {}
+    generated_order_id = str(lifecycle.get("generated_order_id") or "").strip()
+    filled_order_ids = {
+        str(_row_get(order, "exchange_order_id") or "").strip()
+        for order in orders
+        if _order_status(order) in FILLED_STATUSES
+        and str(_row_get(order, "exchange_order_id") or "").strip()
+    }
+    reasons: list[str] = []
+    if len(lifecycles) != 1:
+        reasons.append("exchange_protection_lifecycle_not_unique")
+    if lifecycle.get("version") != OKX_PROTECTION_EXECUTION_VERSION:
+        reasons.append("exchange_protection_version_mismatch")
+    if lifecycle.get("source_authority") != "okx_algo_history_plus_fills_history":
+        reasons.append("exchange_protection_source_not_authoritative")
+    if lifecycle.get("lifecycle_complete") is not True:
+        reasons.append("exchange_protection_lifecycle_incomplete")
+    if str(lifecycle.get("actual_side") or "").lower() not in {"sl", "tp"}:
+        reasons.append("exchange_protection_trigger_side_missing")
+    if _safe_float(lifecycle.get("contracts"), 0.0) <= 0:
+        reasons.append("exchange_protection_fill_contracts_missing")
+    if not generated_order_id or generated_order_id not in filled_order_ids:
+        reasons.append("exchange_protection_generated_order_mismatch")
+    return {
+        "contract_kind": "okx_exchange_protection",
+        "close_fraction": None,
+        "close_contracts": _safe_float(lifecycle.get("contracts"), 0.0),
+        "hard_risk": str(lifecycle.get("actual_side") or "").lower() == "sl",
+        "fee_after_unrealized_pnl_usdt": None,
+        "protection_execution_version": lifecycle.get("version"),
+        "protection_algo_id": lifecycle.get("algo_id"),
+        "protection_actual_side": lifecycle.get("actual_side"),
+        "protection_trigger_to_first_fill_ms": lifecycle.get(
+            "trigger_to_first_fill_ms"
+        ),
+        "reasons": reasons,
+    }
 
 
 def _obsolete_fields(value: Any) -> set[str]:

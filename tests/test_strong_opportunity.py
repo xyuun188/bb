@@ -40,6 +40,7 @@ def _raw(*, complete: bool = True) -> dict[str, object]:
         },
         "opportunity_score": {
             "production_eligible": complete,
+            "policy_provenance": provenance,
             "execution_cost": {
                 "production_eligible": complete,
                 "total_pct": 0.08,
@@ -48,6 +49,11 @@ def _raw(*, complete: bool = True) -> dict[str, object]:
         },
         "profit_risk_sizing": {
             "production_eligible": complete,
+            "risk_budget_usdt": 3.0,
+            "planned_stressed_loss_usdt": 2.4,
+            "stressed_loss_fraction": 0.02,
+            "target_notional_usdt": 150.0,
+            "final_notional_usdt": 120.0,
             "policy_provenance": provenance,
         },
     }

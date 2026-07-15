@@ -3637,7 +3637,6 @@ def health() -> dict[str, Any]:
         "root": PHASE3_ROOT.as_posix(),
         "server_role": "dedicated_cryptocurrency_quant_model_server",
         "storage_policy": "new model/cache/training/runtime/log data under /data/BB",
-        "legacy_policy": "old data preserved in place but not referenced by Phase 3 runtime",
         "port": PHASE3_API_PORT,
         "policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -5017,7 +5016,6 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
         "action": "hold",
         "reason": "本地退出画像只提供观察事实；生产平仓由动态退出契约独占。",
         "observations": observations,
-        "production_permission": False,
         "live_mutation": False,
         "production_permission": False,
     }, features=features, fallback_reason="dynamic_exit_policy_owns_production_exit")

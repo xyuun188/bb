@@ -22,6 +22,7 @@ DEFAULT_MAX_INSTRUMENT_QUERIES = 20
 DEFAULT_MAX_ORDER_HISTORY_CONTEXT_QUERIES = 30
 DEFAULT_MAX_ALGO_DETAIL_QUERIES = 100
 DEFAULT_PROTECTION_ALGO_ORDER_TYPES = ("conditional", "oco", "trigger", "move_order_stop")
+OKX_PROTECTION_EXECUTION_VERSION = "2026-07-15.okx-protection-execution.v1"
 FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
 
 
@@ -1267,7 +1268,7 @@ def build_okx_protection_execution_lifecycle(
         else None
     )
     return {
-        "version": "2026-07-15.okx-protection-execution.v1",
+        "version": OKX_PROTECTION_EXECUTION_VERSION,
         "source_authority": "okx_algo_history_plus_fills_history",
         "lifecycle_complete": lifecycle_complete,
         "algo_id": algo_id,

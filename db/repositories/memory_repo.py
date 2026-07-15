@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import func, or_, select
 
+from core.symbols import normalize_trading_symbol
 from core.training_contracts import SHADOW_LABEL_VERSION
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
@@ -39,12 +40,12 @@ class MemoryRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         rows = list(result.scalars().all())
-        symbol_norm = _norm_symbol(symbol)
+        symbol_norm = normalize_trading_symbol(symbol)
         side_norm = str(side or "").lower()
         filtered = [
             row
             for row in rows
-            if (not row.symbol or _norm_symbol(row.symbol) == symbol_norm)
+            if (not row.symbol or normalize_trading_symbol(row.symbol) == symbol_norm)
             and (not row.side or not side_norm or str(row.side or "").lower() == side_norm)
             and _memory_row_usable(row)
         ]
@@ -78,8 +79,6 @@ class MemoryRepository(BaseRepository):
             existing = result.scalar_one_or_none()
 
         if existing:
-            existing.confidence_adjustment = 0.0
-            existing.position_size_multiplier = 1.0
             existing.evidence_count = int(existing.evidence_count or 0) + int(
                 data.get("evidence_count", 1) or 1
             )
@@ -340,24 +339,11 @@ def _blend(old: float, new: float) -> float:
     return (old * 0.7) + (new * 0.3)
 
 
-def _norm_symbol(symbol: str | None) -> str:
-    if not symbol:
-        return ""
-    value = str(symbol).split(":")[0]
-    if value.endswith("-SWAP"):
-        value = value[:-5]
-    if "/" not in value and "-" in value:
-        parts = value.split("-")
-        if len(parts) >= 2:
-            value = f"{parts[0]}/{parts[1]}"
-    return value.upper()
-
-
 def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
-    # The production database still has NOT NULL legacy columns. Persist only
-    # neutral compatibility values so old callers cannot restore policy influence.
-    data["confidence_adjustment"] = 0.0
-    data["position_size_multiplier"] = 1.0
+    supported = {column.name for column in ExpertMemory.__table__.columns}
+    unknown = sorted(set(data).difference(supported))
+    if unknown:
+        raise ValueError(f"unsupported expert memory fields: {','.join(unknown)}")
     for key in ("lesson", "market_pattern"):
         value = data.get(key)
         if value is not None:

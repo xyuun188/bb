@@ -20,10 +20,6 @@ class ExpertMemory(Base, TimestampMixin):
     market_pattern: Mapped[str] = mapped_column(Text, default="")
     lesson: Mapped[str] = mapped_column(Text, default="")
     recommended_action: Mapped[str] = mapped_column(String(40), default="reduce_risk")
-    # Legacy database columns remain storage-only compatibility fields. Runtime
-    # policy must not use them to alter entry confidence or position sizing.
-    confidence_adjustment: Mapped[float] = mapped_column(Float, default=0.0)
-    position_size_multiplier: Mapped[float] = mapped_column(Float, default=1.0)
     evidence_count: Mapped[int] = mapped_column(Integer, default=1)
     hit_count: Mapped[int] = mapped_column(Integer, default=0)
     success_count: Mapped[int] = mapped_column(Integer, default=0)
