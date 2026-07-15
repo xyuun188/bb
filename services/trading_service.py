@@ -92,6 +92,10 @@ from services.entry_suspicious_symbol import EntrySuspiciousSymbolPolicy
 from services.entry_symbol_universe import EntrySymbolUniversePolicy
 from services.exchange_backed_position_provider import ExchangeBackedPositionProvider
 from services.exchange_close_fill_finder import ExchangeCloseFillFinder
+from services.exchange_exit_decision_lineage import (
+    apply_exit_decision_lineage,
+    load_exit_decision_lineage,
+)
 from services.exchange_position_state import (
     ExchangePositionStatePolicy,
     ExchangeProtectionMapProvider,
@@ -143,6 +147,9 @@ from services.position_open_time import position_open_time
 from services.position_profit_peak_context import PositionProfitPeakContextPolicy
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
+from services.position_protection_rebalance import (
+    rebalance_position_protection_after_exit,
+)
 from services.position_review_batch import PositionReviewBatchPolicy
 from services.position_review_decision_processor import PositionReviewDecisionProcessor
 from services.position_review_decision_service import (
@@ -395,6 +402,7 @@ class TradingService:
             no_exchange_position_result_checker=self.result_has_no_exchange_position,
             trade_count_incrementer=self.increment_trade_count,
             position_execution_persister=self.persist_position_from_execution,
+            position_protection_rebalancer=self.rebalance_position_protection_after_exit,
             order_fact_recovery_trigger=self.request_okx_order_fact_recovery,
             open_positions_execution_applier=self.apply_execution_to_open_positions,
             decision_executed_marker=self.mark_decision_executed,
@@ -2989,6 +2997,15 @@ class TradingService:
             execution_result,
             model_mode,
         )
+
+    async def rebalance_position_protection_after_exit(
+        self,
+        executor: Any,
+        decision: DecisionOutput,
+    ) -> dict[str, Any]:
+        """Resize OKX-native protection through the single integrity owner."""
+
+        return await rebalance_position_protection_after_exit(executor, decision)
 
     def apply_execution_to_open_positions(
         self,
@@ -7716,7 +7733,7 @@ class TradingService:
         position_size_pct: float | None = None,
         reconcile_origin: str | None = None,
     ) -> int | None:
-        """Record a synthetic close decision for exchange-side position closes."""
+        """Complete the original exit decision or record an exchange-side close."""
         try:
             side = str(pos.side or "").lower()
             action = Action.CLOSE_SHORT if side == "short" else Action.CLOSE_LONG
@@ -7726,6 +7743,31 @@ class TradingService:
             }
             close_fraction = self._safe_float(position_size_pct, 1.0)
             close_fraction = min(max(close_fraction, 0.0), 1.0) or 1.0
+            close_order_id = str(close_fill_safe.get("order_id") or "").strip()
+            if close_order_id:
+                resolution = await load_exit_decision_lineage(
+                    session,
+                    model_name=pos.model_name or ENSEMBLE_TRADER_NAME,
+                    symbol=pos.symbol,
+                    action=action.value,
+                    is_paper=pos.execution_mode != "live",
+                    execution_mode=pos.execution_mode,
+                    close_order_id=close_order_id,
+                )
+                lineage = apply_exit_decision_lineage(
+                    resolution,
+                    close_order_id=close_order_id,
+                    close_fill=close_fill_safe,
+                    reconcile_origin=reconcile_origin or "external_okx_sync",
+                    exit_price=exit_price,
+                    realized_pnl=realized_pnl,
+                    closed_at=closed_at,
+                    entry_notional=self._safe_float(pos.entry_price, 0.0)
+                    * self._safe_float(pos.quantity, 0.0),
+                )
+                if lineage is not None:
+                    await session.flush()
+                    return int(lineage["authoritative_decision_id"])
             repo = DecisionRepository(session)
             record = await repo.log_decision(
                 {

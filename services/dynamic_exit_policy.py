@@ -8,6 +8,12 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.current_position_management import (
+    ALLOWED_MANAGEMENT_ACTIONS,
+    CURRENT_POSITION_MANAGEMENT_KIND,
+    CURRENT_POSITION_MANAGEMENT_VERSION,
+    current_position_management_contract_complete,
+)
 from services.dynamic_policy_values import continuous_budget_fraction
 
 
@@ -51,12 +57,14 @@ class DynamicExitAssessment:
     fee_after_unrealized_pnl_usdt: float
     fee_buffer_usdt: float
     execution_cost_complete: bool
+    current_management_contract_complete: bool
     profit_retrace_ratio: float
     stop_risk_usage: float
     continuation_deterioration: float
     opposite_pressure: float
     portfolio_exposure_pressure: float
     planned_stop_crossed: bool
+    current_management_contract_versions: tuple[str, ...]
     policy_provenance: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +103,8 @@ def assess_dynamic_exit(
     planned_risk = 0.0
     peak_profit = 0.0
     planned_stop_crossed = False
+    management_contracts: list[dict[str, Any]] = []
+    management_pressure_values: list[float] = []
     for position in matches:
         qty = abs(
             _safe_float(
@@ -179,6 +189,12 @@ def assess_dynamic_exit(
                 0.0,
             ),
         )
+        management = _safe_dict(position.get("current_management_contract"))
+        management_contracts.append(management)
+        if management.get("management_eligible") is True and not management.get("blockers"):
+            management_pressure_values.append(
+                _clamp(_safe_float(management.get("portfolio_concentration_pressure"), 0.0))
+            )
 
     execution_cost = _safe_dict(raw.get("execution_cost"))
     round_trip_cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
@@ -218,7 +234,34 @@ def assess_dynamic_exit(
     )
     continuation = _clamp(adverse_move / total_move) if total_move > 0.0 else 0.0
     opposite = 0.0
-    portfolio_pressure = 0.0
+    current_management_contract_complete = bool(
+        matches
+        and len(management_contracts) == len(matches)
+        and all(
+            contract.get("management_eligible") is True
+            and contract.get("contract_version") == CURRENT_POSITION_MANAGEMENT_VERSION
+            and contract.get("kind") == CURRENT_POSITION_MANAGEMENT_KIND
+            and contract.get("entry_fee_evidence_complete") is True
+            and contract.get("protection_evidence_complete") is True
+            and contract.get("can_expand_position") is False
+            and contract.get("can_increase_leverage") is False
+            and tuple(contract.get("allowed_actions") or ()) == ALLOWED_MANAGEMENT_ACTIONS
+            and not contract.get("blockers")
+            and current_position_management_contract_complete(position, contract)
+            for position, contract in zip(matches, management_contracts, strict=True)
+        )
+    )
+    adverse_position_pressure = continuous_budget_fraction(
+        retrace,
+        stop_usage,
+        continuation,
+        opposite,
+    )
+    portfolio_pressure = (
+        max(management_pressure_values, default=0.0) * adverse_position_pressure
+        if current_management_contract_complete
+        else 0.0
+    )
     close_fraction = (
         1.0
         if hard_risk
@@ -233,6 +276,8 @@ def assess_dynamic_exit(
     reasons: list[str] = []
     if not matches:
         reasons.append("position_economics_missing")
+    if not hard_risk and matches and not current_management_contract_complete:
+        reasons.append("current_position_management_contract_incomplete")
     if not hard_risk and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
     if not hard_risk and gross_pnl > 0 and net_pnl <= 0 and stop_usage <= 0 and continuation <= 0:
@@ -241,11 +286,13 @@ def assess_dynamic_exit(
         reasons.append("exit_execution_cost_missing")
     eligible = not reasons
     provenance = {
-        "source": "current_position_fee_after_pnl_peak_planned_stop_and_market_returns",
+        "source": (
+            "current_position_takeover_fee_after_pnl_peak_planned_stop_market_and_portfolio_facts"
+        ),
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-07-12.dynamic-exit-authoritative-facts.v2",
+        "strategy_version": "2026-07-15.dynamic-exit-authoritative-facts.v3",
         "fallback_reason": ",".join(reasons),
     }
     return DynamicExitAssessment(
@@ -257,12 +304,22 @@ def assess_dynamic_exit(
         fee_after_unrealized_pnl_usdt=round(net_pnl, 8),
         fee_buffer_usdt=round(fee_buffer, 8),
         execution_cost_complete=execution_cost_complete,
+        current_management_contract_complete=current_management_contract_complete,
         profit_retrace_ratio=round(retrace, 8),
         stop_risk_usage=round(stop_usage, 8),
         continuation_deterioration=round(continuation, 8),
         opposite_pressure=round(opposite, 8),
         portfolio_exposure_pressure=round(portfolio_pressure, 8),
         planned_stop_crossed=planned_stop_crossed,
+        current_management_contract_versions=tuple(
+            sorted(
+                {
+                    str(contract.get("contract_version") or "")
+                    for contract in management_contracts
+                    if str(contract.get("contract_version") or "")
+                }
+            )
+        ),
         policy_provenance=provenance,
     )
 

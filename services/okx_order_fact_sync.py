@@ -13,6 +13,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from math import isclose
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,9 @@ from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
+from services.current_position_management import (
+    build_current_position_management_contract,
+)
 from services.okx_native_facts import (
     OkxNativeAccountBill,
     OkxNativeFactsClient,
@@ -54,6 +58,7 @@ from services.position_settlement import (
     is_final_settlement_status,
     settlement_payload_fields,
 )
+from services.trade_execution_contract import validate_production_entry_contract
 
 logger = structlog.get_logger(__name__)
 
@@ -241,20 +246,38 @@ class OkxOrderFactSyncService:
         started_at = datetime.now(UTC)
         since = self._effective_since(started_at)
         since_naive = _db_naive_since(since)
-        local_orders = await self._load_local_orders(since_naive)
         local_positions = await self._load_local_positions(since_naive)
+        current_position_entry_order_ids = {
+            order_id
+            for position in local_positions
+            if bool(getattr(position, "is_open", False))
+            for order_id in _split_exchange_order_ids(
+                getattr(position, "entry_exchange_order_id", None)
+            )
+        }
+        local_orders = await self._load_local_orders(
+            since_naive,
+            linked_entry_order_ids=current_position_entry_order_ids,
+        )
         external_refresh_orders = [
             order for order in local_orders if _order_needs_okx_pull(order)
         ]
-        target_order_ids = {
+        target_order_ids = current_position_entry_order_ids | {
             token
             for order in external_refresh_orders
             for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
         }
-        priority_target_order_ids = _prioritized_exchange_order_ids(
-            external_refresh_orders,
-            limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
-        )
+        priority_target_order_ids = tuple(
+            dict.fromkeys(
+                [
+                    *sorted(current_position_entry_order_ids),
+                    *_prioritized_exchange_order_ids(
+                        external_refresh_orders,
+                        limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
+                    ),
+                ]
+            )
+        )[:DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC]
         order_target_inst_ids = {
             inst_id
             for order in external_refresh_orders
@@ -277,8 +300,10 @@ class OkxOrderFactSyncService:
         fills: list[OkxNativeFillGroup] = []
         order_rows: list[dict[str, Any]] = []
         protection_algo_rows: list[dict[str, Any]] = []
+        active_protection_orders: list[dict[str, Any]] = []
         protection_execution_error: str | None = None
         exchange_positions: list[dict[str, Any]] = []
+        account_balance_snapshot: dict[str, Any] = {}
         contract_sizes: dict[str, float] = {}
         position_history_rows: list[dict[str, Any]] = []
         position_history_error: str | None = None
@@ -318,6 +343,27 @@ class OkxOrderFactSyncService:
                 record_optional_stage_error("positions", exc)
                 exchange_positions = []
             current_position_target_inst_ids = _current_position_inst_ids(exchange_positions)
+            if current_position_target_inst_ids:
+                try:
+                    active_protection_orders = await _bounded(
+                        native_facts.fetch_position_protection_orders(
+                            inst_ids=current_position_target_inst_ids,
+                            limit=100,
+                        ),
+                        max(3.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
+                    )
+                except Exception as exc:
+                    record_optional_stage_error("active_position_protection", exc)
+            balance_snapshot_loader = getattr(executor, "get_balance_snapshot", None)
+            if callable(balance_snapshot_loader):
+                try:
+                    snapshot = await _bounded(
+                        balance_snapshot_loader(),
+                        max(3.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
+                    )
+                    account_balance_snapshot = snapshot if isinstance(snapshot, dict) else {}
+                except Exception as exc:
+                    record_optional_stage_error("account_balance_snapshot", exc)
             fact_target_inst_ids = (
                 order_target_inst_ids
                 | position_target_inst_ids
@@ -675,6 +721,8 @@ class OkxOrderFactSyncService:
                 current_position_result = await self._sync_current_position_rows(
                     session,
                     exchange_positions=exchange_positions,
+                    active_protection_orders=active_protection_orders,
+                    account_balance_snapshot=account_balance_snapshot,
                     contract_sizes=contract_sizes,
                     now=datetime.now(UTC),
                     samples=samples,
@@ -763,7 +811,13 @@ class OkxOrderFactSyncService:
             return None
         return _parse_datetime(payload.get("reset_at"))
 
-    async def _load_local_orders(self, since_naive: datetime) -> list[Order]:
+    async def _load_local_orders(
+        self,
+        since_naive: datetime,
+        *,
+        linked_entry_order_ids: set[str] | None = None,
+    ) -> list[Order]:
+        linked_ids = sorted(linked_entry_order_ids or set())
         async with get_session_ctx() as session:
             rows = await session.execute(
                 select(Order)
@@ -774,7 +828,17 @@ class OkxOrderFactSyncService:
                 .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
                 .limit(self.limit)
             )
-            return list(rows.scalars().all())
+            recent = list(rows.scalars().all())
+            linked: list[Order] = []
+            if linked_ids:
+                linked_rows = await session.execute(
+                    select(Order).where(
+                        Order.execution_mode == self.mode,
+                        Order.exchange_order_id.in_(linked_ids),
+                    )
+                )
+                linked = list(linked_rows.scalars().all())
+            return _merge_local_order_rows(recent, linked)
 
     async def _load_local_positions(self, since_naive: datetime) -> list[Position]:
         async with get_session_ctx() as session:
@@ -802,6 +866,7 @@ class OkxOrderFactSyncService:
         session: Any,
         since_naive: datetime,
     ) -> list[Order]:
+        linked_ids = await _load_open_position_entry_order_ids(session, mode=self.mode)
         rows = await session.execute(
             select(Order)
             .where(
@@ -811,8 +876,20 @@ class OkxOrderFactSyncService:
             .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
             .limit(self.limit)
         )
+        recent = list(rows.scalars().all())
+        linked: list[Order] = []
+        if linked_ids:
+            linked_rows = await session.execute(
+                select(Order).where(
+                    Order.execution_mode == self.mode,
+                    Order.exchange_order_id.in_(sorted(linked_ids)),
+                )
+            )
+            linked = list(linked_rows.scalars().all())
         return [
-            order for order in rows.scalars().all() if _order_needs_okx_fact_refresh(order)
+            order
+            for order in _merge_local_order_rows(recent, linked)
+            if _order_needs_okx_fact_refresh(order)
         ]
 
     def _apply_local_order_facts(
@@ -1665,6 +1742,8 @@ class OkxOrderFactSyncService:
         session: Any,
         *,
         exchange_positions: list[dict[str, Any]],
+        active_protection_orders: list[dict[str, Any]],
+        account_balance_snapshot: dict[str, Any],
         contract_sizes: dict[str, float],
         now: datetime,
         samples: list[dict[str, Any]],
@@ -1674,6 +1753,34 @@ class OkxOrderFactSyncService:
         updated = 0
         skipped = 0
         candidate_orders = await self._load_current_position_entry_link_orders(session)
+        candidate_orders_by_id = {
+            order_id: order
+            for order in candidate_orders
+            for order_id in _split_exchange_order_ids(
+                getattr(order, "exchange_order_id", None)
+            )
+        }
+        decision_ids = {
+            int(order.decision_id)
+            for order in candidate_orders
+            if getattr(order, "decision_id", None)
+        }
+        entry_decisions_by_id: dict[int, AIDecision] = {}
+        if decision_ids:
+            decision_rows = await session.execute(
+                select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
+            )
+            entry_decisions_by_id = {
+                int(decision.id): decision for decision in decision_rows.scalars().all()
+            }
+        portfolio_snapshot = _current_portfolio_management_snapshot(
+            exchange_positions,
+            active_protection_orders=active_protection_orders,
+            account_balance_snapshot=account_balance_snapshot,
+            contract_sizes=contract_sizes,
+            mode=self.mode,
+            now=now,
+        )
         for row in exchange_positions:
             inst_id = _current_position_inst_id(row)
             side = _current_position_side(row)
@@ -1709,6 +1816,78 @@ class OkxOrderFactSyncService:
                 side=side,
             )
             existing = _best_current_position_cache_row(existing_rows)
+            payload["entry_exchange_order_id"] = _merge_exchange_order_ids(
+                payload.get("entry_exchange_order_id"),
+                *(getattr(position, "entry_exchange_order_id", None) for position in existing_rows),
+                max_length=500,
+            ) or None
+            linked_entry_ids = _split_exchange_order_ids(
+                payload.get("entry_exchange_order_id")
+            )
+            linked_entry_orders = [
+                candidate_orders_by_id[order_id]
+                for order_id in linked_entry_ids
+                if order_id in candidate_orders_by_id
+            ]
+            fee_evidence = _current_position_entry_fee_evidence(
+                linked_entry_ids,
+                linked_entry_orders,
+                current_quantity=_safe_float(payload.get("quantity"), 0.0),
+            )
+            if fee_evidence["complete"]:
+                payload["entry_fee"] = fee_evidence["allocated_entry_fee_usdt"]
+
+            key = (
+                normalize_trading_symbol(payload.get("symbol")),
+                str(payload.get("side") or "").lower(),
+            )
+            position_portfolio = dict(
+                _safe_mapping(portfolio_snapshot.get("positions_by_key")).get(key, {})
+            )
+            if position_portfolio.get("protection_evidence_complete") is True:
+                payload["stop_loss_price"] = position_portfolio.get("stop_loss_price")
+                payload["take_profit_price"] = position_portfolio.get("take_profit_price")
+            original_entry = _original_entry_contract_evidence(
+                linked_entry_ids,
+                linked_entry_orders,
+                decisions_by_id=entry_decisions_by_id,
+            )
+            management_facts = {
+                **position_portfolio,
+                "symbol": payload.get("symbol"),
+                "side": payload.get("side"),
+                "quantity": payload.get("quantity"),
+                "entry_price": payload.get("entry_price"),
+                "current_price": payload.get("current_price"),
+                "entry_fee_usdt": fee_evidence["allocated_entry_fee_usdt"],
+                "full_entry_fee_usdt": fee_evidence["full_entry_fee_usdt"],
+                "full_entry_notional_usdt": fee_evidence["full_entry_notional_usdt"],
+                "entry_fee_evidence_complete": fee_evidence["complete"],
+                "entry_fee_source": fee_evidence["source"],
+                "entry_order_ids": linked_entry_ids,
+                "entry_decision_ids": original_entry["decision_ids"],
+                "original_entry_contract_complete": original_entry["complete"],
+                "original_entry_contract_gaps": original_entry["gaps"],
+                "portfolio_stressed_loss_usdt": portfolio_snapshot.get(
+                    "portfolio_stressed_loss_usdt"
+                ),
+                "portfolio_gross_notional_usdt": portfolio_snapshot.get(
+                    "portfolio_gross_notional_usdt"
+                ),
+                "account_equity_usdt": portfolio_snapshot.get("account_equity_usdt"),
+                "open_position_count": portfolio_snapshot.get("open_position_count"),
+            }
+            payload["current_management_contract"] = (
+                build_current_position_management_contract(
+                    management_facts,
+                    previous_contract=(
+                        getattr(existing, "current_management_contract", None)
+                        if existing is not None
+                        else None
+                    ),
+                    now=now,
+                )
+            )
             if existing is None:
                 session.add(Position(**payload))
                 backfilled += 1
@@ -1719,14 +1898,13 @@ class OkxOrderFactSyncService:
                         "side": payload["side"],
                         "okx_pos_id": payload.get("okx_pos_id"),
                         "entry_exchange_order_id": payload.get("entry_exchange_order_id"),
+                        "entry_fee": payload.get("entry_fee"),
+                        "management_eligible": payload[
+                            "current_management_contract"
+                        ].get("management_eligible"),
                     }
                 )
                 continue
-            payload["entry_exchange_order_id"] = _merge_exchange_order_ids(
-                payload.get("entry_exchange_order_id"),
-                *(getattr(position, "entry_exchange_order_id", None) for position in existing_rows),
-                max_length=500,
-            ) or None
             _apply_current_position_payload(existing, payload, now=now)
             duplicate_ids: list[int] = []
             for duplicate in existing_rows:
@@ -1747,6 +1925,10 @@ class OkxOrderFactSyncService:
                     "side": getattr(existing, "side", None),
                     "okx_pos_id": getattr(existing, "okx_pos_id", None),
                     "entry_exchange_order_id": getattr(existing, "entry_exchange_order_id", None),
+                    "entry_fee": getattr(existing, "entry_fee", None),
+                    "management_eligible": _safe_mapping(
+                        getattr(existing, "current_management_contract", None)
+                    ).get("management_eligible"),
                     "retired_duplicate_position_ids": duplicate_ids,
                 }
             )
@@ -2105,6 +2287,7 @@ class OkxOrderFactSyncService:
         window_start = _db_naive_since(PHASE3_DEFAULT_ORDER_SYNC_START) - timedelta(
             seconds=CURRENT_POSITION_ENTRY_LINK_WINDOW_SECONDS
         )
+        linked_ids = await _load_open_position_entry_order_ids(session, mode=self.mode)
         rows = await session.execute(
             select(Order)
             .where(
@@ -2121,7 +2304,18 @@ class OkxOrderFactSyncService:
             .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
             .limit(self.limit * 3)
         )
-        return list(rows.scalars().all())
+        recent = list(rows.scalars().all())
+        linked: list[Order] = []
+        if linked_ids:
+            linked_rows = await session.execute(
+                select(Order).where(
+                    Order.execution_mode == self.mode,
+                    Order.status == "filled",
+                    Order.exchange_order_id.in_(sorted(linked_ids)),
+                )
+            )
+            linked = list(linked_rows.scalars().all())
+        return _merge_local_order_rows(recent, linked)
 
     async def _find_current_position_cache_rows(
         self,
@@ -3033,12 +3227,14 @@ def _order_has_confirmed_okx_fill_fact(
         return False
     expected_fee = _safe_float(raw.get("fee_abs"), -1.0)
     local_fee = _safe_float(getattr(order, "fee", None), -1.0)
-    if expected_fee >= 0 and local_fee >= 0 and not _relative_close_enough(
-        local_fee,
-        expected_fee,
-        0.001,
-    ):
-        return False
+    if expected_fee >= 0 and local_fee >= 0:
+        fee_matches = (
+            isclose(local_fee, expected_fee, rel_tol=1e-9, abs_tol=1e-12)
+            if expected_fee == 0 or local_fee == 0
+            else _relative_close_enough(local_fee, expected_fee, 0.001)
+        )
+        if not fee_matches:
+            return False
     return True
 
 
@@ -3879,6 +4075,315 @@ def _lifecycle_order_ids_are_empty_or_polluted(existing_ids: set[str], incoming_
     return bool(incoming_ids and existing_ids & incoming_ids and not existing_ids.issubset(incoming_ids))
 
 
+def _safe_mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _merge_local_order_rows(*groups: Iterable[Order]) -> list[Order]:
+    merged: list[Order] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for order in group:
+            database_id = str(getattr(order, "id", "") or "")
+            exchange_id = str(getattr(order, "exchange_order_id", "") or "")
+            key = (
+                ("exchange", exchange_id)
+                if exchange_id
+                else ("database", database_id or str(id(order)))
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(order)
+    return merged
+
+
+async def _load_open_position_entry_order_ids(
+    session: Any,
+    *,
+    mode: str,
+) -> set[str]:
+    rows = await session.execute(
+        select(Position.entry_exchange_order_id).where(
+            Position.execution_mode == mode,
+            Position.is_open.is_(True),
+            Position.entry_exchange_order_id.is_not(None),
+            Position.entry_exchange_order_id != "",
+        )
+    )
+    return {
+        order_id
+        for value in rows.scalars().all()
+        for order_id in _split_exchange_order_ids(value)
+    }
+
+
+def _current_position_entry_fee_evidence(
+    entry_order_ids: list[str],
+    entry_orders: list[Order],
+    *,
+    current_quantity: float,
+) -> dict[str, Any]:
+    orders_by_id = {
+        order_id: order
+        for order in entry_orders
+        for order_id in _split_exchange_order_ids(
+            getattr(order, "exchange_order_id", None)
+        )
+    }
+    missing_ids = [order_id for order_id in entry_order_ids if order_id not in orders_by_id]
+    ordered = [orders_by_id[order_id] for order_id in entry_order_ids if order_id in orders_by_id]
+    exact_fill_ids: list[str] = []
+    fee_fact_missing_ids: list[str] = []
+    total_quantity = 0.0
+    total_fee = 0.0
+    total_notional = 0.0
+    for order_id, order in zip(
+        [order_id for order_id in entry_order_ids if order_id in orders_by_id],
+        ordered,
+        strict=True,
+    ):
+        raw = _safe_mapping(getattr(order, "okx_raw_fills", None))
+        quantity = abs(_safe_float(getattr(order, "quantity", None), 0.0))
+        price = max(_safe_float(getattr(order, "price", None), 0.0), 0.0)
+        fee_present = raw.get("fee_abs") is not None
+        exact = _order_has_confirmed_okx_fill_fact(
+            order,
+            require_verified_contract_size=True,
+        )
+        if not exact:
+            fee_fact_missing_ids.append(order_id)
+            continue
+        if not fee_present or quantity <= 0 or price <= 0:
+            fee_fact_missing_ids.append(order_id)
+            continue
+        exact_fill_ids.append(order_id)
+        total_quantity += quantity
+        total_fee += abs(_safe_float(raw.get("fee_abs"), 0.0))
+        total_notional += quantity * price
+
+    current_qty = max(_safe_float(current_quantity, 0.0), 0.0)
+    quantity_covered = bool(
+        total_quantity > 0
+        and current_qty > 0
+        and (
+            total_quantity > current_qty
+            or isclose(total_quantity, current_qty, rel_tol=1e-9, abs_tol=1e-12)
+        )
+    )
+    complete = bool(
+        entry_order_ids
+        and not missing_ids
+        and not fee_fact_missing_ids
+        and len(exact_fill_ids) == len(entry_order_ids)
+        and quantity_covered
+        and total_notional > 0
+    )
+    allocated_fee = total_fee * current_qty / total_quantity if complete else 0.0
+    return {
+        "complete": complete,
+        "source": "okx_fills_history" if complete else "incomplete_okx_fill_lineage",
+        "entry_order_ids": list(entry_order_ids),
+        "exact_fill_order_ids": exact_fill_ids,
+        "missing_order_ids": missing_ids,
+        "fee_fact_missing_order_ids": fee_fact_missing_ids,
+        "full_entry_quantity": total_quantity,
+        "current_quantity": current_qty,
+        "full_entry_fee_usdt": total_fee,
+        "allocated_entry_fee_usdt": allocated_fee,
+        "full_entry_notional_usdt": total_notional,
+    }
+
+
+def _original_entry_contract_evidence(
+    entry_order_ids: list[str],
+    entry_orders: list[Order],
+    *,
+    decisions_by_id: dict[int, AIDecision],
+) -> dict[str, Any]:
+    orders_by_id = {
+        order_id: order
+        for order in entry_orders
+        for order_id in _split_exchange_order_ids(
+            getattr(order, "exchange_order_id", None)
+        )
+    }
+    gaps: list[str] = []
+    orders_by_decision: dict[int, list[Order]] = {}
+    for order_id in entry_order_ids:
+        order = orders_by_id.get(order_id)
+        if order is None:
+            gaps.append(f"entry_order_not_loaded:{order_id}")
+            continue
+        decision_id = int(getattr(order, "decision_id", 0) or 0)
+        if decision_id <= 0:
+            gaps.append(f"entry_decision_link_missing:{order_id}")
+            continue
+        orders_by_decision.setdefault(decision_id, []).append(order)
+
+    for decision_id, orders in sorted(orders_by_decision.items()):
+        decision = decisions_by_id.get(decision_id)
+        if decision is None:
+            gaps.append(f"entry_decision_not_loaded:{decision_id}")
+            continue
+        raw = _safe_mapping(getattr(decision, "raw_llm_response", None))
+        filled_notional = sum(
+            abs(
+                _safe_float(getattr(order, "quantity", None), 0.0)
+                * _safe_float(getattr(order, "price", None), 0.0)
+            )
+            for order in orders
+        )
+        _, reasons = validate_production_entry_contract(
+            raw,
+            filled_notional_usdt=filled_notional,
+            executed=True,
+            filled_order_present=True,
+        )
+        gaps.extend(f"decision_{decision_id}:{reason}" for reason in reasons)
+
+    decision_ids = sorted(orders_by_decision)
+    return {
+        "complete": bool(entry_order_ids and decision_ids and not gaps),
+        "decision_ids": decision_ids,
+        "gaps": list(dict.fromkeys(gaps)),
+    }
+
+
+def _current_position_protection_snapshot(
+    payload: dict[str, Any],
+    active_protection_orders: list[dict[str, Any]],
+    *,
+    contracts: float,
+    contract_size: float,
+) -> dict[str, Any]:
+    symbol = normalize_trading_symbol(payload.get("symbol"))
+    side = str(payload.get("side") or "").lower()
+    entry_price = max(_safe_float(payload.get("entry_price"), 0.0), 0.0)
+    matching = [
+        order
+        for order in active_protection_orders
+        if normalize_trading_symbol(order.get("symbol")) == symbol
+        and str(order.get("position_side") or "").lower() == side
+    ]
+    rows = [
+        {
+            "algo_id": str(order.get("algo_id") or ""),
+            "state": str(order.get("state") or ""),
+            "contracts": abs(_safe_float(order.get("contracts"), 0.0)),
+            "reduce_only": order.get("reduce_only") is True,
+            "stop_loss_price": _safe_float(order.get("stop_loss_price"), 0.0) or None,
+            "take_profit_price": _safe_float(order.get("take_profit_price"), 0.0) or None,
+            "linked_order_id": str(order.get("linked_order_id") or "") or None,
+        }
+        for order in matching
+    ]
+    covered_contracts = sum(_safe_float(order.get("contracts"), 0.0) for order in rows)
+    exact_coverage = bool(
+        contracts > 0
+        and covered_contracts > 0
+        and isclose(covered_contracts, contracts, rel_tol=1e-9, abs_tol=1e-12)
+    )
+    rows_valid = bool(
+        rows
+        and all(
+            order.get("algo_id")
+            and order.get("reduce_only") is True
+            and _safe_float(order.get("contracts"), 0.0) > 0
+            and _safe_float(order.get("stop_loss_price"), 0.0) > 0
+            and _safe_float(order.get("take_profit_price"), 0.0) > 0
+            for order in rows
+        )
+    )
+    complete = bool(exact_coverage and rows_valid and entry_price > 0 and contract_size > 0)
+    stressed_loss = 0.0
+    take_profit_value = 0.0
+    base_quantity = 0.0
+    if complete:
+        for order in rows:
+            order_quantity = _safe_float(order.get("contracts"), 0.0) * contract_size
+            stressed_loss += order_quantity * abs(
+                entry_price - _safe_float(order.get("stop_loss_price"), 0.0)
+            )
+            take_profit_value += order_quantity * _safe_float(
+                order.get("take_profit_price"),
+                0.0,
+            )
+            base_quantity += order_quantity
+    stop_loss_price = 0.0
+    take_profit_price = 0.0
+    if complete and base_quantity > 0:
+        stop_distance = stressed_loss / base_quantity
+        stop_loss_price = (
+            entry_price - stop_distance if side == "long" else entry_price + stop_distance
+        )
+        take_profit_price = take_profit_value / base_quantity
+    return {
+        "contracts": contracts,
+        "contract_size": contract_size,
+        "protection_evidence_complete": complete,
+        "protection_orders": rows,
+        "protection_contracts": covered_contracts,
+        "stop_loss_price": stop_loss_price,
+        "take_profit_price": take_profit_price,
+        "position_stressed_loss_usdt": stressed_loss,
+    }
+
+
+def _current_portfolio_management_snapshot(
+    exchange_positions: list[dict[str, Any]],
+    *,
+    active_protection_orders: list[dict[str, Any]],
+    account_balance_snapshot: dict[str, Any],
+    contract_sizes: dict[str, float],
+    mode: str,
+    now: datetime,
+) -> dict[str, Any]:
+    positions_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    gross_notional = 0.0
+    stressed_loss = 0.0
+    for row in exchange_positions:
+        inst_id = _current_position_inst_id(row)
+        side = _current_position_side(row)
+        contracts = _current_position_contracts(row)
+        if not inst_id or side not in {"long", "short"} or contracts <= 0:
+            continue
+        contract_size = _current_position_contract_size(row, contract_sizes)
+        payload = _position_from_current_row(
+            row,
+            mode=mode,
+            now=now,
+            contract_size=contract_size,
+        )
+        protection = _current_position_protection_snapshot(
+            payload,
+            active_protection_orders,
+            contracts=contracts,
+            contract_size=contract_size,
+        )
+        quantity = _safe_float(payload.get("quantity"), 0.0)
+        current_price = _safe_float(payload.get("current_price"), 0.0)
+        gross_notional += max(quantity * current_price, 0.0)
+        stressed_loss += _safe_float(protection.get("position_stressed_loss_usdt"), 0.0)
+        positions_by_key[(normalize_trading_symbol(payload.get("symbol")), side)] = protection
+    return {
+        "positions_by_key": positions_by_key,
+        "portfolio_gross_notional_usdt": gross_notional,
+        "portfolio_stressed_loss_usdt": stressed_loss,
+        "account_equity_usdt": _account_equity_from_snapshot(account_balance_snapshot),
+        "open_position_count": len(positions_by_key),
+    }
+
+
+def _account_equity_from_snapshot(snapshot: dict[str, Any]) -> float:
+    value = _safe_mapping(snapshot)
+    for key in ("equity", "account_equity", "total", "allocatable", "cash"):
+        equity = _safe_float(value.get(key), 0.0)
+        if equity > 0:
+            return equity
+    return 0.0
+
+
 def _position_from_current_row(
     row: dict[str, Any],
     *,
@@ -3995,6 +4500,15 @@ def _apply_current_position_payload(position: Position, payload: dict[str, Any],
         existing_close_exchange_order_id,
         payload.get("close_exchange_order_id"),
         max_length=500,
+    ) or None
+    if "entry_fee" in payload:
+        position.entry_fee = max(_safe_float(payload.get("entry_fee"), 0.0), 0.0)
+    if _safe_float(payload.get("stop_loss_price"), 0.0) > 0:
+        position.stop_loss_price = _safe_float(payload.get("stop_loss_price"), 0.0)
+    if _safe_float(payload.get("take_profit_price"), 0.0) > 0:
+        position.take_profit_price = _safe_float(payload.get("take_profit_price"), 0.0)
+    position.current_management_contract = _safe_mapping(
+        payload.get("current_management_contract")
     ) or None
     position.updated_at = now
 

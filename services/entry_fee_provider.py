@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select
 
 from executor.base_executor import OrderStatus
 from models.trade import Order
+from services.current_position_management import (
+    current_position_management_contract_complete,
+)
 
 
 def proportional_fee(fee: float | None, close_qty: float, total_qty: float) -> float:
@@ -24,54 +26,73 @@ def proportional_fee(fee: float | None, close_qty: float, total_qty: float) -> f
 
 
 class EntryFeeProvider:
-    """Find and prorate the entry order fee for a closing position."""
+    """Read exact linked entry-fill fees for a closing position."""
 
     @staticmethod
     def proportional_fee(fee: float | None, close_qty: float, total_qty: float) -> float:
         return proportional_fee(fee, close_qty, total_qty)
 
     async def entry_fee_for_position(self, session: Any, position: Any, close_qty: float) -> float:
-        entry_side = "buy" if position.side == "long" else "sell"
-        created_at = position.created_at
-        statement = select(Order).where(
-            Order.model_name == position.model_name,
-            Order.execution_mode == position.execution_mode,
-            Order.symbol == position.symbol,
-            Order.side == entry_side,
-            Order.status == OrderStatus.FILLED.value,
+        entry_order_ids = _split_exchange_order_ids(
+            getattr(position, "entry_exchange_order_id", None)
         )
-        if created_at:
-            window_start = created_at - timedelta(seconds=90)
-            window_end = created_at + timedelta(seconds=90)
-            window_statement = statement.where(
-                Order.created_at >= window_start,
-                Order.created_at <= window_end,
-            )
+        orders: list[Any] = []
+        for order_id in entry_order_ids:
             order = await self._first_order(
                 session,
-                window_statement.order_by(Order.created_at.asc()).limit(1),
-            )
-            if order:
-                return proportional_fee(order.fee, close_qty, order.quantity)
-
-            order = await self._first_order(
-                session,
-                statement.where(Order.created_at <= created_at)
-                .order_by(Order.created_at.desc())
+                select(Order)
+                .where(
+                    Order.execution_mode == position.execution_mode,
+                    Order.exchange_order_id == order_id,
+                    Order.status == OrderStatus.FILLED.value,
+                )
                 .limit(1),
             )
-            if order:
-                return proportional_fee(order.fee, close_qty, order.quantity)
+            if order is None or not _has_authoritative_fee_fact(order, order_id=order_id):
+                orders = []
+                break
+            orders.append(order)
+        if orders and len(orders) == len(entry_order_ids):
+            total_fee = sum(
+                abs(float(getattr(order, "okx_raw_fills", {}).get("fee_abs") or 0.0))
+                for order in orders
+            )
+            total_quantity = sum(abs(float(getattr(order, "quantity", 0.0) or 0.0)) for order in orders)
+            return proportional_fee(total_fee, close_qty, total_quantity)
 
-        order = await self._first_order(
-            session,
-            statement.order_by(Order.created_at.desc()).limit(1),
-        )
-        if order:
-            return proportional_fee(order.fee, close_qty, order.quantity)
+        if current_position_management_contract_complete(position):
+            return proportional_fee(
+                getattr(position, "entry_fee", None),
+                close_qty,
+                getattr(position, "quantity", None),
+            )
         return 0.0
 
     @staticmethod
     async def _first_order(session: Any, statement: Any) -> Any | None:
         result = await session.execute(statement)
         return result.scalar_one_or_none()
+
+
+def _split_exchange_order_ids(value: Any) -> list[str]:
+    tokens = {str(value or "").strip()}
+    for separator in (",", ";", "|", "\n", "\t", " "):
+        tokens = {
+            part.strip()
+            for token in tokens
+            for part in token.split(separator)
+            if part.strip()
+        }
+    return sorted(token for token in tokens if token)
+
+
+def _has_authoritative_fee_fact(order: Any, *, order_id: str) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    if not isinstance(raw, dict):
+        return False
+    return bool(
+        raw.get("fills_history_confirmed") is True
+        and str(raw.get("order_id") or "").strip() == order_id
+        and raw.get("fee_abs") is not None
+        and abs(float(getattr(order, "quantity", 0.0) or 0.0)) > 0
+    )

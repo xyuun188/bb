@@ -296,6 +296,13 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
                         unrealized_pnl=6.0,
                         is_open=True,
                         entry_exchange_order_id="entry-edge-1",
+                        current_management_contract={
+                            "contract_version": "2026-07-15.current-position-management.v1",
+                            "management_eligible": True,
+                            "can_expand_position": False,
+                            "can_increase_leverage": False,
+                            "blockers": [],
+                        },
                         created_at=datetime(2026, 7, 15, tzinfo=UTC),
                     ),
                 ]
@@ -347,6 +354,7 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
     assert payload["protection_inventory"]["available"] is True
     assert payload["protection_inventory"]["missing_keys"] == []
     row = payload["positions"][0]
+    assert row["current_management_contract"]["management_eligible"] is True
     assert row["risk_contract"]["available"] is True
     risk = row["risk_contract"]["contracts"][0]
     assert risk["risk_budget_usdt"] == 4.0

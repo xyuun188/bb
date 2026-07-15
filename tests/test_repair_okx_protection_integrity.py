@@ -66,6 +66,12 @@ class _RepairExecutor:
     def _native_facts_client(self) -> _SpecsClient:
         return _SpecsClient()
 
+    async def get_contract_specs_strict(
+        self,
+        symbols: list[str],
+    ) -> dict[str, dict[str, str]]:
+        return await _SpecsClient().fetch_contract_specs(symbols=symbols)
+
     async def amend_position_protection_size(
         self,
         *,
@@ -99,6 +105,7 @@ def _args(*, apply: bool, fingerprint: str = "") -> argparse.Namespace:
         mode="paper",
         apply=apply,
         expected_fingerprint=fingerprint,
+        online=False,
     )
 
 

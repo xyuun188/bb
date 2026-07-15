@@ -922,6 +922,31 @@ class _CurrentPositionOnlyCcxt:
             ]
         }
 
+    async def privateGetTradeOrdersAlgoPending(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        if str(params.get("ordType") or "") != "oco":
+            return {"data": []}
+        return {
+            "data": [
+                {
+                    "instId": "FLOKI-USDT-SWAP",
+                    "algoId": "floki-oco-1",
+                    "ordType": "oco",
+                    "state": "live",
+                    "side": "buy",
+                    "posSide": "short",
+                    "sz": "6",
+                    "reduceOnly": "true",
+                    "slTriggerPx": "0.000023",
+                    "tpTriggerPx": "0.000019",
+                    "cTime": str(self.position_ts),
+                    "uTime": str(self.position_ts),
+                }
+            ]
+        }
+
     async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
         assert params["instType"] == "SWAP"
         return {"data": [{"instId": "FLOKI-USDT-SWAP", "ctVal": "100000"}]}
@@ -942,6 +967,9 @@ class _CurrentPositionOnlyExecutor:
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         return await fn(*args, **kwargs)
+
+    async def get_balance_snapshot(self) -> dict[str, Any]:
+        return {"equity": 1_000.0, "free": 900.0, "total": 1_000.0}
 
     async def shutdown(self) -> None:
         return None
@@ -1056,6 +1084,9 @@ class _PartialCloseCurrentPositionExecutor:
 
     async def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         return await fn(*args, **kwargs)
+
+    async def get_balance_snapshot(self) -> dict[str, Any]:
+        return {"equity": 1_000.0, "free": 900.0, "total": 1_000.0}
 
     async def shutdown(self) -> None:
         return None
@@ -3798,6 +3829,16 @@ async def test_order_fact_sync_backfills_open_position_cache_from_okx_current_po
         assert position["closed_at"] is None
         assert position["okx_inst_id"] == "FLOKI-USDT-SWAP"
         assert position["entry_exchange_order_id"] == "3695537280216961024"
+        assert position["entry_fee"] == pytest.approx(0.006522)
+        assert position["stop_loss_price"] == pytest.approx(0.000023)
+        assert position["take_profit_price"] == pytest.approx(0.000019)
+        assert position["current_management_contract"]["management_eligible"] is True, position[
+            "current_management_contract"
+        ]
+        assert position["current_management_contract"]["can_expand_position"] is False
+        assert position["current_management_contract"]["original_entry_contract_status"] == (
+            "historical_entry_contract_incomplete_preserved"
+        )
         assert position["close_exchange_order_id"] is None
         assert len(order_rows) == 1
         assert order_rows[0]._mapping["okx_sync_status"] == OKX_SYNC_OKX_ONLY

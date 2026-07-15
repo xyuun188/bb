@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shlex
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
+from core.remote_ssh import connect_remote_ssh, run_remote_text
+from core.safe_output import safe_print
 from executor.okx_executor import OKXExecutor
+from services.position_protection_rebalance import apply_protection_repair_actions
 from services.protection_order_integrity import audit_protection_order_integrity
 
 
@@ -27,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("paper", "live"), default="paper")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-fingerprint", default="")
+    parser.add_argument("--online", action="store_true")
     return parser
 
 
@@ -35,7 +40,7 @@ async def _snapshot(executor: OKXExecutor) -> dict[str, Any]:
     protection_orders = await executor.get_position_protection_orders(None)
     pending_orders = await executor.get_open_orders_strict(None)
     symbols = [str(position.get("symbol") or "") for position in positions]
-    specs = await executor._native_facts_client().fetch_contract_specs(symbols=symbols)
+    specs = await executor.get_contract_specs_strict(symbols)
     report = audit_protection_order_integrity(
         positions,
         protection_orders,
@@ -65,30 +70,7 @@ async def _apply_actions(
     executor: OKXExecutor,
     actions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    for action in actions:
-        action_name = str(action.get("action") or "")
-        if action_name == "amend_size":
-            response = await executor.amend_position_protection_size(
-                inst_id=str(action.get("inst_id") or ""),
-                algo_id=str(action.get("algo_id") or ""),
-                contracts=float(action.get("new_contracts") or 0.0),
-            )
-        elif action_name == "cancel":
-            response = await executor.cancel_position_protection_order(
-                inst_id=str(action.get("inst_id") or ""),
-                algo_id=str(action.get("algo_id") or ""),
-            )
-        else:
-            raise RuntimeError(f"Unsupported protection repair action: {action_name}")
-        results.append(
-            {
-                "action": action,
-                "okx_code": response.get("code") if isinstance(response, dict) else None,
-                "applied": True,
-            }
-        )
-    return results
+    return await apply_protection_repair_actions(executor, actions)
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -152,10 +134,45 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         await executor.shutdown()
 
 
+def _run_online(args: argparse.Namespace) -> dict[str, Any]:
+    remote_args = [
+        ".venv/bin/python",
+        "scripts/repair_okx_protection_integrity.py",
+        "--mode",
+        args.mode,
+    ]
+    if args.apply:
+        remote_args.append("--apply")
+        remote_args.extend(("--expected-fingerprint", args.expected_fingerprint))
+    app_script = "\n".join(
+        (
+            "cd /data/bb/app",
+            "export DATABASE_URL='postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql'",
+            "exec " + " ".join(shlex.quote(value) for value in remote_args),
+        )
+    )
+    ssh = connect_remote_ssh(ROOT, timeout=20)
+    try:
+        output = run_remote_text(
+            ssh,
+            "runuser -u bb -- /bin/bash -lc " + shlex.quote(app_script),
+            timeout=180,
+            check=True,
+        )
+    finally:
+        ssh.close()
+    safe_print(output)
+    json_lines = [line for line in output.splitlines() if line.lstrip().startswith("{")]
+    if not json_lines:
+        raise RuntimeError("Online protection repair did not return a JSON report")
+    return json.loads(json_lines[-1])
+
+
 def main() -> None:
     args = _parser().parse_args()
-    result = asyncio.run(_run(args))
-    print(json.dumps(result, ensure_ascii=False, default=str))
+    result = _run_online(args) if args.online else asyncio.run(_run(args))
+    if not args.online:
+        safe_print(json.dumps(result, ensure_ascii=False, default=str))
     if args.apply and result.get("verified") is not True:
         raise SystemExit(2)
 

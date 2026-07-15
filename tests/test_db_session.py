@@ -194,6 +194,7 @@ async def test_postgres_trade_fact_columns_skip_existing_columns(
                 "settlement_source",
                 "settlement_synced_at",
                 "settlement_raw",
+                "current_management_contract",
             },
             "orders": {
                 "okx_inst_id",
@@ -242,6 +243,7 @@ async def test_postgres_trade_fact_columns_add_only_missing_columns(
                 "settlement_source",
                 "settlement_synced_at",
                 "settlement_raw",
+                "current_management_contract",
             },
             "orders": {
                 "okx_trade_ids",

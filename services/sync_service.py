@@ -172,7 +172,14 @@ def _merge_local_position_candidates(
             scoped_candidates = matching
     merged = dict(scoped_candidates[0])
     for candidate in scoped_candidates[1:]:
-        for key in ("model_name", "stop_loss", "take_profit", "okx_inst_id", "okx_pos_id"):
+        for key in (
+            "model_name",
+            "stop_loss",
+            "take_profit",
+            "okx_inst_id",
+            "okx_pos_id",
+            "execution_mode",
+        ):
             if merged.get(key) in (None, "") and candidate.get(key) not in (None, ""):
                 merged[key] = candidate.get(key)
         merged["created_at"] = _merge_created_at(merged.get("created_at"), candidate.get("created_at"))
@@ -184,6 +191,12 @@ def _merge_local_position_candidates(
             merged.get("entry_legs"),
             candidate.get("entry_legs"),
         )
+        if not _dict_value(merged.get("current_management_contract")):
+            merged["current_management_contract"] = _dict_value(
+                candidate.get("current_management_contract")
+            )
+        if _float_value(merged.get("entry_fee"), 0.0) <= 0:
+            merged["entry_fee"] = candidate.get("entry_fee")
 
     return merged
 
@@ -269,14 +282,6 @@ def _close_fill_has_protection_metadata(close_fill: dict[str, Any] | None) -> bo
     return bool(_first_value(fill.get("algo_id"), info.get("algoId"), info.get("algoClOrdId")))
 
 
-def _price_matches_protection(close_price: float, protection_price: Any) -> bool:
-    target = _float_value(protection_price, 0.0)
-    if close_price <= 0 or target <= 0:
-        return False
-    tolerance = max(abs(target) * 0.015, abs(close_price) * 0.005, 1e-8)
-    return abs(close_price - target) <= tolerance
-
-
 def _exchange_reconcile_close_origin(
     position: Any,
     close_fill: dict[str, Any] | None,
@@ -287,11 +292,6 @@ def _exchange_reconcile_close_origin(
     if not fill or fill.get("estimated"):
         return RECONCILE_ORIGIN_EXTERNAL_OKX
     if _close_fill_has_protection_metadata(fill):
-        return RECONCILE_ORIGIN_SYSTEM_PROTECTION
-    close_price = _float_value(fill.get("price"), 0.0)
-    if _price_matches_protection(close_price, getattr(position, "stop_loss_price", None)):
-        return RECONCILE_ORIGIN_SYSTEM_PROTECTION
-    if _price_matches_protection(close_price, getattr(position, "take_profit_price", None)):
         return RECONCILE_ORIGIN_SYSTEM_PROTECTION
     return RECONCILE_ORIGIN_EXTERNAL_OKX
 
@@ -511,6 +511,14 @@ def normalized_open_position_context(
     okx_pos_id = _okx_pos_id_from_position_payload(position_payload)
     entry_exchange_order_id = str(position_payload.get("entry_exchange_order_id") or "").strip()
     entry_legs = _list_of_dicts(position_payload.get("entry_legs"))
+    current_management_contract = _dict_value(
+        position_payload.get("current_management_contract")
+    )
+    entry_fee = abs(float_parser(position_payload.get("entry_fee"), 0.0))
+    exit_fee_rate = float_parser(
+        current_management_contract.get("exit_fee_rate_proxy"),
+        0.0,
+    )
     snapshot = parse_exchange_position_snapshot(
         position_payload,
         symbol_normalizer=symbol_normalizer,
@@ -587,6 +595,11 @@ def normalized_open_position_context(
             "okx_pos_id": okx_pos_id,
             "entry_exchange_order_id": entry_exchange_order_id,
             "entry_legs": entry_legs,
+            "entry_fee": entry_fee,
+            "entry_fee_usdt": entry_fee,
+            "exit_fee_rate": exit_fee_rate,
+            "current_management_contract": current_management_contract,
+            "execution_mode": position_payload.get("execution_mode"),
             "info": info,
         }
 
@@ -689,6 +702,11 @@ def normalized_open_position_context(
         "okx_pos_id": okx_pos_id,
         "entry_exchange_order_id": entry_exchange_order_id,
         "entry_legs": entry_legs,
+        "entry_fee": entry_fee,
+        "entry_fee_usdt": entry_fee,
+        "exit_fee_rate": exit_fee_rate,
+        "current_management_contract": current_management_contract,
+        "execution_mode": position_payload.get("execution_mode"),
         "info": info,
     }
 
@@ -2675,11 +2693,10 @@ class OkxSyncService:
                 repo = TradeRepository(session)
                 db_positions = await repo.get_position_records(
                     execution_mode=mode_manager.mode.value,
-                    model_name=ENSEMBLE_TRADER_NAME,
                     limit=1000,
+                    is_open=True,
                 )
-                open_db_positions = [position for position in db_positions if position.is_open]
-                for p in open_db_positions:
+                for p in db_positions:
                     local_positions.append(
                         {
                             "model_name": p.model_name,
@@ -2697,6 +2714,13 @@ class OkxSyncService:
                             "okx_inst_id": getattr(p, "okx_inst_id", None),
                             "okx_pos_id": getattr(p, "okx_pos_id", None),
                             "entry_exchange_order_id": getattr(p, "entry_exchange_order_id", None),
+                            "entry_fee": getattr(p, "entry_fee", None),
+                            "current_management_contract": getattr(
+                                p,
+                                "current_management_contract",
+                                None,
+                            ),
+                            "execution_mode": getattr(p, "execution_mode", None),
                         }
                     )
         except Exception as e:
@@ -2776,6 +2800,9 @@ class OkxSyncService:
                 ("created_at", "created_at"),
                 ("entry_exchange_order_id", "entry_exchange_order_id"),
                 ("entry_legs", "entry_legs"),
+                ("entry_fee", "entry_fee"),
+                ("current_management_contract", "current_management_contract"),
+                ("execution_mode", "execution_mode"),
             ):
                 value = local_position.get(source_key)
                 if value not in (None, "") and payload.get(target_key) in (None, ""):

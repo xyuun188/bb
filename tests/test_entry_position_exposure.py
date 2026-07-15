@@ -36,7 +36,7 @@ def test_entry_position_exposure_summarizes_notional_and_staged_counts() -> None
     assert context["long_count"] == 2
     assert context["short_count"] == 1
     assert context["staged_long_count"] == 1
-    assert context["dominant_side"] == "neutral"
+    assert context["dominant_side"] == "long"
 
 
 def test_entry_position_exposure_uses_count_dominance_when_notional_is_balanced() -> None:

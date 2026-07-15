@@ -4340,7 +4340,7 @@ select.form-input { cursor: pointer; }
 .position-evidence-state.warn { color: var(--accent-light); }
 .position-evidence-summary {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
     margin-bottom: 12px;
 }

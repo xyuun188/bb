@@ -1,6 +1,7 @@
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.current_position_management import build_current_position_management_contract
 from services.dynamic_exit_policy import apply_dynamic_exit
 
 
@@ -20,6 +21,7 @@ def _decision(raw: dict | None = None) -> DecisionOutput:
 
 
 def _position(**overrides: object) -> dict:
+    explicit_contract = "current_management_contract" in overrides
     position = {
         "symbol": "BTC/USDT",
         "side": "long",
@@ -30,9 +32,55 @@ def _position(**overrides: object) -> dict:
         "unrealized_pnl": 10.0,
         "peak_unrealized_pnl": 20.0,
         "stop_loss_pct": 0.02,
+        "stop_loss": 98.0,
+        "take_profit": 110.0,
         "entry_fee_usdt": 0.5,
     }
     position.update(overrides)
+    if not explicit_contract:
+        quantity = float(position["quantity"])
+        entry_price = float(position["entry_price"])
+        current_price = float(position["current_price"])
+        stop_loss = float(position.get("stop_loss") or entry_price * 0.98)
+        take_profit = float(position.get("take_profit") or entry_price * 1.1)
+        entry_fee = float(position.get("entry_fee_usdt") or 0.0)
+        position["current_management_contract"] = build_current_position_management_contract(
+            {
+                "symbol": position["symbol"],
+                "side": position["side"],
+                "quantity": quantity,
+                "contracts": quantity,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "entry_fee_usdt": entry_fee,
+                "full_entry_fee_usdt": entry_fee,
+                "full_entry_notional_usdt": entry_price * quantity,
+                "entry_fee_evidence_complete": True,
+                "entry_fee_source": "okx_fills_history",
+                "stop_loss_price": stop_loss,
+                "take_profit_price": take_profit,
+                "protection_evidence_complete": True,
+                "protection_orders": [
+                    {
+                        "algo_id": "oco-1",
+                        "state": "live",
+                        "contracts": quantity,
+                        "reduce_only": True,
+                        "stop_loss_price": stop_loss,
+                        "take_profit_price": take_profit,
+                    }
+                ],
+                "position_stressed_loss_usdt": abs(entry_price - stop_loss) * quantity,
+                "portfolio_stressed_loss_usdt": abs(entry_price - stop_loss) * quantity,
+                "portfolio_gross_notional_usdt": current_price * quantity,
+                "account_equity_usdt": 10_000.0,
+                "open_position_count": 1,
+                "entry_order_ids": ["entry-1"],
+                "entry_decision_ids": [],
+                "original_entry_contract_complete": False,
+                "original_entry_contract_gaps": ["historical_contract_missing"],
+            }
+        )
     return position
 
 
@@ -47,10 +95,11 @@ def test_profit_retrace_generates_continuous_fraction_and_overrides_legacy_size(
     assert decision.position_size_pct == pytest.approx(0.5)
     assert decision.raw_response["close_fraction"] == pytest.approx(0.5)
     assert result.policy_provenance["source"] == (
-        "current_position_fee_after_pnl_peak_planned_stop_and_market_returns"
+        "current_position_takeover_fee_after_pnl_peak_planned_stop_market_and_portfolio_facts"
     )
     assert result.policy_provenance["fallback_reason"] == ""
     assert result.execution_cost_complete is True
+    assert result.current_management_contract_complete is True
 
 
 def test_profitable_exit_without_execution_cost_fails_closed() -> None:
@@ -122,3 +171,44 @@ def test_low_priced_asset_stop_is_absolute_price_not_legacy_percent_guess() -> N
     assert result.hard_risk is True
     assert result.planned_stop_crossed is True
     assert result.close_fraction == 1.0
+
+
+def test_portfolio_concentration_continuously_amplifies_existing_exit_pressure() -> None:
+    baseline = apply_dynamic_exit(_decision(), [_position()])
+    concentrated = apply_dynamic_exit(
+        _decision(),
+        [
+            _position(
+                current_management_contract={
+                    **_position()["current_management_contract"],
+                    "portfolio_concentration_pressure": 0.5,
+                }
+            )
+        ],
+    )
+
+    assert concentrated.portfolio_exposure_pressure == pytest.approx(0.25)
+    assert concentrated.close_fraction > baseline.close_fraction
+
+
+def test_non_hard_exit_fails_closed_without_current_management_contract() -> None:
+    result = apply_dynamic_exit(
+        _decision(),
+        [_position(current_management_contract={})],
+    )
+
+    assert result.eligible is False
+    assert result.current_management_contract_complete is False
+    assert "current_position_management_contract_incomplete" in result.reason
+
+
+def test_non_hard_exit_fails_closed_when_position_changed_after_contract_refresh() -> None:
+    position = _position()
+    position["quantity"] = 5.0
+    position["notional_usdt"] = 505.0
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.eligible is False
+    assert result.current_management_contract_complete is False
+    assert "current_position_management_contract_incomplete" in result.reason

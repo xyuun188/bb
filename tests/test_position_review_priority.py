@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 
+from services.current_position_management import build_current_position_management_contract
 from services.position_review_priority import PositionReviewPriorityPolicy
 
 
@@ -16,6 +17,46 @@ def _policy(peaks: dict[Any, dict[str, Any]] | None = None) -> PositionReviewPri
 
 def _aggregate(rows, model_name, symbol, side):
     return {**rows[0], "model_name": model_name, "symbol": symbol, "side": side}
+
+
+def _management_contract() -> dict[str, Any]:
+    return build_current_position_management_contract(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 10.0,
+            "contracts": 10.0,
+            "entry_price": 100.0,
+            "current_price": 99.0,
+            "entry_fee_usdt": 0.05,
+            "full_entry_fee_usdt": 0.05,
+            "full_entry_notional_usdt": 1_000.0,
+            "entry_fee_evidence_complete": True,
+            "entry_fee_source": "okx_fills_history",
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_evidence_complete": True,
+            "protection_orders": [
+                {
+                    "algo_id": "oco-btc",
+                    "state": "live",
+                    "contracts": 10.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 98.0,
+                    "take_profit_price": 110.0,
+                }
+            ],
+            "position_stressed_loss_usdt": 20.0,
+            "portfolio_stressed_loss_usdt": 20.0,
+            "portfolio_gross_notional_usdt": 990.0,
+            "account_equity_usdt": 10_000.0,
+            "open_position_count": 1,
+            "entry_order_ids": ["entry-btc"],
+            "entry_decision_ids": [],
+            "original_entry_contract_complete": False,
+            "original_entry_contract_gaps": ["historical_contract_missing"],
+        }
+    )
 
 
 def test_priority_is_continuous_dynamic_exit_fraction() -> None:
@@ -33,6 +74,9 @@ def test_priority_is_continuous_dynamic_exit_fraction() -> None:
                         "unrealized_pnl": -10.0,
                         "entry_fee_usdt": 0.05,
                         "stop_loss_pct": 0.02,
+                        "stop_loss": 98.0,
+                        "take_profit": 110.0,
+                        "current_management_contract": _management_contract(),
                     }
                 ],
             )

@@ -326,6 +326,25 @@ def _exit_contract_row(
         }
         return row, reasons
 
+    external_reconcile_contract = _external_okx_reconcile_exit_contract(raw, orders)
+    if external_reconcile_contract is not None:
+        reasons = list(external_reconcile_contract.pop("reasons"))
+        if executed and not _has_filled_order(orders):
+            reasons.append("executed_exit_without_filled_order")
+        row = {
+            "decision_id": _row_get(decision, "id"),
+            "symbol": _row_get(decision, "symbol"),
+            "action": _action(decision),
+            "executed": executed,
+            "filled_order_count": sum(
+                _order_status(order) in FILLED_STATUSES for order in orders
+            ),
+            "contract_complete": not reasons,
+            **external_reconcile_contract,
+            "reasons": reasons,
+        }
+        return row, reasons
+
     policy = _safe_dict(raw.get("dynamic_exit_policy"))
     reasons: list[str] = []
     if not policy or policy.get("eligible") is not True:
@@ -353,6 +372,20 @@ def _exit_contract_row(
         "reasons": reasons,
     }
     return row, reasons
+
+
+def classify_exit_execution_contract(
+    decision: Any,
+    orders: Sequence[Any],
+) -> dict[str, Any]:
+    """Classify an exit through the same contract owner used by the global audit."""
+
+    raw = _safe_dict(_row_get(decision, "raw_llm_response"))
+    executed = _was_executed(decision, list(orders))
+    row, _ = _exit_contract_row(decision, raw, list(orders), executed)
+    if not row.get("contract_kind"):
+        row["contract_kind"] = "dynamic_exit"
+    return row
 
 
 def _system_protection_exit_contract(
@@ -410,6 +443,61 @@ def _system_protection_exit_contract(
         "protection_actual_side": lifecycle.get("actual_side"),
         "protection_trigger_to_first_fill_ms": lifecycle.get(
             "trigger_to_first_fill_ms"
+        ),
+        "reasons": reasons,
+    }
+
+
+def _external_okx_reconcile_exit_contract(
+    raw: dict[str, Any],
+    orders: list[Any],
+) -> dict[str, Any] | None:
+    close_fill = _safe_dict(raw.get("close_fill"))
+    identified = bool(
+        raw.get("system_sync") is True
+        and raw.get("source") == "okx_position_reconcile"
+        and (
+            raw.get("reconcile_origin") == "external_okx_sync"
+            or close_fill.get("reconcile_origin") == "external_okx_sync"
+        )
+    )
+    if not identified:
+        return None
+
+    authoritative_orders = []
+    for order in orders:
+        fact = _safe_dict(_row_get(order, "okx_raw_fills"))
+        exchange_order_id = str(_row_get(order, "exchange_order_id") or "").strip()
+        fact_order_id = str(fact.get("order_id") or "").strip()
+        complete = bool(
+            _order_status(order) in FILLED_STATUSES
+            and fact.get("fills_history_confirmed") is True
+            and exchange_order_id
+            and fact_order_id == exchange_order_id
+            and str(fact.get("inst_id") or "").strip()
+            and _safe_float(fact.get("contracts"), 0.0) > 0
+            and fact.get("contract_size_verified") is True
+            and _safe_float(fact.get("base_quantity"), 0.0) > 0
+            and _safe_float(fact.get("avg_price"), 0.0) > 0
+            and fact.get("fee_abs") is not None
+        )
+        if complete:
+            authoritative_orders.append(order)
+    reasons: list[str] = []
+    if len(authoritative_orders) != 1:
+        reasons.append("external_okx_close_fill_lifecycle_not_unique")
+    authoritative = authoritative_orders[0] if len(authoritative_orders) == 1 else None
+    fact = _safe_dict(_row_get(authoritative, "okx_raw_fills")) if authoritative else {}
+    return {
+        "contract_kind": "okx_external_reconciliation",
+        "close_fraction": _safe_float(_safe_dict(raw.get("close_fill")).get("close_fraction")),
+        "close_contracts": _safe_float(fact.get("contracts"), 0.0),
+        "hard_risk": None,
+        "fee_after_unrealized_pnl_usdt": None,
+        "authoritative_close_order_id": (
+            str(_row_get(authoritative, "exchange_order_id") or "")
+            if authoritative is not None
+            else None
         ),
         "reasons": reasons,
     }

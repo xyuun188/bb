@@ -171,6 +171,7 @@ async def test_persist_entry_opens_position_with_protection_prices() -> None:
             "leverage": 3.0,
             "unrealized_pnl": 0.0,
             "realized_pnl": 0.0,
+            "entry_fee": 1.0,
             "stop_loss_price": 98.0,
             "take_profit_price": 104.0,
         }

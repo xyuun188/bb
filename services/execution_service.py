@@ -192,6 +192,9 @@ class ExecutionService:
         position_execution_persister: (
             Callable[[str, DecisionOutput, ExecutionResult, str], Awaitable[None]] | None
         ) = None,
+        position_protection_rebalancer: (
+            Callable[[Any, DecisionOutput], Awaitable[dict[str, Any]]] | None
+        ) = None,
         order_fact_recovery_trigger: Callable[[str], None] | None = None,
         open_positions_execution_applier: (
             Callable[[list[dict[str, Any]], str, DecisionOutput, ExecutionResult], None] | None
@@ -252,6 +255,7 @@ class ExecutionService:
         self.no_exchange_position_result_checker = no_exchange_position_result_checker
         self.trade_count_incrementer = trade_count_incrementer
         self.position_execution_persister = position_execution_persister
+        self.position_protection_rebalancer = position_protection_rebalancer
         self.order_fact_recovery_trigger = order_fact_recovery_trigger
         self.open_positions_execution_applier = open_positions_execution_applier
         self.decision_executed_marker = decision_executed_marker
@@ -411,6 +415,15 @@ class ExecutionService:
         if self.position_execution_persister is None:
             raise RuntimeError("ExecutionService requires position_execution_persister dependency")
         return self.position_execution_persister
+
+    def _required_position_protection_rebalancer(
+        self,
+    ) -> Callable[[Any, DecisionOutput], Awaitable[dict[str, Any]]]:
+        if self.position_protection_rebalancer is None:
+            raise RuntimeError(
+                "ExecutionService requires position_protection_rebalancer dependency"
+            )
+        return self.position_protection_rebalancer
 
     def _trigger_order_fact_recovery(self, execution_mode: str) -> bool:
         """Request a non-blocking OKX fill recovery after local order persistence fails."""
@@ -593,6 +606,7 @@ class ExecutionService:
         result_has_no_exchange_position = self._required_no_exchange_position_result_checker()
         increment_trade_count = self._required_trade_count_incrementer()
         persist_position_from_execution = self._required_position_execution_persister()
+        rebalance_position_protection = self._required_position_protection_rebalancer()
         apply_execution_to_open_positions = self._required_open_positions_execution_applier()
         mark_decision_executed = self._required_decision_executed_marker()
         persist_account_update = self._required_account_update_persister()
@@ -1480,6 +1494,38 @@ class ExecutionService:
                             decision,
                             execution_result,
                         )
+                    protection_rebalance: dict[str, Any] | None = None
+                    if decision.is_exit and exchange_confirmed:
+                        try:
+                            protection_rebalance = await rebalance_position_protection(
+                                executor,
+                                decision,
+                            )
+                        except Exception as exc:
+                            protection_rebalance = getattr(exc, "report", None)
+                            if not isinstance(protection_rebalance, dict):
+                                protection_rebalance = {
+                                    "status": "failed",
+                                    "verified": False,
+                                    "error": safe_error_text(exc, limit=180),
+                                }
+                            raw = _safe_dict(decision.raw_response)
+                            raw = dict(raw)
+                            raw["post_exit_protection_rebalance"] = protection_rebalance
+                            decision.raw_response = raw
+                            warning = (
+                                "OKX 退出成交已确认，但剩余持仓保护数量未能完成精确复核；"
+                                "系统保留成交事实并让后续非硬风险退出 fail-closed。"
+                            )
+                            results["warnings"].append(
+                                {"model": model_name, "symbol": symbol, "warning": warning}
+                            )
+                            await log_risk_event("warning", symbol, warning, model_name)
+                        else:
+                            raw = _safe_dict(decision.raw_response)
+                            raw = dict(raw)
+                            raw["post_exit_protection_rebalance"] = protection_rebalance
+                            decision.raw_response = raw
                     await mark_stage(
                         DecisionStage.LOCAL_SYNC,
                         DecisionStageStatus.COMPLETED,
@@ -1487,6 +1533,16 @@ class ExecutionService:
                         {
                             "exit_progress": bool(exit_progress),
                             "exchange_confirmed": bool(exchange_confirmed),
+                            "protection_rebalance_status": (
+                                protection_rebalance.get("status")
+                                if isinstance(protection_rebalance, dict)
+                                else "not_applicable"
+                            ),
+                            "protection_rebalance_verified": (
+                                protection_rebalance.get("verified")
+                                if isinstance(protection_rebalance, dict)
+                                else None
+                            ),
                         },
                     )
                 else:

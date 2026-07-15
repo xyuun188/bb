@@ -69,6 +69,12 @@ def test_normalized_open_position_context_does_not_copy_obsolete_policy_metadata
             "current_price": "101",
             "entry_exchange_order_id": "entry-a,entry-b",
             "entry_legs": [{"exchange_order_id": "entry-a"}, {"exchange_order_id": "entry-b"}],
+            "entry_fee": 0.12,
+            "current_management_contract": {
+                "contract_version": "2026-07-15.current-position-management.v1",
+                "management_eligible": True,
+                "exit_fee_rate_proxy": 0.0006,
+            },
             "profit_first_trade_plan": {"decision_lane": "old"},
             "profit_first_exit_plan": {"max_hold_minutes": 360},
             "info": {"ctVal": "0.1", "instId": "BTC-USDT-SWAP", "posId": "btc-pos"},
@@ -82,6 +88,9 @@ def test_normalized_open_position_context_does_not_copy_obsolete_policy_metadata
         {"exchange_order_id": "entry-a"},
         {"exchange_order_id": "entry-b"},
     ]
+    assert context["entry_fee_usdt"] == pytest.approx(0.12)
+    assert context["exit_fee_rate"] == pytest.approx(0.0006)
+    assert context["current_management_contract"]["management_eligible"] is True
     assert "profit_first_trade_plan" not in context
     assert "profit_first_exit_plan" not in context
 

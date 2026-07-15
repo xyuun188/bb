@@ -204,6 +204,54 @@ def test_system_protection_exit_without_authoritative_lifecycle_fails_closed() -
     ] == 1
 
 
+def test_external_okx_reconciliation_uses_exact_fills_history_lifecycle() -> None:
+    raw = {
+        "system_sync": True,
+        "source": "okx_position_reconcile",
+        "reconcile_origin": "external_okx_sync",
+        "close_fill": {"reconcile_origin": "external_okx_sync"},
+    }
+    order = _filled_order(9)
+    order.exchange_order_id = "okx-external-close-9"
+    order.okx_raw_fills = {
+        "source": "okx_reconcile_close_fill",
+        "fills_history_confirmed": True,
+        "order_id": "okx-external-close-9",
+        "inst_id": "BTC-USDT-SWAP",
+        "contracts": 2.0,
+        "contract_size_verified": True,
+        "base_quantity": 0.02,
+        "avg_price": 100.0,
+        "fee_abs": 0.01,
+    }
+
+    report = summarize_trade_execution_contract(
+        [_decision(9, "close_short", raw)],
+        orders=[order],
+    )
+
+    assert report["summary"]["exit_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["exit_contracts"][0]["contract_kind"] == "okx_external_reconciliation"
+
+
+def test_external_okx_reconciliation_without_exact_fill_fact_fails_closed() -> None:
+    raw = {
+        "system_sync": True,
+        "source": "okx_position_reconcile",
+        "reconcile_origin": "external_okx_sync",
+    }
+
+    report = summarize_trade_execution_contract(
+        [_decision(10, "close_short", raw)],
+        orders=[_filled_order(10)],
+    )
+
+    assert report["violation_reason_counts"][
+        "external_okx_close_fill_lifecycle_not_unique"
+    ] == 1
+
+
 def test_realized_pnl_summary_uses_closed_positions_only() -> None:
     report = summarize_trade_execution_contract(
         [],

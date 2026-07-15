@@ -1,9 +1,10 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from services.current_position_management import build_current_position_management_contract
 from services.entry_fee_provider import EntryFeeProvider, proportional_fee
 
 
@@ -34,6 +35,12 @@ def _position(**kwargs: Any) -> SimpleNamespace:
         "symbol": "BTC/USDT",
         "side": "long",
         "created_at": datetime(2026, 6, 8, 12, 0, tzinfo=UTC),
+        "quantity": 4.0,
+        "entry_price": 100.0,
+        "entry_fee": 2.0,
+        "stop_loss_price": 98.0,
+        "take_profit_price": 110.0,
+        "entry_exchange_order_id": "entry-1",
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -44,6 +51,14 @@ def _order(**kwargs: Any) -> SimpleNamespace:
         "fee": 2.0,
         "quantity": 4.0,
         "created_at": datetime(2026, 6, 8, 12, 0, tzinfo=UTC),
+        "execution_mode": "paper",
+        "status": "filled",
+        "exchange_order_id": "entry-1",
+        "okx_raw_fills": {
+            "fills_history_confirmed": True,
+            "order_id": "entry-1",
+            "fee_abs": 2.0,
+        },
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -58,8 +73,18 @@ def test_proportional_fee_prorates_and_handles_bad_values():
 
 
 @pytest.mark.asyncio
-async def test_entry_fee_provider_uses_window_order_first():
-    session = _FakeSession(_order(fee=3.0, quantity=6.0))
+async def test_entry_fee_provider_uses_exact_linked_okx_fill():
+    session = _FakeSession(
+        _order(
+            fee=3.0,
+            quantity=6.0,
+            okx_raw_fills={
+                "fills_history_confirmed": True,
+                "order_id": "entry-1",
+                "fee_abs": 3.0,
+            },
+        )
+    )
 
     fee = await EntryFeeProvider().entry_fee_for_position(session, _position(), close_qty=2.0)
 
@@ -68,38 +93,85 @@ async def test_entry_fee_provider_uses_window_order_first():
 
 
 @pytest.mark.asyncio
-async def test_entry_fee_provider_falls_back_to_previous_order_near_position_open():
-    session = _FakeSession(None, _order(fee=4.0, quantity=8.0))
+async def test_entry_fee_provider_does_not_guess_from_time_window():
+    session = _FakeSession(
+        _order(
+            exchange_order_id="other-entry",
+            okx_raw_fills={
+                "fills_history_confirmed": True,
+                "order_id": "other-entry",
+                "fee_abs": 4.0,
+            },
+        )
+    )
 
     fee = await EntryFeeProvider().entry_fee_for_position(session, _position(), close_qty=2.0)
 
-    assert fee == 1.0
-    assert len(session.statements) == 2
+    assert fee == 0.0
+    assert len(session.statements) == 1
 
 
 @pytest.mark.asyncio
-async def test_entry_fee_provider_falls_back_to_latest_order_without_position_time():
-    session = _FakeSession(_order(fee=1.5, quantity=3.0))
+async def test_entry_fee_provider_uses_valid_current_management_fee_when_fill_reload_missing():
+    position = _position(entry_exchange_order_id=None)
+    position.current_management_contract = build_current_position_management_contract(
+        {
+            "symbol": position.symbol,
+            "side": position.side,
+            "quantity": position.quantity,
+            "contracts": position.quantity,
+            "entry_price": position.entry_price,
+            "current_price": 101.0,
+            "entry_fee_usdt": position.entry_fee,
+            "full_entry_fee_usdt": position.entry_fee,
+            "full_entry_notional_usdt": position.entry_price * position.quantity,
+            "entry_fee_evidence_complete": True,
+            "entry_fee_source": "okx_fills_history",
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_evidence_complete": True,
+            "protection_orders": [
+                {
+                    "algo_id": "oco-1",
+                    "state": "live",
+                    "contracts": 4.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 98.0,
+                    "take_profit_price": 110.0,
+                }
+            ],
+            "position_stressed_loss_usdt": 8.0,
+            "portfolio_stressed_loss_usdt": 8.0,
+            "portfolio_gross_notional_usdt": 404.0,
+            "account_equity_usdt": 1_000.0,
+            "open_position_count": 1,
+            "entry_order_ids": ["entry-1"],
+            "entry_decision_ids": [],
+            "original_entry_contract_complete": False,
+            "original_entry_contract_gaps": ["historical_contract_missing"],
+        }
+    )
+    session = _FakeSession()
 
     fee = await EntryFeeProvider().entry_fee_for_position(
         session,
-        _position(side="short", created_at=None),
+        position,
         close_qty=1.0,
     )
 
     assert fee == 0.5
-    assert len(session.statements) == 1
+    assert len(session.statements) == 0
 
 
 @pytest.mark.asyncio
 async def test_entry_fee_provider_returns_zero_without_matching_order():
-    session = _FakeSession(None, None, None)
+    session = _FakeSession(None)
 
     fee = await EntryFeeProvider().entry_fee_for_position(
         session,
-        _position(created_at=datetime.now(UTC) - timedelta(minutes=3)),
+        _position(),
         close_qty=1.0,
     )
 
     assert fee == 0.0
-    assert len(session.statements) == 3
+    assert len(session.statements) == 1

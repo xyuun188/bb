@@ -59,6 +59,7 @@ class Position(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     settlement_raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    current_management_contract: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     stop_loss_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)

@@ -13,18 +13,13 @@ from core.symbols import normalize_trading_symbol
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.current_position_management import (
+    current_position_management_contract_complete,
+)
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
+from services.trade_execution_contract import classify_exit_execution_contract
 
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
-FILLED_STATUSES = {"filled", "closed"}
-PROVENANCE_FIELDS = (
-    "source",
-    "observation_window",
-    "sample_count",
-    "generated_at",
-    "strategy_version",
-    "fallback_reason",
-)
 
 
 class PositionCapacityReleaseAuditService:
@@ -110,7 +105,7 @@ class PositionCapacityReleaseAuditService:
         executed_exit_gaps = [
             row
             for row in exit_rows
-            if row["executed"] and not row["dynamic_exit_contract_complete"]
+            if row["executed"] and not row["exit_contract_complete"]
         ]
         return {
             "read_only": True,
@@ -130,7 +125,15 @@ class PositionCapacityReleaseAuditService:
             "position_economics_incomplete_count": len(incomplete_positions),
             "position_economics_incomplete": incomplete_positions[:50],
             "dynamic_exit_decision_count": len(exit_rows),
-            "executed_dynamic_exit_count": sum(row["executed"] for row in exit_rows),
+            "executed_dynamic_exit_count": sum(
+                row["executed"] and row["exit_contract_kind"] == "dynamic_exit"
+                for row in exit_rows
+            ),
+            "executed_exchange_protection_exit_count": sum(
+                row["executed"]
+                and row["exit_contract_kind"] == "okx_exchange_protection"
+                for row in exit_rows
+            ),
             "executed_dynamic_exit_contract_gap_count": len(executed_exit_gaps),
             "executed_dynamic_exit_contract_gaps": executed_exit_gaps[:50],
             "dynamic_exit_decisions": exit_rows[:50],
@@ -150,6 +153,13 @@ class PositionCapacityReleaseAuditService:
         quantity = abs(_safe_float(getattr(position, "quantity", None)))
         notional = abs(quantity * current_price) if quantity > 0 and current_price > 0 else 0.0
         entry_fee = max(_safe_float(getattr(position, "entry_fee", None)), 0.0)
+        management_contract = _safe_dict(
+            getattr(position, "current_management_contract", None)
+        )
+        management_complete = current_position_management_contract_complete(
+            position,
+            management_contract,
+        )
         stop_price = max(_safe_float(getattr(position, "stop_loss_price", None)), 0.0)
         stop_distance = (
             abs(entry_price - stop_price) / entry_price
@@ -161,7 +171,7 @@ class PositionCapacityReleaseAuditService:
             and entry_price > 0
             and current_price > 0
             and notional > 0
-            and entry_fee > 0
+            and management_complete
             and stop_distance > 0
         )
         return {
@@ -174,60 +184,51 @@ class PositionCapacityReleaseAuditService:
             "current_price": current_price,
             "notional_usdt": round(notional, 8),
             "unrealized_pnl_usdt": _safe_float(getattr(position, "unrealized_pnl", None)),
-            "has_execution_fee": entry_fee > 0,
+            "entry_fee_usdt": entry_fee,
+            "has_authoritative_execution_fee": management_contract.get(
+                "entry_fee_evidence_complete"
+            )
+            is True,
             "has_stop_distance": stop_distance > 0,
+            "current_management_contract_complete": management_complete,
+            "current_management_contract": management_contract,
+            "original_entry_contract_status": management_contract.get(
+                "original_entry_contract_status"
+            ),
             "position_economics_complete": economics_complete,
             "created_at": _iso(getattr(position, "created_at", None)),
         }
 
     @staticmethod
     def _exit_row(decision: AIDecision, orders: list[Order]) -> dict[str, Any]:
-        raw = _safe_dict(getattr(decision, "raw_llm_response", None))
-        policy = _safe_dict(raw.get("dynamic_exit_policy"))
-        provenance = _safe_dict(policy.get("policy_provenance"))
-        filled_count = sum(_order_status(order) in FILLED_STATUSES for order in orders)
-        executed = bool(getattr(decision, "was_executed", False)) or filled_count > 0
-        complete = bool(
-            policy.get("eligible") is True
-            and _safe_float(policy.get("close_fraction")) > 0
-            and _provenance_complete(provenance)
-            and (not executed or filled_count > 0)
-        )
+        classified = classify_exit_execution_contract(decision, orders)
+        kind = str(classified.get("contract_kind") or "dynamic_exit")
+        complete = classified.get("contract_complete") is True
         return {
             "decision_id": int(getattr(decision, "id", 0) or 0),
             "symbol": normalize_trading_symbol(getattr(decision, "symbol", "") or ""),
             "action": _action(decision),
-            "executed": executed,
-            "filled_order_count": filled_count,
-            "close_fraction": _safe_float(policy.get("close_fraction")),
-            "hard_risk": bool(policy.get("hard_risk")),
-            "position_sample_count": _safe_int(provenance.get("sample_count")),
-            "dynamic_exit_contract_complete": complete,
+            "executed": classified.get("executed") is True,
+            "filled_order_count": _safe_int(classified.get("filled_order_count")),
+            "close_fraction": classified.get("close_fraction"),
+            "hard_risk": bool(classified.get("hard_risk")),
+            "position_sample_count": _safe_int(
+                _safe_dict(
+                    _safe_dict(getattr(decision, "raw_llm_response", None)).get(
+                        "dynamic_exit_policy"
+                    )
+                ).get("policy_provenance", {}).get("sample_count")
+            ),
+            "exit_contract_kind": kind,
+            "exit_contract_complete": complete,
+            "dynamic_exit_contract_complete": bool(kind == "dynamic_exit" and complete),
+            "contract_reasons": list(classified.get("reasons") or []),
             "created_at": _iso(getattr(decision, "created_at", None)),
         }
 
 
-def _provenance_complete(value: Any) -> bool:
-    provenance = _safe_dict(value)
-    if any(key not in provenance for key in PROVENANCE_FIELDS):
-        return False
-    return bool(
-        str(provenance.get("source") or "").strip()
-        and str(provenance.get("observation_window") or "").strip()
-        and _safe_int(provenance.get("sample_count")) > 0
-        and str(provenance.get("generated_at") or "").strip()
-        and str(provenance.get("strategy_version") or "").strip()
-        and not str(provenance.get("fallback_reason") or "").strip()
-    )
-
-
 def _action(row: Any) -> str:
     value = getattr(row, "action", "")
-    return str(getattr(value, "value", value) or "").lower()
-
-
-def _order_status(order: Any) -> str:
-    value = getattr(order, "status", "")
     return str(getattr(value, "value", value) or "").lower()
 
 

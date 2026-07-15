@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.current_position_management import build_current_position_management_contract
 from services.entry_capacity import EntryCapacityPolicy
 from services.position_review_decision_processor import PositionReviewDecisionProcessor
 from services.position_review_entry_guard import PositionReviewEntryGuardPolicy
@@ -88,7 +89,7 @@ def _processor(calls: list[tuple[str, Any]]) -> PositionReviewDecisionProcessor:
 
 
 def _profitable_retrace_position() -> dict[str, Any]:
-    return {
+    position = {
         "symbol": "BTC/USDT",
         "side": "long",
         "quantity": 10.0,
@@ -97,8 +98,48 @@ def _profitable_retrace_position() -> dict[str, Any]:
         "unrealized_pnl": 10.0,
         "peak_unrealized_pnl": 20.0,
         "stop_loss_pct": 0.02,
+        "stop_loss": 98.0,
+        "take_profit": 110.0,
         "entry_fee_usdt": 0.5,
     }
+    position["current_management_contract"] = build_current_position_management_contract(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 10.0,
+            "contracts": 10.0,
+            "entry_price": 100.0,
+            "current_price": 101.0,
+            "entry_fee_usdt": 0.5,
+            "full_entry_fee_usdt": 0.5,
+            "full_entry_notional_usdt": 1_000.0,
+            "entry_fee_evidence_complete": True,
+            "entry_fee_source": "okx_fills_history",
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_evidence_complete": True,
+            "protection_orders": [
+                {
+                    "algo_id": "oco-btc",
+                    "state": "live",
+                    "contracts": 10.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 98.0,
+                    "take_profit_price": 110.0,
+                }
+            ],
+            "position_stressed_loss_usdt": 20.0,
+            "portfolio_stressed_loss_usdt": 20.0,
+            "portfolio_gross_notional_usdt": 1_010.0,
+            "account_equity_usdt": 10_000.0,
+            "open_position_count": 1,
+            "entry_order_ids": ["entry-btc"],
+            "entry_decision_ids": [],
+            "original_entry_contract_complete": False,
+            "original_entry_contract_gaps": ["historical_contract_missing"],
+        }
+    )
+    return position
 
 
 @pytest.mark.asyncio

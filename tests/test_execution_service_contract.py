@@ -28,6 +28,7 @@ def _test_execution_service(
     stages: list[tuple[str, str, str]] | None = None,
     trade_logger=None,
     position_execution_persister=None,
+    position_protection_rebalancer=None,
     order_fact_recovery_trigger=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
@@ -79,6 +80,7 @@ def _test_execution_service(
         no_exchange_position_result_checker=lambda _result: False,
         trade_count_incrementer=lambda: None,
         position_execution_persister=position_execution_persister or _noop_async,
+        position_protection_rebalancer=position_protection_rebalancer or _noop_async,
         order_fact_recovery_trigger=order_fact_recovery_trigger,
         open_positions_execution_applier=lambda *_args: None,
         decision_executed_marker=_noop_async,
@@ -230,6 +232,7 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
         no_exchange_position_result_checker=lambda _result: False,
         trade_count_incrementer=lambda: None,
         position_execution_persister=_noop_async,
+        position_protection_rebalancer=_noop_async,
         open_positions_execution_applier=lambda *_args: None,
         decision_executed_marker=_noop_async,
         account_update_persister=_noop_async,
@@ -391,6 +394,95 @@ async def test_execution_service_recovers_when_confirmed_order_fact_write_fails(
         stage == DecisionStage.LOCAL_SYNC and status == DecisionStageStatus.FAILED
         for stage, status, _reason in stages
     )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_exit_rebalances_protection_after_position_persistence() -> None:
+    calls: list[str] = []
+    raw_updates: list[dict[str, Any] | None] = []
+
+    class FilledExitExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            calls.append("exchange_fill")
+            return ExecutionResult(
+                order_id="local-exit-1",
+                exchange_order_id="okx-exit-1",
+                symbol=decision.symbol,
+                side="buy",
+                order_type="market",
+                quantity=2.0,
+                price=90.0,
+                status=OrderStatus.FILLED,
+                raw_response={"info": {"ordId": "okx-exit-1"}},
+            )
+
+    executor = FilledExitExecutor()
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return executor
+
+    async def persist_position(*_args: Any, **_kwargs: Any) -> None:
+        calls.append("persist_position")
+
+    async def rebalance(received_executor: Any, decision: DecisionOutput) -> dict[str, Any]:
+        assert received_executor is executor
+        assert decision.action == Action.CLOSE_SHORT
+        calls.append("rebalance_protection")
+        return {"status": "repaired", "verified": True}
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        position_execution_persister=persist_position,
+        position_protection_rebalancer=rebalance,
+        raw_updates=raw_updates,
+    )
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ETC/USDT",
+        action=Action.CLOSE_SHORT,
+        confidence=0.0,
+        reasoning="dynamic exit",
+        position_size_pct=0.5,
+        suggested_leverage=1.0,
+        raw_response={
+            "dynamic_exit_policy": {
+                "eligible": True,
+                "close_fraction": 0.5,
+                "policy_provenance": {
+                    "source": "test",
+                    "observation_window": "current_position",
+                    "sample_count": 1,
+                    "generated_at": "2026-07-15T00:00:00+00:00",
+                    "strategy_version": "test",
+                    "fallback_reason": "",
+                },
+            }
+        },
+    )
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+
+    result = await service.execute_candidate(
+        "ETC/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        89216,
+        results,
+        open_positions=[],
+    )
+
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert calls == ["exchange_fill", "persist_position", "rebalance_protection"]
+    assert decision.raw_response["post_exit_protection_rebalance"] == {
+        "status": "repaired",
+        "verified": True,
+    }
+    assert raw_updates[-1]["post_exit_protection_rebalance"]["verified"] is True
 
 
 @pytest.mark.asyncio

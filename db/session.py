@@ -258,6 +258,7 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
             "settlement_source": "VARCHAR(80)",
             "settlement_synced_at": "DATETIME",
             "settlement_raw": "JSON",
+            "current_management_contract": "JSON",
         }
         for name, column_type in sqlite_position_columns.items():
             if name not in position_columns:
@@ -301,6 +302,9 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
                 "ALTER TABLE positions ADD COLUMN settlement_synced_at TIMESTAMP WITH TIME ZONE"
             ),
             "settlement_raw": "ALTER TABLE positions ADD COLUMN settlement_raw JSONB",
+            "current_management_contract": (
+                "ALTER TABLE positions ADD COLUMN current_management_contract JSONB"
+            ),
         }
         for name, ddl in postgres_position_columns.items():
             if name not in position_columns:

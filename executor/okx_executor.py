@@ -4780,6 +4780,14 @@ class OKXExecutor(AbstractExecutor):
             inst_ids=inst_ids,
         )
 
+    async def get_contract_specs_strict(
+        self,
+        symbols: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch authoritative OKX contract sizing rules and propagate failures."""
+
+        return await self._native_facts_client().fetch_contract_specs(symbols=symbols)
+
     async def amend_position_protection_size(
         self,
         *,

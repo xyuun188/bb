@@ -274,6 +274,7 @@ class PositionExecutionPersistenceService:
             "leverage": decision.suggested_leverage,
             "unrealized_pnl": 0.0,
             "realized_pnl": 0.0,
+            "entry_fee": abs(float(getattr(result, "fee", 0.0) or 0.0)),
             "stop_loss_price": stop_loss,
             "take_profit_price": take_profit,
         }
@@ -324,6 +325,10 @@ class PositionExecutionPersistenceService:
                 primary.current_price = result.price
                 primary.leverage = decision.suggested_leverage
                 primary.is_open = True
+                primary.entry_fee = max(
+                    abs(float(getattr(primary, "entry_fee", 0.0) or 0.0)),
+                    abs(float(getattr(result, "fee", 0.0) or 0.0)),
+                )
                 if okx_inst_id:
                     primary.okx_inst_id = okx_inst_id
                 if okx_pos_id:
@@ -366,6 +371,9 @@ class PositionExecutionPersistenceService:
             primary.current_price = result.price
             primary.leverage = decision.suggested_leverage
             primary.is_open = True
+            primary.entry_fee = abs(float(getattr(primary, "entry_fee", 0.0) or 0.0)) + abs(
+                float(getattr(result, "fee", 0.0) or 0.0)
+            )
             if okx_inst_id:
                 primary.okx_inst_id = okx_inst_id
             if okx_pos_id:

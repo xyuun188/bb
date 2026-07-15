@@ -5909,6 +5909,10 @@ async def get_positions(
                     "leverage": p.leverage,
                     "stop_loss": p.stop_loss_price,
                     "take_profit": p.take_profit_price,
+                    "entry_fee": p.entry_fee,
+                    "current_management_contract": _safe_dict(
+                        getattr(p, "current_management_contract", None)
+                    ),
                     "is_open": display_is_open,
                     "db_is_open": p.is_open,
                     "exchange_synced": exchange_synced,

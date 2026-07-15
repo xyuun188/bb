@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 
@@ -15,13 +14,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-@dataclass(frozen=True, slots=True)
 class EntryPositionExposurePolicy:
     """Summarize current and staged exposure so entries do not stack one side."""
-
-    dominant_notional_ratio: float = 0.65
-    dominant_count_threshold: int = 3
-    dominant_count_share: float = 0.75
 
     def context(
         self,
@@ -107,13 +101,10 @@ class EntryPositionExposurePolicy:
         short_count_share = total_short_count / total_count if total_count > 0 else 0.0
 
         dominant_side = "neutral"
-        if gross_notional > 0 and abs(net_ratio) >= self.dominant_notional_ratio:
-            dominant_side = "long" if net_ratio > 0 else "short"
-        elif (
-            total_count >= self.dominant_count_threshold
-            and max(long_count_share, short_count_share) >= self.dominant_count_share
-        ):
-            dominant_side = "long" if long_count_share > short_count_share else "short"
+        if net_notional != 0:
+            dominant_side = "long" if net_notional > 0 else "short"
+        elif total_long_count != total_short_count:
+            dominant_side = "long" if total_long_count > total_short_count else "short"
 
         return {
             "long_notional": round(long_notional, 4),
