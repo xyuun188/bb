@@ -745,6 +745,39 @@ class OkxPerpetualSdkExchange:
             limit=str(params.get("limit") or ""),
         )
 
+    async def privateGetTradeOrdersAlgoHistory(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.trade_api,
+            "order_algos_history",
+            ordType=str(params.get("ordType") or ""),
+            state=str(params.get("state") or ""),
+            algoId=str(params.get("algoId") or ""),
+            instType=OKX_SWAP_INST_TYPE,
+            instId=str(params.get("instId") or ""),
+            after=str(params.get("after") or ""),
+            before=str(params.get("before") or ""),
+            limit=str(params.get("limit") or ""),
+        )
+
+    async def privateGetTradeOrderAlgoDetails(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        algo_id = str((params or {}).get("algoId") or "").strip()
+        algo_client_id = str((params or {}).get("algoClOrdId") or "").strip()
+        if not algo_id and not algo_client_id:
+            raise ExchangeAPIError("OKX algo detail requires algoId or algoClOrdId")
+        return await self._call_sdk(
+            lambda: self.trade_api,
+            "get_algo_order_details",
+            algoId=algo_id,
+            algoClOrdId=algo_client_id,
+        )
+
     async def privatePostTradeCancelOrder(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params, require_inst_id=True)
         return await self._call_sdk(
@@ -753,6 +786,47 @@ class OkxPerpetualSdkExchange:
             instId=str(params["instId"]),
             ordId=str(params.get("ordId") or ""),
             clOrdId=str(params.get("clOrdId") or ""),
+        )
+
+    async def privatePostTradeAmendAlgos(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params, require_inst_id=True)
+        return await self._call_sdk(
+            lambda: self.trade_api,
+            "amend_algo_order",
+            check_data_code=True,
+            instId=str(params["instId"]),
+            algoId=str(params.get("algoId") or ""),
+            algoClOrdId=str(params.get("algoClOrdId") or ""),
+            cxlOnFail=str(params.get("cxlOnFail") or "false").lower(),
+            reqId=str(params.get("reqId") or ""),
+            newSz=str(params.get("newSz") or ""),
+            newTriggerPx=str(params.get("newTriggerPx") or ""),
+            newOrdPx=str(params.get("newOrdPx") or ""),
+            newTpTriggerPx=str(params.get("newTpTriggerPx") or ""),
+            newTpOrdPx=str(params.get("newTpOrdPx") or ""),
+            newSlTriggerPx=str(params.get("newSlTriggerPx") or ""),
+            newSlOrdPx=str(params.get("newSlOrdPx") or ""),
+        )
+
+    async def privatePostTradeCancelAlgos(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        orders = (params or {}).get("algoIds") or (params or {}).get("orders_data") or []
+        if not isinstance(orders, list) or not orders:
+            raise ExchangeAPIError("OKX cancel algos requires a non-empty algoIds list")
+        normalized = [
+            {
+                "instId": normalize_swap_inst_id(item.get("instId"), required=True),
+                "algoId": str(item.get("algoId") or ""),
+            }
+            for item in orders
+            if isinstance(item, Mapping) and str(item.get("algoId") or "")
+        ]
+        if not normalized:
+            raise ExchangeAPIError("OKX cancel algos has no valid algoId")
+        return await self._call_sdk(
+            lambda: self.trade_api,
+            "cancel_algo_order",
+            check_data_code=True,
+            orders_data=normalized,
         )
 
     async def privatePostTradeClosePosition(self, params: Mapping[str, Any]) -> dict[str, Any]:

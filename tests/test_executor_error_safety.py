@@ -697,7 +697,18 @@ class _EntryMaxMarketSizeCcxt:
             "price": price or 1.0,
             "average": 1.0,
             "status": "closed",
-            "info": {"state": "filled", "ordId": "entry-max-market", "side": side},
+            "info": {
+                "state": "filled",
+                "ordId": "entry-max-market",
+                "side": side,
+                "attachAlgoOrds": [
+                    {
+                        "attachAlgoId": "entry-max-market-oco",
+                        "tpTriggerPx": "1.02",
+                        "slTriggerPx": "0.98",
+                    }
+                ],
+            },
         }
         self.orders["entry-max-market"] = order
         return order
@@ -1500,6 +1511,78 @@ async def test_okx_existing_position_add_on_reuses_authoritative_leverage() -> N
     assert sizing["final_margin_usdt"] == pytest.approx(planned_notional / 2.0)
 
 
+@pytest.mark.asyncio
+async def test_okx_pre_order_execution_facts_share_native_instrument_and_units() -> None:
+    class _PreOrderFactsCcxt:
+        urls = {"api": {"rest": "https://www.okx.com"}}
+        hostname = "www.okx.com"
+
+        def market(self, symbol: str) -> dict[str, Any]:
+            return {
+                "symbol": symbol,
+                "id": "BTC-USDT-SWAP",
+                "info": {"instId": "BTC-USDT-SWAP"},
+            }
+
+        async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params["instId"] == "BTC-USDT-SWAP"
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "last": "100",
+                        "bidPx": "99.9",
+                        "askPx": "100.1",
+                        "ts": "1780000000000",
+                    }
+                ]
+            }
+
+        async def fetch_order_book(self, symbol: str) -> dict[str, Any]:
+            assert symbol == "BTC/USDT:USDT"
+            return {
+                "bids": [[99.9, 2.0]],
+                "asks": [[100.1, 3.0]],
+                "timestamp": 1780000000001,
+            }
+
+        async def publicGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params["instId"] == "BTC-USDT-SWAP"
+            return {"data": [{"instId": "BTC-USDT-SWAP", "markPx": "100.05", "ts": "2"}]}
+
+        async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params == {"instType": "SWAP"}
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "instType": "SWAP",
+                        "ctVal": "0.01",
+                        "ctMult": "1",
+                        "ctValCcy": "BTC",
+                    }
+                ]
+            }
+
+        async def privateGetAccountFeeRates(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params == {"instType": "SWAP"}
+            return {"data": [{"taker": "-0.0005", "ts": "1780000000002"}]}
+
+    executor = _executor(_PreOrderFactsCcxt())
+    executor._markets_loaded = True
+
+    facts = await executor.pre_order_execution_facts("BTC/USDT", "long")
+
+    assert facts["production_eligible"] is True
+    assert facts["inst_id"] == "BTC-USDT-SWAP"
+    snapshot = facts["feature_snapshot"]
+    assert snapshot["contract_value_base"] == pytest.approx(0.01)
+    assert snapshot["orderbook_bid_depth"] == pytest.approx(99.9 * 2.0 * 0.01)
+    assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)
+    assert snapshot["mark_price"] == pytest.approx(100.05)
+    assert snapshot["taker_fee_rate"] == pytest.approx(0.0005)
+
+
 class _FloorAmountPrecisionCcxt:
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
         return str(float(int(amount)))
@@ -1615,6 +1698,12 @@ async def test_okx_entry_caps_market_order_above_exchange_max_before_submit() ->
     assert adjustment["amount_max_market_contracts"] == 100.0
     assert result.raw_response["okx_order_rules"]["market_order_within_max_size"] is True
     assert result.raw_response["okx_order_rules"]["pre_submit_valid"] is True
+    submission = result.raw_response["protection_submission"]
+    assert submission["state"] == "confirmed"
+    assert submission["exchange_confirmation_recorded"] is True
+    assert submission["algo_ids"] == ["entry-max-market-oco"]
+    assert submission["client_submit_requested_at"]
+    assert submission["exchange_confirmed_at"]
 
 
 @pytest.mark.asyncio

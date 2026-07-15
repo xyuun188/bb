@@ -657,6 +657,7 @@ class TradingService:
             fresh_feature_provider=self._fresh_feature_vector_for_price_recheck,
             market_data_quality_reason_provider=self.entry_market_data_quality.reason,
             decision_age_seconds_provider=self.decision_freshness.decision_age_seconds,
+            pre_order_execution_facts_provider=self.pre_order_execution_facts,
         )
         self.entry_policy = EntryPolicy(
             decision_freshness=self.decision_freshness,
@@ -2866,6 +2867,17 @@ class TradingService:
 
         executor = await self._get_okx_executor_for_mode(model_mode)
         return await executor.entry_risk_facts(decision.symbol, open_positions)
+
+    async def pre_order_execution_facts(
+        self,
+        model_mode: str,
+        decision: DecisionOutput,
+    ) -> dict[str, Any]:
+        """Load immediate native market and account cost facts before submit."""
+
+        executor = await self._get_okx_executor_for_mode(model_mode)
+        side = "long" if decision.action == Action.LONG else "short"
+        return await executor.pre_order_execution_facts(decision.symbol, side)
 
     def rejected_execution_result(self, decision: DecisionOutput, reason: str) -> ExecutionResult:
         """Build rejected execution results through an explicit boundary."""

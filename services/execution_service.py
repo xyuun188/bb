@@ -65,6 +65,10 @@ def _return_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
     raw = _safe_dict(decision.raw_response)
     candidate = _safe_dict(raw.get("authoritative_return_candidate"))
     side_evidence = _safe_dict(candidate.get("side_evidence"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    pre_order_facts = _safe_dict(raw.get("pre_order_execution_facts"))
+    cost_sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     candidate_provenance = _safe_dict(side_evidence.get("policy_provenance"))
     sizing_provenance = _safe_dict(sizing.get("policy_provenance"))
@@ -91,6 +95,16 @@ def _return_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
         reasons.append("return_policy_provenance_incomplete")
     if sizing.get("production_eligible") is not True:
         reasons.append("dynamic_position_sizing_not_eligible")
+    if execution_cost.get("order_size_complete") is not True:
+        reasons.append("order_size_execution_cost_incomplete")
+    if _safe_float(execution_cost.get("order_notional_usdt"), 0.0) + 1e-8 < final_notional:
+        reasons.append("execution_cost_notional_below_final_order_notional")
+    if pre_order_facts.get("production_eligible") is not True:
+        reasons.append("pre_order_execution_facts_ineligible")
+    if not str(pre_order_facts.get("input_fingerprint") or "").strip():
+        reasons.append("pre_order_execution_facts_fingerprint_missing")
+    if cost_sizing_pass.get("order_size_complete") is not True:
+        reasons.append("order_size_sizing_pass_incomplete")
     if _safe_float(decision.position_size_pct, 0.0) <= 0:
         reasons.append("dynamic_position_size_zero")
     if not _governance_complete(sizing_provenance):

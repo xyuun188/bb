@@ -5,7 +5,11 @@ from typing import Any
 
 import pytest
 
-from services.okx_native_facts import OkxNativeFactsClient, group_okx_native_fill_rows
+from services.okx_native_facts import (
+    OkxNativeFactsClient,
+    build_okx_protection_execution_lifecycle,
+    group_okx_native_fill_rows,
+)
 
 
 class _FakeCcxt:
@@ -111,6 +115,9 @@ class _NativeStateCcxt:
                     "posSide": "short",
                     "ordType": "conditional",
                     "state": "live",
+                    "sz": "12",
+                    "actualSz": "0",
+                    "reduceOnly": "true",
                     "tpTriggerPx": "0.0105",
                     "tpOrdPx": "-1",
                     "slTriggerPx": "0.0125",
@@ -128,6 +135,56 @@ class _NativeStateCcxt:
                     "tpTriggerPx": "1",
                     "uTime": "1780000003000",
                 },
+            ]
+        }
+
+
+class _NativeAlgoHistoryCcxt:
+    def __init__(self) -> None:
+        self.detail_params: list[dict[str, Any]] = []
+
+    async def privateGetTradeOrderAlgoDetails(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.detail_params.append(dict(params))
+        return {
+            "data": [
+                {
+                    "algoId": "algo-stop-1",
+                    "instId": "CHZ-USDT-SWAP",
+                    "ordId": "close-stop-1",
+                    "ordType": "oco",
+                    "side": "buy",
+                    "posSide": "net",
+                    "actualSide": "sl",
+                    "state": "effective",
+                    "actualSz": "388",
+                    "slTriggerPx": "0.01655",
+                    "tpTriggerPx": "0.01632",
+                    "triggerTime": "1784032234355",
+                    "cTime": "1784001852609",
+                    "uTime": "1784032234355",
+                    "last": "0.01637",
+                }
+            ]
+        }
+
+    async def privateGetTradeOrdersAlgoHistory(
+        self,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "data": [
+                {
+                    "algoId": "history-only-algo",
+                    "instId": "CHZ-USDT-SWAP",
+                    "ordId": "history-only-close",
+                    "ordType": "oco",
+                    "actualSide": "sl",
+                    "state": "effective",
+                    "uTime": "1784032234355",
+                }
             ]
         }
 
@@ -840,6 +897,34 @@ async def test_native_facts_client_fetches_position_history_by_pos_ids() -> None
 
 
 @pytest.mark.asyncio
+async def test_native_position_history_queries_each_okx_pos_id_separately() -> None:
+    ccxt = _PositionHistoryCcxt()
+    since = datetime(2026, 6, 28, 0, 0, tzinfo=UTC)
+
+    rows = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_position_history_rows(
+        pos_ids=["floki-pos-1", "arb-pos-1"],
+        since=since,
+        limit=5,
+    )
+
+    assert [row["posId"] for row in rows] == ["floki-pos-1", "arb-pos-1"]
+    assert ccxt.params == [
+        {
+            "instType": "SWAP",
+            "posId": "arb-pos-1",
+            "limit": "5",
+            "begin": str(int(since.timestamp() * 1000)),
+        },
+        {
+            "instType": "SWAP",
+            "posId": "floki-pos-1",
+            "limit": "5",
+            "begin": str(int(since.timestamp() * 1000)),
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_native_facts_client_fetches_funding_bills_with_type_and_subtype_filters() -> None:
     ccxt = _AccountBillsCcxt()
     since = datetime(2026, 6, 28, 0, 0, tzinfo=UTC)
@@ -1078,6 +1163,9 @@ async def test_native_facts_client_fetch_position_protection_orders_uses_okx_alg
     assert orders[0]["take_profit_price"] == pytest.approx(0.0105)
     assert orders[0]["stop_loss_price"] == pytest.approx(0.0125)
     assert orders[0]["algo_id"] == "spk-tpsl-1"
+    assert orders[0]["contracts"] == pytest.approx(12.0)
+    assert orders[0]["reduce_only"] is True
+    assert orders[0]["state"] == "live"
     assert ccxt.algo_pending_params == [
         {
             "instType": "SWAP",
@@ -1104,6 +1192,83 @@ async def test_native_facts_client_fetch_position_protection_orders_uses_okx_alg
             "limit": "100",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_algo_history_and_fill_build_authoritative_stop_lifecycle() -> None:
+    ccxt = _NativeAlgoHistoryCcxt()
+    client = OkxNativeFactsClient(_FakeExecutor(ccxt))
+
+    algo_rows = await client.fetch_protection_algo_history_rows(
+        algo_ids=["algo-stop-1"],
+        strict=True,
+    )
+    fills = group_okx_native_fill_rows(
+        [
+            {
+                "ordId": "close-stop-1",
+                "tradeId": "fill-1",
+                "instId": "CHZ-USDT-SWAP",
+                "side": "buy",
+                "posSide": "net",
+                "fillSz": "200",
+                "fillPx": "0.01658",
+                "fillMarkPx": "0.01654",
+                "fillIdxPx": "0.01660",
+                "fillTime": "1784032234380",
+                "ts": "1784032234403",
+            },
+            {
+                "ordId": "close-stop-1",
+                "tradeId": "fill-2",
+                "instId": "CHZ-USDT-SWAP",
+                "side": "buy",
+                "posSide": "net",
+                "fillSz": "188",
+                "fillPx": "0.01660",
+                "fillMarkPx": "0.01654",
+                "fillIdxPx": "0.01660",
+                "fillTime": "1784032234380",
+                "ts": "1784032234403",
+            },
+        ]
+    )
+
+    lifecycle = build_okx_protection_execution_lifecycle(
+        fills[0],
+        order_row={"ordId": "close-stop-1", "algoId": "algo-stop-1", "side": "buy"},
+        algo_row=algo_rows[0],
+    )
+
+    assert ccxt.detail_params == [{"algoId": "algo-stop-1"}]
+    assert lifecycle is not None
+    assert lifecycle["lifecycle_complete"] is True
+    assert lifecycle["actual_side"] == "sl"
+    assert lifecycle["position_side"] == "short"
+    assert lifecycle["configured_trigger_price"] == pytest.approx(0.01655)
+    assert lifecycle["actual_trigger_market_price"] is None
+    assert lifecycle["actual_trigger_market_price_available"] is False
+    assert lifecycle["trigger_to_first_fill_ms"] == pytest.approx(25.0)
+    assert lifecycle["fill_mark_price"] == pytest.approx(0.01654)
+    assert lifecycle["fill_path_min_price"] == pytest.approx(0.01658)
+    assert lifecycle["fill_path_max_price"] == pytest.approx(0.01660)
+    assert lifecycle["stop_loss_slippage_pct"] == pytest.approx(
+        (fills[0].avg_price - 0.01655) / 0.01655 * 100.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_algo_history_matches_fill_order_id_without_known_algo_id() -> None:
+    rows = await OkxNativeFactsClient(
+        _FakeExecutor(_NativeAlgoHistoryCcxt())
+    ).fetch_protection_algo_history_rows(
+        algo_ids=["different-known-algo"],
+        order_ids=["history-only-close"],
+        inst_ids=["CHZ-USDT-SWAP"],
+        strict=True,
+    )
+
+    assert [row["algoId"] for row in rows] == ["history-only-algo"]
 
 
 @pytest.mark.asyncio

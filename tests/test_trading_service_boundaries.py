@@ -2328,6 +2328,61 @@ async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
 
 
 @pytest.mark.asyncio
+async def test_entry_policy_reprices_execution_cost_with_planned_order_notional() -> None:
+    events: list[tuple[str, float]] = []
+
+    def fake_score(decision: DecisionOutput, _strategy: dict[str, Any] | None) -> float:
+        planned = float(
+            (decision.feature_snapshot or {}).get("planned_order_notional_usdt") or 0.0
+        )
+        events.append(("score", planned))
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["opportunity_score"] = {
+            "score": 1.0,
+            "execution_cost": {"order_size_complete": planned > 0},
+        }
+        decision.raw_response = raw
+        return 1.0
+
+    async def fake_sizing(
+        decision: DecisionOutput,
+        _model_mode: str,
+        _open_positions: list[dict[str, Any]],
+    ) -> None:
+        sizing_count = sum(name == "sizing" for name, _value in events)
+        final_notional = 100.0 if sizing_count == 0 else 80.0
+        events.append(("sizing", final_notional))
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["profit_risk_sizing"] = {
+            "production_eligible": True,
+            "final_notional_usdt": final_notional,
+        }
+        decision.raw_response = raw
+        decision.position_size_pct = final_notional / 1000.0
+
+    policy = EntryPolicy(
+        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+    )
+    decision = _decision(Action.LONG)
+    decision.feature_snapshot = {"current_price": 100.0}
+
+    await policy.prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert events == [
+        ("score", 0.0),
+        ("sizing", 100.0),
+        ("score", 100.0),
+        ("sizing", 80.0),
+    ]
+    assert decision.raw_response["execution_cost_sizing_pass"] == {
+        "impact_basis_notional_usdt": 100.0,
+        "final_notional_usdt": 80.0,
+        "order_size_complete": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None:
     service = TradingService.__new__(TradingService)
     events: list[str] = []
@@ -2510,13 +2565,14 @@ async def test_entry_policy_uses_injected_price_guard_boundary():
     calls: list[str] = []
 
     class FakePriceGuard:
-        async def guard_reason(self, decision):
+        async def guard_reason(self, decision, model_mode):
             calls.append(decision.symbol)
+            assert model_mode == "paper"
             return "price-blocked"
 
     policy = EntryPolicy(entry_price_guard=FakePriceGuard())
 
-    reason = await policy.pre_execution_price_guard_reason(_decision(Action.LONG))
+    reason = await policy.pre_execution_price_guard_reason(_decision(Action.LONG), "paper")
 
     assert reason == "price-blocked"
     assert calls == ["BTC/USDT"]

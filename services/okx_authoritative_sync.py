@@ -30,7 +30,10 @@ from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.exchange_position_state import parse_exchange_position_snapshot
-from services.okx_native_facts import OkxNativeFactsClient
+from services.okx_native_facts import (
+    OkxNativeFactsClient,
+    build_okx_protection_execution_lifecycle,
+)
 from services.okx_position_confirmation import (
     find_current_position_entry_confirmation,
     order_has_current_position_snapshot_confirmation,
@@ -62,6 +65,7 @@ class OkxFillGroup:
     timestamp_ms: float
     timestamp: datetime | None
     raw_count: int
+    rows: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +108,7 @@ class OkxAuthoritativeIssue:
     okx_algo_id: str = ""
     okx_source: str = ""
     repair_entrypoint: str = ""
+    protection_execution: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +133,11 @@ class OkxAuthoritativeIssue:
             "okx_algo_id": self.okx_algo_id,
             "okx_source": self.okx_source,
             "repair_entrypoint": self.repair_entrypoint,
+            "protection_execution": (
+                dict(self.protection_execution)
+                if isinstance(self.protection_execution, dict)
+                else None
+            ),
         }
 
 
@@ -203,6 +213,7 @@ class OkxAuthoritativeSyncService:
         exchange_positions: list[dict[str, Any]] = []
         exchange_fills: list[OkxFillGroup] = []
         exchange_order_contexts: dict[str, tuple[dict[str, Any], ...]] = {}
+        protection_algo_rows: list[dict[str, Any]] = []
         instrument_contract_sizes: dict[str, float] = {}
         fetch_errors: list[dict[str, Any]] = []
         pull_report = await self._pull_exchange_facts(
@@ -215,6 +226,7 @@ class OkxAuthoritativeSyncService:
         exchange_positions = pull_report["exchange_positions"]
         exchange_fills = pull_report["exchange_fills"]
         exchange_order_contexts = pull_report["exchange_order_contexts"]
+        protection_algo_rows = pull_report["protection_algo_rows"]
         instrument_contract_sizes = pull_report["instrument_contract_sizes"]
         fetch_errors = pull_report["fetch_errors"]
         pull_attempts = pull_report["pull_attempts"]
@@ -260,6 +272,7 @@ class OkxAuthoritativeSyncService:
                 exchange_positions=exchange_positions,
                 exchange_fills=exchange_fills,
                 exchange_order_contexts=exchange_order_contexts,
+                protection_algo_rows=protection_algo_rows,
                 instrument_contract_sizes=instrument_contract_sizes,
                 context_local_orders=context_orders,
                 context_local_decisions=context_decisions,
@@ -301,6 +314,7 @@ class OkxAuthoritativeSyncService:
             "okx_fill_order_count": len(exchange_fills),
             "okx_fill_max_pages": MAX_AUTHORITATIVE_FILL_PAGES,
             "okx_order_history_context_count": len(exchange_order_contexts),
+            "okx_protection_algo_history_count": len(protection_algo_rows),
             "supplemental_local_order_count": len(supplemental_orders),
             "supplemental_local_position_count": len(supplemental_positions),
             "context_local_order_count": len(context_orders),
@@ -363,6 +377,7 @@ class OkxAuthoritativeSyncService:
                     exchange_positions,
                     exchange_fills,
                     exchange_order_contexts,
+                    protection_algo_rows,
                     contract_sizes,
                 ) = await self._pull_once(
                     executor,
@@ -379,6 +394,7 @@ class OkxAuthoritativeSyncService:
                     "exchange_positions": exchange_positions,
                     "exchange_fills": exchange_fills,
                     "exchange_order_contexts": exchange_order_contexts,
+                    "protection_algo_rows": protection_algo_rows,
                     "instrument_contract_sizes": contract_sizes,
                     "fetch_errors": shutdown_errors,
                     "pull_attempts": attempt,
@@ -419,6 +435,7 @@ class OkxAuthoritativeSyncService:
             "exchange_positions": [],
             "exchange_fills": [],
             "exchange_order_contexts": {},
+            "protection_algo_rows": [],
             "instrument_contract_sizes": {},
             "fetch_errors": last_errors,
             "pull_attempts": self.max_pull_attempts,
@@ -441,6 +458,7 @@ class OkxAuthoritativeSyncService:
         list[dict[str, Any]],
         list[OkxFillGroup],
         dict[str, tuple[dict[str, Any], ...]],
+        list[dict[str, Any]],
         dict[str, float],
     ]:
         await _timed_stage(
@@ -483,6 +501,28 @@ class OkxAuthoritativeSyncService:
             ),
             default={},
         )
+        algo_ids = {
+            str(row.get("algoId") or "").strip()
+            for rows in exchange_order_contexts.values()
+            for row in rows
+            if str(row.get("algoId") or "").strip()
+        }
+        protection_algo_rows = await _optional_timed_stage(
+            stages,
+            attempt=attempt,
+            stage="okx_protection_algo_history",
+            timeout_seconds=optional_timeout,
+            operation=OkxNativeFactsClient(executor).fetch_protection_algo_history_rows(
+                algo_ids=algo_ids,
+                order_ids={fill.order_id for fill in exchange_fills if fill.order_id},
+                inst_ids={fill.inst_id for fill in exchange_fills if fill.inst_id},
+                since=since,
+                limit=100,
+                max_pages=MAX_AUTHORITATIVE_FILL_PAGES,
+                strict=True,
+            ),
+            default=[],
+        )
         instrument_contract_sizes: dict[str, float] = {}
         if symbols or target_inst_ids:
             instrument_contract_sizes = await _optional_timed_stage(
@@ -501,6 +541,7 @@ class OkxAuthoritativeSyncService:
             exchange_positions,
             exchange_fills,
             exchange_order_contexts,
+            protection_algo_rows,
             instrument_contract_sizes,
         )
 
@@ -768,6 +809,7 @@ class OkxAuthoritativeSyncService:
                 timestamp_ms=group.timestamp_ms,
                 timestamp=group.timestamp,
                 raw_count=group.raw_count,
+                rows=group.rows,
             )
             for group in groups
         ]
@@ -826,6 +868,7 @@ class OkxAuthoritativeSyncService:
         exchange_positions: list[dict[str, Any]],
         exchange_fills: list[OkxFillGroup],
         exchange_order_contexts: dict[str, tuple[dict[str, Any], ...]] | None = None,
+        protection_algo_rows: list[dict[str, Any]] | None = None,
         instrument_contract_sizes: dict[str, float] | None = None,
         context_local_orders: list[Order] | None = None,
         context_local_decisions: dict[int, AIDecision] | None = None,
@@ -834,6 +877,7 @@ class OkxAuthoritativeSyncService:
         issues: list[OkxAuthoritativeIssue] = []
         fills_by_order_id = {fill.order_id: fill for fill in exchange_fills}
         exchange_order_contexts = exchange_order_contexts or {}
+        protection_algo_rows = protection_algo_rows or []
         contract_sizes_by_symbol = _contract_sizes_from_exchange_positions(exchange_positions)
         instrument_contract_sizes = instrument_contract_sizes or {}
         context_local_orders = context_local_orders or []
@@ -1019,6 +1063,7 @@ class OkxAuthoritativeSyncService:
                 local_orders_by_exchange_id=local_orders_by_exchange_id,
                 local_orders=all_context_orders,
                 local_decisions=all_context_decisions,
+                protection_algo_rows=protection_algo_rows,
             )
             if linked_protection is not None:
                 issues.append(
@@ -1047,6 +1092,9 @@ class OkxAuthoritativeSyncService:
                         repair_entrypoint=(
                             "scripts/repair_missing_position_links_from_okx_fills.py "
                             "--create-linked-protection-fill-orders"
+                        ),
+                        protection_execution=linked_protection.get(
+                            "protection_execution"
                         ),
                     )
                 )
@@ -1099,6 +1147,7 @@ class OkxAuthoritativeSyncService:
                     local_orders_by_exchange_id=local_orders_by_exchange_id,
                     local_orders=all_context_orders,
                     local_decisions=all_context_decisions,
+                    protection_algo_rows=protection_algo_rows,
                 )
                 if linked_protection is not None:
                     continue
@@ -1220,6 +1269,7 @@ def _linked_protection_fill_context(
     local_orders_by_exchange_id: dict[str, Order],
     local_orders: list[Order],
     local_decisions: dict[int, AIDecision],
+    protection_algo_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     rows = list(order_contexts.get(str(fill.order_id)) or ())
     if not rows:
@@ -1241,6 +1291,34 @@ def _linked_protection_fill_context(
     )
     if not looks_like_triggered_protection:
         return None
+    algo_rows = protection_algo_rows or []
+    algo_row = next(
+        (
+            row
+            for row in algo_rows
+            if str(row.get("ordId") or "").strip() == str(fill.order_id)
+        ),
+        None,
+    )
+    if algo_row is None and okx_algo_id:
+        algo_row = next(
+            (
+                row
+                for row in algo_rows
+                if str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+                == okx_algo_id
+            ),
+            None,
+        )
+    protection_execution = (
+        build_okx_protection_execution_lifecycle(
+            fill,
+            order_row=target,
+            algo_row=algo_row,
+        )
+        if isinstance(algo_row, dict)
+        else None
+    )
 
     for row in rows:
         source_order_id = str(row.get("ordId") or "").strip()
@@ -1264,6 +1342,7 @@ def _linked_protection_fill_context(
             "okx_algo_id": okx_algo_id,
             "okx_source": okx_source,
             "match_source": "okx_order_history_context",
+            "protection_execution": protection_execution,
         }
 
     if okx_algo_id:
@@ -1283,6 +1362,7 @@ def _linked_protection_fill_context(
                 "okx_algo_id": okx_algo_id,
                 "okx_source": okx_source,
                 "match_source": "local_decision_attach_algo_id",
+                "protection_execution": protection_execution,
             }
     return None
 

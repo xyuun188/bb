@@ -78,60 +78,77 @@ def _entry_fill_contracts(entry_orders: Iterable[Any]) -> float | None:
     return sum(valid) if valid else None
 
 
-def _iter_raw_nodes(value: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(value, dict):
-        yield value
-        for nested in value.values():
-            yield from _iter_raw_nodes(nested)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            yield from _iter_raw_nodes(nested)
+def _dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
-def _is_stop_loss_fill(order: Any) -> bool:
-    order_type = _text(_value(order, "order_type")).lower()
-    if order_type in {"stop", "stop_loss", "stop-loss", "oco", "conditional"}:
-        return True
-    raw = _value(order, "okx_raw_fills", {})
-    for node in _iter_raw_nodes(raw):
-        algo_id = _text(
-            node.get("algoId")
-            or node.get("algoClOrdId")
-            or node.get("attachAlgoId")
-            or node.get("attachAlgoClOrdId")
-        )
-        trigger = _safe_float(
-            node.get("slTriggerPx") or node.get("triggerPx"),
-            None,
-        )
-        reduce_only = str(node.get("reduceOnly") or "").strip().lower() in {
-            "true",
-            "1",
-        }
-        if algo_id and (trigger is not None or reduce_only):
-            return True
-    return False
-
-
-def _stop_loss_slippage_pct(
-    *,
-    side: str,
-    stop_loss_price: float | None,
-    exit_price: float,
-    confirmed_stop_fill: bool,
-) -> float | None:
+def _protection_execution(order: Any) -> dict[str, Any]:
+    raw = _dict(_value(order, "okx_raw_fills", {}))
+    execution = _dict(raw.get("protection_execution"))
     if (
-        not confirmed_stop_fill
-        or stop_loss_price is None
-        or stop_loss_price <= 0
-        or exit_price <= 0
+        execution.get("lifecycle_complete") is True
+        and _text(execution.get("source_authority"))
+        == "okx_algo_history_plus_fills_history"
+        and _text(execution.get("actual_side")).lower() in {"sl", "tp"}
     ):
+        return execution
+    return {}
+
+
+def _protection_submission(order: Any) -> dict[str, Any]:
+    raw = _dict(_value(order, "okx_raw_fills", {}))
+    submission = _dict(raw.get("protection_submission"))
+    if (
+        submission.get("exchange_confirmation_recorded") is True
+        and _text(submission.get("source_authority"))
+        == "local_submit_plus_okx_create_order_response"
+    ):
+        return submission
+    return {}
+
+
+def _first_protection_execution(orders: Iterable[Any]) -> dict[str, Any]:
+    return next(
+        (execution for order in orders if (execution := _protection_execution(order))),
+        {},
+    )
+
+
+def _first_protection_submission(orders: Iterable[Any]) -> dict[str, Any]:
+    return next(
+        (submission for order in orders if (submission := _protection_submission(order))),
+        {},
+    )
+
+
+def _iso_from_ms(value: Any) -> str | None:
+    timestamp_ms = _safe_float(value, None)
+    if timestamp_ms is None or timestamp_ms <= 0:
         return None
-    if side == "long":
-        return max((stop_loss_price - exit_price) / stop_loss_price * 100.0, 0.0)
-    if side == "short":
-        return max((exit_price - stop_loss_price) / stop_loss_price * 100.0, 0.0)
-    return None
+    return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC).isoformat()
+
+
+def _execution_budget_facts(
+    *,
+    raw_llm_response: dict[str, Any],
+    realized_pnl: float,
+) -> dict[str, float | None]:
+    sizing = _dict(raw_llm_response.get("profit_risk_sizing"))
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"), None)
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), None)
+    actual_loss = max(-realized_pnl, 0.0)
+    return {
+        "risk_budget_usdt": risk_budget if risk_budget is not None and risk_budget > 0 else None,
+        "planned_stressed_loss_usdt": (
+            planned_loss if planned_loss is not None and planned_loss >= 0 else None
+        ),
+        "actual_loss_usdt": actual_loss,
+        "actual_over_budget_loss_usdt": (
+            max(actual_loss - risk_budget, 0.0)
+            if risk_budget is not None and risk_budget > 0
+            else None
+        ),
+    }
 
 
 def _official_ratio_pct(raw: dict[str, Any], fallback: Any) -> float | None:
@@ -267,12 +284,32 @@ def build_okx_history_training_sample(
     stop_loss_price = _safe_float(_value(local_position, "stop_loss_price"), None)
     take_profit_price = _safe_float(_value(local_position, "take_profit_price"), None)
     side = _text(_value(history, "side")).lower()
-    stop_loss_fill_confirmed = any(_is_stop_loss_fill(order) for order in close_orders)
-    stop_loss_slippage_pct = _stop_loss_slippage_pct(
-        side=side,
-        stop_loss_price=stop_loss_price,
-        exit_price=exit_price,
-        confirmed_stop_fill=stop_loss_fill_confirmed,
+    protection_execution = _first_protection_execution(close_orders)
+    protection_submission = _first_protection_submission(entry_orders)
+    stop_loss_fill_confirmed = bool(
+        protection_execution
+        and _text(protection_execution.get("actual_side")).lower() == "sl"
+    )
+    stop_loss_slippage_pct = (
+        _safe_float(protection_execution.get("stop_loss_slippage_pct"), None)
+        if stop_loss_fill_confirmed
+        and _text(protection_execution.get("stop_loss_slippage_source"))
+        == "okx_configured_stop_trigger_to_fills_vwap"
+        else None
+    )
+    protection_execution_gaps: list[str] = []
+    if protection_execution:
+        if not protection_submission:
+            protection_execution_gaps.append("missing_client_protection_submission_confirmation")
+        if protection_execution.get("actual_trigger_market_price_available") is not True:
+            protection_execution_gaps.append("actual_trigger_market_price_unavailable")
+        if protection_execution.get("trigger_path_extrema_available") is not True:
+            protection_execution_gaps.append("trigger_path_extrema_unavailable")
+        if protection_execution.get("trigger_orderbook_snapshot_available") is not True:
+            protection_execution_gaps.append("trigger_orderbook_snapshot_unavailable")
+    budget_facts = _execution_budget_facts(
+        raw_llm_response=raw_llm_response,
+        realized_pnl=realized_pnl,
     )
     lineage_gaps: list[str] = []
     if not entry_order_ids:
@@ -339,6 +376,79 @@ def build_okx_history_training_sample(
         "planned_take_profit_price": take_profit_price,
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
         "stop_loss_slippage_pct": stop_loss_slippage_pct,
+        "stop_loss_slippage_source": (
+            protection_execution.get("stop_loss_slippage_source")
+            if stop_loss_fill_confirmed
+            else "not_authoritatively_confirmed"
+        ),
+        "protection_execution_supervision_ready": bool(protection_execution),
+        "protection_lifecycle_complete": bool(
+            protection_execution and protection_submission
+        ),
+        "protection_execution_gaps": protection_execution_gaps,
+        "protection_algo_id": _text(protection_execution.get("algo_id")) or None,
+        "protection_generated_order_id": (
+            _text(protection_execution.get("generated_order_id")) or None
+        ),
+        "protection_actual_side": (
+            _text(protection_execution.get("actual_side")) or None
+        ),
+        "exchange_configured_trigger_price": _safe_float(
+            protection_execution.get("configured_trigger_price"),
+            None,
+        ),
+        "actual_trigger_market_price": _safe_float(
+            protection_execution.get("actual_trigger_market_price"),
+            None,
+        ),
+        "actual_trigger_market_price_available": (
+            protection_execution.get("actual_trigger_market_price_available") is True
+        ),
+        "protection_exchange_confirmed_at": (
+            protection_submission.get("exchange_confirmed_at")
+            or _iso_from_ms(protection_execution.get("exchange_confirmed_at_ms"))
+        ),
+        "protection_triggered_at": _iso_from_ms(
+            protection_execution.get("triggered_at_ms")
+        ),
+        "protection_fill_started_at": _iso_from_ms(
+            protection_execution.get("fill_started_at_ms")
+        ),
+        "protection_fill_completed_at": _iso_from_ms(
+            protection_execution.get("fill_completed_at_ms")
+        ),
+        "trigger_to_first_fill_ms": _safe_float(
+            protection_execution.get("trigger_to_first_fill_ms"),
+            None,
+        ),
+        "protection_fill_mark_price": _safe_float(
+            protection_execution.get("fill_mark_price"),
+            None,
+        ),
+        "protection_fill_index_price": _safe_float(
+            protection_execution.get("fill_index_price"),
+            None,
+        ),
+        "protection_fill_path_min_price": _safe_float(
+            protection_execution.get("fill_path_min_price"),
+            None,
+        ),
+        "protection_fill_path_max_price": _safe_float(
+            protection_execution.get("fill_path_max_price"),
+            None,
+        ),
+        "protection_fill_mark_slippage_pct": _safe_float(
+            protection_execution.get("fill_mark_slippage_pct"),
+            None,
+        ),
+        "execution_risk_budget_usdt": budget_facts["risk_budget_usdt"],
+        "execution_planned_stressed_loss_usdt": budget_facts[
+            "planned_stressed_loss_usdt"
+        ],
+        "execution_actual_loss_usdt": budget_facts["actual_loss_usdt"],
+        "execution_actual_over_budget_loss_usdt": budget_facts[
+            "actual_over_budget_loss_usdt"
+        ],
         "close_order_types": sorted(
             {
                 _text(_value(order, "order_type")).lower()

@@ -20,6 +20,7 @@ DEFAULT_MAX_FILL_PAGES = 1
 DEFAULT_MAX_TARGET_ORDER_QUERIES = 100
 DEFAULT_MAX_INSTRUMENT_QUERIES = 20
 DEFAULT_MAX_ORDER_HISTORY_CONTEXT_QUERIES = 30
+DEFAULT_MAX_ALGO_DETAIL_QUERIES = 100
 DEFAULT_PROTECTION_ALGO_ORDER_TYPES = ("conditional", "oco", "trigger", "move_order_stop")
 FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
 
@@ -370,10 +371,10 @@ class OkxNativeFactsClient:
 
         params_list: list[dict[str, Any]] = []
         if target_pos_ids:
-            for chunk in _chunked(sorted(target_pos_ids), 20):
+            for pos_id in sorted(target_pos_ids)[: self.max_instrument_queries]:
                 params = {
                     "instType": "SWAP",
-                    "posId": ",".join(chunk),
+                    "posId": pos_id,
                     "limit": str(page_limit),
                 }
                 if len(target_inst_ids) == 1:
@@ -932,6 +933,155 @@ class OkxNativeFactsClient:
         ]
         return [order for order in orders if order is not None]
 
+    async def fetch_protection_algo_history_rows(
+        self,
+        *,
+        algo_ids: Iterable[Any] | None = None,
+        order_ids: Iterable[Any] | None = None,
+        symbols: Iterable[Any] | None = None,
+        inst_ids: Iterable[Any] | None = None,
+        since: datetime | int | float | None = None,
+        ord_types: Iterable[str] = DEFAULT_PROTECTION_ALGO_ORDER_TYPES,
+        states: Iterable[str] = ("effective",),
+        limit: int = DEFAULT_FILL_LIMIT,
+        max_pages: int = DEFAULT_MAX_FILL_PAGES,
+        strict: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Read completed protection algo facts without inferring trigger details."""
+
+        ccxt = await self.executor._get_ccxt()
+        fetch_detail = getattr(ccxt, "privateGetTradeOrderAlgoDetails", None)
+        fetch_history = getattr(ccxt, "privateGetTradeOrdersAlgoHistory", None)
+        if not callable(fetch_detail) and not callable(fetch_history):
+            if strict:
+                raise RuntimeError("OKX native algo-history API is unavailable")
+            return []
+
+        target_algo_ids = {
+            str(value or "").strip()
+            for value in algo_ids or ()
+            if str(value or "").strip()
+        }
+        target_order_ids = _target_order_ids(order_ids)
+        target_inst_ids = _target_inst_ids(symbols=symbols, inst_ids=inst_ids)
+        since_ms = _timestamp_ms(since)
+        page_limit = _limit(limit)
+        page_count = _max_pages(max_pages)
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        last_error: Exception | None = None
+        successful_read = False
+
+        def append_rows(values: Iterable[dict[str, Any]]) -> None:
+            for row in values:
+                algo_id = str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+                order_id = str(row.get("ordId") or "").strip()
+                inst_id = str(row.get("instId") or "").strip().upper()
+                updated_ms = _safe_float(row.get("uTime") or row.get("triggerTime") or row.get("cTime"), 0.0)
+                if (
+                    (target_algo_ids or target_order_ids)
+                    and algo_id not in target_algo_ids
+                    and order_id not in target_order_ids
+                ):
+                    continue
+                if target_inst_ids and inst_id not in target_inst_ids:
+                    continue
+                if since_ms > 0 and updated_ms > 0 and updated_ms < since_ms:
+                    continue
+                key = (algo_id, order_id)
+                if not algo_id or key in seen:
+                    continue
+                seen.add(key)
+                rows.append(dict(row))
+
+        if target_algo_ids and callable(fetch_detail):
+            for algo_id in sorted(target_algo_ids)[:DEFAULT_MAX_ALGO_DETAIL_QUERIES]:
+                try:
+                    response = await self.executor._with_retry(
+                        fetch_detail,
+                        {"algoId": algo_id},
+                    )
+                    successful_read = True
+                    append_rows(_response_rows(response))
+                except Exception as exc:
+                    last_error = exc
+
+        unresolved_algo_ids = target_algo_ids - {
+            str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+            for row in rows
+        }
+        needs_history = bool(
+            callable(fetch_history)
+            and (
+                not target_algo_ids
+                or unresolved_algo_ids
+                or target_order_ids
+            )
+        )
+        if needs_history:
+            for ord_type in ord_types or DEFAULT_PROTECTION_ALGO_ORDER_TYPES:
+                ord_type_text = str(ord_type or "").strip()
+                if not ord_type_text:
+                    continue
+                for state in states or ("effective",):
+                    params = {
+                        "instType": "SWAP",
+                        "ordType": ord_type_text,
+                        "state": str(state or "").strip(),
+                        "limit": str(page_limit),
+                    }
+                    if len(target_inst_ids) == 1:
+                        params["instId"] = next(iter(target_inst_ids))
+                    after_cursor = ""
+                    seen_cursors: set[str] = set()
+                    for _page in range(page_count):
+                        page_params = dict(params)
+                        if after_cursor:
+                            page_params["after"] = after_cursor
+                        try:
+                            response = await self.executor._with_retry(fetch_history, page_params)
+                            successful_read = True
+                        except Exception as exc:
+                            last_error = exc
+                            break
+                        page_rows = _response_rows(response)
+                        append_rows(page_rows)
+                        if len(page_rows) < page_limit:
+                            break
+                        oldest_ms = min(
+                            (
+                                _safe_float(
+                                    row.get("uTime") or row.get("triggerTime") or row.get("cTime"),
+                                    0.0,
+                                )
+                                for row in page_rows
+                                if _safe_float(
+                                    row.get("uTime") or row.get("triggerTime") or row.get("cTime"),
+                                    0.0,
+                                )
+                                > 0
+                            ),
+                            default=0.0,
+                        )
+                        if since_ms > 0 and oldest_ms > 0 and oldest_ms < since_ms:
+                            break
+                        cursor = str(page_rows[-1].get("algoId") or "").strip() if page_rows else ""
+                        if not cursor or cursor in seen_cursors:
+                            break
+                        seen_cursors.add(cursor)
+                        after_cursor = cursor
+
+        if strict and last_error is not None and not successful_read:
+            raise last_error
+        return sorted(
+            rows,
+            key=lambda row: _safe_float(
+                row.get("uTime") or row.get("triggerTime") or row.get("cTime"),
+                0.0,
+            ),
+            reverse=True,
+        )
+
 
 def group_okx_native_fill_rows(
     rows: Iterable[dict[str, Any]],
@@ -1005,6 +1155,168 @@ def group_okx_native_fill_rows(
             )
         )
     return sorted(result, key=lambda item: item.timestamp_ms, reverse=True)
+
+
+def build_okx_protection_execution_lifecycle(
+    fill: Any,
+    *,
+    order_row: dict[str, Any] | None = None,
+    algo_row: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build an exchange-proven protection lifecycle without price fallbacks."""
+
+    order_row = dict(order_row or {})
+    algo_row = dict(algo_row or {})
+    algo_id = str(
+        algo_row.get("algoId")
+        or order_row.get("algoId")
+        or algo_row.get("algoClOrdId")
+        or ""
+    ).strip()
+    generated_order_id = str(algo_row.get("ordId") or order_row.get("ordId") or "").strip()
+    fill_order_id = str(getattr(fill, "order_id", "") or "").strip()
+    actual_side = str(algo_row.get("actualSide") or "").strip().lower()
+    if actual_side not in {"sl", "tp"}:
+        return None
+    if fill_order_id and generated_order_id and fill_order_id != generated_order_id:
+        return None
+
+    configured_trigger_price = _safe_float(
+        algo_row.get("slTriggerPx") if actual_side == "sl" else algo_row.get("tpTriggerPx"),
+        0.0,
+    )
+    fill_price = _safe_float(getattr(fill, "avg_price", 0.0), 0.0)
+    fill_rows = [
+        dict(row)
+        for row in (getattr(fill, "rows", ()) or ())
+        if isinstance(row, dict)
+    ]
+    fill_start_ms = min(
+        (
+            _safe_float(row.get("fillTime") or row.get("ts"), 0.0)
+            for row in fill_rows
+            if _safe_float(row.get("fillTime") or row.get("ts"), 0.0) > 0
+        ),
+        default=_safe_float(getattr(fill, "timestamp_ms", 0.0), 0.0),
+    )
+    fill_end_ms = max(
+        (
+            _safe_float(row.get("fillTime") or row.get("ts"), 0.0)
+            for row in fill_rows
+            if _safe_float(row.get("fillTime") or row.get("ts"), 0.0) > 0
+        ),
+        default=_safe_float(getattr(fill, "timestamp_ms", 0.0), 0.0),
+    )
+    trigger_time_ms = _safe_float(algo_row.get("triggerTime"), 0.0)
+    fill_prices = [
+        _safe_float(row.get("fillPx"), 0.0)
+        for row in fill_rows
+        if _safe_float(row.get("fillPx"), 0.0) > 0
+    ]
+
+    def weighted_reference(field: str) -> float | None:
+        weighted = 0.0
+        total = 0.0
+        for row in fill_rows:
+            value = _safe_float(row.get(field), 0.0)
+            weight = _safe_float(row.get("fillSz") or row.get("sz"), 0.0)
+            if value <= 0 or weight <= 0:
+                continue
+            weighted += value * weight
+            total += weight
+        return weighted / total if total > 0 else None
+
+    fill_mark_price = weighted_reference("fillMarkPx")
+    fill_index_price = weighted_reference("fillIdxPx")
+    close_side = str(
+        order_row.get("side") or algo_row.get("side") or getattr(fill, "side", "") or ""
+    ).strip().lower()
+    position_side = str(
+        algo_row.get("posSide")
+        or order_row.get("posSide")
+        or getattr(fill, "pos_side", "")
+        or ""
+    ).strip().lower()
+    if position_side not in {"long", "short"}:
+        position_side = "short" if close_side == "buy" else "long" if close_side == "sell" else ""
+
+    def adverse_slippage(reference: float | None) -> float | None:
+        reference_value = _safe_float(reference, 0.0)
+        if reference_value <= 0 or fill_price <= 0:
+            return None
+        if position_side == "long":
+            return max((reference_value - fill_price) / reference_value * 100.0, 0.0)
+        if position_side == "short":
+            return max((fill_price - reference_value) / reference_value * 100.0, 0.0)
+        return None
+
+    state = str(algo_row.get("state") or "").strip().lower()
+    lifecycle_complete = bool(
+        algo_id
+        and generated_order_id
+        and (not fill_order_id or generated_order_id == fill_order_id)
+        and state == "effective"
+        and trigger_time_ms > 0
+        and fill_start_ms > 0
+        and fill_price > 0
+        and configured_trigger_price > 0
+    )
+    stop_slippage = (
+        adverse_slippage(configured_trigger_price)
+        if actual_side == "sl" and lifecycle_complete
+        else None
+    )
+    return {
+        "version": "2026-07-15.okx-protection-execution.v1",
+        "source_authority": "okx_algo_history_plus_fills_history",
+        "lifecycle_complete": lifecycle_complete,
+        "algo_id": algo_id,
+        "generated_order_id": generated_order_id,
+        "inst_id": str(algo_row.get("instId") or order_row.get("instId") or "").strip().upper(),
+        "state": state,
+        "actual_side": actual_side,
+        "position_side": position_side,
+        "close_side": close_side,
+        "contracts": _safe_float(algo_row.get("actualSz") or getattr(fill, "contracts", 0.0), 0.0),
+        "client_submit_requested_at": None,
+        "client_submit_recorded": False,
+        "exchange_confirmed_at_ms": _safe_float(algo_row.get("cTime"), 0.0) or None,
+        "triggered_at_ms": trigger_time_ms or None,
+        "configured_trigger_price": configured_trigger_price or None,
+        "configured_trigger_price_source": (
+            "okx_algo_history.slTriggerPx"
+            if actual_side == "sl"
+            else "okx_algo_history.tpTriggerPx"
+        ),
+        "actual_trigger_market_price": None,
+        "actual_trigger_market_price_available": False,
+        "actual_trigger_market_price_reason": "okx_algo_history_does_not_report_trigger_market_tick",
+        "fill_started_at_ms": fill_start_ms or None,
+        "fill_completed_at_ms": fill_end_ms or None,
+        "trigger_to_first_fill_ms": (
+            max(fill_start_ms - trigger_time_ms, 0.0)
+            if trigger_time_ms > 0 and fill_start_ms > 0
+            else None
+        ),
+        "fill_price": fill_price or None,
+        "fill_price_source": "okx_fills_history_vwap",
+        "fill_mark_price": fill_mark_price,
+        "fill_index_price": fill_index_price,
+        "fill_market_reference_available": bool(fill_mark_price or fill_index_price),
+        "fill_path_min_price": min(fill_prices) if fill_prices else None,
+        "fill_path_max_price": max(fill_prices) if fill_prices else None,
+        "fill_path_extrema_available": bool(fill_prices),
+        "trigger_path_extrema_available": False,
+        "trigger_orderbook_snapshot_available": False,
+        "stop_loss_slippage_pct": stop_slippage,
+        "stop_loss_slippage_source": (
+            "okx_configured_stop_trigger_to_fills_vwap"
+            if stop_slippage is not None
+            else "not_applicable_or_incomplete"
+        ),
+        "fill_mark_slippage_pct": adverse_slippage(fill_mark_price),
+        "algo_row": algo_row,
+    }
 
 
 def _target_inst_ids(
@@ -1163,10 +1475,18 @@ def _native_algo_order_to_protection_shape(
         "position_side": pos_side,
         "close_side": close_side,
         "order_type": str(row.get("ordType") or "").lower(),
+        "contracts": _safe_float(row.get("sz"), 0.0),
+        "actual_contracts": _safe_float(row.get("actualSz"), 0.0),
+        "state": state,
+        "reduce_only": _native_bool(row.get("reduceOnly")),
         "take_profit_price": take_profit if take_profit > 0 else None,
         "stop_loss_price": stop_loss if stop_loss > 0 else None,
         "trigger_price": trigger_price if trigger_price > 0 else None,
         "algo_id": str(row.get("algoId") or row.get("algoClOrdId") or ""),
+        "linked_order_id": str(
+            row.get("ordId") or row.get("attachAlgoId") or row.get("attachAlgoClOrdId") or ""
+        ),
+        "created_at_ms": _safe_float(row.get("cTime"), 0.0),
         "updated_at_ms": _safe_float(row.get("uTime") or row.get("cTime"), 0.0),
         "raw": {"info": dict(row), **dict(row)},
     }

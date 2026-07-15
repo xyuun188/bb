@@ -538,6 +538,8 @@ class OKXExecutor(AbstractExecutor):
         base_quantity = 0.0
         okx_order_rules: dict[str, Any] = {}
         params: dict[str, Any] = {}
+        protection_submit_requested_at: datetime | None = None
+        protection_submission: dict[str, Any] = {}
 
         try:
             okx_symbol = await self._resolve_swap_symbol(decision.symbol)
@@ -1261,6 +1263,8 @@ class OKXExecutor(AbstractExecutor):
             )
 
             try:
+                if decision.is_entry and params.get("attachAlgoOrds"):
+                    protection_submit_requested_at = datetime.now(UTC)
                 order = await self._with_retry(
                     ccxt.create_order,
                     okx_symbol,
@@ -1325,6 +1329,7 @@ class OKXExecutor(AbstractExecutor):
                                 request_params=params,
                                 leverage_check=leverage_check,
                             )
+                        protection_submit_requested_at = datetime.now(UTC)
                         order = await self._with_retry(
                             ccxt.create_order,
                             okx_symbol,
@@ -1350,6 +1355,12 @@ class OKXExecutor(AbstractExecutor):
                         )
                 else:
                     raise
+            protection_submission = self._protection_submission_fact(
+                params=params,
+                order=order,
+                requested_at=protection_submit_requested_at,
+                acknowledged_at=datetime.now(UTC),
+            )
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
             result_symbol = self._execution_result_symbol(order, decision.symbol)
             filled_contracts = self._safe_float(order.get("filled"), 0.0)
@@ -1397,6 +1408,11 @@ class OKXExecutor(AbstractExecutor):
                         "planned_base_quantity": base_quantity,
                         "okx_order_rules": okx_order_rules,
                         "order_status": status.value,
+                        **(
+                            {"protection_submission": protection_submission}
+                            if protection_submission
+                            else {}
+                        ),
                     },
                 )
             filled_base_quantity = filled_contracts * contract_size
@@ -1637,6 +1653,11 @@ class OKXExecutor(AbstractExecutor):
                     ),
                     "order_resize_note": order_resize_note,
                     **(
+                        {"protection_submission": protection_submission}
+                        if protection_submission
+                        else {}
+                    ),
+                    **(
                         {"market_order_size_adjustment": market_order_size_adjustment}
                         if market_order_size_adjustment is not None
                         else {}
@@ -1740,6 +1761,43 @@ class OKXExecutor(AbstractExecutor):
             error_text = safe_error_text(e)
             logger.error("order placement failed", error=error_text)
             raise OrderPlacementError(f"Failed to place order: {error_text}") from e
+
+    @staticmethod
+    def _protection_submission_fact(
+        *,
+        params: dict[str, Any],
+        order: dict[str, Any],
+        requested_at: datetime | None,
+        acknowledged_at: datetime,
+    ) -> dict[str, Any]:
+        requested = params.get("attachAlgoOrds")
+        if not isinstance(requested, list) or not requested:
+            return {}
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        response_rows = order.get("attachAlgoOrds") or info.get("attachAlgoOrds") or []
+        response_rows = [dict(row) for row in response_rows if isinstance(row, dict)]
+        algo_ids = [
+            str(row.get("attachAlgoId") or row.get("algoId") or "").strip()
+            for row in response_rows
+            if str(row.get("attachAlgoId") or row.get("algoId") or "").strip()
+        ]
+        confirmed = bool(algo_ids)
+        return {
+            "version": "2026-07-15.okx-protection-submission.v1",
+            "source_authority": "local_submit_plus_okx_create_order_response",
+            "client_submit_requested_at": (
+                requested_at.isoformat() if requested_at is not None else None
+            ),
+            "exchange_acknowledged_at": acknowledged_at.isoformat(),
+            "exchange_confirmation_recorded": confirmed,
+            "exchange_confirmed_at": acknowledged_at.isoformat() if confirmed else None,
+            "state": "confirmed" if confirmed else "submitted_unconfirmed",
+            "requested_attach_algo_orders": [
+                dict(row) for row in requested if isinstance(row, dict)
+            ],
+            "response_attach_algo_orders": response_rows,
+            "algo_ids": algo_ids,
+        }
 
     async def _place_okx_native_full_close(
         self,
@@ -4585,6 +4643,119 @@ class OKXExecutor(AbstractExecutor):
             },
         }
 
+    async def pre_order_execution_facts(
+        self,
+        symbol: str,
+        side: str,
+    ) -> dict[str, Any]:
+        """Refresh native quote, book, mark, contract and fee facts before entry."""
+
+        if not self._connected:
+            await self.initialize()
+        okx_symbol = await self._resolve_swap_symbol(symbol)
+        inst_id = okx_inst_id_from_symbol(symbol)
+        ccxt = await self._get_ccxt()
+        ticker, book, mark_response, specs, fee = await asyncio.gather(
+            self._fetch_native_ticker(symbol),
+            self._with_retry(ccxt.fetch_order_book, okx_symbol),
+            self._with_retry(ccxt.publicGetPublicMarkPrice, {"instId": inst_id}),
+            self._native_facts_client().fetch_contract_specs(symbols=[symbol]),
+            self.fetch_account_fee_snapshot(),
+        )
+        mark_rows = mark_response.get("data") if isinstance(mark_response, dict) else []
+        mark_row = mark_rows[0] if isinstance(mark_rows, list) and mark_rows else {}
+        mark_row = mark_row if isinstance(mark_row, dict) else {}
+        mark_price = max(self._safe_float(mark_row.get("markPx"), 0.0), 0.0)
+        spec = specs.get(inst_id) if isinstance(specs, dict) else None
+        spec = spec if isinstance(spec, dict) else {}
+        ct_val = max(self._safe_float(spec.get("ctVal"), 0.0), 0.0)
+        ct_mult = max(self._safe_float(spec.get("ctMult"), 0.0), 0.0)
+        contract_value_base = ct_val * ct_mult
+        bids = [
+            [self._safe_float(level[0], 0.0), self._safe_float(level[1], 0.0)]
+            for level in (book.get("bids") or [])
+            if isinstance(level, (list, tuple)) and len(level) >= 2
+        ]
+        asks = [
+            [self._safe_float(level[0], 0.0), self._safe_float(level[1], 0.0)]
+            for level in (book.get("asks") or [])
+            if isinstance(level, (list, tuple)) and len(level) >= 2
+        ]
+        bid = max(self._safe_float(ticker.get("bid"), 0.0), 0.0)
+        ask = max(self._safe_float(ticker.get("ask"), 0.0), 0.0)
+        if bid <= 0 and bids:
+            bid = bids[0][0]
+        if ask <= 0 and asks:
+            ask = asks[0][0]
+        bid_depth = sum(price * contracts * contract_value_base for price, contracts in bids)
+        ask_depth = sum(price * contracts * contract_value_base for price, contracts in asks)
+        total_depth = bid_depth + ask_depth
+        imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0.0
+        reasons: list[str] = []
+        if not inst_id:
+            reasons.append("okx_pre_order_inst_id_missing")
+        if max(self._safe_float(ticker.get("last"), 0.0), 0.0) <= 0:
+            reasons.append("okx_pre_order_last_price_missing")
+        if bid <= 0 or ask <= 0 or bid > ask:
+            reasons.append("okx_pre_order_bid_ask_invalid")
+        if mark_price <= 0:
+            reasons.append("okx_pre_order_mark_price_missing")
+        if contract_value_base <= 0:
+            reasons.append("okx_pre_order_contract_spec_missing")
+        if not bids or not asks or bid_depth <= 0 or ask_depth <= 0:
+            reasons.append("okx_pre_order_orderbook_incomplete")
+        if not fee.get("taker_fee_rate"):
+            reasons.append("okx_pre_order_account_fee_missing")
+        generated_at = datetime.now(UTC).isoformat()
+        feature_snapshot = {
+            "current_price": max(self._safe_float(ticker.get("last"), 0.0), 0.0),
+            "bid": bid,
+            "ask": ask,
+            "mark_price": mark_price,
+            "spread_pct": (
+                (ask - bid) / ((ask + bid) / 2.0) * 100.0
+                if bid > 0 and ask >= bid
+                else 0.0
+            ),
+            "orderbook_bids": bids,
+            "orderbook_asks": asks,
+            "orderbook_bid_depth": bid_depth,
+            "orderbook_ask_depth": ask_depth,
+            "orderbook_imbalance": imbalance,
+            "contract_value_base": contract_value_base,
+            "contract_spec": spec,
+            "taker_fee_rate": fee.get("taker_fee_rate"),
+            "entry_fee_rate": fee.get("entry_fee_rate"),
+            "exit_fee_rate": fee.get("exit_fee_rate"),
+            "fee_rate_source": fee.get("fee_rate_source"),
+            "fee_rate_observed_at": fee.get("fee_rate_observed_at"),
+            "fee_policy_provenance": fee.get("policy_provenance"),
+        }
+        return {
+            "production_eligible": not reasons,
+            "reason": "okx_native_pre_order_execution_facts_ready"
+            if not reasons
+            else ",".join(reasons),
+            "symbol": normalize_trading_symbol(symbol),
+            "side": str(side or "").lower(),
+            "okx_symbol": okx_symbol,
+            "inst_id": inst_id,
+            "ticker_source_timestamp_ms": ticker.get("timestamp"),
+            "orderbook_source_timestamp_ms": book.get("timestamp"),
+            "mark_source_timestamp_ms": self._safe_float(mark_row.get("ts"), 0.0),
+            "contract_spec": spec,
+            "fee_snapshot": fee,
+            "feature_snapshot": feature_snapshot,
+            "policy_provenance": {
+                "source": "okx_native_ticker_orderbook_mark_contract_and_account_fee",
+                "observation_window": "current_immediate_pre_order_refresh",
+                "sample_count": len(bids) + len(asks) + int(mark_price > 0) + int(bool(spec)),
+                "generated_at": generated_at,
+                "strategy_version": "2026-07-15.okx-pre-order-execution-facts.v1",
+                "fallback_reason": "" if not reasons else ",".join(reasons),
+            },
+        }
+
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         okx_symbol = self._to_swap_symbol(symbol) if symbol else None
         try:
@@ -4607,6 +4778,55 @@ class OKXExecutor(AbstractExecutor):
         inst_ids = [okx_inst_id_from_symbol(symbol)] if symbol else None
         return await self._native_facts_client().fetch_position_protection_orders(
             inst_ids=inst_ids,
+        )
+
+    async def amend_position_protection_size(
+        self,
+        *,
+        inst_id: str,
+        algo_id: str,
+        contracts: float,
+    ) -> dict[str, Any]:
+        """Amend only the OKX algo size while preserving its dynamic prices."""
+
+        if contracts <= 0:
+            raise ExchangeAPIError("Protection amend requires positive contracts")
+        ccxt = await self._get_ccxt()
+        amend = getattr(ccxt, "privatePostTradeAmendAlgos", None)
+        if not callable(amend):
+            raise ExchangeAPIError("OKX native amend-algo API is unavailable")
+        return await self._with_retry(
+            amend,
+            {
+                "instId": str(inst_id or "").upper(),
+                "algoId": str(algo_id or ""),
+                "newSz": self._format_okx_number(contracts),
+                "cxlOnFail": "false",
+            },
+        )
+
+    async def cancel_position_protection_order(
+        self,
+        *,
+        inst_id: str,
+        algo_id: str,
+    ) -> dict[str, Any]:
+        """Cancel one proven orphan or zero-allocation OKX protection order."""
+
+        ccxt = await self._get_ccxt()
+        cancel = getattr(ccxt, "privatePostTradeCancelAlgos", None)
+        if not callable(cancel):
+            raise ExchangeAPIError("OKX native cancel-algo API is unavailable")
+        return await self._with_retry(
+            cancel,
+            {
+                "algoIds": [
+                    {
+                        "instId": str(inst_id or "").upper(),
+                        "algoId": str(algo_id or ""),
+                    }
+                ]
+            },
         )
 
     async def fetch_account_fee_snapshot(self) -> dict[str, Any]:

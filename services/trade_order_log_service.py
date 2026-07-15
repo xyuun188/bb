@@ -243,6 +243,9 @@ class TradeOrderLogService:
             else None,
             "rows": [dict(info)],
         }
+        protection_submission = raw.get("protection_submission")
+        if isinstance(protection_submission, dict) and protection_submission:
+            raw_fact["protection_submission"] = dict(protection_submission)
         payload: dict[str, Any] = {
             "okx_inst_id": inst_id,
             "okx_trade_ids": trade_id or None,

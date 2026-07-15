@@ -79,6 +79,8 @@ def _decision() -> DecisionOutput:
                 "execution_cost": {
                     "total_pct": 0.05,
                     "spread_source": "bid_ask",
+                    "order_size_complete": True,
+                    "order_notional_usdt": 40.0,
                     "production_eligible": True,
                     "policy_provenance": provenance,
                 },
@@ -123,6 +125,15 @@ def _decision() -> DecisionOutput:
                 "planned_stressed_loss_usdt": 0.8,
                 "stressed_loss_fraction": 0.02,
                 "policy_provenance": provenance,
+            },
+            "pre_order_execution_facts": {
+                "production_eligible": True,
+                "input_fingerprint": "test-pre-order-fingerprint",
+            },
+            "execution_cost_sizing_pass": {
+                "order_size_complete": True,
+                "impact_basis_notional_usdt": 40.0,
+                "final_notional_usdt": 40.0,
             },
         },
     )

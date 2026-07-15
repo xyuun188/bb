@@ -13,8 +13,17 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.dynamic_exit_policy import apply_dynamic_exit
+from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.return_execution_policy import apply_production_entry_policy
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
 
 
 @dataclass(slots=True)
@@ -132,10 +141,14 @@ class EntryPolicy:
             return self.decision_freshness.stale_decision_reason(decision)
         return None
 
-    async def pre_execution_price_guard_reason(self, decision: DecisionOutput) -> str | None:
+    async def pre_execution_price_guard_reason(
+        self,
+        decision: DecisionOutput,
+        model_mode: str = "",
+    ) -> str | None:
         if self.entry_price_guard is None:
             return None
-        return await self.entry_price_guard.guard_reason(decision)
+        return await self.entry_price_guard.guard_reason(decision, model_mode)
 
     async def apply_profit_risk_sizing(
         self,
@@ -166,11 +179,89 @@ class EntryPolicy:
             decision,
             self.strategy_context_from_decision(decision),
         )
+        if self.entry_opportunity_score is None:
+            await self.apply_profit_risk_sizing(
+                decision,
+                model_mode,
+                open_positions=open_positions or [],
+            )
+            return
+
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
+        sizing = sizing if isinstance(sizing, dict) else {}
+        impact_basis_notional = max(
+            _safe_float(sizing.get("final_notional_usdt"), 0.0),
+            0.0,
+        )
+        if impact_basis_notional <= 0:
+            await self.apply_profit_risk_sizing(
+                decision,
+                model_mode,
+                open_positions=open_positions or [],
+            )
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
+            sizing = sizing if isinstance(sizing, dict) else {}
+            impact_basis_notional = max(
+                _safe_float(sizing.get("final_notional_usdt"), 0.0),
+                0.0,
+            )
+        if impact_basis_notional <= 0:
+            return
+
+        snapshot = (
+            dict(decision.feature_snapshot)
+            if isinstance(decision.feature_snapshot, dict)
+            else {}
+        )
+        snapshot["planned_order_notional_usdt"] = impact_basis_notional
+        snapshot["planned_order_side"] = (
+            "long" if decision.action == Action.LONG else "short"
+        )
+        decision.feature_snapshot = snapshot
+        self.score_candidate(
+            decision,
+            self.strategy_context_from_decision(decision),
+        )
         await self.apply_profit_risk_sizing(
             decision,
             model_mode,
             open_positions=open_positions or [],
         )
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
+        sizing = sizing if isinstance(sizing, dict) else {}
+        final_notional = max(_safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0)
+        if final_notional > impact_basis_notional:
+            reconcile_profit_risk_sizing(
+                decision,
+                final_notional_usdt=impact_basis_notional,
+                final_leverage=decision.suggested_leverage,
+                source="size_aware_execution_cost_non_enlargement",
+                execution_facts={
+                    "impact_basis_notional_usdt": impact_basis_notional,
+                    "calculated_final_notional_usdt": final_notional,
+                },
+            )
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["execution_cost_sizing_pass"] = {
+            "impact_basis_notional_usdt": impact_basis_notional,
+            "final_notional_usdt": (
+                (raw.get("profit_risk_sizing") or {}).get("final_notional_usdt")
+                if isinstance(raw.get("profit_risk_sizing"), dict)
+                else 0.0
+            ),
+            "order_size_complete": (
+                ((raw.get("opportunity_score") or {}).get("execution_cost") or {}).get(
+                    "order_size_complete"
+                )
+                if isinstance(raw.get("opportunity_score"), dict)
+                and isinstance((raw.get("opportunity_score") or {}).get("execution_cost"), dict)
+                else False
+            ),
+        }
+        decision.raw_response = raw
 
     async def high_risk_review_gate(
         self,
@@ -204,12 +295,18 @@ class EntryPolicy:
                 {"intent": "not_entry", "pipeline_context": context.public_data()}
             )
 
-        price_guard_reason = await self.pre_execution_price_guard_reason(decision)
+        price_guard_reason = await self.pre_execution_price_guard_reason(decision, model_mode)
         if price_guard_reason:
             return PolicyGateResult.block(
                 "pre_execution_price_guard",
                 price_guard_reason,
                 {"pipeline_context": context.public_data()},
+            )
+
+        if self.entry_opportunity_score is not None:
+            self.score_candidate(
+                decision,
+                self.strategy_context_from_decision(decision),
             )
 
         safety_reason = self.gate_reason(decision)

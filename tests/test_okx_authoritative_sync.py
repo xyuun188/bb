@@ -834,6 +834,32 @@ class _LinkedProtectionFillCcxt:
             }
         return {"data": []}
 
+    async def privateGetTradeOrderAlgoDetails(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert params == {"algoId": "aave-oco-triggered"}
+        return {
+            "data": [
+                {
+                    "algoId": "aave-oco-triggered",
+                    "instId": "AAVE-USDT-SWAP",
+                    "ordId": "aave-protection-close",
+                    "ordType": "oco",
+                    "side": "buy",
+                    "posSide": "net",
+                    "actualSide": "sl",
+                    "state": "effective",
+                    "actualSz": "6.1",
+                    "slTriggerPx": "97.5",
+                    "tpTriggerPx": "81.88",
+                    "triggerTime": str(self.timestamp_ms - 25),
+                    "cTime": str(self.timestamp_ms - 60000),
+                    "uTime": str(self.timestamp_ms - 25),
+                }
+            ]
+        }
+
     async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
         self.instrument_params.append(dict(params))
         return {"data": [{"instId": "AAVE-USDT-SWAP", "ctVal": "0.1"}]}
@@ -1053,6 +1079,13 @@ async def test_okx_authoritative_sync_classifies_linked_protection_fill_missing_
         assert linked_issue["linked_exchange_order_id"] == "aave-entry-order"
         assert linked_issue["linked_local_order_id"] is not None
         assert linked_issue["okx_algo_id"] == "aave-oco-triggered"
+        execution = linked_issue["protection_execution"]
+        assert execution["lifecycle_complete"] is True
+        assert execution["actual_side"] == "sl"
+        assert execution["configured_trigger_price"] == pytest.approx(97.5)
+        assert execution["actual_trigger_market_price"] is None
+        assert execution["trigger_to_first_fill_ms"] == pytest.approx(25.0)
+        assert execution["fill_price"] == pytest.approx(97.54)
         assert "--create-linked-protection-fill-orders" in linked_issue["repair_entrypoint"]
         assert report["okx_order_history_context_count"] >= 1
     finally:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -36,8 +38,15 @@ class EntryPriceGuardPolicy:
     fresh_feature_provider: Callable[[str], Awaitable[Any]]
     market_data_quality_reason_provider: Callable[..., str | None]
     decision_age_seconds_provider: Callable[[DecisionOutput], float]
+    pre_order_execution_facts_provider: (
+        Callable[[str, DecisionOutput], Awaitable[dict[str, Any]]] | None
+    ) = None
 
-    async def guard_reason(self, decision: DecisionOutput) -> str | None:
+    async def guard_reason(
+        self,
+        decision: DecisionOutput,
+        model_mode: str = "",
+    ) -> str | None:
         if not decision.is_entry:
             return None
 
@@ -52,6 +61,34 @@ class EntryPriceGuardPolicy:
         fresh = await self._fresh_valid_snapshot(decision.symbol)
         if not fresh:
             return "Fresh pre-order native market fact is incomplete; entry fails closed."
+
+        execution_facts: dict[str, Any] = {}
+        if self.pre_order_execution_facts_provider is not None:
+            try:
+                execution_facts = await self.pre_order_execution_facts_provider(
+                    model_mode,
+                    decision,
+                )
+            except Exception:
+                return "Authoritative pre-order execution facts are unavailable; entry fails closed."
+            if execution_facts.get("production_eligible") is not True:
+                return (
+                    "Authoritative pre-order execution facts are incomplete; entry fails closed: "
+                    f"{execution_facts.get('reason') or 'unknown'}"
+                )
+            execution_snapshot = _safe_dict(execution_facts.get("feature_snapshot"))
+            if not execution_snapshot:
+                return "Authoritative pre-order execution snapshot is missing; entry fails closed."
+            fresh_inst_id = str(
+                _safe_dict(_safe_dict(fresh.get("market_fact")).get("native_identity")).get(
+                    "inst_id"
+                )
+                or ""
+            ).upper()
+            execution_inst_id = str(execution_facts.get("inst_id") or "").upper()
+            if fresh_inst_id and execution_inst_id and fresh_inst_id != execution_inst_id:
+                return "Pre-order market fact and execution fact instrument mismatch; entry fails closed."
+            fresh = {**fresh, **execution_snapshot}
 
         snapshot_price = _safe_float(snapshot.get("current_price") or snapshot.get("close"))
         if snapshot_price <= 0:
@@ -98,9 +135,32 @@ class EntryPriceGuardPolicy:
                 "fresh_source_interface": fresh_fact.get("source_interface"),
             },
         }
-        decision.raw_response = raw
         if adverse <= allowed:
+            public_execution_facts = {
+                key: value
+                for key, value in execution_facts.items()
+                if key not in {"feature_snapshot", "fee_snapshot"}
+            }
+            if execution_facts:
+                fingerprint_payload = {
+                    "facts": public_execution_facts,
+                    "feature_snapshot": _safe_dict(execution_facts.get("feature_snapshot")),
+                }
+                public_execution_facts["input_fingerprint"] = hashlib.sha256(
+                    json.dumps(
+                        fingerprint_payload,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
+                raw["pre_order_execution_facts"] = public_execution_facts
+                fresh["pre_order_execution_facts"] = public_execution_facts
+            decision.feature_snapshot = {**snapshot, **fresh}
+            decision.raw_response = raw
             return None
+
+        decision.raw_response = raw
 
         return (
             "Current adverse price movement exceeds the authoritative fee-after return "

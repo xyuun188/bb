@@ -53,6 +53,8 @@ def _trade_sample() -> dict:
         "side": "long",
         "hold_minutes": 45.0,
         "stop_loss_slippage_pct": 0.03,
+        "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "protection_execution_supervision_ready": True,
         "sample_weight": 1.0,
         "exclude_from_training": False,
         "profit_learning_labels": {

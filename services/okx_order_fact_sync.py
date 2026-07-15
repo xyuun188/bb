@@ -36,6 +36,7 @@ from services.okx_native_facts import (
     OkxNativeAccountBill,
     OkxNativeFactsClient,
     OkxNativeFillGroup,
+    build_okx_protection_execution_lifecycle,
 )
 from services.okx_position_confirmation import (
     OkxCurrentPositionEntryConfirmation,
@@ -137,6 +138,8 @@ class OkxOrderFactSyncSummary:
     unverified_count: int = 0
     backfilled_count: int = 0
     order_history_backfilled_count: int = 0
+    protection_execution_count: int = 0
+    protection_execution_error: str | None = None
     position_history_checked_count: int = 0
     position_history_backfilled_count: int = 0
     position_history_updated_count: int = 0
@@ -179,6 +182,8 @@ class OkxOrderFactSyncSummary:
             "unverified_count": self.unverified_count,
             "backfilled_count": self.backfilled_count,
             "order_history_backfilled_count": self.order_history_backfilled_count,
+            "protection_execution_count": self.protection_execution_count,
+            "protection_execution_error": self.protection_execution_error,
             "position_history_checked_count": self.position_history_checked_count,
             "position_history_backfilled_count": self.position_history_backfilled_count,
             "position_history_updated_count": self.position_history_updated_count,
@@ -271,6 +276,8 @@ class OkxOrderFactSyncService:
         pull_error: str | None = None
         fills: list[OkxNativeFillGroup] = []
         order_rows: list[dict[str, Any]] = []
+        protection_algo_rows: list[dict[str, Any]] = []
+        protection_execution_error: str | None = None
         exchange_positions: list[dict[str, Any]] = []
         contract_sizes: dict[str, float] = {}
         position_history_rows: list[dict[str, Any]] = []
@@ -387,6 +394,27 @@ class OkxOrderFactSyncService:
                     record_optional_stage_error("orders_history_targeted", exc)
             order_rows = _dedupe_order_rows([*account_order_rows, *target_order_rows])
             try:
+                protection_algo_rows = await _bounded(
+                    native_facts.fetch_protection_algo_history_rows(
+                        algo_ids=_algo_ids_from_order_rows(order_rows),
+                        order_ids={fill.order_id for fill in fills if fill.order_id},
+                        inst_ids=(
+                            fact_target_inst_ids
+                            | {fill.inst_id for fill in fills if fill.inst_id}
+                        ),
+                        since=since,
+                        limit=100,
+                        max_pages=history_page_count,
+                        strict=True,
+                    ),
+                    history_timeout_seconds,
+                )
+            except Exception as exc:
+                protection_execution_error = record_optional_stage_error(
+                    "protection_algo_history",
+                    exc,
+                )
+            try:
                 contract_sizes = await _bounded(
                     native_facts.fetch_contract_sizes(
                         inst_ids=(
@@ -479,6 +507,11 @@ class OkxOrderFactSyncService:
 
         fills_by_order_id = {fill.order_id: fill for fill in fills}
         order_rows_by_id = _order_rows_by_id(order_rows)
+        protection_execution_by_order_id = _protection_execution_by_order_id(
+            fills=fills,
+            order_rows_by_id=order_rows_by_id,
+            algo_rows=protection_algo_rows,
+        )
         async with get_session_ctx() as session:
             writable_orders = await self._load_writable_refresh_orders(session, since_naive)
             stored_repair_orders = (
@@ -528,6 +561,7 @@ class OkxOrderFactSyncService:
                     fills=fills,
                     fills_by_order_id=fills_by_order_id,
                     order_rows_by_id=order_rows_by_id,
+                    protection_execution_by_order_id=protection_execution_by_order_id,
                     contract_sizes=contract_sizes,
                     decisions_by_id=decisions_by_id,
                     now=datetime.now(UTC),
@@ -537,6 +571,7 @@ class OkxOrderFactSyncService:
                     session,
                     fills=fills,
                     order_rows=order_rows,
+                    protection_execution_by_order_id=protection_execution_by_order_id,
                     contract_sizes=contract_sizes,
                     since=since,
                     now=datetime.now(UTC),
@@ -678,6 +713,8 @@ class OkxOrderFactSyncService:
             unverified_count=unverified_count,
             backfilled_count=backfilled_count,
             order_history_backfilled_count=order_history_backfilled_count,
+            protection_execution_count=len(protection_execution_by_order_id),
+            protection_execution_error=protection_execution_error,
                 position_history_checked_count=position_history_result.checked_count,
                 position_history_backfilled_count=position_history_result.backfilled_count,
                 position_history_updated_count=position_history_result.updated_count,
@@ -787,6 +824,7 @@ class OkxOrderFactSyncService:
         fills: list[OkxNativeFillGroup],
         fills_by_order_id: dict[str, OkxNativeFillGroup],
         order_rows_by_id: dict[str, dict[str, Any]],
+        protection_execution_by_order_id: dict[str, dict[str, Any]],
         contract_sizes: dict[str, float],
         decisions_by_id: dict[int, AIDecision] | None = None,
         now: datetime,
@@ -830,6 +868,9 @@ class OkxOrderFactSyncService:
                         contract_size=contract_size,
                         contract_size_source=contract_size_source,
                         order_row=order_rows_by_id.get(str(pending_fill.order_id or "").strip()),
+                        protection_execution=protection_execution_by_order_id.get(
+                            str(pending_fill.order_id or "").strip()
+                        ),
                     )
                     confirmed_count += 1
                     samples.append(_sample(order, kind="native_full_close_backfill_confirmed"))
@@ -950,6 +991,7 @@ class OkxOrderFactSyncService:
                 contract_size=contract_size,
                 contract_size_source=contract_size_source,
                 order_row=order_row,
+                protection_execution=protection_execution_by_order_id.get(fill.order_id),
             )
             confirmed_count += 1
             samples.append(_sample(order, kind="local_order_confirmed"))
@@ -999,6 +1041,7 @@ class OkxOrderFactSyncService:
         *,
         fills: list[OkxNativeFillGroup],
         order_rows: list[dict[str, Any]],
+        protection_execution_by_order_id: dict[str, dict[str, Any]],
         contract_sizes: dict[str, float],
         since: datetime,
         now: datetime,
@@ -1050,6 +1093,7 @@ class OkxOrderFactSyncService:
                 contract_size=contract_size,
                 contract_size_source=contract_size_source,
                 order_row=order_rows_by_id.get(fill.order_id),
+                protection_execution=protection_execution_by_order_id.get(fill.order_id),
             )
             session.add(order)
             existing_exchange_ids.add(fill.order_id)
@@ -2253,6 +2297,7 @@ class OkxOrderFactSyncService:
         contract_size: float = 0.0,
         contract_size_source: str = "",
         order_row: dict[str, Any] | None = None,
+        protection_execution: dict[str, Any] | None = None,
     ) -> None:
         contract_size_source = str(contract_size_source or "").strip()
         if not contract_size_source:
@@ -2273,7 +2318,9 @@ class OkxOrderFactSyncService:
         order.okx_sync_status = sync_status
         order.okx_synced_at = now
         order.okx_last_error = None
-        order.okx_raw_fills = {
+        existing_raw = getattr(order, "okx_raw_fills", None)
+        existing_raw = existing_raw if isinstance(existing_raw, dict) else {}
+        raw_fact = {
             "fills_history_confirmed": True,
             "order_id": fill.order_id,
             "trade_ids": list(fill.trade_ids),
@@ -2291,6 +2338,12 @@ class OkxOrderFactSyncService:
             "rows": list(fill.rows[:20]),
             "order_rows": [dict(order_row)] if isinstance(order_row, dict) and order_row else [],
         }
+        protection_submission = existing_raw.get("protection_submission")
+        if isinstance(protection_submission, dict) and protection_submission:
+            raw_fact["protection_submission"] = dict(protection_submission)
+        if isinstance(protection_execution, dict) and protection_execution:
+            raw_fact["protection_execution"] = dict(protection_execution)
+        order.okx_raw_fills = raw_fact
 
 
 def _apply_position_confirmation_to_order(
@@ -2827,6 +2880,8 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
         "cancelled",
         "canceled",
     }
+    if _order_has_protection_fill_hint_without_execution(order):
+        return refreshable_status
     if sync_status == OKX_SYNC_CONFIRMED and _order_has_confirmed_okx_fill_fact(
         order,
         require_verified_contract_size=True,
@@ -2884,12 +2939,34 @@ def _order_needs_okx_pull(order: Order) -> bool:
         "canceled",
     }:
         return False
+    if _order_has_protection_fill_hint_without_execution(order):
+        return True
     if _order_has_fills_history_confirmed(order) and _order_has_confirmed_okx_fill_fact(
         order,
         require_verified_contract_size=True,
     ):
         return False
     return True
+
+
+def _order_has_protection_fill_hint_without_execution(order: Order) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    execution = raw.get("protection_execution")
+    if isinstance(execution, dict) and execution.get("lifecycle_complete") is True:
+        return False
+    rows = [
+        row
+        for key in ("rows", "order_rows")
+        for row in (raw.get(key) if isinstance(raw.get(key), list) else [])
+        if isinstance(row, dict)
+    ]
+    return any(
+        str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+        or str(row.get("source") or "").strip() == "7"
+        or str(row.get("clOrdId") or "").strip().startswith("O")
+        for row in rows
+    )
 
 
 def _order_is_reduce_only_close(order: Order) -> bool:
@@ -4492,6 +4569,48 @@ def _ordered_exchange_ids(values: Any) -> list[str]:
         if token and token not in seen:
             result.append(token)
             seen.add(token)
+    return result
+
+
+def _algo_ids_from_order_rows(rows: list[dict[str, Any]]) -> set[str]:
+    return {
+        algo_id
+        for row in rows
+        if (algo_id := str(row.get("algoId") or "").strip())
+    }
+
+
+def _protection_execution_by_order_id(
+    *,
+    fills: list[OkxNativeFillGroup],
+    order_rows_by_id: dict[str, dict[str, Any]],
+    algo_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    algo_by_order_id = {
+        str(row.get("ordId") or "").strip(): row
+        for row in algo_rows
+        if str(row.get("ordId") or "").strip()
+    }
+    algo_by_id = {
+        str(row.get("algoId") or row.get("algoClOrdId") or "").strip(): row
+        for row in algo_rows
+        if str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for fill in fills:
+        order_id = str(fill.order_id or "").strip()
+        order_row = order_rows_by_id.get(order_id, {})
+        algo_id = str(order_row.get("algoId") or "").strip()
+        algo_row = algo_by_order_id.get(order_id) or algo_by_id.get(algo_id)
+        if not isinstance(algo_row, dict):
+            continue
+        lifecycle = build_okx_protection_execution_lifecycle(
+            fill,
+            order_row=order_row,
+            algo_row=algo_row,
+        )
+        if lifecycle is not None:
+            result[order_id] = lifecycle
     return result
 
 

@@ -137,6 +137,13 @@ def _dynamic_return_ready_decision() -> DecisionOutput:
                 "policy_provenance": provenance,
             },
         },
+        "opportunity_score": {
+            "execution_cost": {
+                "production_eligible": True,
+                "order_size_complete": True,
+                "order_notional_usdt": 90.0,
+            },
+        },
         "profit_risk_sizing": {
             "production_eligible": True,
             "available_margin_usdt": 1000.0,
@@ -148,6 +155,15 @@ def _dynamic_return_ready_decision() -> DecisionOutput:
             "final_notional_usdt": 90.0,
             "final_margin_usdt": 30.0,
             "policy_provenance": {**provenance, "contract_fingerprint": "test-fingerprint"},
+        },
+        "pre_order_execution_facts": {
+            "production_eligible": True,
+            "input_fingerprint": "test-pre-order-fingerprint",
+        },
+        "execution_cost_sizing_pass": {
+            "order_size_complete": True,
+            "impact_basis_notional_usdt": 90.0,
+            "final_notional_usdt": 90.0,
         },
     }
     return decision

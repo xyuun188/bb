@@ -14,7 +14,7 @@ from services.profit_supervision import (
 )
 from services.return_objective import validate_return_distribution_contract
 
-RETURN_EXECUTION_POLICY_VERSION = "2026-07-15.standardized-return-execution.v4"
+RETURN_EXECUTION_POLICY_VERSION = "2026-07-15.standardized-return-execution.v5"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -105,6 +105,8 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     raw = _safe_dict(decision.raw_response)
     opportunity = _safe_dict(raw.get("opportunity_score"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    pre_order_facts = _safe_dict(raw.get("pre_order_execution_facts"))
+    cost_sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
     breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
     distribution = _safe_dict(opportunity.get("return_distribution_contract"))
@@ -214,6 +216,16 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         reasons.append("execution_cost_distribution_missing")
     if str(execution_cost.get("spread_source") or "") == "missing":
         reasons.append("live_spread_observation_missing")
+    if execution_cost.get("order_size_complete") is not True:
+        reasons.append("order_size_execution_cost_incomplete")
+    if _safe_float(execution_cost.get("order_notional_usdt"), 0.0) + 1e-8 < final_notional:
+        reasons.append("execution_cost_notional_below_final_order_notional")
+    if pre_order_facts.get("production_eligible") is not True:
+        reasons.append("pre_order_execution_facts_ineligible")
+    if not str(pre_order_facts.get("input_fingerprint") or "").strip():
+        reasons.append("pre_order_execution_facts_fingerprint_missing")
+    if cost_sizing_pass.get("order_size_complete") is not True:
+        reasons.append("order_size_sizing_pass_incomplete")
     if not cost_provenance_complete:
         reasons.append("execution_cost_policy_provenance_incomplete")
     if (

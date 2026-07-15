@@ -79,6 +79,22 @@ class _TradeApi:
         self.calls.append(("place_order", dict(kwargs)))
         return {"code": "0", "data": [{"ordId": "okx-1", "sCode": "0"}]}
 
+    def amend_algo_order(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("amend_algo_order", dict(kwargs)))
+        return {"code": "0", "data": [{"algoId": "algo-1", "sCode": "0"}]}
+
+    def cancel_algo_order(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("cancel_algo_order", dict(kwargs)))
+        return {"code": "0", "data": [{"algoId": "algo-1", "sCode": "0"}]}
+
+    def order_algos_history(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("order_algos_history", dict(kwargs)))
+        return {"code": "0", "data": [{"algoId": "algo-1", "state": "effective"}]}
+
+    def get_algo_order_details(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_algo_order_details", dict(kwargs)))
+        return {"code": "0", "data": [{"algoId": "algo-1", "state": "effective"}]}
+
 
 class _AccountApi:
     def __init__(self) -> None:
@@ -288,6 +304,83 @@ async def test_sdk_adapter_reads_account_level_swap_fee_rate() -> None:
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_amends_and_cancels_native_algo_orders() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    trade_api = _TradeApi()
+    exchange._trade_api = trade_api
+
+    await exchange.privatePostTradeAmendAlgos(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "algoId": "algo-1",
+            "newSz": "13",
+            "cxlOnFail": "false",
+        }
+    )
+    await exchange.privatePostTradeCancelAlgos(
+        {"algoIds": [{"instId": "BTC-USDT-SWAP", "algoId": "algo-1"}]}
+    )
+
+    assert trade_api.calls[0] == (
+        "amend_algo_order",
+        {
+            "instId": "BTC-USDT-SWAP",
+            "algoId": "algo-1",
+            "algoClOrdId": "",
+            "cxlOnFail": "false",
+            "reqId": "",
+            "newSz": "13",
+            "newTriggerPx": "",
+            "newOrdPx": "",
+            "newTpTriggerPx": "",
+            "newTpOrdPx": "",
+            "newSlTriggerPx": "",
+            "newSlOrdPx": "",
+        },
+    )
+    assert trade_api.calls[1] == (
+        "cancel_algo_order",
+        {"orders_data": [{"instId": "BTC-USDT-SWAP", "algoId": "algo-1"}]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_reads_algo_history_and_exact_details() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    trade_api = _TradeApi()
+    exchange._trade_api = trade_api
+
+    await exchange.privateGetTradeOrdersAlgoHistory(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordType": "oco",
+            "state": "effective",
+            "after": "cursor-1",
+            "limit": "20",
+        }
+    )
+    await exchange.privateGetTradeOrderAlgoDetails({"algoId": "algo-1"})
+
+    assert trade_api.calls[0] == (
+        "order_algos_history",
+        {
+            "ordType": "oco",
+            "state": "effective",
+            "algoId": "",
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+            "after": "cursor-1",
+            "before": "",
+            "limit": "20",
+        },
+    )
+    assert trade_api.calls[1] == (
+        "get_algo_order_details",
+        {"algoId": "algo-1", "algoClOrdId": ""},
+    )
 
 
 @pytest.mark.asyncio

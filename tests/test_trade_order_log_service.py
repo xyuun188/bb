@@ -239,6 +239,11 @@ async def test_trade_order_log_service_persists_okx_execution_result_facts() -> 
             "filled_contracts": 158.0,
             "filled": 158.0,
             "average": 0.0097,
+            "protection_submission": {
+                "source_authority": "local_submit_plus_okx_create_order_response",
+                "exchange_confirmation_recorded": True,
+                "algo_ids": ["algo-act-1"],
+            },
             "info": {
                 "ordId": "3703940352525967360",
                 "instId": "ACT-USDT-SWAP",
@@ -274,6 +279,9 @@ async def test_trade_order_log_service_persists_okx_execution_result_facts() -> 
     assert order["okx_raw_fills"]["execution_result_confirmed"] is True
     assert order["okx_raw_fills"]["order_id"] == "3703940352525967360"
     assert order["okx_raw_fills"]["inst_id"] == "ACT-USDT-SWAP"
+    assert order["okx_raw_fills"]["protection_submission"]["algo_ids"] == [
+        "algo-act-1"
+    ]
 
 
 @pytest.mark.asyncio

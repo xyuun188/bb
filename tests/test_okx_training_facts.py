@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from services.okx_training_facts import build_okx_history_training_sample
 from services.training_data_quality import annotate_training_payload
 
@@ -209,3 +211,91 @@ def test_position_fallback_payload_is_not_misreported_as_exact_entry_lineage() -
     assert sample["decision_id"] == 0
     assert sample["decision_lineage_source"] == "position_time_fallback_payload"
     assert "missing_exact_entry_order_decision_link" in sample["strategy_lineage_gaps"]
+
+
+def test_stop_slippage_uses_exchange_algo_trigger_not_local_planned_stop() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills = {
+        "protection_submission": {
+            "source_authority": "local_submit_plus_okx_create_order_response",
+            "exchange_confirmation_recorded": True,
+            "exchange_confirmed_at": "2026-07-11T01:00:01+00:00",
+            "algo_ids": ["algo-stop-1"],
+        }
+    }
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills = {
+        "protection_execution": {
+            "source_authority": "okx_algo_history_plus_fills_history",
+            "lifecycle_complete": True,
+            "algo_id": "algo-stop-1",
+            "generated_order_id": "close-1",
+            "actual_side": "sl",
+            "configured_trigger_price": 97_500.0,
+            "actual_trigger_market_price": None,
+            "actual_trigger_market_price_available": False,
+            "exchange_confirmed_at_ms": 1783731601000,
+            "triggered_at_ms": 1783735200000,
+            "fill_started_at_ms": 1783735200025,
+            "fill_completed_at_ms": 1783735200030,
+            "trigger_to_first_fill_ms": 25.0,
+            "fill_mark_price": 97_450.0,
+            "fill_index_price": 97_460.0,
+            "fill_path_min_price": 96_950.0,
+            "fill_path_max_price": 97_100.0,
+            "fill_mark_slippage_pct": 0.461775,
+            "trigger_path_extrema_available": False,
+            "trigger_orderbook_snapshot_available": False,
+            "stop_loss_slippage_pct": (97_500.0 - 97_000.0) / 97_500.0 * 100.0,
+            "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        }
+    }
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "profit_risk_sizing": {
+            "risk_budget_usdt": 5.0,
+            "planned_stressed_loss_usdt": 4.5,
+        }
+    }
+    history = _history(
+        close_avg_px=97_000.0,
+        realized_pnl=-8.5,
+        pnl=-7.0,
+        pnl_ratio=-0.085,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "realizedPnl": "-8.5",
+        "pnl": "-7",
+        "pnlRatio": "-0.085",
+    }
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["stop_loss_fill_confirmed"] is True
+    assert sample["stop_loss_slippage_pct"] == pytest.approx(
+        (97_500.0 - 97_000.0) / 97_500.0 * 100.0
+    )
+    assert sample["stop_loss_slippage_pct"] != pytest.approx(
+        (98_000.0 - 97_000.0) / 98_000.0 * 100.0
+    )
+    assert sample["stop_loss_slippage_source"] == (
+        "okx_configured_stop_trigger_to_fills_vwap"
+    )
+    assert sample["actual_trigger_market_price"] is None
+    assert sample["protection_lifecycle_complete"] is True
+    assert sample["trigger_to_first_fill_ms"] == pytest.approx(25.0)
+    assert sample["execution_actual_over_budget_loss_usdt"] == pytest.approx(3.5)
+    assert "actual_trigger_market_price_unavailable" in sample["protection_execution_gaps"]
+
+
+def test_legacy_stop_order_type_cannot_recreate_planned_price_slippage() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["close-1"].order_type = "stop_loss"
+
+    sample = build_okx_history_training_sample(
+        _history(close_avg_px=97_000.0),
+        **lineage,
+    )
+
+    assert sample["stop_loss_fill_confirmed"] is False
+    assert sample["stop_loss_slippage_pct"] is None
+    assert sample["stop_loss_slippage_source"] == "not_authoritatively_confirmed"

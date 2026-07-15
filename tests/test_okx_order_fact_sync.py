@@ -155,6 +155,105 @@ def test_native_full_close_pending_order_targets_and_matches_real_fill() -> None
     )
 
 
+def test_fill_refresh_preserves_submission_and_persists_protection_execution() -> None:
+    filled_at = datetime(2026, 7, 15, 1, 5, tzinfo=UTC)
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="CHZ/USDT",
+        side="buy",
+        order_type="market",
+        quantity=388.0,
+        price=0.01659,
+        status="filled",
+        fee=0.0,
+        exchange_order_id="close-stop-1",
+        filled_at=filled_at,
+    )
+    order.okx_raw_fills = {
+        "protection_submission": {
+            "state": "confirmed",
+            "algo_ids": ["algo-stop-1"],
+        }
+    }
+    fill = OkxNativeFillGroup(
+        order_id="close-stop-1",
+        trade_ids=("trade-stop-1",),
+        inst_id="CHZ-USDT-SWAP",
+        symbol="CHZ/USDT",
+        side="buy",
+        pos_side="net",
+        contracts=388.0,
+        avg_price=0.01659,
+        fee_abs=0.01,
+        fill_pnl=-1.0,
+        timestamp_ms=filled_at.timestamp() * 1000,
+        timestamp=filled_at,
+        raw_count=1,
+        rows=(),
+    )
+    lifecycle = {
+        "lifecycle_complete": True,
+        "actual_side": "sl",
+        "algo_id": "algo-stop-1",
+    }
+
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order,
+        fill,
+        now=filled_at,
+        sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=1.0,
+        contract_size_source="okx_public_instruments",
+        protection_execution=lifecycle,
+    )
+
+    assert order.okx_raw_fills["protection_submission"]["state"] == "confirmed"
+    assert order.okx_raw_fills["protection_execution"] == lifecycle
+    assert order.okx_raw_fills["fills_history_confirmed"] is True
+
+
+def test_confirmed_algo_fill_refreshes_only_until_protection_execution_is_complete() -> None:
+    order = Order(
+        model_name="okx_authoritative_sync",
+        execution_mode="paper",
+        symbol="CHZ/USDT",
+        side="buy",
+        order_type="market",
+        quantity=3880.0,
+        price=0.01659,
+        status="filled",
+        fee=0.01,
+        exchange_order_id="close-stop-1",
+    )
+    order.okx_sync_status = OKX_SYNC_CONFIRMED
+    order.okx_inst_id = "CHZ-USDT-SWAP"
+    order.okx_fill_contracts = 388.0
+    order.okx_raw_fills = {
+        "fills_history_confirmed": True,
+        "order_id": "close-stop-1",
+        "inst_id": "CHZ-USDT-SWAP",
+        "contract_size_verified": True,
+        "contract_size_source": "okx_public_instruments",
+        "contract_size": 10.0,
+        "contracts": 388.0,
+        "base_quantity": 3880.0,
+        "avg_price": 0.01659,
+        "rows": [{"clOrdId": "Oclose-stop-1", "ordId": "close-stop-1"}],
+    }
+
+    assert _order_needs_okx_pull(order) is True
+    assert _order_needs_okx_fact_refresh(order) is True
+
+    order.okx_raw_fills["protection_execution"] = {
+        "lifecycle_complete": True,
+        "source_authority": "okx_algo_history_plus_fills_history",
+    }
+
+    assert _order_needs_okx_pull(order) is False
+    assert _order_needs_okx_fact_refresh(order) is False
+
+
 class _FillCcxt:
     def __init__(self) -> None:
         start_ms = int((PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=10)).timestamp() * 1000)

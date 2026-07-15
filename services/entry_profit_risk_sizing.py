@@ -612,10 +612,12 @@ class EntryProfitRiskSizingPolicy:
         wick = max(_safe_float(snapshot.get("abnormal_wick_max_pct"), 0.0) / 100.0, 0.0)
         stop_slippage_tail = _distribution_tail(calibration.get("stop_loss_slippage_pct")) / 100.0
         general_slippage_tail = _distribution_tail(calibration.get("slippage_pct")) / 100.0
-        market_impact = (
-            max(_safe_float(execution_cost.get("slippage_pct"), 0.0), 0.0)
-            + max(_safe_float(execution_cost.get("liquidity_penalty_pct"), 0.0), 0.0)
-            + max(_safe_float(execution_cost.get("imbalance_penalty_pct"), 0.0), 0.0)
+        market_impact = max(
+            _safe_float(execution_cost.get("slippage_pct"), 0.0),
+            _safe_float(execution_cost.get("liquidity_penalty_pct"), 0.0),
+            _safe_float(execution_cost.get("imbalance_penalty_pct"), 0.0),
+            _safe_float(execution_cost.get("market_impact_pct"), 0.0),
+            0.0,
         ) / 100.0
         stressed_loss_fraction = max(
             declared_stop,

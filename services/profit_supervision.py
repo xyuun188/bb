@@ -162,7 +162,12 @@ def _trade_cost_labels(
     fee = _safe_float(labels.get("fee_return_pct"))
     slippage = _safe_float(labels.get("slippage_return_pct"))
     slippage_source = "okx_entry_and_exit_fill_slippage"
-    if slippage is None:
+    if (
+        slippage is None
+        and sample.get("protection_execution_supervision_ready") is True
+        and _safe_text(sample.get("stop_loss_slippage_source"))
+        == "okx_configured_stop_trigger_to_fills_vwap"
+    ):
         slippage = _safe_float(sample.get("stop_loss_slippage_pct"))
         slippage_source = "okx_stop_trigger_to_fill_slippage"
     funding = _safe_float(labels.get("funding_return_pct"))
@@ -253,8 +258,21 @@ def build_profit_supervision_contract(
                 labels.get("gross_return_on_notional_pct")
             ),
             "hold_minutes": _safe_float(sample.get("hold_minutes")),
-            "stop_loss_slippage_pct": _safe_float(
-                sample.get("stop_loss_slippage_pct")
+            "stop_loss_slippage_pct": (
+                _safe_float(sample.get("stop_loss_slippage_pct"))
+                if sample.get("protection_execution_supervision_ready") is True
+                and _safe_text(sample.get("stop_loss_slippage_source"))
+                == "okx_configured_stop_trigger_to_fills_vwap"
+                else None
+            ),
+            "protection_actual_side": _safe_text(
+                sample.get("protection_actual_side")
+            ),
+            "trigger_to_first_fill_ms": _safe_float(
+                sample.get("trigger_to_first_fill_ms")
+            ),
+            "execution_actual_over_budget_loss_usdt": _safe_float(
+                sample.get("execution_actual_over_budget_loss_usdt")
             ),
             "exit_timing_label": _safe_text(labels.get("exit_timing_label")),
             "exit_quality_label": _safe_text(labels.get("payoff_profile_label")),
