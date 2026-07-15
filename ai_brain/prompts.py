@@ -527,9 +527,11 @@ def build_batch_experts_user_prompt(
         if isinstance(strategy_mode.get("strategy_learning"), dict)
         else {}
     )
-    active_return_profile = (
-        strategy_learning.get("active_profile")
-        if isinstance(strategy_learning.get("active_profile"), dict)
+    current_production_strategy = (
+        strategy_mode.get("current_production_strategy")
+        if isinstance(strategy_mode.get("current_production_strategy"), dict)
+        else strategy_learning.get("current_production_strategy")
+        if isinstance(strategy_learning.get("current_production_strategy"), dict)
         else {}
     )
     strategy_learning_runtime = (
@@ -540,25 +542,15 @@ def build_batch_experts_user_prompt(
     strategy_summary = {
         "strategy": strategy_mode.get("strategy"),
         "posture": strategy_mode.get("posture"),
-        "profile": strategy_mode.get("strategy_profile_id") or strategy_mode.get("profile_id"),
+        "current_production_strategy": compact_value(
+            current_production_strategy,
+            depth=2,
+            dict_limit=12,
+        ),
         "return_schedule": {
             "mode": strategy_learning.get("scheduler_mode"),
             "candidate_count": strategy_learning.get("candidate_count"),
             "governed_candidate_count": strategy_learning.get("governed_candidate_count"),
-            "active_selector": compact_value(
-                active_return_profile.get("params", {}).get("selector", {})
-                if isinstance(active_return_profile.get("params"), dict)
-                else {},
-                depth=1,
-            ),
-            "historical_return_distribution": compact_value(
-                active_return_profile.get("params", {}).get(
-                    "historical_return_distribution", {}
-                )
-                if isinstance(active_return_profile.get("params"), dict)
-                else {},
-                depth=1,
-            ),
             "production_influence_enabled": strategy_learning_runtime.get(
                 "production_influence_enabled"
             ),

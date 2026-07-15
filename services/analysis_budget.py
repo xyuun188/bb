@@ -84,7 +84,6 @@ class AnalysisBudgetRuntime:
     roster_fill_market_symbol_min: int
     max_position_group_bound: int
     source: str
-    strategy_profile_id: str | None
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -453,7 +452,6 @@ class AnalysisBudgetPolicy:
             roster_fill_market_symbol_min=0,
             max_position_group_bound=max_bound,
             source="config_compute_budget_only",
-            strategy_profile_id=None,
         )
 
     def _result(
@@ -481,7 +479,6 @@ class AnalysisBudgetPolicy:
             "read_only": True,
             "is_entry_gate": False,
             "budget_source": runtime.source,
-            "strategy_profile_id": runtime.strategy_profile_id,
             "risk_level": risk_level,
             "market_limit_policy": market_limit_policy,
             "configured_market_symbol_limit": configured_limit,
@@ -539,7 +536,6 @@ class AnalysisBudgetPolicy:
             "position_group_count": position_group_count,
             "target_position_groups": runtime.target_position_groups,
             "budget_source": runtime.source,
-            "strategy_profile_id": runtime.strategy_profile_id,
             "max_position_group_bound": runtime.max_position_group_bound,
             "market_limit_diagnostics": market_limit_diagnostics,
             "reason": reason,

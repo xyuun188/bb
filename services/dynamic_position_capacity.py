@@ -41,9 +41,8 @@ class DynamicPositionCapacityPolicy:
         strategy_context: dict[str, Any] | None = None,
         market_regime: dict[str, Any] | None = None,
         account_equity: float | None = None,
-        active_strategy_profile_id: str | None = None,
     ) -> DynamicCapacityDecision:
-        del strategy_context, market_regime, active_strategy_profile_id
+        del strategy_context, market_regime
         open_groups = self._open_group_count(open_positions)
         generated_at = datetime.now(UTC).isoformat()
         provenance = {

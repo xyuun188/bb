@@ -3372,7 +3372,7 @@ async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> No
             "created_at": datetime.now(UTC),
             "context": {
                 "strategy": "cached_strategy",
-                "strategy_profile_id": "cached_profile",
+                "current_production_strategy": {"id": "cached_production_strategy"},
                 "account_equity": 200.0,
             },
         }
@@ -3391,7 +3391,7 @@ async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> No
         lambda: SimpleNamespace(
             build=lambda **_kwargs: {
                 "strategy": "baseline",
-                "strategy_profile_id": "baseline_current",
+                "current_production_strategy": {"id": "baseline_production_strategy"},
             }
         )
     )
@@ -3411,7 +3411,10 @@ async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> No
         async def apply_to_strategy_context(self, **kwargs):
             refresh_started.set()
             await release_refresh.wait()
-            return {**kwargs["strategy_context"], "strategy_profile_id": "fresh_profile"}
+            return {
+                **kwargs["strategy_context"],
+                "current_production_strategy": {"id": "fresh_production_strategy"},
+            }
 
     service.strategy_learning_service = SlowLearning()
     service._refresh_dynamic_capacity = (  # type: ignore[method-assign]
@@ -3427,7 +3430,7 @@ async def test_market_strategy_mode_uses_cached_learning_without_waiting() -> No
     finally:
         trading_service._analysis_scope_context.reset(token)
 
-    assert result["strategy_profile_id"] == "cached_profile"
+    assert result["current_production_strategy"]["id"] == "cached_production_strategy"
     assert result["strategy_learning_cache_status"] == "stale_background_refresh"
     task = service._strategy_learning_context_refresh_tasks.get("paper")
     assert task is not None and not task.done()
@@ -3442,13 +3445,14 @@ def test_decision_snapshot_keeps_governed_strategy_attribution_without_permissio
     service = TradingService.__new__(TradingService)
     decision = _decision(Action.LONG)
     strategy_context = {
-        "strategy_profile_id": "fee_after_return_side_abc",
-        "strategy_profile_version": 42,
         "scheduler_reason": "highest governed fee-after return LCB",
         "market_regime": {"mode": "trend"},
+        "current_production_strategy": {
+            "id": "dynamic_fee_after_return_execution",
+            "version": "2026-07-15.dynamic-profit-execution.v1",
+        },
         "strategy_learning": {
             "scheduler_mode": "governed_dynamic_return",
-            "active_profile": {"id": "fee_after_return_side_abc", "version": 42},
             "runtime": {"production_influence_enabled": True},
         },
     }
@@ -3456,8 +3460,11 @@ def test_decision_snapshot_keeps_governed_strategy_attribution_without_permissio
     service._attach_strategy_learning_context(decision, strategy_context)
 
     snapshot = decision.raw_response["strategy_learning_context"]
-    assert snapshot["strategy_profile_id"] == "fee_after_return_side_abc"
-    assert snapshot["strategy_profile_version"] == 42
+    assert snapshot["current_production_strategy"]["id"] == (
+        "dynamic_fee_after_return_execution"
+    )
+    assert "strategy_profile_id" not in snapshot
+    assert "strategy_profile_version" not in snapshot
     assert snapshot["scheduler_reason"] == "highest governed fee-after return LCB"
     assert snapshot["production_influence_enabled"] is True
     assert snapshot["production_permission"] is False

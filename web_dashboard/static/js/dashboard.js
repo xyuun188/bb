@@ -9947,7 +9947,7 @@ async function fetchStrategyLearning() {
 function renderStrategyLearningFallback(data) {
     const summary = document.getElementById('strategy-learning-summary');
     if (!summary) return;
-    const profile = data?.schedule?.active_profile || data?.active_profile || {};
-    summary.innerHTML = `<div class="opening-funnel-empty">\u7b56\u7565\u63a7\u5236\u53f0\u6570\u636e\u5df2\u52a0\u8f7d\uff1a${escHtml(profile.label || profile.id || '\u5f53\u524d\u57fa\u7ebf')}</div>`;
+    const production = data?.current_production_strategy || data?.schedule?.current_production_strategy || {};
+    summary.innerHTML = `<div class="opening-funnel-empty">\u5f53\u524d\u751f\u4ea7\u7b56\u7565\uff1a${escHtml(production.name || production.id || '\u5408\u540c\u7f3a\u5931')}</div>`;
 }
 

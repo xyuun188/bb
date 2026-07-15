@@ -32,6 +32,10 @@ def test_strategy_learning_ui_shows_dynamic_return_governance() -> None:
     assert "分区排名首位 · 未生效" in VIEW
     assert "最近实际匹配记录" in VIEW
     assert "runtime_prior_usage" in VIEW
+    assert "current_production_strategy" in VIEW
+    assert "策略 ID" in VIEW
+    assert "权威 outcome" in VIEW
+    assert "active_profile" not in VIEW
     assert "币种方向候选" not in VIEW
 
 

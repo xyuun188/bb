@@ -136,13 +136,13 @@ function strategyLearningProductionOverview(data) {
     const runtime = schedule.runtime || {};
     const usage = data?.feedback?.runtime_prior_usage || {};
     const candidates = Array.isArray(schedule.candidates) ? schedule.candidates : [];
-    const active = schedule.active_profile || data?.active_profile || null;
+    const production = data?.current_production_strategy || schedule.current_production_strategy || {};
     const leading = schedule.leading_candidate || candidates[0] || null;
     const governedCount = Number(schedule.governed_candidate_count || 0);
     const influenceEnabled = runtime.production_influence_enabled === true && governedCount > 0;
     const rejectedCount = Number(schedule.rejected_candidate_count || 0);
     const governedProfiles = candidates.filter(profile => profile?.promotion?.production_influence_eligible === true);
-    const eligible = active || governedProfiles[0] || null;
+    const eligible = governedProfiles[0] || null;
     const eligibleIdentity = eligible
         ? `${strategyLearningProfileTitle(eligible)} · ${eligible.id || '-'} · v${Number(eligible.version || 0)}`
         : '';
@@ -150,7 +150,9 @@ function strategyLearningProductionOverview(data) {
         ? `${strategyLearningProfileTitle(leading)} · ${leading.id || '-'} · v${Number(leading.version || 0)}`
         : '当前窗口没有可排名的历史收益分区';
     const matchedDecisionCount = Number(usage.matched_decision_count || 0);
-    const owners = Array.isArray(runtime.execution_owners) ? runtime.execution_owners : [];
+    const owners = Array.isArray(production.execution_owners)
+        ? production.execution_owners
+        : Array.isArray(runtime.execution_owners) ? runtime.execution_owners : [];
     const ownerItems = owners.length ? owners : [
         'return_execution_policy',
         'dynamic_entry_risk_budget',
@@ -173,11 +175,18 @@ function strategyLearningProductionOverview(data) {
                 <div class="strategy-learning-runtime-head">
                     <div>
                         <span>所有币种当前共同执行规则</span>
-                        <strong>动态费后收益执行链</strong>
+                        <strong>${strategyLearningEsc(production.name || '动态费后收益执行链')}</strong>
                     </div>
-                    <span class="strategy-learning-table-pill good">正在运行</span>
+                    <span class="strategy-learning-table-pill ${production.enabled === false ? 'bad' : 'good'}">${production.enabled === false ? '已停用' : '正在运行'}</span>
                 </div>
                 <p class="strategy-learning-runtime-copy">每个币种在每轮决策中独立比较做多与做空的实时费后收益，不存在预先固定的逐币执行策略。</p>
+                <div class="strategy-learning-command-meta">
+                    <span class="strategy-learning-meta"><b>策略 ID</b>${strategyLearningEsc(production.id || '缺失')}</span>
+                    <span class="strategy-learning-meta"><b>版本</b>${strategyLearningEsc(production.version || '缺失')}</span>
+                    <span class="strategy-learning-meta"><b>目标</b>${strategyLearningEsc(production.objective || '缺失')}</span>
+                    <span class="strategy-learning-meta"><b>所有者</b>${strategyLearningEsc(production.owner || '缺失')}</span>
+                    <span class="strategy-learning-meta"><b>权威 outcome</b>${strategyLearningEsc(production.data_sources?.authoritative_trade_outcome?.status || '缺失')}</span>
+                </div>
                 <div class="strategy-learning-execution-chain">
                     ${ownerItems.map((owner, index) => `
                         <span class="strategy-learning-owner-step">

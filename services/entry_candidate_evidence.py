@@ -59,7 +59,11 @@ def _scheduled_return_prior(
         return {
             "available": False,
             "role": "historical_prior_only",
+            "match_status": "not_matched",
+            "reason": "no_governed_historical_prior_matches_context",
+            "context_fields_influenced": [],
             "can_authorize_entry": False,
+            "can_change_size_or_leverage": False,
         }
     applicable.sort(
         key=lambda item: (
@@ -72,6 +76,7 @@ def _scheduled_return_prior(
     selected = applicable[0]
     return {
         "available": True,
+        "match_status": "matched_historical_prior",
         "profile_id": selected.get("id"),
         "profile_version": selected.get("version"),
         "rank": selected.get("rank"),
@@ -82,8 +87,10 @@ def _scheduled_return_prior(
         "walk_forward": _safe_dict(selected.get("walk_forward")),
         "shadow_validation": _safe_dict(selected.get("shadow_validation")),
         "role": "historical_prior_only",
+        "context_fields_influenced": ["scheduled_return_prior"],
         "current_return_contract_required": True,
         "can_authorize_entry": False,
+        "can_change_size_or_leverage": False,
     }
 
 

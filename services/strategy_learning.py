@@ -28,7 +28,9 @@ from services.text_integrity import sanitize_runtime_text
 logger = structlog.get_logger(__name__)
 
 DEFAULT_LOOKBACK_HOURS = 168
-STRATEGY_SCHEDULER_VERSION = "2026-07-13.dynamic-return-scheduler.v1"
+STRATEGY_SCHEDULER_VERSION = "2026-07-15.historical-return-prior-scheduler.v2"
+PRODUCTION_STRATEGY_ID = "dynamic_fee_after_return_execution"
+PRODUCTION_STRATEGY_VERSION = "2026-07-15.dynamic-profit-execution.v1"
 EXECUTION_OWNERS = (
     "return_execution_policy",
     "dynamic_entry_risk_budget",
@@ -102,6 +104,7 @@ def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
     matched_profile_ids: set[str] = set()
     evaluated_side_count = 0
     matched_evaluation_count = 0
+    decision_records: list[dict[str, Any]] = []
 
     for decision in decisions:
         evidence = _safe_dict(getattr(decision, "entry_candidate_evidence", None))
@@ -110,11 +113,43 @@ def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
             evidence = _safe_dict(raw.get("entry_candidate_evidence"))
         decision_id = _safe_int(getattr(decision, "id", None))
         symbol = str(getattr(decision, "symbol", "") or "").upper()
+        side_records: list[dict[str, Any]] = []
         for side in ("long", "short"):
             side_evidence = _safe_dict(evidence.get(side))
             if side_evidence:
                 evaluated_side_count += 1
             prior = _safe_dict(side_evidence.get("scheduled_return_prior"))
+            matched = prior.get("available") is True
+            side_records.append(
+                {
+                    "side": side,
+                    "evaluation_status": (
+                        "matched_historical_prior"
+                        if matched
+                        else "not_matched"
+                        if side_evidence
+                        else "not_evaluated"
+                    ),
+                    "profile_id": prior.get("profile_id") if matched else None,
+                    "profile_version": prior.get("profile_version") if matched else None,
+                    "selector": _safe_dict(prior.get("selector")) if matched else None,
+                    "context_fields_influenced": ["scheduled_return_prior"] if matched else [],
+                    "can_authorize_entry": False,
+                    "can_change_size_or_leverage": False,
+                    "missing_reason": (
+                        None
+                        if matched
+                        else str(
+                            prior.get("reason")
+                            or (
+                                "entry_side_evidence_missing"
+                                if not side_evidence
+                                else "no_governed_historical_prior_matches_context"
+                            )
+                        )
+                    ),
+                }
+            )
             if prior.get("available") is not True:
                 continue
 
@@ -141,6 +176,25 @@ def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
                 "can_authorize_entry": False,
             }
 
+        decision_records.append(
+            {
+                "decision_id": decision_id or None,
+                "created_at": _timestamp_text(getattr(decision, "created_at", None)),
+                "symbol": symbol,
+                "final_action": str(getattr(decision, "action", "") or ""),
+                "was_executed": bool(getattr(decision, "was_executed", False)),
+                "final_reason": str(
+                    getattr(decision, "execution_reason", "")
+                    or (
+                        "executed_after_all_production_contracts_passed"
+                        if bool(getattr(decision, "was_executed", False))
+                        else "not_executed_by_current_production_contracts"
+                    )
+                ),
+                "side_evaluations": side_records,
+            }
+        )
+
     latest_matches = list(latest_by_symbol_side.values())
     return {
         "role": "historical_prior_only",
@@ -151,7 +205,56 @@ def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
         "matched_profile_count": len(matched_profile_ids),
         "latest_match_at": latest_matches[0]["matched_at"] if latest_matches else None,
         "latest_matches": latest_matches,
+        "decision_records": decision_records,
         "can_authorize_entry": False,
+    }
+
+
+def _current_production_strategy(
+    feedback: StrategyFeedback,
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    authoritative_count = len(feedback.authoritative_return_samples)
+    return {
+        "id": PRODUCTION_STRATEGY_ID,
+        "version": PRODUCTION_STRATEGY_VERSION,
+        "name": "Dynamic fee-after return execution",
+        "objective": "maximize_authoritative_fee_after_return_rate",
+        "owner": "trading_service_production_entry_pipeline",
+        "enabled": True,
+        "status": "running",
+        "scope": "all_symbols_evaluated_independently_per_side_and_decision",
+        "entry_permission_owner": "current_return_distribution_plus_dynamic_risk_contracts",
+        "historical_prior_role": "context_only",
+        "historical_prior_can_authorize_entry": False,
+        "historical_prior_can_change_size_or_leverage": False,
+        "execution_owners": list(EXECUTION_OWNERS),
+        "data_sources": {
+            "authoritative_trade_outcome": {
+                "status": "available" if authoritative_count else "missing",
+                "count": authoritative_count,
+                "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+            },
+            "current_return_distribution": {
+                "status": "evaluated_per_decision",
+                "owner": "return_execution_policy",
+            },
+            "live_execution_cost": {
+                "status": "evaluated_per_decision",
+                "owner": "return_execution_policy",
+            },
+            "dynamic_risk_budget": {
+                "status": "evaluated_per_decision",
+                "owner": "dynamic_entry_risk_budget",
+            },
+            "position_capacity": {
+                "status": "evaluated_per_decision",
+                "owner": "dynamic_position_capacity",
+            },
+        },
+        "historical_prior_matching_enabled": bool(
+            runtime.get("production_influence_enabled")
+        ),
     }
 
 
@@ -377,7 +480,7 @@ class StrategyCandidateGenerator:
         profiles: list[StrategyProfile] = []
         for profile_id, (selector, samples) in sorted(partitions.items()):
             metrics = _return_metrics(samples)
-            version = max(_safe_int(sample.get("source_id")) for sample in samples)
+            version = max(_safe_int(sample.get("source_row_id")) for sample in samples)
             provenance = {
                 "source": "trusted_cost_complete_closed_positions",
                 "observation_window": f"trailing_{feedback.window_hours}_hours",
@@ -386,7 +489,7 @@ class StrategyCandidateGenerator:
                 "strategy_version": STRATEGY_SCHEDULER_VERSION,
                 "fallback_reason": "",
                 "position_ids": sorted(
-                    _safe_int(sample.get("source_id")) for sample in samples
+                    _safe_int(sample.get("position_id")) for sample in samples
                 ),
             }
             profiles.append(
@@ -599,23 +702,7 @@ class StrategyLearningEngine:
         ]
         context = _safe_dict(current_context)
         current_regime = _regime_label(context.get("market_regime"))
-        applicable = [
-            candidate
-            for candidate in governed
-            if _safe_dict(_safe_dict(candidate.get("params")).get("selector")).get("scope")
-            != "symbol_side"
-            and (
-                not _safe_dict(_safe_dict(candidate.get("params")).get("selector")).get(
-                    "market_regime"
-                )
-                or _safe_dict(_safe_dict(candidate.get("params")).get("selector")).get(
-                    "market_regime"
-                )
-                == current_regime
-            )
-        ]
         leading = (candidates or [None])[0]
-        active = (applicable or [None])[0]
         influence_enabled = bool(governed)
         scheduler_mode = (
             "governed_dynamic_return"
@@ -674,8 +761,8 @@ class StrategyLearningEngine:
                 "fallback_reason": "" if influence_enabled else scheduler_mode,
             },
         }
+        production_strategy = _current_production_strategy(feedback, runtime)
         schedule = {
-            "active_profile": active,
             "leading_candidate": leading,
             "reason": reason,
             "runtime": runtime,
@@ -690,11 +777,12 @@ class StrategyLearningEngine:
                 "rows": shadow_rows,
             },
             "scheduler_mode": scheduler_mode,
+            "current_production_strategy": production_strategy,
         }
         return {
             "feedback": feedback.to_dict(include_samples=detail == "full"),
             "schedule": schedule,
-            "active_profile": active,
+            "current_production_strategy": production_strategy,
         }
 
     def apply_to_context(
@@ -705,22 +793,24 @@ class StrategyLearningEngine:
         result = dict(strategy_context or {})
         schedule = _safe_dict(payload.get("schedule"))
         runtime = _safe_dict(schedule.get("runtime"))
-        active = _safe_dict(schedule.get("active_profile"))
         leading = _safe_dict(schedule.get("leading_candidate"))
-        result["strategy_profile_id"] = active.get("id")
-        result["strategy_profile_version"] = active.get("version")
         result["scheduler_reason"] = schedule.get("reason")
+        result["current_production_strategy"] = _safe_dict(
+            schedule.get("current_production_strategy")
+        )
         result["strategy_learning"] = {
             "scheduler_mode": schedule.get("scheduler_mode"),
             "candidate_count": schedule.get("candidate_count"),
             "governed_candidate_count": schedule.get("governed_candidate_count"),
             "rejected_candidate_count": schedule.get("rejected_candidate_count"),
-            "active_profile": active,
             "leading_candidate": leading,
             "runtime": runtime,
             "advisory_prior_only": True,
             "production_permission": False,
             "policy_provenance": runtime.get("policy_provenance"),
+            "current_production_strategy": _safe_dict(
+                schedule.get("current_production_strategy")
+            ),
         }
         return result
 
@@ -843,6 +933,8 @@ class StrategyLearningService:
                             AIDecision.symbol,
                             AIDecision.action,
                             AIDecision.created_at,
+                            AIDecision.was_executed,
+                            AIDecision.execution_reason,
                             AIDecision.raw_llm_response[
                                 "entry_candidate_evidence"
                             ].label("entry_candidate_evidence"),
@@ -895,6 +987,7 @@ class StrategyLearningService:
                 {
                     "source": "authoritative_trade_outcome",
                     "source_id": outcome.get("outcome_id"),
+                    "source_row_id": outcome.get("id"),
                     "outcome_id": outcome.get("outcome_id"),
                     "outcome_version": outcome.get("outcome_version"),
                     "outcome_fingerprint": outcome.get("outcome_fingerprint"),
@@ -1064,8 +1157,8 @@ class StrategyLearningService:
     ) -> int | None:
         context = _safe_dict(strategy_context)
         learning = _safe_dict(context.get("strategy_learning"))
-        active = _safe_dict(learning.get("active_profile"))
         runtime = _safe_dict(learning.get("runtime"))
+        response = _safe_dict(raw_response or getattr(decision, "raw_response", None))
         decision_action = action or str(
             getattr(getattr(decision, "action", None), "value", "")
         )
@@ -1076,6 +1169,12 @@ class StrategyLearningService:
             if "short" in decision_action
             else None
         )
+        side_evidence = _safe_dict(
+            _safe_dict(response.get("entry_candidate_evidence")).get(side)
+        )
+        matched_prior = _safe_dict(side_evidence.get("scheduled_return_prior"))
+        if matched_prior.get("available") is not True:
+            matched_prior = {}
         resolved_market_state = _safe_dict(
             market_state
             or context.get("market_regime")
@@ -1095,20 +1194,18 @@ class StrategyLearningService:
             decision_id=decision_id,
             order_id=order_id,
             position_id=position_id,
-            profile_id=str(
-                context.get("strategy_profile_id") or active.get("id") or ""
-            )
-            or None,
-            profile_version=(
-                _safe_int(context.get("strategy_profile_version") or active.get("version"))
-                or None
-            ),
+            profile_id=str(matched_prior.get("profile_id") or "") or None,
+            profile_version=_safe_int(matched_prior.get("profile_version")) or None,
             scheduler_reason=str(sanitize_runtime_text(scheduler_reason or "") or "")[:2000],
             strategy_snapshot=sanitize_runtime_text(
                 _json_safe(
                     {
                         "scheduler_mode": learning.get("scheduler_mode"),
-                        "active_profile": active,
+                        "current_production_strategy": _safe_dict(
+                            context.get("current_production_strategy")
+                            or learning.get("current_production_strategy")
+                        ),
+                        "matched_historical_prior": matched_prior,
                         "runtime": runtime,
                         "production_permission": False,
                     }

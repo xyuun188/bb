@@ -3880,7 +3880,6 @@ class TradingService:
                 strategy_context=strategy_context,
                 market_regime=market_regime,
                 account_equity=account_equity,
-                active_strategy_profile_id=strategy_context.get("strategy_profile_id") or None,
             )
             .as_dict()
         )
@@ -4154,8 +4153,10 @@ class TradingService:
             "advisory_prior_only": True,
             "production_permission": False,
             "optimization_target": "maximize_authoritative_fee_after_return_rate",
-            "strategy_profile_id": strategy_mode_context.get("strategy_profile_id"),
-            "strategy_profile_version": strategy_mode_context.get("strategy_profile_version"),
+            "current_production_strategy": self._safe_dict(
+                strategy_mode_context.get("current_production_strategy")
+                or learning.get("current_production_strategy")
+            ),
             "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
             "market_regime": strategy_mode_context.get("market_regime"),
             "production_influence_enabled": runtime.get("production_influence_enabled")

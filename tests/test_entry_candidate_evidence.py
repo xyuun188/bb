@@ -86,12 +86,14 @@ def test_governed_schedule_is_exposed_as_prior_without_changing_current_score() 
                 "governed_profiles": [
                     {
                         "id": "portfolio_long",
+                        "version": 11,
                         "rank": 1,
                         "selector": {"scope": "side", "side": "long"},
                         "historical_return_distribution": {"return_lcb_pct": 0.3},
                     },
                     {
                         "id": "btc_long",
+                        "version": 12,
                         "rank": 2,
                         "selector": {
                             "scope": "symbol_side",
@@ -113,8 +115,87 @@ def test_governed_schedule_is_exposed_as_prior_without_changing_current_score() 
     assert prior["available"] is True
     assert prior["profile_id"] == "btc_long"
     assert prior["role"] == "historical_prior_only"
+    assert prior["match_status"] == "matched_historical_prior"
+    assert prior["context_fields_influenced"] == ["scheduled_return_prior"]
     assert prior["can_authorize_entry"] is False
+    assert prior["can_change_size_or_leverage"] is False
     assert evidence["long"]["score"] == pytest.approx(0.45)
+
+
+def test_icp_does_not_match_another_symbols_historical_prior() -> None:
+    strategy = {
+        "strategy_learning": {
+            "runtime": {
+                "governed_profiles": [
+                    {
+                        "id": "arb_short_prior",
+                        "version": 9,
+                        "selector": {
+                            "scope": "symbol_side",
+                            "symbol": "ARB/USDT",
+                            "side": "short",
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+    evidence = _policy().build(_Feature(symbol="ICP/USDT"), strategy, {}, {}, {}, {})
+    prior = evidence["short"]["scheduled_return_prior"]
+
+    assert prior["available"] is False
+    assert prior["match_status"] == "not_matched"
+    assert prior["context_fields_influenced"] == []
+    assert prior["reason"] == "no_governed_historical_prior_matches_context"
+
+
+def test_arb_profitable_prior_is_recorded_but_cannot_authorize_or_resize() -> None:
+    strategy = {
+        "strategy_learning": {
+            "runtime": {
+                "governed_profiles": [
+                    {
+                        "id": "arb_long_prior",
+                        "version": 10,
+                        "rank": 1,
+                        "selector": {
+                            "scope": "symbol_side",
+                            "symbol": "ARB/USDT",
+                            "side": "long",
+                        },
+                        "historical_return_distribution": {"return_lcb_pct": 2.1},
+                    }
+                ]
+            }
+        }
+    }
+
+    evidence = _policy().build(_Feature(symbol="ARB/USDT"), strategy, {}, {}, {}, {})
+    prior = evidence["long"]["scheduled_return_prior"]
+
+    assert prior["available"] is True
+    assert prior["profile_id"] == "arb_long_prior"
+    assert prior["profile_version"] == 10
+    assert prior["can_authorize_entry"] is False
+    assert prior["can_change_size_or_leverage"] is False
+    assert evidence["long"]["score"] == pytest.approx(0.45)
+
+
+def test_governance_blocked_icp_prior_is_absent_from_runtime_matching() -> None:
+    strategy = {
+        "strategy_learning": {
+            "runtime": {
+                "governed_profiles": [],
+                "blocked_profile_ids": ["icp_short_prior"],
+            }
+        }
+    }
+
+    evidence = _policy().build(_Feature(symbol="ICP/USDT"), strategy, {}, {}, {}, {})
+
+    assert evidence["short"]["scheduled_return_prior"]["available"] is False
+    assert evidence["short"]["scheduled_return_prior"]["can_authorize_entry"] is False
 
 
 def test_candidate_evidence_has_no_legacy_probe_contract() -> None:

@@ -25,6 +25,8 @@ def _sample(
 ) -> dict:
     return {
         "source_id": source_id,
+        "source_row_id": source_id,
+        "position_id": source_id,
         "symbol": symbol,
         "side": side,
         "market_regime": regime,
@@ -156,6 +158,13 @@ def test_runtime_prior_usage_reports_actual_matches_not_ranked_candidates() -> N
             "can_authorize_entry": False,
         }
     ]
+    assert usage["decision_records"][0]["decision_id"] == 12
+    assert usage["decision_records"][0]["side_evaluations"][0][
+        "evaluation_status"
+    ] == "matched_historical_prior"
+    assert usage["decision_records"][0]["side_evaluations"][0][
+        "context_fields_influenced"
+    ] == ["scheduled_return_prior"]
 
 
 def test_scheduler_uses_walk_forward_and_cost_complete_shadow_governance() -> None:
@@ -168,8 +177,11 @@ def test_scheduler_uses_walk_forward_and_cost_complete_shadow_governance() -> No
     assert schedule["runtime"]["production_influence_enabled"] is True
     assert schedule["runtime"]["can_authorize_entry"] is False
     assert schedule["runtime"]["can_change_size_or_leverage"] is False
-    assert schedule["active_profile"]["promotion"]["production_permission"] is False
-    assert schedule["active_profile"]["params"]["selector"]["scope"] != "symbol_side"
+    production = schedule["current_production_strategy"]
+    assert production["id"] == "dynamic_fee_after_return_execution"
+    assert production["enabled"] is True
+    assert production["historical_prior_can_authorize_entry"] is False
+    assert "active_profile" not in schedule
     assert all(row["partition_policy"] == "sqrt_cardinality_expanding_walk_forward" for row in schedule["backtest"]["rows"])
     assert schedule["shadow_validation"]["cost_complete_required"] is True
     assert all(row["rows"] == [] for row in schedule["shadow_validation"]["rows"])
@@ -245,7 +257,8 @@ def test_missing_shadow_evidence_fails_closed_without_numeric_fallback() -> None
     assert payload["schedule"]["scheduler_mode"] == "shadow_validation"
     assert payload["schedule"]["governed_candidate_count"] == 0
     assert payload["schedule"]["runtime"]["production_influence_enabled"] is False
-    assert payload["schedule"]["active_profile"] is None
+    assert "active_profile" not in payload["schedule"]
+    assert payload["schedule"]["current_production_strategy"]["status"] == "running"
     assert payload["schedule"]["leading_candidate"] == payload["schedule"]["candidates"][0]
     assert all(
         "no_cost_complete_shadow_samples" in row["promotion"]["rejection_reasons"]
@@ -265,9 +278,12 @@ def test_blocked_leading_candidate_is_not_attached_as_active_strategy() -> None:
 
     result = engine.apply_to_context({}, payload)
 
-    assert result["strategy_profile_id"] is None
-    assert result["strategy_profile_version"] is None
-    assert result["strategy_learning"]["active_profile"] == {}
+    assert "strategy_profile_id" not in result
+    assert "strategy_profile_version" not in result
+    assert "active_profile" not in result["strategy_learning"]
+    assert result["current_production_strategy"]["id"] == (
+        "dynamic_fee_after_return_execution"
+    )
     assert (
         result["strategy_learning"]["leading_candidate"]["id"]
         == payload["schedule"]["leading_candidate"]["id"]
@@ -315,7 +331,9 @@ def test_strategy_learning_context_cannot_mutate_execution_fields() -> None:
     learning = result["strategy_learning"]
     assert learning["advisory_prior_only"] is True
     assert learning["production_permission"] is False
-    assert result["strategy_profile_id"] == payload["schedule"]["active_profile"]["id"]
+    assert result["current_production_strategy"] == payload[
+        "current_production_strategy"
+    ]
     assert result["scheduler_reason"] == payload["schedule"]["reason"]
 
 
