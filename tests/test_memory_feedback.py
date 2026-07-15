@@ -1,5 +1,9 @@
 import pytest
 
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
 from services.memory_feedback import MemoryFeedbackPolicy
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 
@@ -17,8 +21,11 @@ def _trade_memory(
         "memory_type": "profit_pattern" if pnl_usdt > 0 else "loss_lesson",
         "evidence_count": 1,
         "extra": {
-            "source": "authoritative_settlement_backfill",
+            "source": "authoritative_trade_outcome",
             "source_position_id": position_id,
+            "outcome_id": f"ato:{position_id}",
+            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+            "authority_level": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
             "net_return_after_cost_pct": net_return_pct,
             "realized_pnl": pnl_usdt,
             "objective": RETURN_OBJECTIVE_NAME,

@@ -210,3 +210,44 @@ async def test_existing_reflection_still_refreshes_return_memories(monkeypatch) 
     assert len(upserted_memories) == 1
     assert all(row["extra"]["reflection_id"] == 654 for row in upserted_memories)
     assert all(row["extra"]["net_return_after_cost_pct"] == -10.0 for row in upserted_memories)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disabled(
+    monkeypatch,
+) -> None:
+    processed: list[str] = []
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def load_outcomes(**_kwargs):
+        return [
+            {
+                "lifecycle_key": "paper|ICP|1",
+                "settlement_fact_trusted": True,
+                "outcome_complete": True,
+            }
+        ]
+
+    service = ExpertMemoryService(
+        memory_enabled_provider=lambda: False,
+        session_factory=SessionContext,
+        authoritative_outcome_loader=load_outcomes,
+    )
+
+    async def record(_session, outcome):
+        processed.append(outcome["lifecycle_key"])
+        return True
+
+    monkeypatch.setattr(service, "_record_authoritative_outcome_in_session", record)
+
+    report = await service.backfill_trade_reflections("paper")
+
+    assert report["status"] == "completed"
+    assert report["processed"] == 1
+    assert processed == ["paper|ICP|1"]

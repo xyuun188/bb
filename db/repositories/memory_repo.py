@@ -35,13 +35,7 @@ class MemoryRepository(BaseRepository):
                 ExpertMemory.is_active.is_(True),
                 or_(ExpertMemory.symbol.is_(None), ExpertMemory.symbol == symbol),
             )
-            .order_by(
-                ExpertMemory.symbol.desc(),
-                ExpertMemory.confidence_score.desc(),
-                ExpertMemory.evidence_count.desc(),
-                ExpertMemory.updated_at.desc().nullslast(),
-                ExpertMemory.created_at.desc(),
-            )
+            .order_by(ExpertMemory.updated_at.desc().nullslast(), ExpertMemory.id.desc())
         )
         result = await self.session.execute(stmt)
         rows = list(result.scalars().all())
@@ -54,7 +48,7 @@ class MemoryRepository(BaseRepository):
             and (not row.side or not side_norm or str(row.side or "").lower() == side_norm)
             and _memory_row_usable(row)
         ]
-        return filtered
+        return sorted(filtered, key=_memory_authority_sort_key, reverse=True)
 
     async def mark_memories_used(self, memory_ids: list[int]) -> None:
         if not memory_ids:
@@ -145,6 +139,21 @@ class MemoryRepository(BaseRepository):
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def update_reflection(
+        self,
+        reflection: TradeReflection,
+        data: dict[str, Any],
+    ) -> TradeReflection:
+        normalized = _normalize_reflection_payload(dict(data or {}))
+        for key, value in normalized.items():
+            if key in {"id", "position_id", "created_at"}:
+                continue
+            if hasattr(reflection, key):
+                setattr(reflection, key, value)
+        reflection.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return reflection
 
     async def create_shadow_backtest(self, data: dict[str, Any]) -> ShadowBacktest:
         data = _normalize_shadow_backtest_payload(dict(data or {}))
@@ -397,6 +406,14 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
     previous = _memory_outcome_aggregation(existing)
     if previous.get("return_unit") != "percentage_points":
         previous = {}
+    if (
+        incoming.get("source") != "authoritative_trade_outcome"
+        or incoming.get("authority_level") != "okx_settlement_and_execution"
+        or incoming.get("outcome_version") != "2026-07-15.authoritative-trade-outcome.v1"
+        or incoming.get("production_evidence_eligible") is not True
+    ):
+        return {**existing, **incoming}
+
     realized_pnl = _finite_float(incoming.get("realized_pnl"), None)
     net_return = _finite_float(incoming.get("net_return_after_cost_pct"), None)
     if realized_pnl is None or net_return is None:
@@ -408,7 +425,15 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         for value in previous.get("source_position_ids", [])
         if int(_finite_float(value, 0.0) or 0) > 0
     ]
-    if source_position_id > 0 and source_position_id in source_position_ids:
+    outcome_id = str(incoming.get("outcome_id") or "").strip()
+    source_outcome_ids = [
+        str(value)
+        for value in previous.get("source_outcome_ids", [])
+        if str(value or "").strip()
+    ]
+    if outcome_id and outcome_id in source_outcome_ids:
+        return {**existing, **incoming, "outcome_aggregation": previous}
+    if not outcome_id and source_position_id > 0 and source_position_id in source_position_ids:
         return {**existing, **incoming, "outcome_aggregation": previous}
 
     previous_count = int(previous.get("count") or 0)
@@ -448,11 +473,7 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
     gross_loss = float(previous.get("gross_loss_usdt") or 0.0) + max(
         -float(realized_pnl or 0.0), 0.0
     )
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 1e-12
-        else (3.0 if gross_profit > 0 else 0.0)
-    )
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
     aggregation = {
         "objective": "maximize_expected_realized_net_return_after_cost",
         "objective_version": "2026-07-12.v1",
@@ -470,11 +491,16 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         "worst_net_return_pct": round(worst_return, 8),
         "gross_profit_usdt": round(gross_profit, 8),
         "gross_loss_usdt": round(gross_loss, 8),
-        "profit_factor": round(profit_factor, 8),
+        "profit_factor": round(profit_factor, 8) if profit_factor is not None else None,
+        "profit_factor_defined": profit_factor is not None,
         "latest_source_position_id": incoming.get("source_position_id"),
         "source_position_ids": [
             *source_position_ids,
             *([source_position_id] if source_position_id > 0 else []),
+        ][-2000:],
+        "source_outcome_ids": [
+            *source_outcome_ids,
+            *([outcome_id] if outcome_id else []),
         ][-2000:],
     }
     return {**existing, **incoming, "outcome_aggregation": aggregation}
@@ -486,6 +512,22 @@ def _finite_float(value: Any, default: float | None = 0.0) -> float | None:
         return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else default
     except (TypeError, ValueError):
         return default
+
+
+def _memory_authority_sort_key(memory: ExpertMemory) -> tuple[float, float, float, float]:
+    extra = memory.extra if isinstance(memory.extra, dict) else {}
+    aggregation = _memory_outcome_aggregation(extra)
+    authority_rank = _finite_float(extra.get("authority_rank"), 0.0) or 0.0
+    updated_at = getattr(memory, "updated_at", None) or getattr(memory, "created_at", None)
+    timestamp = updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
+    return_lcb = _finite_float(aggregation.get("return_lcb_pct"), float("-inf"))
+    worst_return = _finite_float(aggregation.get("worst_net_return_pct"), float("-inf"))
+    return (
+        float(authority_rank),
+        timestamp,
+        float(return_lcb if return_lcb is not None else float("-inf")),
+        float(worst_return if worst_return is not None else float("-inf")),
+    )
 
 
 def _memory_text_usable(value: Any) -> bool:

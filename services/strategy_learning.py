@@ -18,12 +18,12 @@ from db.session import get_read_session_ctx, get_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest, StrategyLearningEvent
 from models.trade import Position
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+    load_authoritative_trade_outcomes,
+)
 from services.shadow_backtest_service import shadow_fee_after_outcome
 from services.text_integrity import sanitize_runtime_text
-from services.trade_fact_trust import (
-    closed_position_trade_fact_trusted,
-    closed_position_trade_fact_untrusted_reason,
-)
 
 logger = structlog.get_logger(__name__)
 
@@ -775,23 +775,12 @@ class StrategyLearningService:
         effective_limit = max(int(limit or 1), 1)
         since = datetime.now(UTC) - timedelta(hours=effective_hours)
         since_naive = since.replace(tzinfo=None)
+        outcomes = await load_authoritative_trade_outcomes(
+            mode=selected_mode,
+            since=since,
+            limit=effective_limit,
+        )
         async with get_read_session_ctx() as session:
-            closed = list(
-                (
-                    await session.execute(
-                        select(Position)
-                        .where(
-                            Position.execution_mode == selected_mode,
-                            Position.is_open.is_(False),
-                            Position.closed_at >= since_naive,
-                        )
-                        .order_by(Position.closed_at.desc())
-                        .limit(effective_limit)
-                    )
-                )
-                .scalars()
-                .all()
-            )
             open_rows = list(
                 (
                     await session.execute(
@@ -804,7 +793,14 @@ class StrategyLearningService:
                 .scalars()
                 .all()
             )
-            position_ids = [int(row.id) for row in closed if getattr(row, "id", None)]
+            position_ids = sorted(
+                {
+                    int(value)
+                    for outcome in outcomes
+                    for value in (outcome.get("position_ids") or [outcome.get("position_id")])
+                    if str(value or "").isdigit() and int(value) > 0
+                }
+            )
             events = (
                 list(
                     (
@@ -873,27 +869,49 @@ class StrategyLearningService:
 
         quarantine_reasons: dict[str, int] = {}
         authoritative_samples: list[dict[str, Any]] = []
-        for row in closed:
-            untrusted = closed_position_trade_fact_untrusted_reason(row)
-            if untrusted or not closed_position_trade_fact_trusted(row):
-                reason = untrusted or "untrusted_trade_fact"
-                quarantine_reasons[reason] = quarantine_reasons.get(reason, 0) + 1
+        for outcome in outcomes:
+            if (
+                outcome.get("event_type") != "AuthoritativeTradeOutcome"
+                or outcome.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION
+                or outcome.get("outcome_complete") is not True
+                or outcome.get("trade_fact_trusted") is not True
+            ):
+                reasons = _safe_list(outcome.get("outcome_evidence_gaps")) or [
+                    "authoritative_outcome_incomplete"
+                ]
+                for reason in reasons:
+                    reason_text = str(reason)
+                    quarantine_reasons[reason_text] = quarantine_reasons.get(reason_text, 0) + 1
                 continue
-            if not self._cost_complete(row):
-                quarantine_reasons["cost_incomplete"] = (
-                    quarantine_reasons.get("cost_incomplete", 0) + 1
+            position_id = _safe_int(outcome.get("position_id"))
+            net_return = _optional_float(outcome.get("authoritative_pnl_ratio_pct"))
+            net_pnl = _optional_float(outcome.get("realized_pnl"))
+            if net_return is None or net_pnl is None:
+                quarantine_reasons["authoritative_return_missing"] = (
+                    quarantine_reasons.get("authoritative_return_missing", 0) + 1
                 )
                 continue
-            sample = self._position_return_sample(
-                row,
-                market_regime=regime_by_position.get(_safe_int(getattr(row, "id", None)), ""),
+            authoritative_samples.append(
+                {
+                    "source": "authoritative_trade_outcome",
+                    "source_id": outcome.get("outcome_id"),
+                    "outcome_id": outcome.get("outcome_id"),
+                    "outcome_version": outcome.get("outcome_version"),
+                    "outcome_fingerprint": outcome.get("outcome_fingerprint"),
+                    "position_id": position_id,
+                    "symbol": str(outcome.get("symbol") or "").upper(),
+                    "side": str(outcome.get("side") or "").lower(),
+                    "market_regime": regime_by_position.get(position_id, ""),
+                    "net_pnl_after_all_costs_usdt": round(net_pnl, 8),
+                    "net_return_after_cost_pct": round(net_return, 8),
+                    "return_basis_source": "okx_positions_history.pnlRatio",
+                    "timestamp": _timestamp_text(outcome.get("label_timestamp")),
+                    "cost_policy_provenance": _safe_dict(
+                        outcome.get("consumer_provenance")
+                    ),
+                    "attribution": _safe_dict(outcome.get("attribution")),
+                }
             )
-            if sample is None:
-                quarantine_reasons["margin_basis_incomplete"] = (
-                    quarantine_reasons.get("margin_basis_incomplete", 0) + 1
-                )
-                continue
-            authoritative_samples.append(sample)
 
         shadow_samples: list[dict[str, Any]] = []
         shadow_excluded: dict[str, int] = {}
@@ -960,7 +978,7 @@ class StrategyLearningService:
         observation = {
             **_legacy_observation_summary(authoritative_samples),
             "cost_complete_sample_count": len(authoritative_samples),
-            "excluded_incomplete_or_untrusted_count": len(closed)
+            "excluded_incomplete_or_untrusted_count": len(outcomes)
             - len(authoritative_samples),
         }
         generated_at = datetime.now(UTC).isoformat()
@@ -997,7 +1015,7 @@ class StrategyLearningService:
             },
             manual_intervention={},
             trade_fact_quarantine={
-                "checked_count": len(closed),
+                "checked_count": len(outcomes),
                 "trusted_cost_complete_count": len(authoritative_samples),
                 "reason_counts": quarantine_reasons,
             },
@@ -1020,59 +1038,6 @@ class StrategyLearningService:
             runtime_prior_usage=_runtime_prior_usage(decisions),
             authoritative_return_samples=authoritative_samples,
             shadow_return_samples=shadow_samples,
-        )
-
-    @classmethod
-    def _position_return_sample(
-        cls,
-        position: Position,
-        *,
-        market_regime: str,
-    ) -> dict[str, Any] | None:
-        net_pnl = cls._fee_after_pnl(position)
-        quantity = abs(_safe_float(getattr(position, "quantity", None)))
-        entry_price = abs(_safe_float(getattr(position, "entry_price", None)))
-        leverage = abs(_safe_float(getattr(position, "leverage", None)))
-        notional = quantity * entry_price
-        margin_basis = notional / leverage if notional > 0 and leverage > 0 else 0.0
-        if margin_basis <= 0:
-            return None
-        return {
-            "source": "trusted_cost_complete_closed_position",
-            "source_id": _safe_int(getattr(position, "id", None)),
-            "symbol": str(getattr(position, "symbol", "") or "").upper(),
-            "side": str(getattr(position, "side", "") or "").lower(),
-            "market_regime": market_regime,
-            "net_pnl_after_all_costs_usdt": round(net_pnl, 8),
-            "margin_basis_usdt": round(margin_basis, 8),
-            "net_return_after_cost_pct": round(net_pnl / margin_basis * 100.0, 8),
-            "timestamp": _timestamp_text(
-                getattr(position, "closed_at", None) or getattr(position, "created_at", None)
-            ),
-            "cost_policy_provenance": {
-                "source": "position_realized_pnl_entry_fee_close_fee_funding_fee",
-                "observation_window": "full_position_lifecycle",
-                "sample_count": 1,
-                "generated_at": datetime.now(UTC).isoformat(),
-                "strategy_version": STRATEGY_SCHEDULER_VERSION,
-                "fallback_reason": "",
-            },
-        }
-
-    @staticmethod
-    def _fee_after_pnl(position: Position) -> float:
-        return (
-            _safe_float(getattr(position, "realized_pnl", None))
-            - max(_safe_float(getattr(position, "entry_fee", None)), 0.0)
-            - max(_safe_float(getattr(position, "close_fee", None)), 0.0)
-            + _safe_float(getattr(position, "funding_fee", None))
-        )
-
-    @staticmethod
-    def _cost_complete(position: Position) -> bool:
-        return all(
-            getattr(position, field_name, None) is not None
-            for field_name in ("entry_fee", "close_fee", "funding_fee")
         )
 
     async def record_event(

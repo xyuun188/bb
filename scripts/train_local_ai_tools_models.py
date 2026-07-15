@@ -22,18 +22,19 @@ from config.settings import settings
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text
 from core.url_safety import normalize_http_base_url
 from db.session import get_read_session_ctx, get_session_ctx
-from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
-from models.trade import OkxPositionHistory, Order, Position
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+    load_authoritative_trade_outcomes,
+)
 from services.execution_cost_model import round_trip_fee_pct
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
     load_latest_paper_observation_report,
 )
-from services.okx_training_facts import build_okx_history_training_sample
 from services.okx_training_gate import okx_training_refresh_gate
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
@@ -570,224 +571,27 @@ async def _load_trade_reflection_samples() -> list[dict[str, Any]]:
     return samples
 
 
-async def _decision_raw_by_position_id(position_ids: set[int]) -> dict[int, dict[str, Any]]:
-    if not position_ids:
-        return {}
-    async with get_session_ctx() as session:
-        position_result = await session.execute(
-            select(Position).where(Position.id.in_(sorted(position_ids)))
-        )
-        positions = list(position_result.scalars().all())
-        symbols = {str(row.symbol or "").strip() for row in positions if str(row.symbol or "").strip()}
-        orders: list[Order] = []
-        if symbols:
-            order_result = await session.execute(
-                select(Order)
-                .where(Order.symbol.in_(sorted(symbols)))
-                .order_by(Order.filled_at.desc(), Order.created_at.desc(), Order.id.desc())
-            )
-            orders = list(order_result.scalars().all())
-        decision_ids = {
-            int(getattr(order, "decision_id", 0) or 0)
-            for order in orders
-            if int(getattr(order, "decision_id", 0) or 0) > 0
-        }
-        decisions_by_id: dict[int, Any] = {}
-        if decision_ids:
-            decision_result = await session.execute(
-                select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
-            )
-            decisions_by_id = {
-                int(decision.id): decision for decision in decision_result.scalars().all()
-            }
-    order_list = list(orders)
-    raw_by_position_id: dict[int, dict[str, Any]] = {}
-    for position in positions:
-        decision = _match_entry_decision_for_training(position, order_list, decisions_by_id)
-        if decision is None or not isinstance(getattr(decision, "raw_llm_response", None), dict):
-            continue
-        raw_by_position_id[int(position.id)] = dict(decision.raw_llm_response)
-    return raw_by_position_id
-
-
-def _match_entry_decision_for_training(
-    position: Position,
-    orders: list[Order],
-    decisions_by_id: dict[int, Any],
-) -> Any | None:
-    position_symbol = str(getattr(position, "symbol", "") or "").strip()
-    position_side = str(getattr(position, "side", "") or "").lower().strip()
-    position_created = _as_utc(getattr(position, "created_at", None))
-    entry_exchange_order_id = str(getattr(position, "entry_exchange_order_id", "") or "").strip()
-    best: Any | None = None
-    best_delta: float | None = None
-    for order in orders:
-        if position_symbol and str(getattr(order, "symbol", "") or "").strip() != position_symbol:
-            continue
-        decision = decisions_by_id.get(int(getattr(order, "decision_id", 0) or 0))
-        if decision is None:
-            continue
-        action = str(getattr(decision, "action", "") or "").lower()
-        if action not in {"long", "short"} or action != position_side:
-            continue
-        order_exchange_id = str(getattr(order, "exchange_order_id", "") or "").strip()
-        if entry_exchange_order_id and order_exchange_id == entry_exchange_order_id:
-            return decision
-        order_time = _as_utc(getattr(order, "filled_at", None) or getattr(order, "created_at", None))
-        if position_created is not None and order_time is not None:
-            delta = abs((position_created - order_time).total_seconds())
-            if delta > 15 * 60:
-                continue
-        else:
-            delta = 0.0
-        if best_delta is None or delta < best_delta:
-            best = decision
-            best_delta = delta
-    return best
-
-
 async def _load_authoritative_trade_samples() -> list[dict[str, Any]]:
-    """Load one training sample per mirrored OKX positions-history lifecycle."""
+    """Compatibility name for the canonical outcome loader."""
 
-    async with get_session_ctx() as session:
-        stmt = (
-            select(OkxPositionHistory)
-            .order_by(
-                OkxPositionHistory.updated_at_okx.desc().nullslast(),
-                OkxPositionHistory.id.desc(),
-            )
-        )
-        records = list((await session.execute(stmt)).scalars().all())
-        position_ids = {
-            int(value)
-            for record in records
-            for value in (record.position_ids or [])
-            if str(value or "").isdigit() and int(value) > 0
-        }
-        order_ids = {
-            str(value or "").strip()
-            for record in records
-            for value in [
-                *(record.entry_order_ids or []),
-                *(record.close_order_ids or []),
-                *(record.linked_order_ids or []),
-            ]
-            if str(value or "").strip()
-        }
-        positions_by_id: dict[int, Position] = {}
-        if position_ids:
-            position_rows = await session.execute(
-                select(Position).where(Position.id.in_(sorted(position_ids)))
-            )
-            positions_by_id = {
-                int(position.id): position for position in position_rows.scalars().all()
-            }
-        orders_by_exchange_id: dict[str, Order] = {}
-        decision_raw_by_order_id: dict[str, dict[str, Any]] = {}
-        if order_ids:
-            order_rows = await session.execute(
-                select(Order).where(Order.exchange_order_id.in_(sorted(order_ids)))
-            )
-            loaded_orders = list(order_rows.scalars().all())
-            orders_by_exchange_id = {
-                str(order.exchange_order_id): order
-                for order in loaded_orders
-                if str(order.exchange_order_id or "").strip()
-            }
-            decision_ids = {
-                int(order.decision_id or 0)
-                for order in loaded_orders
-                if int(order.decision_id or 0) > 0
-            }
-            decisions_by_id: dict[int, AIDecision] = {}
-            if decision_ids:
-                decision_rows = await session.execute(
-                    select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
-                )
-                decisions_by_id = {
-                    int(decision.id): decision for decision in decision_rows.scalars().all()
-                }
-            for order in loaded_orders:
-                exchange_id = str(order.exchange_order_id or "").strip()
-                decision = decisions_by_id.get(int(order.decision_id or 0))
-                raw = getattr(decision, "raw_llm_response", None)
-                if exchange_id and isinstance(raw, dict) and raw:
-                    decision_raw_by_order_id[exchange_id] = dict(raw)
-
-    decision_raw_by_position_id = await _decision_raw_by_position_id(position_ids)
-    samples = [
-        build_okx_history_training_sample(
-            record,
-            positions_by_id=positions_by_id,
-            orders_by_exchange_id=orders_by_exchange_id,
-            decision_raw_by_position_id=decision_raw_by_position_id,
-            decision_raw_by_order_id=decision_raw_by_order_id,
-        )
-        for record in records
-    ]
-    samples.reverse()
-    return samples
-
-
-def _deep_merge_trade_sample_dict(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in extra.items():
-        if key not in merged or merged.get(key) in (None, "", [], {}):
-            merged[key] = value
-            continue
-        existing = merged.get(key)
-        if isinstance(existing, dict) and isinstance(value, dict):
-            merged[key] = _deep_merge_trade_sample_dict(existing, value)
-    return merged
+    return await load_authoritative_trade_outcomes()
 
 
 def _merge_trade_samples(
     reflection_samples: list[dict[str, Any]],
     authoritative_samples: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Attach reflection features to official lifecycle samples without duplicating labels."""
+    """Return only versioned real outcomes; reflections are already linked by the owner."""
 
-    merged = [
+    del reflection_samples
+    return [
         dict(sample)
         for sample in authoritative_samples
         if str(sample.get("source") or "").strip() == "okx_position_history"
         and str(sample.get("lifecycle_key") or "").strip()
+        and sample.get("event_type") == "AuthoritativeTradeOutcome"
+        and sample.get("outcome_version") == AUTHORITATIVE_TRADE_OUTCOME_VERSION
     ]
-    index_by_position_id: dict[int, int] = {}
-    for index, sample in enumerate(merged):
-        position_ids = sample.get("position_ids") or [sample.get("position_id")]
-        for value in position_ids:
-            try:
-                position_id = int(value or 0)
-            except (TypeError, ValueError):
-                continue
-            if position_id > 0:
-                index_by_position_id[position_id] = index
-    for reflection in reflection_samples:
-        repair_source = str(reflection.get("trade_fact_repair_source") or "").strip().lower()
-        reflection_source = str(reflection.get("reflection_source") or "").strip().lower()
-        if any(
-            candidate in _TRAINING_REPAIR_SOURCES
-            or any(token in candidate for token in _TRAINING_REPAIR_SOURCE_MARKERS)
-            for candidate in (repair_source, reflection_source)
-            if candidate
-        ):
-            continue
-        position_id = int(reflection.get("position_id") or 0)
-        index = index_by_position_id.get(position_id)
-        if index is None:
-            continue
-        official = merged[index]
-        combined = _deep_merge_trade_sample_dict(official, reflection)
-        combined["source"] = "okx_position_history"
-        combined["realized_pnl"] = official.get("realized_pnl")
-        combined["fee_estimate"] = official.get("fee_estimate")
-        combined["funding_fee"] = official.get("funding_fee")
-        combined["pnl_source"] = official.get("pnl_source")
-        combined["trade_fact_trusted"] = official.get("trade_fact_trusted")
-        combined["trade_fact_trust_reason"] = official.get("trade_fact_trust_reason")
-        merged[index] = combined
-    return merged
 
 
 async def _completed_shadow_sample_count() -> int:

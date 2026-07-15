@@ -20,6 +20,7 @@ from scripts.train_local_ai_tools_models import (
     _normalize_base_url,
     _post_training_payload,
 )
+from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 
 
@@ -231,11 +232,15 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
     authoritative_samples = [
         {
             "source": "okx_position_history",
+            "event_type": "AuthoritativeTradeOutcome",
+            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+            "outcome_id": "ato:7",
             "id": 7,
             "lifecycle_key": "paper|AAA-USDT-SWAP|pos-7|long|1",
             "position_id": 7,
             "position_ids": [7],
             "realized_pnl": -1.2,
+            "hold_minutes": 4.0,
             "raw_llm_response": {
                 "profit_first_trade_plan": {
                     "decision_lane": "tiny_probe",
@@ -245,6 +250,9 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
         },
         {
             "source": "okx_position_history",
+            "event_type": "AuthoritativeTradeOutcome",
+            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+            "outcome_id": "ato:9",
             "id": 9,
             "lifecycle_key": "paper|BBB-USDT-SWAP|pos-9|long|2",
             "position_id": 9,
@@ -260,7 +268,7 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
         "okx_position_history",
     ]
     assert [item["position_id"] for item in merged] == [7, 9]
-    assert merged[0]["hold_minutes"] == 3.0
+    assert merged[0]["hold_minutes"] == 4.0
     assert merged[0]["raw_llm_response"]["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
     assert merged[1]["realized_pnl"] == 0.4
 

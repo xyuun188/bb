@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.okx_training_facts import build_okx_history_training_sample
 from services.training_data_quality import annotate_training_payload
 
@@ -85,6 +86,19 @@ def _complete_lineage() -> dict:
     }
 
 
+def _outcome(sample: dict) -> dict:
+    reflection = SimpleNamespace(
+        id=501,
+        position_id=7,
+        source="authoritative_trade_outcome",
+        outcome=sample.get("outcome"),
+        mistake_summary="fact",
+        improvement_summary="recalibrate distribution",
+        created_at=datetime(2026, 7, 11, 2, tzinfo=UTC),
+    )
+    return build_authoritative_trade_outcome(sample, reflection=reflection)
+
+
 def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     sample = build_okx_history_training_sample(
         _history(),
@@ -129,7 +143,7 @@ def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons
         if key not in {"fundingFee", "_bb_contract_spec"}
     }
 
-    sample = build_okx_history_training_sample(history)
+    sample = _outcome(build_okx_history_training_sample(history))
     payload = annotate_training_payload(
         shadow_samples=[],
         trade_samples=[sample],
@@ -145,7 +159,7 @@ def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons
 
 
 def test_training_report_blocks_pnl_return_sign_mismatch() -> None:
-    sample = build_okx_history_training_sample(_history(), **_complete_lineage())
+    sample = _outcome(build_okx_history_training_sample(_history(), **_complete_lineage()))
     sample["authoritative_pnl_ratio_pct"] = -8.5
     payload = annotate_training_payload(
         shadow_samples=[],
@@ -168,7 +182,7 @@ def test_authoritative_loss_with_exact_entry_lineage_remains_supervision_ready()
         "pnl": "-7",
         "pnlRatio": "-0.085",
     }
-    sample = build_okx_history_training_sample(history, **_complete_lineage())
+    sample = _outcome(build_okx_history_training_sample(history, **_complete_lineage()))
 
     payload = annotate_training_payload(
         shadow_samples=[],
@@ -183,7 +197,7 @@ def test_authoritative_loss_with_exact_entry_lineage_remains_supervision_ready()
     labels = trade["profit_learning_labels"]
     assert labels["training_supervision_ready"] is True
     assert labels["exit_attribution_supervision_ready"] is True
-    assert labels["losing_exit_attribution"] == "fee_after_return_forecast_error"
+    assert labels["losing_exit_attribution"] == "authoritative_multi_factor_outcome"
     assert labels["realized_net_pnl_usdt"] == -8.5
 
 

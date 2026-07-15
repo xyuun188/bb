@@ -7,6 +7,10 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 
 SIDES = ("long", "short")
@@ -56,6 +60,10 @@ def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if extra.get("objective_version") != RETURN_OBJECTIVE_VERSION:
         return None
+    if extra.get("authority_level") != AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY:
+        return None
+    if extra.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION:
+        return None
 
     aggregation = _safe_dict(extra.get("outcome_aggregation"))
     if aggregation:
@@ -65,7 +73,12 @@ def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
             for value in aggregation.get("source_position_ids", [])
             if _safe_int(value, 0) > 0
         }
-        if count <= 0 or not position_ids:
+        outcome_ids = {
+            str(value)
+            for value in aggregation.get("source_outcome_ids", [])
+            if str(value or "").strip()
+        }
+        if count <= 0 or not position_ids or not outcome_ids:
             return None
         return {
             "count": count,
@@ -84,10 +97,12 @@ def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
                 aggregation.get("worst_net_return_pct"),
                 min(_safe_float(aggregation.get("avg_net_return_pct")), 0.0),
             ),
+            "outcome_ids": outcome_ids,
         }
 
     position_id = _safe_int(extra.get("source_position_id"), 0)
-    if position_id <= 0 or "net_return_after_cost_pct" not in extra:
+    outcome_id = str(extra.get("outcome_id") or "").strip()
+    if position_id <= 0 or not outcome_id or "net_return_after_cost_pct" not in extra:
         return None
     net_return = _safe_float(extra.get("net_return_after_cost_pct"))
     pnl = _safe_float(extra.get("realized_pnl"))
@@ -100,6 +115,7 @@ def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
         "gross_profit_usdt": max(pnl, 0.0),
         "gross_loss_usdt": max(-pnl, 0.0),
         "worst_return_pct": min(net_return, 0.0),
+        "outcome_ids": {outcome_id},
     }
 
 
@@ -161,7 +177,7 @@ class MemoryFeedbackPolicy:
                         positive += outcome["count"]
                     elif outcome["total_pnl_usdt"] < 0:
                         risk += outcome["count"]
-            if len(top_reasons) < 3:
+            if outcome is not None and len(top_reasons) < 3:
                 lesson = str(memory.get("lesson") or memory.get("market_pattern") or "").strip()
                 if lesson:
                     top_reasons.append(lesson[:96])

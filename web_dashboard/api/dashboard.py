@@ -7019,10 +7019,15 @@ async def get_expert_memories(
     reflection_page: int = 1,
     expert_name: str | None = None,
     symbol: str | None = None,
+    mode: str | None = None,
 ):
     """Return long-term expert memories and recent trade reflections."""
     from db.repositories.memory_repo import MemoryRepository
     from db.session import get_session_ctx
+    from services.authoritative_trade_outcome import (
+        AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+        load_authoritative_trade_outcomes,
+    )
 
     size = max(min(int(page_size or limit or 10), 100), 1)
     memory_page = max(int(memory_page or 1), 1)
@@ -7049,6 +7054,17 @@ async def get_expert_memories(
             offset=reflection_offset,
         )
 
+    selected_mode = str(mode or "").lower()
+    outcomes = await load_authoritative_trade_outcomes(
+        mode=selected_mode if selected_mode in {"paper", "live"} else None,
+    )
+    outcome_by_position_id = {
+        int(position_id): outcome
+        for outcome in outcomes
+        for position_id in (outcome.get("position_ids") or [outcome.get("position_id")])
+        if str(position_id or "").isdigit() and int(position_id) > 0
+    }
+
     memory_rows = [
         {
             "id": m.id,
@@ -7068,11 +7084,17 @@ async def get_expert_memories(
             "last_used_at": m.last_used_at.isoformat() if m.last_used_at else None,
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+            "authority_level": _safe_dict(m.extra).get("authority_level"),
+            "outcome_id": _safe_dict(m.extra).get("outcome_id"),
+            "outcome_version": _safe_dict(m.extra).get("outcome_version"),
+            "outcome_distribution": _safe_dict(m.extra).get("outcome_aggregation"),
         }
         for m in memories
     ]
-    reflection_rows = [
-        {
+    reflection_rows = []
+    for r in reflections:
+        authoritative_outcome = outcome_by_position_id.get(int(r.position_id or 0))
+        reflection_rows.append({
             "id": r.id,
             "position_id": r.position_id,
             "symbol": r.symbol,
@@ -7089,14 +7111,49 @@ async def get_expert_memories(
             "improvement_summary": sanitize_text(r.improvement_summary),
             "source": r.source,
             "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in reflections
-    ]
+            "evidence_precedence": (
+                "authoritative_trade_outcome"
+                if authoritative_outcome
+                else "reflection_without_authoritative_outcome"
+            ),
+            "authoritative_outcome": (
+                {
+                    "event_type": authoritative_outcome.get("event_type"),
+                    "outcome_id": authoritative_outcome.get("outcome_id"),
+                    "outcome_version": authoritative_outcome.get("outcome_version"),
+                    "outcome_fingerprint": authoritative_outcome.get("outcome_fingerprint"),
+                    "authority_level": authoritative_outcome.get("authority_level"),
+                    "complete": authoritative_outcome.get("outcome_complete"),
+                    "evidence_gaps": authoritative_outcome.get("outcome_evidence_gaps"),
+                    "decision_id": authoritative_outcome.get("decision_id"),
+                    "entry_order_ids": authoritative_outcome.get("entry_order_ids"),
+                    "close_order_ids": authoritative_outcome.get("close_order_ids"),
+                    "realized_pnl": authoritative_outcome.get("realized_pnl"),
+                    "authoritative_return_pct": authoritative_outcome.get(
+                        "authoritative_pnl_ratio_pct"
+                    ),
+                    "attribution": authoritative_outcome.get("attribution"),
+                    "counterfactual_evidence": authoritative_outcome.get(
+                        "counterfactual_evidence"
+                    ),
+                    "learning_summary": authoritative_outcome.get("learning_summary"),
+                }
+                if authoritative_outcome
+                else None
+            ),
+        })
     return {
         "memories": memory_rows,
         "reflections": reflection_rows,
         "count": memory_total,
         "reflection_count": reflection_total,
+        "authoritative_outcome_contract": {
+            "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+            "loaded_count": len(outcomes),
+            "complete_count": sum(item.get("outcome_complete") is True for item in outcomes),
+            "actual_outcome_overrides_shadow": True,
+            "shadow_production_weight": 0.0,
+        },
         "pagination": {
             "page_size": size,
             "memory_page": memory_page,

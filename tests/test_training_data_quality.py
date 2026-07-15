@@ -9,6 +9,7 @@ from core.training_contracts import (
     compact_shadow_label_contract,
 )
 from services import training_data_quality
+from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
 from services.model_promotion_policy import build_return_objective_report
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
@@ -462,6 +463,10 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
         trade_samples=[
             _trade_sample(
                 source="okx_position_history",
+                event_type="AuthoritativeTradeOutcome",
+                outcome_version=AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+                outcome_id="ato:test-1",
+                outcome_fingerprint="fingerprint-test-1",
                 trade_fact_trusted=True,
                 lifecycle_key="okx-position:test-1",
                 execution_slippage_usdt=0.0,

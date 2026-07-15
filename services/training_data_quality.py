@@ -17,6 +17,7 @@ from core.training_contracts import (
     SHADOW_LABEL_VERSION,
     shadow_label_contract_reasons,
 )
+from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
 from services.dynamic_policy_values import empirical_policy_value
 from services.execution_cost_model import execution_cost_estimate
 from services.profit_supervision import (
@@ -439,6 +440,17 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
 
     source = _safe_str(sample.get("source")).lower()
     if source == "okx_position_history":
+        if (
+            sample.get("event_type") != "AuthoritativeTradeOutcome"
+            or sample.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION
+            or not _safe_str(sample.get("outcome_id"))
+            or not _safe_str(sample.get("outcome_fingerprint"))
+        ):
+            return _final_assessment(
+                0.0,
+                ["missing_authoritative_trade_outcome_contract"],
+                exclude=True,
+            )
         evidence_gaps = [
             _safe_str(reason)
             for reason in sample.get("training_evidence_gaps") or []
@@ -2257,6 +2269,8 @@ def annotate_training_payload(
             "text_sentiment": annotated_text,
         }
     )
+    outcome_manifest = _authoritative_outcome_manifest(annotated_trade)
+    report["authoritative_trade_outcomes"] = outcome_manifest
     return {
         "shadow_samples": trainable_samples(annotated_shadow),
         "trade_samples": trainable_samples(annotated_trade),
@@ -2264,4 +2278,46 @@ def annotate_training_payload(
         "text_sentiment_samples": trainable_samples(annotated_text),
         "quality_report": report,
         "governance_report": governance_report(report),
+        "authoritative_outcome_manifest": outcome_manifest,
+    }
+
+
+def _authoritative_outcome_manifest(
+    annotated_trade_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    records = []
+    for sample in annotated_trade_samples:
+        if sample.get("event_type") != "AuthoritativeTradeOutcome":
+            continue
+        records.append(
+            {
+                "outcome_id": sample.get("outcome_id"),
+                "outcome_version": sample.get("outcome_version"),
+                "outcome_fingerprint": sample.get("outcome_fingerprint"),
+                "position_ids": sample.get("position_ids") or [sample.get("position_id")],
+                "decision_id": sample.get("decision_id"),
+                "symbol": sample.get("symbol"),
+                "side": sample.get("side"),
+                "label_timestamp": sample.get("label_timestamp"),
+                "training_status": sample.get("data_quality_status"),
+                "training_weight": sample.get("training_weight"),
+                "exclusion_reasons": sample.get("data_quality_reasons") or [],
+            }
+        )
+    canonical = json.dumps(
+        records,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    included = [item for item in records if item.get("training_status") != "excluded"]
+    return {
+        "contract_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+        "single_owner": "services.authoritative_trade_outcome",
+        "record_count": len(records),
+        "included_count": len(included),
+        "excluded_count": len(records) - len(included),
+        "dataset_fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "records": records,
     }

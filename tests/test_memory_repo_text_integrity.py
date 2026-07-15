@@ -8,6 +8,23 @@ import pytest
 
 import db.repositories.memory_repo as memory_repo_module
 from db.repositories.memory_repo import MemoryRepository
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
+
+
+def _outcome_extra(*, position_id: int, outcome_id: str, pnl: float, return_pct: float) -> dict:
+    return {
+        "source": "authoritative_trade_outcome",
+        "authority_level": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
+        "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+        "outcome_id": outcome_id,
+        "production_evidence_eligible": True,
+        "realized_pnl": pnl,
+        "net_return_after_cost_pct": return_pct,
+        "source_position_id": position_id,
+    }
 
 
 class FakeScalarResult:
@@ -59,19 +76,11 @@ def _install_fake_sanitizer(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 def test_memory_outcomes_merge_conflicting_evidence_by_fee_after_return() -> None:
     positive = memory_repo_module._merge_memory_outcomes(
         None,
-        {
-            "realized_pnl": 1.0,
-            "net_return_after_cost_pct": 4.0,
-            "source_position_id": 1,
-        },
+        _outcome_extra(position_id=1, outcome_id="ato:1", pnl=1.0, return_pct=4.0),
     )
     merged = memory_repo_module._merge_memory_outcomes(
         positive,
-        {
-            "realized_pnl": -5.0,
-            "net_return_after_cost_pct": -10.0,
-            "source_position_id": 2,
-        },
+        _outcome_extra(position_id=2, outcome_id="ato:2", pnl=-5.0, return_pct=-10.0),
     )
 
     outcome = merged["outcome_aggregation"]
@@ -84,29 +93,33 @@ def test_memory_outcomes_merge_conflicting_evidence_by_fee_after_return() -> Non
     assert outcome["squared_net_return_sum_pct2"] == pytest.approx(116.0)
     assert outcome["profit_factor"] == pytest.approx(0.2)
     assert outcome["return_unit"] == "percentage_points"
+    assert outcome["source_outcome_ids"] == ["ato:1", "ato:2"]
 
 
 def test_memory_outcome_aggregation_is_idempotent_per_position() -> None:
     first = memory_repo_module._merge_memory_outcomes(
         None,
-        {
-            "realized_pnl": -5.0,
-            "net_return_after_cost_pct": -10.0,
-            "source_position_id": 2,
-        },
+        _outcome_extra(position_id=2, outcome_id="ato:2", pnl=-5.0, return_pct=-10.0),
     )
     repeated = memory_repo_module._merge_memory_outcomes(
         first,
-        {
-            "realized_pnl": -5.0,
-            "net_return_after_cost_pct": -10.0,
-            "source_position_id": 2,
-        },
+        _outcome_extra(position_id=2, outcome_id="ato:2", pnl=-5.0, return_pct=-10.0),
     )
 
     assert repeated["outcome_aggregation"]["count"] == 1
     assert repeated["outcome_aggregation"]["total_realized_net_pnl_usdt"] == -5.0
     assert repeated["outcome_aggregation"]["source_position_ids"] == [2]
+    assert repeated["outcome_aggregation"]["source_outcome_ids"] == ["ato:2"]
+
+
+def test_memory_profit_factor_is_undefined_without_any_realized_loss() -> None:
+    merged = memory_repo_module._merge_memory_outcomes(
+        None,
+        _outcome_extra(position_id=3, outcome_id="ato:3", pnl=5.0, return_pct=2.0),
+    )
+
+    assert merged["outcome_aggregation"]["profit_factor"] is None
+    assert merged["outcome_aggregation"]["profit_factor_defined"] is False
 
 
 def test_reflection_source_is_sanitized_to_database_contract() -> None:

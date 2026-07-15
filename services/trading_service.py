@@ -1558,6 +1558,13 @@ class TradingService:
                         )
                         + 1
                     )
+                    changed_count = int(row.get("inserted_count") or 0) + int(
+                        row.get("updated_count") or 0
+                    )
+                    if changed_count > 0:
+                        row["authoritative_outcome_feedback"] = (
+                            await self.expert_memory_service.backfill_trade_reflections(mode)
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
