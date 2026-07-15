@@ -4,13 +4,13 @@ from typing import Any
 
 import pytest
 
+from scripts import start_phase3_paper_with_preflight as start_cli
 from scripts.start_phase3_paper_with_preflight import (
-    CONFIRM_TOKEN,
+    CONFIRMATION_PHRASE,
     CommandResult,
     build_phase3_paper_start_report,
     collect_phase3_paper_resume_preflight_via_command,
 )
-from scripts import start_phase3_paper_with_preflight as start_cli
 
 
 def test_paper_start_entrypoint_imports_runtime_env_bootstrap() -> None:
@@ -106,7 +106,7 @@ async def test_paper_start_entrypoint_blocks_without_ready_preflight() -> None:
         preflight_provider=_blocked_preflight,
         command_runner=runner,
         start_service=True,
-        confirm_resume_paper=CONFIRM_TOKEN,
+        confirm_resume_paper=CONFIRMATION_PHRASE,
     )
 
     assert report["status"] == "blocked"
@@ -150,7 +150,7 @@ async def test_paper_start_entrypoint_starts_only_after_ready_and_confirmed() ->
         preflight_provider=_ready_preflight,
         command_runner=runner,
         start_service=True,
-        confirm_resume_paper=CONFIRM_TOKEN,
+        confirm_resume_paper=CONFIRMATION_PHRASE,
     )
 
     assert report["status"] == "started"
@@ -180,7 +180,7 @@ async def test_paper_start_entrypoint_default_path_runs_preflight_command_before
     report = await build_phase3_paper_start_report(
         command_runner=runner,
         start_service=True,
-        confirm_resume_paper=CONFIRM_TOKEN,
+        confirm_resume_paper=CONFIRMATION_PHRASE,
     )
 
     assert report["status"] == "started"
@@ -203,7 +203,7 @@ async def test_paper_start_entrypoint_default_path_blocks_when_preflight_command
     report = await build_phase3_paper_start_report(
         command_runner=runner,
         start_service=True,
-        confirm_resume_paper=CONFIRM_TOKEN,
+        confirm_resume_paper=CONFIRMATION_PHRASE,
     )
 
     assert report["status"] == "blocked"

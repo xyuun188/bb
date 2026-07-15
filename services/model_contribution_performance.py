@@ -84,7 +84,7 @@ def _empty_bucket(label: str) -> dict[str, Any]:
         "loss": 0.0,
         "avg_pnl": 0.0,
         "win_rate": 0.0,
-        "profit_factor": 0.0,
+        "profit_factor": None,
         "pnl_lcb_usdt": 0.0,
         "production_permission": False,
         "state": "not_observed",

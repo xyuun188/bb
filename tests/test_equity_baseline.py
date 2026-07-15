@@ -7,7 +7,10 @@ import pytest
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.account import ExecutionEquitySnapshot
-from services.equity_baseline import apply_daily_equity_baseline, phase3_equity_change_from_snapshots
+from services.equity_baseline import (
+    apply_daily_equity_baseline,
+    phase3_equity_change_from_snapshots,
+)
 
 
 @pytest.mark.asyncio

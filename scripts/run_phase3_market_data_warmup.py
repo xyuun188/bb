@@ -15,13 +15,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sqlalchemy import func, select  # noqa: E402
+
 from config.settings import settings  # noqa: E402
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
 from models.market_data import Kline, Ticker  # noqa: E402
 from services.crypto_feature_coverage import CryptoFeatureCoverageService  # noqa: E402
-from services.data_service import DataService, KLINE_PERSIST_TIMEFRAME_LIMITS  # noqa: E402
-from sqlalchemy import func, select  # noqa: E402
+from services.data_service import KLINE_PERSIST_TIMEFRAME_LIMITS, DataService  # noqa: E402
 
 DEFAULT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT")
 REPORT_DIR = ROOT / "data" / "phase3_market_data_warmup"
@@ -213,10 +214,11 @@ async def warm_market_data(
             "error": safe_error_text(exc, limit=180),
         }
 
+    rest_close_error = ""
     try:
         await service.rest_client.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        rest_close_error = safe_error_text(exc, limit=180)
 
     fetched_timeframe_counts = {
         timeframe: sum(
@@ -274,6 +276,7 @@ async def warm_market_data(
         "fetched_kline_timeframe_ready_counts": fetched_timeframe_counts,
         "db_verification_available": db_available,
         "db_verification_error": db_coverage.get("error") or "",
+        "rest_client_close_error": rest_close_error,
         "db_ticker_symbols": db_coverage.get("ticker_symbols") or [],
         "db_kline_symbols_by_timeframe": db_coverage.get("kline_symbols_by_timeframe") or {},
         "feature_coverage_status_after_warmup": feature_report.get("status"),

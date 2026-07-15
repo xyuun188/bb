@@ -460,3 +460,15 @@ def test_strategy_scheduler_page_separates_production_prior_matches_and_rejectio
     ):
         assert token in view
     assert "币种方向候选" not in view
+
+
+def test_undefined_profit_factor_and_auc_are_not_rendered_as_zero() -> None:
+    assert "function profitFactorLabel" in SCRIPT
+    assert "function metricNumberLabel" in SCRIPT
+    assert "Number(metrics.top_long_profit_factor || 0)" not in SCRIPT
+    assert "Number(metrics.top_short_profit_factor || 0)" not in SCRIPT
+    assert "Number(row.profit_factor || 0)" not in SCRIPT
+    assert "Number(summary.profit_factor || 0)" not in SCRIPT
+    assert "Number(metrics.long_auc || 0)" not in SCRIPT
+    assert "Number(metrics.short_auc || 0)" not in SCRIPT
+    assert "profitFactorLabel(summary.profit_factor)" in SCRIPT

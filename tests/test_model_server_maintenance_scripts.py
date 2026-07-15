@@ -96,9 +96,10 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     )
     app_env = app_dir / ".env"
     app_env.write_text(
-        "AI_API_BASE=http://175.155.64.171:31840/v1\n"
+        "AI_API_BASE=http://stale-decision-route.example.invalid:31840/v1\n"
         "AI_MODEL=qwen3-32b-trade\n"
-        "AI_MODELS=[{\"model\":\"qwen3-14b-trade\",\"api_base\":\"http://103.85.84.147:21840/v1\"}]\n"
+        "AI_MODELS=[{\"model\":\"qwen3-14b-trade\",\"api_base\":"
+        "\"http://stale-model-route.example.invalid:21840/v1\"}]\n"
         "LOCAL_AI_TOOLS_API_BASE=http://old-local-ai.example\n"
         "HIGH_RISK_REVIEW_MODEL=old-risk-model\n"
         "DATABASE_URL=postgresql+asyncpg://app\n"

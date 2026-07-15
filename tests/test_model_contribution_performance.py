@@ -68,6 +68,14 @@ def test_model_contribution_is_read_only_for_current_return_sources() -> None:
     assert stats["expert_alignment"]["count"] == 0
 
 
+def test_unobserved_model_contribution_does_not_invent_profit_factor() -> None:
+    stats = ModelContributionPerformanceService().build_stats([], [], {})
+
+    assert stats
+    assert all(bucket["count"] == 0 for bucket in stats.values())
+    assert all(bucket["profit_factor"] is None for bucket in stats.values())
+
+
 def test_legacy_profit_first_and_alignment_flags_are_ignored() -> None:
     now = datetime(2026, 6, 10, tzinfo=UTC)
     raw = {

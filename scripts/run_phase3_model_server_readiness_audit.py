@@ -21,10 +21,13 @@ from scripts.runtime_env_bootstrap import (  # noqa: E402
 load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
-from config.settings import settings
-from core.remote_server_info import parse_remote_server_info
-from core.safe_output import safe_error_text
-from services.phase3_model_server_readiness import Phase3ModelServerReadinessAuditService
+# These imports must follow runtime environment loading because settings are read at import time.
+from config.settings import settings  # noqa: E402
+from core.remote_server_info import parse_remote_server_info  # noqa: E402
+from core.safe_output import safe_error_text  # noqa: E402
+from services.phase3_model_server_readiness import (  # noqa: E402
+    Phase3ModelServerReadinessAuditService,
+)
 
 DEFAULT_REPORT_DIR = "phase3_model_server_readiness_reports"
 

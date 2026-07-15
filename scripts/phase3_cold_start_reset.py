@@ -17,10 +17,11 @@ import hashlib
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy import and_, delete, func, select, text, update
 
@@ -28,9 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import models  # noqa: F401,E402 - register SQLAlchemy metadata
 import db.session as session_module  # noqa: E402
+import models  # noqa: F401,E402 - register SQLAlchemy metadata
 from config.settings import settings  # noqa: E402
+from core.symbols import normalize_trading_symbol  # noqa: E402
 from db.session import close_db, get_engine, init_db  # noqa: E402
 from executor.okx_executor import OKXExecutor  # noqa: E402
 from models.account import ExecutionEquitySnapshot, VirtualAccount  # noqa: E402
@@ -47,8 +49,6 @@ from models.news import NewsArticle, SocialPost  # noqa: E402
 from models.risk import ModelPerformanceSnapshot, RiskEvent  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
 from services.exchange_position_state import parse_exchange_position_snapshot  # noqa: E402
-from core.symbols import normalize_trading_symbol  # noqa: E402
-
 
 CONFIRMATION = "PHASE3_COLD_START_RESET"
 DEFAULT_BACKUP_DIR = Path("data/codex_backups/phase3-cold-start-reset")
@@ -125,6 +125,13 @@ def _row_to_json(row: dict[str, Any]) -> dict[str, Any]:
     return {key: _json_safe(value) for key, value in row.items()}
 
 
+def _write_jsonl_batch(path: Path, rows: list[dict[str, Any]], *, append: bool) -> None:
+    mode = "a" if append else "w"
+    with path.open(mode, encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(_row_to_json(row), ensure_ascii=False) + "\n")
+
+
 def _condition_for(target: ResetTarget) -> Any | None:
     return target.condition(target.table) if target.condition is not None else None
 
@@ -176,7 +183,7 @@ async def _backup_target(
     *,
     batch_size: int = 1000,
 ) -> dict[str, Any]:
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(backup_dir.mkdir, parents=True, exist_ok=True)
     if target.backup_mode == "summary":
         return await _backup_target_summary(target, backup_dir)
 
@@ -189,17 +196,17 @@ async def _backup_target(
         stmt = stmt.order_by(target.table.c.id)
 
     count = 0
+    append = False
     engine = await get_engine()
     async with engine.connect() as conn:
         result = await conn.execute(stmt)
-        with path.open("w", encoding="utf-8") as fh:
-            while True:
-                rows = result.mappings().fetchmany(batch_size)
-                if not rows:
-                    break
-                for row in rows:
-                    fh.write(json.dumps(_row_to_json(dict(row)), ensure_ascii=False) + "\n")
-                    count += 1
+        while True:
+            rows = [dict(row) for row in result.mappings().fetchmany(batch_size)]
+            if not rows:
+                break
+            await asyncio.to_thread(_write_jsonl_batch, path, rows, append=append)
+            append = True
+            count += len(rows)
     return {"table": target.name, "rows": count, "path": str(path)}
 
 

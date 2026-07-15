@@ -1,0 +1,195 @@
+{
+  "incidents": {
+    "DOGE": {
+      "after": {
+        "blockers": [],
+        "dispersion_pct": 0.2449,
+        "distribution_member_count": 1,
+        "objective_expected_return_pct": 0.42819999999999997,
+        "production_eligible": true,
+        "uncertainty_penalty_pct": 0.2449
+      },
+      "before": {
+        "expected_net_return_pct": 0.314699,
+        "return_lcb_pct": 0.314699,
+        "return_uncertainty_pct": 0.0,
+        "source_count": 1
+      },
+      "decision_id": 79568,
+      "symbol": "DOGE/USDT"
+    },
+    "ICP": {
+      "after": {
+        "authoritative_return_after_cost_pct": -5.51319027,
+        "distribution_blockers": [
+          "lower_quantile_above_raw_expected",
+          "lower_quantile_above_median"
+        ],
+        "distribution_production_eligible": false,
+        "outcome_complete": true,
+        "production_contribution": 0.0,
+        "stop_execution_slippage": {
+          "contribution_return_pct": -3.3936651583710487,
+          "contribution_usdt": -44.268539728506894,
+          "source": "okx_configured_stop_trigger_to_fills_vwap",
+          "status": "measured",
+          "trigger_to_first_fill_ms": null
+        }
+      },
+      "before": {
+        "expected_return_pct": 0.4603,
+        "lower_quantile_return_pct": 0.496,
+        "production_influence": true
+      },
+      "decision_id": 79318,
+      "symbol": "ICP/USDT"
+    },
+    "ROBO": {
+      "all_invalid_entries_quarantined": true,
+      "incident_count": 6,
+      "replays": [
+        {
+          "after": {
+            "market_fact_reasons": [
+              "zero_notional_turnover"
+            ],
+            "market_fact_status": "quarantined",
+            "production_contribution": 0.0,
+            "shadow_contract_reasons": [
+              "entry:zero_notional_turnover",
+              "result_market_fact_missing",
+              "native_price_path_missing"
+            ],
+            "shadow_contract_status": "quarantined",
+            "training_sample_weight": 0.0
+          },
+          "before": {
+            "entry_price": 0.10834,
+            "maximum_recorded_short_return_pct": 88.0561196234078,
+            "training_contract_present": false
+          },
+          "decision_id": 79757
+        },
+        {
+          "after": {
+            "market_fact_reasons": [
+              "zero_notional_turnover"
+            ],
+            "market_fact_status": "quarantined",
+            "production_contribution": 0.0,
+            "shadow_contract_reasons": [
+              "entry:zero_notional_turnover",
+              "result_market_fact_missing",
+              "native_price_path_missing"
+            ],
+            "shadow_contract_status": "quarantined",
+            "training_sample_weight": 0.0
+          },
+          "before": {
+            "entry_price": 0.10834,
+            "maximum_recorded_short_return_pct": 88.10227062949973,
+            "training_contract_present": false
+          },
+          "decision_id": 80207
+        },
+        {
+          "after": {
+            "market_fact_reasons": [
+              "zero_notional_turnover"
+            ],
+            "market_fact_status": "quarantined",
+            "production_contribution": 0.0,
+            "shadow_contract_reasons": [
+              "entry:zero_notional_turnover",
+              "result_market_fact_missing",
+              "native_price_path_missing"
+            ],
+            "shadow_contract_status": "quarantined",
+            "training_sample_weight": 0.0
+          },
+          "before": {
+            "entry_price": 0.10834,
+            "maximum_recorded_short_return_pct": 88.12996123315489,
+            "training_contract_present": false
+          },
+          "decision_id": 80213
+        },
+        {
+          "after": {
+            "market_fact_reasons": [
+              "zero_notional_turnover"
+            ],
+            "market_fact_status": "quarantined",
+            "production_contribution": 0.0,
+            "shadow_contract_reasons": [
+              "entry:zero_notional_turnover",
+              "result_market_fact_missing",
+              "native_price_path_missing"
+            ],
+            "shadow_contract_status": "quarantined",
+            "training_sample_weight": 0.0
+          },
+          "before": {
+            "entry_price": 0.10834,
+            "maximum_recorded_short_return_pct": 88.21303304412037,
+            "training_contract_present": false
+          },
+          "decision_id": 80325
+        },
+        {
+          "after": {
+            "market_fact_reasons": [
+              "zero_notional_turnover"
+            ],
+            "market_fact_status": "quarantined",
+            "production_contribution": 0.0,
+            "shadow_contract_reasons": [
+              "entry:zero_notional_turnover",
+              "result_market_fact_missing",
+              "native_price_path_missing"
+            ],
+            "shadow_contract_status": "quarantined",
+            "training_sample_weight": 0.0
+          },
+          "before": {
+            "entry_price": 0.10834,
+            "maximum_recorded_short_return_pct": 88.21303304412037,
+            "training_contract_present": false
+          },
+          "decision_id": 80426
+        },
+        {
+          "after": {
+            "market_fact_reasons": [
+              "zero_notional_turnover"
+            ],
+            "market_fact_status": "quarantined",
+            "production_contribution": 0.0,
+            "shadow_contract_reasons": [
+              "entry:zero_notional_turnover",
+              "result_market_fact_missing",
+              "native_price_path_missing"
+            ],
+            "shadow_contract_status": "quarantined",
+            "training_sample_weight": 0.0
+          },
+          "before": {
+            "entry_price": 0.10834,
+            "maximum_recorded_short_return_pct": 88.0561196234078,
+            "training_contract_present": false
+          },
+          "decision_id": 80855
+        }
+      ],
+      "symbol": "ROBO/USDT"
+    }
+  },
+  "inputs": {
+    "baseline_fixture": "tests/fixtures/profit_integrity/2026-07-14-root-cause-baseline.json",
+    "robo_fixture": "tests/fixtures/profit_integrity/2026-07-14-robo-native-source-regression.json"
+  },
+  "optimization_target": "authoritative_fee_after_return_and_left_tail_loss",
+  "replay_version": "2026-07-15.profit-integrity-incident-replay.v1",
+  "status": "passed",
+  "win_rate_used_for_acceptance": false
+}

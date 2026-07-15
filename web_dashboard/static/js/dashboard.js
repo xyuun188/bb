@@ -4315,6 +4315,23 @@ function mlSampleCountLabel(value) {
     return value !== null && Number.isFinite(value) ? String(value) : '缺失 / 未评估';
 }
 
+function metricNumberLabel(value, digits = 2, missing = '未评估') {
+    if (value === null || value === undefined || value === '') return missing;
+    const num = Number(value);
+    return Number.isFinite(num) ? num.toFixed(digits) : missing;
+}
+
+function profitFactorLabel(value, digits = 2) {
+    return metricNumberLabel(value, digits, '未定义');
+}
+
+function profitFactorTone(value) {
+    if (value === null || value === undefined || value === '') return 'muted';
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 'muted';
+    return num > 1 ? 'good' : 'warn';
+}
+
 function mlWinBar(label, value, tone = 'muted') {
     const num = Number(value);
     const pct = Number.isFinite(num) ? Math.max(0, Math.min(num * 100, 100)) : 0;
@@ -4340,8 +4357,8 @@ function renderMLSignalMetrics() {
         <div class="ml-metrics-grid">
             ${mlMetricCard('做多影子市场收益下界', signedPctValueLabel(metrics.top_long_return_lcb_pct), '毛市场机会诊断；生产端仍需独立扣除成本和实际滑点尾部', Number(metrics.top_long_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
             ${mlMetricCard('做空影子市场收益下界', signedPctValueLabel(metrics.top_short_return_lcb_pct), '毛市场机会诊断；生产端仍需独立扣除成本和实际滑点尾部', Number(metrics.top_short_return_lcb_pct || 0) > 0 ? 'good' : 'warn')}
-            ${mlMetricCard('做多影子市场 Profit Factor', Number(metrics.top_long_profit_factor || 0).toFixed(2), '仅评估影子市场机会分层，不等于实际成交 Profit Factor', Number(metrics.top_long_profit_factor || 0) > 1 ? 'good' : 'warn')}
-            ${mlMetricCard('做空影子市场 Profit Factor', Number(metrics.top_short_profit_factor || 0).toFixed(2), '仅评估影子市场机会分层，不等于实际成交 Profit Factor', Number(metrics.top_short_profit_factor || 0) > 1 ? 'good' : 'warn')}
+            ${mlMetricCard('做多影子市场 Profit Factor', profitFactorLabel(metrics.top_long_profit_factor), '仅评估影子市场机会分层，不等于实际成交 Profit Factor', profitFactorTone(metrics.top_long_profit_factor))}
+            ${mlMetricCard('做空影子市场 Profit Factor', profitFactorLabel(metrics.top_short_profit_factor), '仅评估影子市场机会分层，不等于实际成交 Profit Factor', profitFactorTone(metrics.top_short_profit_factor))}
         </div>
         <div class="ml-panel">
             <div class="ml-panel-title">影子市场机会分层质量</div>
@@ -4352,8 +4369,8 @@ function renderMLSignalMetrics() {
             ${mlWinBar('做空高分组胜率', metrics.top_short_win_rate, mlSignalToneByRate(metrics.top_short_win_rate))}
             ${mlWinBar('做空低分组胜率', metrics.bottom_short_win_rate, 'muted')}
             <div class="ml-metrics-grid">
-                ${mlMetricCard('做多 AUC（诊断）', Number(metrics.long_auc || 0).toFixed(3), '仅用于观察分类器，不影响 ready 或生产权重', 'muted')}
-                ${mlMetricCard('做空 AUC（诊断）', Number(metrics.short_auc || 0).toFixed(3), '仅用于观察分类器，不影响 ready 或生产权重', 'muted')}
+                ${mlMetricCard('做多 AUC（诊断）', metricNumberLabel(metrics.long_auc, 3), '仅用于观察分类器，不影响 ready 或生产权重', 'muted')}
+                ${mlMetricCard('做空 AUC（诊断）', metricNumberLabel(metrics.short_auc, 3), '仅用于观察分类器，不影响 ready 或生产权重', 'muted')}
                 ${mlMetricCard('做多准确率（诊断）', pctLabel(metrics.long_accuracy, 1), '不能代表收益能力', 'muted')}
                 ${mlMetricCard('做空准确率（诊断）', pctLabel(metrics.short_accuracy, 1), '不能代表收益能力', 'muted')}
             </div>
@@ -4399,7 +4416,7 @@ function renderModelContributionStats() {
                                 <td><span class="analysis-pill analysis-pill-${tone}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} U</span></td>
                                 <td>${pctLabel(row.win_rate, 1)}</td>
                                 <td>${Number(row.avg_pnl || 0).toFixed(4)} U</td>
-                                <td>${Number(row.profit_factor || 0).toFixed(2)}</td>
+                                <td>${profitFactorLabel(row.profit_factor)}</td>
                             </tr>`;
                     }).join('')}
                 </tbody>
@@ -9945,7 +9962,7 @@ function renderProfitAttributionSummary(data) {
     el.innerHTML = `
         <div class="opening-funnel-verdict opening-funnel-${tone}">
             <strong>${signedMoney(pnl)} U</strong>
-            <span>最近 ${data.window_hours || 24} 小时已平仓 ${trades} 笔，胜率 ${pctLabel(summary.win_rate, 1)}，盈亏比 ${Number(summary.profit_factor || 0).toFixed(2)}。</span>
+            <span>最近 ${data.window_hours || 24} 小时已平仓 ${trades} 笔，胜率 ${pctLabel(summary.win_rate, 1)}，盈亏比 ${profitFactorLabel(summary.profit_factor)}。</span>
         </div>
         <div class="opening-funnel-kpis">
             <div><span>盈利 / 亏损</span><strong>${Number(summary.win_count || 0)} / ${Number(summary.loss_count || 0)}</strong></div>

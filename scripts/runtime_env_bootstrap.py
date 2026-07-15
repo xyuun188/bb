@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_RUNTIME_ENV_PATH = Path("/etc/bb/bb-runtime.env")
 DEFAULT_RUNTIME_USER = "bb"
 RUNTIME_USER_DROPPED_ENV = "BB_RUNTIME_USER_DROPPED"

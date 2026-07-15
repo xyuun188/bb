@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import request
+from urllib import parse, request
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -109,18 +109,34 @@ def _json_object_available(content: str) -> bool:
     return isinstance(parsed, dict) and parsed.get("ok") is True
 
 
+def _probe_url(api_base: str) -> str:
+    parsed = parse.urlsplit(str(api_base or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("shadow probe URL must use http or https")
+    if parsed.username or parsed.password:
+        raise ValueError("shadow probe URL must not contain credentials")
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("shadow probe URL must target a loopback tunnel")
+    if parsed.query or parsed.fragment:
+        raise ValueError("shadow probe URL must not contain query or fragment data")
+    path = f"{parsed.path.rstrip('/')}/chat/completions"
+    return parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
 def probe_one(spec: ProbeSpec, *, timeout_seconds: float) -> dict[str, Any]:
     body = _request_body(spec)
-    url = f"{spec.api_base.rstrip('/')}/chat/completions"
+    url = _probe_url(spec.api_base)
     started = time.monotonic()
-    req = request.Request(
+    req = request.Request(  # noqa: S310 - _probe_url permits loopback HTTP(S) only.
         url,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with request.urlopen(req, timeout=timeout_seconds) as response:
+        with request.urlopen(  # noqa: S310 - req uses the validated loopback URL above.
+            req, timeout=timeout_seconds
+        ) as response:
             payload = json.loads(response.read(256_000).decode("utf-8", "replace"))
         latency_ms = round((time.monotonic() - started) * 1000, 1)
         content = _content_from_response(payload)

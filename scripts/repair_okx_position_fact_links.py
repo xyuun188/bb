@@ -22,7 +22,11 @@ if str(ROOT) not in sys.path:
 
 from sqlalchemy import or_, select  # noqa: E402
 
-from core.symbols import okx_inst_id_from_symbol, symbol_from_okx_inst_id, trading_symbol_variants  # noqa: E402
+from core.symbols import (  # noqa: E402
+    okx_inst_id_from_symbol,
+    symbol_from_okx_inst_id,
+    trading_symbol_variants,
+)
 from db.session import close_db, get_session_ctx, init_db  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
 from services.manual_close_marker import is_manual_close_order  # noqa: E402

@@ -13,16 +13,19 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.runtime_env_bootstrap import (
+from scripts.runtime_env_bootstrap import (  # noqa: E402
     drop_privileges_to_runtime_user_if_needed,
     load_runtime_env_files,
 )
 
 load_runtime_env_files(project_root=ROOT)
 
-from config.settings import settings
-from core.safe_output import safe_error_text
-from services.phase3_paper_resume_preflight import Phase3PaperResumePreflightService
+# These imports must follow runtime environment loading because settings are read at import time.
+from config.settings import settings  # noqa: E402
+from core.safe_output import safe_error_text  # noqa: E402
+from services.phase3_paper_resume_preflight import (  # noqa: E402
+    Phase3PaperResumePreflightService,
+)
 
 DEFAULT_REPORT_DIR = "phase3_paper_resume_preflight_reports"
 

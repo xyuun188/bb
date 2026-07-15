@@ -72,6 +72,31 @@ def test_lower_quantile_above_raw_expected_is_blocked_not_clamped() -> None:
         )
 
 
+@pytest.mark.parametrize("expected", (-1.2, -0.1, 0.0, 0.4, 2.0))
+@pytest.mark.parametrize("distance", (0.0, 0.01, 0.2, 1.0))
+@pytest.mark.parametrize("dispersion", (0.0, 0.01, 0.3))
+def test_return_distribution_quantile_and_uncertainty_properties(
+    expected: float,
+    distance: float,
+    dispersion: float,
+) -> None:
+    lower = expected - distance
+    contract = _distribution(
+        raw_expected_return_pct=expected,
+        median_return_pct=expected,
+        lower_quantile_return_pct=lower,
+        upper_quantile_return_pct=expected + distance,
+        dispersion_pct=dispersion,
+        distribution_member_count=1,
+    )
+
+    assert contract["production_eligible"] is True
+    assert contract["lower_quantile_return_pct"] <= contract["raw_expected_return_pct"]
+    assert contract["uncertainty_penalty_pct"] >= 0.0
+    if distance > 0.0 or dispersion > 0.0:
+        assert contract["uncertainty_penalty_pct"] > 0.0
+
+
 @pytest.mark.parametrize(
     ("overrides", "blocker"),
     [

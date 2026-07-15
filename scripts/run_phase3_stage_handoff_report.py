@@ -12,7 +12,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.runtime_env_bootstrap import (
+from scripts.runtime_env_bootstrap import (  # noqa: E402
     drop_privileges_to_runtime_user_if_needed,
     load_runtime_env_files,
 )
@@ -20,9 +20,10 @@ from scripts.runtime_env_bootstrap import (
 load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
-from config.settings import settings
-from core.safe_output import safe_error_text
-from services.phase3_stage_handoff import (
+# These imports must follow runtime environment loading because settings are read at import time.
+from config.settings import settings  # noqa: E402
+from core.safe_output import safe_error_text  # noqa: E402
+from services.phase3_stage_handoff import (  # noqa: E402
     DEFAULT_REPORT_MAX_AGE_SECONDS,
     Phase3StageHandoffService,
 )

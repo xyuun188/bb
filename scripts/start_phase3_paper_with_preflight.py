@@ -12,10 +12,11 @@ import asyncio
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -27,10 +28,13 @@ from scripts.runtime_env_bootstrap import (  # noqa: E402
 
 load_runtime_env_files(project_root=ROOT)
 
-from core.safe_output import safe_error_text
-from scripts.run_phase3_paper_resume_preflight import write_report as write_preflight_report
+# These imports must follow runtime environment loading because settings are read at import time.
+from core.safe_output import safe_error_text  # noqa: E402
+from scripts.run_phase3_paper_resume_preflight import (  # noqa: E402
+    write_report as write_preflight_report,
+)
 
-CONFIRM_TOKEN = "CONFIRM_PHASE3_PAPER_RESUME"
+CONFIRMATION_PHRASE = "CONFIRM_PHASE3_PAPER_RESUME"
 DEFAULT_SERVICE_NAME = "bb-paper-trading.service"
 
 
@@ -161,7 +165,7 @@ async def build_phase3_paper_start_report(
         }
 
     can_resume = bool(preflight.get("can_resume_paper"))
-    confirmed = str(confirm_resume_paper or "").strip() == CONFIRM_TOKEN
+    confirmed = str(confirm_resume_paper or "").strip() == CONFIRMATION_PHRASE
     action_status = "preflight_only"
     blockers: list[dict[str, Any]] = []
     command_results: list[dict[str, Any]] = []
@@ -180,7 +184,10 @@ async def build_phase3_paper_start_report(
             {
                 "code": "resume_confirmation_missing",
                 "severity": "blocking",
-                "message": f"Starting paper trading requires --confirm-resume-paper {CONFIRM_TOKEN}.",
+                "message": (
+                    "Starting paper trading requires --confirm-resume-paper "
+                    f"{CONFIRMATION_PHRASE}."
+                ),
             }
         )
 
@@ -236,7 +243,7 @@ async def build_phase3_paper_start_report(
         "preflight": preflight,
         "can_resume_paper": can_resume,
         "start_requested": bool(start_service),
-        "confirmation_token_required": CONFIRM_TOKEN,
+        "confirmation_phrase_required": CONFIRMATION_PHRASE,
         "confirmation_present": confirmed,
         "starts_trading_service": started,
         "submits_orders": False,

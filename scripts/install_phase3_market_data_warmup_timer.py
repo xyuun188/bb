@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import posixpath
+import secrets
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 SERVICE_NAME = "bb-phase3-market-data-warmup.service"
 TIMER_NAME = "bb-phase3-market-data-warmup.timer"
 REPORT_DIR_REL = "data/phase3_market_data_warmup"
+REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
 DEFAULT_ON_CALENDAR = "*-*-* *:04,19,34,49:00"
 
 
@@ -128,6 +130,10 @@ def install_timer(
 
     user, group = _owner_parts(owner)
     report_dir = posixpath.join(remote_app_dir, REPORT_DIR_REL)
+    staging_dir = posixpath.join(remote_app_dir, REMOTE_STAGING_DIR_REL)
+    nonce = secrets.token_hex(12)
+    staged_service = posixpath.join(staging_dir, f"{SERVICE_NAME}.{nonce}")
+    staged_timer = posixpath.join(staging_dir, f"{TIMER_NAME}.{nonce}")
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
         run_remote_text(
@@ -135,14 +141,13 @@ def install_timer(
             " && ".join(
                 [
                     f"install -d -o {_remote_quote(user)} -g {_remote_quote(group)} -m 0755 {_remote_quote(report_dir)}",
+                    f"install -d -o {_remote_quote(user)} -g {_remote_quote(group)} -m 0700 {_remote_quote(staging_dir)}",
                     f"chown -R {_remote_quote(owner)} {_remote_quote(report_dir)}",
                 ]
             ),
             timeout=60,
             check=True,
         )
-        staged_service = f"/tmp/{SERVICE_NAME}"
-        staged_timer = f"/tmp/{TIMER_NAME}"
         _upload_text(ssh, staged_service, service)
         _upload_text(ssh, staged_timer, timer)
         commands = [
@@ -152,6 +157,7 @@ def install_timer(
             f"systemctl enable --now {TIMER_NAME}",
             f"systemctl is-enabled {TIMER_NAME}",
             f"systemctl is-active {TIMER_NAME}",
+            f"rm -f -- {_remote_quote(staged_service)} {_remote_quote(staged_timer)}",
         ]
         if run_now:
             commands.append(f"systemctl start {SERVICE_NAME} || true")

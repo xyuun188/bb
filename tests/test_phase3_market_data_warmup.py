@@ -182,6 +182,25 @@ async def test_market_data_warmup_status_uses_verified_db_coverage() -> None:
     assert report["db_ticker_symbols"] == ["BTC/USDT"]
 
 
+@pytest.mark.asyncio
+async def test_market_data_warmup_reports_rest_client_close_failure() -> None:
+    data_service = FakeDataService()
+
+    async def broken_close() -> None:
+        raise RuntimeError("close failed")
+
+    data_service.rest_client.close = broken_close
+    report = await warm_market_data(
+        symbols=["BTC/USDT"],
+        data_service=data_service,  # type: ignore[arg-type]
+        feature_service=FakeFeatureService(),  # type: ignore[arg-type]
+        db_coverage_loader=ready_db_coverage,
+    )
+
+    assert report["status"] == "ready"
+    assert report["rest_client_close_error"] == "close failed"
+
+
 def test_market_data_warmup_timer_contract_does_not_start_trading() -> None:
     service = render_service(symbol_limit=7)
 
