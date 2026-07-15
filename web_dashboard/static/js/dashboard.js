@@ -30,6 +30,8 @@ const state = {
     tradesPageMode: '',
     positionsPage: 1,
     positionsTotal: 0,
+    openPositions: [],
+    protectionInventory: null,
     positionHistoryPage: 1,
     positionHistoryTotal: 0,
     dailyPnlRecords: [],
@@ -3848,6 +3850,8 @@ function renderExpertMemories(data = {}) {
     const reflectionCountEl = document.getElementById('trade-reflection-count');
     const memoryBody = document.getElementById('expert-memory-tbody');
     const reflectionBody = document.getElementById('trade-reflection-tbody');
+    const authorityEl = document.getElementById('trade-reflection-authority');
+    const authority = data.authoritative_outcome_contract || {};
     const memoryTotal = Number(pagination.memory_total ?? state.expertMemoryTotal ?? memories.length);
     const reflectionTotal = Number(pagination.reflection_total ?? state.tradeReflectionTotal ?? reflections.length);
     const memoryPage = Number(pagination.memory_page || state.expertMemoryPage || 1);
@@ -3856,6 +3860,14 @@ function renderExpertMemories(data = {}) {
     const reflectionTotalPages = Number(pagination.reflection_total_pages || Math.max(Math.ceil(reflectionTotal / EXPERT_MEMORY_PAGE_SIZE), 1));
     if (countEl) countEl.textContent = `${memoryTotal} 条`;
     if (reflectionCountEl) reflectionCountEl.textContent = `${reflectionTotal} 条`;
+    if (authorityEl) {
+        const loaded = mlOptionalNumber(authority.loaded_count);
+        const complete = mlOptionalNumber(authority.complete_count);
+        authorityEl.className = `trade-reflection-authority ${authority.actual_outcome_overrides_shadow === true ? 'ready' : 'blocked'}`;
+        authorityEl.innerHTML = authority.actual_outcome_overrides_shadow === true
+            ? `<strong>权威成交结果优先</strong><span>已加载 ${mlSampleCountLabel(loaded)} 个 OKX outcome，完整 ${mlSampleCountLabel(complete)} 个；影子反事实生产权重 ${mlEvidenceValue(authority.shadow_production_weight)}。</span><em>${escHtml(authority.version || '合同版本缺失')}</em>`
+            : '<strong>Outcome 优先级证据缺失</strong><span>不能确认影子结果是否会覆盖真实成交结果。</span>';
+    }
     setExpertMemoryView(state.expertMemoryView || 'memories');
 
     if (memoryBody) {
@@ -3882,20 +3894,42 @@ function renderExpertMemories(data = {}) {
 
     if (reflectionBody) {
         if (!reflections.length) {
-            reflectionBody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">暂无复盘记录。</td></tr>';
+            reflectionBody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted);text-align:center;padding:24px;">暂无复盘记录。</td></tr>';
         } else {
             reflectionBody.innerHTML = reflections.map(r => {
-                const pnl = valueNumber(r.realized_pnl) || 0;
-                const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+                const authoritative = r.authoritative_outcome || null;
+                const authoritativePnl = authoritative
+                    ? mlOptionalNumber(authoritative.realized_pnl) : null;
+                const fallbackPnl = mlOptionalNumber(r.realized_pnl);
+                const pnl = authoritative ? authoritativePnl : fallbackPnl;
+                const pnlColor = pnl === null ? 'var(--text-muted)' : pnl >= 0 ? 'var(--green)' : 'var(--red)';
                 const generatedTime = tradeReflectionTimeHtml(r.created_at);
                 const generatedTimeTitle = toBeijingDateTime(r.created_at);
+                const shadowRows = Array.isArray(authoritative?.counterfactual_evidence)
+                    ? authoritative.counterfactual_evidence : [];
+                const actualHtml = authoritative
+                    ? `<div class="trade-outcome-cell ${authoritative.complete ? 'ready' : 'blocked'}">
+                        <strong>${distributionPctLabel(authoritative.authoritative_return_pct)}</strong>
+                        <span>${escHtml(authoritative.outcome_id || 'Outcome ID 缺失')}</span>
+                        <em>${authoritative.complete ? '权威证据完整' : `缺口：${(authoritative.evidence_gaps || []).map(item => escHtml(item)).join(' / ') || '未说明'}`}</em>
+                    </div>`
+                    : '<div class="trade-outcome-cell blocked"><strong>未关联</strong><span>权威成交 outcome 缺失</span><em>当前只显示复盘记录，不能作为完整训练事实</em></div>';
+                const shadowHtml = authoritative
+                    ? `<div class="trade-shadow-cell">
+                        <strong>${shadowRows.length} 条路径</strong>
+                        <span>生产权重 ${mlEvidenceValue(authoritative.counterfactual_production_weight)}</span>
+                        <em>只作反事实对照，不能覆盖真实盈亏</em>
+                    </div>`
+                    : '<div class="trade-shadow-cell"><strong>未关联</strong><span>没有权威 outcome 上下文</span><em>影子结果不得替代真实成交</em></div>';
                 return `
                     <tr>
                         <td class="trade-reflection-time" title="${escHtml(generatedTimeTitle)}">${generatedTime}</td>
                         <td>${escHtml(r.symbol || '-')}</td>
                         <td>${sideLabel(r.side)}</td>
-                        <td style="color:${pnlColor};white-space:nowrap;">${signedMoney(pnl)} USDT</td>
-                        <td>${Number(r.hold_minutes || 0).toFixed(1)} 分钟</td>
+                        <td style="color:${pnlColor};white-space:nowrap;">${pnl === null ? '证据缺失' : `${signedMoney(pnl)} USDT`}</td>
+                        <td>${mlOptionalNumber(r.hold_minutes) === null ? '证据缺失' : `${mlOptionalNumber(r.hold_minutes).toFixed(1)} 分钟`}</td>
+                        <td>${actualHtml}</td>
+                        <td>${shadowHtml}</td>
                         <td><div class="trade-reflection-text">${escHtml(r.mistake_summary || '-')}</div></td>
                         <td><div class="trade-reflection-text">${escHtml(r.improvement_summary || '-')}</div></td>
                     </tr>
@@ -4182,6 +4216,21 @@ function localModelStatus(status, key) {
     return Boolean(status?.service_available !== false && (modelReady || endpoint?.available));
 }
 
+function mlOptionalNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
+function mlFirstNumber(source, keys) {
+    for (const key of keys) {
+        if (!Object.prototype.hasOwnProperty.call(source || {}, key)) continue;
+        const number = mlOptionalNumber(source[key]);
+        if (number !== null) return number;
+    }
+    return null;
+}
+
 function mlSampleCounts() {
     const ml = state.mlSignalStatus || {};
     const local = state.localAIToolsStatus || {};
@@ -4193,41 +4242,42 @@ function mlSampleCounts() {
         const value = Number(report[key]);
         return Number.isFinite(value) ? value : null;
     };
-    const trainingMl = Number(ml.phase3_clean_trainable_shadow_sample_count || 0);
-    const completedMl = Number(
-        ml.phase3_clean_completed_shadow_sample_count
-        || ml.phase3_clean_trainable_shadow_sample_count
-        || trainingMl
-    );
-    const trainingLocal = Number(
-        local.phase3_clean_trainable_shadow_sample_count || 0
-    );
-    const completedLocal = Number(
-        local.phase3_clean_completed_shadow_sample_count
-        || local.phase3_clean_trainable_shadow_sample_count
-        || trainingLocal
-    );
-    const trainingLocalTrade = Number(
-        local.phase3_clean_trainable_trade_sample_count
-        || local.training_trade_sample_count
-        || 0
-    );
-    const completedLocalTrade = Number(
-        local.phase3_clean_trainable_trade_sample_count
-        || local.completed_trade_sample_count
-        || trainingLocalTrade
-    );
-    const configuredLimit = Number(
-        ml.training_shadow_sample_limit || local.training_shadow_sample_limit
-    );
-    const limit = Number.isFinite(configuredLimit) && configuredLimit > 0
+    const trainingMl = mlFirstNumber(ml, [
+        'phase3_clean_trainable_shadow_sample_count',
+        'training_shadow_sample_count',
+    ]);
+    const completedMl = mlFirstNumber(ml, [
+        'phase3_clean_completed_shadow_sample_count',
+        'completed_shadow_sample_count',
+    ]);
+    const trainingLocal = mlFirstNumber(local, [
+        'phase3_clean_trainable_shadow_sample_count',
+        'training_shadow_sample_count',
+    ]);
+    const completedLocal = mlFirstNumber(local, [
+        'phase3_clean_completed_shadow_sample_count',
+        'completed_shadow_sample_count',
+    ]);
+    const trainingLocalTrade = mlFirstNumber(local, [
+        'phase3_clean_trainable_trade_sample_count',
+        'training_trade_sample_count',
+    ]);
+    const completedLocalTrade = mlFirstNumber(local, [
+        'phase3_clean_completed_trade_sample_count',
+        'completed_trade_sample_count',
+    ]);
+    const configuredLimit = mlFirstNumber(ml, ['training_shadow_sample_limit'])
+        ?? mlFirstNumber(local, ['training_shadow_sample_limit']);
+    const limit = configuredLimit !== null && configuredLimit > 0
         ? configuredLimit
         : null;
-    const newCount = Number(
-        ml.phase3_new_shadow_sample_count
-        || local.phase3_new_shadow_sample_count
-        || Math.max(completedMl - Number(autoLast.previous_phase3_sample_count || trainingMl || 0), 0)
-    );
+    let newCount = mlFirstNumber(ml, ['phase3_new_shadow_sample_count', 'new_shadow_sample_count'])
+        ?? mlFirstNumber(local, ['phase3_new_shadow_sample_count', 'new_shadow_sample_count']);
+    const previousCount = mlFirstNumber(autoLast, ['previous_phase3_sample_count'])
+        ?? trainingMl;
+    if (newCount === null && completedMl !== null && previousCount !== null) {
+        newCount = Math.max(completedMl - previousCount, 0);
+    }
     return {
         trainingMl,
         completedMl,
@@ -4262,7 +4312,7 @@ function mlSampleCounts() {
 }
 
 function mlSampleCountLabel(value) {
-    return Number.isFinite(value) ? String(value) : '缺失 / 未评估';
+    return value !== null && Number.isFinite(value) ? String(value) : '缺失 / 未评估';
 }
 
 function mlWinBar(label, value, tone = 'muted') {
@@ -4401,6 +4451,60 @@ function mlDecisionAlignment(record, prediction) {
     return '方向不一致';
 }
 
+function mlPredictionEconomicsHtml(record, prediction) {
+    const economics = record?.prediction_economics || {};
+    const distribution = standardizedReturnDistribution(prediction, prediction?.best_side);
+    const productionDistribution = economics.return_distribution_contract || {};
+    const cost = economics.execution_cost || {};
+    const breakdown = economics.cost_and_return_breakdown || {};
+    const blockers = Array.isArray(economics.blockers) ? economics.blockers : [];
+    const metric = (label, value) => `
+        <div class="ml-prediction-metric">
+            <span>${escHtml(label)}</span>
+            <strong>${escHtml(value)}</strong>
+        </div>`;
+    const distributionMetrics = [
+        metric('原始期望', distributionPctLabel(distribution?.raw_expected_return_pct)),
+        metric('目标期望', distributionPctLabel(distribution?.objective_expected_return_pct)),
+        metric('收益下界', distributionPctLabel(distribution?.lower_quantile_return_pct)),
+        metric('不确定性', distributionPctLabel(distribution?.uncertainty_penalty_pct ?? distribution?.dispersion_pct)),
+        metric('尾损概率', distributionProbabilityLabel(distribution?.tail_loss_probability)),
+        metric('尾损尺度', distributionPctLabel(distribution?.tail_loss_scale_pct)),
+    ];
+    const costRows = [
+        ['往返手续费', cost.fee_pct],
+        ['实时滑点', cost.slippage_pct],
+        ['盘口价差', cost.spread_pct],
+        ['流动性惩罚', cost.liquidity_penalty_pct],
+        ['失衡惩罚', cost.imbalance_penalty_pct],
+        ['订单冲击', cost.market_impact_pct],
+        ['实时总成本', cost.total_pct],
+        ['反事实成本期望', breakdown.historical_counterfactual_cost_expected_pct],
+        ['反事实成本不确定性', breakdown.historical_counterfactual_cost_uncertainty_pct],
+        ['权威滑点尾部增量', breakdown.authoritative_slippage_tail_excess_pct],
+    ];
+    const contractReady = economics.available === true
+        && distribution?.production_eligible === true
+        && economics.production_eligible === true;
+    return `
+        <div class="ml-prediction-contract ${contractReady ? 'ready' : 'blocked'}">
+            <div class="ml-prediction-contract-head">
+                <strong>收益分布与逐项成本</strong>
+                <span>${contractReady ? '生产合同完整' : '仅观察 / 已阻断'}</span>
+            </div>
+            <div class="ml-prediction-distribution">${distributionMetrics.join('')}</div>
+            <div class="ml-prediction-costs">
+                ${costRows.map(([label, value]) => `<span><b>${escHtml(label)}</b>${distributionPctLabel(value)}</span>`).join('')}
+            </div>
+            <div class="ml-prediction-provenance">
+                <span>生产净收益 ${distributionPctLabel(productionDistribution.raw_expected_return_pct ?? breakdown.net_pct)}</span>
+                <span>生产收益下界 ${distributionPctLabel(productionDistribution.objective_expected_return_pct)}</span>
+                <span>成本扣除次数 ${mlSampleCountLabel(mlOptionalNumber(breakdown.cost_deduction_count))}</span>
+            </div>
+            ${blockers.length ? `<div class="ml-prediction-blockers">阻断：${blockers.map(item => escHtml(item)).join(' / ')}</div>` : ''}
+        </div>`;
+}
+
 function renderMLSignalRecent() {
     const container = document.getElementById('ml-signal-recent');
     const countEl = document.getElementById('ml-signal-recent-count');
@@ -4429,8 +4533,8 @@ function renderMLSignalRecent() {
                         <th>ML倾向</th>
                         <th>做多预期</th>
                         <th>做空预期</th>
-                        <th>预期收益</th>
-                        <th>过滤结论</th>
+                        <th>收益分布与成本</th>
+                        <th>生产结论</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -4452,7 +4556,7 @@ function renderMLSignalRecent() {
                                 <td><span class="analysis-pill analysis-pill-${tone}">${mlSideLabel(pred.best_side)} ${distributionPctLabel(bestDistribution?.objective_expected_return_pct)}</span></td>
                                 <td>${distributionPctLabel(longDistribution?.raw_expected_return_pct)}<div style="font-size:10px;color:var(--text-muted);">目标 ${distributionPctLabel(longDistribution?.objective_expected_return_pct)} · 下界 ${distributionPctLabel(longDistribution?.lower_quantile_return_pct)} · 胜率诊断 ${pctLabel(longRate)}</div></td>
                                 <td>${distributionPctLabel(shortDistribution?.raw_expected_return_pct)}<div style="font-size:10px;color:var(--text-muted);">目标 ${distributionPctLabel(shortDistribution?.objective_expected_return_pct)} · 下界 ${distributionPctLabel(shortDistribution?.lower_quantile_return_pct)} · 胜率诊断 ${pctLabel(shortRate)}</div></td>
-                                <td style="white-space:nowrap;">${distributionPctLabel(bestDistribution?.objective_expected_return_pct)}</td>
+                                <td>${mlPredictionEconomicsHtml(record, pred)}</td>
                                 <td style="max-width:260px;">${escHtml(mlDecisionAlignment(record, pred))}<div style="font-size:10px;color:var(--text-muted);margin-top:4px;">${escHtml(signal.suggestion || signal.note || '盈亏质量过滤')}</div></td>
                             </tr>`;
                     }).join('')}
@@ -7805,6 +7909,9 @@ async function fetchPositions() {
     if (requestToken !== positionsRequestToken) return;
     state.positionsPage = data.page || state.positionsPage;
     state.positionsTotal = data.total || 0;
+    state.openPositions = data.positions || [];
+    state.protectionInventory = data.protection_inventory || null;
+    renderPositionProtectionInventory();
     renderOpenPositionsTable(data.positions || [], state.positionsPage, data.total_pages || 1, data.total || 0);
     const badge = document.getElementById('position-badge');
     if (badge) {
@@ -7812,6 +7919,42 @@ async function fetchPositions() {
         badge.textContent = total;
         badge.style.display = total > 0 ? '' : 'none';
     }
+}
+
+function positionProtectionInventoryWarnings(inventory) {
+    const missing = Array.isArray(inventory.missing_keys) ? inventory.missing_keys : [];
+    const orphan = Array.isArray(inventory.orphan_keys) ? inventory.orphan_keys : [];
+    const mismatch = Array.isArray(inventory.coverage_mismatches) ? inventory.coverage_mismatches : [];
+    const repairBlockers = Array.isArray(inventory.repair_blockers) ? inventory.repair_blockers : [];
+    const invalidCount = mlOptionalNumber(inventory.invalid_order_count);
+    return [...new Set([
+        ...missing.map(key => `缺失 ${Array.isArray(key) ? key.join(' ') : key}`),
+        ...orphan.map(key => `孤儿 ${Array.isArray(key) ? key.join(' ') : key}`),
+        ...mismatch.map(item => `数量不一致 ${item.symbol || '-'} ${item.side || '-'}`),
+        ...(invalidCount !== null && invalidCount > 0 ? [`无效保护单 ${invalidCount} 张`] : []),
+        ...repairBlockers.map(item => `修复阻断 ${item}`),
+    ])];
+}
+
+function renderPositionProtectionInventory() {
+    const container = document.getElementById('positions-protection-status');
+    if (!container) return;
+    const inventory = state.protectionInventory || {};
+    if (inventory.available !== true) {
+        const blockers = Array.isArray(inventory.blockers) ? inventory.blockers : [];
+        container.className = 'positions-protection-status blocked';
+        container.innerHTML = `<strong>OKX OCO 证据不可用</strong><span>${blockers.length ? blockers.map(item => escHtml(item)).join(' / ') : '保护快照尚未返回；不能把缺失显示为 0。'}</span>`;
+        return;
+    }
+    const warnings = positionProtectionInventoryWarnings(inventory);
+    const splitCoverage = Array.isArray(inventory.split_coverage_keys)
+        ? inventory.split_coverage_keys : [];
+    container.className = `positions-protection-status ${warnings.length ? 'warn' : 'ready'}`;
+    container.innerHTML = `
+        <strong>OKX OCO：持仓 ${mlSampleCountLabel(mlOptionalNumber(inventory.position_count))} · 保护单 ${mlSampleCountLabel(mlOptionalNumber(inventory.protection_order_count))}</strong>
+        <span>${warnings.length ? warnings.map(item => escHtml(item)).join(' / ') : '数量覆盖检查通过，未发现缺失、孤儿、无效或重复覆盖。'}</span>
+        ${splitCoverage.length ? `<span>精确分片覆盖：${splitCoverage.map(key => escHtml(Array.isArray(key) ? key.join(' ') : key)).join(' / ')}</span>` : ''}
+        <em>${escHtml(inventory.contract_version || '合同版本缺失')} · ${escHtml(inventory.inventory_fingerprint || '指纹缺失')}</em>`;
 }
 
 async function fetchPositionHistory() {
@@ -7831,7 +7974,7 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
         if (pagination) pagination.style.display = 'none';
         return;
     }
-    tbody.innerHTML = positions.map(p => {
+    tbody.innerHTML = positions.map((p, positionIndex) => {
         const pnl = Number(p.unrealized_pnl || 0);
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
         const positionId = Number(p.id || 0);
@@ -7850,6 +7993,12 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             `data-side="${escHtml(p.side || '')}"`,
             'title="手动平掉该持仓"',
         ].filter(Boolean).join(' ');
+        const riskBlockers = Array.isArray(p.risk_contract?.blockers) ? p.risk_contract.blockers : [];
+        const protectionBlockers = Array.isArray(p.protection_contract?.blockers) ? p.protection_contract.blockers : [];
+        const evidenceReady = p.risk_contract?.available === true
+            && p.protection_contract?.available === true
+            && !riskBlockers.length
+            && !protectionBlockers.length;
         return `
         <tr>
             <td>${escHtml(p.symbol || '-')}</td>
@@ -7862,7 +8011,13 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             <td>${p.take_profit ? fmtPrice(p.take_profit) : '-'}</td>
             <td>${p.stop_loss ? fmtPrice(p.stop_loss) : '-'}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.opened_at)}</td>
-            <td><button ${closeButtonAttrs}>${closeLabel}</button></td>
+            <td>
+                <div class="position-action-stack">
+                    <button class="btn btn-sm js-position-evidence" data-position-index="${positionIndex}">查看证据</button>
+                    <span class="position-evidence-state ${evidenceReady ? 'ok' : 'warn'}">${evidenceReady ? '风险/OCO 完整' : '存在证据阻断'}</span>
+                    <button ${closeButtonAttrs}>${closeLabel}</button>
+                </div>
+            </td>
         </tr>`;
     }).join('');
     renderPagination('positions-pagination', page, totalPages, totalItems, 'changePositionsPage');
@@ -7930,6 +8085,100 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
         </tr>`;
     }).join('');
     renderPagination('position-history-pagination', page, totalPages, totalItems, 'changePositionHistoryPage');
+}
+
+function positionEvidenceValue(value, suffix = '') {
+    const number = mlOptionalNumber(value);
+    return number === null ? '证据缺失' : `${number.toFixed(4)}${suffix}`;
+}
+
+function positionEvidenceBlockers(blockers) {
+    const values = Array.isArray(blockers) ? blockers.filter(Boolean) : [];
+    return values.length
+        ? `<div class="position-evidence-blockers">阻断：${values.map(item => escHtml(item)).join(' / ')}</div>`
+        : '';
+}
+
+function openPositionEvidenceModal(positionIndex) {
+    const position = (state.openPositions || [])[Number(positionIndex)];
+    if (!position) return;
+    const riskEnvelope = position.risk_contract || {};
+    const contracts = Array.isArray(riskEnvelope.contracts) ? riskEnvelope.contracts : [];
+    const protection = position.protection_contract || {};
+    const protectionOrders = Array.isArray(protection.orders) ? protection.orders : [];
+    const inventory = state.protectionInventory || {};
+    const title = document.getElementById('position-linked-orders-modal-title');
+    const body = document.getElementById('position-linked-orders-modal-body');
+    const overlay = document.getElementById('position-linked-orders-modal-overlay');
+    if (!body || !overlay) return;
+    if (title) title.textContent = `${position.symbol || '-'} ${sideLabel(position.side)} · 风险与 OCO 证据`;
+
+    const riskHtml = contracts.length
+        ? contracts.map(contract => {
+            const portfolio = contract.portfolio_risk_snapshot || {};
+            const adjustments = Array.isArray(contract.adjustment_reasons)
+                ? contract.adjustment_reasons : [];
+            return `
+                <article class="position-evidence-contract">
+                    <div class="position-evidence-contract-head">
+                        <strong>独立风险合同 · 决策 #${escHtml(contract.decision_id || '-')}</strong>
+                        <span class="position-evidence-state ${contract.production_eligible ? 'ok' : 'warn'}">${contract.production_eligible ? '执行时有效' : '合同未通过'}</span>
+                    </div>
+                    <div class="position-evidence-grid">
+                        <div><span>独立风险预算</span><strong>${positionEvidenceValue(contract.risk_budget_usdt, ' U')}</strong></div>
+                        <div><span>计划压力损失</span><strong>${positionEvidenceValue(contract.planned_stressed_loss_usdt, ' U')}</strong></div>
+                        <div><span>压力损失距离</span><strong>${distributionProbabilityLabel(contract.stressed_loss_fraction)}</strong></div>
+                        <div><span>目标 notional</span><strong>${positionEvidenceValue(contract.target_notional_usdt, ' U')}</strong></div>
+                        <div><span>最终 notional</span><strong>${positionEvidenceValue(contract.final_notional_usdt, ' U')}</strong></div>
+                        <div><span>预期费后收益</span><strong>${distributionPctLabel(contract.expected_net_return_pct)}</strong></div>
+                        <div><span>组合风险预算</span><strong>${positionEvidenceValue(contract.portfolio_risk_budget_usdt, ' U')}</strong></div>
+                        <div><span>组合已占压力损失</span><strong>${positionEvidenceValue(contract.current_portfolio_stressed_loss_usdt ?? portfolio.current_stressed_loss_usdt, ' U')}</strong></div>
+                        <div><span>组合剩余风险预算</span><strong>${positionEvidenceValue(contract.remaining_portfolio_risk_budget_usdt, ' U')}</strong></div>
+                        <div><span>组合总 notional</span><strong>${positionEvidenceValue(portfolio.gross_notional_usdt, ' U')}</strong></div>
+                        <div><span>同方向 notional</span><strong>${positionEvidenceValue(portfolio.same_side_notional_usdt, ' U')}</strong></div>
+                        <div><span>方向集中度</span><strong>${distributionProbabilityLabel(portfolio.direction_concentration)}</strong></div>
+                    </div>
+                    <div class="position-evidence-reasons"><b>调整原因</b><span>${adjustments.length ? adjustments.map(item => escHtml(item)).join(' / ') : '目标与最终仓位一致，无下游缩减记录'}</span></div>
+                    <div class="position-evidence-provenance"><span>版本 ${escHtml(contract.contract_version || '缺失')}</span><span>指纹 ${escHtml(contract.policy_provenance?.contract_fingerprint || '缺失')}</span></div>
+                    ${positionEvidenceBlockers(contract.blockers)}
+                </article>`;
+        }).join('')
+        : `<div class="position-evidence-empty">无法追溯入场订单对应的独立风险合同。${positionEvidenceBlockers(riskEnvelope.blockers)}</div>`;
+
+    const protectionHtml = protectionOrders.length
+        ? protectionOrders.map(order => `
+            <article class="position-protection-order">
+                <div><span>OKX algo ID</span><strong>${escHtml(order.algo_id || '证据缺失')}</strong></div>
+                <div><span>状态</span><strong>${escHtml(order.state || '证据缺失')}</strong></div>
+                <div><span>止损触发价</span><strong>${order.stop_loss_price == null ? '证据缺失' : fmtPrice(order.stop_loss_price)}</strong></div>
+                <div><span>止盈触发价</span><strong>${order.take_profit_price == null ? '证据缺失' : fmtPrice(order.take_profit_price)}</strong></div>
+                <div><span>移动触发价</span><strong>${order.trigger_price == null ? '未设置' : fmtPrice(order.trigger_price)}</strong></div>
+                <div><span>保护合约数</span><strong>${positionEvidenceValue(order.contracts)}</strong></div>
+                <div><span>关联订单 ID</span><strong>${escHtml(order.linked_order_id || '证据缺失')}</strong></div>
+                <div><span>唯一性</span><strong>${protection.unique ? '唯一一张' : protection.split_coverage ? `精确分片 ${protection.order_count ?? protectionOrders.length} 张` : `异常多张 ${protection.order_count ?? protectionOrders.length} 张`}</strong></div>
+            </article>`).join('')
+        : '<div class="position-evidence-empty">没有加载到该持仓的 OKX 原生 OCO/止盈止损保护单。</div>';
+
+    const inventoryWarnings = positionProtectionInventoryWarnings(inventory);
+    body.innerHTML = `
+        <div class="position-evidence-summary">
+            <div><strong>${escHtml(position.symbol || '-')}</strong><span>OKX 当前持仓</span></div>
+            <div><strong>${positionEvidenceValue(position.quantity)}</strong><span>持仓数量</span></div>
+            <div><strong>${positionEvidenceValue(position.unrealized_pnl, ' U')}</strong><span>当前浮盈亏</span></div>
+            <div><strong>${riskEnvelope.available === true ? '已关联' : '缺失'}</strong><span>风险合同</span></div>
+            <div><strong>${protection.available === true ? `${protection.order_count ?? 0} 张` : '读取失败'}</strong><span>OKX 保护</span></div>
+        </div>
+        ${positionEvidenceBlockers([...(riskEnvelope.blockers || []), ...(protection.blockers || [])])}
+        <section class="position-evidence-section"><h3>风险预算与仓位调整</h3>${riskHtml}</section>
+        <section class="position-evidence-section"><h3>OKX OCO / 保护生命周期</h3>${protectionHtml}</section>
+        <section class="position-evidence-section"><h3>全账户保护告警</h3>
+            ${inventory.available === false
+                ? positionEvidenceBlockers(inventory.blockers)
+                : inventoryWarnings.length
+                    ? `<div class="position-evidence-blockers">${inventoryWarnings.map(item => escHtml(item)).join(' / ')}</div>`
+                    : '<div class="position-evidence-ok">当前快照未发现孤儿或多张保护方向。</div>'}
+        </section>`;
+    overlay.style.display = 'flex';
 }
 
 function openPositionLinkedOrdersModal(groupId) {
@@ -8010,6 +8259,12 @@ function initPositionActions() {
     if (!tbody || tbody.dataset.closeHandlerAttached === '1') return;
     tbody.dataset.closeHandlerAttached = '1';
     tbody.addEventListener('click', (event) => {
+        const evidenceButton = event.target?.closest?.('.js-position-evidence');
+        if (evidenceButton && tbody.contains(evidenceButton)) {
+            event.preventDefault();
+            openPositionEvidenceModal(Number(evidenceButton.dataset.positionIndex || 0));
+            return;
+        }
         const button = event.target?.closest?.('.js-close-position');
         if (!button || !tbody.contains(button)) return;
         event.preventDefault();
@@ -9118,6 +9373,89 @@ function renderReadableTrainableModelCard(model) {
         </div>`;
 }
 
+function mlEvidenceValue(value, suffix = '') {
+    if (value === null || value === undefined || value === '') return '证据缺失';
+    return `${value}${suffix}`;
+}
+
+function mlEvidenceRow(label, value, tone = '') {
+    return `<div class="ml-evidence-row ${tone}"><span>${escHtml(label)}</span><strong>${escHtml(value)}</strong></div>`;
+}
+
+function mlLocalEvidenceHtml(status) {
+    const quality = status.quality_report || {};
+    const totals = quality.totals || {};
+    const byKind = quality.by_kind || {};
+    const shadow = byKind.shadow || {};
+    const trade = byKind.trade || {};
+    const reasons = Array.isArray(quality.top_reasons) ? quality.top_reasons : [];
+    const diagnostics = quality.training_view_diagnostics || {};
+    const symbolInfluence = Array.isArray(diagnostics.leave_one_symbol_out)
+        ? diagnostics.leave_one_symbol_out : [];
+    const registry = status.artifact_registry || {};
+    const manifest = registry.manifest || {};
+    const activation = status.artifact_activation_manifest
+        || registry.activation_manifest
+        || {};
+    const walkForward = status.walk_forward_report || {};
+    const symbolStability = status.leave_one_symbol_out_report || {};
+    const readiness = status.readiness || {};
+    const blockers = Array.isArray(readiness.blocking_reasons)
+        ? readiness.blocking_reasons : [];
+    const authoritative = status.authoritative_trade_return_evidence || {};
+    const fingerprint = quality.market_fact_contract?.provenance?.data_fingerprint
+        || diagnostics.provenance?.data_fingerprint
+        || status.training_data_sha256;
+    const evidenceSections = [
+        `<section class="ml-evidence-panel">
+            <div class="ml-evidence-head"><strong>数据版本与样本分布</strong><span>${escHtml(quality.data_quality_version || '版本缺失')}</span></div>
+            ${mlEvidenceRow('数据指纹', mlEvidenceValue(fingerprint))}
+            ${mlEvidenceRow('全部 / 纳入 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(totals.total))} / ${mlSampleCountLabel(mlOptionalNumber(totals.included))} / ${mlSampleCountLabel(mlOptionalNumber(totals.excluded))}`)}
+            ${mlEvidenceRow('影子样本 原始 / 纳入 / 降权 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(shadow.total))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.included))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.downweighted))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.excluded))}`)}
+            ${mlEvidenceRow('真实成交 纳入 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(trade.included))} / ${mlSampleCountLabel(mlOptionalNumber(trade.excluded))}`)}
+        </section>`,
+        `<section class="ml-evidence-panel ${reasons.length ? 'warn' : ''}">
+            <div class="ml-evidence-head"><strong>隔离与降权原因</strong><span>${reasons.length ? `${reasons.length} 类` : '无已报告原因'}</span></div>
+            <div class="ml-evidence-list">${reasons.length
+                ? reasons.slice(0, 8).map(item => mlEvidenceRow(item.reason || '未知原因', mlSampleCountLabel(mlOptionalNumber(item.count)), 'warn')).join('')
+                : '<div class="ml-evidence-empty">当前 artifact 未报告隔离或降权原因。</div>'}</div>
+        </section>`,
+        `<section class="ml-evidence-panel">
+            <div class="ml-evidence-head"><strong>单币种影响重算</strong><span>${symbolInfluence.length ? `${symbolInfluence.length} 个币种` : '未评估'}</span></div>
+            <div class="ml-evidence-list">${symbolInfluence.length
+                ? symbolInfluence.slice(0, 8).map(item => mlEvidenceRow(
+                    item.symbol || '未知币种',
+                    `样本 ${mlSampleCountLabel(mlOptionalNumber(item.sample_count))} · 去除后变化 ${distributionPctLabel(item.best_return_mean_delta_pct)}`,
+                )).join('')
+                : '<div class="ml-evidence-empty">缺少逐币移除重算证据，不能把符号影响显示为 0。</div>'}</div>
+        </section>`,
+        `<section class="ml-evidence-panel">
+            <div class="ml-evidence-head"><strong>Artifact manifest</strong><span>${escHtml(status.artifact_lifecycle || '生命周期缺失')}</span></div>
+            ${mlEvidenceRow('Artifact 版本', mlEvidenceValue(registry.version || manifest.artifact_version || status.artifact_version))}
+            ${mlEvidenceRow('Artifact SHA256', mlEvidenceValue(registry.sha256 || manifest.artifact_sha256 || status.artifact_sha256))}
+            ${mlEvidenceRow('训练数据 SHA256', mlEvidenceValue(status.training_data_sha256))}
+            ${mlEvidenceRow('源码 SHA256', mlEvidenceValue(status.source_code_sha256))}
+            ${mlEvidenceRow('Manifest 路径', mlEvidenceValue(registry.manifest_path || status.artifact_manifest_path))}
+        </section>`,
+        `<section class="ml-evidence-panel ${activation.production_influence_authorized === true ? '' : 'warn'}">
+            <div class="ml-evidence-head"><strong>晋升与激活证据</strong><span>${activation.production_influence_authorized === true ? '已授权' : '未授权'}</span></div>
+            ${mlEvidenceRow('激活阶段', mlEvidenceValue(activation.activation_stage || status.artifact_lifecycle))}
+            ${mlEvidenceRow('Walk-forward', mlEvidenceValue(walkForward.status))}
+            ${mlEvidenceRow('滚动折数', mlSampleCountLabel(mlOptionalNumber(walkForward.folds?.length)))}
+            ${mlEvidenceRow('做多移除单币稳定', mlEvidenceValue(symbolStability.long?.stable))}
+            ${mlEvidenceRow('做空移除单币稳定', mlEvidenceValue(symbolStability.short?.stable))}
+            ${mlEvidenceRow('权威成交指纹', mlEvidenceValue(authoritative.data_fingerprint))}
+        </section>`,
+        `<section class="ml-evidence-panel ${blockers.length ? 'bad' : ''}">
+            <div class="ml-evidence-head"><strong>当前晋升阻断</strong><span>${blockers.length ? `${blockers.length} 项` : '无阻断'}</span></div>
+            <div class="ml-evidence-list">${blockers.length
+                ? blockers.slice(0, 10).map(item => mlEvidenceRow(item.code || '未命名阻断', item.message || mlEvidenceValue(item.actual), 'bad')).join('')
+                : mlEvidenceRow('Readiness', readiness.state || status.readiness_state || '证据缺失')}</div>
+        </section>`,
+    ];
+    return `<div class="ml-evidence-grid">${evidenceSections.join('')}</div>`;
+}
+
 function renderMLSignalOverview() {
     const container = document.getElementById('ml-signal-overview');
     const updatedEl = document.getElementById('ml-signal-updated');
@@ -9138,6 +9476,20 @@ function renderMLSignalOverview() {
     const samples = mlSampleCounts();
     const readiness = status.readiness || {};
     const readinessMetrics = readiness.metrics || {};
+    const trainDecisionGroupCount = mlOptionalNumber(status.train_decision_group_count);
+    const testDecisionGroupCount = mlOptionalNumber(status.test_decision_group_count);
+    const splitEvidenceAvailable = trainDecisionGroupCount !== null && testDecisionGroupCount !== null;
+    const readinessDistributionAvailable = status.available === true
+        && Boolean(readinessMetrics.training_data_version);
+    const dirtySampleRatioLabel = readinessDistributionAvailable
+        ? distributionProbabilityLabel(readinessMetrics.dirty_sample_ratio)
+        : '缺失 / 未评估';
+    const quarantinedSampleCount = readinessDistributionAvailable
+        ? mlOptionalNumber(readinessMetrics.quarantined_sample_count)
+        : null;
+    const downweightedSampleCount = readinessDistributionAvailable
+        ? mlOptionalNumber(readinessMetrics.downweighted_sample_count)
+        : null;
     const readinessBlockers = Array.isArray(readiness.blocking_reasons) ? readiness.blocking_reasons : [];
     const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
     const allowLivePositionInfluence = status.allow_live_position_influence === true;
@@ -9147,8 +9499,8 @@ function renderMLSignalOverview() {
     const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
     const readinessReasonText = readinessBlockers.length
         ? readinessBlockers.slice(0, 4).map(item => item?.message || item?.code || '').filter(Boolean).join('；')
-        : '当前没有 readiness 阻塞项';
-    const prAucText = `${monitorNumber(readinessMetrics.long_pr_auc, 3)} / ${monitorNumber(readinessMetrics.short_pr_auc, 3)}`;
+        : Object.keys(readiness).length ? '当前没有 readiness 阻塞项' : 'Readiness 证据缺失';
+    const prAucText = `${mlEvidenceValue(mlOptionalNumber(readinessMetrics.long_pr_auc))} / ${mlEvidenceValue(mlOptionalNumber(readinessMetrics.short_pr_auc))}`;
     const latestText = latestRecord
         ? `${toBeijingTime(latestRecord.created_at)} ${latestRecord.symbol || '-'}`
         : '暂无最近预测';
@@ -9191,16 +9543,17 @@ function renderMLSignalOverview() {
             ${mlMetricCard('影子市场机会样本', mlSampleCountLabel(samples.mlShadowMarket), '不代表实际成交或真实费后收益', Number.isFinite(samples.mlShadowMarket) ? 'good' : 'warn')}
             ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
             ${mlMetricCard('OKX 实际费后收益样本', mlSampleCountLabel(samples.mlActualReturn), '只统计可信已平仓生命周期', Number.isFinite(samples.mlActualReturn) ? 'good' : 'warn')}
-            ${mlMetricCard('训练/留出分组', `${Number(status.train_decision_group_count || 0)} / ${Number(status.test_decision_group_count || 0)}`, '同一 decision 不得跨训练和留出集', 'good')}
-            ${mlMetricCard('脏样本比例', pctLabel(readinessMetrics.dirty_sample_ratio, 1), `隔离 ${Number(readinessMetrics.quarantined_sample_count || 0)} / 降权 ${Number(readinessMetrics.downweighted_sample_count || 0)}`, readinessTone)}
+            ${mlMetricCard('训练/留出分组', `${mlSampleCountLabel(trainDecisionGroupCount)} / ${mlSampleCountLabel(testDecisionGroupCount)}`, '同一 decision 不得跨训练和留出集', splitEvidenceAvailable ? 'good' : 'warn')}
+            ${mlMetricCard('脏样本比例', dirtySampleRatioLabel, `隔离 ${mlSampleCountLabel(quarantinedSampleCount)} / 降权 ${mlSampleCountLabel(downweightedSampleCount)}`, readinessDistributionAvailable ? readinessTone : 'warn')}
             ${mlMetricCard('PR-AUC 多/空（诊断）', prAucText, '仅观察分类器，不参与 ready、评分或晋升', 'muted')}
-            ${mlMetricCard('三期新增未训练样本', String(samples.newCount), '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', 'muted')}
+            ${mlMetricCard('三期新增未训练样本', mlSampleCountLabel(samples.newCount), status.sample_count_blocker || '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', status.sample_count_blocker ? 'bad' : 'muted')}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} ${distributionSummaryText(latestDistribution)}` : '等待新分析', latestDistribution && Number(latestDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn')}
             ${mlMetricCard('正目标期望数量', `${strongSignals} / ${records.length}`, '最近记录里标准合同目标期望为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
-            ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || '-', `要求 ${readinessMetrics.required_training_data_version || '-'}`, readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
+            ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || status.quality_report?.data_quality_version || '证据缺失', `要求 ${readinessMetrics.required_training_data_version || '证据缺失'}`, readinessMetrics.training_data_version && readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
             ${mlMetricCard('训练窗口配置', samples.limit === null ? '未公开' : String(samples.limit), '这是训练数据窗口，不是收益、仓位或生产准入阈值', 'muted')}
-        </div>`;
+        </div>
+        ${mlLocalEvidenceHtml(status)}`;
 }
 
 function renderLocalAIToolsStatus() {
@@ -9255,15 +9608,15 @@ function renderLocalAIToolsStatus() {
         },
         {
             label: '序列样本',
-            value: String(Number(status.sequence_sample_count || 0)),
+            value: mlSampleCountLabel(mlOptionalNumber(status.sequence_sample_count)),
             subtitle: models.deep_timeseries || models.timeseries || '用于多周期行情预测',
-            tone: Number(status.sequence_sample_count || 0) > 0 ? 'good' : 'warn',
+            tone: mlOptionalNumber(status.sequence_sample_count) !== null ? 'good' : 'warn',
         },
         {
             label: '文本情绪样本',
-            value: String(Number(status.text_sentiment_sample_count || 0)),
+            value: mlSampleCountLabel(mlOptionalNumber(status.text_sentiment_sample_count)),
             subtitle: models.deep_sentiment || models.sentiment || '用于新闻/公告/情绪校准',
-            tone: Number(status.text_sentiment_sample_count || 0) > 0 ? 'good' : 'warn',
+            tone: mlOptionalNumber(status.text_sentiment_sample_count) !== null ? 'good' : 'warn',
         },
     ];
 
@@ -9308,7 +9661,7 @@ function renderTrainableModels() {
         ready: Boolean(model.runtime_available && model.identity_verified),
         statusLabel: lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
         description: `任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
-        samples: `${Number(model.sample_count || 0)} 条可追溯样本`,
+        samples: `${mlSampleCountLabel(mlOptionalNumber(model.sample_count))} 条可追溯样本`,
         trainedAt: model.trained_at ? toBeijingTime(model.trained_at) : '-',
         usage: model.live_influence ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
         metrics: [

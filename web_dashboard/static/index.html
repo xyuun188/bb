@@ -18,8 +18,8 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260705-official-settlement-badge">
-    <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260714-runtime-prior-clarity">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260715-profit-evidence">
+<link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260715-profit-evidence">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
@@ -358,6 +358,7 @@
                     <span class="card-subtitle" id="positions-mode-label">模拟盘</span>
                     <button class="btn btn-sm" id="close-all-positions-btn" onclick="closeAllOpenPositions()" style="margin-left:auto;color:var(--red);border-color:var(--red);">一键平仓</button>
                 </div>
+                <div id="positions-protection-status" class="positions-protection-status">正在读取 OKX OCO 保护快照...</div>
                 <div class="table-wrap">
                     <table>
                         <thead>
@@ -372,7 +373,7 @@
                                 <th>止盈价</th>
                                 <th>止损价</th>
                                 <th>开仓时间</th>
-                                <th>操作</th>
+                                <th>风险 / OCO / 操作</th>
                             </tr>
                         </thead>
                         <tbody id="positions-tbody">
@@ -783,7 +784,7 @@
                                 <span class="strategy-learning-stage-kicker">03 · Audit Trail</span>
                                 <strong>执行审计轨迹</strong>
                             </div>
-                            <p>把事件覆盖、自动回滚和最近策略事件放在一起，方便追踪问题从哪里开始。</p>
+                            <p>把事件覆盖、实际匹配和治理拒绝放在一起，明确历史先验是否真正参与过决策。</p>
                         </div>
                         <div class="strategy-learning-grid strategy-learning-grid-wide strategy-learning-grid-audit">
                         <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-events">
@@ -795,8 +796,8 @@
                         </div>
                         <div class="opening-funnel-panel strategy-learning-panel strategy-learning-panel-guard">
                             <div class="analysis-section-head">
-                                <span class="analysis-section-title">自动回滚护栏</span>
-                                <span class="analysis-section-subtitle">亏损、fallback、执行异常</span>
+                                <span class="analysis-section-title">先验治理状态</span>
+                                <span class="analysis-section-subtitle">只读先验不能授权开仓或仓位</span>
                             </div>
                             <div id="strategy-learning-guard" class="opening-funnel-list"></div>
                         </div>
@@ -909,6 +910,9 @@
                 <div class="pagination" id="expert-memory-pagination" style="display:none;"></div>
                 </div>
                 <div class="tab-panel" id="expert-memory-panel-reflections">
+                <div id="trade-reflection-authority" class="trade-reflection-authority">
+                    正在读取权威成交 outcome 与影子反事实优先级...
+                </div>
                 <div class="table-wrap tab-table-wrap trade-reflection-table-wrap">
                     <table class="trade-reflection-table">
                         <thead>
@@ -918,12 +922,14 @@
                                 <th>方向</th>
                                 <th>盈亏</th>
                                 <th>持仓</th>
+                                <th>权威成交结果</th>
+                                <th>影子反事实</th>
                                 <th>复盘结论</th>
                                 <th>改进建议</th>
                             </tr>
                         </thead>
                         <tbody id="trade-reflection-tbody">
-                            <tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">暂无复盘记录</td></tr>
+                            <tr><td colspan="9" style="color:var(--text-muted);text-align:center;padding:24px;">暂无复盘记录</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1784,7 +1790,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-    <script src="/static/js/dashboard.js?v=20260705-official-settlement-badge"></script>
+    <script src="/static/js/dashboard.js?v=20260715-profit-evidence"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260714-runtime-prior-clarity"></script>
 </body>
 </html>

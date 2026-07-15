@@ -1740,7 +1740,14 @@
     }
 
     .strategy-learning-meta {
-        justify-content: space-between;
+        display: block;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+    }
+
+    .strategy-learning-meta b {
+        display: inline-block;
+        margin-right: 6px;
     }
 
     .strategy-learning-profile-card-stats {

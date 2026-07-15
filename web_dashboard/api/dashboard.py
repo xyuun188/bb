@@ -738,6 +738,93 @@ def _display_opportunity_score(
     return payload
 
 
+def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
+    """Expose the persisted distribution and cost contract without recalculating it."""
+
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    distribution = _safe_dict(opportunity.get("return_distribution_contract"))
+    execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
+    policy = _safe_dict(raw.get("production_return_policy"))
+    if not opportunity:
+        return {
+            "available": False,
+            "blockers": ["production_return_distribution_missing"],
+        }
+    blockers = list(
+        dict.fromkeys(
+            str(value)
+            for value in (
+                (["production_return_distribution_missing"] if not distribution else [])
+                + (["live_execution_cost_missing"] if not execution_cost else [])
+                + (["expected_net_breakdown_missing"] if not breakdown else [])
+                + (["production_return_policy_missing"] if not policy else [])
+                + _safe_list(distribution.get("blockers"))
+                + _safe_list(opportunity.get("blockers"))
+                + ([execution_cost.get("reason")] if execution_cost.get("production_eligible") is not True else [])
+            )
+            if value
+        )
+    )
+    return {
+        "available": bool(distribution and execution_cost and breakdown and policy),
+        "production_eligible": opportunity.get("production_eligible") is True,
+        "side": opportunity.get("side"),
+        "return_distribution_contract": distribution,
+        "execution_cost": {
+            key: execution_cost.get(key)
+            for key in (
+                "fee_pct",
+                "slippage_pct",
+                "total_pct",
+                "spread_pct",
+                "liquidity_penalty_pct",
+                "imbalance_penalty_pct",
+                "market_impact_pct",
+                "order_notional_usdt",
+                "order_size_complete",
+                "slippage_source",
+                "production_eligible",
+                "reason",
+                "policy_provenance",
+            )
+        },
+        "cost_and_return_breakdown": {
+            key: breakdown.get(key)
+            for key in (
+                "formula",
+                "unit",
+                "net_pct",
+                "model_gross_pct",
+                "live_execution_cost_pct",
+                "historical_counterfactual_cost_expected_pct",
+                "historical_counterfactual_cost_uncertainty_pct",
+                "authoritative_slippage_expected_pct",
+                "authoritative_slippage_upper_hinge_pct",
+                "authoritative_slippage_tail_excess_pct",
+                "authoritative_realized_net_expected_pct",
+                "authoritative_realized_net_lower_hinge_pct",
+                "market_uncertainty_pct",
+                "actual_trade_calibration_uncertainty_pct",
+                "cost_deduction_count",
+            )
+        },
+        "production_return_policy": {
+            key: policy.get(key)
+            for key in (
+                "eligible",
+                "reason",
+                "expected_net_return_pct",
+                "return_lcb_pct",
+                "execution_cost_pct",
+                "production_source_count",
+                "policy_provenance",
+            )
+        },
+        "blockers": blockers,
+    }
+
+
 def _side_from_action(action: str | None) -> str:
     value = str(action or "").lower()
     if "short" in value:
@@ -2108,6 +2195,379 @@ def _trading_service_cached_okx_balance_snapshot(mode: str) -> dict[str, Any] | 
     result.pop("balance_error", None)
     result.pop("error_cached", None)
     return result
+
+
+def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
+    raw = _safe_dict(getattr(decision, "raw_llm_response", None))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    decision_id = getattr(decision, "id", None)
+    if not sizing:
+        return {
+            "available": False,
+            "decision_id": decision_id,
+            "blockers": ["profit_risk_sizing_missing"],
+        }
+
+    reconciliations = [
+        {
+            "source": item.get("source"),
+            "generated_at": item.get("generated_at"),
+            "final_notional_usdt": item.get("final_notional_usdt"),
+            "final_leverage": item.get("final_leverage"),
+            "eligible": item.get("eligible"),
+            "reasons": _safe_list(item.get("reasons")),
+        }
+        for item in _safe_list(sizing.get("execution_reconciliations"))
+        if isinstance(item, dict)
+    ]
+    portfolio = _safe_dict(sizing.get("portfolio_risk_snapshot"))
+    provenance = _safe_dict(sizing.get("policy_provenance"))
+    risk_budget = sizing.get("risk_budget_usdt")
+    if risk_budget is None:
+        risk_budget = sizing.get("single_trade_risk_budget_usdt")
+    evidence_gaps = [
+        name
+        for name, value in (
+            ("risk_contract_version_missing", sizing.get("contract_version")),
+            ("independent_risk_budget_missing", risk_budget),
+            ("planned_stressed_loss_missing", sizing.get("planned_stressed_loss_usdt")),
+            ("target_notional_missing", sizing.get("target_notional_usdt")),
+            ("final_notional_missing", sizing.get("final_notional_usdt")),
+            (
+                "portfolio_stressed_loss_missing",
+                sizing.get("current_portfolio_stressed_loss_usdt")
+                if sizing.get("current_portfolio_stressed_loss_usdt") is not None
+                else portfolio.get("current_stressed_loss_usdt"),
+            ),
+            ("portfolio_gross_notional_missing", portfolio.get("gross_notional_usdt")),
+            ("risk_contract_fingerprint_missing", provenance.get("contract_fingerprint")),
+        )
+        if value is None or value == ""
+    ]
+    eligibility_blockers = (
+        [sizing.get("reason") or "profit_risk_sizing_not_production_eligible"]
+        if sizing.get("production_eligible") is not True
+        else []
+    )
+    blockers = list(
+        dict.fromkeys(
+            str(value)
+            for value in (
+                _safe_list(sizing.get("blockers"))
+                + eligibility_blockers
+                + evidence_gaps
+            )
+            if value
+        )
+    )
+    target_notional = _safe_float(sizing.get("target_notional_usdt"), None)
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), None)
+    adjustment_reasons: list[str] = []
+    if (
+        target_notional is not None
+        and final_notional is not None
+        and final_notional < target_notional
+    ):
+        adjustment_reasons.append("final_notional_reduced_from_dynamic_target")
+    for item in reconciliations:
+        source = str(item.get("source") or "").strip()
+        if source:
+            adjustment_reasons.append(source)
+        adjustment_reasons.extend(str(value) for value in item.get("reasons") or [] if value)
+
+    return {
+        "available": not evidence_gaps,
+        "evidence_complete": not evidence_gaps,
+        "evidence_gaps": evidence_gaps,
+        "decision_id": decision_id,
+        "contract_version": sizing.get("contract_version"),
+        "production_eligible": sizing.get("production_eligible") is True,
+        "reason": sizing.get("reason"),
+        "blockers": blockers,
+        "risk_budget_usdt": sizing.get("risk_budget_usdt"),
+        "single_trade_risk_budget_usdt": sizing.get("single_trade_risk_budget_usdt"),
+        "portfolio_risk_budget_usdt": sizing.get("portfolio_risk_budget_usdt"),
+        "remaining_portfolio_risk_budget_usdt": sizing.get(
+            "remaining_portfolio_risk_budget_usdt"
+        ),
+        "current_portfolio_stressed_loss_usdt": sizing.get(
+            "current_portfolio_stressed_loss_usdt"
+        ),
+        "planned_stressed_loss_usdt": sizing.get("planned_stressed_loss_usdt"),
+        "stressed_loss_fraction": sizing.get("stressed_loss_fraction"),
+        "target_notional_usdt": sizing.get("target_notional_usdt"),
+        "final_notional_usdt": sizing.get("final_notional_usdt"),
+        "final_margin_usdt": sizing.get("final_margin_usdt"),
+        "expected_net_return_pct": sizing.get("expected_net_return_pct"),
+        "expected_profit_usdt": sizing.get("expected_profit_usdt"),
+        "portfolio_risk_snapshot": {
+            "current_stressed_loss_usdt": portfolio.get("current_stressed_loss_usdt"),
+            "current_margin_usdt": portfolio.get("current_margin_usdt"),
+            "gross_notional_usdt": portfolio.get("gross_notional_usdt"),
+            "same_side_notional_usdt": portfolio.get("same_side_notional_usdt"),
+            "direction_concentration": portfolio.get("direction_concentration"),
+        },
+        "adjustment_reasons": list(dict.fromkeys(adjustment_reasons)),
+        "execution_reconciliations": reconciliations,
+        "policy_provenance": {
+            "source": provenance.get("source"),
+            "observation_window": provenance.get("observation_window"),
+            "sample_count": provenance.get("sample_count"),
+            "generated_at": provenance.get("generated_at"),
+            "strategy_version": provenance.get("strategy_version"),
+            "fallback_reason": provenance.get("fallback_reason"),
+            "input_fingerprint": provenance.get("input_fingerprint"),
+            "contract_fingerprint": provenance.get("contract_fingerprint"),
+        },
+    }
+
+
+async def _dashboard_open_position_risk_evidence(
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> None:
+    from sqlalchemy import select
+
+    from db.session import get_session_ctx
+    from models.decision import AIDecision
+    from models.trade import Order, Position
+
+    position_ids = {
+        int(position_id)
+        for item in positions
+        for position_id in (
+            _safe_list(item.get("local_position_ids"))
+            or _safe_list(item.get("position_ids"))
+            or [item.get("id")]
+        )
+        if str(position_id or "").isdigit() and int(position_id) > 0
+    }
+    if not position_ids:
+        for item in positions:
+            item["risk_contract"] = {
+                "available": False,
+                "contracts": [],
+                "blockers": ["local_position_lineage_missing"],
+            }
+        return
+
+    async with get_session_ctx() as session:
+        local_rows = list(
+            (
+                await session.execute(select(Position).where(Position.id.in_(position_ids)))
+            )
+            .scalars()
+            .all()
+        )
+        entry_ids_by_position_id = {
+            int(row.id): _dashboard_split_exchange_order_ids(row.entry_exchange_order_id)
+            for row in local_rows
+        }
+        entry_ids = {
+            exchange_id
+            for values in entry_ids_by_position_id.values()
+            for exchange_id in values
+        }
+        order_rows: list[Any] = []
+        if entry_ids:
+            order_stmt = select(Order).where(Order.exchange_order_id.in_(entry_ids))
+            if mode:
+                order_stmt = order_stmt.where(Order.execution_mode == mode)
+            order_rows = list((await session.execute(order_stmt)).scalars().all())
+        orders_by_exchange_id = {
+            exchange_id: order
+            for order in order_rows
+            for exchange_id in _dashboard_split_exchange_order_ids(order.exchange_order_id)
+        }
+        decision_ids = {
+            int(order.decision_id)
+            for order in order_rows
+            if getattr(order, "decision_id", None)
+        }
+        decisions_by_id: dict[int, Any] = {}
+        if decision_ids:
+            decisions_by_id = {
+                int(decision.id): decision
+                for decision in (
+                    await session.execute(
+                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            }
+
+    for item in positions:
+        item_position_ids = [
+            int(value)
+            for value in (
+                _safe_list(item.get("local_position_ids"))
+                or _safe_list(item.get("position_ids"))
+                or [item.get("id")]
+            )
+            if str(value or "").isdigit() and int(value) > 0
+        ]
+        matched_decisions: dict[int, Any] = {}
+        blockers: list[str] = []
+        for position_id in item_position_ids:
+            entry_ids_for_position = entry_ids_by_position_id.get(position_id, set())
+            if not entry_ids_for_position:
+                blockers.append(f"position_{position_id}_entry_order_lineage_missing")
+                continue
+            for entry_id in entry_ids_for_position:
+                order = orders_by_exchange_id.get(entry_id)
+                if order is None:
+                    blockers.append(f"position_{position_id}_entry_order_not_loaded")
+                    continue
+                decision = decisions_by_id.get(int(order.decision_id or 0))
+                if decision is None:
+                    blockers.append(f"entry_order_{entry_id}_decision_not_loaded")
+                    continue
+                matched_decisions[int(decision.id)] = decision
+        contracts = [
+            _dashboard_position_risk_contract(decision)
+            for decision in sorted(
+                matched_decisions.values(),
+                key=lambda value: int(getattr(value, "id", 0) or 0),
+            )
+        ]
+        blockers.extend(
+            blocker
+            for contract in contracts
+            for blocker in _safe_list(contract.get("blockers"))
+            if blocker
+        )
+        if not contracts and not blockers:
+            blockers.append("entry_decision_risk_contract_missing")
+        item["risk_contract"] = {
+            "available": bool(contracts) and all(
+                contract.get("available") is True for contract in contracts
+            ),
+            "contract_count": len(contracts),
+            "contracts": contracts,
+            "blockers": list(dict.fromkeys(blockers)),
+        }
+
+
+async def _dashboard_open_position_protection_evidence(
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> dict[str, Any]:
+    from services.protection_order_integrity import audit_protection_order_integrity
+
+    selected_mode = "live" if mode == "live" else "paper"
+    executor = _dashboard_okx_executor_for_mode(selected_mode)
+    if executor is None:
+        for item in positions:
+            item["protection_contract"] = {
+                "available": False,
+                "orders": [],
+                "blockers": ["okx_executor_unavailable"],
+            }
+        return {
+            "available": False,
+            "blockers": ["okx_executor_unavailable"],
+            "orphan_keys": [],
+            "split_coverage_keys": [],
+        }
+
+    try:
+        raw_positions, protection_orders, pending_orders = await asyncio.gather(
+            _fetch_dashboard_okx_positions(selected_mode),
+            asyncio.wait_for(
+                executor.get_position_protection_orders(),
+                timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+            ),
+            asyncio.wait_for(
+                executor.get_open_orders_strict(),
+                timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+            ),
+        )
+        audit = audit_protection_order_integrity(
+            raw_positions,
+            protection_orders,
+            pending_orders,
+            {},
+            pending_snapshot_complete=True,
+        )
+    except Exception as exc:
+        blocker = f"okx_protection_inventory_unavailable:{safe_error_text(exc, limit=120)}"
+        for item in positions:
+            item["protection_contract"] = {
+                "available": False,
+                "orders": [],
+                "blockers": [blocker],
+            }
+        return {
+            "available": False,
+            "blockers": [blocker],
+            "orphan_keys": [],
+            "split_coverage_keys": [],
+        }
+
+    orders_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for order in _safe_list(audit.get("protection_orders")):
+        if not isinstance(order, dict):
+            continue
+        key = _dashboard_position_key(order.get("symbol"), order.get("side"))
+        orders_by_key.setdefault(key, []).append(order)
+    missing_keys = {tuple(value) for value in _safe_list(audit.get("missing_keys"))}
+    split_keys = {tuple(value) for value in _safe_list(audit.get("split_coverage_keys"))}
+    invalid_algo_ids = {
+        str(order.get("algo_id") or "")
+        for order in _safe_list(audit.get("invalid_orders"))
+        if isinstance(order, dict)
+    }
+    mismatch_keys = {
+        _dashboard_position_key(row.get("symbol"), row.get("side"))
+        for row in _safe_list(audit.get("coverage_mismatches"))
+        if isinstance(row, dict)
+    }
+    for item in positions:
+        key = _dashboard_position_key(item.get("symbol"), item.get("side"))
+        orders = orders_by_key.get(key, [])
+        blockers: list[str] = []
+        if key in missing_keys:
+            blockers.append("missing_okx_position_protection")
+        if key in mismatch_keys:
+            blockers.append("okx_protection_quantity_coverage_mismatch")
+        if any(str(order.get("algo_id") or "") in invalid_algo_ids for order in orders):
+            blockers.append("invalid_okx_protection_order")
+        item["protection_contract"] = {
+            "available": True,
+            "contract_version": audit.get("contract_version"),
+            "order_count": len(orders),
+            "unique": len(orders) == 1,
+            "split_coverage": key in split_keys,
+            "coverage_state": (
+                "missing"
+                if not orders
+                else "single"
+                if len(orders) == 1
+                else "split_exact"
+                if key in split_keys and key not in mismatch_keys
+                else "multiple_invalid"
+            ),
+            "orders": orders,
+            "blockers": blockers,
+            "inventory_fingerprint": audit.get("input_fingerprint"),
+        }
+    return {
+        "available": True,
+        "contract_version": audit.get("contract_version"),
+        "position_count": audit.get("position_count"),
+        "protection_order_count": audit.get("protection_order_count"),
+        "missing_keys": audit.get("missing_keys"),
+        "orphan_keys": audit.get("orphan_keys"),
+        "split_coverage_keys": audit.get("split_coverage_keys"),
+        "coverage_mismatches": audit.get("coverage_mismatches"),
+        "invalid_order_count": len(_safe_list(audit.get("invalid_orders"))),
+        "repair_blockers": audit.get("repair_blockers"),
+        "inventory_fingerprint": audit.get("input_fingerprint"),
+        "blockers": [],
+    }
 
 
 async def _fetch_dashboard_okx_positions_uncached(
@@ -4741,11 +5201,15 @@ async def get_ml_signal_status():
         status["new_shadow_sample_count"] = int(auto_new or 0)
     except Exception as exc:
         _log_dashboard_fallback("ml signal sample count fallback", exc)
-        status["phase3_clean_completed_shadow_sample_count"] = training_count
-        status["completed_shadow_sample_count"] = training_count
-        status["total_shadow_sample_count"] = training_count
-        status["phase3_new_shadow_sample_count"] = 0
-        status["new_shadow_sample_count"] = 0
+        status["phase3_clean_completed_shadow_sample_count"] = None
+        status["completed_shadow_sample_count"] = None
+        status["total_shadow_sample_count"] = None
+        status["phase3_new_shadow_sample_count"] = None
+        status["new_shadow_sample_count"] = None
+        status["sample_count_blocker"] = (
+            "phase3_completed_shadow_sample_count_unavailable:"
+            f"{safe_error_text(exc, limit=120)}"
+        )
 
     return status
 
@@ -4958,6 +5422,7 @@ async def get_positions(
     page = max(int(page or 1), 1)
     page_size = max(1, min(int(page_size or 20), 100))
     positions = []
+    protection_inventory: dict[str, Any] | None = None
     exchange_mark_map = {} if closed_only else await _get_exchange_position_mark_map(mode)
     exchange_temporarily_unavailable = bool(
         not closed_only
@@ -5545,6 +6010,37 @@ async def get_positions(
             exchange_mark_map,
             mode=mode,
         )
+        try:
+            await _dashboard_open_position_risk_evidence(positions, mode=mode)
+        except Exception as exc:
+            _log_dashboard_fallback("open position risk evidence unavailable", exc, mode=mode)
+            blocker = f"position_risk_evidence_unavailable:{safe_error_text(exc, limit=120)}"
+            for item in positions:
+                item["risk_contract"] = {
+                    "available": False,
+                    "contracts": [],
+                    "blockers": [blocker],
+                }
+        try:
+            protection_inventory = await _dashboard_open_position_protection_evidence(
+                positions,
+                mode=mode,
+            )
+        except Exception as exc:
+            _log_dashboard_fallback("open position OCO evidence unavailable", exc, mode=mode)
+            blocker = f"okx_protection_evidence_unavailable:{safe_error_text(exc, limit=120)}"
+            for item in positions:
+                item["protection_contract"] = {
+                    "available": False,
+                    "orders": [],
+                    "blockers": [blocker],
+                }
+            protection_inventory = {
+                "available": False,
+                "blockers": [blocker],
+                "orphan_keys": [],
+                "split_coverage_keys": [],
+            }
 
     display_total = len(positions) if open_only or closed_only else total
     display_open_count = len(positions) if open_only else open_count
@@ -5562,6 +6058,7 @@ async def get_positions(
         "page": page,
         "page_size": page_size,
         "total_pages": display_total_pages,
+        "protection_inventory": protection_inventory,
     }
 
 
@@ -6462,6 +6959,12 @@ async def get_analysis_records(
                 max_items=40,
                 max_text=600,
             ),
+            "prediction_economics": _bounded_dashboard_payload(
+                _display_prediction_economics(raw),
+                max_depth=5,
+                max_items=48,
+                max_text=600,
+            ),
             "is_paper": d.is_paper,
             "flow_summary": (
                 f"{pre_expert_skip.get('label')}：{pre_expert_skip.get('reason')}"
@@ -7135,6 +7638,9 @@ async def get_expert_memories(
                     "attribution": authoritative_outcome.get("attribution"),
                     "counterfactual_evidence": authoritative_outcome.get(
                         "counterfactual_evidence"
+                    ),
+                    "counterfactual_production_weight": authoritative_outcome.get(
+                        "counterfactual_production_weight"
                     ),
                     "learning_summary": authoritative_outcome.get("learning_summary"),
                 }

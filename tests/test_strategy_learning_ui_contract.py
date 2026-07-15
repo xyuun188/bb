@@ -71,7 +71,8 @@ def test_strategy_learning_console_labels_dynamic_scheduler_contract() -> None:
     assert "运行与分区状态索引" in HTML
     assert "不是按币种配置的独立执行策略" in HTML
     assert "strategy_learning_view.js?v=20260714-runtime-prior-clarity" in HTML
-    assert "strategy_learning.css?v=20260714-runtime-prior-clarity" in HTML
+    assert "strategy_learning.css?v=20260715-profit-evidence" in HTML
+    assert "word-break: break-word" in STYLE
     assert 'id="strategy-learning-summary"' in HTML
     assert 'id="strategy-learning-sides"' in HTML
     assert 'id="strategy-learning-profiles"' in HTML

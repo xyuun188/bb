@@ -477,7 +477,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260705-official-settlement-badge" in html
+    assert "dashboard.js?v=20260715-profit-evidence" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -616,8 +616,8 @@ def test_system_audit_nodes_use_state_aware_display_status() -> None:
 def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "dashboard.css?v=20260705-official-settlement-badge" in html
-    assert "dashboard.js?v=20260705-official-settlement-badge" in html
+    assert "dashboard.css?v=20260715-profit-evidence" in html
+    assert "dashboard.js?v=20260715-profit-evidence" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -773,8 +773,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260705-official-settlement-badge" in html
-    assert "dashboard.js?v=20260705-official-settlement-badge" in html
+    assert "dashboard.css?v=20260715-profit-evidence" in html
+    assert "dashboard.js?v=20260715-profit-evidence" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -800,7 +800,7 @@ def test_strategy_learning_candidate_lab_prevents_card_overflow() -> None:
     assert "/* Strategy learning console */" not in dashboard_style
     assert ".strategy-learning-profile-list {" not in dashboard_style
     assert ".strategy-learning-event-list {" not in dashboard_style
-    assert "strategy_learning.css?v=20260714-runtime-prior-clarity" in (
+    assert "strategy_learning.css?v=20260715-profit-evidence" in (
         PROJECT_ROOT / "web_dashboard/static/index.html"
     ).read_text(encoding="utf-8")
     assert (
