@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isclose
 from typing import Any
 
 import structlog
@@ -113,10 +114,11 @@ class RiskEngine:
                     f"{opposite_side} 仓位后再重新评估。"
                 ),
             )
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing")
+        sizing = sizing if isinstance(sizing, dict) else {}
         size_check = self.position_checker.check_contract_entry_limits(
-            proposed_margin_pct=decision.position_size_pct,
-            proposed_leverage=decision.suggested_leverage,
-            proposed_stop_loss_pct=decision.stop_loss_pct,
+            risk_contract=sizing,
             current_positions=current_positions,
             account_balance=account_balance,
             symbol=decision.symbol,
@@ -127,10 +129,6 @@ class RiskEngine:
                 decision=decision,
                 rejection_reason=size_check.reason,
             )
-        if size_check.adjusted_size_pct is not None:
-            decision.position_size_pct = size_check.adjusted_size_pct
-            warnings.append(size_check.reason)
-
         return None
 
     @staticmethod
@@ -157,16 +155,48 @@ class RiskEngine:
             and str(provenance.get("strategy_version") or "").strip()
             and not str(provenance.get("fallback_reason") or "").strip()
         )
-        planned_loss = RiskEngine._safe_positive_float(sizing.get("planned_stop_loss_usdt"))
-        max_loss = RiskEngine._safe_positive_float(sizing.get("max_stop_loss_usdt"))
-        stress_stop = RiskEngine._safe_positive_float(sizing.get("stress_stop_loss_pct"))
+        risk_budget = RiskEngine._safe_positive_float(sizing.get("risk_budget_usdt"))
+        planned_loss = RiskEngine._safe_positive_float(
+            sizing.get("planned_stressed_loss_usdt")
+        )
+        stress_stop = RiskEngine._safe_positive_float(sizing.get("stressed_loss_fraction"))
+        final_notional = RiskEngine._safe_positive_float(sizing.get("final_notional_usdt"))
+        target_notional = RiskEngine._safe_positive_float(sizing.get("target_notional_usdt"))
+        portfolio_budget = RiskEngine._safe_positive_float(
+            sizing.get("portfolio_risk_budget_usdt")
+        )
+        current_portfolio_risk = RiskEngine._safe_positive_float(
+            sizing.get("current_portfolio_stressed_loss_usdt")
+        )
+        position_size = RiskEngine._safe_positive_float(sizing.get("position_size_pct"))
+        leverage = RiskEngine._safe_positive_float(decision.suggested_leverage)
         if sizing.get("production_eligible") is not True:
             return "Dynamic account risk budget is not production eligible."
         if not provenance_complete:
             return "Dynamic account risk budget provenance is incomplete."
-        if planned_loss <= 0 or max_loss <= 0 or planned_loss > max_loss + 1e-9:
+        if planned_loss <= 0 or risk_budget <= 0 or planned_loss > risk_budget + 1e-8:
             return "Dynamic planned loss exceeds or is missing from the account risk budget."
-        if stress_stop <= 0 or float(decision.position_size_pct or 0.0) <= 0:
+        if portfolio_budget <= 0 or current_portfolio_risk + planned_loss > portfolio_budget + 1e-8:
+            return "Dynamic entry exceeds the portfolio stressed-loss budget."
+        if final_notional <= 0 or final_notional > target_notional + 1e-8:
+            return "Dynamic final notional exceeds or is missing from its target."
+        if not isclose(
+            planned_loss,
+            final_notional * stress_stop,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        ):
+            return "Dynamic risk contract notional and stressed loss are inconsistent."
+        if not isclose(
+            position_size,
+            float(decision.position_size_pct or 0.0),
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        ):
+            return "Decision position size differs from the authoritative risk contract."
+        if leverage < 1:
+            return "Dynamic leverage is missing from the authoritative risk contract."
+        if stress_stop <= 0 or position_size <= 0:
             return "Dynamic stop distance or position size is missing."
         return None
 

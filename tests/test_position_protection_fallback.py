@@ -39,7 +39,7 @@ def _decision(**kwargs: Any) -> SimpleNamespace:
             "production_return_policy": {"eligible": True},
             "profit_risk_sizing": {
                 "production_eligible": True,
-                "stress_stop_loss_pct": 0.05,
+                "stressed_loss_fraction": 0.05,
                 "policy_provenance": provenance,
             },
         },

@@ -32,6 +32,10 @@ from core.symbols import (
 )
 from core.trading_mode import mode_manager
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
+from services.entry_profit_risk_sizing import (
+    reconcile_profit_risk_sizing,
+    select_okx_leverage_tier,
+)
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
@@ -557,7 +561,16 @@ class OKXExecutor(AbstractExecutor):
                     balance = override_balance
                 else:
                     balance = await self.get_balance()
-                position_value = balance * decision.position_size_pct * decision.suggested_leverage
+                sizing = (
+                    decision.raw_response.get("profit_risk_sizing")
+                    if isinstance(decision.raw_response, dict)
+                    else {}
+                )
+                sizing = sizing if isinstance(sizing, dict) else {}
+                position_value = max(
+                    self._safe_float(sizing.get("final_notional_usdt"), 0.0),
+                    0.0,
+                )
 
             exit_position_snapshot: list[dict[str, Any]] | None = None
 
@@ -1021,8 +1034,15 @@ class OKXExecutor(AbstractExecutor):
                 )
                 if actual_leverage > 0 and abs(actual_leverage - quantity_leverage) > 1e-9:
                     decision.suggested_leverage = actual_leverage
-                    position_value = (
-                        balance * decision.position_size_pct * decision.suggested_leverage
+                    sizing = (
+                        decision.raw_response.get("profit_risk_sizing")
+                        if isinstance(decision.raw_response, dict)
+                        else {}
+                    )
+                    sizing = sizing if isinstance(sizing, dict) else {}
+                    position_value = max(
+                        self._safe_float(sizing.get("final_notional_usdt"), 0.0),
+                        0.0,
                     )
                     order_quantity, base_quantity = self._entry_order_amount(
                         ccxt,
@@ -1095,6 +1115,42 @@ class OKXExecutor(AbstractExecutor):
                         f"OKX 单笔市价单上限为 {market_size_adjustment['amount_max_market_contracts']:g} 张，"
                         f"系统已把原计划 {market_size_adjustment['original_planned_order_contracts']:g} 张"
                         f"缩到 {order_quantity:g} 张后提交。"
+                    )
+                reconciled_contract = reconcile_profit_risk_sizing(
+                    decision,
+                    final_notional_usdt=order_quantity * contract_size * max(price, 0.0),
+                    final_leverage=decision.suggested_leverage,
+                    source="okx_pre_submit_order_shape",
+                    execution_facts={
+                        "okx_symbol": okx_symbol,
+                        "price": price,
+                        "contract_size": contract_size,
+                        "order_contracts": order_quantity,
+                        "base_quantity": base_quantity,
+                        "okx_order_rules": okx_order_rules,
+                        "leverage_check": leverage_check,
+                    },
+                )
+                if reconciled_contract.get("eligible") is not True:
+                    return ExecutionResult(
+                        order_id="risk_contract_rejected",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0.0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "The final OKX order shape does not match the authoritative "
+                                "risk contract; no order was submitted."
+                            ),
+                            "execution_blocker": "execution_risk_contract_reconciliation",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "reconciliation_reasons": reconciled_contract.get("reasons"),
+                            "okx_order_rules": okx_order_rules,
+                        },
                     )
                 stop_loss_px, take_profit_px = self._attached_sl_tp_prices(
                     decision,
@@ -1238,6 +1294,37 @@ class OKXExecutor(AbstractExecutor):
                         )
                         order_quantity = capped_quantity
                         base_quantity = order_quantity * contract_size
+                        retry_contract = reconcile_profit_risk_sizing(
+                            decision,
+                            final_notional_usdt=(
+                                order_quantity * contract_size * max(price, 0.0)
+                            ),
+                            final_leverage=decision.suggested_leverage,
+                            source="okx_51004_position_limit_retry",
+                            execution_facts={
+                                "okx_symbol": okx_symbol,
+                                "price": price,
+                                "contract_size": contract_size,
+                                "order_contracts": order_quantity,
+                                "original_error": error_text,
+                            },
+                        )
+                        if retry_contract.get("eligible") is not True:
+                            return self._entry_exchange_rejection_result(
+                                decision=decision,
+                                side=side,
+                                price=price,
+                                exchange_error=(
+                                    "OKX retry quantity failed authoritative risk reconciliation"
+                                ),
+                                okx_symbol=okx_symbol,
+                                contract_size=contract_size,
+                                order_quantity=order_quantity,
+                                base_quantity=base_quantity,
+                                okx_order_rules=okx_order_rules,
+                                request_params=params,
+                                leverage_check=leverage_check,
+                            )
                         order = await self._with_retry(
                             ccxt.create_order,
                             okx_symbol,
@@ -1313,6 +1400,22 @@ class OKXExecutor(AbstractExecutor):
                     },
                 )
             filled_base_quantity = filled_contracts * contract_size
+            if decision.is_entry and filled_contracts > 0:
+                reconcile_profit_risk_sizing(
+                    decision,
+                    final_notional_usdt=(
+                        filled_contracts * contract_size * max(execution_price, 0.0)
+                    ),
+                    final_leverage=decision.suggested_leverage,
+                    source="okx_confirmed_entry_fill",
+                    execution_facts={
+                        "okx_symbol": okx_symbol,
+                        "execution_price": execution_price,
+                        "contract_size": contract_size,
+                        "filled_contracts": filled_contracts,
+                        "order_id": order.get("id") or (order.get("info") or {}).get("ordId"),
+                    },
+                )
 
             if decision.is_exit and target_side:
                 after_contracts = pre_exit_contracts
@@ -2946,22 +3049,17 @@ class OKXExecutor(AbstractExecutor):
         """
         if price <= 0 or position_value <= 0:
             return 0.0, 0.0
+        del balance, leverage
 
         contract_size = self._contract_size(market)
         planned_contracts = position_value / (price * contract_size)
         amount_min = self._amount_min(market)
         min_contracts = amount_min if amount_min > 0 else 0.0
-        contracts = max(planned_contracts, min_contracts)
+        contracts = planned_contracts
 
-        # OKX enforces minSz/lotSz in contracts.  Entry sizing owns risk, but
-        # exchange validity owns order shape: if the intended order is below the
-        # hard minimum and the account can afford that minimum, lift to the
-        # minimum before submission instead of letting OKX reject the order.
-        min_notional = min_contracts * contract_size * price
+        # Exchange minimums may reject a risk-sized order, but must never enlarge it.
         if min_contracts > 0 and planned_contracts < min_contracts:
-            affordable_notional = balance * max(float(leverage or 1.0), 1.0)
-            if min_notional > affordable_notional:
-                return 0.0, 0.0
+            return 0.0, 0.0
 
         try:
             contracts = float(ccxt.amount_to_precision(market["symbol"], contracts))
@@ -3015,8 +3113,8 @@ class OKXExecutor(AbstractExecutor):
             "final_base_quantity": round(max(final_contracts, 0.0) * contract_size, 12),
             "final_notional_usdt": round(final_notional, 8),
             "required_margin_usdt": round(final_notional / effective_leverage, 8),
-            "system_adjusted_to_min_contracts": bool(
-                amount_min > 0 and 0 < planned_contracts < amount_min <= final_contracts
+            "planned_below_minimum_contracts": bool(
+                amount_min > 0 and 0 < planned_contracts < amount_min
             ),
             "market_order_within_max_size": bool(
                 amount_market_max <= 0 or final_contracts <= amount_market_max
@@ -3226,8 +3324,7 @@ class OKXExecutor(AbstractExecutor):
         if max_contracts <= 0 or max_contracts >= current_quantity:
             return None
 
-        # Leave a small buffer so rounding and pending-order race conditions do not hit the cap again.
-        capped = max_contracts * 0.98
+        capped = max_contracts
         try:
             capped = float(ccxt.amount_to_precision(market["symbol"], capped))
         except Exception as exc:
@@ -3515,34 +3612,90 @@ class OKXExecutor(AbstractExecutor):
             "errors": errors[:3],
         }
 
-    async def _fetch_okx_max_leverage(
+    async def _fetch_applicable_okx_leverage_tier(
         self,
         okx_symbol: str,
-        params: dict[str, Any],
-        requested_leverage: int,
-    ) -> float:
-        """Return OKX's max leverage for this swap when available."""
+        decision: DecisionOutput,
+    ) -> dict[str, Any]:
+        """Refresh and select the OKX tier for the executable position."""
+
+        tiers = await self._fetch_okx_leverage_tiers(okx_symbol)
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
+        sizing = sizing if isinstance(sizing, dict) else {}
+        original = sizing.get("leverage_tier_selection")
+        original = original if isinstance(original, dict) else {}
+        contract_spec = original.get("contract_spec")
+        contract_spec = contract_spec if isinstance(contract_spec, dict) else {}
+        snapshot = decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
+        selection = select_okx_leverage_tier(
+            tiers,
+            target_notional_usdt=self._safe_float(
+                sizing.get("final_notional_usdt"),
+                0.0,
+            ),
+            mark_price=self._safe_float(
+                original.get("mark_price") or snapshot.get("current_price") or snapshot.get("close"),
+                0.0,
+            ),
+            contract_spec=contract_spec,
+            current_position_notional_usdt=self._safe_float(
+                original.get("current_position_notional_usdt"),
+                0.0,
+            ),
+            current_position_contracts=self._safe_float(
+                original.get("current_position_contracts"),
+                0.0,
+            ),
+        )
+        if selection.get("production_eligible") is not True:
+            return selection
+        original_max = self._safe_float(original.get("max_leverage"), 0.0)
+        if original and (original.get("production_eligible") is not True or original_max < 1):
+            selection = dict(selection)
+            selection.update(
+                {
+                    "production_eligible": False,
+                    "reason": "authoritative_sizing_leverage_tier_missing",
+                    "max_leverage": 0.0,
+                }
+            )
+            return selection
+        if original_max >= 1:
+            selection = dict(selection)
+            selection["max_leverage"] = min(
+                self._safe_float(selection.get("max_leverage"), 0.0),
+                original_max,
+            )
+            selection["sizing_tier_max_leverage"] = original_max
+        return selection
+
+    async def _fetch_okx_leverage_tiers(self, okx_symbol: str) -> list[dict[str, Any]]:
+        """Return unmodified OKX tier bounds plus normalized max leverage."""
+
         ccxt = await self._get_ccxt()
-        values: list[float] = []
         try:
             tiers = await self._with_retry(ccxt.fetch_market_leverage_tiers, okx_symbol)
-            if isinstance(tiers, list):
-                for tier in tiers:
-                    if isinstance(tier, dict):
-                        values.append(
-                            self._safe_float(
-                                tier.get("maxLeverage") or tier.get("max_leverage"), 0.0
-                            )
-                        )
+            if not isinstance(tiers, list):
+                return []
+            return [
+                {
+                    **dict(tier),
+                    "maxLeverage": self._safe_float(
+                        tier.get("maxLeverage") or tier.get("max_leverage"),
+                        0.0,
+                    ),
+                }
+                for tier in tiers
+                if isinstance(tier, dict)
+            ]
         except Exception as e:
             logger.debug(
                 "fetch leverage tiers failed",
                 symbol=okx_symbol,
                 error=safe_error_text(e),
             )
-
-        values = [value for value in values if value > 0]
-        return max(values) if values else 1.0
+            return []
 
     def _extract_verified_leverage(self, leverage_response: dict[str, Any] | None) -> float:
         """Return the leverage reported by CCXT fetch_leverage."""
@@ -3568,7 +3721,24 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(decision.symbol)
         params = {"mgnMode": "cross"}
         requested_leverage = max(1, int(round(decision.suggested_leverage)))
-        max_leverage = await self._fetch_okx_max_leverage(okx_symbol, params, requested_leverage)
+        tier_selection = await self._fetch_applicable_okx_leverage_tier(okx_symbol, decision)
+        max_leverage = self._safe_float(tier_selection.get("max_leverage"), 0.0)
+        if tier_selection.get("production_eligible") is not True or max_leverage < 1.0:
+            return {
+                "ok": False,
+                "error": (
+                    "OKX did not return an authoritative leverage tier for the executable "
+                    "position; the entry was rejected before submission."
+                ),
+                "ai_requested_leverage": requested_leverage,
+                "okx_max_leverage": None,
+                "okx_leverage_tier_selection": tier_selection,
+                "target_leverage": None,
+                "actual_leverage": None,
+                "set_response": None,
+                "verify_response": None,
+                "params": params,
+            }
         leverage = int(
             max(
                 1,
@@ -3598,6 +3768,7 @@ class OKXExecutor(AbstractExecutor):
                 "reason": "当前 OKX 杠杆已等于系统目标杠杆，无需重复设置。",
                 "ai_requested_leverage": requested_leverage,
                 "okx_max_leverage": max_leverage,
+                "okx_leverage_tier_selection": tier_selection,
                 "target_leverage": leverage,
                 "actual_leverage": actual,
                 "set_response": None,
@@ -3644,8 +3815,28 @@ class OKXExecutor(AbstractExecutor):
                     ),
                     "ai_requested_leverage": requested_leverage,
                     "okx_max_leverage": max_leverage,
+                    "okx_leverage_tier_selection": tier_selection,
                     "target_leverage": leverage,
                     "actual_leverage": None,
+                    "existing_position": True,
+                    "existing_position_side": target_side,
+                    "set_response": None,
+                    "verify_response": verify_response,
+                    "params": params,
+                }
+            if position_leverage > max_leverage + 1e-8:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"OKX existing position leverage {position_leverage:g}x exceeds the "
+                        f"current projected-position tier maximum {max_leverage:g}x; "
+                        "the add-on entry was rejected."
+                    ),
+                    "ai_requested_leverage": requested_leverage,
+                    "okx_max_leverage": max_leverage,
+                    "okx_leverage_tier_selection": tier_selection,
+                    "target_leverage": leverage,
+                    "actual_leverage": position_leverage,
                     "existing_position": True,
                     "existing_position_side": target_side,
                     "set_response": None,
@@ -3663,6 +3854,7 @@ class OKXExecutor(AbstractExecutor):
                 ),
                 "ai_requested_leverage": requested_leverage,
                 "okx_max_leverage": max_leverage,
+                "okx_leverage_tier_selection": tier_selection,
                 "target_leverage": position_leverage,
                 "actual_leverage": position_leverage,
                 "existing_position": True,
@@ -3717,6 +3909,7 @@ class OKXExecutor(AbstractExecutor):
                             ),
                             "ai_requested_leverage": requested_leverage,
                             "okx_max_leverage": max_leverage,
+                            "okx_leverage_tier_selection": tier_selection,
                             "target_leverage": leverage,
                             "actual_leverage": actual,
                             "set_response": None,
@@ -3765,6 +3958,7 @@ class OKXExecutor(AbstractExecutor):
                             "error": message,
                             "ai_requested_leverage": requested_leverage,
                             "okx_max_leverage": max_leverage,
+                            "okx_leverage_tier_selection": tier_selection,
                             "target_leverage": leverage,
                             "actual_leverage": None,
                             "set_response": None,
@@ -3795,6 +3989,7 @@ class OKXExecutor(AbstractExecutor):
                             "error": message,
                             "ai_requested_leverage": requested_leverage,
                             "okx_max_leverage": max_leverage,
+                            "okx_leverage_tier_selection": tier_selection,
                             "target_leverage": leverage,
                             "actual_leverage": actual,
                             "set_response": None,
@@ -3824,6 +4019,7 @@ class OKXExecutor(AbstractExecutor):
                         ),
                         "ai_requested_leverage": requested_leverage,
                         "okx_max_leverage": max_leverage,
+                        "okx_leverage_tier_selection": tier_selection,
                         "target_leverage": leverage,
                         "actual_leverage": fallback_leverage,
                         "set_response": None,
@@ -3857,6 +4053,7 @@ class OKXExecutor(AbstractExecutor):
                 "error": message,
                 "ai_requested_leverage": requested_leverage,
                 "okx_max_leverage": max_leverage,
+                "okx_leverage_tier_selection": tier_selection,
                 "target_leverage": leverage,
                 "actual_leverage": actual or None,
                 "set_response": set_response,
@@ -3888,6 +4085,7 @@ class OKXExecutor(AbstractExecutor):
                 "error": message,
                 "ai_requested_leverage": requested_leverage,
                 "okx_max_leverage": max_leverage,
+                "okx_leverage_tier_selection": tier_selection,
                 "target_leverage": leverage,
                 "actual_leverage": None,
                 "set_response": set_response,
@@ -3915,6 +4113,7 @@ class OKXExecutor(AbstractExecutor):
                 "error": message,
                 "ai_requested_leverage": requested_leverage,
                 "okx_max_leverage": max_leverage,
+                "okx_leverage_tier_selection": tier_selection,
                 "target_leverage": leverage,
                 "actual_leverage": actual,
                 "set_response": set_response,
@@ -3927,6 +4126,7 @@ class OKXExecutor(AbstractExecutor):
             "ok": True,
             "ai_requested_leverage": requested_leverage,
             "okx_max_leverage": max_leverage,
+            "okx_leverage_tier_selection": tier_selection,
             "target_leverage": leverage,
             "actual_leverage": actual,
             "set_response": set_response,
@@ -4211,9 +4411,10 @@ class OKXExecutor(AbstractExecutor):
             total = float(asset_data.get("total") or 0.0)
             cash = raw_float("cashBal", total)
             equity = raw_float("eq", total)
+            available = float(asset_data.get("free") or 0.0) or raw_float("availEq", 0.0)
             allocatable = equity if equity > 0 else (cash if cash > 0 else total)
             return {
-                "free": float(asset_data.get("free") or 0.0),
+                "free": available,
                 "used": float(asset_data.get("used") or 0.0),
                 "total": total,
                 "cash": cash,
@@ -4319,6 +4520,70 @@ class OKXExecutor(AbstractExecutor):
         """Fetch authoritative OKX-native positions and propagate failures."""
         inst_ids = [okx_inst_id_from_symbol(symbol)] if symbol else None
         return await self._native_facts_client().fetch_positions(inst_ids=inst_ids)
+
+    async def entry_risk_facts(
+        self,
+        symbol: str,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return authoritative account, instrument, and leverage facts for sizing."""
+
+        if not self._connected:
+            await self.initialize()
+        okx_symbol = await self._resolve_swap_symbol(symbol)
+        position_symbols = [str(position.get("symbol") or "") for position in positions or []]
+        requested_symbols = [symbol, *position_symbols]
+        balance_snapshot, contract_specs, leverage_tiers = await asyncio.gather(
+            self.get_balance_snapshot(),
+            self._native_facts_client().fetch_contract_specs(symbols=requested_symbols),
+            self._fetch_okx_leverage_tiers(okx_symbol),
+        )
+        tier_leverages = [
+            self._safe_float(tier.get("maxLeverage"), 0.0) for tier in leverage_tiers
+        ]
+        tier_leverages = [value for value in tier_leverages if value > 0]
+        reported_max_leverage = max(tier_leverages) if tier_leverages else 0.0
+        equity = max(self._safe_float(balance_snapshot.get("equity"), 0.0), 0.0)
+        available_margin = max(self._safe_float(balance_snapshot.get("free"), 0.0), 0.0)
+        target_inst_id = okx_inst_id_from_symbol(symbol)
+        required_inst_ids = {
+            inst_id
+            for item in requested_symbols
+            if (inst_id := okx_inst_id_from_symbol(item))
+        }
+        missing_specs = sorted(required_inst_ids.difference(contract_specs))
+        reasons: list[str] = []
+        if equity <= 0:
+            reasons.append("okx_account_equity_missing")
+        if available_margin <= 0:
+            reasons.append("okx_available_margin_missing")
+        if not leverage_tiers or reported_max_leverage < 1:
+            reasons.append("okx_leverage_tiers_missing")
+        if not target_inst_id or target_inst_id not in contract_specs:
+            reasons.append("target_okx_contract_spec_missing")
+        if missing_specs:
+            reasons.append("open_position_okx_contract_spec_missing")
+        generated_at = datetime.now(UTC).isoformat()
+        return {
+            "production_eligible": not reasons,
+            "account_equity_usdt": equity,
+            "available_margin_usdt": available_margin,
+            "reported_max_leverage": reported_max_leverage,
+            "leverage_tiers": leverage_tiers,
+            "margin_mode": "cross",
+            "target_inst_id": target_inst_id,
+            "contract_specs": contract_specs,
+            "missing_contract_specs": missing_specs,
+            "balance_snapshot": balance_snapshot,
+            "policy_provenance": {
+                "source": "okx_native_balance_contract_specs_and_leverage_tiers",
+                "observation_window": "current_pre_entry_exchange_snapshot",
+                "sample_count": len(contract_specs) + int(equity > 0) + len(leverage_tiers),
+                "generated_at": generated_at,
+                "strategy_version": "2026-07-15.okx-entry-risk-facts.v2",
+                "fallback_reason": ",".join(reasons),
+            },
+        }
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         okx_symbol = self._to_swap_symbol(symbol) if symbol else None

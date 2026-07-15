@@ -40,7 +40,18 @@ class _PublicApi:
 
     def get_position_tiers(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get_position_tiers", dict(kwargs)))
-        return {"code": "0", "data": [{"maxLever": "20"}]}
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "instFamily": "SOL-USDT",
+                    "tier": "1",
+                    "minSz": "0",
+                    "maxSz": "1000",
+                    "maxLever": "20",
+                }
+            ],
+        }
 
     def get_mark_price(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get_mark_price", dict(kwargs)))
@@ -288,13 +299,15 @@ async def test_sdk_adapter_leverage_tiers_normalizes_max_leverage() -> None:
     tiers = await exchange.fetch_market_leverage_tiers("SOL/USDT")
 
     assert tiers[0]["maxLeverage"] == 20.0
+    assert tiers[0]["minSz"] == "0"
+    assert tiers[0]["maxSz"] == "1000"
     assert public_api.calls == [
         (
             "get_position_tiers",
             {
                 "instType": "SWAP",
                 "tdMode": "cross",
-                "instId": "SOL-USDT-SWAP",
+                "instFamily": "SOL-USDT",
             },
         )
     ]

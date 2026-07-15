@@ -17,9 +17,18 @@ def _decision(symbol: str = "BTC/USDT", action: Action = Action.LONG) -> Decisio
         raw_response={
             "profit_risk_sizing": {
                 "production_eligible": True,
-                "planned_stop_loss_usdt": 0.9,
-                "max_stop_loss_usdt": 1.2,
-                "stress_stop_loss_pct": 0.03,
+                "account_equity_usdt": 1000.0,
+                "available_margin_usdt": 1000.0,
+                "position_size_pct": 0.03,
+                "risk_budget_usdt": 12.0,
+                "portfolio_risk_budget_usdt": 20.0,
+                "current_portfolio_stressed_loss_usdt": 0.0,
+                "planned_stressed_loss_usdt": 10.8,
+                "target_notional_usdt": 400.0,
+                "final_notional_usdt": 360.0,
+                "final_margin_usdt": 30.0,
+                "stressed_loss_fraction": 0.03,
+                "exchange_contract_specs": {},
                 "policy_provenance": {
                     "source": "fee_after_return_cost_stop_distance_account_and_portfolio_state",
                     "observation_window": "current_decision_and_open_portfolio",
@@ -90,9 +99,12 @@ def test_same_symbol_opposite_entry_is_still_rejected_by_okx_net_position_fact()
     assert "OKX 净持仓模式" in result.rejection_reason
 
 
-def test_physical_account_margin_boundary_caps_to_remaining_equity() -> None:
+def test_physical_account_margin_boundary_rejects_without_mutating_contract() -> None:
+    decision = _decision("ETH/USDT")
+    decision.raw_response["profit_risk_sizing"]["available_margin_usdt"] = 10.0
+    original_size = decision.position_size_pct
     result = RiskEngine().assess(
-        decision=_decision("ETH/USDT"),
+        decision=decision,
         current_positions=[
             {
                 "model_name": "ensemble_trader",
@@ -106,7 +118,17 @@ def test_physical_account_margin_boundary_caps_to_remaining_equity() -> None:
         account_balance=1000.0,
     )
 
-    assert result.approved is True
+    assert result.approved is False
     assert result.decision is not None
-    assert result.decision.position_size_pct == pytest.approx(0.01)
-    assert any("current account capacity" in warning for warning in result.warnings)
+    assert result.decision.position_size_pct == pytest.approx(original_size)
+    assert "available margin" in result.rejection_reason
+
+
+def test_risk_engine_rejects_notional_loss_algebra_mismatch() -> None:
+    decision = _decision("ETH/USDT")
+    decision.raw_response["profit_risk_sizing"]["planned_stressed_loss_usdt"] = 1.0
+
+    result = RiskEngine().assess(decision, [], 1000.0)
+
+    assert result.approved is False
+    assert "inconsistent" in result.rejection_reason

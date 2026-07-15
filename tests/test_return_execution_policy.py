@@ -115,24 +115,27 @@ def _decision() -> DecisionOutput:
             },
             "profit_risk_sizing": {
                 "production_eligible": True,
-                "account_balance_usdt": 1000.0,
+                "available_margin_usdt": 1000.0,
+                "position_size_pct": 0.02,
+                "target_notional_usdt": 40.0,
                 "final_notional_usdt": 40.0,
-                "max_stop_loss_usdt": 10.0,
-                "stress_stop_loss_pct": 0.02,
+                "risk_budget_usdt": 10.0,
+                "planned_stressed_loss_usdt": 0.8,
+                "stressed_loss_fraction": 0.02,
                 "policy_provenance": provenance,
             },
         },
     )
 
 
-def test_return_policy_derives_size_from_return_lcb_and_account_budget() -> None:
+def test_return_policy_validates_authoritative_size_without_rederiving_it() -> None:
     decision = _decision()
 
     result = apply_production_entry_policy(decision)
 
     assert result.eligible is True
     assert result.return_lcb_pct == pytest.approx(0.7)
-    assert result.position_size_pct == pytest.approx(0.21875)
+    assert result.position_size_pct == pytest.approx(0.02)
     assert decision.position_size_pct == pytest.approx(result.position_size_pct)
     assert result.policy_provenance["sample_count"] == 2
     assert "legacy_score_gate_enabled" not in result.policy_provenance

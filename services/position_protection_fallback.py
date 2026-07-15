@@ -66,7 +66,7 @@ class PositionProtectionFallbackPolicy:
             and str(provenance.get("strategy_version") or "").strip()
             and not str(provenance.get("fallback_reason") or "").strip()
         )
-        stop_loss_pct = self.float_parser(sizing.get("stress_stop_loss_pct"), 0.0)
+        stop_loss_pct = self.float_parser(sizing.get("stressed_loss_fraction"), 0.0)
         if (
             return_policy.get("eligible") is not True
             or sizing.get("production_eligible") is not True

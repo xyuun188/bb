@@ -139,7 +139,15 @@ def _dynamic_return_ready_decision() -> DecisionOutput:
         },
         "profit_risk_sizing": {
             "production_eligible": True,
-            "policy_provenance": provenance,
+            "available_margin_usdt": 1000.0,
+            "position_size_pct": 0.03,
+            "risk_budget_usdt": 2.0,
+            "planned_stressed_loss_usdt": 0.9,
+            "stressed_loss_fraction": 0.01,
+            "target_notional_usdt": 200.0,
+            "final_notional_usdt": 90.0,
+            "final_margin_usdt": 30.0,
+            "policy_provenance": {**provenance, "contract_fingerprint": "test-fingerprint"},
         },
     }
     return decision

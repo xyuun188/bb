@@ -8512,7 +8512,7 @@ function executionStepDataText(data) {
             ['\u6700\u7ec8\u5e01\u6570', rules.final_base_quantity],
             ['\u6700\u7ec8\u540d\u4e49\u4ef7\u503c', formatRuleValue(rules.final_notional_usdt, ' USDT')],
             ['\u9884\u8ba1\u4fdd\u8bc1\u91d1', formatRuleValue(rules.required_margin_usdt, ' USDT')],
-            ['\u662f\u5426\u62ac\u5230\u6700\u5c0f\u5f20\u6570', rules.system_adjusted_to_min_contracts ? '\u662f' : '\u5426'],
+            ['\u8ba1\u5212\u662f\u5426\u4f4e\u4e8e\u6700\u5c0f\u5f20\u6570', rules.planned_below_minimum_contracts ? '\u662f' : '\u5426'],
             ['\u63d0\u4ea4\u524d\u6821\u9a8c', rules.pre_submit_valid ? '\u901a\u8fc7' : '\u672a\u901a\u8fc7'],
         ].filter(([, value]) => value !== null && value !== undefined && value !== '');
         return rows.map(([label, value]) => `${label}: ${value}`).join('\n');

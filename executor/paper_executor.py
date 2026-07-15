@@ -17,6 +17,7 @@ import structlog
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
+from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 
 logger = structlog.get_logger(__name__)
 
@@ -176,8 +177,13 @@ class PaperExecutor(AbstractExecutor):
                 raw_response={"error": "Position size is zero after evidence sizing"},
             )
 
-        # Calculate quantity
-        position_value = balance * decision.position_size_pct * leverage
+        sizing = (
+            decision.raw_response.get("profit_risk_sizing")
+            if isinstance(decision.raw_response, dict)
+            else {}
+        )
+        sizing = sizing if isinstance(sizing, dict) else {}
+        position_value = max(float(sizing.get("final_notional_usdt") or 0.0), 0.0)
         quantity = position_value / fill_price
         order_value = quantity * fill_price
         fee = order_value * PAPER_FEE_RATE
@@ -202,6 +208,33 @@ class PaperExecutor(AbstractExecutor):
                         status=OrderStatus.REJECTED,
                         raw_response={"error": "Insufficient balance"},
                     )
+
+            reconciliation = reconcile_profit_risk_sizing(
+                decision,
+                final_notional_usdt=order_value,
+                final_leverage=leverage,
+                source="paper_confirmed_entry_fill",
+                execution_facts={
+                    "fill_price": fill_price,
+                    "quantity": quantity,
+                    "fee_usdt": fee,
+                    "margin_used_usdt": margin_used,
+                },
+            )
+            if reconciliation.get("eligible") is not True:
+                return ExecutionResult(
+                    order_id=str(uuid.uuid4())[:12],
+                    symbol=decision.symbol,
+                    side="long",
+                    order_type="market",
+                    quantity=0.0,
+                    price=fill_price,
+                    status=OrderStatus.REJECTED,
+                    raw_response={
+                        "error": "Paper fill does not match the authoritative risk contract",
+                        "reconciliation_reasons": reconciliation.get("reasons"),
+                    },
+                )
 
             # Deduct from balance
             self._balances[model_name] = balance - margin_used - fee
@@ -254,6 +287,33 @@ class PaperExecutor(AbstractExecutor):
                         status=OrderStatus.REJECTED,
                         raw_response={"error": "Insufficient balance"},
                     )
+
+            reconciliation = reconcile_profit_risk_sizing(
+                decision,
+                final_notional_usdt=order_value,
+                final_leverage=leverage,
+                source="paper_confirmed_entry_fill",
+                execution_facts={
+                    "fill_price": fill_price,
+                    "quantity": quantity,
+                    "fee_usdt": fee,
+                    "margin_used_usdt": margin_used,
+                },
+            )
+            if reconciliation.get("eligible") is not True:
+                return ExecutionResult(
+                    order_id=str(uuid.uuid4())[:12],
+                    symbol=decision.symbol,
+                    side="short",
+                    order_type="market",
+                    quantity=0.0,
+                    price=fill_price,
+                    status=OrderStatus.REJECTED,
+                    raw_response={
+                        "error": "Paper fill does not match the authoritative risk contract",
+                        "reconciliation_reasons": reconciliation.get("reasons"),
+                    },
+                )
 
             self._balances[model_name] = balance - margin_used - fee
 

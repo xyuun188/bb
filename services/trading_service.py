@@ -83,7 +83,10 @@ from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
 from services.entry_position_exposure import EntryPositionExposurePolicy
 from services.entry_price_guard import EntryPriceGuardPolicy
 from services.entry_priority import EntryExecutionPriorityPolicy
-from services.entry_profit_risk_sizing import EntryProfitRiskSizingPolicy
+from services.entry_profit_risk_sizing import (
+    EntryProfitRiskSizingPolicy,
+    build_portfolio_correlation_context,
+)
 from services.entry_strategy_mode import EntryStrategyModeContextPolicy
 from services.entry_suspicious_symbol import EntrySuspiciousSymbolPolicy
 from services.entry_symbol_universe import EntrySymbolUniversePolicy
@@ -630,6 +633,7 @@ class TradingService:
         )
         self.entry_profit_risk_sizing = EntryProfitRiskSizingPolicy(
             allocated_order_balance=self.allocated_order_balance,
+            exchange_risk_facts=self.entry_exchange_risk_facts,
         )
         self._open_positions_context_cache: dict[str, Any] = {}
         self._open_positions_context_refresh_task: asyncio.Task | None = None
@@ -2851,6 +2855,17 @@ class TradingService:
             model_mode,
             decision,
         )
+
+    async def entry_exchange_risk_facts(
+        self,
+        model_mode: str,
+        decision: DecisionOutput,
+        open_positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Load the OKX-native facts consumed by authoritative entry sizing."""
+
+        executor = await self._get_okx_executor_for_mode(model_mode)
+        return await executor.entry_risk_facts(decision.symbol, open_positions)
 
     def rejected_execution_result(self, decision: DecisionOutput, reason: str) -> ExecutionResult:
         """Build rejected execution results through an explicit boundary."""
@@ -5271,6 +5286,9 @@ class TradingService:
                 self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
                 market_regime_context,
                 open_positions,
+            )
+            strategy_mode_context["portfolio_correlation"] = (
+                build_portfolio_correlation_context(feature_vectors, open_positions)
             )
             analysis_budget_context = self._position_review_budget_context(
                 open_positions,

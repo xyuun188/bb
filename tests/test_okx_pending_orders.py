@@ -21,7 +21,38 @@ def _entry_decision(symbol: str = "HOME/USDT") -> DecisionOutput:
         suggested_leverage=3.0,
         stop_loss_pct=0.013,
         take_profit_pct=0.027,
-        raw_response={},
+        raw_response={
+            "profit_risk_sizing": {
+                "production_eligible": True,
+                "available_margin_usdt": 1000.0,
+                "position_size_pct": 0.1,
+                "risk_budget_usdt": 130.0,
+                "portfolio_risk_budget_usdt": 130.0,
+                "current_portfolio_stressed_loss_usdt": 0.0,
+                "planned_stressed_loss_usdt": 0.039,
+                "target_notional_usdt": 10000.0,
+                "final_notional_usdt": 3.0,
+                "final_margin_usdt": 1.0,
+                "stressed_loss_fraction": 0.013,
+                "expected_net_return_pct": 1.0,
+                "leverage_tier_selection": {
+                    "production_eligible": True,
+                    "max_leverage": 20.0,
+                    "mark_price": 1.0,
+                    "contract_spec": {"ctVal": "1", "ctMult": "1"},
+                    "current_position_notional_usdt": 0.0,
+                    "current_position_contracts": 0.0,
+                },
+                "policy_provenance": {
+                    "source": "test",
+                    "observation_window": "test",
+                    "sample_count": 1,
+                    "generated_at": "2026-07-15T00:00:00+00:00",
+                    "strategy_version": "test",
+                    "fallback_reason": "",
+                },
+            }
+        },
         feature_snapshot={"current_price": 1.0},
     )
 
@@ -387,12 +418,19 @@ async def test_existing_active_entry_order_blocks_duplicate_submit():
 
 
 @pytest.mark.asyncio
-async def test_entry_size_lifts_to_okx_min_contracts_when_affordable():
+async def test_entry_size_below_okx_min_contracts_is_rejected_without_enlargement():
     fake_ccxt = FakeCcxt(amount_min=10.0, contract_size=1.0)
     executor = _executor(fake_ccxt)
     decision = _entry_decision()
     decision.position_size_pct = 0.001
     decision.suggested_leverage = 1.0
+    decision.raw_response["profit_risk_sizing"].update(
+        {
+            "final_notional_usdt": 1.0,
+            "final_margin_usdt": 1.0,
+            "planned_stressed_loss_usdt": 0.013,
+        }
+    )
 
     result = await executor.place_order(
         decision,
@@ -400,14 +438,14 @@ async def test_entry_size_lifts_to_okx_min_contracts_when_affordable():
         override_balance=1_000.0,
     )
 
-    assert fake_ccxt.create_calls
-    assert fake_ccxt.create_calls[0][3] == pytest.approx(10.0)
+    assert fake_ccxt.create_calls == []
+    assert result.status == OrderStatus.REJECTED
     assert result.raw_response is not None
     rules = result.raw_response["okx_order_rules"]
     assert rules["amount_min_contracts"] == pytest.approx(10.0)
-    assert rules["planned_contracts_raw"] == pytest.approx(3.0)
-    assert rules["final_contracts"] == pytest.approx(10.0)
-    assert rules["system_adjusted_to_min_contracts"] is True
+    assert rules["planned_contracts_raw"] == pytest.approx(1.0)
+    assert rules["final_contracts"] == pytest.approx(0.0)
+    assert rules["planned_below_minimum_contracts"] is True
 
 
 @pytest.mark.asyncio

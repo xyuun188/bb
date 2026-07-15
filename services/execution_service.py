@@ -8,6 +8,7 @@ submit/confirm/local-sync flow physically lives here.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from time import perf_counter
@@ -70,6 +71,13 @@ def _return_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
     expected_net = _safe_float(side_evidence.get("expected_net_return_pct"), 0.0)
     return_lcb = _safe_float(side_evidence.get("return_lcb_pct"), 0.0)
     source_count = int(_safe_float(side_evidence.get("production_source_count"), 0.0))
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
+    stress_fraction = _safe_float(sizing.get("stressed_loss_fraction"), 0.0)
+    target_notional = _safe_float(sizing.get("target_notional_usdt"), 0.0)
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    final_margin = _safe_float(sizing.get("final_margin_usdt"), 0.0)
+    available_margin = _safe_float(sizing.get("available_margin_usdt"), 0.0)
     reasons: list[str] = []
     if candidate.get("production_eligible") is not True:
         reasons.append("authoritative_return_candidate_not_eligible")
@@ -87,6 +95,26 @@ def _return_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
         reasons.append("dynamic_position_size_zero")
     if not _governance_complete(sizing_provenance):
         reasons.append("sizing_policy_provenance_incomplete")
+    if not str(sizing_provenance.get("contract_fingerprint") or "").strip():
+        reasons.append("sizing_contract_fingerprint_missing")
+    if risk_budget <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
+        reasons.append("sizing_risk_budget_invalid")
+    if stress_fraction <= 0 or not math.isclose(
+        planned_loss,
+        final_notional * stress_fraction,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("sizing_stressed_loss_algebra_mismatch")
+    if final_notional <= 0 or final_notional > target_notional + 1e-8:
+        reasons.append("sizing_notional_target_invalid")
+    if final_margin <= 0 or available_margin <= 0 or not math.isclose(
+        final_margin,
+        final_notional / max(_safe_float(decision.suggested_leverage, 1.0), 1.0),
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("sizing_margin_algebra_mismatch")
     if reasons:
         return PolicyGateResult.block(
             "dynamic_return_execution_contract_incomplete",

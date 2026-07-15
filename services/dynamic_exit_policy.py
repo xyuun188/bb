@@ -162,10 +162,7 @@ def assess_dynamic_exit(
             )
             if actual_entry_fee > 0.0:
                 exit_fee_rates.append(actual_entry_fee / position_notional)
-        stop_distance = max(
-            _safe_float(position.get("stop_loss_pct"), 0.0),
-            _safe_float(_safe_dict(position.get("risk_budget")).get("stress_stop_loss_pct"), 0.0),
-        )
+        stop_distance = max(_safe_float(position.get("stop_loss_pct"), 0.0), 0.0)
         stop_price = max(_safe_float(position.get("stop_loss"), 0.0), 0.0)
         if stop_distance <= 0 and stop_price > 0 and entry > 0:
             stop_distance = abs(entry - stop_price) / entry

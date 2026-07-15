@@ -6,11 +6,12 @@ def _input(**overrides):
         "symbol": "BTC/USDT",
         "requested_leverage": 3.0,
         "system_max_leverage": 20.0,
-        "balance": 1000.0,
-        "position_size_pct": 0.02,
-        "stress_stop_loss_pct": 0.02,
-        "max_loss_usdt": 16.0,
+        "target_notional_usdt": 240.0,
+        "available_margin_usdt": 100.0,
+        "stressed_loss_fraction": 0.02,
         "expected_net_return_pct": 1.2,
+        "return_lcb_pct": 0.8,
+        "expected_loss_pct": 0.3,
         "profit_quality_ratio": 1.2,
         "loss_probability": 0.38,
         "tail_risk_score": 0.30,
@@ -21,7 +22,7 @@ def _input(**overrides):
             "slippage_pct": 0.02,
             "spread_pct": 0.02,
         },
-        "portfolio_exposure_pct": 0.04,
+        "portfolio_capacity_fraction": 0.96,
     }
     base.update(overrides)
     return DynamicLeverageInput(**base)
@@ -61,19 +62,25 @@ def test_dynamic_leverage_continuously_tempers_weak_return_quality():
     assert decision.policy_provenance["fallback_reason"] == ""
 
 
-def test_dynamic_leverage_clamps_to_integer_risk_budget():
+def test_dynamic_leverage_observes_required_margin_without_using_size_to_set_budget():
     decision = DynamicLeverageAllocator().allocate(
         _input(
             requested_leverage=9.7,
-            balance=1000.0,
-            position_size_pct=0.08,
-            stress_stop_loss_pct=0.03,
-            max_loss_usdt=9.0,
+            target_notional_usdt=375.0,
+            available_margin_usdt=100.0,
         )
     )
 
-    assert decision.risk_budget_leverage == 3.75
-    assert decision.final_integer_leverage == 3
+    assert decision.required_margin_leverage == 3.75
+    assert decision.final_integer_leverage <= decision.system_max_leverage
+
+
+def test_requested_leverage_is_not_the_exchange_system_maximum() -> None:
+    low_request = DynamicLeverageAllocator().allocate(_input(requested_leverage=2.0))
+    high_request = DynamicLeverageAllocator().allocate(_input(requested_leverage=12.0))
+
+    assert low_request.system_max_leverage == high_request.system_max_leverage == 20.0
+    assert low_request.final_integer_leverage == high_request.final_integer_leverage
 
 
 def test_dynamic_leverage_missing_cost_distribution_falls_back_to_one_x() -> None:

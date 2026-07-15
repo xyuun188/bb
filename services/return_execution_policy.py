@@ -14,7 +14,7 @@ from services.profit_supervision import (
 )
 from services.return_objective import validate_return_distribution_contract
 
-RETURN_EXECUTION_POLICY_VERSION = "2026-07-15.standardized-return-execution.v3"
+RETURN_EXECUTION_POLICY_VERSION = "2026-07-15.standardized-return-execution.v4"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -139,18 +139,18 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         float("nan"),
     )
 
-    leverage = max(_safe_float(decision.suggested_leverage, 1.0), 1.0)
-    balance = max(_safe_float(sizing.get("account_balance_usdt"), 0.0), 0.0)
-    max_loss = max(_safe_float(sizing.get("max_stop_loss_usdt"), 0.0), 0.0)
-    stop_distance = max(_safe_float(sizing.get("stress_stop_loss_pct"), 0.0), 0.0)
-    risk_budget_size = (
-        max_loss / (balance * leverage * stop_distance)
-        if balance > 0 and max_loss > 0 and stop_distance > 0
-        else 0.0
+    position_size = max(_safe_float(sizing.get("position_size_pct"), 0.0), 0.0)
+    risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
+    planned_loss = max(
+        _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0),
+        0.0,
     )
-    denominator = max(abs(expected_net), uncertainty, 1e-12)
-    return_quality = min(max(return_lcb / denominator, 0.0), 1.0)
-    position_size = min(max(risk_budget_size * return_quality, 0.0), 1.0)
+    target_notional = max(_safe_float(sizing.get("target_notional_usdt"), 0.0), 0.0)
+    final_notional = max(_safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0)
+    stressed_loss_fraction = max(
+        _safe_float(sizing.get("stressed_loss_fraction"), 0.0),
+        0.0,
+    )
 
     opportunity_provenance = _safe_dict(opportunity.get("policy_provenance"))
     generated_at = str(opportunity_provenance.get("generated_at") or "").strip()
@@ -164,7 +164,7 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     )
     sizing_provenance_complete = _complete_provenance(sizing.get("policy_provenance"))
     provenance = {
-        "source": "separated_realized_net_distribution_and_account_stop_budget",
+        "source": "validated_realized_net_distribution_and_authoritative_risk_sizing",
         "observation_window": (
             "current_governed_market_live_cost_and_authoritative_trade_calibration"
         ),
@@ -251,8 +251,26 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         reasons.append("dynamic_entry_risk_budget_ineligible")
     if not sizing_provenance_complete:
         reasons.append("dynamic_entry_risk_budget_provenance_incomplete")
-    if balance <= 0 or max_loss <= 0 or stop_distance <= 0:
-        reasons.append("account_stop_risk_budget_incomplete")
+    if risk_budget <= 0 or stressed_loss_fraction <= 0:
+        reasons.append("independent_risk_budget_incomplete")
+    if planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
+        reasons.append("planned_stressed_loss_exceeds_risk_budget")
+    if final_notional <= 0 or final_notional > target_notional + 1e-8:
+        reasons.append("final_notional_exceeds_authoritative_target")
+    if not isclose(
+        planned_loss,
+        final_notional * stressed_loss_fraction,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("risk_sizing_algebra_mismatch")
+    if not isclose(
+        position_size,
+        max(_safe_float(decision.position_size_pct, 0.0), 0.0),
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("decision_position_size_differs_from_authoritative_sizing")
     if position_size <= 0:
         reasons.append("dynamic_position_budget_zero")
 
@@ -277,5 +295,6 @@ def apply_production_entry_policy(decision: DecisionOutput) -> ReturnExecutionAs
     raw = _safe_dict(decision.raw_response)
     raw["production_return_policy"] = assessment.to_dict()
     decision.raw_response = raw
-    decision.position_size_pct = assessment.position_size_pct if assessment.eligible else 0.0
+    if not assessment.eligible:
+        decision.position_size_pct = 0.0
     return assessment

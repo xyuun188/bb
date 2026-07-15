@@ -982,12 +982,13 @@ class OkxPerpetualSdkExchange:
 
     async def fetch_market_leverage_tiers(self, symbol: str) -> list[dict[str, Any]]:
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
+        inst_family = inst_id.removesuffix("-SWAP")
         response = await self._call_sdk(
             lambda: self.public_api,
             "get_position_tiers",
             instType=OKX_SWAP_INST_TYPE,
             tdMode=OKX_CROSS_MARGIN_MODE,
-            instId=inst_id,
+            instFamily=inst_family,
         )
         rows = response.get("data") if isinstance(response, Mapping) else []
         tiers: list[dict[str, Any]] = []
@@ -995,7 +996,14 @@ class OkxPerpetualSdkExchange:
             if not isinstance(row, Mapping):
                 continue
             max_lever = _safe_float(row.get("maxLever"), 0.0)
-            tiers.append({**dict(row), "maxLeverage": max_lever, "info": dict(row)})
+            tiers.append(
+                {
+                    **dict(row),
+                    "instFamily": str(row.get("instFamily") or inst_family),
+                    "maxLeverage": max_lever,
+                    "info": dict(row),
+                }
+            )
         return tiers
 
     @staticmethod

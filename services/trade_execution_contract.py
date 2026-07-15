@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from math import isfinite
+from math import isclose, isfinite
 from typing import Any
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
@@ -224,6 +224,34 @@ def _entry_contract_row(
         reasons.append("dynamic_risk_budget_ineligible")
     if not _provenance_complete(sizing.get("policy_provenance")):
         reasons.append("dynamic_risk_budget_provenance_incomplete")
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"))
+    stress_fraction = _safe_float(sizing.get("stressed_loss_fraction"))
+    target_notional = _safe_float(sizing.get("target_notional_usdt"))
+    final_notional = _safe_float(sizing.get("final_notional_usdt"))
+    if risk_budget <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
+        reasons.append("dynamic_risk_budget_algebra_invalid")
+    if stress_fraction <= 0 or not isclose(
+        planned_loss,
+        final_notional * stress_fraction,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("dynamic_stressed_loss_algebra_invalid")
+    if final_notional <= 0 or final_notional > target_notional + 1e-8:
+        reasons.append("dynamic_notional_target_invalid")
+    filled_notional = sum(
+        abs(_safe_float(_row_get(order, "quantity")) * _safe_float(_row_get(order, "price")))
+        for order in orders
+        if _order_status(order) in FILLED_STATUSES
+    )
+    if executed and filled_notional > 0 and not isclose(
+        final_notional,
+        filled_notional,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("filled_order_notional_differs_from_risk_contract")
     if executed and not _has_filled_order(orders):
         reasons.append("executed_entry_without_filled_order")
     row = {
@@ -237,6 +265,10 @@ def _entry_contract_row(
         "return_lcb_pct": _safe_float(policy.get("return_lcb_pct")),
         "execution_cost_pct": _safe_float(policy.get("execution_cost_pct")),
         "position_size_pct": _safe_float(policy.get("position_size_pct")),
+        "risk_budget_usdt": risk_budget,
+        "planned_stressed_loss_usdt": planned_loss,
+        "final_notional_usdt": final_notional,
+        "filled_order_notional_usdt": filled_notional,
         "production_source_count": _safe_int(policy.get("production_source_count")),
         "reasons": reasons,
     }

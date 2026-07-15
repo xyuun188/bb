@@ -39,6 +39,11 @@ def _entry_raw() -> dict[str, object]:
         },
         "profit_risk_sizing": {
             "production_eligible": True,
+            "risk_budget_usdt": 3.0,
+            "planned_stressed_loss_usdt": 2.4,
+            "stressed_loss_fraction": 0.02,
+            "target_notional_usdt": 150.0,
+            "final_notional_usdt": 120.0,
             "policy_provenance": provenance,
         },
     }
@@ -55,7 +60,12 @@ def _decision(decision_id: int, action: str, raw: dict[str, object]) -> SimpleNa
 
 
 def _filled_order(decision_id: int) -> SimpleNamespace:
-    return SimpleNamespace(decision_id=decision_id, status="filled")
+    return SimpleNamespace(
+        decision_id=decision_id,
+        status="filled",
+        quantity=1.2,
+        price=100.0,
+    )
 
 
 def test_complete_dynamic_return_entry_contract_is_clean() -> None:

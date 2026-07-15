@@ -2348,8 +2348,35 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
     decision = _decision(Action.LONG)
     decision.stop_loss_pct = 0.02
     decision.take_profit_pct = 0.04
-    decision.feature_snapshot = {"current_price": 100.0, "atr_pct": 0.01}
+    decision.feature_snapshot = {
+        "current_price": 100.0,
+        "atr_pct": 0.01,
+        "orderbook_ask_depth": 500.0,
+        "orderbook_bid_depth": 500.0,
+    }
     decision.raw_response = {
+        "strategy_mode": {"drawdown_pressure": 0.0, "portfolio_correlation": {}},
+        "exchange_risk_facts": {
+            "production_eligible": True,
+            "account_equity_usdt": 1000.0,
+            "available_margin_usdt": 1000.0,
+            "reported_max_leverage": 20.0,
+            "target_inst_id": "BTC-USDT-SWAP",
+            "contract_specs": {
+                "BTC-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
+            },
+            "leverage_tiers": [
+                {"tier": "1", "minSz": "0", "maxSz": "1000", "maxLeverage": 20},
+            ],
+            "policy_provenance": {
+                "source": "okx_test_facts",
+                "observation_window": "current",
+                "sample_count": 1,
+                "generated_at": "2026-07-15T00:00:00+00:00",
+                "strategy_version": "test",
+                "fallback_reason": "",
+            },
+        },
         "opportunity_score": {
             "score": 0.2,
             "expected_net_return_pct": 0.5,
@@ -2357,12 +2384,34 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
             "server_profit_loss_probability": 0.2,
             "tail_risk_score": 0.2,
             "profit_quality_ratio": 2.0,
+            "return_lcb_pct": 0.3,
+            "return_distribution_contract": {
+                "raw_expected_return_pct": 0.5,
+                "objective_expected_return_pct": 0.3,
+                "uncertainty_penalty_pct": 0.1,
+                "tail_loss_penalty_pct": 0.1,
+                "tail_loss_probability": 0.2,
+            },
             "execution_cost": {"production_eligible": True, "total_pct": 0.1},
             "expected_net_breakdown": {
                 "components": [
                     {
                         "production_eligible": True,
                         "included_in_return_distribution": True,
+                        "actual_trade_calibration": {
+                            "source_authority": "okx_position_history",
+                            "profile_source": "symbol_side",
+                            "net_return_after_cost_pct": {
+                                "count": 3,
+                                "expected": 0.2,
+                                "lower_hinge": 0.1,
+                            },
+                            "slippage_pct": {
+                                "count": 3,
+                                "expected": 0.01,
+                                "upper_hinge": 0.02,
+                            },
+                        },
                     }
                 ]
             },

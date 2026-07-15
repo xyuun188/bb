@@ -10,6 +10,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.exceptions import ExchangeAPIError, OrderPlacementError
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
+from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 
 
 class _FakeLogger:
@@ -1115,7 +1116,38 @@ def _entry_decision() -> DecisionOutput:
         suggested_leverage=5.0,
         stop_loss_pct=0.013,
         take_profit_pct=0.027,
-        raw_response={},
+        raw_response={
+            "profit_risk_sizing": {
+                "production_eligible": True,
+                "available_margin_usdt": 100.0,
+                "position_size_pct": 0.1,
+                "risk_budget_usdt": 100.0,
+                "portfolio_risk_budget_usdt": 100.0,
+                "current_portfolio_stressed_loss_usdt": 0.0,
+                "planned_stressed_loss_usdt": 0.65,
+                "target_notional_usdt": 1000.0,
+                "final_notional_usdt": 50.0,
+                "final_margin_usdt": 10.0,
+                "stressed_loss_fraction": 0.013,
+                "expected_net_return_pct": 1.0,
+                "leverage_tier_selection": {
+                    "production_eligible": True,
+                    "max_leverage": 20.0,
+                    "mark_price": 100.0,
+                    "contract_spec": {"ctVal": "1", "ctMult": "1"},
+                    "current_position_notional_usdt": 0.0,
+                    "current_position_contracts": 0.0,
+                },
+                "policy_provenance": {
+                    "source": "test",
+                    "observation_window": "test",
+                    "sample_count": 1,
+                    "generated_at": "2026-07-15T00:00:00+00:00",
+                    "strategy_version": "test",
+                    "fallback_reason": "",
+                },
+            }
+        },
         feature_snapshot={"current_price": 100.0},
     )
 
@@ -1455,6 +1487,18 @@ async def test_okx_existing_position_add_on_reuses_authoritative_leverage() -> N
     assert decision.suggested_leverage == 2
     assert exchange.set_leverage_calls == 0
 
+    planned_notional = decision.raw_response["profit_risk_sizing"]["final_notional_usdt"]
+    reconciled = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=planned_notional,
+        final_leverage=result["actual_leverage"],
+        source="test_okx_existing_position_actual_leverage",
+    )
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert reconciled["eligible"] is True
+    assert sizing["final_notional_usdt"] == pytest.approx(planned_notional)
+    assert sizing["final_margin_usdt"] == pytest.approx(planned_notional / 2.0)
+
 
 class _FloorAmountPrecisionCcxt:
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
@@ -1472,7 +1516,7 @@ def test_okx_amount_min_uses_raw_okx_min_size() -> None:
     assert executor._amount_min(market) == 5.0
 
 
-def test_okx_entry_amount_lifts_to_okx_raw_min_size() -> None:
+def test_okx_entry_amount_below_raw_min_size_is_rejected_without_enlargement() -> None:
     executor = OKXExecutor(mode="paper")
     market = {
         "symbol": "DOGE/USDT:USDT",
@@ -1490,8 +1534,8 @@ def test_okx_entry_amount_lifts_to_okx_raw_min_size() -> None:
         leverage=1.0,
     )
 
-    assert contracts == 5.0
-    assert base_quantity == 5.0
+    assert contracts == 0.0
+    assert base_quantity == 0.0
 
 
 def test_okx_order_contracts_ceil_after_precision_rounds_below_minimum() -> None:
@@ -1551,6 +1595,13 @@ async def test_okx_entry_caps_market_order_above_exchange_max_before_submit() ->
     decision = _entry_decision()
     decision.position_size_pct = 0.4
     decision.suggested_leverage = 5.0
+    decision.raw_response["profit_risk_sizing"].update(
+        {
+            "final_notional_usdt": 200.0,
+            "final_margin_usdt": 40.0,
+            "planned_stressed_loss_usdt": 2.6,
+        }
+    )
 
     result = await executor.place_order(decision, override_balance=100.0)
 
