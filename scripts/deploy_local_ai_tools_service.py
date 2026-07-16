@@ -39,6 +39,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -149,6 +150,7 @@ _CURRENT_MODEL_MTIME_NS: int | None = None
 _CURRENT_MODEL_PATH: Path | None = None
 _STATUS_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
 _TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
+_MODEL_CACHE_LOCK = threading.RLock()
 _STATUS_METADATA_KEYS = (
     "artifact_policy_id",
     "phase",
@@ -250,9 +252,10 @@ def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
 
 
 def _cache_get_or_load(key: str, loader):
-    if key not in _TRANSFORMER_MODEL_CACHE:
-        _TRANSFORMER_MODEL_CACHE[key] = loader()
-    return _TRANSFORMER_MODEL_CACHE[key]
+    with _MODEL_CACHE_LOCK:
+        if key not in _TRANSFORMER_MODEL_CACHE:
+            _TRANSFORMER_MODEL_CACHE[key] = loader()
+        return _TRANSFORMER_MODEL_CACHE[key]
 
 
 def _is_loopback_request(request: Request) -> bool:
@@ -1558,7 +1561,7 @@ def _resolve_artifact_pointer_for_status(
     return resolved
 
 
-def load_bundle() -> dict[str, Any] | None:
+def _load_bundle_unlocked() -> dict[str, Any] | None:
     global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
     global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
     model_mtime_ns: int | None = None
@@ -1628,6 +1631,13 @@ def load_bundle() -> dict[str, Any] | None:
         _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
         _CURRENT_MODEL_MTIME_NS = model_mtime_ns if model_mtime_ns is not None else -1
         return None
+
+
+def load_bundle() -> dict[str, Any] | None:
+    """Load one verified artifact once when concurrent inference starts."""
+
+    with _MODEL_CACHE_LOCK:
+        return _load_bundle_unlocked()
 
 
 def _file_stat(path: Path) -> dict[str, Any]:

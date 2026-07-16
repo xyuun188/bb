@@ -339,6 +339,15 @@ async def test_local_ai_tools_readtimeout_does_not_open_circuit(
     assert len(calls) == 9
 
 
+def test_local_ai_tools_localizes_request_timeouts_and_keeps_them_soft() -> None:
+    client = LocalAIToolsClient()
+
+    message = client._request_error_message(httpx.ReadTimeout("read timed out"))
+
+    assert message == "服务器量化工具读取响应超时"
+    assert client._is_soft_timeout_failure(message) is True
+
+
 def test_local_ai_tools_client_refreshes_runtime_settings(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -701,7 +710,18 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
         assert request_timeout == 0.5
         if path == "/health":
             return {"ok": True, "service": "phase3_quant_api", "trained_models_available": False}
-        return {"available": False, "message": "No trained local quant bundle found"}
+        return {
+            "available": False,
+            "message": "No trained local quant bundle found",
+            "child_endpoints": {
+                "profit_prediction": {
+                    "available": False,
+                    "path": "/profit/predict",
+                    "probe_mode": "metadata_contract",
+                    "actual_inference_probe": False,
+                }
+            },
+        }
 
     async def post_probe(
         path: str,
@@ -717,19 +737,18 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     result = await client.status()
 
     assert get_calls == ["/models/status", "/health"]
-    assert set(post_calls) == {
-        "/profit/predict",
-        "/timeseries/predict",
-        "/sentiment/deep/analyze",
-        "/exit/advise",
-    }
+    assert post_calls == []
     assert result["available"] is True
     assert result["model_bundle_available"] is False
     assert result["service_available"] is True
     assert result["api_base"] == "http://local-ai-tools.test"
     assert result["enabled_for_trading"] is True
     assert result["status"] == "artifact_unavailable"
-    assert result["child_endpoints"]["profit_prediction"]["available"] is True
+    assert result["child_endpoints"]["profit_prediction"]["available"] is False
+    assert result["child_endpoints"]["profit_prediction"]["probe_mode"] == (
+        "metadata_contract"
+    )
+    assert result["child_endpoints"]["profit_prediction"]["actual_inference_probe"] is False
 
 
 @pytest.mark.asyncio
@@ -861,7 +880,18 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
     async def fail_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         assert request_timeout == 0.5
         if path == "/health":
-            return {"ok": True, "service": "phase3_quant_api"}
+            return {
+                "ok": True,
+                "service": "phase3_quant_api",
+                "child_endpoints": {
+                    "profit_prediction": {
+                        "available": True,
+                        "path": "/profit/predict",
+                        "probe_mode": "metadata_contract",
+                        "actual_inference_probe": False,
+                    }
+                },
+            }
         raise RuntimeError("models status endpoint unavailable")
 
     async def post_probe(
@@ -943,7 +973,18 @@ async def test_local_ai_tools_status_uses_short_cache(
         assert request_timeout == 0.5
         if path == "/health":
             return {"ok": True, "service": "phase3_quant_api"}
-        return {"available": False, "message": "No trained local quant bundle found"}
+        return {
+            "available": False,
+            "message": "No trained local quant bundle found",
+            "child_endpoints": {
+                "profit_prediction": {
+                    "available": True,
+                    "path": "/profit/predict",
+                    "probe_mode": "metadata_contract",
+                    "actual_inference_probe": False,
+                }
+            },
+        }
 
     async def post_probe(
         path: str,
@@ -961,12 +1002,7 @@ async def test_local_ai_tools_status_uses_short_cache(
     second = await client.status()
 
     assert get_calls == ["/models/status", "/health"]
-    assert set(post_calls) == {
-        "/profit/predict",
-        "/timeseries/predict",
-        "/sentiment/deep/analyze",
-        "/exit/advise",
-    }
+    assert post_calls == []
     assert second["status_cache"]["hit"] is True
     assert second["child_endpoints"]["profit_prediction"]["available"] is True
 

@@ -2983,6 +2983,40 @@ function analysisToolStatus(payload) {
     return analysisPill(analysisToolPlainStatus(payload), payload.trained === false ? 'warn' : 'good');
 }
 
+function analysisLocalToolsRunStatus(status) {
+    const labels = {
+        completed: '全部返回',
+        partial: '部分返回',
+        unavailable: '全部不可用',
+        error: '调用失败',
+        disabled: '未启用',
+        circuit_open: '暂时熔断',
+    };
+    const normalized = String(status || 'completed').toLowerCase();
+    return labels[normalized] || analysisLocalizeText(normalized);
+}
+
+function analysisLocalToolsErrorsText(errors) {
+    if (!errors || typeof errors !== 'object') return '-';
+    const labels = {
+        profit_prediction: '盈利预测',
+        time_series_prediction: '时序预测',
+        sentiment_analysis: '情绪模型',
+        exit_advice: '平仓建议',
+    };
+    return Object.entries(errors).map(([name, raw]) => {
+        const text = String(raw || '').trim();
+        const readable = /ReadTimeout|读取响应超时/i.test(text)
+            ? '读取服务器响应超时，该轮未取得结果'
+            : /ConnectTimeout|连接.*超时/i.test(text)
+                ? '连接服务器超时，该轮未取得结果'
+                : /could not reach the service|无法连接服务器量化工具/i.test(text)
+                    ? '无法连接服务器量化工具'
+                    : analysisLocalizeText(text);
+        return `${labels[name] || analysisLocalizeText(name)}：${readable}`;
+    }).join('；');
+}
+
 function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
     if (!tools) {
         return '<div class="analysis-empty">本轮没有调用服务器量化工具。</div>';
@@ -3035,7 +3069,7 @@ function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
             <div class="analysis-card-head">
                 <div class="analysis-card-title">服务器量化工具</div>
                 <div class="analysis-card-tags">
-                    ${analysisPill(tools.status || 'completed', tools.status === 'completed' ? 'good' : 'warn')}
+                    ${analysisPill(analysisLocalToolsRunStatus(tools.status), tools.status === 'completed' ? 'good' : 'warn')}
                     ${tools.duration_sec !== undefined ? analysisPill(`耗时 ${analysisDurationLabel(tools.duration_sec)}`, Number(tools.duration_sec || 0) > 2 ? 'warn' : 'muted') : ''}
                 </div>
             </div>
@@ -3072,7 +3106,7 @@ function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
                     ${exitStatus}
                     ${analysisText(exitAdvice.action ? `${analysisToolMetaText(exitAdvice)}；${exitAdvice.action_label || analysisDecisionLabel(exitAdvice.action)}，信心 ${(Number(exitAdvice.confidence || 0) * 100).toFixed(0)}%${exitAdvice.reason ? `，原因：${analysisReasonLabel(exitAdvice.reason)}` : ''}` : '本轮没有返回独立平仓建议；如果不是持仓分析记录，通常不会触发这一项。')}
                 </div>` : `<div class="analysis-note analysis-note-muted"><span>平仓建议</span>${exitStatus}${analysisText('市场分析只评估开仓机会、方向和风险；平仓建议只在持仓分析中显示。')}</div>`}
-                ${tools.errors ? `<div class="analysis-note analysis-note-muted"><span>部分错误</span>${analysisText(JSON.stringify(tools.errors))}</div>` : ''}
+                ${tools.errors ? `<div class="analysis-note analysis-note-muted"><span>部分错误</span>${analysisText(analysisLocalToolsErrorsText(tools.errors))}</div>` : ''}
             </div>
         </div>`;
 }

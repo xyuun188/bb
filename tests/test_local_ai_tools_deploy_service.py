@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
@@ -598,6 +600,33 @@ def test_load_bundle_reuses_verified_unchanged_artifact(tmp_path: Path) -> None:
     assert first is not None
     assert second is first
     assert resolve_count == 1
+
+
+def test_load_bundle_serializes_concurrent_cold_loads(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_concurrent_bundle_cache_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _persist_test_shadow_artifact(module, tmp_path)
+    module._BUNDLE_CACHE = None
+    module._CURRENT_POINTER_MTIME_NS = None
+    module._CURRENT_MODEL_MTIME_NS = None
+    module._CURRENT_MODEL_PATH = None
+    module._STATUS_ARTIFACT_CACHE.clear()
+    load_count = 0
+    original_load = module.load_trusted_joblib_bundle
+
+    def counted_load(path: Path) -> dict:
+        nonlocal load_count
+        load_count += 1
+        time.sleep(0.05)
+        return original_load(path)
+
+    module.load_trusted_joblib_bundle = counted_load
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        bundles = list(pool.map(lambda _index: module.load_bundle(), range(3)))
+
+    assert all(bundle is bundles[0] for bundle in bundles)
+    assert load_count == 1
 
 
 def test_rejected_current_bundle_is_not_reloaded_until_pointer_changes(tmp_path: Path) -> None:

@@ -1518,6 +1518,20 @@ def test_analysis_model_decision_observation_is_not_rendered_as_failure() -> Non
     assert "本轮未启用最终交易员" not in decision_block
 
 
+def test_analysis_local_ai_tool_partial_errors_are_readable_chinese() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    start = script.index("function analysisLocalToolsRunStatus")
+    end = script.index("function renderAnalysisNewsContext", start)
+    block = script[start:end]
+
+    assert "partial: '部分返回'" in block
+    assert "time_series_prediction: '时序预测'" in block
+    assert "sentiment_analysis: '情绪模型'" in block
+    assert "读取服务器响应超时，该轮未取得结果" in block
+    assert "JSON.stringify(tools.errors)" not in block
+    assert "analysisLocalToolsErrorsText(tools.errors)" in block
+
+
 def test_dashboard_localizes_historical_model_decision_permission_note() -> None:
     payload = dashboard._analysis_decision_maker(
         {

@@ -67,7 +67,26 @@ class LocalAIToolsClient:
     @staticmethod
     def _is_soft_timeout_failure(reason: str) -> bool:
         lowered = str(reason or "").lower()
-        return "readtimeout" in lowered or "timed out" in lowered or "timeout" in lowered
+        return (
+            "readtimeout" in lowered
+            or "timed out" in lowered
+            or "timeout" in lowered
+            or "超时" in lowered
+        )
+
+    @staticmethod
+    def _request_error_message(exc: httpx.RequestError) -> str:
+        if isinstance(exc, httpx.ReadTimeout):
+            return "服务器量化工具读取响应超时"
+        if isinstance(exc, httpx.ConnectTimeout):
+            return "连接服务器量化工具超时"
+        if isinstance(exc, httpx.PoolTimeout):
+            return "等待服务器量化工具连接池超时"
+        if isinstance(exc, httpx.WriteTimeout):
+            return "向服务器量化工具发送请求超时"
+        if isinstance(exc, httpx.ConnectError):
+            return "无法连接服务器量化工具"
+        return f"服务器量化工具请求失败：{safe_error_text(exc)}"
 
     def _refresh_runtime_settings(self) -> None:
         self._timeout = min(
@@ -467,7 +486,7 @@ class LocalAIToolsClient:
             health_ok = False
             health_error = safe_error_text(exc, limit=180)
 
-        child_endpoints = await self._probe_child_endpoints()
+        child_endpoints = self._metadata_child_endpoints(status, health)
         child_available = any(
             bool(item.get("available") or item.get("ok"))
             for item in child_endpoints.values()
@@ -566,70 +585,23 @@ class LocalAIToolsClient:
             }
         )
 
-    async def _probe_child_endpoints(self) -> dict[str, dict[str, Any]]:
-        payload = self._json_safe(
-            {
-                "symbol": "BTC/USDT",
-                "features": {
-                    "symbol": "BTC/USDT",
-                    "current_price": 100.0,
-                    "close": 100.0,
-                    "returns_1": 0.02,
-                    "returns_5": 0.04,
-                    "returns_20": 0.08,
-                    "volume_ratio": 1.0,
-                    "volatility_20": 0.01,
-                    "spread_pct": 0.01,
-                    "adx_14": 20.0,
-                    "news_sentiment_avg": 0.0,
-                    "social_sentiment_avg": 0.0,
-                },
-                "open_positions": [
-                    {
-                        "symbol": "BTC/USDT",
-                        "side": "long",
-                        "entry_price": 100.0,
-                        "current_price": 100.2,
-                        "unrealized_pnl": 0.2,
-                        "unrealized_pnl_pct": 0.002,
-                    }
-                ],
-            }
-        )
-        specs = {
-            "profit_prediction": "/profit/predict",
-            "time_series_prediction": "/timeseries/predict",
-            "sentiment_analysis": "/sentiment/deep/analyze",
-            "exit_advice": "/exit/advise",
-        }
+    @staticmethod
+    def _metadata_child_endpoints(
+        status: Mapping[str, Any],
+        health: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Read child readiness without executing expensive inference routes."""
 
-        async def probe(name: str, path: str) -> tuple[str, dict[str, Any]]:
-            started = datetime.now(UTC)
-            try:
-                result = await self._post(
-                    path,
-                    payload,
-                    request_timeout=self._request_timeout(),
-                )
-                item = self._normalize_signal(name, result)
-                item["available"] = bool(item.get("available", True))
-            except Exception as exc:
-                item = {"available": False, "error": safe_error_text(exc, limit=180)}
-            item["path"] = path
-            item["duration_sec"] = round((datetime.now(UTC) - started).total_seconds(), 3)
-            return name, item
-
-        results = await asyncio.gather(
-            *(probe(name, path) for name, path in specs.items()),
-            return_exceptions=True,
-        )
-        out: dict[str, dict[str, Any]] = {}
-        for result in results:
-            if isinstance(result, Exception):
+        for source in (status, health):
+            raw = source.get("child_endpoints")
+            if not isinstance(raw, dict):
                 continue
-            name, item = result
-            out[name] = item
-        return out
+            return {
+                str(name): dict(item)
+                for name, item in raw.items()
+                if str(name).strip() and isinstance(item, dict)
+            }
+        return {}
 
     async def train(
         self,
@@ -827,9 +799,7 @@ class LocalAIToolsClient:
             async with httpx.AsyncClient(timeout=request_timeout or self._timeout) as client:
                 response = await client.get(f"{base}{path}", headers=self._auth_headers())
         except httpx.RequestError as exc:
-            raise RuntimeError(
-                f"local AI tools request could not reach the service: {safe_error_text(exc)}"
-            ) from exc
+            raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
 
     async def _post(
@@ -858,9 +828,7 @@ class LocalAIToolsClient:
                     headers=self._auth_headers(),
                 )
         except httpx.RequestError as exc:
-            raise RuntimeError(
-                f"local AI tools request could not reach the service: {safe_error_text(exc)}"
-            ) from exc
+            raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
 
     def _api_base(self) -> str:
