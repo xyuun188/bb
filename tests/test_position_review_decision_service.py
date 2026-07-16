@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -92,6 +93,33 @@ async def test_position_review_decision_service_builds_ensemble_context_and_meta
     attach_kwargs = next(value for name, value in calls if name == "attach")[1]
     assert attach_kwargs["phase"] == "position_review"
     assert attach_kwargs["skills"] == ["skill"]
+
+
+@pytest.mark.asyncio
+async def test_position_review_decision_service_awaits_async_ml_predictor() -> None:
+    calls: list[str] = []
+
+    async def ml_predictor(_feature_vector: Any) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        calls.append("ml")
+        return {"ready": True}
+
+    service = PositionReviewDecisionService(
+        default_model_name="ensemble_trader",
+        expert_memory_context_provider=lambda _symbol: _async_dict({}),
+        ml_signal_predictor=ml_predictor,
+        local_ai_tools_context_provider=lambda *_args, **_kwargs: _async_dict({}),
+        position_skills_provider=lambda **_kwargs: [],
+        agent_skills_attacher=lambda *_args, **_kwargs: {},
+        ensemble_decider=lambda *_args, **_kwargs: _async_tuple((_decision(), [])),
+        model_provider=lambda _name: None,
+    )
+
+    result = await service.decide(_request())
+
+    assert result is not None
+    assert calls == ["ml"]
+    assert result.ml_signal_context == {"ready": True}
 
 
 @pytest.mark.asyncio

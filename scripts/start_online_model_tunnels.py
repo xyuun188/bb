@@ -158,11 +158,41 @@ def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
     ]
 
 
-def start_servers(specs: list[TunnelSpec], ssh_transport: Any) -> list[ForwardServer]:
-    """Start all local forwarding servers."""
+def open_dedicated_transports(
+    specs: list[TunnelSpec],
+    server_info: Any,
+) -> tuple[list[Any], list[Any]]:
+    """Open one SSH transport per endpoint to prevent cross-model blocking."""
+
+    ssh_clients: list[Any] = []
+    transports: list[Any] = []
+    try:
+        for spec in specs:
+            ssh = connect_remote_ssh(ROOT, timeout=20, info=server_info)
+            ssh_clients.append(ssh)
+            transport = ssh.get_transport()
+            if transport is None or not transport.is_active():
+                raise RuntimeError(f"{spec.name} SSH transport is not active")
+            transport.set_keepalive(TRANSPORT_KEEPALIVE_SECONDS)
+            transports.append(transport)
+    except Exception:
+        for ssh in reversed(ssh_clients):
+            ssh.close()
+        raise
+    return ssh_clients, transports
+
+
+def start_servers(
+    specs: list[TunnelSpec],
+    ssh_transports: list[Any],
+) -> list[ForwardServer]:
+    """Start local forwarders with a dedicated transport for every endpoint."""
+
+    if len(specs) != len(ssh_transports):
+        raise ValueError("each tunnel endpoint requires one dedicated SSH transport")
 
     servers: list[ForwardServer] = []
-    for spec in specs:
+    for spec, ssh_transport in zip(specs, ssh_transports, strict=True):
         server = ForwardServer(spec, ssh_transport)
         thread = threading.Thread(target=server.serve_forever, name=f"tunnel-{spec.name}")
         thread.daemon = True
@@ -176,26 +206,33 @@ def start_servers(specs: list[TunnelSpec], ssh_transport: Any) -> list[ForwardSe
 
 
 def run_tunnels(specs: list[TunnelSpec]) -> None:
-    """Connect to the model server and keep loopback tunnels alive."""
+    """Connect isolated SSH transports and keep loopback tunnels alive."""
 
     info = load_model_server_info_from_secure_settings_sync()
-    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
+    ssh_clients: list[Any] = []
+    transports: list[Any] = []
     servers: list[ForwardServer] = []
     try:
-        transport = ssh.get_transport()
-        if transport is None or not transport.is_active():
-            raise RuntimeError("SSH transport is not active")
-        transport.set_keepalive(TRANSPORT_KEEPALIVE_SECONDS)
-        servers = start_servers(specs, transport)
-        safe_print("online model tunnels ready")
-        while transport.is_active():
+        ssh_clients, transports = open_dedicated_transports(specs, info)
+        servers = start_servers(specs, transports)
+        safe_print("online model tunnels ready with isolated transports")
+        while True:
+            inactive_names = [
+                spec.name
+                for spec, transport in zip(specs, transports, strict=True)
+                if not transport.is_active()
+            ]
+            if inactive_names:
+                raise RuntimeError(
+                    "SSH transport closed for: " + ", ".join(inactive_names)
+                )
             time.sleep(5)
-        raise RuntimeError("SSH transport closed")
     finally:
         for server in servers:
             server.shutdown()
             server.server_close()
-        ssh.close()
+        for ssh in reversed(ssh_clients):
+            ssh.close()
 
 
 def parse_port(value: str) -> int:

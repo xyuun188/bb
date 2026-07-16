@@ -170,10 +170,65 @@ def test_local_ai_tools_training_uses_per_sample_costs_and_empirical_tail_policy
     assert "def _dynamic_min_samples_leaf(sample_count: int)" in SERVICE_CODE
     assert "min_samples_leaf=8" not in SERVICE_CODE
     assert "min_samples_leaf=10" not in SERVICE_CODE
+    assert "n_jobs=-1" not in SERVICE_CODE
+    assert "def _adaptive_training_worker_count()" in SERVICE_CODE
+    assert "_configure_bundle_for_inference(candidate)" in SERVICE_CODE
     assert "sentiment_leaf_size = _dynamic_min_samples_leaf(len(sentiment_samples))" in (
         SERVICE_CODE
     )
     assert "if len(rows) < 80:" not in SERVICE_CODE
+
+
+def test_local_ai_tools_training_parallelism_leaves_inference_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_parallelism_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(
+        module.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(16)),
+        raising=False,
+    )
+
+    regressor = module._make_regressor(100)
+    classifier = module._make_classifier([0, 1, 0, 1])
+
+    assert module._available_cpu_count() == 16
+    assert module._adaptive_training_worker_count() == 4
+    assert regressor.named_steps["model"].n_jobs == 4
+    assert classifier.named_steps["model"].n_jobs == 4
+
+
+def test_local_ai_tools_loaded_bundle_forces_single_worker_inference(
+    tmp_path: Path,
+) -> None:
+    from sklearn.ensemble import ExtraTreesRegressor
+
+    module = ModuleType("local_ai_tools_inference_parallelism_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    estimator_names = (
+        "long_return_model",
+        "short_return_model",
+        "long_cost_model",
+        "short_cost_model",
+    )
+    bundle = {
+        name: ExtraTreesRegressor(n_estimators=2, n_jobs=-1)
+        for name in estimator_names
+    }
+    bundle["horizon_models"] = {
+        10: {"long_model": ExtraTreesRegressor(n_estimators=2, n_jobs=-1)}
+    }
+    module.persist_candidate_bundle(bundle, _test_artifact_metadata(module))
+    module.activate_candidate_shadow({"test": "shadow"})
+
+    loaded = module.load_bundle()
+
+    assert loaded is not None
+    assert all(loaded[name].n_jobs == 1 for name in estimator_names)
+    assert loaded["horizon_models"][10]["long_model"].n_jobs == 1
 
 
 def test_text_sentiment_training_uses_available_distribution_without_fixed_sample_gate() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from typing import Any
 from ai_brain.base_model import DecisionOutput
 
 ExpertMemoryContextProvider = Callable[[str], Awaitable[dict[str, Any]]]
-MLSignalPredictor = Callable[[Any], dict[str, Any]]
+MLSignalPredictor = Callable[[Any], dict[str, Any] | Awaitable[dict[str, Any]]]
 LocalAIToolsContextProvider = Callable[..., Awaitable[dict[str, Any]]]
 PositionSkillsProvider = Callable[..., list[Any]]
 AgentSkillsAttacher = Callable[..., dict[str, Any]]
@@ -83,7 +84,10 @@ class PositionReviewDecisionService:
         memory_context = await self.expert_memory_context_provider(
             request.normalized_symbol or request.symbol
         )
-        ml_signal_context = self.ml_signal_predictor(request.feature_vector)
+        ml_signal_result = self.ml_signal_predictor(request.feature_vector)
+        ml_signal_context = (
+            await ml_signal_result if inspect.isawaitable(ml_signal_result) else ml_signal_result
+        )
         local_ai_tools_context = await self.local_ai_tools_context_provider(
             request.feature_vector,
             ml_signal_context,

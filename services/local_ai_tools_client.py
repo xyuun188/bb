@@ -60,6 +60,7 @@ class LocalAIToolsClient:
         self._last_failure: str = ""
         self._last_success_at: datetime | None = None
         self._status_cache: tuple[float, dict[str, Any]] | None = None
+        self._inference_lock = asyncio.Lock()
 
     def _request_timeout(self) -> float:
         return min(max(self._timeout, 0.5), _MAX_REQUEST_TIMEOUT_SECONDS)
@@ -175,10 +176,15 @@ class LocalAIToolsClient:
             )
             return item
 
-        results = await asyncio.gather(
-            *(call_tool(name, path) for name, path in tool_specs),
-            return_exceptions=True,
-        )
+        # Market and position analysis run independently.  Without one shared
+        # client-side queue, their three-tool batches can overlap and turn into
+        # six CPU-heavy requests against the single quant-service process.
+        # Queueing does not consume the per-request read timeout; each request
+        # starts its own timeout only after it owns the inference slot.
+        results: list[dict[str, Any]] = []
+        async with self._inference_lock:
+            for name, path in tool_specs:
+                results.append(await call_tool(name, path))
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",

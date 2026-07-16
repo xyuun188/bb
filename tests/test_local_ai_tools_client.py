@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -137,6 +138,44 @@ async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_secon
     assert result["profit_prediction"]["duration_sec"] > 0
     assert result["time_series_prediction"]["duration_sec"] > 0
     assert result["sentiment_analysis"]["duration_sec"] > 0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_serializes_overlapping_batches_and_tool_calls(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    active_calls = 0
+    max_active_calls = 0
+    calls: list[tuple[str, str]] = []
+
+    async def succeed(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        nonlocal active_calls, max_active_calls
+        active_calls += 1
+        max_active_calls = max(max_active_calls, active_calls)
+        calls.append((str(payload.get("symbol") or ""), path))
+        await asyncio.sleep(0.01)
+        active_calls -= 1
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post", succeed)
+
+    first, second = await asyncio.gather(
+        client.enrich_with_context({"symbol": "BTC/USDT"}),
+        client.enrich_with_context({"symbol": "ETH/USDT"}),
+    )
+
+    assert first["status"] == "completed"
+    assert second["status"] == "completed"
+    assert max_active_calls == 1
+    assert len(calls) == 6
+    symbols = [symbol for symbol, _path in calls]
+    assert sum(left != right for left, right in zip(symbols, symbols[1:], strict=False)) == 1
 
 
 def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> None:

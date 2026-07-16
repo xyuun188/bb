@@ -1,5 +1,7 @@
 import asyncio
 import json
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -58,6 +60,39 @@ def _decision(action: Action) -> DecisionOutput:
         raw_response={},
         feature_snapshot={"current_price": 100.0},
     )
+
+
+@pytest.mark.asyncio
+async def test_local_ml_signal_context_offloads_and_serializes_predictions() -> None:
+    service = TradingService.__new__(TradingService)
+    service._local_ml_inference_lock = asyncio.Lock()
+    main_thread_id = threading.get_ident()
+    worker_thread_ids: list[int] = []
+    active_predictions = 0
+    max_active_predictions = 0
+
+    class Predictor:
+        def predict(self, features: dict[str, str]) -> dict[str, str]:
+            nonlocal active_predictions, max_active_predictions
+            worker_thread_ids.append(threading.get_ident())
+            active_predictions += 1
+            max_active_predictions = max(max_active_predictions, active_predictions)
+            time.sleep(0.02)
+            active_predictions -= 1
+            return features
+
+    service.ml_signal_service = Predictor()
+
+    first, second = await asyncio.gather(
+        service._local_ml_signal_context({"symbol": "BTC/USDT"}),
+        service._local_ml_signal_context({"symbol": "ETH/USDT"}),
+    )
+
+    assert first == {"symbol": "BTC/USDT"}
+    assert second == {"symbol": "ETH/USDT"}
+    assert max_active_predictions == 1
+    assert worker_thread_ids
+    assert all(thread_id != main_thread_id for thread_id in worker_thread_ids)
 
 
 @pytest.mark.asyncio

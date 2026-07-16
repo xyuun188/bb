@@ -1050,6 +1050,19 @@ def _dynamic_min_samples_leaf(sample_count: int) -> int:
     return max(int(math.log2(max(observed_count, 2))), 1)
 
 
+def _available_cpu_count() -> int:
+    try:
+        return max(len(os.sched_getaffinity(0)), 1)
+    except (AttributeError, OSError):
+        return max(int(os.cpu_count() or 1), 1)
+
+
+def _adaptive_training_worker_count() -> int:
+    """Use sublinear training parallelism so live inference always has headroom."""
+
+    return max(int(math.sqrt(_available_cpu_count())), 1)
+
+
 def _make_regressor(sample_count: int) -> Pipeline:
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -1058,7 +1071,7 @@ def _make_regressor(sample_count: int) -> Pipeline:
             max_depth=12,
             min_samples_leaf=_dynamic_min_samples_leaf(sample_count),
             random_state=42,
-            n_jobs=-1,
+            n_jobs=_adaptive_training_worker_count(),
         )),
     ])
 
@@ -1075,7 +1088,7 @@ def _make_classifier(y: list[int]) -> Pipeline:
             min_samples_leaf=_dynamic_min_samples_leaf(len(y)),
             class_weight="balanced",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=_adaptive_training_worker_count(),
         )
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -1622,6 +1635,7 @@ def _load_bundle_unlocked() -> dict[str, Any] | None:
             "artifact_activation_manifest": activation,
         }
         candidate = {**candidate, "metadata": runtime_metadata}
+        _configure_bundle_for_inference(candidate)
         _BUNDLE_CACHE = candidate
         _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
         _CURRENT_MODEL_MTIME_NS = model_mtime_ns
@@ -1638,6 +1652,54 @@ def load_bundle() -> dict[str, Any] | None:
 
     with _MODEL_CACHE_LOCK:
         return _load_bundle_unlocked()
+
+
+def _set_estimator_inference_workers(value: Any) -> None:
+    """Prevent one-row tree inference from fanning out across every CPU."""
+
+    if isinstance(value, dict):
+        for nested in value.values():
+            _set_estimator_inference_workers(nested)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _set_estimator_inference_workers(nested)
+        return
+    get_params = getattr(value, "get_params", None)
+    set_params = getattr(value, "set_params", None)
+    if callable(get_params) and callable(set_params):
+        try:
+            parameters = get_params(deep=True)
+            updates = {
+                name: 1
+                for name in parameters
+                if name == "n_jobs" or name.endswith("__n_jobs")
+            }
+            if updates:
+                set_params(**updates)
+                return
+        except Exception:
+            pass
+    if hasattr(value, "n_jobs"):
+        try:
+            value.n_jobs = 1
+        except Exception:
+            pass
+
+
+def _configure_bundle_for_inference(bundle: dict[str, Any]) -> None:
+    for key in (
+        "long_return_model",
+        "short_return_model",
+        "long_cost_model",
+        "short_cost_model",
+        "long_loss_model",
+        "short_loss_model",
+        "horizon_models",
+        "sentiment_model",
+        "text_sentiment_model",
+    ):
+        _set_estimator_inference_workers(bundle.get(key))
 
 
 def _file_stat(path: Path) -> dict[str, Any]:
@@ -2363,7 +2425,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     std = X.std(axis=0, keepdims=True) + 1e-6
     X = (X - mean) / std
 
-    torch.set_num_threads(max(min(os.cpu_count() or 2, 8), 1))
+    torch.set_num_threads(_adaptive_training_worker_count())
     xt = torch.tensor(X, dtype=torch.float32)
     yt = torch.tensor(y, dtype=torch.float32)
     model = nn.Sequential(
@@ -4047,7 +4109,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
                     max_depth=8,
                     min_samples_leaf=sentiment_leaf_size,
                     random_state=random_state,
-                    n_jobs=-1,
+                    n_jobs=_adaptive_training_worker_count(),
                 )),
             ])
 

@@ -338,6 +338,7 @@ class TradingService:
         self.ml_signal_service = MLSignalService(
             training_state_store=self.model_training_state_store
         )
+        self._local_ml_inference_lock = asyncio.Lock()
         self.local_ai_tools = LocalAIToolsClient()
         self.high_risk_review_service = HighRiskReviewService()
         self.agent_skills = TradingAgentSkillBook()
@@ -489,7 +490,7 @@ class TradingService:
         self.position_review_decision_service = PositionReviewDecisionService(
             default_model_name=ENSEMBLE_TRADER_NAME,
             expert_memory_context_provider=self.expert_memory_service.context,
-            ml_signal_predictor=self.ml_signal_service.predict,
+            ml_signal_predictor=self._local_ml_signal_context,
             local_ai_tools_context_provider=self._local_ai_tools_context,
             position_skills_provider=self.agent_skills.position_skills,
             agent_skills_attacher=self.agent_skills.attach,
@@ -3179,6 +3180,16 @@ class TradingService:
                 "error": error_text,
             }
 
+    async def _local_ml_signal_context(self, features: Any) -> dict[str, Any]:
+        """Run CPU-bound local ML inference without starving the event loop."""
+
+        lock = getattr(self, "_local_ml_inference_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._local_ml_inference_lock = lock
+        async with lock:
+            return await asyncio.to_thread(self.ml_signal_service.predict, features)
+
     def _entry_direction_competition_policy(self) -> EntryDirectionCompetitionPolicy:
         policy = getattr(self, "entry_direction_competition", None)
         if policy is not None:
@@ -5599,7 +5610,7 @@ class TradingService:
                     strategy_context=strategy_mode_context,
                 )
                 memory_context = await self._memory_context_with_vector_feedback(symbol)
-                ml_signal_context = self.ml_signal_service.predict(fv)
+                ml_signal_context = await self._local_ml_signal_context(fv)
                 local_ai_tools_context = await self._local_ai_tools_context(
                     fv,
                     ml_signal_context,
@@ -7117,7 +7128,7 @@ class TradingService:
 
         # Manual trades also use the unified multi-model ensemble.
         memory_context = await self._memory_context_with_vector_feedback(symbol)
-        ml_signal_context = self.ml_signal_service.predict(fv)
+        ml_signal_context = await self._local_ml_signal_context(fv)
         local_ai_tools_context = await self._local_ai_tools_context(
             fv,
             ml_signal_context,

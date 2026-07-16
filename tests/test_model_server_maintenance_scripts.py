@@ -344,6 +344,54 @@ def test_start_online_model_tunnels_swallow_short_client_disconnects() -> None:
     assert ForwardHandler._sendall_or_closed(socket_obj, b"hello") is False
 
 
+def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch) -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.keepalive: int | None = None
+
+        def is_active(self) -> bool:
+            return True
+
+        def set_keepalive(self, seconds: int) -> None:
+            self.keepalive = seconds
+
+    class FakeSSHClient:
+        def __init__(self) -> None:
+            self.transport = FakeTransport()
+            self.closed = False
+
+        def get_transport(self) -> FakeTransport:
+            return self.transport
+
+        def close(self) -> None:
+            self.closed = True
+
+    clients: list[FakeSSHClient] = []
+
+    def connect(*_args, **_kwargs) -> FakeSSHClient:
+        client = FakeSSHClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(tunnels, "connect_remote_ssh", connect)
+    specs = tunnels.build_default_tunnels()
+
+    opened_clients, transports = tunnels.open_dedicated_transports(specs, object())
+
+    assert opened_clients == clients
+    assert len(clients) == len(specs) == 4
+    assert len({id(transport) for transport in transports}) == len(specs)
+    assert all(
+        transport.keepalive == tunnels.TRANSPORT_KEEPALIVE_SECONDS
+        for transport in transports
+    )
+    assert transports[1] is not transports[0]
+    assert transports[1] is not transports[2]
+    assert transports[1] is not transports[3]
+
+
 def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:
     source = (ROOT / "core" / "model_server_bridge.py").read_text(encoding="utf-8")
 
