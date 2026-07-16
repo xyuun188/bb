@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 _EXACT_TRANSLATIONS = {
+    "Production permission belongs to the authoritative fee-after return policy; the legacy final decision-maker override is removed.": "生产交易许可由权威费后收益策略统一决定；旧版“最终交易员”强制覆盖权限已移除，本模型结果仅供观察。",
     "OKX auto reconciliation is unhealthy; pause new entries until OKX/backend state is consistent.": "OKX 自动对账异常；暂停新开仓，等待 OKX 与本地后台状态恢复一致。",
     "OKX auto reconciliation is stale; pause new entries until OKX/backend state is consistent.": "OKX 自动对账已过期；暂停新开仓，等待 OKX 与本地后台状态恢复一致。",
     "Trading runtime heartbeat is unavailable; new entries are blocked until the runtime publishes a fresh OKX sync heartbeat.": "交易运行时心跳不可用；暂停新开仓，直到运行时发布新的 OKX 同步心跳。",

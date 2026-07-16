@@ -281,7 +281,7 @@ def render_server_monitor_probe(
             if not isinstance(runtime_item, dict):
                 runtime_item = {{}}
             models = runtime_item.get("models") or []
-            provider_model = runtime_item.get("provider_model") or PRIMARY_MODEL_ID
+            provider_model = runtime_item.get("provider_model") or ""
             wanted = (provider_model or "").lower()
             model_ids = [str(m or "") for m in (models or []) if str(m or "")]
             active = bool(model_ids) and (
@@ -303,6 +303,23 @@ def render_server_monitor_probe(
                 "endpoint": runtime_item.get("endpoint") or "",
                 "models": model_ids,
             }}
+
+
+        def visible_vllm_service_rows(runtime):
+            if not isinstance(runtime, dict):
+                return []
+            rows = []
+            for item in runtime.get("vllm_endpoints", []):
+                if not isinstance(item, dict):
+                    continue
+                # The untargeted port-8000 fallback is already represented by
+                # model_runtime.vllm_endpoints.  It is not an independently
+                # configured model service, so repeating it here produces a
+                # misleading service row (and historically a false DOWN).
+                if not str(item.get("provider_model") or "").strip():
+                    continue
+                rows.append(vllm_model_service_status(item))
+            return rows
 
 
         def http_json(url, timeout=3, extra_headers=None):
@@ -576,13 +593,7 @@ def render_server_monitor_probe(
             "disks": [d for d in [disk_usage("/"), disk_usage("/data")] if d],
             "gpu": gpu_status(),
             "gpu_processes": gpu_processes(),
-            "services": [
-                *[
-                    vllm_model_service_status(item)
-                    for item in runtime.get("vllm_endpoints", [])
-                    if isinstance(item, dict)
-                ],
-            ],
+            "services": visible_vllm_service_rows(runtime),
             "model_runtime": runtime,
         }}
         print(json.dumps(payload, ensure_ascii=False))

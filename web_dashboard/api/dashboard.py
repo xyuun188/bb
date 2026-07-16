@@ -645,6 +645,19 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _analysis_decision_maker(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a localized copy of the user-visible model-decision record."""
+    source = raw.get("decision_maker")
+    if not isinstance(source, dict):
+        return None
+    payload = dict(source)
+    for key in ("reasoning", "reason", "guard_reason"):
+        note = str(payload.get(key) or "").strip()
+        if note:
+            payload[key] = sanitize_text(localize_execution_reason(note))
+    return payload
+
+
 def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
     """Return a normalized pre-expert skip state for analysis-flow rendering."""
     fast_prefilter = _safe_dict(raw.get("fast_prefilter"))
@@ -6863,11 +6876,7 @@ async def get_analysis_records(
                 "missing_experts": missing_experts,
                 "cross_validations": cross_validations,
                 "consultation": consultation,
-                "decision_maker": (
-                    raw.get("decision_maker")
-                    if isinstance(raw.get("decision_maker"), dict)
-                    else None
-                ),
+                "decision_maker": _analysis_decision_maker(raw),
                 "decision_attribution": _build_decision_attribution(d, raw, experts),
                 "ml_signal": (
                     raw.get("ml_signal") if isinstance(raw.get("ml_signal"), dict) else None

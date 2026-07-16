@@ -3597,23 +3597,38 @@ function renderAnalysisReasonModal(record) {
             </div>
         </div>`;
     const decisionMaker = record.decision_maker || null;
+    const decisionMakerObservationOnly = decisionMaker?.status === 'observation_only';
+    const decisionMakerStatusLabel = decisionMakerObservationOnly
+        ? '仅观察'
+        : decisionMaker?.status === 'completed'
+            ? '已裁决'
+            : decisionMaker?.status === 'skipped'
+                ? '已跳过'
+                : '未完成';
+    const decisionMakerStatusTone = decisionMakerObservationOnly
+        ? 'muted'
+        : decisionMaker?.status === 'completed'
+            ? 'good'
+            : decisionMaker?.status === 'skipped'
+                ? 'muted'
+                : 'warn';
     const decisionMakerHtml = decisionMaker ? `
         <div class="analysis-card analysis-final-card">
             <div class="analysis-card-head">
-                <div class="analysis-card-title">最终交易员</div>
+                <div class="analysis-card-title">模型裁决记录</div>
                 <div class="analysis-card-tags">
-                    ${analysisPill(decisionMaker.status === 'completed' ? '已裁决' : decisionMaker.status === 'skipped' ? '已跳过' : '未完成', decisionMaker.status === 'completed' ? 'good' : decisionMaker.status === 'skipped' ? 'muted' : 'warn')}
+                    ${analysisPill(decisionMakerStatusLabel, decisionMakerStatusTone)}
                     ${decisionMaker.action ? analysisPill(analysisActionLabel(decisionMaker.action, record), analysisTone(decisionMaker.action)) : ''}
                     ${decisionMaker.confidence !== undefined ? analysisPill(`信心 ${(Number(decisionMaker.confidence || 0) * 100).toFixed(0)}%`, Number(decisionMaker.confidence || 0) >= 0.6 ? 'good' : 'muted') : ''}
-                    ${decisionMaker.applied === true ? analysisPill('已采用', 'good') : decisionMaker.applied === false ? analysisPill('未采用', 'warn') : ''}
+                    ${decisionMakerObservationOnly ? analysisPill('不参与生产裁决', 'muted') : decisionMaker.applied === true ? analysisPill('已采用', 'good') : decisionMaker.applied === false ? analysisPill('未采用', 'warn') : ''}
                 </div>
             </div>
             <div class="analysis-card-text">
-                <div class="analysis-note"><span>裁决说明</span>${analysisText(decisionMaker.reasoning || decisionMaker.reason || decisionMaker.guard_reason || '-')}</div>
+                <div class="analysis-note"><span>${decisionMakerObservationOnly ? '权限说明' : '裁决说明'}</span>${analysisText(decisionMaker.reasoning || decisionMaker.reason || decisionMaker.guard_reason || '-')}</div>
                 ${decisionMaker.provider_model ? `<div class="analysis-note analysis-note-muted"><span>模型</span>${analysisText(decisionMaker.provider_model)}</div>` : ''}
             </div>
         </div>
-    ` : '<div class="analysis-empty">本轮未启用最终交易员</div>';
+    ` : '<div class="analysis-empty">本轮没有模型裁决记录</div>';
 
     const latencySummary = record.latency_summary || {};
     const timingBreakdown = Array.isArray(record.timing_breakdown) ? record.timing_breakdown : [];

@@ -7,6 +7,18 @@ def test_localize_unknown_reason_preserves_text() -> None:
     assert localize_execution_reason("自定义中文原因") == "自定义中文原因"
 
 
+def test_localize_legacy_final_override_observation_note() -> None:
+    localized = localize_execution_reason(
+        "Production permission belongs to the authoritative fee-after return policy; "
+        "the legacy final decision-maker override is removed."
+    )
+
+    assert localized == (
+        "生产交易许可由权威费后收益策略统一决定；旧版“最终交易员”强制覆盖权限"
+        "已移除，本模型结果仅供观察。"
+    )
+
+
 def test_localize_okx_attention_reason_with_dynamic_count() -> None:
     reason = (
         "OKX auto reconciliation found 2 current-state differences requiring review; "

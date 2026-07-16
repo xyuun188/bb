@@ -137,8 +137,8 @@ class EnsembleCoordinator:
             "status": "observation_only",
             "applied": False,
             "reason": (
-                "Production permission belongs to the authoritative fee-after return policy; "
-                "the legacy final decision-maker override is removed."
+                "生产交易许可由权威费后收益策略统一决定；旧版“最终交易员”强制覆盖权限"
+                "已移除，本模型结果仅供观察。"
             ),
             "strategy_version": "2026-07-12.remove-final-override.v1",
         }

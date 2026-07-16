@@ -1504,6 +1504,41 @@ def test_analysis_pre_expert_skip_contract_is_not_reported_as_model_config_error
     assert "function renderAnalysisReasonModal" in script[detail_start:detail_end]
 
 
+def test_analysis_model_decision_observation_is_not_rendered_as_failure() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    decision_start = script.index("const decisionMaker = record.decision_maker || null;")
+    decision_end = script.index("const latencySummary", decision_start)
+    decision_block = script[decision_start:decision_end]
+
+    assert "decisionMakerObservationOnly" in decision_block
+    assert "模型裁决记录" in decision_block
+    assert "仅观察" in decision_block
+    assert "不参与生产裁决" in decision_block
+    assert "权限说明" in decision_block
+    assert "本轮未启用最终交易员" not in decision_block
+
+
+def test_dashboard_localizes_historical_model_decision_permission_note() -> None:
+    payload = dashboard._analysis_decision_maker(
+        {
+            "decision_maker": {
+                "status": "observation_only",
+                "applied": False,
+                "reason": (
+                    "Production permission belongs to the authoritative fee-after return policy; "
+                    "the legacy final decision-maker override is removed."
+                ),
+            }
+        }
+    )
+
+    assert payload is not None
+    assert payload["reason"] == (
+        "生产交易许可由权威费后收益策略统一决定；旧版“最终交易员”强制覆盖权限"
+        "已移除，本模型结果仅供观察。"
+    )
+
+
 def test_dashboard_api_normalizes_market_prefilter_expert_status() -> None:
     raw = {
         "fast_prefilter": {

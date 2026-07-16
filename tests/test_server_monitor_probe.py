@@ -256,15 +256,34 @@ def test_server_monitor_probe_marks_vllm_port_model_mismatch() -> None:
     assert "BB-FinQuant-Expert-14B" in str(result["error"])
 
 
-def test_server_monitor_probe_reports_each_vllm_endpoint_as_service() -> None:
-    script = render_server_monitor_probe("qwen3-14b-trade", "Qwen3-14B-Instruct")
+def test_server_monitor_probe_omits_untargeted_fallback_from_duplicate_service_rows() -> None:
+    script = render_server_monitor_probe("deepseek-v4-pro", "deepseek-v4-pro")
+    namespace = _load_probe_namespace(script)
+    visible_rows = cast(Callable[[dict[str, object]], list[dict[str, object]]], namespace["visible_vllm_service_rows"])
 
-    assert 'for item in runtime.get("vllm_endpoints", [])' in script
-    assert "vllm_model_service_status(item)" in script
-    assert 'runtime.get("vllm", {}).get("models")' not in script
-    assert '"provider_model": provider_model' in script
-    assert "DeepSeek R1 14B" in script
-    assert "deepseek-r1-14b-risk" in script
+    rows = visible_rows(
+        {
+            "vllm_endpoints": [
+                {
+                    "label": "Local decision fallback",
+                    "provider_model": "",
+                    "models": ["qwen3-14b-trade"],
+                    "endpoint": "127.0.0.1:8000/v1",
+                },
+                {
+                    "label": "DeepSeek R1 14B",
+                    "provider_model": "deepseek-r1-14b-risk",
+                    "models": ["deepseek-r1-14b-risk"],
+                    "endpoint": "127.0.0.1:8002/v1",
+                },
+            ]
+        }
+    )
+
+    assert [row["name"] for row in rows] == ["DeepSeek R1 14B"]
+    assert rows[0]["active"] is True
+    assert '"services": visible_vllm_service_rows(runtime)' in script
+    assert 'provider_model = runtime_item.get("provider_model") or PRIMARY_MODEL_ID' not in script
 
 
 def test_server_monitor_probe_keeps_primary_vllm_separate_from_available_expert() -> None:
