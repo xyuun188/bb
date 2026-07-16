@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -673,6 +674,52 @@ async def test_phase3_server_migration_does_not_observe_legacy_takeover_as_ready
     assert "under observation" not in card["summary"]
     assert state == "unresolved"
     assert label
+
+
+@pytest.mark.asyncio
+async def test_phase3_server_migration_marks_policy_preserved_data_as_observing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePhase3ServerMigrationAuditService:
+        def __init__(self, *, timeout_seconds: int) -> None:
+            assert timeout_seconds == system_audit.PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS
+
+        async def report(self) -> dict[str, Any]:
+            return {
+                "status": "ready",
+                "read_only": True,
+                "audit_only": True,
+                "can_mutate_remote": False,
+                "can_delete_remote_data": False,
+                "phase3_go_live_blocked": False,
+                "remote_probe_available": True,
+                "legacy_data_path_count": 3,
+                "forbidden_service_count": 0,
+                "legacy_process_count": 0,
+                "migration_manifest": {"present": True, "item_count": 1},
+                "blockers": [],
+                "warnings": [
+                    {
+                        "code": "legacy_data_paths_preserved",
+                        "severity": "warning",
+                        "message": "旧数据路径按策略隔离保留。",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3ServerMigrationAuditService",
+        FakePhase3ServerMigrationAuditService,
+    )
+
+    card = await system_audit._phase3_server_migration_audit()
+    state, label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
+
+    assert card["status"] == "warning"
+    assert card["details"]["observing"] is True
+    assert state == "observing"
+    assert "观察" in label
 
 
 @pytest.mark.asyncio
@@ -2017,7 +2064,7 @@ def test_market_data_warmup_warning_is_observing() -> None:
     state, label = system_audit._issue_ledger_state(card, cards_by_key={})
 
     assert state == "observing"
-    assert "market-data warmup" in label
+    assert "行情数据预热" in label
 
 
 def test_market_data_zero_coverage_warning_remains_unresolved() -> None:
@@ -2036,6 +2083,37 @@ def test_market_data_zero_coverage_warning_remains_unresolved() -> None:
     state, _label = system_audit._issue_ledger_state(card, cards_by_key={})
 
     assert state == "unresolved"
+
+
+def test_system_audit_primary_user_facing_reasons_are_chinese() -> None:
+    source = (Path(__file__).resolve().parents[1] / "web_dashboard/api/system_audit.py").read_text(
+        encoding="utf-8"
+    )
+
+    for english_text in (
+        "Phase 3 paper resume preflight has been consumed",
+        "Strong opportunity classifier is shadow-only",
+        "Dynamic fee-after return architecture is ready",
+        "High-risk review audit found no required hard-review entries",
+        "Missed opportunities remain read-only fee-after return observations",
+    ):
+        assert english_text not in source
+
+    nodes = system_audit._build_audit_nodes([])
+    visible_text = " ".join(
+        str(value)
+        for node in nodes
+        for value in (
+            node.get("title"),
+            node.get("layer"),
+            node.get("impact"),
+            *(node.get("checks") or []),
+        )
+    )
+
+    assert "High-risk review" not in visible_text
+    assert "Strong opportunity" not in visible_text
+    assert "Shadow missed opportunity" not in visible_text
 
 
 
@@ -3470,12 +3548,44 @@ async def test_okx_trade_fact_integrity_warns_when_position_links_are_repairable
         "_okx_authoritative_sync_summary",
         fake_okx_authoritative_sync_summary,
     )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_trading_runtime_status_for_audit",
+        lambda: {
+            "available": True,
+            "running": True,
+            "heartbeat_age_seconds": 1.0,
+            "okx_authoritative_sync": {
+                "status": "ok",
+                "last_error": None,
+                "last_requires_attention_count": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_okx_daily_reconciliation_report_summary",
+        lambda: {
+            "available": True,
+            "status": "warning",
+            "stale": False,
+            "requires_attention": False,
+            "can_open_new_entries": True,
+            "can_refresh_training": True,
+            "entry_blocked": False,
+            "training_blocked": False,
+            "attention_buckets": {"entry": 0, "manual_review": 0, "training": 0},
+        },
+    )
 
     card = await system_audit._okx_trade_fact_integrity_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
 
     assert card["status"] == "warning"
     assert card["details"]["position_fact_link_repair"]["repairable_count"] == 1
     assert card["details"]["position_fact_link_repair"]["diagnostics"][0]["position_id"] == 10
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert "历史事实链接只读隔离" in ledger["observing"][0]["state_label"]
 
 
 @pytest.mark.asyncio

@@ -5172,18 +5172,17 @@ async def get_ml_signal_status():
     status.setdefault("training_window_policy", "all_current_clean_cost_complete_samples")
 
     try:
-        completed_total = _explicit_phase3_count(
-            status,
-            "phase3_clean_completed_shadow_sample_count",
-            "phase3_clean_trainable_shadow_sample_count",
-        )
-        if completed_total is None:
-            completed_total = await _completed_ml_shadow_sample_count()
+        # Artifact metadata is the last-trained cursor, not the current database total.
+        # Always read the live clean view so the "new, untrained" counter can advance.
+        completed_total = await _completed_ml_shadow_sample_count()
         completed_total = int(completed_total or 0)
         completed_total = max(completed_total, training_count)
         status["phase3_clean_completed_shadow_sample_count"] = completed_total
         status["completed_shadow_sample_count"] = completed_total
         status["total_shadow_sample_count"] = completed_total
+        status["completed_shadow_sample_count_source"] = (
+            "live_phase3_clean_training_view"
+        )
 
         auto_last = (
             status.get("auto_train_last_result")

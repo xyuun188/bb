@@ -287,10 +287,15 @@ class ModelTrainingStateStore:
         now = self.now_provider()
         schedulers = payload.get("schedulers")
         schedulers = schedulers if isinstance(schedulers, dict) else {}
-        stale_ids: list[str] = []
+        scheduler_model_ids: dict[str, set[str]] = {}
         for scheduler_id, raw in schedulers.items():
             if not isinstance(raw, dict):
                 continue
+            scheduler_model_ids[str(scheduler_id)] = {
+                str(model_id)
+                for model_id in raw.get("model_ids") or []
+                if str(model_id)
+            }
             heartbeat = _parse_datetime(raw.get("heartbeat_at"))
             interval = max(float(raw.get("interval_seconds") or 0.0), 1.0)
             age = (now - heartbeat).total_seconds() if heartbeat is not None else None
@@ -298,10 +303,36 @@ class ModelTrainingStateStore:
             raw["heartbeat_age_seconds"] = round(max(age, 0.0), 3) if age is not None else None
             raw["heartbeat_stale_after_seconds"] = round(stale_after, 3)
             raw["heartbeat_stale"] = age is None or age > stale_after
-            if raw["heartbeat_stale"]:
-                stale_ids.append(str(scheduler_id))
+        fresh_scheduler_models = {
+            str(scheduler_id): scheduler_model_ids.get(str(scheduler_id), set())
+            for scheduler_id, raw in schedulers.items()
+            if isinstance(raw, dict) and raw.get("heartbeat_stale") is False
+        }
+        stale_ids: list[str] = []
+        superseded_ids: list[str] = []
+        for scheduler_id, raw in schedulers.items():
+            if not isinstance(raw, dict):
+                continue
+            normalized_id = str(scheduler_id)
+            model_ids = scheduler_model_ids.get(normalized_id, set())
+            covered_by = sorted(
+                fresh_id
+                for fresh_id, fresh_models in fresh_scheduler_models.items()
+                if fresh_id != normalized_id and model_ids and model_ids.issubset(fresh_models)
+            )
+            superseded = bool(raw.get("heartbeat_stale") and covered_by)
+            raw["heartbeat_superseded"] = superseded
+            raw["heartbeat_superseded_by"] = covered_by
+            raw["heartbeat_effective_stale"] = bool(
+                raw.get("heartbeat_stale") and not superseded
+            )
+            if superseded:
+                superseded_ids.append(normalized_id)
+            elif raw["heartbeat_effective_stale"]:
+                stale_ids.append(normalized_id)
         payload["status"] = "warning" if stale_ids else payload.get("status", "ok")
         payload["stale_scheduler_ids"] = stale_ids
+        payload["superseded_scheduler_ids"] = superseded_ids
         payload["heartbeat_stale"] = bool(stale_ids)
         timed_out_models: list[str] = []
         models = payload.get("models") if isinstance(payload.get("models"), dict) else {}

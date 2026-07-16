@@ -2458,7 +2458,7 @@ async def _model_expert_competition_audit() -> dict[str, Any]:
     )[:8]
     status = _status_from_counts(warning=bool(blockers or concerning))
     summary = (
-        "竞赛缺少 baseline 样本，仅记录观察。"
+        "竞赛缺少基线样本，仅记录观察。"
         if blockers
         else "模型/专家费后收益对比仅供观察，不生成生产权重建议。"
     )
@@ -2478,7 +2478,7 @@ async def _model_expert_competition_audit() -> dict[str, Any]:
             "top_competitors": top_competitors,
         },
         evidence=[
-            {"label": "baseline样本", "value": int(baseline.get("sample_count") or 0)},
+            {"label": "基线样本", "value": int(baseline.get("sample_count") or 0)},
             {"label": "竞赛组件", "value": len(competitors)},
             {
                 "label": "仅观察",
@@ -2487,7 +2487,7 @@ async def _model_expert_competition_audit() -> dict[str, Any]:
             {"label": "生产权重变更", "value": concerning},
         ],
         next_actions=[
-            "本卡只读展示 baseline 和费后收益差异。",
+            "本卡只读展示基线和费后收益差异。",
             "模型晋升必须使用权威费后收益分布与完整治理证据。",
             "本报告不能改变生产专家集合、权重或路由。",
         ],
@@ -2549,7 +2549,7 @@ async def _model_dynamic_routing_audit() -> dict[str, Any]:
             {"label": "收益合同不合格却执行", "value": ineligible_executed},
         ],
         next_actions=[
-            "没有 C2/C3 baseline 和线上观察前，不得把动态路由应用到真实专家调用。",
+            "没有 C2/C3 基线和线上观察前，不得把动态路由应用到真实专家调用。",
             "不得为了降延迟跳过 risk_expert 或必要风控复核。",
             "若弱证据执行或快亏平增加，继续保持 shadow_only 并先诊断执行质量。",
         ],
@@ -2567,9 +2567,9 @@ async def _high_risk_review_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "high_risk_review_audit",
-            "High-risk review",
+            "高风险独立复核",
             "warning",
-            "High-risk review audit failed; keep hard-review gates fail-closed.",
+            "高风险独立复核失败；硬复核门继续保持保守阻断。",
             details={"error": safe_error_text(exc, limit=180), "audit_only": True},
         )
     unsafe = int(report.get("executed_without_required_review_count") or 0)
@@ -2577,17 +2577,17 @@ async def _high_risk_review_audit() -> dict[str, Any]:
     blocked = int(report.get("blocked_count") or 0)
     status = "critical" if unsafe else "warning" if hard_required and not blocked else "ok"
     summary = (
-        "High-risk entries executed without completed approval; inspect gate wiring before live expansion."
+        "存在未完成审批就执行的高风险开仓；扩大生产影响前必须检查复核门接线。"
         if unsafe
         else (
-            "High-risk review gate is active and blocking or approving required reviews."
+            "高风险复核门正在运行，并按要求阻断或批准复核。"
             if hard_required
-            else "High-risk review audit found no required hard-review entries in the current window."
+            else "当前窗口没有需要硬复核的开仓。"
         )
     )
     return _audit_card(
         "high_risk_review_audit",
-        "High-risk review",
+        "高风险独立复核",
         status,
         summary,
         details={
@@ -2611,14 +2611,14 @@ async def _high_risk_review_audit() -> dict[str, Any]:
             "policy": report.get("policy") or {},
         },
         evidence=[
-            {"label": "Hard reviews", "value": hard_required},
-            {"label": "Blocked", "value": blocked},
-            {"label": "Unsafe executed", "value": unsafe},
+            {"label": "需要硬复核", "value": hard_required},
+            {"label": "已阻断", "value": blocked},
+            {"label": "不安全执行", "value": unsafe},
         ],
         next_actions=[
-            "Hard-review-required entries must have approved=true before execution.",
-            "Ordinary low-risk entries should not route through the high-risk reviewer.",
-            "High-risk review failure must not bypass risk controls.",
+            "需要硬复核的开仓必须在 approved=true 后才能执行。",
+            "普通低风险开仓不应进入高风险复核器。",
+            "高风险复核失败时不得绕过风险控制。",
         ],
     )
 
@@ -2634,12 +2634,12 @@ async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "shadow_missed_opportunity",
-            "Shadow missed opportunity",
+            "影子错失机会复盘",
             "warning",
-            "Shadow missed opportunity report failed; keep missed-opportunity feedback observe-only.",
+            "影子错失机会报告读取失败；错失机会反馈继续只作观察。",
             details={"error": safe_error_text(exc, limit=180), "audit_only": True},
             next_actions=[
-                "Check shadow_backtests completion rows and missed opportunity report inputs."
+                "检查 shadow_backtests 完成记录和错失机会报告输入。"
             ],
         )
     summary = _safe_dict(report.get("summary"))
@@ -2648,12 +2648,12 @@ async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
     warning = contract_gaps > 0
     return _audit_card(
         "shadow_missed_opportunity",
-        "Shadow missed opportunity",
+        "影子错失机会复盘",
         "warning" if warning else "ok",
         (
-            "Executed entries are missing a positive fee-after return contract."
+            "已执行开仓缺少正向费后收益契约。"
             if warning
-            else "Missed opportunities remain read-only fee-after return observations."
+            else "错失机会继续作为只读费后收益观察样本。"
         ),
         details={
             "audit_only": True,
@@ -2669,15 +2669,15 @@ async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
             )[:10],
         },
         evidence=[
-            {"label": "completed", "value": int(summary.get("completed_count") or 0)},
-            {"label": "missed", "value": int(summary.get("missed_count") or 0)},
-            {"label": "observed groups", "value": int(summary.get("observe_only_count") or 0)},
-            {"label": "execution contract gaps", "value": contract_gaps},
+            {"label": "已完成", "value": int(summary.get("completed_count") or 0)},
+            {"label": "已错失", "value": int(summary.get("missed_count") or 0)},
+            {"label": "观察分组", "value": int(summary.get("observe_only_count") or 0)},
+            {"label": "执行契约缺口", "value": contract_gaps},
         ],
         next_actions=[
-            "Keep missed-opportunity returns observation-only.",
-            "Require current positive return LCB, live costs and provenance for every entry.",
-            "Investigate every executed return-contract gap before model promotion.",
+            "错失机会收益只能用于观察。",
+            "每次开仓都必须具备当前为正的收益置信下界、实时成本和来源证据。",
+            "模型晋升前必须调查每一个已执行收益契约缺口。",
         ],
     )
 
@@ -2693,9 +2693,9 @@ async def _strong_opportunity_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "strong_opportunity",
-            "Strong opportunity",
+            "强机会识别",
             "warning",
-            "Strong opportunity report failed; keep Phase 2 promotion shadow-only.",
+            "强机会报告读取失败；二阶段晋升继续保持影子模式。",
             details={
                 "error": safe_error_text(exc, limit=180),
                 "audit_only": True,
@@ -2706,8 +2706,8 @@ async def _strong_opportunity_audit() -> dict[str, Any]:
                 "can_apply_live_sizing": False,
             },
             next_actions=[
-                "Check recent entry decision raw opportunity_score and entry_candidate_evidence.",
-                "Do not promote sizing or entry behavior while the report is unavailable.",
+                "检查最近开仓决策的原始 opportunity_score 和 entry_candidate_evidence。",
+                "报告不可用时不得晋升仓位大小或开仓行为。",
             ],
         )
     strong_count = int(report.get("strong_candidate_count") or 0)
@@ -2718,12 +2718,12 @@ async def _strong_opportunity_audit() -> dict[str, Any]:
     warning = bool(strong_count == 0 or near_miss_count or blockers)
     return _audit_card(
         "strong_opportunity",
-        "Strong opportunity",
+        "强机会识别",
         "warning" if warning else "ok",
         (
-            "Strong opportunity classifier is shadow-only; no live sizing promotion is allowed."
+            "强机会分类器当前只作影子观察；禁止晋升到生产仓位调整。"
             if warning
-            else "Strong opportunity classifier found auditable candidates in shadow mode."
+            else "强机会分类器在影子模式中找到了可审计候选。"
         ),
         details={
             "audit_only": True,
@@ -2746,15 +2746,15 @@ async def _strong_opportunity_audit() -> dict[str, Any]:
             "diagnostic_boundary": report.get("diagnostic_boundary"),
         },
         evidence=[
-            {"label": "entries", "value": entry_decisions},
-            {"label": "strong", "value": strong_count},
-            {"label": "executed_strong", "value": executed_strong},
-            {"label": "near_miss", "value": near_miss_count},
+            {"label": "开仓决策", "value": entry_decisions},
+            {"label": "强机会", "value": strong_count},
+            {"label": "已执行强机会", "value": executed_strong},
+            {"label": "接近达标", "value": near_miss_count},
         ],
         next_actions=[
-            "Use this card only as Phase 2 shadow evidence; it cannot force open orders.",
-            "Before live promotion, verify OKX fact integrity, selected-side return distribution, live cost, provenance and left-tail quality.",
-            "Do not increase leverage, position size, or bypass risk gates from this report alone.",
+            "本卡片只能作为二阶段影子证据，不能强制开仓。",
+            "生产晋升前必须验证 OKX 事实完整性、选中方向收益分布、实时成本、来源证据和左尾质量。",
+            "不得仅凭本报告提高杠杆或仓位，也不得绕过风险门。",
         ],
     )
 
@@ -2791,25 +2791,25 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
     violation_count = economics_gaps + exit_gaps
     return _audit_card(
         "position_capacity_release",
-        "Position economics and dynamic exit",
+        "持仓经济性与动态退出",
         "critical" if violation_count else "ok",
         (
-            "Position economics or executed dynamic-exit contracts are incomplete."
+            "持仓经济性或已执行动态退出契约不完整。"
             if violation_count
-            else "Open positions and executed exits satisfy current economics contracts."
+            else "当前持仓和已执行退出满足现行经济性契约。"
         ),
         details=report,
         evidence=[
-            {"label": "Open positions", "value": int(report.get("open_position_count") or 0)},
-            {"label": "Economics complete", "value": int(report.get("position_economics_complete_count") or 0)},
-            {"label": "Economics gaps", "value": economics_gaps},
-            {"label": "Dynamic exits", "value": int(report.get("dynamic_exit_decision_count") or 0)},
-            {"label": "Executed exit contract gaps", "value": exit_gaps},
+            {"label": "当前持仓", "value": int(report.get("open_position_count") or 0)},
+            {"label": "经济性完整", "value": int(report.get("position_economics_complete_count") or 0)},
+            {"label": "经济性缺口", "value": economics_gaps},
+            {"label": "动态退出", "value": int(report.get("dynamic_exit_decision_count") or 0)},
+            {"label": "已执行退出契约缺口", "value": exit_gaps},
         ],
         next_actions=(
-            ["Block new risk and investigate every economics or executed-exit contract gap."]
+            ["阻断新增风险，并调查每个经济性或已执行退出契约缺口。"]
             if violation_count
-            else ["Continue auditing fee-after position economics and dynamic exit provenance."]
+            else ["继续审计费后持仓经济性和动态退出来源证据。"]
         ),
         owner_path="services/position_capacity_release_audit.py",
     )
@@ -2866,26 +2866,26 @@ async def _strategy_quality_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "strategy_quality",
-            "Dynamic return strategy quality",
+            "动态费后收益策略质量",
             "warning",
-            "Strategy return-quality audit is unavailable; production remains fail-closed.",
+            "策略收益质量审计不可用；生产继续保持保守关闭。",
             details={"error": safe_error_text(exc, limit=180), "audit_only": True},
             owner_path="services/strategy_signal_root_cause_audit.py",
         )
     blocked = int(report.get("production_return_blocked_count") or 0)
     return _audit_card(
         "strategy_quality",
-        "Dynamic return strategy quality",
+        "动态费后收益策略质量",
         "warning" if blocked else "ok",
-        str(report.get("summary") or "Dynamic return strategy audit completed."),
+        str(report.get("summary") or "动态费后收益策略审计已完成。"),
         details=report,
         evidence=[
-            {"label": "Entry decisions", "value": int(report.get("entry_decision_count") or 0)},
+            {"label": "开仓决策", "value": int(report.get("entry_decision_count") or 0)},
             {
-                "label": "Return contracts ready",
+                "label": "收益契约完整",
                 "value": int(report.get("production_return_ready_count") or 0),
             },
-            {"label": "Return contracts blocked", "value": blocked},
+            {"label": "收益契约阻断", "value": blocked},
         ],
         next_actions=_safe_list(report.get("next_actions")),
         owner_path="services/strategy_signal_root_cause_audit.py",
@@ -2906,9 +2906,9 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "strategy_closed_loop",
-            "Dynamic return closed loop",
+            "动态费后收益闭环",
             "warning",
-            "Closed-loop audit is unavailable; no live policy is changed.",
+            "闭环审计不可用；当前不会修改任何生产策略。",
             details={"error": safe_error_text(exc, limit=180), "audit_only": True},
             owner_path="services/trade_execution_contract.py",
         )
@@ -2918,12 +2918,12 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
     status = "critical" if violations else "warning" if blocked else "ok"
     return _audit_card(
         "strategy_closed_loop",
-        "Dynamic return closed loop",
+        "动态费后收益闭环",
         status,
         (
-            "Executed decisions violated the return contract."
+            "已执行决策违反收益契约。"
             if violations
-            else "Return inputs, execution contracts and realized PnL are auditable."
+            else "收益输入、执行契约和已实现盈亏均可审计。"
         ),
         details={
             "audit_only": True,
@@ -2932,10 +2932,10 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
             "trade_execution_contract": contract_report,
         },
         evidence=[
-            {"label": "Input contracts blocked", "value": blocked},
-            {"label": "Execution violations", "value": violations},
+            {"label": "输入契约阻断", "value": blocked},
+            {"label": "执行违规", "value": violations},
             {
-                "label": "Realized net PnL",
+                "label": "已实现净盈亏",
                 "value": float(contract_summary.get("realized_net_pnl_usdt") or 0.0),
             },
         ],
@@ -3030,9 +3030,9 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "trade_execution_contract",
-            "Dynamic return execution contract",
+            "动态费后收益执行契约",
             "warning",
-            "The return-contract audit is unavailable; production policies remain fail-closed.",
+            "收益契约审计不可用；生产策略继续保持保守关闭。",
             details={
                 "error": safe_error_text(exc, limit=180),
                 "audit_only": True,
@@ -3042,7 +3042,7 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
                 "summary": {},
             },
             next_actions=[
-                "Restore the read-only audit before changing any production return policy."
+                "修改任何生产收益策略前，先恢复只读审计。"
             ],
             owner_path="services/trade_execution_contract.py",
         )
@@ -3051,37 +3051,37 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
     violation_count = int(summary.get("contract_violation_count") or 0)
     return _audit_card(
         "trade_execution_contract",
-        "Dynamic return execution contract",
+        "动态费后收益执行契约",
         "critical" if violation_count else "ok",
         (
-            "Executed decisions violated the dynamic return contract."
+            "已执行决策违反动态费后收益契约。"
             if violation_count
-            else "Executed entries and exits satisfy the dynamic return contract."
+            else "已执行开仓和平仓满足动态费后收益契约。"
         ),
         details=report,
         evidence=[
-            {"label": "Executed entries", "value": int(summary.get("executed_entry_count") or 0)},
+            {"label": "已执行开仓", "value": int(summary.get("executed_entry_count") or 0)},
             {
-                "label": "Entry contracts ready",
+                "label": "开仓契约完整",
                 "value": int(summary.get("entry_contract_ready_count") or 0),
             },
-            {"label": "Executed exits", "value": int(summary.get("executed_exit_count") or 0)},
+            {"label": "已执行平仓", "value": int(summary.get("executed_exit_count") or 0)},
             {
-                "label": "Exit contracts ready",
+                "label": "平仓契约完整",
                 "value": int(summary.get("exit_contract_ready_count") or 0),
             },
-            {"label": "Violations", "value": violation_count},
+            {"label": "违规项", "value": violation_count},
             {
-                "label": "Realized net PnL",
+                "label": "已实现净盈亏",
                 "value": float(summary.get("realized_net_pnl_usdt") or 0.0),
             },
         ],
         next_actions=(
             [
-                "Block any executed path missing positive fee-after return LCB, live cost, risk budget or provenance."
+                "阻断任何缺少正向费后收益置信下界、实时成本、风险预算或来源证据的执行路径。"
             ]
             if violation_count
-            else ["Continue auditing realized fee-after return and left-tail outcomes."]
+            else ["继续审计已实现费后收益和左尾结果。"]
         ),
         owner_path="services/trade_execution_contract.py",
     )
@@ -3513,8 +3513,8 @@ async def _model_training_audit() -> dict[str, Any]:
         ),
         "requires_walk_forward": bool(evaluation_policy.get("requires_walk_forward", True)),
         "policy": (
-            "Phase 3 model changes must progress through shadow -> canary -> live; "
-            "audit visibility must not mutate live trading weights by itself."
+            "三期模型变更必须按影子 -> 灰度 -> 生产的顺序推进；"
+            "审计可见性本身不得修改生产交易权重。"
         ),
     }
     phase3_rebuild_readiness = Phase3RebuildReadinessService().report(
@@ -3568,9 +3568,9 @@ async def _model_training_audit() -> dict[str, Any]:
         if local_tools_unconfigured:
             observing_reasons.append("本地量化工具未配置")
         if artifact_retirement_required:
-            observing_reasons.append("Phase 3 artifact rebuild required")
+            observing_reasons.append("需要按三期干净训练视图重建旧模型产物")
         if artifact_retirement_audit_warning:
-            observing_reasons.append("artifact retirement audit unavailable")
+            observing_reasons.append("旧模型产物退役巡检暂不可用")
         if training_scheduler_stale:
             observing_reasons.append("训练调度心跳过期")
         if training_scheduler_error:
@@ -3676,8 +3676,8 @@ async def _model_training_audit() -> dict[str, Any]:
             "模型 critical 时优先查端口契约 18000/18001/18002/18003 和 Phase 3 量化 API 健康状态。",
             "可选增强源未配置只影响新闻/事件覆盖，不应误判为模型训练硬故障。",
             "learning_only 表示模型可用但仍需效果验证，继续看高分组收益和样本质量。",
-            "Retired or untrusted artifacts must be rebuilt from the Phase 3 clean training view before live influence.",
-            "Phase 3 rebuild readiness must be ready before running --persist-artifact --confirm-phase3-rebuild.",
+            "已退役或不可信的模型产物必须使用三期干净训练视图重建，重建前不得影响生产交易。",
+            "只有三期重建预检显示就绪，才能执行持久化模型产物的确认命令。",
         ],
     )
 
@@ -3693,37 +3693,44 @@ async def _phase3_server_migration_audit() -> dict[str, Any]:
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     phase3_blocked = bool(report.get("phase3_go_live_blocked"))
-    report["observing"] = False
+    warning_codes = {
+        str(item.get("code") or "")
+        for item in warnings
+        if isinstance(item, dict)
+    }
+    report["observing"] = bool(
+        warnings
+        and not phase3_blocked
+        and not blockers
+        and warning_codes.issubset({"legacy_data_paths_preserved"})
+    )
     status = "warning" if phase3_blocked or warnings else "ok"
-    summary = "Phase 3 model-server reset and migration gate is ready."
+    summary = "三期模型服务器资源释放和迁移检查已通过。"
     if phase3_blocked:
-        summary = (
-            "Phase 3 model-server go-live is blocked until legacy resource release, "
-            "/data/BB isolation, and whitelist migration are verified."
-        )
+        summary = "三期模型服务器仍被阻断：旧资源释放、/data/BB 隔离或白名单迁移尚未验证完成。"
     elif warnings:
-        summary = "Phase 3 model-server gate is usable but has non-blocking migration warnings."
+        summary = "三期模型服务器可用；仅保留按策略隔离的旧数据路径观察项，不阻断运行。"
     return _audit_card(
         "phase3_server_migration",
-        "Phase 3 server resource-release/migration gate",
+        "三期模型服务器资源释放与迁移检查",
         status,
         summary,
         details=report,
         evidence=[
-            {"label": "Go-live blocked", "value": phase3_blocked},
-            {"label": "Blockers", "value": len(blockers)},
-            {"label": "Legacy data paths", "value": report.get("legacy_data_path_count") or 0},
-            {"label": "Legacy services", "value": report.get("forbidden_service_count") or 0},
+            {"label": "生产启用是否阻断", "value": phase3_blocked},
+            {"label": "硬阻断", "value": len(blockers)},
+            {"label": "已隔离旧数据路径", "value": report.get("legacy_data_path_count") or 0},
+            {"label": "旧服务残留", "value": report.get("forbidden_service_count") or 0},
             {
-                "label": "Migration items",
+                "label": "白名单迁移项",
                 "value": _safe_dict(report.get("migration_manifest")).get("item_count") or 0,
             },
         ],
         next_actions=[
-            "Do not enable Phase 3 model-server production until this gate reports ready.",
-            "Stop legacy services/processes/containers and keep old data isolated in place.",
-            "Migrate only the approved whitelist manifest from the old server; never copy the old server wholesale.",
-            "Keep Phase 3 model/cache/training/runtime/log data rooted under /data/BB.",
+            "检查未显示就绪前，不得启用三期模型服务器的生产影响。",
+            "旧服务、进程和容器必须保持停止；旧数据只读隔离保留。",
+            "只允许迁移白名单清单中的内容，禁止整体复制旧服务器。",
+            "三期模型、缓存、训练、运行和日志数据统一保存在 /data/BB。",
         ],
     )
 
@@ -3746,47 +3753,45 @@ async def _phase3_model_server_readiness_audit() -> dict[str, Any]:
         status = "ok"
     else:
         status = "warning"
-    summary = "Phase 3 quant model server artifacts and services are ready."
+    summary = "三期量化模型服务器的产物和服务均已就绪。"
     if blockers:
         summary = (
-            "Phase 3 quant model server is blocked by artifact, CUDA, GPU, or policy "
-            "readiness failures."
+            "三期量化模型服务器因产物、CUDA、GPU 或策略就绪检查失败而阻断。"
         )
     elif not runtime_ready:
         summary = (
-            "Phase 3 quant model artifacts are ready, but model-serving services/endpoints "
-            "are not active yet."
+            "三期量化模型产物已就绪，但模型服务或接口尚未运行。"
         )
     elif warnings:
-        summary = "Phase 3 quant model server is usable with non-blocking warnings."
+        summary = "三期量化模型服务器可用，但仍有非阻断提示。"
     return _audit_card(
         "phase3_model_server_readiness",
-        "Phase 3 quant model-server readiness",
+        "三期量化模型服务器就绪检查",
         status,
         summary,
         details=report,
         evidence=[
-            {"label": "Artifact ready", "value": artifact_ready},
-            {"label": "Runtime ready", "value": runtime_ready},
-            {"label": "Go-live blocked", "value": service_go_live_blocked},
-            {"label": "GPU count", "value": report.get("gpu_count") or 0},
+            {"label": "模型产物就绪", "value": artifact_ready},
+            {"label": "运行环境就绪", "value": runtime_ready},
+            {"label": "生产启用阻断", "value": service_go_live_blocked},
+            {"label": "GPU 数量", "value": report.get("gpu_count") or 0},
             {
-                "label": "Required slots",
+                "label": "必需模型槽位",
                 "value": (
                     f"{report.get('required_slot_ready_count') or 0}/"
                     f"{report.get('required_slot_count') or 0}"
                 ),
             },
             {
-                "label": "Active endpoints",
+                "label": "运行中接口",
                 "value": report.get("active_endpoint_count") or 0,
             },
         ],
         next_actions=[
-            "Do not route Phase 3 model calls to the new server until this gate reports runtime_ready=true.",
-            "Keep LLM roles shadow/candidate-only until service health, latency, and promotion gates pass.",
-            "Start or install audited Phase 3 model services from /data/BB only; do not reuse /data/trade_ai legacy services.",
-            "After services are active, re-run this audit and then connect platform tunnels in shadow/canary mode.",
+            "本检查返回 runtime_ready=true 前，不得把三期模型调用路由到新服务器。",
+            "服务健康、延迟和晋升检查通过前，大模型角色只能处于影子或候选阶段。",
+            "三期模型服务只能从 /data/BB 启动或安装，不得复用 /data/trade_ai 的旧服务。",
+            "服务运行后重新执行本巡检，再以影子或灰度模式连接平台隧道。",
         ],
     )
 
@@ -3842,50 +3847,50 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
         status = "critical"
     if consumed_after_resume:
         status = "warning"
-    summary = "Phase 3 paper resume hard gate is ready; operator approval is still required."
+    summary = "三期模拟盘恢复硬检查已通过，但仍需要操作员批准。"
     if consumed_after_resume:
-        summary = "Phase 3 paper resume preflight has been consumed; post-resume observation is now authoritative."
+        summary = "三期模拟盘已恢复，恢复前检查已完成；现在以恢复后观察为准。"
     elif blockers:
-        summary = "Phase 3 paper resume is blocked by hard preflight gates."
+        summary = "三期模拟盘恢复被硬性前置检查阻断。"
     elif warnings:
-        summary = "Phase 3 paper resume gate is passable with warnings that need review."
+        summary = "三期模拟盘恢复检查可通过，但仍有提示需要复核。"
     details = dict(report)
     details["consumed_after_resume"] = consumed_after_resume
     details["observing"] = consumed_after_resume
     return _audit_card(
         "phase3_paper_resume_preflight",
-        "Phase 3 paper resume hard gate",
+        "三期模拟盘恢复硬检查",
         status,
         summary,
         details=details,
         evidence=[
-            {"label": "Can resume paper", "value": can_resume},
-            {"label": "Blockers", "value": len(blockers)},
-            {"label": "Warnings", "value": len(warnings)},
+            {"label": "可恢复模拟盘", "value": can_resume},
+            {"label": "阻断项", "value": len(blockers)},
+            {"label": "提示项", "value": len(warnings)},
             {
-                "label": "OKX issues",
+                "label": "OKX 问题",
                 "value": _safe_dict(report.get("summary")).get("okx_issue_count") or 0,
             },
             {
-                "label": "OKX equity",
+                "label": "OKX 账户权益",
                 "value": bool(
                     _safe_dict(report.get("summary")).get("okx_account_equity_available")
                 ),
             },
             {
-                "label": "Model runtime",
+                "label": "模型运行环境",
                 "value": bool(_safe_dict(report.get("summary")).get("model_server_runtime_ready")),
             },
             {
-                "label": "Quant API",
+                "label": "量化接口",
                 "value": bool(_safe_dict(report.get("summary")).get("phase3_quant_api_available")),
             },
         ],
         next_actions=[
-            "Do not start bb-paper-trading.service until can_resume_paper=true.",
-            "Clear OKX native sync, trade-fact integrity, model-server runtime, tunnel, and specialist-shadow blockers first.",
-            "When the gate passes, resume paper only through an approved operator action and keep live trading disabled.",
-            "After resume, watch OKX authoritative sync and specialist shadow evaluation for fresh samples.",
+            "can_resume_paper=true 前不得启动 bb-paper-trading.service。",
+            "先清除 OKX 原生同步、交易事实完整性、模型服务器运行环境、隧道和专用模型影子评估阻断。",
+            "检查通过后只能由获批的操作员动作恢复模拟盘，并继续关闭实盘交易。",
+            "恢复后持续观察 OKX 权威同步和专用模型影子评估的新样本。",
         ],
     )
 
@@ -3906,47 +3911,47 @@ async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
         status = "warning"
     else:
         status = "ok"
-    summary = "Phase 3 post-resume paper observation is healthy."
+    summary = "三期模拟盘恢复后观察正常。"
     if status_value == "waiting_for_resume":
         summary = (
-            "Phase 3 post-resume observation is waiting because paper trading is still stopped."
+            "模拟盘仍处于停止状态，三期恢复后观察正在等待。"
         )
     elif status_value == "warming_up":
-        summary = "Phase 3 paper has resumed but observation samples are still warming up."
+        summary = "三期模拟盘已恢复，但观察样本仍在预热积累。"
     elif blockers:
-        summary = "Phase 3 post-resume observation found hard blockers."
+        summary = "三期模拟盘恢复后观察发现硬阻断。"
     elif warnings:
-        summary = "Phase 3 post-resume observation has warnings that need review."
+        summary = "三期模拟盘恢复后观察有提示需要复核。"
     details = dict(report)
     details["observing"] = status_value in {"waiting_for_resume", "warming_up"}
     return _audit_card(
         "phase3_paper_resume_observation",
-        "Phase 3 post-resume paper observation",
+        "三期模拟盘恢复后观察",
         status,
         summary,
         details=details,
         evidence=[
-            {"label": "Paper active", "value": bool(report.get("paper_active"))},
-            {"label": "Blockers", "value": len(blockers)},
-            {"label": "Warnings", "value": len(warnings)},
+            {"label": "模拟盘运行中", "value": bool(report.get("paper_active"))},
+            {"label": "阻断项", "value": len(blockers)},
+            {"label": "提示项", "value": len(warnings)},
             {
-                "label": "Shadow created",
+                "label": "已创建影子样本",
                 "value": _safe_dict(report.get("summary")).get("created_shadow_count") or 0,
             },
             {
-                "label": "Shadow completed",
+                "label": "已完成影子样本",
                 "value": _safe_dict(report.get("summary")).get("completed_shadow_count") or 0,
             },
             {
-                "label": "Specialist eligible",
+                "label": "专用模型可评估样本",
                 "value": _safe_dict(report.get("summary")).get("specialist_eligible_shadow_count")
                 or 0,
             },
         ],
         next_actions=[
-            "Before paper starts, use this card as the zero-sample baseline.",
-            "After paper starts, watch the first 30/60/120 minutes for OKX clean state and sample accumulation.",
-            "Do not promote specialist models until this observation is healthy and sample floors pass.",
+            "模拟盘启动前，把本卡片作为零样本基线。",
+            "模拟盘启动后，观察前 30/60/120 分钟的 OKX 干净状态和样本积累。",
+            "本观察正常且样本要求通过前，不得晋升专用模型。",
         ],
     )
 
@@ -3958,32 +3963,32 @@ async def _phase3_stage_handoff_audit() -> dict[str, Any]:
     ready = bool(report.get("ready")) and str(report.get("status") or "") == "dynamic_return_ready"
     status = "critical" if blockers else "warning" if warnings else "ok"
     summary = (
-        "Phase 3 dynamic return observation is blocked."
+        "三期动态费后收益观察被阻断。"
         if blockers
         else (
-            "Phase 3 dynamic return observation is ready with non-authorizing warnings."
+            "三期动态费后收益观察已就绪，但提示项不授予生产权限。"
             if warnings
-            else "Phase 3 dynamic return observation is ready and remains permissionless."
+            else "三期动态费后收益观察已就绪，并继续保持无生产权限。"
         )
     )
     details = dict(report)
     details["observing"] = not blockers
     return _audit_card(
         "phase3_stage_handoff",
-        "Phase 3 dynamic return observation",
+        "三期动态费后收益观察",
         status,
         summary,
         details=details,
         evidence=[
-            {"label": "Ready", "value": ready},
-            {"label": "Production permission", "value": False},
-            {"label": "Blockers", "value": len(blockers)},
-            {"label": "Warnings", "value": len(warnings)},
+            {"label": "已就绪", "value": ready},
+            {"label": "生产权限", "value": False},
+            {"label": "阻断项", "value": len(blockers)},
+            {"label": "提示项", "value": len(warnings)},
         ],
         next_actions=(
-            ["Fix every dynamic-return, OKX fact, or observation-boundary blocker."]
+            ["修复所有动态收益、OKX 事实或观察边界阻断。"]
             if blockers
-            else ["Keep this report read-only; it cannot start trading or promote models."]
+            else ["保持本报告只读；它不能启动交易或晋升模型。"]
         ),
         owner_path="services/phase3_stage_handoff.py",
     )
@@ -4150,33 +4155,33 @@ def _phase3_go_no_go_audit_from_cards(cards: list[dict[str, Any]]) -> dict[str, 
     ready = bool(report.get("ready")) and str(report.get("status") or "") == "go"
     card_status = "critical" if blockers else "warning" if warnings else "ok"
     summary = (
-        "Dynamic fee-after return architecture is blocked."
+        "动态费后收益架构被阻断。"
         if blockers
         else (
-            "Dynamic fee-after return architecture is ready with observable warnings."
+            "动态费后收益架构已就绪，但仍有可观察提示。"
             if warnings
-            else "Dynamic fee-after return architecture satisfies all required contracts."
+            else "动态费后收益架构满足全部必需契约。"
         )
     )
     report_summary = _safe_dict(report.get("summary"))
     return _audit_card(
         "phase3_go_no_go",
-        "Phase 3 dynamic return gate",
+        "三期动态费后收益检查",
         card_status,
         summary,
         details=report,
         evidence=[
-            {"label": "Ready", "value": ready},
-            {"label": "Execution violations", "value": int(report_summary.get("current_contract_violation_count") or 0)},
-            {"label": "Position economics gaps", "value": int(report_summary.get("position_economics_incomplete_count") or 0)},
-            {"label": "Dynamic exit gaps", "value": int(report_summary.get("executed_dynamic_exit_contract_gap_count") or 0)},
-            {"label": "Blockers", "value": len(blockers)},
-            {"label": "Warnings", "value": len(warnings)},
+            {"label": "已就绪", "value": ready},
+            {"label": "执行违规", "value": int(report_summary.get("current_contract_violation_count") or 0)},
+            {"label": "持仓经济性缺口", "value": int(report_summary.get("position_economics_incomplete_count") or 0)},
+            {"label": "动态退出缺口", "value": int(report_summary.get("executed_dynamic_exit_contract_gap_count") or 0)},
+            {"label": "阻断项", "value": len(blockers)},
+            {"label": "提示项", "value": len(warnings)},
         ],
         next_actions=(
-            ["Fix every listed return, cost, provenance, position-economics, or training blocker before promotion."]
+            ["晋升前修复所有列出的收益、成本、来源、持仓经济性或训练阻断。"]
             if blockers
-            else ["Keep all expert, memory, shadow, and strategy-learning outputs observation-only."]
+            else ["所有专家、记忆、影子和策略学习输出继续只作观察。"]
         ),
         owner_path="services/phase3_go_no_go.py",
     )
@@ -4367,7 +4372,7 @@ def _issue_ledger_state(
     if observation_only:
         return "observing", "历史/样本观察 / 当前未复现硬错误"
     if status == "warning" and bool(details.get("observing")):
-        return "observing", "Observation / controlled stage or warmup"
+        return "observing", "观察项 / 受控阶段或预热中"
     if (
         key == "model_training"
         and status == "warning"
@@ -4378,12 +4383,17 @@ def _issue_ledger_state(
     if key == "okx_reconciliation" and status == "warning" and bool(details.get("timeout")):
         return "observing", "观察项 / 对账巡检超时"
     if key == "market_data" and status == "warning" and bool(details.get("warmup_observing")):
-        return "observing", "Observation / market-data warmup coverage expanding"
+        return "observing", "观察项 / 行情数据预热覆盖扩展中"
     if key == "okx_trade_fact_integrity" and status == "warning":
         runtime_gate = _safe_dict(details.get("runtime_okx_entry_gate"))
         runtime_blocker = str(runtime_gate.get("blocker") or "")
         link_repair = _safe_dict(details.get("position_fact_link_repair"))
         authoritative_sync = _safe_dict(details.get("okx_authoritative_sync"))
+        daily_report = _safe_dict(details.get("daily_reconciliation_report"))
+        unresolved_link_candidate_count = _okx_unresolved_link_candidate_count(
+            details,
+            link_repair,
+        )
         runtime_only_blocked = runtime_blocker in {
             "runtime_heartbeat_unavailable",
             "trading_runtime_inactive",
@@ -4394,7 +4404,6 @@ def _issue_ledger_state(
             for value in (
                 details.get("critical_count"),
                 details.get("warning_count"),
-                _okx_unresolved_link_candidate_count(details, link_repair),
                 _safe_dict(authoritative_sync.get("severity_counts")).get("critical"),
                 _safe_dict(authoritative_sync.get("severity_counts")).get("warning"),
                 authoritative_sync.get("manual_review_count"),
@@ -4410,12 +4419,24 @@ def _issue_ledger_state(
             and runtime_gate.get("sync_status") == "ok"
             and int(runtime_gate.get("last_requires_attention_count") or 0) == 0
         )
+        historical_links_isolated = bool(
+            unresolved_link_candidate_count > 0
+            and not has_data_integrity_issue
+            and runtime_sync_healthy
+            and link_repair.get("read_only") is True
+            and not bool(link_repair.get("live_repair_mutation"))
+            and daily_report.get("can_open_new_entries") is True
+            and daily_report.get("can_refresh_training") is True
+            and daily_report.get("requires_attention") is False
+        )
+        if historical_links_isolated:
+            return "observing", "历史事实链接只读隔离 / 当前交易与训练口径正常"
         if (
             (runtime_only_blocked or authoritative_pull_failed)
             and not has_data_integrity_issue
             and (runtime_only_blocked or runtime_sync_healthy)
         ):
-            return "observing", "Observation / OKX runtime sync healthy or runtime-only state"
+            return "observing", "观察项 / OKX 运行同步健康或仅运行态待观察"
         if not has_data_integrity_issue and runtime_sync_healthy:
             severity_counts = _safe_dict(details.get("severity_counts"))
             issues = _safe_list(details.get("issues"))
@@ -4429,14 +4450,14 @@ def _issue_ledger_state(
                 )
             )
             if info_only:
-                return "observing", "Observation / OKX integrity info-only residuals"
+                return "observing", "观察项 / OKX 一致性仅有信息级历史残留"
     if key == "phase3_go_no_go" and status == "warning":
         if (
             str(details.get("status") or "") == "go"
             and bool(details.get("ready"))
             and not _safe_list(details.get("blockers"))
         ):
-            return "observing", "Observation / dynamic return gate warnings"
+            return "observing", "观察项 / 动态费后收益门存在非阻断提示"
     if key == "phase3_stage_handoff" and status == "warning":
         if (
             str(details.get("status") or "") == "dynamic_return_ready"
@@ -4449,13 +4470,13 @@ def _issue_ledger_state(
             and not bool(details.get("live_mutation"))
             and not _safe_list(details.get("blockers"))
         ):
-            return "observing", "Observation / dynamic return readiness"
+            return "observing", "观察项 / 动态费后收益准备状态"
     if (
         key == "trade_loop"
         and status == "warning"
         and bool(details.get("dynamic_return_gate_ready"))
     ):
-        return "observing", "Observation / trading service stopped with return gate ready"
+        return "observing", "观察项 / 收益门已就绪但交易服务当前停止"
     if key == "trade_loop" and status == "warning" and bool(details.get("cold_start")):
         return "observing", "观察项 / 服务冷启动"
     if key == "trade_loop" and status == "warning" and bool(details.get("market_analysis_paused")):
@@ -4478,7 +4499,7 @@ def _issue_ledger_state(
         and not bool(details.get("live_weight_mutation"))
         and not bool(details.get("can_apply_live_weight"))
     ):
-        return "observing", "观察项 / baseline 或竞赛样本不足"
+        return "observing", "观察项 / 基线或竞赛样本不足"
     if (
         key == "model_dynamic_routing"
         and status == "warning"
@@ -4500,7 +4521,7 @@ def _issue_ledger_state(
             _safe_dict(details.get("summary")).get("executed_without_required_review_count")
         )
     ):
-        return "observing", "Observation / high-risk review gate"
+        return "observing", "观察项 / 高风险复核门只读检查"
     if (
         key == "crypto_feature_coverage"
         and status == "warning"
@@ -4530,7 +4551,7 @@ def _issue_ledger_state(
         and not bool(details.get("can_force_open"))
         and not bool(details.get("can_apply_live_sizing"))
     ):
-        return "observing", "Observation / strong opportunity shadow audit"
+        return "observing", "观察项 / 强机会分类器处于影子审计阶段"
     if (
         key == "position_capacity_release"
         and status == "warning"
@@ -4542,7 +4563,7 @@ def _issue_ledger_state(
         and not bool(details.get("can_close_winners"))
         and not bool(details.get("can_bypass_risk_controls"))
     ):
-        return "observing", "Observation / capacity release audit"
+        return "observing", "观察项 / 仓位容量释放只读检查"
     if (
         key == "phase3_paper_resume_observation"
         and status == "warning"
@@ -4554,7 +4575,7 @@ def _issue_ledger_state(
         and not bool(details.get("changes_model_routing"))
         and not bool(details.get("live_mutation"))
     ):
-        return "observing", "Observation / paper resume warming window"
+        return "observing", "观察项 / 模拟盘恢复预热窗口"
     if (
         key == "strategy_signal_root_cause"
         and status == "warning"
@@ -4568,7 +4589,7 @@ def _issue_ledger_state(
         and not bool(details.get("can_change_ml_readiness"))
         and not bool(details.get("can_bypass_risk_controls"))
     ):
-        return "observing", "Observation / strategy signal root-cause audit"
+        return "observing", "观察项 / 策略信号根因只读检查"
     if (
         key == "strategy_quality"
         and status == "warning"
@@ -4691,62 +4712,61 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         _node_from_cards(
             "server_migration",
-            "Phase 3 server resource-release/migration",
-            "Infra layer",
+            "三期服务器资源释放与迁移",
+            "基础设施层",
             cards_by_key,
             ["phase3_server_migration"],
             impact=(
-                "Blocks Phase 3 model-server go-live if legacy services/processes still consume "
-                "resources, /data/BB isolation is missing, or old-server migration is not whitelist-only."
+                "若旧服务或进程仍占用资源、/data/BB 未隔离，或旧服务器迁移未限定白名单，"
+                "则阻断三期模型服务器启用。"
             ),
             downstream=["model_training", "model_expert_health", "strategy_decision"],
             checks=[
-                "resource-release marker",
-                "/data/BB isolation",
-                "legacy service/process stopped",
-                "whitelist migration manifest",
-                "old data preserved as isolated history",
+                "资源释放证明",
+                "/data/BB 隔离",
+                "旧服务与进程已停止",
+                "白名单迁移清单",
+                "旧数据只读隔离保留",
             ],
         ),
         _node_from_cards(
             "model_server_readiness",
-            "Phase 3 quant model-server readiness",
-            "Model infra layer",
+            "三期量化模型服务器就绪检查",
+            "模型基础设施层",
             cards_by_key,
             ["phase3_model_server_readiness"],
             impact=(
-                "Blocks Phase 3 model-server shadow/canary routing if model artifacts, CUDA/GPU "
-                "validation, service contracts, or model endpoints are not ready."
+                "模型产物、CUDA/GPU 验证、服务契约或模型接口未就绪时，"
+                "阻断三期模型服务器的影子或灰度路由。"
             ),
             upstream=["server_migration"],
             downstream=["model_training", "model_expert_health", "model_dynamic_routing"],
             checks=[
-                "download manifest",
-                "validation manifest",
-                "8 GPU CUDA validation",
-                "required quant model slots",
-                "model service endpoints",
+                "下载清单",
+                "验证清单",
+                "8 张 GPU 的 CUDA 验证",
+                "必需量化模型槽位",
+                "模型服务接口",
             ],
         ),
         _node_from_cards(
             "phase3_stage_handoff",
-            "Phase 3 controlled stage handoff",
-            "Release gate layer",
+            "三期受控阶段交接",
+            "发布检查层",
             cards_by_key,
             ["phase3_stage_handoff", "phase3_go_no_go"],
             impact=(
-                "Shows the only allowed next Phase 3 action: stay shadow-only, start paper "
-                "with explicit approval, observe post-resume, or review canary. It never starts "
-                "paper, promotes canary, or enables live routing by itself."
+                "只展示三期下一步允许动作：保持影子、经明确批准启动模拟盘、观察恢复后状态或复核灰度。"
+                "本节点不会自行启动模拟盘、晋升灰度或启用生产路由。"
             ),
             upstream=["server_migration", "model_server_readiness", "okx_execution"],
             downstream=["runtime_loop", "strategy_closed_loop", "model_routing"],
             checks=[
-                "Go/No-Go freshness",
-                "paper start approval boundary",
-                "post-resume observation",
-                "specialist shadow evidence",
-                "live disabled",
+                "启用/不启用结论新鲜度",
+                "模拟盘启动审批边界",
+                "恢复后观察",
+                "专用模型影子证据",
+                "生产影响已关闭",
             ],
         ),
         _node_from_cards(
@@ -4809,10 +4829,10 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "模型层",
             cards_by_key,
             ["model_expert_competition"],
-            impact="对模型/专家与 baseline 的离线/影子/模拟竞赛结果做证据化比较，不直接改真实权重。",
+            impact="对模型/专家与基线的离线/影子/模拟竞赛结果做证据化比较，不直接改真实权重。",
             upstream=["model_expert_health", "model_training"],
             downstream=["model_routing", "strategy_decision"],
-            checks=["baseline 对比", "影子竞赛", "模拟A/B", "权重建议来源"],
+            checks=["基线对比", "影子竞赛", "模拟 A/B", "权重建议来源"],
         ),
         _node_from_cards(
             "model_dynamic_routing",
@@ -4827,38 +4847,38 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ),
         _node_from_cards(
             "high_risk_review_audit",
-            "High-risk review",
-            "Risk layer",
+            "高风险独立复核",
+            "风控层",
             cards_by_key,
             ["high_risk_review_audit"],
-            impact="Audits independent high-risk review triggers, approvals, blocks, and unsafe executions without changing live gates.",
+            impact="审计独立高风险复核的触发、审批、阻断和不安全执行，不修改生产门。",
             upstream=["model_dynamic_routing", "strategy_decision"],
             downstream=["risk_guard", "okx_execution"],
-            checks=["hard-review triggers", "approval status", "blocked count", "unsafe executed"],
+            checks=["硬复核触发", "审批状态", "阻断数量", "不安全执行"],
         ),
         _node_from_cards(
             "shadow_missed_opportunity",
-            "Shadow missed opportunity",
-            "Learning layer",
+            "影子错失机会复盘",
+            "学习层",
             cards_by_key,
             ["shadow_missed_opportunity"],
-            impact="Audits whether missed opportunities are usable only after repeated same-symbol same-side evidence.",
+            impact="审计错失机会是否只有在同币种同方向证据重复出现后才可用于学习。",
             upstream=["strategy_closed_loop", "model_training"],
             downstream=["strategy_decision", "training_data"],
             checks=[
-                "same-symbol same-side repeats",
-                "stable positive returns",
-                "low risk evidence",
-                "weak evidence execution",
+                "同币种同方向重复证据",
+                "稳定正收益",
+                "低风险证据",
+                "弱证据执行",
             ],
         ),
         _node_from_cards(
             "strong_opportunity",
-            "Strong opportunity",
-            "Strategy layer",
+            "强机会识别",
+            "策略层",
             cards_by_key,
             ["strong_opportunity"],
-            impact="Audits Phase 2 strong opportunity shape without changing live entries, sizing, leverage, or risk gates.",
+            impact="审计二阶段强机会形态，不修改生产开仓、仓位、杠杆或风险门。",
             upstream=[
                 "market_data",
                 "model_training",
@@ -4867,30 +4887,30 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ],
             downstream=["strategy_decision", "risk_guard", "training_data"],
             checks=[
-                "selected-side expected net",
-                "profit quality",
-                "loss probability",
-                "tail risk",
-                "aligned sources",
-                "read-only flags",
+                "选中方向预期净收益",
+                "收益质量",
+                "亏损概率",
+                "尾部风险",
+                "一致来源",
+                "只读标记",
             ],
         ),
         _node_from_cards(
             "position_capacity_release",
-            "Position capacity release",
-            "Risk layer",
+            "持仓容量释放",
+            "风控层",
             cards_by_key,
             ["position_capacity_release"],
-            impact="Audits capacity pressure, release candidates, old profit rotation candidates, and unclosed release decisions before entry thresholds are changed.",
+            impact="在开仓策略参数变化前，审计容量压力、释放候选、旧盈利轮换候选和未闭环释放决策。",
             upstream=["position_sync", "strong_opportunity", "strategy_closed_loop"],
             downstream=["strategy_decision", "risk_guard", "okx_execution"],
             checks=[
-                "current capacity",
-                "release candidates",
-                "old profit candidates",
-                "unclosed release decisions",
-                "crowded-side blocks",
-                "read-only flags",
+                "当前容量",
+                "释放候选",
+                "旧盈利候选",
+                "未闭环释放决策",
+                "拥挤方向阻断",
+                "只读标记",
             ],
         ),
         _node_from_cards(
@@ -4938,11 +4958,11 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             upstream=["model_training", "shadow_missed_opportunity", "market_data"],
             downstream=["strategy_decision", "strategy_closed_loop"],
             checks=[
-                "ML readiness",
-                "server_profit contribution",
-                "shadow missed conversion",
-                "expected-net components",
-                "candidate concentration",
+                "本地 ML 就绪状态",
+                "服务器收益模型贡献",
+                "影子错失机会转化",
+                "预期净收益组成",
+                "候选集中度",
             ],
         ),
         _node_from_cards(

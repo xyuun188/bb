@@ -195,6 +195,64 @@ async def test_data_collection_normalizes_unknown_local_ai_status(
 
 
 @pytest.mark.asyncio
+async def test_data_collection_reads_local_ai_status_once_without_fixed_outer_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {
+                "available": True,
+                "service_available": True,
+                "status": "shadow",
+                "phase3_clean_completed_shadow_sample_count": 12,
+                "phase3_clean_completed_trade_sample_count": 3,
+            }
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_phase3_completed_shadow_count",
+        AsyncMock(return_value=12),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_phase3_completed_trade_count",
+        AsyncMock(return_value=3),
+    )
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert calls == 1
+    assert status["completed_shadow_sample_count"] == 12
+
+
+def test_data_collection_local_ai_status_has_no_duplicate_normalizer_or_outer_timeout() -> None:
+    source = Path(data_collection_module.__file__).read_text(encoding="utf-8")
+    training_status_block = source[
+        source.index("async def _local_ai_training_status") : source.index(
+            "async def _raw_local_ai_tools_status"
+        )
+    ]
+    raw_status_block = source[
+        source.index("async def _raw_local_ai_tools_status") : source.index(
+            "async def _phase3_completed_shadow_count"
+        )
+    ]
+
+    assert "asyncio.wait_for" not in raw_status_block
+    assert "_dashboard_local_ai_tools_status" not in source
+    assert "await asyncio.gather(" in training_status_block
+
+
+@pytest.mark.asyncio
 async def test_data_collection_does_not_promote_legacy_training_counts_to_phase3(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

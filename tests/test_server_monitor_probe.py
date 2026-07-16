@@ -87,6 +87,37 @@ def test_server_monitor_probe_redacts_json_style_remote_secrets() -> None:
     assert "access_token=***" in redacted
 
 
+def test_server_monitor_probe_stops_before_json_parse_when_response_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = render_server_monitor_probe("qwen3-32b-trade", "Qwen3 32B")
+    namespace = _load_probe_namespace(script)
+    read_limit = cast(int, namespace["HTTP_BODY_READ_LIMIT"])
+
+    class OversizedResponse:
+        status = 200
+
+        def __enter__(self) -> OversizedResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            return b'{"payload":"' + (b"x" * (read_limit + 1))
+
+    urllib_module = namespace["urllib"]
+    monkeypatch.setattr(urllib_module.request, "urlopen", lambda *_args, **_kwargs: OversizedResponse())
+
+    http_json = cast(Callable[..., dict[str, object]], namespace["http_json"])
+    result = http_json("http://127.0.0.1:8101/health")
+
+    assert result["ok"] is False
+    assert result["truncated"] is True
+    assert result["data"] is None
+    assert "超过监控读取上限" in str(result["error"])
+
+
 def test_server_monitor_probe_safe_prelude_runs_without_shell() -> None:
     script = render_server_monitor_probe("qwen3-32b-trade", "Qwen3 32B")
 

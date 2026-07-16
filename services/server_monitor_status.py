@@ -49,13 +49,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_MONITOR_CACHE_TTL_SECONDS = 10.0
 SERVER_MONITOR_STALE_CACHE_TTL_SECONDS = 60.0
 PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS = 3.5
-LOCAL_AI_TOOLS_DEEP_PROBE_TIMEOUT_SECONDS = 15.0
-LOCAL_AI_TOOLS_CHILD_ENDPOINT_TIMEOUT_SECONDS = {
-    "profit_prediction": PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
-    "time_series_prediction": LOCAL_AI_TOOLS_DEEP_PROBE_TIMEOUT_SECONDS,
-    "sentiment_analysis": 8.0,
-    "exit_advice": 8.0,
-}
 PLATFORM_SERVICE_NAMES = (
     "bb-dashboard.service",
     "bb-paper-trading.service",
@@ -1144,92 +1137,53 @@ def _remote_monitor_unavailable_payload(
     )
 
 
-def _local_ai_tools_probe_payload() -> dict[str, Any]:
-    return {
-        "symbol": "BTC/USDT",
-        "features": {
-            "symbol": "BTC/USDT",
-            "current_price": 100.0,
-            "close": 100.0,
-            "returns_1": 0.02,
-            "returns_5": 0.04,
-            "returns_20": 0.08,
-            "volume_ratio": 1.0,
-            "volatility_20": 0.01,
-            "spread_pct": 0.01,
-            "adx_14": 20.0,
-            "news_sentiment_avg": 0.0,
-            "social_sentiment_avg": 0.0,
-        },
-        "open_positions": [
-            {
-                "symbol": "BTC/USDT",
-                "side": "long",
-                "entry_price": 100.0,
-                "current_price": 100.2,
-                "unrealized_pnl": 0.2,
-                "unrealized_pnl_pct": 0.002,
-            }
-        ],
-    }
-
-
 def _local_ai_tools_api_key_for_platform_probe() -> str:
     return str(
         settings.local_ai_tools_api_key or os.environ.get("LOCAL_AI_TOOLS_API_KEY") or ""
     ).strip()
 
 
-async def _probe_local_ai_tools_child_endpoints(
-    client: httpx.AsyncClient,
-    local_base: str,
-    api_key: str,
+def _local_ai_tools_child_endpoint_contracts(
+    health_metadata: dict[str, Any],
+    status_metadata: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
+    """Read lightweight route contracts without running expensive inference probes."""
+
     specs = {
         "profit_prediction": "/profit/predict",
         "time_series_prediction": "/timeseries/deep/predict",
         "sentiment_analysis": "/sentiment/deep/analyze",
         "exit_advice": "/exit/advise",
     }
-    payload = _local_ai_tools_probe_payload()
-
-    async def probe(name: str, path: str) -> tuple[str, dict[str, Any]]:
-        timeout_seconds = LOCAL_AI_TOOLS_CHILD_ENDPOINT_TIMEOUT_SECONDS.get(
-            name,
-            PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
-        )
-        result = await _probe_platform_json(
-            client,
-            f"{local_base}{path}",
-            api_key=api_key,
-            method="POST",
-            payload=payload,
-            timeout_seconds=timeout_seconds,
-        )
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        payload_available = bool(data.get("available", True)) if isinstance(data, dict) else True
-        return name, {
-            "available": bool(result.get("ok") and payload_available),
-            "ok": bool(result.get("ok")),
-            "path": path,
-            "status_code": result.get("status_code"),
-            "latency_ms": result.get("latency_ms"),
-            "timeout_seconds": timeout_seconds,
-            "status_category": result.get("status_category"),
-            "error": result.get("error", ""),
+    raw_contracts = status_metadata.get("child_endpoints")
+    if not isinstance(raw_contracts, dict):
+        raw_contracts = health_metadata.get("child_endpoints")
+    raw_contracts = raw_contracts if isinstance(raw_contracts, dict) else {}
+    rows: dict[str, dict[str, Any]] = {}
+    for name, path in specs.items():
+        raw = raw_contracts.get(name)
+        raw = raw if isinstance(raw, dict) else {}
+        available = raw.get("available") is True
+        rows[name] = {
+            "available": available,
+            "ok": available,
+            "path": str(raw.get("path") or path),
+            "status_code": None,
+            "latency_ms": None,
+            "status_category": "metadata_contract" if raw else "contract_missing",
+            "probe_mode": str(raw.get("probe_mode") or "metadata_contract"),
+            "actual_inference_probe": False,
+            "message": str(
+                raw.get("message")
+                or (
+                    "状态契约已确认；实际推理由影子评估持续验证。"
+                    if available
+                    else "状态接口尚未返回该子接口的就绪契约。"
+                )
+            ),
+            "error": "" if available else "child_endpoint_contract_missing_or_not_ready",
         }
-
-    results = await asyncio.gather(
-        *(probe(name, path) for name, path in specs.items()),
-        return_exceptions=True,
-    )
-    child_endpoints: dict[str, dict[str, Any]] = {}
-    for result in results:
-        if isinstance(result, Exception):
-            continue
-        name, item = result
-        child_endpoints[name] = item
-    return child_endpoints
+    return rows
 
 
 async def collect_platform_runtime_status() -> dict[str, Any]:
@@ -1323,10 +1277,9 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             model_bundle_available = bool(
                 status_metadata.get("available") or metadata.get("trained_models_available")
             )
-            child_endpoints = await _probe_local_ai_tools_child_endpoints(
-                client,
-                local_base,
-                api_key,
+            child_endpoints = _local_ai_tools_child_endpoint_contracts(
+                metadata,
+                status_metadata,
             )
             child_available = any(
                 bool(item.get("available") or item.get("ok"))

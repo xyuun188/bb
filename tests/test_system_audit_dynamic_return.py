@@ -308,7 +308,7 @@ def test_phase3_audit_card_uses_dynamic_go_no_go_contract() -> None:
     assert card["status"] == "ok"
     assert card["details"]["status"] == "go"
     assert card["details"]["ready"] is True
-    assert card["evidence"][0] == {"label": "Ready", "value": True}
+    assert card["evidence"][0] == {"label": "已就绪", "value": True}
 
 
 @pytest.mark.asyncio
@@ -338,7 +338,7 @@ async def test_phase3_handoff_audit_is_permissionless_observation(
     assert card["status"] == "warning"
     assert card["details"]["production_permission"] is False
     assert card["details"]["observing"] is True
-    assert card["evidence"][0] == {"label": "Ready", "value": True}
+    assert card["evidence"][0] == {"label": "已就绪", "value": True}
 
 
 @pytest.mark.asyncio

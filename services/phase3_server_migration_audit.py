@@ -340,7 +340,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         blockers.append(
             _blocker(
                 "resource_release_marker_missing",
-                "Phase 3 resource-release evidence is missing on the new model server.",
+                "新模型服务器缺少三期资源释放证明。",
                 evidence=RESOURCE_RELEASE_MARKER_PATH,
             )
         )
@@ -348,7 +348,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         blockers.append(
             _blocker(
                 "resource_release_marker_invalid",
-                "Resource-release evidence exists but does not prove the required Phase 3 policy.",
+                "资源释放证明存在，但不能证明已执行要求的三期策略。",
                 evidence={
                     "expected_policy_id": PHASE3_RESOURCE_POLICY_ID,
                     "actual_policy_id": marker_policy,
@@ -362,7 +362,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 _blocker(
                     "legacy_resources_not_released",
-                    "Legacy services/processes/containers must be stopped before Phase 3 go-live.",
+                    "三期启用前必须停止旧服务、进程和容器。",
                     evidence=RESOURCE_RELEASE_MARKER_PATH,
                 )
             )
@@ -370,7 +370,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 _blocker(
                     "phase3_root_not_data_bb",
-                    "Phase 3 model/cache/training/runtime/log data must be rooted under /data/BB.",
+                    "三期模型、缓存、训练、运行和日志数据必须统一位于 /data/BB。",
                     evidence=phase3_root,
                 )
             )
@@ -378,7 +378,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             warnings.append(
                 _warning(
                     "old_data_not_marked_preserved",
-                    "Current policy is to preserve old data in place and only release resource usage.",
+                    "当前策略要求原地保留旧数据，仅释放其资源占用。",
                     evidence=RESOURCE_RELEASE_MARKER_PATH,
                 )
             )
@@ -387,7 +387,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         blockers.append(
             _blocker(
                 "phase3_required_roots_missing",
-                "Required /data/BB Phase 3 workspace directories are missing.",
+                "缺少三期要求的 /data/BB 工作目录。",
                 evidence=missing_phase3_roots,
             )
         )
@@ -396,7 +396,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         warnings.append(
             _warning(
                 "legacy_data_paths_preserved",
-                "Legacy data paths still exist by policy; they must remain isolated from Phase 3 runtime.",
+                "旧数据路径按策略保留，必须继续与三期运行环境隔离。",
                 evidence=[item.get("path") for item in legacy_paths],
             )
         )
@@ -404,7 +404,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         blockers.append(
             _blocker(
                 "legacy_services_present",
-                "Legacy model services still exist or are active on the new model server.",
+                "新模型服务器仍存在或正在运行旧模型服务。",
                 evidence=[
                     {
                         "service": item.get("name"),
@@ -419,7 +419,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         blockers.append(
             _blocker(
                 "legacy_processes_running",
-                "Legacy model/download processes are still running.",
+                "旧模型或下载进程仍在运行。",
                 evidence=legacy_process_evidence[:10],
             )
         )
@@ -428,7 +428,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         blockers.append(
             _blocker(
                 "migration_manifest_missing",
-                "Old-server migration must be controlled by a whitelist manifest, not an ad-hoc copy.",
+                "旧服务器迁移必须由白名单清单控制，禁止临时整体复制。",
                 evidence=MIGRATION_MANIFEST_PATH,
             )
         )
@@ -437,14 +437,14 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 _blocker(
                     "migration_not_whitelist_only",
-                    "Migration manifest does not explicitly enforce whitelist-only migration.",
+                    "迁移清单没有明确强制仅白名单迁移。",
                 )
             )
         if disallowed_categories:
             blockers.append(
                 _blocker(
                     "migration_category_not_approved",
-                    "Migration manifest contains categories outside the Phase 3 whitelist.",
+                    "迁移清单包含三期白名单以外的类别。",
                     evidence=disallowed_categories,
                 )
             )
@@ -452,7 +452,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 _blocker(
                     "migration_source_not_approved",
-                    "Migration manifest contains non-approved data sources.",
+                    "迁移清单包含未经批准的数据来源。",
                     evidence=disallowed_sources,
                 )
             )
@@ -460,7 +460,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             warnings.append(
                 _warning(
                     "migration_manifest_empty",
-                    "Migration manifest is present but contains no explicit asset rows.",
+                    "迁移清单存在，但没有明确的资产条目。",
                 )
             )
 
@@ -821,7 +821,7 @@ class Phase3ServerMigrationAuditService:
             status = "model_server_config_error"
         blocker = _blocker(
             status,
-            "Phase 3 server resource-release/migration readiness could not be verified.",
+            "无法验证三期服务器资源释放与迁移是否就绪。",
             evidence=safe_error_text(exc, limit=180),
         )
         return {

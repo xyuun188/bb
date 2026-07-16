@@ -61,6 +61,10 @@ def _reason(
     return payload
 
 
+def _side_label(side: str) -> str:
+    return {"long": "做多", "short": "做空"}.get(str(side), str(side))
+
+
 def _quality_totals(metadata: dict[str, Any]) -> dict[str, Any]:
     quality = _safe_dict(metadata.get("quality_report"))
     return _safe_dict(quality.get("totals"))
@@ -73,7 +77,7 @@ def _market_fact_contract_blockers(metadata: dict[str, Any]) -> list[dict[str, A
         blockers.append(
             _reason(
                 "artifact_market_fact_contract_missing_or_stale",
-                "Artifact is not bound to the required native market-fact contract.",
+                "模型产物没有绑定当前要求的原生行情事实契约。",
                 actual=contract.get("version") or "missing",
                 required=MARKET_FACT_CONTRACT_VERSION,
             )
@@ -86,7 +90,7 @@ def _market_fact_contract_blockers(metadata: dict[str, Any]) -> list[dict[str, A
         blockers.append(
             _reason(
                 "artifact_market_fact_contract_violated",
-                "Artifact training data contains unresolved native market-fact violations.",
+                "模型训练数据仍包含未解决的原生行情事实违规项。",
                 actual={"status": status or "missing", "violation_count": violation_count},
                 required={"status": "clean", "violation_count": 0},
             )
@@ -103,7 +107,7 @@ def _market_fact_contract_blockers(metadata: dict[str, Any]) -> list[dict[str, A
         blockers.append(
             _reason(
                 "artifact_market_fact_assertions_incomplete",
-                "Artifact market-fact assertions are incomplete.",
+                "模型产物的行情事实断言不完整。",
                 actual=failed_assertions,
                 required=list(required_assertions),
             )
@@ -129,7 +133,7 @@ def _market_fact_contract_blockers(metadata: dict[str, Any]) -> list[dict[str, A
         blockers.append(
             _reason(
                 "artifact_market_fact_provenance_incomplete",
-                "Artifact market-fact provenance is incomplete.",
+                "模型产物的行情事实来源信息不完整。",
                 actual=missing_provenance,
                 required=list(required_provenance) + ["sample_count/effective_sample_size"],
             )
@@ -139,6 +143,7 @@ def _market_fact_contract_blockers(metadata: dict[str, Any]) -> list[dict[str, A
 
 def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
+    side_text = _side_label(side)
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0) or 0.0
     bottom_return = _safe_float(metrics.get(f"bottom_{side}_avg_return_pct"), 0.0) or 0.0
     top_return_lcb = _safe_float(metrics.get(f"top_{side}_return_lcb_pct"), None)
@@ -149,7 +154,7 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
         blockers.append(
             _reason(
                 f"{side}_top_return_not_above_bottom",
-                f"{side} top-score bucket return is not above the bottom bucket.",
+                f"{side_text}高分组费后收益没有高于低分组。",
                 actual=round(top_return, 4),
                 required=round(bottom_return, 4),
             )
@@ -158,7 +163,7 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
         blockers.append(
             _reason(
                 f"{side}_top_return_lcb_not_positive",
-                f"{side} top-score return confidence lower bound is not positive.",
+                f"{side_text}高分组收益置信下界不为正。",
                 actual=None if top_return_lcb is None else round(top_return_lcb, 4),
                 required=0.0,
             )
@@ -167,7 +172,7 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
         blockers.append(
             _reason(
                 f"{side}_top_profit_factor_not_above_one",
-                f"{side} top-score Profit Factor is not above one.",
+                f"{side_text}高分组盈亏比没有高于自然盈亏平衡线 1。",
                 actual=None if top_profit_factor is None else round(top_profit_factor, 4),
                 required=1.0,
             )
@@ -180,7 +185,7 @@ def _side_metric_blockers(metrics: dict[str, Any], side: str) -> list[dict[str, 
         blockers.append(
             _reason(
                 f"{side}_top_tail_loss_not_improved",
-                f"{side} top-score tail-loss rate is missing or worse than the bottom bucket.",
+                f"{side_text}高分组尾部亏损率缺失，或比低分组更差。",
                 actual=None if top_tail_loss is None else round(top_tail_loss, 4),
                 required=None if bottom_tail_loss is None else round(bottom_tail_loss, 4),
             )
@@ -253,7 +258,7 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
             blockers.append(
                 _reason(
                     f"artifact_{field}_missing_or_invalid",
-                    f"Artifact {field} is missing or invalid.",
+                    f"模型产物字段 {field} 缺失或无效。",
                     actual=metadata.get(field) or "missing",
                     required="sha256",
                 )
@@ -262,7 +267,7 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
         blockers.append(
             _reason(
                 "artifact_evaluation_group_policy_invalid",
-                "Artifact evaluation does not use chronological disjoint decision groups.",
+                "模型评估没有使用按时间隔离且互不重叠的决策分组。",
                 actual=metadata.get("evaluation_group_policy") or "missing",
                 required="chronological_disjoint_decision_groups",
             )
@@ -272,7 +277,7 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
             blockers.append(
                 _reason(
                     f"artifact_{field}_missing",
-                    f"Artifact {field} does not describe a non-empty partition.",
+                    f"模型产物字段 {field} 没有提供非空数据分组。",
                 )
             )
     governance = _safe_dict(metadata.get("governance_report"))
@@ -285,7 +290,7 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
         blockers.append(
             _reason(
                 "artifact_quality_fingerprint_mismatch",
-                "Artifact is not bound to the exact governed clean training view.",
+                "模型产物没有绑定到完全一致的受治理干净训练视图。",
                 actual={
                     "quality_fingerprint": governance.get("quality_fingerprint"),
                     "artifact_quality_fingerprint": governance.get(
@@ -308,7 +313,7 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
         blockers.append(
             _reason(
                 "artifact_walk_forward_incomplete",
-                "Artifact lacks complete refitted chronological walk-forward evidence.",
+                "模型产物缺少按时间滚动且每折重新训练的完整验证证据。",
             )
         )
     authoritative = _safe_dict(metadata.get("authoritative_trade_return_evidence"))
@@ -320,7 +325,7 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
         blockers.append(
             _reason(
                 "authoritative_trade_return_evidence_missing",
-                "Artifact lacks fingerprinted authoritative trade-return evidence.",
+                "模型产物缺少带数据指纹的权威成交收益证据。",
             )
         )
     return blockers
@@ -331,6 +336,7 @@ def _side_artifact_evidence_blockers(
     side: str,
 ) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
+    side_text = _side_label(side)
     walk_forward = _safe_dict(metadata.get("walk_forward_report"))
     walk_side = _safe_dict(_safe_dict(walk_forward.get("sides")).get(side))
     folds = list(walk_forward.get("folds") or [])
@@ -351,7 +357,7 @@ def _side_artifact_evidence_blockers(
         blockers.append(
             _reason(
                 f"{side}_walk_forward_return_stability_failed",
-                f"{side} fee-after return evidence is not stable across walk-forward folds.",
+                f"{side_text}费后收益证据在时间滚动验证各折之间不稳定。",
             )
         )
     loso = _safe_dict(
@@ -361,7 +367,7 @@ def _side_artifact_evidence_blockers(
         blockers.append(
             _reason(
                 f"{side}_leave_one_symbol_out_stability_failed",
-                f"{side} return evidence depends on at least one removed symbol.",
+                f"{side_text}收益证据依赖至少一个单独币种，泛化稳定性不足。",
             )
         )
     oos = _safe_dict(_safe_dict(metadata.get("oos_return_evaluation")).get(side))
@@ -370,14 +376,14 @@ def _side_artifact_evidence_blockers(
         blockers.append(
             _reason(
                 f"{side}_oos_profit_factor_undefined",
-                f"{side} OOS Profit Factor is undefined without a loss denominator.",
+                f"{side_text}样本外盈亏比因缺少亏损分母而无法计算。",
             )
         )
     elif oos_profit_factor <= 1.0:
         blockers.append(
             _reason(
                 f"{side}_oos_profit_factor_not_above_break_even",
-                f"{side} OOS Profit Factor is not above natural break-even.",
+                f"{side_text}样本外盈亏比没有高于自然盈亏平衡线 1。",
                 actual=oos_profit_factor,
                 required=1.0,
             )
@@ -391,7 +397,7 @@ def _side_artifact_evidence_blockers(
         blockers.append(
             _reason(
                 f"{side}_oos_return_tail_evidence_incomplete",
-                f"{side} OOS return LCB, CVaR, or drawdown evidence is incomplete.",
+                f"{side_text}样本外收益下界、尾部风险或回撤证据不完整。",
             )
         )
     authoritative = _safe_dict(
@@ -404,14 +410,14 @@ def _side_artifact_evidence_blockers(
         blockers.append(
             _reason(
                 f"{side}_authoritative_profit_factor_undefined",
-                f"{side} actual-trade Profit Factor is undefined without losses.",
+                f"{side_text}真实成交盈亏比因缺少亏损分母而无法计算。",
             )
         )
     elif authoritative_profit_factor <= 1.0:
         blockers.append(
             _reason(
                 f"{side}_authoritative_profit_factor_not_above_break_even",
-                f"{side} actual-trade Profit Factor is not above natural break-even.",
+                f"{side_text}真实成交盈亏比没有高于自然盈亏平衡线 1。",
                 actual=authoritative_profit_factor,
                 required=1.0,
             )
@@ -425,7 +431,7 @@ def _side_artifact_evidence_blockers(
         blockers.append(
             _reason(
                 f"{side}_authoritative_return_tail_evidence_incomplete",
-                f"{side} actual-trade return LCB, CVaR, or drawdown evidence is incomplete.",
+                f"{side_text}真实成交收益下界、尾部风险或回撤证据不完整。",
             )
         )
     return blockers
@@ -476,7 +482,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "artifact_objective_version_mismatch",
-                "Artifact does not use the required fee-after return objective.",
+                "模型产物没有使用要求的费后收益目标版本。",
                 actual=f"{objective_name or 'unknown'}@{objective_version or 'unknown'}",
                 required=f"{RETURN_OBJECTIVE_NAME}@{RETURN_OBJECTIVE_VERSION}",
             )
@@ -485,7 +491,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "artifact_return_label_version_mismatch",
-                "Artifact does not use the required fee-after return label contract.",
+                "模型产物没有使用要求的费后收益标签契约。",
                 actual=label_version or "unknown",
                 required=RETURN_LABEL_VERSION,
             )
@@ -494,7 +500,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "artifact_cost_policy_incomplete",
-                "Artifact does not separate market opportunity from execution cost.",
+                "模型产物没有把市场机会与执行成本分开建模。",
                 actual=training_cost_policy or "missing",
                 required="separated_market_opportunity_and_execution_cost_tasks",
             )
@@ -506,7 +512,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "profit_supervision_contract_missing",
-                "Artifact does not carry the separated profit supervision contract.",
+                "模型产物没有携带市场机会与执行成本分离的收益监督契约。",
                 actual=profit_supervision_version or "missing",
                 required=PROFIT_SUPERVISION_VERSION,
             )
@@ -523,7 +529,7 @@ def build_ml_readiness_report(
             global_blockers.append(
                 _reason(
                     code,
-                    f"Separated supervision report is missing {field}.",
+                    f"分离监督报告缺少字段 {field}。",
                     actual=profit_supervision_report.get(field),
                     required="non-empty authoritative distribution",
                 )
@@ -543,7 +549,7 @@ def build_ml_readiness_report(
             global_blockers.append(
                 _reason(
                     f"{side}_dynamic_tail_policy_incomplete",
-                    f"{side} dynamic tail-loss policy metadata is incomplete.",
+                    f"{_side_label(side)}动态尾部亏损策略元数据不完整。",
                     actual={"policy": side_policy, "scale_pct": scale},
                     required="complete empirical policy provenance and positive artifact scale",
                 )
@@ -552,7 +558,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "training_distribution_missing",
-                "Training return distribution is missing.",
+                "缺少训练集收益分布。",
                 actual=sample_count,
             )
         )
@@ -560,7 +566,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "holdout_distribution_missing",
-                "Holdout return distribution is missing.",
+                "缺少留出集收益分布。",
                 actual=test_count,
             )
         )
@@ -579,14 +585,14 @@ def build_ml_readiness_report(
             side_blockers[side].append(
                 _reason(
                     f"{side}_authoritative_realized_return_calibration_missing",
-                    f"{side} authoritative realized-return calibration is missing.",
+                    f"{_side_label(side)}缺少权威真实成交收益校准。",
                 )
             )
         if int(_safe_float(actual_slippage.get("count"), 0.0) or 0) <= 0:
             side_blockers[side].append(
                 _reason(
                     f"{side}_authoritative_slippage_calibration_missing",
-                    f"{side} authoritative slippage calibration is missing.",
+                    f"{_side_label(side)}缺少权威真实滑点校准。",
                 )
             )
     profit_quality_diagnostics = {
@@ -601,7 +607,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "training_data_version_stale",
-                "Model was trained with an older data-quality contract.",
+                "模型使用了旧版数据质量契约训练。",
                 actual=data_quality_version or "unknown",
                 required=DATA_QUALITY_VERSION,
             )
@@ -610,7 +616,7 @@ def build_ml_readiness_report(
         global_blockers.append(
             _reason(
                 "model_training_timestamp_missing",
-                "Model is missing a valid trained_at timestamp.",
+                "模型缺少有效的训练时间。",
             )
         )
 

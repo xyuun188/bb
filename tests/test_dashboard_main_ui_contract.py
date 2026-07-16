@@ -945,6 +945,35 @@ def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
     assert "short_pr_auc" in overview_block
 
 
+def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+    reason_block = script[
+        script.index("const DASHBOARD_REASON_TEXT") : script.index(
+            "function mlSampleCounts"
+        )
+    ]
+    overview_block = script[
+        script.index("function renderMLSignalOverview") : script.index(
+            "function renderLocalAIToolsStatus"
+        )
+    ]
+
+    assert "average_fee_after_return_not_positive: '平均费后收益不为正'" in reason_block
+    assert "样本外盈亏比没有高于自然盈亏平衡线 1" in reason_block
+    assert "const rawText = message || code" in reason_block
+    assert "/Unterminated string/i.test(rawText)" in reason_block
+    assert "系统返回了未中文化的异常说明，已按问题处理" in reason_block
+    assert "当前新增待训练样本" in overview_block
+    assert "当前干净完成 ${samples.completedMl} - 最近已训练游标" in overview_block
+    assert "map(dashboardReasonText)" in overview_block
+    assert "mlMetricCard('就绪判断'" in script
+    assert "const SYSTEM_AUDIT_NODE_LABELS" in script
+    assert "upstream.map(systemAuditNodeLabel)" in script
+    assert "downstream.map(systemAuditNodeLabel)" in script
+
+
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
         encoding="utf-8"

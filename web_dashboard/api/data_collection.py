@@ -527,23 +527,14 @@ async def _training_sample_quality() -> dict[str, Any]:
 
 
 async def _local_ai_training_status() -> dict[str, Any]:
-    normalized_status = await _dashboard_local_ai_tools_status()
-    if (
-        isinstance(normalized_status, dict)
-        and normalized_status.get("available") is not False
-        and _max_count(
-            normalized_status.get("phase3_clean_trainable_shadow_sample_count"),
-            normalized_status.get("phase3_clean_completed_shadow_sample_count"),
-            normalized_status.get("shadow_sample_count"),
-        )
-        > 0
-    ):
-        status = normalized_status
-    else:
-        status = await _raw_local_ai_tools_status()
-        if not isinstance(status, dict):
-            return status
-        status = await _merge_dashboard_local_ai_tools_status(status)
+    # Read the lightweight service contract once. This function already derives the
+    # authoritative Phase 3 counters below, so calling the Dashboard normalizer would
+    # duplicate the remote request and database counts under an unrelated fixed timeout.
+    status, db_completed_shadow_count, db_completed_trade_count = await asyncio.gather(
+        _raw_local_ai_tools_status(),
+        _phase3_completed_shadow_count(),
+        _phase3_completed_trade_count(),
+    )
     if not isinstance(status, dict):
         return {"available": False, "status": "invalid_status"}
     original_raw_shadow_count = _safe_int_count(
@@ -583,8 +574,6 @@ async def _local_ai_training_status() -> dict[str, Any]:
         if isinstance(status.get("governance_report"), dict)
         else {}
     )
-    db_completed_shadow_count = await _phase3_completed_shadow_count()
-    db_completed_trade_count = await _phase3_completed_trade_count()
     explicit_shadow_counts = [
         status.get("phase3_clean_trainable_shadow_sample_count"),
         status.get("phase3_clean_completed_shadow_sample_count"),
@@ -668,7 +657,7 @@ async def _raw_local_ai_tools_status() -> dict[str, Any]:
     if local_ai_tools is None:
         return {"available": False, "status": "client_not_ready"}
     try:
-        status = await asyncio.wait_for(local_ai_tools.status(), timeout=3.5)
+        status = await local_ai_tools.status()
     except TimeoutError:
         return {"available": False, "status": "timeout"}
     except Exception as exc:
@@ -676,67 +665,6 @@ async def _raw_local_ai_tools_status() -> dict[str, Any]:
     if not isinstance(status, dict):
         return {"available": False, "status": "invalid_status"}
     return status
-
-
-async def _dashboard_local_ai_tools_status() -> dict[str, Any]:
-    normalizer = getattr(_dash, "get_local_ai_tools_status", None)
-    if not callable(normalizer):
-        return {"available": False, "status": "normalizer_missing"}
-    try:
-        status = await asyncio.wait_for(normalizer(), timeout=3.5)
-    except Exception as exc:
-        logger.warning(
-            "data collection dashboard local ai tools status fallback failed",
-            error=safe_error_text(exc),
-        )
-        return {"available": False, "status": "normalizer_error", "error": safe_error_text(exc, limit=180)}
-    return status if isinstance(status, dict) else {"available": False, "status": "invalid_status"}
-
-
-async def _merge_dashboard_local_ai_tools_status(status: dict[str, Any]) -> dict[str, Any]:
-    """Reuse the Dashboard-normalized Local AI Tools counters when available."""
-
-    normalizer = getattr(_dash, "get_local_ai_tools_status", None)
-    if not callable(normalizer):
-        return status
-    try:
-        normalized = await asyncio.wait_for(normalizer(), timeout=3.5)
-    except Exception as exc:
-        logger.warning(
-            "data collection local ai tools normalized status fallback failed",
-            error=safe_error_text(exc),
-        )
-        return status
-    if not isinstance(normalized, dict):
-        return status
-
-    merged = dict(status)
-    numeric_keys = {
-        "phase3_clean_trainable_shadow_sample_count",
-        "phase3_clean_completed_shadow_sample_count",
-        "phase3_clean_trainable_trade_sample_count",
-        "phase3_clean_completed_trade_sample_count",
-        "shadow_sample_count",
-        "training_shadow_sample_count",
-        "completed_shadow_sample_count",
-        "total_shadow_sample_count",
-        "raw_shadow_sample_count",
-        "legacy_shadow_sample_count",
-        "trade_sample_count",
-        "training_trade_sample_count",
-        "completed_trade_sample_count",
-        "raw_trade_sample_count",
-        "legacy_trade_sample_count",
-        "service_model_window_shadow_sample_count",
-        "service_model_window_trade_sample_count",
-    }
-    for key in numeric_keys:
-        if key in normalized and _safe_int_count(normalized.get(key)) > 0:
-            merged[key] = normalized.get(key)
-    for key in ("training_sample_source",):
-        if key in normalized:
-            merged[key] = normalized.get(key)
-    return merged
 
 
 async def _phase3_completed_shadow_count() -> int:

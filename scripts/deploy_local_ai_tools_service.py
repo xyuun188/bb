@@ -146,6 +146,8 @@ ALLOW_UNAUTHENTICATED_LOOPBACK = os.environ.get(
 _BUNDLE_CACHE: dict[str, Any] | None = None
 _CURRENT_POINTER_MTIME_NS: int | None = None
 _CURRENT_MODEL_MTIME_NS: int | None = None
+_CURRENT_MODEL_PATH: Path | None = None
+_STATUS_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
 _TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
 _STATUS_METADATA_KEYS = (
     "artifact_policy_id",
@@ -213,6 +215,18 @@ _STATUS_METADATA_KEYS = (
     "evaluation_report_hashes",
     "artifact_return_evidence_sha256",
 )
+_STATUS_LIST_LIMIT = 12
+_STATUS_DICT_LIMIT = 80
+_STATUS_MAX_DEPTH = 8
+_STATUS_OMITTED_DETAIL_KEYS = {
+    "authoritative_evidence",
+    "raw_samples",
+    "return_evidence_report",
+    "return_observations",
+    "shadow_events",
+    "training_rows",
+    "worst_samples",
+}
 
 
 def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
@@ -1490,37 +1504,93 @@ def rollback_current_artifact() -> dict[str, Any]:
     return restored
 
 
+def _path_stat_signature(path: Path) -> tuple[str, int | None, int | None, int | None]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return str(path), None, None, None
+    return str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+
+
+def _resolved_artifact_signature(
+    pointer_path: Path,
+    resolved: dict[str, Any] | None,
+) -> tuple[tuple[str, int | None, int | None, int | None], ...]:
+    paths = [pointer_path]
+    if resolved:
+        paths.extend(
+            path
+            for path in (
+                resolved.get("manifest_path"),
+                resolved.get("model_path"),
+                resolved.get("metadata_path"),
+            )
+            if isinstance(path, Path)
+        )
+        activation_relative = str(
+            (resolved.get("pointer") or {}).get("activation_manifest_path") or ""
+        ).strip()
+        if activation_relative:
+            paths.append(MODEL_DIR / activation_relative)
+    return tuple(_path_stat_signature(path) for path in paths)
+
+
+def _resolve_artifact_pointer_for_status(
+    pointer_path: Path,
+    *,
+    role: str,
+) -> dict[str, Any] | None:
+    """Reuse a verified immutable artifact while all source file stats are unchanged."""
+
+    cache_key = f"{role}:{pointer_path}"
+    cached = _STATUS_ARTIFACT_CACHE.get(cache_key)
+    if cached is not None:
+        cached_resolved = cached.get("resolved")
+        if _resolved_artifact_signature(pointer_path, cached_resolved) == cached.get(
+            "signature"
+        ):
+            return cached_resolved
+    resolved = _resolve_artifact_pointer(pointer_path, role=role)
+    _STATUS_ARTIFACT_CACHE[cache_key] = {
+        "resolved": resolved,
+        "signature": _resolved_artifact_signature(pointer_path, resolved),
+    }
+    return resolved
+
+
 def load_bundle() -> dict[str, Any] | None:
-    global _BUNDLE_CACHE, _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+    global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
+    global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
     model_mtime_ns: int | None = None
     pointer_mtime_ns = (
         CURRENT_POINTER_PATH.stat().st_mtime_ns
         if CURRENT_POINTER_PATH.exists()
         else None
     )
+    if (
+        _CURRENT_POINTER_MTIME_NS == pointer_mtime_ns
+        and _CURRENT_MODEL_PATH is not None
+    ):
+        try:
+            model_mtime_ns = _CURRENT_MODEL_PATH.stat().st_mtime_ns
+        except OSError:
+            model_mtime_ns = None
+        if _CURRENT_MODEL_MTIME_NS == model_mtime_ns:
+            return _BUNDLE_CACHE
     try:
-        current = _resolve_artifact_pointer(
+        current = _resolve_artifact_pointer_for_status(
             CURRENT_POINTER_PATH,
             role="current",
-            deserialize_bundle=False,
         )
         if current is None:
             _BUNDLE_CACHE = None
+            _CURRENT_MODEL_PATH = None
             _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
             _CURRENT_MODEL_MTIME_NS = None
             return None
-        model_mtime_ns = current["model_path"].stat().st_mtime_ns
-        if (
-            _CURRENT_POINTER_MTIME_NS == pointer_mtime_ns
-            and _CURRENT_MODEL_MTIME_NS == model_mtime_ns
-        ):
-            return _BUNDLE_CACHE
-        current = _resolve_artifact_pointer(
-            CURRENT_POINTER_PATH,
-            role="current",
-            deserialize_bundle=True,
-        )
-        candidate = current["bundle"] if current else None
+        _CURRENT_MODEL_PATH = current["model_path"]
+        model_mtime_ns = _CURRENT_MODEL_PATH.stat().st_mtime_ns
+        candidate = load_trusted_joblib_bundle(_CURRENT_MODEL_PATH)
         metadata = candidate.get("metadata") if isinstance(candidate, dict) else None
         if not isinstance(metadata, dict) or (
             metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
@@ -1577,10 +1647,52 @@ def _file_stat(path: Path) -> dict[str, Any]:
 
 def _read_metadata_file() -> dict[str, Any]:
     try:
-        current = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
+        current = _resolve_artifact_pointer_for_status(
+            CURRENT_POINTER_PATH,
+            role="current",
+        )
         return current["metadata"] if current else {}
     except Exception:
         return {}
+
+
+def _status_summary_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    """Bound status payloads without changing the persisted training artifact."""
+
+    if key in _STATUS_OMITTED_DETAIL_KEYS:
+        return None
+    if depth >= _STATUS_MAX_DEPTH:
+        return "status_detail_omitted"
+    if isinstance(value, dict):
+        result = {}
+        rows = list(value.items())
+        for child_key, child_value in rows[:_STATUS_DICT_LIMIT]:
+            summarized = _status_summary_value(
+                child_value,
+                key=str(child_key),
+                depth=depth + 1,
+            )
+            if summarized is not None:
+                result[str(child_key)] = summarized
+        if len(rows) > _STATUS_DICT_LIMIT:
+            result["status_omitted_key_count"] = len(rows) - _STATUS_DICT_LIMIT
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            summarized
+            for item in list(value)[:_STATUS_LIST_LIMIT]
+            if (
+                summarized := _status_summary_value(
+                    item,
+                    key=key,
+                    depth=depth + 1,
+                )
+            )
+            is not None
+        ]
+    if isinstance(value, str):
+        return value[:1000]
+    return value
 
 
 def _status_metadata() -> dict[str, Any]:
@@ -1588,9 +1700,36 @@ def _status_metadata() -> dict[str, Any]:
     if not metadata and _BUNDLE_CACHE and isinstance(_BUNDLE_CACHE.get("metadata"), dict):
         metadata = _BUNDLE_CACHE["metadata"]
     return {
-        key: metadata.get(key)
+        key: summarized
         for key in _STATUS_METADATA_KEYS
         if key in metadata
+        and (
+            summarized := _status_summary_value(metadata.get(key), key=key)
+        )
+        is not None
+    }
+
+
+def _status_child_endpoint_contracts(model_bundle_available: bool) -> dict[str, Any]:
+    routes = {
+        "profit_prediction": "/profit/predict",
+        "time_series_prediction": "/timeseries/deep/predict",
+        "sentiment_analysis": "/sentiment/deep/analyze",
+        "exit_advice": "/exit/advise",
+    }
+    return {
+        name: {
+            "available": bool(model_bundle_available),
+            "path": path,
+            "probe_mode": "metadata_contract",
+            "actual_inference_probe": False,
+            "message": (
+                "服务和模型产物已就绪；实际推理由影子评估持续验证。"
+                if model_bundle_available
+                else "服务在线，但模型产物尚未就绪。"
+            ),
+        }
+        for name, path in routes.items()
     }
 
 
@@ -1603,7 +1742,7 @@ def _model_artifact_status() -> dict[str, Any]:
         ("rollback", ROLLBACK_POINTER_PATH),
     ):
         try:
-            resolved = _resolve_artifact_pointer(path, role=role)
+            resolved = _resolve_artifact_pointer_for_status(path, role=role)
             resolved_rows[role] = resolved
             pointer_rows[role] = {
                 "available": resolved is not None,
@@ -1618,9 +1757,23 @@ def _model_artifact_status() -> dict[str, Any]:
                 "error": safe_error(exc),
             }
     current = resolved_rows["current"]
-    metadata = current["metadata"] if current else {}
+    raw_metadata = current["metadata"] if current else {}
+    metadata = {
+        key: summarized
+        for key in _STATUS_METADATA_KEYS
+        if key in raw_metadata
+        and (
+            summarized := _status_summary_value(raw_metadata.get(key), key=key)
+        )
+        is not None
+    }
     activation = current["activation_manifest"] if current else {}
-    model_bundle_available = current is not None and bool(metadata)
+    activation_status = _status_summary_value(
+        activation,
+        key="activation_manifest",
+    )
+    activation_status = activation_status if isinstance(activation_status, dict) else {}
+    model_bundle_available = current is not None and bool(raw_metadata)
     activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
     return {
         "available": model_bundle_available,
@@ -1641,14 +1794,15 @@ def _model_artifact_status() -> dict[str, Any]:
         "metadata_file": (
             _file_stat(current["metadata_path"]) if current else {"exists": False}
         ),
-        "metadata_loaded": bool(metadata),
-        "metadata_source": "verified_current_pointer" if metadata else "missing",
-        "activation_manifest": activation or {},
+        "metadata_loaded": bool(raw_metadata),
+        "metadata_source": "verified_current_pointer" if raw_metadata else "missing",
+        "status_payload_compacted": True,
+        "activation_manifest": activation_status,
         "artifact_pointers": pointer_rows,
         **metadata,
         "artifact_lifecycle": activation_stage,
         "model_stage": activation_stage if model_bundle_available else "candidate",
-        "artifact_activation_manifest": activation or {},
+        "artifact_activation_manifest": activation_status,
         "production_influence_authorized": bool(
             (activation or {}).get("production_influence_authorized")
         ),
@@ -3659,6 +3813,9 @@ def health() -> dict[str, Any]:
     payload.setdefault("return_objective_report", {})
     payload.setdefault("profit_supervision_report", {})
     payload.update(_phase3_inventory_status())
+    payload["child_endpoints"] = _status_child_endpoint_contracts(
+        bool(payload.get("model_bundle_available"))
+    )
     payload["specialist_model_chains"] = {
         "timeseries": _specialist_model_chain("timeseries"),
         "sentiment": _specialist_model_chain("sentiment"),
@@ -3678,6 +3835,9 @@ def local_models_status() -> dict[str, Any]:
     return {
         **artifact_status,
         "message": message,
+        "child_endpoints": _status_child_endpoint_contracts(
+            bool(artifact_status.get("model_bundle_available"))
+        ),
         "specialist_adapter_preflight": _specialist_adapter_preflight(),
         "status_endpoint_uses_metadata_only": True,
     }
@@ -4198,10 +4358,13 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "training_mode": str(req.training_mode or "shadow"),
         }
     )
-    global _BUNDLE_CACHE, _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+    global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
+    global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
     _BUNDLE_CACHE = None
+    _CURRENT_MODEL_PATH = None
     _CURRENT_POINTER_MTIME_NS = None
     _CURRENT_MODEL_MTIME_NS = None
+    _STATUS_ARTIFACT_CACHE.clear()
     loaded = load_bundle()
     if loaded is None:
         raise ValueError("Local AI shadow artifact failed post-activation load verification.")
@@ -5066,6 +5229,8 @@ def render_phase3_quant_api_service() -> str:
             EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
             ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 5
+            KillMode=mixed
+            TimeoutStopSec=20
             Restart=always
             RestartSec=5
             StandardOutput=append:{PHASE3_LOG_DIR}/phase3_quant_api.log

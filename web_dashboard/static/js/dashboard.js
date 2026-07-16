@@ -4231,6 +4231,119 @@ function mlFirstNumber(source, keys) {
     return null;
 }
 
+const DASHBOARD_REASON_TEXT = Object.freeze({
+    shadow_market_opportunity_distribution_missing: '缺少影子市场机会收益分布',
+    counterfactual_execution_cost_distribution_missing: '缺少反事实执行成本分布',
+    authoritative_realized_return_distribution_missing: '缺少权威真实成交收益分布',
+    authoritative_return_distribution_missing: '缺少权威真实成交收益分布',
+    authoritative_execution_cost_distribution_missing: '缺少权威执行成本分布',
+    authoritative_slippage_distribution_missing: '缺少权威真实滑点分布',
+    average_fee_after_return_not_positive: '平均费后收益不为正',
+    empirical_return_lower_hinge_not_positive: '费后收益经验下界不为正',
+    profit_factor_undefined: '缺少亏损分母，盈亏比暂时无法计算',
+    profit_factor_not_above_break_even: '盈亏比没有高于自然盈亏平衡线 1',
+    profit_factor_below_unity: '盈亏比低于自然盈亏平衡线 1',
+    realized_net_pnl_non_positive: '权威已实现净收益不为正',
+    no_trainable_samples: '没有符合干净训练契约的可训练样本',
+    effective_training_weight_zero: '可训练样本的有效权重为 0',
+    return_objective_report_missing: '缺少费后收益目标报告',
+    paper_observation_not_healthy: '模拟盘观察尚未达到健康状态',
+    walk_forward_required: '缺少按时间滚动验证',
+    model_stage_not_live: '模型仍处于影子或候选阶段',
+    model_stage_not_canary_eligible: '模型证据尚不满足灰度阶段要求',
+    live_mutation_not_enabled: '生产影响权限未开启',
+    ml_readiness_blocks_live_route: '本地 ML 收益证据未达标，禁止切换生产路由',
+    competition_not_live_applicable: '模型竞赛结果仍为观察数据，不能应用到生产',
+    competition_baseline_missing: '缺少可比较的生产基线样本',
+    baseline_missing: '缺少可比较的基线样本',
+    feature_coverage_missing: '特征覆盖不完整',
+    authoritative_fee_after_return_lcb_not_positive: '权威费后收益置信下界不为正',
+    authoritative_profit_factor_undefined: '权威成交缺少亏损分母，盈亏比无法计算',
+    authoritative_profit_factor_below_unity: '权威成交盈亏比低于自然盈亏平衡线 1',
+    child_endpoint_contract_missing_or_not_ready: '量化子接口尚未返回就绪契约',
+    legacy_data_paths_preserved: '旧数据路径按策略只读隔离保留，不影响当前运行',
+    deterministic_position_order_match: '历史仓位与订单可确定匹配，等待受控补链',
+    missing_matching_entry_order: '历史仓位缺少可确认的开仓订单链接',
+    missing_matching_close_order: '历史仓位缺少可确认的平仓订单链接',
+    'timed out': '请求超时',
+    TimeoutError: '请求超时',
+    ReadTimeout: '读取响应超时',
+    network_error: '网络连接异常',
+    runtime_heartbeat_unavailable: '运行心跳不可用',
+    trading_runtime_inactive: '交易服务当前未运行',
+    trading_runtime_heartbeat_stale: '交易服务心跳已过期',
+    ok: '当前正常',
+    ready: '当前已就绪',
+    active: '当前运行中',
+    warning: '当前需要关注',
+    blocked: '当前已阻断',
+    unavailable: '当前不可用',
+});
+
+function dashboardReasonText(value) {
+    const item = value && typeof value === 'object' ? value : {};
+    const code = String(item.code || item.reason || (typeof value === 'string' ? value : '') || '').trim();
+    const message = String(item.message || '').trim();
+    const rawText = message || code;
+    if (DASHBOARD_REASON_TEXT[code]) return DASHBOARD_REASON_TEXT[code];
+    if (code.startsWith('paper_observation_unsafe:')) {
+        return `模拟盘观察存在不安全项：${code.split(':').slice(1).join(':')}`;
+    }
+    const sideMatch = code.match(/^(long|short)_(.+)$/);
+    if (sideMatch) {
+        const sideText = sideMatch[1] === 'long' ? '做多' : '做空';
+        const suffix = sideMatch[2];
+        const sideReasons = {
+            top_return_not_above_bottom: '高分组费后收益没有高于低分组',
+            top_return_lcb_not_positive: '高分组收益置信下界不为正',
+            top_profit_factor_not_above_one: '高分组盈亏比没有高于自然盈亏平衡线 1',
+            top_tail_loss_not_improved: '高分组尾部亏损没有改善',
+            walk_forward_return_stability_failed: '费后收益在时间滚动验证中不稳定',
+            walk_forward_return_evidence_not_ready: '时间滚动费后收益证据尚未就绪',
+            walk_forward_fold_not_ready: '时间滚动验证分折证据尚未就绪',
+            leave_one_symbol_out_stability_failed: '收益过度依赖单一币种',
+            leave_one_symbol_out_not_stable: '逐币种剔除验证仍不稳定',
+            oos_return_evidence_not_ready: '样本外收益证据尚未就绪',
+            oos_profit_factor_undefined: '样本外盈亏比无法计算',
+            oos_profit_factor_not_above_break_even: '样本外盈亏比没有高于自然盈亏平衡线 1',
+            oos_return_tail_evidence_incomplete: '样本外尾部风险证据不完整',
+            authoritative_profit_factor_undefined: '真实成交盈亏比无法计算',
+            authoritative_profit_factor_not_above_break_even: '真实成交盈亏比没有高于自然盈亏平衡线 1',
+            authoritative_return_tail_evidence_incomplete: '真实成交尾部风险证据不完整',
+            authoritative_realized_return_calibration_missing: '缺少真实成交收益校准',
+            authoritative_slippage_calibration_missing: '缺少真实滑点校准',
+            authoritative_return_evidence_not_ready: '真实成交收益证据尚未就绪',
+            return_distribution_input_missing: '缺少收益分布输入',
+            return_distribution_input_version_mismatch: '收益分布输入版本不匹配',
+        };
+        if (sideReasons[suffix]) return `${sideText}${sideReasons[suffix]}`;
+    }
+    if (/Unterminated string/i.test(rawText)) {
+        return '状态响应被截断，JSON 不完整；这属于监控读取错误，不代表模型损坏';
+    }
+    const englishPatterns = [
+        [/^(long|short) top-score return confidence lower bound is not positive\.?$/i, '高分组收益置信下界不为正'],
+        [/^(long|short) fee-after return evidence is not stable across walk-forward folds\.?$/i, '费后收益在时间滚动验证各折之间不稳定'],
+        [/^(long|short) return evidence depends on at least one removed symbol\.?$/i, '收益证据过度依赖至少一个单独币种'],
+        [/^(long|short) OOS Profit Factor is not above natural break-even\.?$/i, '样本外盈亏比没有高于自然盈亏平衡线 1'],
+    ];
+    for (const [pattern, text] of englishPatterns) {
+        const match = rawText.match(pattern);
+        if (match) return `${match[1].toLowerCase() === 'long' ? '做多' : '做空'}${text}`;
+    }
+    if (/timed?\s*out|timeout/i.test(rawText)) return '请求超时，服务没有在监控时限内返回';
+    if (/connection refused|could not connect|connect error/i.test(rawText)) return '服务连接失败，请检查服务进程和接口监听状态';
+    if (/unauthorized|forbidden|\b401\b|\b403\b/i.test(rawText)) return '接口鉴权失败，请检查服务凭据配置';
+    if (/not found|\b404\b/i.test(rawText)) return '接口或模型资源不存在';
+    if (/no trained local quant bundle/i.test(rawText)) return '本地量化模型产物尚未生成或尚未注册';
+    if (rawText && /[\u3400-\u9fff]/.test(rawText)) return rawText;
+    if (/^[a-z][a-z0-9_:-]*$/i.test(code)) {
+        return `未登记中文说明的系统原因，已按异常处理（诊断代码：${code}）`;
+    }
+    if (/[A-Za-z]{4}/.test(rawText)) return '系统返回了未中文化的异常说明，已按问题处理';
+    return rawText || '原因尚未返回';
+}
+
 function mlSampleCounts() {
     const ml = state.mlSignalStatus || {};
     const local = state.localAIToolsStatus || {};
@@ -4273,7 +4386,14 @@ function mlSampleCounts() {
         : null;
     let newCount = mlFirstNumber(ml, ['phase3_new_shadow_sample_count', 'new_shadow_sample_count'])
         ?? mlFirstNumber(local, ['phase3_new_shadow_sample_count', 'new_shadow_sample_count']);
-    const previousCount = mlFirstNumber(autoLast, ['previous_phase3_sample_count'])
+    const previousCount = mlFirstNumber(ml, [
+            'last_trained_phase3_shadow_sample_count',
+            'last_trained_completed_shadow_sample_count',
+        ])
+        ?? mlFirstNumber(autoLast, [
+            'last_trained_completed_shadow_sample_count',
+            'last_trained_completed_sample_count',
+        ])
         ?? trainingMl;
     if (newCount === null && completedMl !== null && previousCount !== null) {
         newCount = Math.max(completedMl - previousCount, 0);
@@ -4308,6 +4428,7 @@ function mlSampleCounts() {
         ),
         limit,
         newCount,
+        trainedCursor: previousCount,
     };
 }
 
@@ -4518,7 +4639,7 @@ function mlPredictionEconomicsHtml(record, prediction) {
                 <span>生产收益下界 ${distributionPctLabel(productionDistribution.objective_expected_return_pct)}</span>
                 <span>成本扣除次数 ${mlSampleCountLabel(mlOptionalNumber(breakdown.cost_deduction_count))}</span>
             </div>
-            ${blockers.length ? `<div class="ml-prediction-blockers">阻断：${blockers.map(item => escHtml(item)).join(' / ')}</div>` : ''}
+            ${blockers.length ? `<div class="ml-prediction-blockers">阻断：${blockers.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>` : ''}
         </div>`;
 }
 
@@ -4638,6 +4759,8 @@ function collectionStatusLabel(status, enabled = true) {
         artifact_unavailable: '缺少模型产物',
         shadow_ready: '影子可用',
         shadow: '影子观察',
+        canary: '灰度',
+        live: '生产',
         empty: '冷启动等待',
         quarantined: '已隔离',
         downweighted: '已降权',
@@ -4691,11 +4814,11 @@ function renderPhase3PromotionGate(promotion, localTools = {}) {
         : [];
     return `
         <div class="data-quality-panel">
-            <strong>Phase 3 promotion gate</strong>
+            <strong>三期模型晋升检查</strong>
             <div class="data-collection-summary data-collection-summary-compact">
-                ${collectionMetric('Recommended stage', gate.recommended_stage || localTools.model_stage || 'shadow', `mode=${localTools.training_mode || 'shadow'}`, gate.live_ready ? 'good' : gate.canary_ready ? 'warn' : 'muted')}
-                ${collectionMetric('Canary ready', gate.canary_ready ? 'yes' : 'no', canaryBlockers.slice(0, 2).join(', ') || 'no blocker reported', gate.canary_ready ? 'good' : 'warn')}
-                ${collectionMetric('Live ready', gate.live_ready ? 'yes' : 'no', liveBlockers.slice(0, 3).join(', ') || 'live mutation remains disabled', gate.live_ready ? 'good' : 'warn')}
+                ${collectionMetric('建议阶段', collectionStatusLabel(gate.recommended_stage || localTools.model_stage || 'shadow', true), `训练模式：${collectionStatusLabel(localTools.training_mode || 'shadow', true)}`, gate.live_ready ? 'good' : gate.canary_ready ? 'warn' : 'muted')}
+                ${collectionMetric('灰度是否就绪', gate.canary_ready ? '是' : '否', canaryBlockers.slice(0, 2).map(dashboardReasonText).join('；') || '没有灰度阻断', gate.canary_ready ? 'good' : 'warn')}
+                ${collectionMetric('生产是否就绪', gate.live_ready ? '是' : '否', liveBlockers.slice(0, 3).map(dashboardReasonText).join('；') || '生产影响权限保持关闭', gate.live_ready ? 'good' : 'warn')}
             </div>
         </div>`;
 }
@@ -5681,15 +5804,15 @@ function systemAuditPhase3ServerMigrationDetails(details) {
     const release = details.resource_release_marker || details.reset_marker || {};
     const policy = details.migration_policy || {};
     const blockerRows = blockers.slice(0, 10).map(item => [
-        item.code || '-',
-        item.severity || '-',
-        item.message || '-',
+        dashboardReasonText(item),
+        systemAuditStatusLabel(item.severity || '-'),
+        dashboardReasonText(item),
         item.evidence || '-',
     ]);
     const warningRows = warnings.slice(0, 8).map(item => [
-        item.code || '-',
-        item.severity || '-',
-        item.message || '-',
+        dashboardReasonText(item),
+        systemAuditStatusLabel(item.severity || '-'),
+        dashboardReasonText(item),
         item.evidence || '-',
     ]);
     const pathRows = legacyPaths.slice(0, 12).map(item => [
@@ -5707,29 +5830,29 @@ function systemAuditPhase3ServerMigrationDetails(details) {
         item.enabled_state || '-',
     ]);
     const approvedRows = [
-        ['approved categories', Array.isArray(policy.approved_categories) ? policy.approved_categories.join(', ') : '-'],
-        ['approved sources', Array.isArray(policy.approved_sources) ? policy.approved_sources.join(', ') : '-'],
-        ['whole disk copy allowed', policy.whole_disk_copy_allowed ?? false],
-        ['old server role', policy.old_server_production_role_after_migration || '-'],
+        ['允许迁移的类别', Array.isArray(policy.approved_categories) ? policy.approved_categories.join(', ') : '-'],
+        ['允许的数据来源', Array.isArray(policy.approved_sources) ? policy.approved_sources.join(', ') : '-'],
+        ['是否允许整盘复制', policy.whole_disk_copy_allowed ? '是' : '否'],
+        ['旧服务器迁移后角色', policy.old_server_production_role_after_migration || '-'],
     ];
     return `
         <div class="system-audit-detail-grid">
-            ${systemAuditMetric('Go-live blocked', details.phase3_go_live_blocked ? 'yes' : 'no', 'Phase 3 model-server gate')}
-            ${systemAuditMetric('Probe', details.remote_probe_available ? 'available' : 'unavailable', details.error || 'read-only')}
-            ${systemAuditMetric('Release marker', release.present ? 'present' : 'missing', details.resource_release_marker_path || details.reset_marker_path || '-')}
-            ${systemAuditMetric('Legacy released', release.legacy_resources_stopped ? 'yes' : 'no', release.policy_id || details.policy_id || '-')}
-            ${systemAuditMetric('Phase 3 root', details.phase3_root || '-', Array.isArray(details.missing_phase3_roots) && details.missing_phase3_roots.length ? 'missing roots' : 'isolated')}
-            ${systemAuditMetric('Migration manifest', migration.present ? 'present' : 'missing', details.migration_manifest_path || '-')}
-            ${systemAuditMetric('Migration items', migration.item_count ?? 0, migration.whitelist_only ? 'whitelist only' : 'not whitelist only')}
-            ${systemAuditMetric('Legacy data paths', details.legacy_data_path_count ?? 0, 'preserved, isolated')}
-            ${systemAuditMetric('Legacy services', details.forbidden_service_count ?? 0, 'must be 0')}
-            ${systemAuditMetric('Legacy processes', details.legacy_process_count ?? 0, 'must be 0')}
+            ${systemAuditMetric('生产启用是否阻断', details.phase3_go_live_blocked ? '是' : '否', '三期模型服务器检查')}
+            ${systemAuditMetric('远端探针', details.remote_probe_available ? '可用' : '不可用', details.error || '只读检查')}
+            ${systemAuditMetric('资源释放证明', release.present ? '存在' : '缺失', details.resource_release_marker_path || details.reset_marker_path || '-')}
+            ${systemAuditMetric('旧资源是否释放', release.legacy_resources_stopped ? '是' : '否', release.policy_id || details.policy_id || '-')}
+            ${systemAuditMetric('三期数据根目录', details.phase3_root || '-', Array.isArray(details.missing_phase3_roots) && details.missing_phase3_roots.length ? '目录缺失' : '已隔离')}
+            ${systemAuditMetric('迁移清单', migration.present ? '存在' : '缺失', details.migration_manifest_path || '-')}
+            ${systemAuditMetric('迁移条目', migration.item_count ?? 0, migration.whitelist_only ? '仅允许白名单' : '未强制白名单')}
+            ${systemAuditMetric('只读保留旧数据路径', details.legacy_data_path_count ?? 0, '保留但与当前运行隔离')}
+            ${systemAuditMetric('旧服务残留', details.forbidden_service_count ?? 0, '正常应为 0')}
+            ${systemAuditMetric('旧进程残留', details.legacy_process_count ?? 0, '正常应为 0')}
         </div>
-        ${systemAuditSection('Phase 3 blockers', systemAuditTable(['Code', 'Severity', 'Message', 'Evidence'], blockerRows))}
-        ${systemAuditSection('Migration warnings', systemAuditTable(['Code', 'Severity', 'Message', 'Evidence'], warningRows))}
-        ${systemAuditSection('Preserved legacy data paths', systemAuditTable(['Path', 'Kind', 'Size', 'Children'], pathRows))}
-        ${systemAuditSection('Forbidden legacy services', systemAuditTable(['Service', 'Unit', 'Active', 'Enabled', 'Active state', 'Enabled state'], serviceRows))}
-        ${systemAuditSection('Whitelist migration policy', systemAuditTable(['Policy', 'Value'], approvedRows))}`;
+        ${systemAuditSection('三期硬阻断', systemAuditTable(['原因', '级别', '说明', '证据'], blockerRows))}
+        ${systemAuditSection('迁移观察项', systemAuditTable(['原因', '级别', '说明', '证据'], warningRows))}
+        ${systemAuditSection('只读保留的旧数据路径', systemAuditTable(['路径', '类型', '大小', '内容示例'], pathRows))}
+        ${systemAuditSection('禁止残留的旧服务', systemAuditTable(['服务', '单元', '运行', '启用', '运行状态', '启用状态'], serviceRows))}
+        ${systemAuditSection('白名单迁移策略', systemAuditTable(['策略', '值'], approvedRows))}`;
 }
 
 function systemAuditGenericDetailsHtml(details) {
@@ -5758,10 +5881,10 @@ function systemAuditShadowMissedOpportunityDetails(details) {
         ? details.executed_return_contract_gaps
         : [])
         .slice(0, 8)
-        .map(item => [item.decision_id ?? '-', item.reason || '-']);
+        .map(item => [item.decision_id ?? '-', dashboardReasonText(item.reason)]);
     const blockedReasonRows = Object.entries(blockedCounts)
         .slice(0, 8)
-        .map(([reason, count]) => [reason, count]);
+        .map(([reason, count]) => [dashboardReasonText(reason), count]);
     return `
         <div class="system-audit-detail-grid">
             ${systemAuditMetric('Completed', summary.completed_count || 0, 'shadow rows')}
@@ -5783,7 +5906,7 @@ function systemAuditOkxDetailsV2(details) {
     const dailyReport = details.daily_reconciliation_report || {};
     const rootCauseRows = Array.isArray(rootCause.root_causes)
         ? rootCause.root_causes.slice(0, 6).map(item => [
-            item.code || '-',
+            dashboardReasonText(item),
             item.count ?? 0,
             item.training_policy || '-',
             item.action || '-',
@@ -5798,7 +5921,7 @@ function systemAuditOkxDetailsV2(details) {
             item.symbol || '-',
             item.side || '-',
             item.exchange_order_id || item.local_order_id || item.local_position_id || '-',
-            item.reason || '-',
+            dashboardReasonText(item),
         ]);
     const runtimeKindRows = Object.entries(runtimeGate.last_result_kinds || {})
         .slice(0, 8)
@@ -5824,7 +5947,7 @@ function systemAuditOkxDetailsV2(details) {
     const dailyEntryBlockerRows = (Array.isArray(dailyReport.entry_blockers) ? dailyReport.entry_blockers : [])
         .slice(0, 8)
         .map(item => [
-            item.code || '-',
+            dashboardReasonText(item),
             item.card_key || '-',
             item.status || '-',
             item.requires_attention === true ? 'yes' : 'no',
@@ -5833,7 +5956,7 @@ function systemAuditOkxDetailsV2(details) {
     const dailyTrainingBlockerRows = (Array.isArray(dailyReport.training_blockers) ? dailyReport.training_blockers : [])
         .slice(0, 8)
         .map(item => [
-            item.code || '-',
+            dashboardReasonText(item),
             item.card_key || '-',
             item.status || '-',
             item.summary || '-',
@@ -5858,7 +5981,7 @@ function systemAuditOkxDetailsV2(details) {
             ${systemAuditMetric('OKX positions', authoritative.okx_position_count ?? 0, 'current exchange positions')}
             ${systemAuditMetric('OKX fill orders', authoritative.okx_fill_order_count ?? 0, 'recent exchange fills')}
             ${systemAuditMetric('OKX sync issues', authoritative.issue_count ?? 0, 'manual review/repairable/skipped')}
-            ${systemAuditMetric('Entry gate', runtimeGateState, runtimeGate.blocker || runtimeGate.status || 'runtime OKX sync')}
+            ${systemAuditMetric('Entry gate', runtimeGateState, dashboardReasonText(runtimeGate.blocker || runtimeGate.status || 'runtime OKX sync'))}
             ${systemAuditMetric('Daily report', dailyReportState, dailyReport.generated_at ? toBeijingTime(dailyReport.generated_at) : 'latest timer artifact')}
             ${systemAuditMetric('Can train', dailyReport.can_refresh_training === true ? 'yes' : 'no', dailyReport.training_blocked === true ? 'training blocked' : 'clean-view allowed')}
         </div>
@@ -5881,8 +6004,8 @@ function systemAuditOkxDetailsV2(details) {
             runtimeGate.entry_blocked,
             runtimeGate.heartbeat_age_seconds ?? '-',
             runtimeGate.heartbeat_fresh_limit_seconds ?? '-',
-            runtimeGate.blocker || '-',
-            runtimeGate.reason || '-',
+            dashboardReasonText(runtimeGate.blocker || '-'),
+            dashboardReasonText(runtimeGate.reason || '-'),
         ]]))}
         ${systemAuditSection('Runtime OKX sync result kinds', systemAuditTable(['Kind', 'Count'], runtimeKindRows))}
         ${systemAuditSection('Runtime OKX sync samples', systemAuditTable(['Kind', 'Symbol', 'Side', 'Requires attention', 'Exchange order', 'Note'], runtimeSampleRows))}
@@ -6138,6 +6261,40 @@ function renderSystemAuditRootCauses(rootCauses) {
     }).join('');
 }
 
+const SYSTEM_AUDIT_NODE_LABELS = Object.freeze({
+    server_migration: '三期服务器迁移',
+    model_server_readiness: '模型服务器就绪检查',
+    phase3_stage_handoff: '三期阶段交接',
+    runtime_loop: '调度与心跳',
+    market_data: '行情与 K 线',
+    crypto_feature_coverage: '数字货币特征覆盖',
+    model_training: '模型与训练数据',
+    model_expert_health: '模型/专家体检',
+    model_expert_competition: '模型/专家竞赛',
+    model_dynamic_routing: '模型动态路由',
+    model_routing: '模型路由',
+    high_risk_review_audit: '高风险独立复核',
+    shadow_missed_opportunity: '影子错失机会复盘',
+    strong_opportunity: '强机会识别',
+    position_capacity_release: '持仓容量释放',
+    strategy_decision: '策略决策质量',
+    strategy_closed_loop: '策略闭环有效性',
+    strategy_signal_root_cause: '策略信号根因',
+    strategy_gate_contract: '策略门槛契约',
+    risk_guard: '风控与守门',
+    okx_execution: 'OKX 执行与历史对账',
+    position_sync: '持仓同步与盈亏',
+    training_data: '训练标签与样本治理',
+    dashboard_observability: '页面与可观测性',
+    visible_text_encoding: '中文显示与乱码',
+    runtime_text_integrity: '运行时文本完整性',
+});
+
+function systemAuditNodeLabel(value) {
+    const key = String(value || '');
+    return SYSTEM_AUDIT_NODE_LABELS[key] || key || '无';
+}
+
 function renderSystemAuditCards(cards) {
     const container = document.getElementById('system-audit-cards');
     if (!container) return;
@@ -6200,8 +6357,8 @@ function renderSystemAuditNodes(nodes) {
                 <strong>${escHtml(node.title || node.key || '-')}</strong>
                 <p>${escHtml(systemAuditShortText(node.summary || node.impact || '-', 180))}</p>
                 <div class="system-audit-node-flow">
-                    <span>上游 ${escHtml(upstream.length ? upstream.join('、') : '无')}</span>
-                    <span>下游 ${escHtml(downstream.length ? downstream.join('、') : '无')}</span>
+                    <span>上游 ${escHtml(upstream.length ? upstream.map(systemAuditNodeLabel).join('、') : '无')}</span>
+                    <span>下游 ${escHtml(downstream.length ? downstream.map(systemAuditNodeLabel).join('、') : '无')}</span>
                 </div>
                 <div class="system-audit-node-checks">
                     ${checks.map(item => `<i>${escHtml(item)}</i>`).join('') || '<i>暂无检查项</i>'}
@@ -6679,7 +6836,7 @@ function runtimeEndpointSummary(health) {
     const parts = [];
     parts.push(status ? `HTTP ${status}` : (health.ok ? 'HTTP 正常' : 'HTTP 未连接'));
     if (Number.isFinite(latency)) parts.push(`${monitorNumber(latency, 0)} ms`);
-    if (health.error) parts.push(String(health.error));
+    if (health.error) parts.push(dashboardReasonText(health.error));
     if (health.truncated) parts.push('响应已截断');
     return parts.join(' · ');
 }
@@ -6748,7 +6905,7 @@ function renderServerModelRuntime(data, container) {
                 <div>配置模型：${escHtml(targetModel || '-')}</div>
                 <div>模型：${escHtml(modelNames)}</div>
                 ${mismatchLine}
-                ${item.error ? `<div style="color:var(--red);">错误：${escHtml(item.error)}</div>` : ''}
+                ${item.error ? `<div style="color:var(--red);">错误：${escHtml(dashboardReasonText(item.error))}</div>` : ''}
             </div>`;
     }).join('');
     const vllmEndpointRows = vllmEndpoints.length
@@ -6808,7 +6965,7 @@ function renderServerModelRuntime(data, container) {
                 <div>交易样本：窗口 ${monitorNumber(tools.trade_sample_count, 0)} / 累计 ${monitorNumber(tools.completed_trade_sample_count, 0)}</div>
                 <div>盈利模型：${escHtml(toolsModels.profit || '未返回')}</div>
                 <div>平仓模型：${escHtml(toolsModels.exit || '未返回')}</div>
-                ${tools.error ? `<div style="color:var(--red);">错误：${escHtml(tools.error)}</div>` : ''}
+                ${tools.error ? `<div style="color:var(--red);">错误：${escHtml(dashboardReasonText(tools.error))}</div>` : ''}
             </div>
             <div class="server-monitor-runtime-card">
                 <strong>GPU 模型进程</strong>
@@ -7949,7 +8106,7 @@ function positionProtectionInventoryWarnings(inventory) {
         ...orphan.map(key => `孤儿 ${Array.isArray(key) ? key.join(' ') : key}`),
         ...mismatch.map(item => `数量不一致 ${item.symbol || '-'} ${item.side || '-'}`),
         ...(invalidCount !== null && invalidCount > 0 ? [`无效保护单 ${invalidCount} 张`] : []),
-        ...repairBlockers.map(item => `修复阻断 ${item}`),
+        ...repairBlockers.map(item => `修复阻断：${dashboardReasonText(item)}`),
     ])];
 }
 
@@ -7960,7 +8117,7 @@ function renderPositionProtectionInventory() {
     if (inventory.available !== true) {
         const blockers = Array.isArray(inventory.blockers) ? inventory.blockers : [];
         container.className = 'positions-protection-status blocked';
-        container.innerHTML = `<strong>OKX OCO 证据不可用</strong><span>${blockers.length ? blockers.map(item => escHtml(item)).join(' / ') : '保护快照尚未返回；不能把缺失显示为 0。'}</span>`;
+        container.innerHTML = `<strong>OKX OCO 证据不可用</strong><span>${blockers.length ? blockers.map(item => escHtml(dashboardReasonText(item))).join(' / ') : '保护快照尚未返回；不能把缺失显示为 0。'}</span>`;
         return;
     }
     const warnings = positionProtectionInventoryWarnings(inventory);
@@ -8117,7 +8274,7 @@ function positionEvidenceValue(value, suffix = '') {
 function positionEvidenceBlockers(blockers) {
     const values = Array.isArray(blockers) ? blockers.filter(Boolean) : [];
     return values.length
-        ? `<div class="position-evidence-blockers">阻断：${values.map(item => escHtml(item)).join(' / ')}</div>`
+        ? `<div class="position-evidence-blockers">阻断：${values.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>`
         : '';
 }
 
@@ -9503,8 +9660,8 @@ function mlLocalEvidenceHtml(status) {
         `<section class="ml-evidence-panel ${blockers.length ? 'bad' : ''}">
             <div class="ml-evidence-head"><strong>当前晋升阻断</strong><span>${blockers.length ? `${blockers.length} 项` : '无阻断'}</span></div>
             <div class="ml-evidence-list">${blockers.length
-                ? blockers.slice(0, 10).map(item => mlEvidenceRow(item.code || '未命名阻断', item.message || mlEvidenceValue(item.actual), 'bad')).join('')
-                : mlEvidenceRow('Readiness', readiness.state || status.readiness_state || '证据缺失')}</div>
+                ? blockers.slice(0, 10).map(item => mlEvidenceRow('阻断原因', dashboardReasonText(item), 'bad')).join('')
+                : mlEvidenceRow('就绪判断', readiness.state || status.readiness_state || '证据缺失')}</div>
         </section>`,
     ];
     return `<div class="ml-evidence-grid">${evidenceSections.join('')}</div>`;
@@ -9552,8 +9709,8 @@ function renderMLSignalOverview() {
     const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;
     const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
     const readinessReasonText = readinessBlockers.length
-        ? readinessBlockers.slice(0, 4).map(item => item?.message || item?.code || '').filter(Boolean).join('；')
-        : Object.keys(readiness).length ? '当前没有 readiness 阻塞项' : 'Readiness 证据缺失';
+        ? readinessBlockers.slice(0, 4).map(dashboardReasonText).filter(Boolean).join('；')
+        : Object.keys(readiness).length ? '当前没有就绪阻断项' : '就绪证据缺失';
     const prAucText = `${mlEvidenceValue(mlOptionalNumber(readinessMetrics.long_pr_auc))} / ${mlEvidenceValue(mlOptionalNumber(readinessMetrics.short_pr_auc))}`;
     const latestText = latestRecord
         ? `${toBeijingTime(latestRecord.created_at)} ${latestRecord.symbol || '-'}`
@@ -9592,7 +9749,7 @@ function renderMLSignalOverview() {
         </div>
         <div class="ml-overview-grid">
             ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
-            ${mlMetricCard('Readiness', readinessDisplayState, readinessReasonText, readinessTone)}
+            ${mlMetricCard('就绪判断', readinessDisplayState, readinessReasonText, readinessTone)}
             ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('影子市场机会样本', mlSampleCountLabel(samples.mlShadowMarket), '不代表实际成交或真实费后收益', Number.isFinite(samples.mlShadowMarket) ? 'good' : 'warn')}
             ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
@@ -9600,7 +9757,7 @@ function renderMLSignalOverview() {
             ${mlMetricCard('训练/留出分组', `${mlSampleCountLabel(trainDecisionGroupCount)} / ${mlSampleCountLabel(testDecisionGroupCount)}`, '同一 decision 不得跨训练和留出集', splitEvidenceAvailable ? 'good' : 'warn')}
             ${mlMetricCard('脏样本比例', dirtySampleRatioLabel, `隔离 ${mlSampleCountLabel(quarantinedSampleCount)} / 降权 ${mlSampleCountLabel(downweightedSampleCount)}`, readinessDistributionAvailable ? readinessTone : 'warn')}
             ${mlMetricCard('PR-AUC 多/空（诊断）', prAucText, '仅观察分类器，不参与 ready、评分或晋升', 'muted')}
-            ${mlMetricCard('三期新增未训练样本', mlSampleCountLabel(samples.newCount), status.sample_count_blocker || '只统计三期完成样本减去本次训练窗口；旧累计样本不显示、不训练', status.sample_count_blocker ? 'bad' : 'muted')}
+            ${mlMetricCard('当前新增待训练样本', mlSampleCountLabel(samples.newCount), status.sample_count_blocker || (samples.completedMl !== null && samples.trainedCursor !== null ? `当前干净完成 ${samples.completedMl} - 最近已训练游标 ${samples.trainedCursor}` : '等待当前干净样本总数与最近训练游标'), status.sample_count_blocker ? 'bad' : (Number(samples.newCount || 0) > 0 ? 'warn' : 'muted'))}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} ${distributionSummaryText(latestDistribution)}` : '等待新分析', latestDistribution && Number(latestDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn')}
             ${mlMetricCard('正目标期望数量', `${strongSignals} / ${records.length}`, '最近记录里标准合同目标期望为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}

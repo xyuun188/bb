@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -519,6 +520,86 @@ def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Pat
     ] is False
 
 
+def test_local_ai_tools_status_payload_is_bounded_and_exposes_child_contracts(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_compact_status_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    current = _persist_test_shadow_artifact(
+        module,
+        tmp_path,
+        profit_supervision_report={
+            "version": module.PROFIT_SUPERVISION_VERSION,
+            "shadow_market_sample_count": 100,
+            "shadow_events": [
+                {"symbol": f"TOKEN-{index}", "payload": "x" * 4096}
+                for index in range(300)
+            ],
+            "authoritative_evidence": [
+                {"symbol": f"TOKEN-{index}", "payload": "y" * 4096}
+                for index in range(300)
+            ],
+        },
+    )
+    activation_path = current["version_root"] / "activation-shadow.json"
+    activation = module.read_json_object(activation_path)
+    activation["return_evidence_report"] = {
+        "rows": [
+            {"symbol": f"TOKEN-{index}", "payload": "z" * 4096}
+            for index in range(300)
+        ]
+    }
+    module.write_json_atomic(activation_path, activation)
+    pointer = module.read_json_object(module.CURRENT_POINTER_PATH)
+    pointer["activation_manifest_sha256"] = module.sha256_file(activation_path)
+    module.write_json_atomic(module.CURRENT_POINTER_PATH, pointer)
+    module._STATUS_ARTIFACT_CACHE.clear()
+
+    health = module.health()
+    status = module.local_models_status()
+    encoded = json.dumps(status, ensure_ascii=False).encode("utf-8")
+
+    assert len(encoded) < 512 * 1024
+    assert "shadow_events" not in encoded.decode("utf-8")
+    assert "authoritative_evidence" not in encoded.decode("utf-8")
+    assert "return_evidence_report" not in encoded.decode("utf-8")
+    assert status["status_payload_compacted"] is True
+    assert health["child_endpoints"]["profit_prediction"]["available"] is True
+    assert status["child_endpoints"]["time_series_prediction"]["probe_mode"] == (
+        "metadata_contract"
+    )
+    assert status["child_endpoints"]["sentiment_analysis"][
+        "actual_inference_probe"
+    ] is False
+
+
+def test_load_bundle_reuses_verified_unchanged_artifact(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_verified_bundle_cache_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _persist_test_shadow_artifact(module, tmp_path)
+    module._BUNDLE_CACHE = None
+    module._CURRENT_POINTER_MTIME_NS = None
+    module._CURRENT_MODEL_MTIME_NS = None
+    module._CURRENT_MODEL_PATH = None
+    module._STATUS_ARTIFACT_CACHE.clear()
+    resolve_count = 0
+    original_resolve = module._resolve_artifact_pointer
+
+    def counted_resolve(*args: object, **kwargs: object) -> dict | None:
+        nonlocal resolve_count
+        resolve_count += 1
+        return original_resolve(*args, **kwargs)
+
+    module._resolve_artifact_pointer = counted_resolve
+
+    first = module.load_bundle()
+    second = module.load_bundle()
+
+    assert first is not None
+    assert second is first
+    assert resolve_count == 1
+
+
 def test_rejected_current_bundle_is_not_reloaded_until_pointer_changes(tmp_path: Path) -> None:
     module = ModuleType("local_ai_tools_api_rejected_bundle_cache_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
@@ -526,6 +607,8 @@ def test_rejected_current_bundle_is_not_reloaded_until_pointer_changes(tmp_path:
     module._BUNDLE_CACHE = None
     module._CURRENT_POINTER_MTIME_NS = None
     module._CURRENT_MODEL_MTIME_NS = None
+    module._CURRENT_MODEL_PATH = None
+    module._STATUS_ARTIFACT_CACHE.clear()
     load_count = 0
 
     def load_legacy_bundle(_path: Path) -> dict:
@@ -2180,6 +2263,8 @@ def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:
     assert "Environment=LOCAL_AI_TOOLS_MODEL_DIR=/data/BB/models/local_ai_tools" in service
     assert "EnvironmentFile=-/data/BB/env/phase3.env" in service
     assert "--host 127.0.0.1 --port 8101" in service
+    assert "KillMode=mixed" in service
+    assert "TimeoutStopSec=20" in service
     assert "bb-phase3-quant-api.service" in source
     assert "/data/trade_ai" not in source
     assert "local-ai-tools.service" not in source

@@ -314,6 +314,15 @@ def render_server_monitor_probe(
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     text, truncated = read_response_text(resp)
+                    if truncated:
+                        return {{
+                            "ok": False,
+                            "status_code": resp.status,
+                            "latency_ms": elapsed_ms(started),
+                            "truncated": True,
+                            "error": "响应内容超过监控读取上限；请使用精简状态接口。",
+                            "data": None,
+                        }}
                     return {{
                         "ok": 200 <= resp.status < 300,
                         "status_code": resp.status,

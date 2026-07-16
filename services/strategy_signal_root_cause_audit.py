@@ -111,7 +111,7 @@ class StrategySignalRootCauseAuditService:
             "summary": (
                 "Production return contract gaps were found."
                 if causes
-                else "Production return contracts are complete in the audit window."
+                else "审计窗口内的生产收益契约完整。"
             ),
             "audit_only": True,
             "read_only": True,
@@ -156,7 +156,7 @@ class StrategySignalRootCauseAuditService:
                 "Restore authoritative fee-after return, live cost, risk-budget and provenance inputs before production execution."
             ]
             if causes
-            else ["Continue observing realized fee-after returns and left-tail behavior."],
+            else ["继续观察已实现费后收益和左尾表现。"],
         }
 
 

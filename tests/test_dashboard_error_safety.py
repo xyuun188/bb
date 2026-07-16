@@ -2198,7 +2198,7 @@ def test_server_monitor_remote_command_failure_is_redacted() -> None:
     assert "password=***" in result["message"]
 
 
-async def test_collect_platform_runtime_status_probes_real_local_tool_endpoints(
+async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_contracts(
     monkeypatch,
 ) -> None:
     requests: list[tuple[str, str, str]] = []
@@ -2245,12 +2245,33 @@ async def test_collect_platform_runtime_status_probes_real_local_tool_endpoints(
                     request=request,
                 )
             if url == "http://local-ai.test/health":
-                return httpx.Response(500, json={"detail": "booting"}, request=request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "service": "phase3_quant_api",
+                        "trained_models_available": True,
+                        "child_endpoints": {
+                            "profit_prediction": {
+                                "available": True,
+                                "path": "/profit/predict",
+                                "probe_mode": "metadata_contract",
+                            },
+                            "exit_advice": {
+                                "available": False,
+                                "path": "/exit/advise",
+                                "probe_mode": "metadata_contract",
+                            },
+                        },
+                    },
+                    request=request,
+                )
             if url == "http://local-ai.test/models/status":
-                return httpx.Response(503, json={"available": False}, request=request)
-            if url.endswith("/profit/predict"):
-                return httpx.Response(200, json={"available": True}, request=request)
-            return httpx.Response(500, json={"available": False}, request=request)
+                return httpx.Response(
+                    200,
+                    json={"available": True},
+                    request=request,
+                )
+            raise AssertionError(f"unexpected heavy inference probe: {method} {url}")
 
     monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
 
@@ -2259,14 +2280,15 @@ async def test_collect_platform_runtime_status_probes_real_local_tool_endpoints(
     assert result["ai_models"][0]["available"] is True
     tools = result["local_ai_tools"]
     assert tools["available"] is True
-    assert tools["health"]["ok"] is False
-    assert tools["status"]["ok"] is False
-    assert tools["model_bundle_available"] is False
+    assert tools["health"]["ok"] is True
+    assert tools["status"]["ok"] is True
+    assert tools["model_bundle_available"] is True
     assert tools["child_endpoints"]["profit_prediction"]["available"] is True
     assert tools["child_endpoints"]["exit_advice"]["available"] is False
+    assert tools["child_endpoints"]["profit_prediction"]["actual_inference_probe"] is False
     assert tools["expected_platform_api_base"] == "http://127.0.0.1:18001"
     assert tools["tunnel_contract"]["status"] == "external_or_dev_endpoint"
-    assert ("POST", "http://local-ai.test/profit/predict", "Bearer hidden-tools-key") in requests
+    assert all(method == "GET" for method, _url, _auth in requests)
 
 
 async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_settings_empty(
@@ -2300,7 +2322,19 @@ async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_set
             json: dict[str, Any] | None = None,
         ) -> httpx.Response:
             requests.append((method, url, str((headers or {}).get("Authorization") or "")))
-            return httpx.Response(200, json={"available": True}, request=httpx.Request(method, url))
+            payload = {"available": True}
+            if url.endswith("/health"):
+                payload = {
+                    "available": True,
+                    "service": "phase3_quant_api",
+                    "child_endpoints": {
+                        "profit_prediction": {
+                            "available": True,
+                            "path": "/profit/predict",
+                        }
+                    },
+                }
+            return httpx.Response(200, json=payload, request=httpx.Request(method, url))
 
     monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
 
@@ -2309,7 +2343,7 @@ async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_set
     assert result["local_ai_tools"]["available"] is True
     assert ("GET", "http://local-ai.test/health", "Bearer env-tools-key") in requests
     assert ("GET", "http://local-ai.test/models/status", "Bearer env-tools-key") in requests
-    assert ("POST", "http://local-ai.test/profit/predict", "Bearer env-tools-key") in requests
+    assert all(method == "GET" for method, _url, _auth in requests)
 
 
 async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_unconfigured(
