@@ -265,7 +265,7 @@ def test_server_monitor_probe_omits_untargeted_fallback_from_duplicate_service_r
         {
             "vllm_endpoints": [
                 {
-                    "label": "Local decision fallback",
+                    "label": "本地决策备用池",
                     "provider_model": "",
                     "models": ["qwen3-14b-trade"],
                     "endpoint": "127.0.0.1:8000/v1",
@@ -405,7 +405,7 @@ def test_server_monitor_probe_treats_external_primary_as_local_fallback() -> Non
     endpoints = cast(list[dict[str, object]], runtime["vllm_endpoints"])
 
     assert vllm["endpoint"] == "127.0.0.1:8000/v1"
-    assert vllm["label"] == "Local decision fallback"
+    assert vllm["label"] == "本地决策备用池"
     assert vllm["provider_model"] == ""
     assert vllm["available"] is True
     assert vllm["model_mismatch"] is False

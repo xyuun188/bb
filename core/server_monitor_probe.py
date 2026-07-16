@@ -292,7 +292,7 @@ def render_server_monitor_probe(
                 )
             )
             return {{
-                "name": runtime_item.get("label") or provider_model or "Local LLM",
+                "name": runtime_item.get("label") or provider_model or "本地大模型",
                 "service_name": "vllm-openai-api",
                 "provider_model": provider_model,
                 "active": active,
@@ -548,9 +548,9 @@ def render_server_monitor_probe(
                 else ""
             )
             local_decision_label = (
-                PRIMARY_MODEL_LABEL or "Local decision model"
+                PRIMARY_MODEL_LABEL or "本地决策模型"
                 if primary_model_is_local_decision_candidate()
-                else "Local decision fallback"
+                else "本地决策备用池"
             )
             vllm_endpoints = [
                 vllm_endpoint_runtime(8000, local_decision_label, local_decision_target),
