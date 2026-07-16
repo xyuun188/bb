@@ -1005,6 +1005,19 @@ class _CurrentPositionNoFillExecutor:
         return None
 
 
+class _CurrentPositionProtectionTimeoutCcxt(_CurrentPositionOnlyCcxt):
+    async def privateGetTradeOrdersAlgoPending(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise TimeoutError("protection snapshot unavailable")
+
+
+class _CurrentPositionProtectionTimeoutExecutor(_CurrentPositionOnlyExecutor):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _CurrentPositionProtectionTimeoutCcxt()
+
+
 class _PartialCloseCurrentPositionCcxt:
     def __init__(self) -> None:
         self.position_ts = int(
@@ -1835,6 +1848,13 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
                 )
             ).all()
             orders = {row._mapping["exchange_order_id"]: row._mapping for row in rows}
+            position_rows = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.okx_pos_id == "spk-phase3-pos"
+                    )
+                )
+            ).all()
 
         assert report["okx_pull_available"] is True
         assert report["phase3_order_sync_start"] == "2026-06-27T16:00:00+00:00"
@@ -1869,13 +1889,6 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
         rejected = next(row._mapping for row in rows if row._mapping["symbol"] == "COAI/USDT")
         assert rejected["okx_sync_status"] == OKX_SYNC_NO_FILL_REJECTED
         assert rejected["okx_state"] == "rejected_no_exchange_fill"
-        position_rows = (
-            await session.execute(
-                Position.__table__.select().where(
-                    Position.__table__.c.okx_pos_id == "spk-phase3-pos"
-                )
-            )
-        ).all()
         assert position_rows == []
     finally:
         await close_db()
@@ -3908,6 +3921,60 @@ async def test_order_fact_sync_updates_existing_open_position_cache_from_okx_cur
         assert position["is_open"] is True
         assert position["entry_exchange_order_id"] == "stale-local-order,3695537280216961024"
         assert position["close_exchange_order_id"] is None
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_preserves_complete_management_contract_on_protection_timeout(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-current-position-protection-timeout.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_CurrentPositionOnlyExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+        async with get_session_ctx() as session:
+            before = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.okx_pos_id == "3695537280250515456"
+                    )
+                )
+            ).one()._mapping
+            before_contract = dict(before["current_management_contract"])
+            assert before_contract["management_eligible"] is True
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_CurrentPositionProtectionTimeoutExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            after = (
+                await session.execute(
+                    Position.__table__.select().where(
+                        Position.__table__.c.okx_pos_id == "3695537280250515456"
+                    )
+                )
+            ).one()._mapping
+
+        assert any(
+            item.startswith("active_position_protection:")
+            for item in report["optional_stage_errors"]
+        )
+        assert after["current_management_contract"] == before_contract
+        assert after["current_management_contract"]["management_eligible"] is True
     finally:
         await close_db()
 

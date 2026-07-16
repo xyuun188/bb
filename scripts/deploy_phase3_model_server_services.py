@@ -16,8 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
-from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
+from core.remote_ssh import run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
 PHASE3_ROOT = "/data/BB"
@@ -125,25 +124,25 @@ class Phase3ServiceSpec:
 PHASE3_SERVICE_SPECS = (
     Phase3ServiceSpec(
         slot="llm_decision_maker",
-        role="decision_maker_shadow",
+        role="decision_fallback_and_finquant_carrier",
         service_name="bb-phase3-llm-decision.service",
-        served_model_name="qwen3-32b-trade",
-        model_dir="/data/BB/models/llm_decision_maker/Qwen--Qwen3-32B-AWQ",
+        served_model_name="qwen3-14b-trade",
+        model_dir="/data/trade_models/Qwen/Qwen3-14B-AWQ",
         port=8000,
-        cuda_visible_devices="0,1",
-        max_model_len=8192,
-        gpu_memory_utilization=0.76,
+        cuda_visible_devices="0",
+        max_model_len=4096,
+        gpu_memory_utilization=0.72,
         max_num_seqs=2,
-        tensor_parallel_size=2,
+        tensor_parallel_size=1,
     ),
     Phase3ServiceSpec(
         slot="llm_expert_pool",
         role="expert_pool_shadow",
         service_name="bb-phase3-llm-expert.service",
         served_model_name="BB-FinQuant-Expert-14B",
-        model_dir="/data/BB/models/llm_expert_pool/Qwen--Qwen3-14B-AWQ",
+        model_dir="/data/BB/models/finquant_lora/current.json",
         port=8003,
-        cuda_visible_devices="2",
+        cuda_visible_devices="0",
         max_model_len=4096,
         gpu_memory_utilization=0.72,
         max_num_seqs=2,
@@ -153,9 +152,9 @@ PHASE3_SERVICE_SPECS = (
         role="high_risk_review_shadow",
         service_name="bb-phase3-llm-risk-review.service",
         served_model_name="deepseek-r1-14b-risk",
-        model_dir="/data/BB/models/llm_high_risk_review/casperhansen--deepseek-r1-distill-qwen-14b-awq",
+        model_dir="/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
         port=8002,
-        cuda_visible_devices="3",
+        cuda_visible_devices="0",
         max_model_len=4096,
         gpu_memory_utilization=0.72,
         max_num_seqs=2,
@@ -253,54 +252,10 @@ def install_services(*, start: bool = False, plan_only: bool = False) -> None:
     safe_print(_render_plan())
     if plan_only:
         return
-
-    info = load_model_server_info_from_platform(ROOT)
-    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
-    try:
-        if start:
-            run_remote_text(
-                ssh,
-                _stop_phase3_model_services_command(PHASE3_SERVICE_SPECS),
-                timeout=60,
-                check=True,
-            )
-        run_remote_text(
-            ssh,
-            " && ".join(
-                [
-                    f"mkdir -p {sh(SCRIPT_DIR)} {sh(SERVICE_DIR)} {sh(LOG_DIR)} "
-                    f"{sh(f'{PHASE3_ROOT}/runtime/vllm')} {sh(f'{PHASE3_ROOT}/manifests')}",
-                    _remote_preflight_command(),
-                ]
-            ),
-            timeout=180,
-            check=True,
-        )
-        for spec in PHASE3_SERVICE_SPECS:
-            _upload_text(ssh, spec.start_script_path, spec.render_start_script(), mode=0o755)
-            _upload_text(ssh, spec.staged_service_path, spec.render_systemd_service())
-            run_remote_text(
-                ssh,
-                f"install -m 0644 {sh(spec.staged_service_path)} "
-                f"/etc/systemd/system/{sh(spec.service_name)}",
-                timeout=30,
-                check=True,
-            )
-        _upload_text(ssh, MANIFEST_PATH, render_manifest())
-        run_remote_text(ssh, "systemctl daemon-reload", timeout=30, check=True)
-        if not start:
-            safe_print("Phase 3 model services installed but not started.")
-            return
-        services = " ".join(sh(spec.service_name) for spec in PHASE3_SERVICE_SPECS)
-        run_remote_text(
-            ssh,
-            f"systemctl enable {services} && systemctl restart {services}",
-            timeout=120,
-            check=True,
-        )
-        safe_print(run_remote_text(ssh, _readiness_command(PHASE3_SERVICE_SPECS), timeout=720))
-    finally:
-        ssh.close()
+    raise RuntimeError(
+        "Direct Phase 3 vLLM installation is retired; use "
+        "migrate_phase3_model_service_identity.py for the verified shared-carrier runtime."
+    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

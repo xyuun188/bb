@@ -473,21 +473,65 @@ class ModelArtifactRegistry:
                 or list(return_evidence.get("blocking_reasons") or [])
             ):
                 raise ValueError(f"{stage} return evidence does not authorize production")
+            live_enabled_sides = return_evidence.get("live_enabled_sides")
+            if not isinstance(live_enabled_sides, list):
+                raise ValueError(f"{stage} activation requires explicit live-enabled sides")
+            live_sides = {
+                str(side).strip().lower()
+                for side in live_enabled_sides
+                if str(side).strip()
+            }
+            if (
+                not live_sides
+                or not live_sides.issubset({"long", "short"})
+                or len(live_sides) != len(live_enabled_sides)
+            ):
+                raise ValueError(f"{stage} activation contains invalid live-enabled sides")
+            if return_evidence.get("state") == "ready" and live_sides != {"long", "short"}:
+                raise ValueError(f"{stage} ready activation requires both live sides")
+            if return_evidence.get("state") == "partial_ready" and len(live_sides) != 1:
+                raise ValueError(f"{stage} partial-ready activation requires exactly one live side")
+            evidence_sides = evidence.get("live_enabled_sides")
+            if not isinstance(evidence_sides, list) or set(evidence_sides) != live_sides:
+                raise ValueError(f"{stage} activation sides must match return evidence")
             walk_forward = candidate.manifest.get("walk_forward_report")
             loso = candidate.manifest.get("leave_one_symbol_out_report")
             oos = candidate.manifest.get("oos_return_evaluation")
-            if not isinstance(walk_forward, dict) or walk_forward.get("stable") is not True:
+            if (
+                not isinstance(walk_forward, dict)
+                or walk_forward.get("status") != "complete"
+                or walk_forward.get("decision_group_disjoint") is not True
+                or walk_forward.get("chronological_label_disjoint") is not True
+                or walk_forward.get("model_refit_per_fold") is not True
+                or not isinstance(walk_forward.get("sides"), dict)
+                or not list(walk_forward.get("folds") or [])
+            ):
+                raise ValueError(f"{stage} activation requires complete walk-forward evidence")
+            walk_sides = walk_forward["sides"]
+            folds = walk_forward["folds"]
+            if any(
+                not isinstance(walk_sides.get(side), dict)
+                or walk_sides[side].get("promotion_math_ready") is not True
+                or any(
+                    not isinstance(fold, dict)
+                    or not isinstance(fold.get("sides"), dict)
+                    or not isinstance(fold["sides"].get(side), dict)
+                    or fold["sides"][side].get("promotion_math_ready") is not True
+                    for fold in folds
+                )
+                for side in live_sides
+            ):
                 raise ValueError(f"{stage} activation requires stable walk-forward evidence")
             if not isinstance(loso, dict) or any(
                 not isinstance(loso.get(side), dict)
                 or loso[side].get("stable") is not True
-                for side in ("long", "short")
+                for side in live_sides
             ):
                 raise ValueError(f"{stage} activation requires stable symbol-removal evidence")
             if not isinstance(oos, dict) or any(
                 not isinstance(oos.get(side), dict)
                 or oos[side].get("promotion_math_ready") is not True
-                for side in ("long", "short")
+                for side in live_sides
             ):
                 raise ValueError(f"{stage} activation requires complete OOS return evidence")
         return {

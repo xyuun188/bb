@@ -10,20 +10,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
+from core.phase3_model_contract import (  # noqa: E402
+    PHASE3_APPROVED_RUNTIME_MODEL_PATHS,
+    PHASE3_MODEL_SERVER_SERVICES,
+)
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
-VLLM_SERVICES = (
-    ("bb-phase3-llm-decision.service", "qwen3-32b-trade", 8000),
-    ("bb-phase3-llm-risk-review.service", "deepseek-r1-14b-risk", 8002),
-    ("bb-phase3-llm-expert.service", "BB-FinQuant-Expert-14B", 8003),
-)
+VLLM_SERVICES = PHASE3_MODEL_SERVER_SERVICES
 
 PHASE3_QUANT_API_PORT = 8101
 MODEL_DIRS = (
-    "/data/BB/models/llm_decision_maker/Qwen--Qwen3-32B-AWQ",
-    "/data/BB/models/llm_high_risk_review/casperhansen--deepseek-r1-distill-qwen-14b-awq",
-    "/data/BB/models/llm_expert_pool/Qwen--Qwen3-14B-AWQ",
+    *PHASE3_APPROVED_RUNTIME_MODEL_PATHS,
+    "/data/BB/models/finquant_lora/current.json",
 )
 DEPRECATED_SERVICES = (
     "local-ai-tools.service",

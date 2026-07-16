@@ -9,6 +9,13 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from core.phase3_model_contract import (
+    PHASE3_DECISION_MODEL_ID,
+    PHASE3_DECISION_REPO_ID,
+    PHASE3_RISK_MODEL_ID,
+    PHASE3_RISK_REPO_ID,
+)
+
 REMOTE_AI_ROOT = "/data/trade_ai"
 REMOTE_MODEL_ROOT = "/data/trade_models"
 REMOTE_RUNTIME_DIRS = (
@@ -447,25 +454,12 @@ class RemoteVllmServiceSpec:
         )
 
 
-QWEN3_32B_MAIN_SERVICE = RemoteVllmServiceSpec(
-    model_repo="Qwen/Qwen3-32B-AWQ",
-    modelscope_model="Qwen/Qwen3-32B-AWQ",
-    model_dir=f"{REMOTE_MODEL_ROOT}/Qwen/Qwen3-32B-AWQ",
-    served_model_name="qwen3-32b-trade",
-    service_name="qwen3-32b-main.service",
-    description="Qwen3 32B AWQ vLLM OpenAI API",
-    start_script_name="start_qwen3_32b_main.sh",
-    download_script_name="download_qwen3_32b_awq.sh",
-    log_name="qwen3_32b_main.log",
-)
-
-
 QWEN3_14B_TRADE_SERVICE = RemoteVllmServiceSpec(
-    model_repo="Qwen/Qwen3-14B-AWQ",
-    modelscope_model="Qwen/Qwen3-14B-AWQ",
+    model_repo=PHASE3_DECISION_REPO_ID,
+    modelscope_model=PHASE3_DECISION_REPO_ID,
     model_dir=f"{REMOTE_MODEL_ROOT}/Qwen/Qwen3-14B-AWQ",
-    served_model_name="qwen3-14b-trade",
-    service_name="qwen3-14b-trade.service",
+    served_model_name=PHASE3_DECISION_MODEL_ID,
+    service_name="bb-phase3-llm-decision.service",
     description="Qwen3 14B AWQ vLLM trade experts API",
     start_script_name="start_qwen3_14b_trade.sh",
     download_script_name="download_qwen3_14b_awq.sh",
@@ -478,11 +472,11 @@ QWEN3_14B_TRADE_SERVICE = RemoteVllmServiceSpec(
 )
 
 DEEPSEEK_R1_14B_RISK_SERVICE = RemoteVllmServiceSpec(
-    model_repo="casperhansen/deepseek-r1-distill-qwen-14b-awq",
-    modelscope_model="casperhansen/deepseek-r1-distill-qwen-14b-awq",
+    model_repo=PHASE3_RISK_REPO_ID,
+    modelscope_model=PHASE3_RISK_REPO_ID,
     model_dir=f"{REMOTE_MODEL_ROOT}/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
-    served_model_name="deepseek-r1-14b-risk",
-    service_name="deepseek-r1-14b-risk.service",
+    served_model_name=PHASE3_RISK_MODEL_ID,
+    service_name="bb-phase3-llm-risk-review.service",
     description="DeepSeek R1 Distill Qwen 14B vLLM risk experts API",
     start_script_name="start_deepseek_r1_14b_risk.sh",
     download_script_name="download_deepseek_r1_14b.sh",

@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -225,3 +226,25 @@ def test_no_positive_production_lcb_returns_neutral() -> None:
     assert evidence["preferred_side_by_evidence"] == "neutral"
     assert evidence["long"]["production_eligible"] is False
     assert evidence["short"]["production_eligible"] is False
+
+
+def test_missing_return_distribution_never_persists_non_finite_score() -> None:
+    def unavailable_score(decision: DecisionOutput, _strategy: dict | None) -> float:
+        raw = dict(decision.raw_response)
+        raw["opportunity_score"] = {
+            "score": None,
+            "expected_net_return_pct": None,
+            "return_lcb_pct": None,
+            "production_eligible": False,
+            "policy_provenance": {"sample_count": 0},
+        }
+        decision.raw_response = raw
+        return float("-inf")
+
+    evidence = _policy(unavailable_score).build(_Feature(), {}, {}, {}, {}, {})
+
+    assert evidence["preferred_side_by_evidence"] == "neutral"
+    assert evidence["long"]["score"] is None
+    assert evidence["short"]["score"] is None
+    assert evidence["long"]["production_eligible"] is False
+    json.dumps(evidence, allow_nan=False)

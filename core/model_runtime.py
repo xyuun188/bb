@@ -11,7 +11,7 @@ HIGH_RISK_REVIEW_TOKEN_CAP = 600
 COMPLETION_TOKEN_CAPS = {
     "expert": 360,
     "decision_maker": 320,
-    "batch_expert": 700,
+    "batch_expert": 900,
     "consultation": 700,
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 700,

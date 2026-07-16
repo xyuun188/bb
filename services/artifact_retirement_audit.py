@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,9 @@ LEGACY_RELATIVE_PATHS = {
     "ml_signal/winrate_model.joblib",
     "ml_signal/winrate_model_metadata.json",
 }
+
+_REGISTRY_VERSION_RE = re.compile(r"^\d{8}T\d{12}Z-[0-9a-f]{8}$")
+_REGISTRY_POINTER_NAMES = ("current.json", "rollback.json", "candidate.json")
 
 
 def _now_iso() -> str:
@@ -87,6 +91,71 @@ def _metadata_for_artifact(artifact_path: Path) -> tuple[Path | None, dict[str, 
     return None, {}, "missing_manifest"
 
 
+def _registry_pointer_versions(root: Path) -> dict[str, set[str]]:
+    """Return only versions reachable through a structurally valid registry pointer."""
+    registry_root = root / "model_artifacts"
+    if not registry_root.is_dir():
+        return {}
+    references: dict[str, set[str]] = {}
+    for model_root in registry_root.iterdir():
+        if not model_root.is_dir():
+            continue
+        for pointer_name in _REGISTRY_POINTER_NAMES:
+            pointer_path = model_root / pointer_name
+            pointer, error = _read_json(pointer_path)
+            if error or not pointer:
+                continue
+            expected_role = pointer_name.removesuffix(".json")
+            version = str(pointer.get("version") or "").strip()
+            if (
+                pointer.get("model_id") != model_root.name
+                or pointer.get("pointer_role") != expected_role
+                or not _REGISTRY_VERSION_RE.fullmatch(version)
+            ):
+                continue
+            manifest_relative = str(pointer.get("manifest_path") or "").strip()
+            if not manifest_relative:
+                continue
+            try:
+                version_root = (model_root / "versions" / version).resolve(strict=True)
+                manifest_path = (model_root / manifest_relative).resolve(strict=True)
+                manifest_path.relative_to(version_root)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            manifest, manifest_error = _read_json(manifest_path)
+            if (
+                manifest_error
+                or manifest.get("artifact_model_id") != model_root.name
+                or manifest.get("artifact_version") != version
+            ):
+                continue
+            references.setdefault(model_root.name, set()).add(version)
+    return references
+
+
+def _unreferenced_registry_artifact(
+    artifact_path: Path,
+    *,
+    root: Path,
+    registry_references: dict[str, set[str]],
+) -> bool:
+    try:
+        relative = artifact_path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return False
+    parts = relative.parts
+    if (
+        len(parts) != 5
+        or parts[0] != "model_artifacts"
+        or parts[2] != "versions"
+        or parts[4] != "model.joblib"
+        or not _REGISTRY_VERSION_RE.fullmatch(parts[3])
+    ):
+        return False
+    referenced_versions = registry_references.get(parts[1])
+    return bool(referenced_versions) and parts[3] not in referenced_versions
+
+
 def _phase3_evidence(metadata: dict[str, Any]) -> dict[str, Any]:
     evaluation_policy = _safe_dict(metadata.get("evaluation_policy"))
     governance_report = _safe_dict(metadata.get("governance_report"))
@@ -114,6 +183,7 @@ def _artifact_classification(
     relative_path: str,
     metadata: dict[str, Any],
     metadata_error: str | None,
+    unreferenced_registry_artifact: bool = False,
 ) -> tuple[str, list[str], dict[str, Any]]:
     evidence = _phase3_evidence(metadata)
     reasons: list[str] = []
@@ -153,6 +223,9 @@ def _artifact_classification(
     if reasons:
         if "known_legacy_artifact_path" in reasons:
             return "retired_legacy", reasons, evidence
+        if unreferenced_registry_artifact:
+            reasons.append("unreferenced_registry_version")
+            return "retired_unreferenced", reasons, evidence
         if "missing_phase3_metadata" in reasons or "missing_or_unreadable_phase3_manifest" in reasons:
             return "missing_manifest", reasons, evidence
         return "untrusted", reasons, evidence
@@ -196,6 +269,7 @@ class ArtifactRetirementAuditService:
     async def report(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         root = self._root()
+        registry_references = _registry_pointer_versions(root)
         artifacts: list[dict[str, Any]] = []
         status_counts: dict[str, int] = {}
 
@@ -207,6 +281,11 @@ class ArtifactRetirementAuditService:
                 relative_path=relative,
                 metadata=metadata,
                 metadata_error=metadata_error,
+                unreferenced_registry_artifact=_unreferenced_registry_artifact(
+                    path,
+                    root=root,
+                    registry_references=registry_references,
+                ),
             )
             status_counts[classification] = status_counts.get(classification, 0) + 1
             artifacts.append(
@@ -235,13 +314,16 @@ class ArtifactRetirementAuditService:
             item
             for item in artifacts
             if item["classification"]
-            in {"retired_legacy", "missing_manifest", "untrusted"}
+            in {"retired_legacy", "retired_unreferenced", "missing_manifest", "untrusted"}
         ]
         phase3_compatible = [
             item for item in artifacts if item["classification"] == "phase3_compatible"
         ]
         retired_legacy = [
             item for item in artifacts if item["classification"] == "retired_legacy"
+        ]
+        retired_unreferenced = [
+            item for item in artifacts if item["classification"] == "retired_unreferenced"
         ]
         unresolved = [
             item
@@ -252,7 +334,7 @@ class ArtifactRetirementAuditService:
             "retired_required"
             if unresolved
             else "ready_with_retired_legacy"
-            if retired_legacy
+            if retired_legacy or retired_unreferenced
             else "ready"
         )
         return {
@@ -268,6 +350,7 @@ class ArtifactRetirementAuditService:
             "artifact_count": len(artifacts),
             "phase3_compatible_count": len(phase3_compatible),
             "retired_legacy_count": len(retired_legacy),
+            "retired_unreferenced_count": len(retired_unreferenced),
             "unresolved_artifact_count": len(unresolved),
             "retired_or_untrusted_count": len(retired_or_untrusted),
             "status_counts": status_counts,
@@ -279,7 +362,7 @@ class ArtifactRetirementAuditService:
                 "rebuild_phase3_artifacts_from_clean_training_view"
                 if unresolved
                 else "preserve_retired_legacy_read_only"
-                if retired_legacy
+                if retired_legacy or retired_unreferenced
                 else "keep_phase3_artifact_manifest_attached"
             ),
         }

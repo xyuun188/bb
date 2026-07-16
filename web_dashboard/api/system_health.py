@@ -11,6 +11,10 @@ from fastapi import APIRouter
 from sqlalchemy import func, select
 
 from config.settings import DECISION_MAKER_NAME, FIXED_AI_MODEL_SLOTS, settings
+from core.phase3_model_contract import (
+    PHASE3_DECISION_MODEL_ID,
+    PHASE3_PLATFORM_ENDPOINTS,
+)
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from data_feed.external_event_scraper import SCRAPLING_SOURCE_PREFIX
@@ -29,14 +33,9 @@ from web_dashboard.api.text_sanitize import sanitize_payload
 
 router = APIRouter()
 
-EXPECTED_PLATFORM_ENDPOINTS = {
-    "qwen3-32b-trade": "http://127.0.0.1:18000/v1",
-    "phase3_quant_api": "http://127.0.0.1:18001",
-    "deepseek-r1-14b-risk": "http://127.0.0.1:18002/v1",
-    "BB-FinQuant-Expert-14B": "http://127.0.0.1:18003/v1",
-}
+EXPECTED_PLATFORM_ENDPOINTS = PHASE3_PLATFORM_ENDPOINTS
 MODEL_ACCESS_ENDPOINTS = {
-    "qwen3-32b-trade": "platform loopback 18000 only",
+    PHASE3_DECISION_MODEL_ID: "platform loopback 18000 only",
     "phase3_quant_api": "platform loopback 18001 only",
     "deepseek-r1-14b-risk": "platform loopback 18002 only",
     "BB-FinQuant-Expert-14B": "platform loopback 18003 only",
@@ -620,7 +619,7 @@ def _configured_endpoint_items(
                 item
                 for item in runtime_models
                 if isinstance(item, dict)
-                and str(item.get("model") or "").strip() == "qwen3-32b-trade"
+                and str(item.get("model") or "").strip() == PHASE3_DECISION_MODEL_ID
             ),
             None,
         )
@@ -665,7 +664,7 @@ def _configured_endpoint_items(
             )
         )
     for model, expected in EXPECTED_PLATFORM_ENDPOINTS.items():
-        if model == "qwen3-32b-trade":
+        if model == PHASE3_DECISION_MODEL_ID:
             continue
         actual = configured_by_model.get(model, "")
         if not actual:

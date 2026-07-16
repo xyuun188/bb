@@ -389,15 +389,20 @@ def _llm_rows(
         )
         if isinstance(row, dict)
     }
+    runtime_reports = {
+        str(row.get("slot") or ""): row
+        for row in _safe_list(model_server_report.get("manifest_services"))
+        if isinstance(row, dict) and str(row.get("slot") or "")
+    }
     finquant_slot = _safe_dict(slot_reports.get("llm_expert_pool"))
     decision_slot = _safe_dict(slot_reports.get("llm_decision_maker"))
     risk_slot = _safe_dict(slot_reports.get("llm_high_risk_review"))
 
     def current_slot_runtime(slot: dict[str, Any]) -> bool:
+        runtime = _safe_dict(runtime_reports.get(str(slot.get("slot") or ""))) or slot
         return bool(
-            slot.get("ok")
-            and slot.get("service_active")
-            and slot.get("endpoint_ready")
+            runtime.get("service_active")
+            and runtime.get("endpoint_ready")
         )
 
     specialization = _safe_dict(finquant_slot.get("specialization_evidence"))

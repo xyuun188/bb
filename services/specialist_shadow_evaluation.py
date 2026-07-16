@@ -729,7 +729,10 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         ],
         "worst_samples": list(metric.get("worst_samples") or [])[:MAX_WORST_SAMPLE_COUNT],
         "shadow_event_count": len(metric.get("shadow_events") or []),
-        "shadow_events": list(metric.get("shadow_events") or []),
+        "shadow_events": list(metric.get("shadow_events") or [])[:MAX_WORST_SAMPLE_COUNT],
+        "shadow_events_truncated": (
+            len(metric.get("shadow_events") or []) > MAX_WORST_SAMPLE_COUNT
+        ),
         "authoritative_attempt_count": int(metric.get("authoritative_attempt_count") or 0),
         "authoritative_actual_inference_count": int(
             metric.get("authoritative_actual_inference_count") or 0
@@ -1119,6 +1122,7 @@ class SpecialistShadowEvaluationService:
         authoritative_trade_samples: Sequence[Any] | None = None,
     ) -> dict[str, Any]:
         from sqlalchemy import select
+        from sqlalchemy.orm import load_only
 
         from db.session import get_read_session_ctx
         from models.learning import ShadowBacktest
@@ -1130,7 +1134,28 @@ class SpecialistShadowEvaluationService:
         async with session_factory() as session:
             result = await session.execute(
                 select(ShadowBacktest)
-                .where(ShadowBacktest.created_at >= since_naive)
+                .where(
+                    ShadowBacktest.created_at >= since_naive,
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.long_return_pct.is_not(None),
+                    ShadowBacktest.short_return_pct.is_not(None),
+                )
+                .options(
+                    load_only(
+                        ShadowBacktest.id,
+                        ShadowBacktest.decision_id,
+                        ShadowBacktest.status,
+                        ShadowBacktest.symbol,
+                        ShadowBacktest.feature_snapshot,
+                        ShadowBacktest.long_return_pct,
+                        ShadowBacktest.short_return_pct,
+                        ShadowBacktest.best_action,
+                        ShadowBacktest.horizon_minutes,
+                        ShadowBacktest.due_at,
+                        ShadowBacktest.created_at,
+                        ShadowBacktest.updated_at,
+                    )
+                )
                 .order_by(ShadowBacktest.id.desc())
             )
             rows = list(result.scalars().all())
@@ -1143,6 +1168,10 @@ class SpecialistShadowEvaluationService:
             "read_only": True,
             "ordered_by_primary_key": True,
             "db_time_filter": True,
+            "completed_cost_label_filter": True,
+            "necessary_columns_only": True,
+            "event_statistics_use_full_window": True,
+            "event_evidence_rows_bounded": True,
             "row_limit": None,
         }
         return report

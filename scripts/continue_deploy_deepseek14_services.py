@@ -6,7 +6,7 @@ import sys
 
 DEPRECATED_MESSAGE = (
     "The DeepSeek 14B continuation deploy path is deprecated and must not be used. "
-    "Use scripts/deploy_qwen3_32b_main_service.py for the main LLM and "
+    "Use scripts/migrate_phase3_model_service_identity.py for the model services and "
     "scripts/deploy_local_ai_tools_service.py for local quant tools."
 )
 

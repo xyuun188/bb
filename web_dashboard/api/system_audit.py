@@ -125,6 +125,16 @@ PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS = 45
 PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS = 24
 PHASE3_PAPER_RESUME_OBSERVATION_TIMEOUT_SECONDS = 70
 PHASE3_PAPER_RESUME_PREFLIGHT_TIMEOUT_SECONDS = 70
+SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
+    "phase3_server_migration": PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS + 5,
+    "phase3_model_server_readiness": PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS + 5,
+    "phase3_paper_resume_preflight": PHASE3_PAPER_RESUME_PREFLIGHT_TIMEOUT_SECONDS + 5,
+    "phase3_paper_resume_observation": PHASE3_PAPER_RESUME_OBSERVATION_TIMEOUT_SECONDS + 5,
+    "strategy_closed_loop": 60.0,
+    "strategy_signal_root_cause": 60.0,
+    "model_training": 180.0,
+    "position_capacity_release": 60.0,
+}
 PRIORITY_AUDIT_KEYS = ("okx_reconciliation", "trade_execution_contract")
 DB_AUDIT_KEYS = (
     "trade_loop",
@@ -994,12 +1004,29 @@ def _specialist_shadow_latest_report() -> dict[str, Any]:
     }
 
 
-async def _audit_maybe_async(factory: Any) -> dict[str, Any]:
+def _system_audit_section_timeout_seconds(key: str) -> float:
+    value = SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES.get(
+        str(key or ""),
+        SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS,
+    )
+    return max(float(value or SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS), 0.001)
+
+
+async def _audit_maybe_async(
+    factory: Any,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     result = factory()
     if inspect.isawaitable(result):
+        effective_timeout = (
+            SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         result = await asyncio.wait_for(
             result,
-            timeout=max(float(SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS or 20.0), 0.001),
+            timeout=max(float(effective_timeout or 20.0), 0.001),
         )
     return result
 
@@ -1016,7 +1043,10 @@ async def _run_audit_specs(
         results: dict[str, dict[str, Any] | Exception] = {}
         for key, factory in specs:
             try:
-                results[key] = await _audit_maybe_async(factory)
+                results[key] = await _audit_maybe_async(
+                    factory,
+                    timeout_seconds=_system_audit_section_timeout_seconds(key),
+                )
             except Exception as exc:
                 results[key] = exc
         return results
@@ -1026,7 +1056,10 @@ async def _run_audit_specs(
     async def run_one(key: str, factory: Any) -> tuple[str, dict[str, Any] | Exception]:
         async with semaphore:
             try:
-                return key, await _audit_maybe_async(factory)
+                return key, await _audit_maybe_async(
+                    factory,
+                    timeout_seconds=_system_audit_section_timeout_seconds(key),
+                )
             except Exception as exc:
                 return key, exc
 
@@ -3252,6 +3285,15 @@ def _model_training_health_summary(
     }
 
 
+def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        return
+
+
 async def _model_training_audit() -> dict[str, Any]:
     runtime_task = asyncio.create_task(
         asyncio.wait_for(
@@ -3259,6 +3301,7 @@ async def _model_training_audit() -> dict[str, Any]:
             timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS,
         )
     )
+    runtime_task.add_done_callback(_consume_background_task_exception)
     try:
         data_status = await data_collection_api.get_data_collection_status(
             include_feature_coverage=False

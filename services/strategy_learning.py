@@ -71,10 +71,33 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if isfinite(value) else None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except Exception:
+            return None
     try:
-        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        return json.loads(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                default=str,
+                allow_nan=False,
+            )
+        )
     except (TypeError, ValueError):
-        return {}
+        return None
 
 
 def _timestamp_text(value: Any) -> str:

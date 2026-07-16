@@ -190,6 +190,105 @@ def test_rest_ws_quotes_use_native_tick_and_one_minute_path_not_fixed_band() -> 
     assert all(contract["assertions"].values())
 
 
+def test_current_candle_lag_is_warning_when_native_executable_quotes_overlap() -> None:
+    timestamp = 1_783_990_859_000
+    rest = build_market_fact(
+        "ROBO/USDT",
+        _snapshot(0.01305, timestamp),
+        contract_spec=_spec(),
+    )
+    websocket = build_market_fact(
+        "ROBO/USDT",
+        {
+            **_snapshot(0.01305, timestamp),
+            "source": "websocket",
+            "source_endpoint": "okx_ws_public",
+        },
+        contract_spec=_spec(),
+    )
+    auxiliary = _source_consistency_auxiliary(timestamp, 0.01305)
+    auxiliary["orderbook_fact"].update({"bid": 0.01304, "ask": 0.01306})
+
+    contract = build_market_source_consistency(
+        rest,
+        [websocket],
+        **auxiliary,
+        bars=[[timestamp - 59_000, 0.01290, 0.01300, 0.01280, 0.01295, 10_000]],
+    )
+
+    assert contract["status"] == "clean"
+    assert contract["reasons"] == []
+    assert contract["path"]["observed_prices_within_path"] is False
+    assert contract["path"]["continuity_accepted_via"] == "native_executable_quote_overlap"
+    assert "observed_price_outside_recent_native_path" in contract["reference_warnings"]
+    assert contract["assertions"]["one_minute_path_verified"] is False
+    assert contract["assertions"]["market_continuity_verified"] is True
+    assert market_fact_contract_reasons(
+        build_shadow_market_fact_contract(
+            rest,
+            {**rest, "source_consistency": contract},
+            verify_market_fact_path(
+                rest,
+                rest,
+                [[timestamp, 0.01290, 0.01310, 0.01280, 0.01305, 10_000]],
+            ),
+        )
+    ) == []
+
+
+def test_missing_index_reference_is_visible_without_corrupting_swap_path() -> None:
+    timestamp = 1_783_990_800_000
+    rest = build_market_fact(
+        "ROBO/USDT",
+        _snapshot(0.01290, timestamp),
+        contract_spec=_spec(),
+    )
+    auxiliary = _source_consistency_auxiliary(timestamp, 0.01290)
+    auxiliary["index_price_fact"] = {
+        "inst_id": "ROBO-USDT",
+        "inst_type": "INDEX",
+        "source_timestamp_ms": 0,
+        "price": 0.0,
+    }
+
+    contract = build_market_source_consistency(
+        rest,
+        [],
+        **auxiliary,
+        bars=[[timestamp, 0.01285, 0.01295, 0.01280, 0.01290, 10_000]],
+    )
+
+    assert contract["status"] == "clean"
+    assert contract["path"]["observed_prices_within_path"] is True
+    assert contract["reference_observations"]["index_price_available"] is False
+    assert contract["reference_warnings"] == [
+        "index_price_missing",
+        "index_price_source_timestamp_missing",
+    ]
+
+
+def test_index_basis_is_not_compared_with_executable_swap_candle_path() -> None:
+    timestamp = 1_783_990_800_000
+    rest = build_market_fact(
+        "ROBO/USDT",
+        _snapshot(0.01290, timestamp),
+        contract_spec=_spec(),
+    )
+    auxiliary = _source_consistency_auxiliary(timestamp, 0.01290)
+    auxiliary["index_price_fact"]["price"] = 0.01320
+
+    contract = build_market_source_consistency(
+        rest,
+        [],
+        **auxiliary,
+        bars=[[timestamp, 0.01285, 0.01295, 0.01280, 0.01290, 10_000]],
+    )
+
+    assert contract["status"] == "clean"
+    assert contract["path"]["observed_prices_within_path"] is True
+    assert contract["reference_observations"]["index_price_available"] is True
+
+
 def test_robo_cross_source_jump_is_quarantined_by_native_path_reachability() -> None:
     timestamp = 1_783_990_800_000
     rest = build_market_fact(

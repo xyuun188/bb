@@ -89,6 +89,22 @@ def _recommendation(return_report: dict[str, object]) -> dict[str, object]:
     )
 
 
+def test_promotion_fails_closed_when_contamination_classification_is_unknown() -> None:
+    report = build_phase3_promotion_recommendation(
+        training_mode="walk_forward",
+        model_stage="live",
+        quality_report={"totals": {"total": 4, "effective_weight_ratio": 1.0}},
+        governance_report={"trainable_sample_count": 4, "contamination_risk": "unknown"},
+        evaluation_policy={"live_mutation": True, "requires_paper_observation": True},
+        paper_observation_report=_healthy_paper_observation(),
+        return_objective_report=_return_report((0.8, 0.7, 0.6, -0.1)),
+    )
+
+    assert report["recommended_stage"] == "degraded"
+    assert report["canary_ready"] is False
+    assert "contamination_risk_unverified" in report["canary_blocking_reasons"]
+
+
 def test_return_objective_promotes_positive_fee_after_distribution() -> None:
     report = _return_report((0.8, 0.7, 0.6, -0.1))
 

@@ -12,10 +12,7 @@ MODEL_SERVER_SCRIPTS = [
     "scripts/check_server_model_status.py",
     "scripts/inspect_server_ai_services.py",
     "scripts/inspect_deepseek_deploy_status.py",
-    "scripts/fix_local_ai_tools_service_path.py",
     "scripts/deploy_local_ai_tools_service.py",
-    "scripts/deploy_qwen3_32b_main_service.py",
-    "scripts/start_qwen3_32b_main_service.py",
     "scripts/deploy_dual_14b_llm_services.py",
     "scripts/install_sentiment_transformer_models.py",
     "scripts/start_dual_14b_llm_tunnel.py",
@@ -60,6 +57,8 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert "model-tunnels-degraded" in source
     assert "--require-model-tunnels" in source
     assert "systemctl enable {dashboard_service} {model_tunnel_service}" in source
+    assert "REMOTE_MODEL_READINESS_SERVICE_NAME" in source
+    assert "systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}" in source
 
 
 def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
@@ -75,7 +74,7 @@ def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
     assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" in source
-    assert "qwen3-32b-trade" in source
+    assert "qwen3-14b-trade" in source
     assert "deepseek-r1-14b-risk" in source
 
 
@@ -357,6 +356,7 @@ def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:
 
 def test_model_server_status_scripts_use_dual_14b_contract() -> None:
     check_source = (ROOT / "scripts" / "check_server_model_status.py").read_text(encoding="utf-8")
+    contract_source = (ROOT / "core" / "phase3_model_contract.py").read_text(encoding="utf-8")
     inspect_source = (ROOT / "scripts" / "inspect_server_ai_services.py").read_text(
         encoding="utf-8"
     )
@@ -367,13 +367,14 @@ def test_model_server_status_scripts_use_dual_14b_contract() -> None:
         assert "qwen3-32b-main.service" in source
         assert "deprecated service" in source.lower()
 
-    assert '("bb-phase3-llm-decision.service", "qwen3-32b-trade", 8000)' in check_source
-    assert '("bb-phase3-llm-risk-review.service", "deepseek-r1-14b-risk", 8002)' in check_source
-    assert '("bb-phase3-llm-expert.service", "BB-FinQuant-Expert-14B", 8003)' in check_source
-    assert "/data/BB/models/" in check_source
+    assert "VLLM_SERVICES = PHASE3_MODEL_SERVER_SERVICES" in check_source
+    assert '("bb-phase3-llm-decision.service", PHASE3_DECISION_MODEL_ID, 8000)' in contract_source
+    assert '("bb-phase3-llm-risk-review.service", PHASE3_RISK_MODEL_ID, 8002)' in contract_source
+    assert '("bb-phase3-llm-expert.service", PHASE3_EXPERT_MODEL_ID, 8003)' in contract_source
+    assert "/data/trade_models/" in contract_source
     assert "PHASE3_QUANT_API_PORT = 8101" in check_source
     assert "http://127.0.0.1:{PHASE3_QUANT_API_PORT}/health" in check_source
     assert "http://127.0.0.1:{port}/v1/models" in check_source
-    assert "Qwen--Qwen3-32B-AWQ" in check_source
+    assert "Qwen3-14B-AWQ" in contract_source
     assert "qwen3_32b_main.log" not in check_source
     assert "start_qwen3_32b_main.sh" not in inspect_source

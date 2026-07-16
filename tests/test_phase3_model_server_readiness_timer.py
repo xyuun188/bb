@@ -3,6 +3,13 @@ from __future__ import annotations
 from scripts import install_phase3_model_server_readiness_timer as timer_script
 
 
+def test_phase3_model_server_readiness_default_refreshes_twice_hourly() -> None:
+    timer = timer_script.render_timer()
+
+    assert timer_script.DEFAULT_ON_CALENDAR == "*-*-* *:00/30:00"
+    assert "OnCalendar=*-*-* *:00/30:00" in timer
+
+
 def test_phase3_model_server_readiness_timer_service_runs_as_bb_with_runtime_env() -> None:
     service = timer_script.render_service()
     timer = timer_script.render_timer(on_calendar="*-*-* 00:55:00")

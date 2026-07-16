@@ -23,7 +23,7 @@ TIMER_NAME = "bb-phase3-model-server-readiness.timer"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REPORT_DIR_REL = "data/phase3_model_server_readiness_reports"
 REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
-DEFAULT_ON_CALENDAR = "*-*-* 00:55:00"
+DEFAULT_ON_CALENDAR = "*-*-* *:00/30:00"
 
 
 def _remote_quote(value: str) -> str:

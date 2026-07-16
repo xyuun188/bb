@@ -942,27 +942,32 @@ def test_training_governance_report_preserves_raw_records_and_targets_refresh() 
     assert report["raw_records_preserved"] is True
     assert report["excluded_sample_count"] == 1
     assert report["downweighted_sample_count"] == 3
-    assert report["contamination_risk"] == "high"
+    assert report["contamination_risk"] == "unknown"
+    assert report["contamination_classification_complete"] is False
     assert "vector_memory_reindex" in report["refresh_targets"]
 
 
-def test_training_governance_treats_any_contamination_as_high_risk() -> None:
+def test_training_governance_treats_quarantined_contamination_as_low_residual_risk() -> None:
     report = governance_report(
         {
             "data_quality_version": DATA_QUALITY_VERSION,
             "totals": {
                 "total": 9951,
-                "included": 9914,
-                "downweighted": 24,
+                "included": 9938,
+                "downweighted": 0,
+                "benign_downweighted": 0,
+                "contamination_downweighted": 0,
                 "excluded": 13,
-                "effective_weight_ratio": 0.9974,
+                "effective_weight_ratio": 0.9987,
             },
             "top_reasons": [{"reason": "sequence:abnormal_future_return", "count": 13}],
         }
     )
 
     assert report["status"] == "quarantined"
-    assert report["contamination_risk"] == "high"
+    assert report["contamination_risk"] == "low"
+    assert report["contamination_risk_basis"] == "all_identified_contamination_quarantined"
+    assert report["contamination_classification_complete"] is True
     assert report["excluded_ratio"] == 0.001306
     assert report["blocked_reason_count"] == 13
     assert report["requires_artifact_refresh"] is True
@@ -972,10 +977,12 @@ def test_training_governance_treats_any_contamination_as_high_risk() -> None:
             "data_quality_version": DATA_QUALITY_VERSION,
             "totals": {
                 "total": 9951,
-                "included": 9914,
-                "downweighted": 24,
+                "included": 9938,
+                "downweighted": 0,
+                "benign_downweighted": 0,
+                "contamination_downweighted": 0,
                 "excluded": 13,
-                "effective_weight_ratio": 0.9974,
+                "effective_weight_ratio": 0.9987,
             },
             "top_reasons": [{"reason": "sequence:abnormal_future_return", "count": 13}],
         },
@@ -983,6 +990,28 @@ def test_training_governance_treats_any_contamination_as_high_risk() -> None:
     )
     assert refreshed["artifact_matches_quality"] is True
     assert refreshed["requires_artifact_refresh"] is False
+
+
+def test_training_governance_blocks_contamination_that_remains_trainable() -> None:
+    report = governance_report(
+        {
+            "data_quality_version": DATA_QUALITY_VERSION,
+            "totals": {
+                "total": 4,
+                "included": 2,
+                "downweighted": 1,
+                "benign_downweighted": 0,
+                "contamination_downweighted": 1,
+                "excluded": 1,
+                "effective_weight_ratio": 0.625,
+            },
+            "top_reasons": [{"reason": "shadow:invalid_market_fact", "count": 2}],
+        }
+    )
+
+    assert report["contamination_risk"] == "high"
+    assert report["contamination_risk_basis"] == "trainable_contamination_present"
+    assert report["contamination_classification_complete"] is True
 
 
 def test_artifact_bound_governance_report_marks_new_artifact_current() -> None:
@@ -1006,6 +1035,7 @@ def test_artifact_bound_governance_report_marks_new_artifact_current() -> None:
     assert report["artifact_quality_fingerprint"] == report["quality_fingerprint"]
     assert report["artifact_matches_quality"] is True
     assert report["requires_artifact_refresh"] is False
+    assert report["contamination_risk"] == "high"
 
 
 def test_trade_return_uses_valid_derived_notional_over_tiny_placeholder() -> None:

@@ -14,7 +14,7 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symb
 
 MARKET_FACT_SCHEMA_VERSION = "2026-07-14.okx-native-market-fact.v1"
 MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
-MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-14.okx-source-consistency.v1"
+MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-16.okx-source-consistency.v2"
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -326,7 +326,7 @@ def market_source_consistency_reasons(
         "executable_quotes_verified",
         "tick_alignment_verified",
         "reference_prices_verified",
-        "one_minute_path_verified",
+        "market_continuity_verified",
     )
     return [
         f"source_consistency_assertion_failed:{name}"
@@ -406,15 +406,19 @@ def build_market_source_consistency(
         if not _timestamp_ms(mark.get("source_timestamp_ms")):
             reasons.append("mark_price_source_timestamp_missing")
 
+    reference_warnings: list[str] = []
+    index_price = _safe_float(index.get("price"), 0.0) or 0.0
+    index_timestamp = _timestamp_ms(index.get("source_timestamp_ms"))
     if not index:
-        reasons.append("index_price_fact_missing")
+        reference_warnings.append("index_price_fact_missing")
     else:
-        if _text(index.get("inst_id")).upper() != uly:
+        index_inst_id = _text(index.get("inst_id")).upper()
+        if index_inst_id and index_inst_id != uly:
             reasons.append("index_price_native_identity_mismatch")
-        if (_safe_float(index.get("price"), 0.0) or 0.0) <= 0:
-            reasons.append("index_price_missing")
-        if not _timestamp_ms(index.get("source_timestamp_ms")):
-            reasons.append("index_price_source_timestamp_missing")
+        if index_price <= 0:
+            reference_warnings.append("index_price_missing")
+        if not index_timestamp:
+            reference_warnings.append("index_price_source_timestamp_missing")
 
     intervals: list[dict[str, Any]] = []
     for fact in facts:
@@ -454,6 +458,11 @@ def build_market_source_consistency(
     if not tick_alignment_verified:
         reasons.append("executable_quote_not_tick_aligned")
 
+    quotes_overlap = bool(valid_intervals) and (
+        max(float(item["bid"]) for item in valid_intervals)
+        <= min(float(item["ask"]) for item in valid_intervals) + (_safe_float(tick_size, 0.0) or 0.0)
+    )
+
     normalized_bars = [bar for row in bars if (bar := _bar_payload(row)) is not None]
     normalized_bars.sort(key=lambda item: item["open_time_ms"])
     path_low = min((item["low"] for item in normalized_bars), default=None)
@@ -477,12 +486,13 @@ def build_market_source_consistency(
             for minute in range(first_open, last_open + minute_ms, minute_ms)
             if minute not in available_minutes
         ]
+    path_reasons: list[str] = []
     if not timestamps or not normalized_bars:
-        reasons.append("recent_one_minute_price_path_missing")
+        path_reasons.append("recent_one_minute_price_path_missing")
     elif missing_minutes:
-        reasons.append("recent_one_minute_price_path_incomplete")
+        path_reasons.append("recent_one_minute_price_path_incomplete")
 
-    observed_prices = [
+    executable_prices = [
         price
         for fact in facts
         for price in (
@@ -490,31 +500,28 @@ def build_market_source_consistency(
             _safe_float(_dict(fact.get("prices")).get("bid"), None),
             _safe_float(_dict(fact.get("prices")).get("ask"), None),
         )
-        if price is not None
+        if price is not None and price > 0
     ]
-    observed_prices.extend(
+    executable_prices.extend(
         price
         for price in (
             _safe_float(orderbook.get("bid"), None),
             _safe_float(orderbook.get("ask"), None),
-            _safe_float(mark.get("price"), None),
-            _safe_float(index.get("price"), None),
         )
-        if price is not None
+        if price is not None and price > 0
     )
     tick = _safe_float(tick_size, 0.0) or 0.0
-    prices_within_path = bool(observed_prices and path_low is not None and path_high is not None)
+    prices_within_path = bool(
+        executable_prices and path_low is not None and path_high is not None
+    )
     if prices_within_path:
         prices_within_path = all(
-            path_low - tick <= price <= path_high + tick for price in observed_prices
+            path_low - tick <= price <= path_high + tick
+            for price in executable_prices
         )
     if not prices_within_path:
-        reasons.append("observed_price_outside_recent_native_path")
+        path_reasons.append("observed_price_outside_recent_native_path")
 
-    quotes_overlap = bool(valid_intervals) and (
-        max(float(item["bid"]) for item in valid_intervals)
-        <= min(float(item["ask"]) for item in valid_intervals) + tick
-    )
     executable_quotes_verified = bool(
         valid_intervals
         and len(valid_intervals) == len(intervals)
@@ -523,7 +530,15 @@ def build_market_source_consistency(
     if not executable_quotes_verified:
         reasons.append("executable_quote_sources_not_reconciled")
 
+    native_quote_continuity = bool(quotes_overlap and tick_alignment_verified)
+    market_continuity_verified = bool(native_quote_continuity or prices_within_path)
+    if native_quote_continuity:
+        reference_warnings.extend(path_reasons)
+    else:
+        reasons.extend(path_reasons)
+
     reasons = list(dict.fromkeys(reasons))
+    reference_warnings = list(dict.fromkeys(reference_warnings))
     assertions = {
         "native_identity_verified": not any("identity_mismatch" in item for item in reasons),
         "executable_quotes_verified": executable_quotes_verified,
@@ -534,11 +549,24 @@ def build_market_source_consistency(
         "one_minute_path_verified": bool(
             normalized_bars and not missing_minutes and prices_within_path
         ),
+        "market_continuity_verified": market_continuity_verified,
     }
+    required_assertions = (
+        "native_identity_verified",
+        "executable_quotes_verified",
+        "tick_alignment_verified",
+        "reference_prices_verified",
+        "market_continuity_verified",
+    )
     contract = {
         "version": MARKET_SOURCE_CONSISTENCY_VERSION,
-        "status": "clean" if not reasons and all(assertions.values()) else "quarantined",
+        "status": (
+            "clean"
+            if not reasons and all(assertions.get(name) is True for name in required_assertions)
+            else "quarantined"
+        ),
         "reasons": reasons,
+        "reference_warnings": reference_warnings,
         "assertions": assertions,
         "native_identity": {
             "inst_id": inst_id,
@@ -564,8 +592,22 @@ def build_market_source_consistency(
             "path_high": path_high,
             "missing_open_times_ms": missing_minutes,
             "observed_prices_within_path": prices_within_path,
+            "continuity_accepted_via": (
+                "native_executable_quote_overlap"
+                if native_quote_continuity and not prices_within_path
+                else "native_one_minute_path"
+                if prices_within_path
+                else ""
+            ),
         },
         "reference_prices": {"mark": mark, "index": index},
+        "reference_observations": {
+            "mark_price_available": bool(
+                (_safe_float(mark.get("price"), 0.0) or 0.0) > 0
+                and _timestamp_ms(mark.get("source_timestamp_ms"))
+            ),
+            "index_price_available": bool(index_price > 0 and index_timestamp),
+        },
         "orderbook_fact": orderbook,
         "provenance": {
             "source": "okx_native_rest_ws_book_mark_index_1m",

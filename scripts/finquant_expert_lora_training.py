@@ -60,9 +60,11 @@ REMOTE_INFERENCE_BASE_MODEL = "/data/trade_models/Qwen/Qwen3-14B-AWQ"
 REMOTE_TRAIN_BASE_REPO = "Qwen/Qwen3-14B"
 REMOTE_TRAIN_BASE_MODEL = f"{REMOTE_ROOT}/models/trainable/Qwen3-14B"
 REMOTE_QWEN_START_SCRIPT = "/data/trade_ai/scripts/start_qwen3_14b_trade.sh"
+REMOTE_QWEN_SERVICE = "bb-phase3-llm-decision.service"
+REMOTE_RISK_SERVICE = "bb-phase3-llm-risk-review.service"
 REMOTE_GATEWAY_DIR = f"{REMOTE_ROOT}/services/finquant_expert_gateway"
 REMOTE_GATEWAY_SCRIPT = f"{REMOTE_GATEWAY_DIR}/gateway.py"
-REMOTE_GATEWAY_SERVICE = "bb-finquant-expert-gateway.service"
+REMOTE_GATEWAY_SERVICE = "bb-phase3-llm-expert.service"
 REMOTE_GATEWAY_SERVICE_PATH = f"/etc/systemd/system/{REMOTE_GATEWAY_SERVICE}"
 REMOTE_LEGACY_ALIAS_SERVICE = "bb-finquant-expert-alias.service"
 REMOTE_TRAIN_LOG_DIR = f"{REMOTE_TRAINING_DIR}/logs"
@@ -1860,7 +1862,7 @@ if __name__ == "__main__":
 """
     gateway_service = f"""[Unit]
 Description=BB FinQuant verified adapter gateway
-After=network-online.target qwen3-14b-trade.service
+After=network-online.target {REMOTE_QWEN_SERVICE}
 Wants=network-online.target
 
 [Service]
@@ -1894,7 +1896,7 @@ UNIT
         sudo -n install -m 0644 {sh(gateway_service_upload)} {sh(REMOTE_GATEWAY_SERVICE_PATH)}
         sudo -n systemctl disable --now {sh(REMOTE_LEGACY_ALIAS_SERVICE)} || true
         sudo -n systemctl daemon-reload
-        sudo -n systemctl restart qwen3-14b-trade.service
+        sudo -n systemctl restart {sh(REMOTE_QWEN_SERVICE)}
         sudo -n systemctl enable --now {sh(REMOTE_GATEWAY_SERVICE)}
         sudo -n systemctl restart {sh(REMOTE_GATEWAY_SERVICE)}
         """).strip()
@@ -2102,12 +2104,12 @@ def deploy_and_optionally_train(
             )
             pre = (
                 f"sudo -n systemctl stop {REMOTE_GATEWAY_SERVICE} "
-                f"{REMOTE_LEGACY_ALIAS_SERVICE} qwen3-14b-trade.service "
-                "deepseek-r1-14b-risk.service || true; "
+                f"{REMOTE_LEGACY_ALIAS_SERVICE} {REMOTE_QWEN_SERVICE} "
+                f"{REMOTE_RISK_SERVICE} || true; "
             )
             post = (
-                "sudo -n systemctl start qwen3-14b-trade.service "
-                f"{REMOTE_GATEWAY_SERVICE} deepseek-r1-14b-risk.service || true; "
+                f"sudo -n systemctl start {REMOTE_QWEN_SERVICE} "
+                f"{REMOTE_GATEWAY_SERVICE} {REMOTE_RISK_SERVICE} || true; "
             )
             train_cmd = (
                 "set -euo pipefail; "
@@ -2137,8 +2139,8 @@ def deploy_and_optionally_train(
                 tail = run_remote_text(
                     ssh,
                     f"tail -n 160 {sh(train_log)} 2>/dev/null || true; "
-                    "sudo -n systemctl start qwen3-14b-trade.service "
-                    f"{REMOTE_GATEWAY_SERVICE} deepseek-r1-14b-risk.service || true",
+                    f"sudo -n systemctl start {REMOTE_QWEN_SERVICE} "
+                    f"{REMOTE_GATEWAY_SERVICE} {REMOTE_RISK_SERVICE} || true",
                     timeout=120,
                     check=False,
                 )

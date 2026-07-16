@@ -69,6 +69,10 @@ INDICATOR_SNAPSHOT_BUILD_CONCURRENCY = max(
     min(4, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY)),
 )
 KLINE_PERSIST_CONCURRENCY = 2
+TICKER_PERSIST_CONCURRENCY = max(
+    1,
+    min(4, max(int(settings.database_pool_size or 1) // 8, 1)),
+)
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
 TIMEFRAME_SECONDS = {
     "1m": 60,
@@ -125,6 +129,7 @@ class DataService:
         self._kline_background_refresh_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_refresh_scheduled_at: dict[tuple[str, str], datetime] = {}
         self._kline_persist_semaphore = asyncio.Semaphore(KLINE_PERSIST_CONCURRENCY)
+        self._ticker_persist_semaphore = asyncio.Semaphore(TICKER_PERSIST_CONCURRENCY)
         self._kline_coverage_refresh_task: asyncio.Task | None = None
         self._kline_coverage_symbols: list[str] = []
         self._kline_coverage_index = 0
@@ -212,9 +217,13 @@ class DataService:
                     separators=(",", ":"),
                 ),
             }
-            async with get_session_ctx() as session:
-                repo = MarketRepository(session)
-                await repo.upsert_ticker(normalized, payload)
+            # WebSocket updates arrive for the full market at once. Keep payload
+            # preparation outside the gate and bound only the short DB section so
+            # cache persistence cannot consume the reconciliation/trading pool.
+            async with self._ticker_persist_gate():
+                async with get_session_ctx() as session:
+                    repo = MarketRepository(session)
+                    await repo.upsert_ticker(normalized, payload)
             self._ticker_persisted_at[normalized] = datetime.now(UTC)
         except Exception as exc:
             logger.debug(
@@ -227,6 +236,14 @@ class DataService:
             normalized = self._normalize_symbols([symbol])[0] if symbol else ""
             if normalized and normalized != symbol:
                 getattr(self, "_ticker_persist_inflight", set()).discard(normalized)
+
+    def _ticker_persist_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_ticker_persist_semaphore", None)
+        if isinstance(gate, asyncio.Semaphore):
+            return gate
+        gate = asyncio.Semaphore(TICKER_PERSIST_CONCURRENCY)
+        self._ticker_persist_semaphore = gate
+        return gate
 
     async def start(self) -> None:
         """Start all data feed connections."""
@@ -615,6 +632,7 @@ class DataService:
         block_on_remote_derivatives: bool = True,
         allow_cached_indicator_build: bool = True,
         allow_indicator_background_refresh: bool = True,
+        allow_derivatives_background_refresh: bool = True,
     ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
         sentiment_task = asyncio.create_task(
@@ -672,6 +690,7 @@ class DataService:
                 self._get_feature_derivatives_snapshot(
                     symbol,
                     block_on_remote=block_on_remote_derivatives,
+                    allow_background_refresh=allow_derivatives_background_refresh,
                 ),
             )
         )
@@ -1137,8 +1156,8 @@ class DataService:
         if bid > 0 and ask > 0:
             if bid > ask:
                 return "crossed_bid_ask"
-            if last_price > 0 and not bid <= last_price <= ask:
-                return "last_price_outside_bid_ask"
+            # Last trade and top-of-book updates are not atomic. Ordinary quote
+            # movement can leave the last trade outside the current spread.
         if last_price <= 0 or high_24h <= 0 or low_24h <= 0 or high_24h < low_24h:
             return None
         if low_24h <= last_price <= high_24h:
@@ -1260,12 +1279,20 @@ class DataService:
         symbol: str,
         *,
         block_on_remote: bool = True,
+        allow_background_refresh: bool = True,
     ) -> dict[str, Any]:
         getter = self._get_derivatives_snapshot
         try:
-            return await getter(symbol, block_on_remote=block_on_remote)
+            return await getter(
+                symbol,
+                block_on_remote=block_on_remote,
+                allow_background_refresh=allow_background_refresh,
+            )
         except TypeError as exc:
-            if "block_on_remote" not in safe_error_text(exc):
+            error_text = safe_error_text(exc)
+            if "allow_background_refresh" in error_text:
+                return await getter(symbol, block_on_remote=block_on_remote)
+            if "block_on_remote" not in error_text:
                 raise
             return await getter(symbol)
 
@@ -1872,6 +1899,7 @@ class DataService:
         symbol: str,
         *,
         block_on_remote: bool = True,
+        allow_background_refresh: bool = True,
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
         normalized = self._normalize_symbols([symbol])[0]
@@ -1891,14 +1919,16 @@ class DataService:
                 isinstance(updated_at, datetime)
                 and (now - updated_at).total_seconds() <= DERIVATIVES_STALE_MAX_AGE_SECONDS
             ):
-                self._schedule_derivatives_background_refresh(normalized)
+                if allow_background_refresh:
+                    self._schedule_derivatives_background_refresh(normalized)
                 data = dict(cached.get("data") or {})
                 if data:
                     data["derivatives_snapshot_stale"] = True
                     data["derivatives_refresh_in_background"] = True
                 return data
             if not block_on_remote:
-                self._schedule_derivatives_background_refresh(normalized)
+                if allow_background_refresh:
+                    self._schedule_derivatives_background_refresh(normalized)
                 data = dict(cached.get("data") or {})
                 if data:
                     data["derivatives_snapshot_stale"] = True
@@ -1913,8 +1943,10 @@ class DataService:
                 return dict(result or {})
             return {"derivatives_refresh_in_background": True}
         if not block_on_remote:
-            self._schedule_derivatives_background_refresh(normalized)
-            return {"derivatives_refresh_in_background": True}
+            if allow_background_refresh:
+                self._schedule_derivatives_background_refresh(normalized)
+                return {"derivatives_refresh_in_background": True}
+            return {}
         task = asyncio.create_task(self._refresh_derivatives_snapshot(normalized))
         tasks[normalized] = task
         try:

@@ -1,28 +1,23 @@
 from __future__ import annotations
 
-from scripts import download_phase3_decision_model as download
+import pytest
+
+from scripts import deploy_qwen3_32b_main_service as deploy_32b
+from scripts import download_phase3_decision_model as download_32b
+from scripts import start_qwen3_32b_main_service as start_32b
 
 
-def test_phase3_decision_downloader_targets_data_bb_32b_model() -> None:
-    script = download.render_remote_downloader()
+@pytest.mark.parametrize(
+    ("entrypoint", "message"),
+    (
+        (lambda: download_32b.main([]), download_32b.RETIRED_MESSAGE),
+        (deploy_32b.main, deploy_32b.RETIRED_MESSAGE),
+        (start_32b.main, start_32b.RETIRED_MESSAGE),
+    ),
+)
+def test_obsolete_qwen3_32b_entrypoints_refuse_execution(entrypoint, message: str) -> None:
+    with pytest.raises(RuntimeError, match="Qwen3-32B") as exc_info:
+        entrypoint()
 
-    assert download.MODEL_REPO == "Qwen/Qwen3-32B-AWQ"
-    assert download.TARGET_DIR == "/data/BB/models/llm_decision_maker/Qwen--Qwen3-32B-AWQ"
-    assert "/data/trade_models" not in script
-    assert "llm_decision_maker" in script
-    assert '"repo_id": MODEL_REPO' in script
-    assert '"live_routing_enabled": False' in script
-    assert "/data/BB/reports/inventory/phase3_model_download_manifest_latest.json" in script
-    assert "/data/BB/reports/inventory/phase3_model_validation_latest.json" in script
-    assert '"decision_maker": MODEL_REPO' in script
-    assert '"llm_live_routing_enabled"] = False' in script
-    assert "snapshot_download(" in script
-
-
-def test_phase3_decision_downloader_start_command_records_pid() -> None:
-    command = download._start_command()
-
-    assert "nohup" in command
-    assert "echo $!" in command
-    assert download.PID_PATH in command
-    assert download.LOG_PATH in command
+    assert str(exc_info.value) == message
+    assert "migrate_phase3_model_service_identity.py" in message

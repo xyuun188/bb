@@ -35,6 +35,7 @@ from models.learning import StrategyLearningEvent
 from models.trade import Order, Position
 from services.current_position_management import (
     build_current_position_management_contract,
+    current_position_management_contract_complete,
 )
 from services.okx_native_facts import (
     OkxNativeAccountBill,
@@ -301,6 +302,7 @@ class OkxOrderFactSyncService:
         order_rows: list[dict[str, Any]] = []
         protection_algo_rows: list[dict[str, Any]] = []
         active_protection_orders: list[dict[str, Any]] = []
+        active_protection_snapshot_complete = False
         protection_execution_error: str | None = None
         exchange_positions: list[dict[str, Any]] = []
         account_balance_snapshot: dict[str, Any] = {}
@@ -352,6 +354,7 @@ class OkxOrderFactSyncService:
                         ),
                         max(3.0, min(self.timeout_seconds, CORE_OKX_STAGE_TIMEOUT_SECONDS)),
                     )
+                    active_protection_snapshot_complete = True
                 except Exception as exc:
                     record_optional_stage_error("active_position_protection", exc)
             balance_snapshot_loader = getattr(executor, "get_balance_snapshot", None)
@@ -722,6 +725,7 @@ class OkxOrderFactSyncService:
                     session,
                     exchange_positions=exchange_positions,
                     active_protection_orders=active_protection_orders,
+                    active_protection_snapshot_complete=active_protection_snapshot_complete,
                     account_balance_snapshot=account_balance_snapshot,
                     contract_sizes=contract_sizes,
                     now=datetime.now(UTC),
@@ -1743,6 +1747,7 @@ class OkxOrderFactSyncService:
         *,
         exchange_positions: list[dict[str, Any]],
         active_protection_orders: list[dict[str, Any]],
+        active_protection_snapshot_complete: bool,
         account_balance_snapshot: dict[str, Any],
         contract_sizes: dict[str, float],
         now: datetime,
@@ -1877,16 +1882,29 @@ class OkxOrderFactSyncService:
                 "account_equity_usdt": portfolio_snapshot.get("account_equity_usdt"),
                 "open_position_count": portfolio_snapshot.get("open_position_count"),
             }
-            payload["current_management_contract"] = (
-                build_current_position_management_contract(
-                    management_facts,
-                    previous_contract=(
-                        getattr(existing, "current_management_contract", None)
-                        if existing is not None
-                        else None
-                    ),
-                    now=now,
+            previous_management_contract = _safe_mapping(
+                getattr(existing, "current_management_contract", None)
+                if existing is not None
+                else None
+            )
+            refreshed_management_contract = build_current_position_management_contract(
+                management_facts,
+                previous_contract=previous_management_contract,
+                now=now,
+            )
+            preserve_previous_management_contract = bool(
+                not active_protection_snapshot_complete
+                and existing is not None
+                and _current_management_contract_matches_payload(
+                    existing,
+                    payload,
+                    previous_management_contract,
                 )
+            )
+            payload["current_management_contract"] = (
+                previous_management_contract
+                if preserve_previous_management_contract
+                else refreshed_management_contract
             )
             if existing is None:
                 session.add(Position(**payload))
@@ -1929,6 +1947,9 @@ class OkxOrderFactSyncService:
                     "management_eligible": _safe_mapping(
                         getattr(existing, "current_management_contract", None)
                     ).get("management_eligible"),
+                    "management_contract_preserved_from_last_complete_protection_snapshot": (
+                        preserve_previous_management_contract
+                    ),
                     "retired_duplicate_position_ids": duplicate_ids,
                 }
             )
@@ -4511,6 +4532,29 @@ def _apply_current_position_payload(position: Position, payload: dict[str, Any],
         payload.get("current_management_contract")
     ) or None
     position.updated_at = now
+
+
+def _current_management_contract_matches_payload(
+    position: Position,
+    payload: dict[str, Any],
+    contract: dict[str, Any],
+) -> bool:
+    if not contract:
+        return False
+    position_view = {
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "quantity": payload.get("quantity"),
+        "entry_price": payload.get("entry_price"),
+        "entry_fee": (
+            payload.get("entry_fee")
+            if "entry_fee" in payload
+            else getattr(position, "entry_fee", None)
+        ),
+        "stop_loss_price": getattr(position, "stop_loss_price", None),
+        "take_profit_price": getattr(position, "take_profit_price", None),
+    }
+    return current_position_management_contract_complete(position_view, contract)
 
 
 def _matching_current_position_entry_orders(

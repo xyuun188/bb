@@ -200,7 +200,8 @@ def test_8003_gateway_requires_a_real_adapter_and_does_not_rename_base_model() -
     assert 'payload["model"] = UPSTREAM_MODEL' not in rendered
     assert '"parent": FALLBACK_MODEL' not in rendered
     assert "finquant_adapter_not_loaded" in rendered
-    assert "bb-finquant-expert-gateway.service" in rendered
+    assert "bb-phase3-llm-expert.service" in rendered
+    assert "bb-phase3-llm-decision.service" in rendered
     assert "systemctl disable --now 'bb-finquant-expert-alias.service'" in rendered
 
 

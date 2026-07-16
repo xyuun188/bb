@@ -2134,6 +2134,8 @@ def governance_report(
     total = int(totals.get("total") or 0)
     included = int(totals.get("included") or 0)
     downweighted = int(totals.get("downweighted") or 0)
+    benign_downweighted = int(totals.get("benign_downweighted") or 0)
+    contamination_downweighted = int(totals.get("contamination_downweighted") or 0)
     excluded = int(totals.get("excluded") or 0)
     trainable = included + downweighted
     effective_weight_ratio = float(totals.get("effective_weight_ratio") or 0.0)
@@ -2157,10 +2159,16 @@ def governance_report(
     )
     blocked_reason_ratio = blocked_reason_count / max(total, 1)
     contamination_risk = _contamination_risk(
-        has_contamination=has_contamination,
-        excluded_ratio=excluded_ratio,
-        blocked_reason_ratio=blocked_reason_ratio,
-        effective_weight_ratio=effective_weight_ratio,
+        total=total,
+        included=included,
+        downweighted=downweighted,
+        benign_downweighted=benign_downweighted,
+        contamination_downweighted=contamination_downweighted,
+        excluded=excluded,
+    )
+    contamination_classification_complete = (
+        total == included + downweighted + excluded
+        and downweighted == benign_downweighted + contamination_downweighted
     )
     status = "clean"
     if excluded:
@@ -2199,10 +2207,22 @@ def governance_report(
         "trainable_sample_count": trainable,
         "excluded_sample_count": excluded,
         "downweighted_sample_count": downweighted,
+        "benign_downweighted_sample_count": benign_downweighted,
+        "contamination_downweighted_sample_count": contamination_downweighted,
+        "contamination_classification_complete": contamination_classification_complete,
         "effective_weight_ratio": round(effective_weight_ratio, 4),
         "excluded_ratio": round(excluded_ratio, 6),
         "blocked_reason_ratio": round(blocked_reason_ratio, 6),
         "contamination_risk": contamination_risk,
+        "contamination_risk_basis": (
+            "trainable_contamination_present"
+            if contamination_risk == "high"
+            else (
+                "quality_classification_incomplete"
+                if contamination_risk == "unknown"
+                else "all_identified_contamination_quarantined"
+            )
+        ),
         "blocked_reason_count": blocked_reason_count,
         "requires_artifact_refresh": bool(has_contamination and not artifact_matches_quality),
         "quality_fingerprint": quality_fingerprint,
@@ -2239,15 +2259,30 @@ def artifact_bound_governance_report(
 
 def _contamination_risk(
     *,
-    has_contamination: bool,
-    excluded_ratio: float,
-    blocked_reason_ratio: float,
-    effective_weight_ratio: float,
+    total: int,
+    included: int,
+    downweighted: int,
+    benign_downweighted: int,
+    contamination_downweighted: int,
+    excluded: int,
 ) -> str:
-    if not has_contamination:
-        return "low"
-    del excluded_ratio, blocked_reason_ratio, effective_weight_ratio
-    return "high"
+    counts = (
+        total,
+        included,
+        downweighted,
+        benign_downweighted,
+        contamination_downweighted,
+        excluded,
+    )
+    if any(value < 0 for value in counts):
+        return "unknown"
+    if total != included + downweighted + excluded:
+        return "unknown"
+    if downweighted != benign_downweighted + contamination_downweighted:
+        return "unknown"
+    if contamination_downweighted:
+        return "high"
+    return "low"
 
 
 def annotate_training_payload(

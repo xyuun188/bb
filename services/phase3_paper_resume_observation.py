@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -491,40 +492,49 @@ class Phase3PaperResumeObservationService:
     sample_limit: int = DEFAULT_SAMPLE_LIMIT
 
     async def report(self) -> dict[str, Any]:
-        sample_summary = await self._collect(
-            "sample_summary",
-            self.sample_summary_provider,
-            self._default_sample_summary,
-        )
-        platform_server = await self._collect(
-            "platform_server",
-            self.platform_server_provider,
-            collect_platform_server_status,
-        )
-        platform_runtime = await self._collect(
-            "platform_runtime",
-            self.platform_runtime_provider,
-            collect_platform_runtime_status,
-        )
-        trading_runtime = await self._collect(
-            "trading_runtime_status",
-            self.trading_runtime_provider,
-            _load_trading_runtime_status,
+        (
+            sample_summary,
+            platform_server,
+            platform_runtime,
+            trading_runtime,
+            specialist,
+            preflight,
+        ) = await asyncio.gather(
+            self._collect(
+                "sample_summary",
+                self.sample_summary_provider,
+                self._default_sample_summary,
+            ),
+            self._collect(
+                "platform_server",
+                self.platform_server_provider,
+                collect_platform_server_status,
+            ),
+            self._collect(
+                "platform_runtime",
+                self.platform_runtime_provider,
+                collect_platform_runtime_status,
+            ),
+            self._collect(
+                "trading_runtime_status",
+                self.trading_runtime_provider,
+                _load_trading_runtime_status,
+            ),
+            self._collect(
+                "specialist_shadow_evaluation",
+                self.specialist_shadow_provider,
+                self._default_specialist_shadow,
+            ),
+            self._collect(
+                "latest_preflight",
+                self.latest_preflight_provider,
+                self._default_latest_preflight,
+            ),
         )
         okx_sync = await self._collect(
             "okx_authoritative_sync",
             self.okx_sync_provider,
             self._default_okx_sync,
-        )
-        specialist = await self._collect(
-            "specialist_shadow_evaluation",
-            self.specialist_shadow_provider,
-            self._default_specialist_shadow,
-        )
-        preflight = await self._collect(
-            "latest_preflight",
-            self.latest_preflight_provider,
-            self._default_latest_preflight,
         )
         return evaluate_phase3_paper_resume_observation_inputs(
             sample_summary=sample_summary,

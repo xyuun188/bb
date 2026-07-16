@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -19,9 +20,18 @@ def _safe_dict(value: Any) -> dict[str, Any]:
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
+    return result if isfinite(result) else default
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if isfinite(result) else None
 
 
 def _feature_snapshot(feature_vector: Any) -> dict[str, Any]:
@@ -189,6 +199,7 @@ class EntryCandidateEvidencePolicy:
             feature_snapshot=_feature_snapshot(feature_vector),
         )
         score = self.score_candidate(decision, strategy)
+        finite_score = _optional_float(score)
         opportunity = _safe_dict(_safe_dict(decision.raw_response).get("opportunity_score"))
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         return_lcb = _safe_float(opportunity.get("return_lcb_pct"), 0.0)
@@ -205,7 +216,7 @@ class EntryCandidateEvidencePolicy:
         )
         return {
             "side": side,
-            "score": round(score, 8),
+            "score": round(finite_score, 8) if finite_score is not None else None,
             "score_policy": opportunity.get("score_policy"),
             "expected_net_return_pct": round(expected_net, 8),
             "return_lcb_pct": round(return_lcb, 8),

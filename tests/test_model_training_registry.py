@@ -99,15 +99,55 @@ def test_registry_marks_verified_finquant_specialization_as_trained() -> None:
                     },
                 }
             ],
+            "manifest_services": [
+                {
+                    "slot": "llm_expert_pool",
+                    "service_active": True,
+                    "endpoint_ready": True,
+                }
+            ],
         }
     )
 
     finquant = _by_id(payload)["bb_finquant_expert_14b"]
 
     assert finquant["artifact_available"] is True
+    assert finquant["runtime_available"] is True
     assert finquant["identity_verified"] is True
     assert finquant["alias_only"] is False
     assert finquant["lifecycle"] == "trained"
+
+
+def test_registry_joins_llm_artifact_and_runtime_rows_by_slot() -> None:
+    payload = build_model_training_registry(
+        model_server_report={
+            "required_slots": [
+                {"slot": "llm_decision_maker", "served_model_name": "qwen3-14b-trade"},
+                {
+                    "slot": "llm_high_risk_review",
+                    "served_model_name": "deepseek-r1-14b-risk",
+                },
+            ],
+            "manifest_services": [
+                {
+                    "slot": "llm_decision_maker",
+                    "service_active": True,
+                    "endpoint_ready": True,
+                },
+                {
+                    "slot": "llm_high_risk_review",
+                    "service_active": True,
+                    "endpoint_ready": True,
+                },
+            ],
+        }
+    )
+
+    rows = _by_id(payload)
+    assert rows["qwen3_14b_trade"]["runtime_available"] is True
+    assert rows["qwen3_14b_trade"]["lifecycle"] == "inference_only"
+    assert rows["deepseek_r1_14b_risk"]["runtime_available"] is True
+    assert rows["deepseek_r1_14b_risk"]["lifecycle"] == "inference_only"
 
 
 def test_registry_separates_pretrained_specialists_from_project_training() -> None:

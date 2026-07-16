@@ -23,7 +23,7 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
                 "name": "decision_maker",
                 "api_base": "http://127.0.0.1:8003/v1",
                 "api_key": "unit-key",
-                "model": "qwen3-32b-trade",
+                "model": "qwen3-14b-trade",
                 "enabled": True,
             },
             {
@@ -49,8 +49,8 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
     items = system_health._configured_endpoint_items()
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["endpoint_qwen3-32b-trade"]["status"] == "critical"
-    assert by_key["endpoint_qwen3-32b-trade"]["details"]["expected_platform_endpoint"] == (
+    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "critical"
+    assert by_key["endpoint_qwen3-14b-trade"]["details"]["expected_platform_endpoint"] == (
         "http://127.0.0.1:18000/v1"
     )
     assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
@@ -69,7 +69,7 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
             "ai_models": [
                 {
                     "name": "decision_maker",
-                    "model": "qwen3-32b-trade",
+                    "model": "qwen3-14b-trade",
                     "api_base": "http://127.0.0.1:18000/v1",
                 },
                 {
@@ -88,7 +88,7 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
     items = system_health._configured_endpoint_items(monitor_status)
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["endpoint_qwen3-32b-trade"]["status"] == "ok"
+    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "ok"
     assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
     assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
     assert by_key["endpoint_BB-FinQuant-Expert-14B"]["status"] == "ok"
@@ -124,7 +124,7 @@ def test_self_check_accepts_external_deepseek_final_decision_route(
     items = system_health._configured_endpoint_items()
     by_key = {item["key"]: item for item in items}
 
-    assert "endpoint_qwen3-32b-trade" not in by_key
+    assert "endpoint_qwen3-14b-trade" not in by_key
     assert by_key["endpoint_deepseek-v4-pro"]["status"] == "ok"
     assert by_key["endpoint_deepseek-v4-pro"]["details"]["slot_name"] == (
         "decision_maker"
@@ -175,7 +175,7 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
                 "name": "trend_expert",
                 "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "unit-key",
-                "model": "qwen3-32b-trade",
+                "model": "qwen3-14b-trade",
                 "enabled": True,
             }
         ],
@@ -197,7 +197,7 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
                         "model_available": False,
                     },
                     {
-                        "model": "qwen3-32b-trade",
+                        "model": "qwen3-14b-trade",
                         "api_base": "http://127.0.0.1:18000/v1",
                         "available": False,
                         "endpoint_ok": False,
@@ -212,8 +212,8 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
     by_key = {item["key"]: item for item in items}
     assert by_key["runtime_model_deepseek-v4-pro"]["status"] == "info"
     assert by_key["runtime_model_deepseek-v4-pro"]["details"]["required"] is False
-    assert by_key["runtime_model_qwen3-32b-trade"]["status"] == "critical"
-    assert by_key["runtime_model_qwen3-32b-trade"]["details"]["required"] is True
+    assert by_key["runtime_model_qwen3-14b-trade"]["status"] == "critical"
+    assert by_key["runtime_model_qwen3-14b-trade"]["details"]["required"] is True
 
 
 def test_expert_model_diversity_flags_shared_expert_provider() -> None:

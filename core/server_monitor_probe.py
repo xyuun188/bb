@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import textwrap
 
+from core.phase3_model_contract import PHASE3_DECISION_MODEL_ID
+
 SERVER_MONITOR_REMOTE_COMMAND_TIMEOUT_SECONDS = 45
 
 
@@ -50,7 +52,7 @@ def render_server_monitor_probe(
         PRIMARY_MODEL_ID = {json.dumps(primary_model_id, ensure_ascii=False)}
         PRIMARY_MODEL_LABEL = {json.dumps(primary_model_label, ensure_ascii=False)}
         LOCAL_AI_TOOLS_API_KEY = {json.dumps(local_ai_tools_api_key, ensure_ascii=False)}
-        LOCAL_DECISION_MODEL_ID = "qwen3-32b-trade"
+        LOCAL_DECISION_MODEL_ID = {json.dumps(PHASE3_DECISION_MODEL_ID)}
         DEEPSEEK_R1_MODEL_ID = "deepseek-r1-14b-risk"
         QWEN3_EXPERT_POOL_MODEL_ID = "BB-FinQuant-Expert-14B"
         ERROR_TEXT_LIMIT = 240

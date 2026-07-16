@@ -290,8 +290,12 @@ def build_phase3_promotion_recommendation(
     blockers: list[str] = []
     if total <= 0 or trainable <= 0:
         blockers.append("no_trainable_samples")
-    if contamination == "high":
-        blockers.append("high_contamination_risk")
+    if contamination != "low":
+        blockers.append(
+            "high_contamination_risk"
+            if contamination == "high"
+            else "contamination_risk_unverified"
+        )
     if effective_weight is not None and effective_weight <= 0:
         blockers.append("effective_training_weight_zero")
     if return_report.get("promotion_ready") is not True:
@@ -320,7 +324,7 @@ def build_phase3_promotion_recommendation(
         live_blockers.append("live_mutation_not_enabled")
     live_blockers = list(dict.fromkeys(live_blockers))
     recommended_stage = "live" if not live_blockers else "canary" if not canary_blockers else "shadow"
-    if contamination == "high" or str(model_stage or "").lower() in {"degraded", "retired"}:
+    if contamination != "low" or str(model_stage or "").lower() in {"degraded", "retired"}:
         recommended_stage = "degraded"
 
     return {

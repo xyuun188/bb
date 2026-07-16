@@ -3331,6 +3331,7 @@ class TradingService:
         block_on_remote_derivatives: bool = True,
         allow_cached_indicator_build: bool = True,
         allow_indicator_background_refresh: bool = True,
+        allow_derivatives_background_refresh: bool = True,
     ) -> Any:
         """Read a feature vector while preserving compatibility with older test doubles."""
 
@@ -3354,6 +3355,9 @@ class TradingService:
             accepts_indicator_background_refresh_option = (
                 "allow_indicator_background_refresh" in parameters or accepts_var_kwargs
             )
+            accepts_derivatives_background_refresh_option = (
+                "allow_derivatives_background_refresh" in parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             accepts_options = True
             accepts_ticker_option = True
@@ -3361,6 +3365,7 @@ class TradingService:
             accepts_derivatives_option = True
             accepts_cached_indicator_build_option = True
             accepts_indicator_background_refresh_option = True
+            accepts_derivatives_background_refresh_option = True
 
         kwargs: dict[str, Any] = {}
         if accepts_options:
@@ -3375,6 +3380,10 @@ class TradingService:
             kwargs["allow_cached_indicator_build"] = allow_cached_indicator_build
         if accepts_indicator_background_refresh_option:
             kwargs["allow_indicator_background_refresh"] = allow_indicator_background_refresh
+        if accepts_derivatives_background_refresh_option:
+            kwargs["allow_derivatives_background_refresh"] = (
+                allow_derivatives_background_refresh
+            )
         if kwargs:
             return await getter(symbol, **kwargs)
         return await getter(symbol)
@@ -3673,7 +3682,7 @@ class TradingService:
                     symbol,
                     wait_for_sentiment=False,
                     block_on_remote_indicators=False,
-                    block_on_remote_derivatives=False,
+                    block_on_remote_derivatives=True,
                 ),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
@@ -5144,6 +5153,11 @@ class TradingService:
                                     and mode_manager.is_auto_scan
                                 ),
                                 allow_indicator_background_refresh=not (
+                                    run_market_analysis
+                                    and not run_position_analysis
+                                    and mode_manager.is_auto_scan
+                                ),
+                                allow_derivatives_background_refresh=not (
                                     run_market_analysis
                                     and not run_position_analysis
                                     and mode_manager.is_auto_scan

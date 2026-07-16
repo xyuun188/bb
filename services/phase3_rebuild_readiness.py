@@ -97,6 +97,8 @@ class Phase3RebuildReadinessService:
             blockers.append("clean_training_view_unavailable")
         elif contamination_risk == "high":
             blockers.append("high_contamination_risk")
+        elif contamination_risk != "low":
+            blockers.append("contamination_risk_unverified")
         elif governance_status in {"quarantined", "downweighted"} or excluded_total:
             warnings.append("clean_training_view_has_quarantined_or_downweighted_samples")
         else:

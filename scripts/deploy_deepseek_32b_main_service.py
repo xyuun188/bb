@@ -6,7 +6,7 @@ import sys
 
 DEPRECATED_MESSAGE = (
     "DeepSeek-R1-Distill-Qwen-32B-AWQ is no longer an allowed main LLM service for "
-    "this project. Use scripts/deploy_qwen3_32b_main_service.py to deploy "
+    "this project. Use scripts/migrate_phase3_model_service_identity.py to manage "
     "Qwen3-32B-AWQ with non-thinking runtime controls."
 )
 

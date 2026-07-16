@@ -7,7 +7,6 @@ import pytest
 from core.remote_ai_service_spec import (
     DEEPSEEK_R1_14B_RISK_SERVICE,
     QWEN3_14B_TRADE_SERVICE,
-    QWEN3_32B_MAIN_SERVICE,
     QWEN3_MAIN_REMOTE_MODEL_CLEANUP_PATHS,
     RemoteVllmServiceSpec,
     data_disk_guard_command,
@@ -31,16 +30,6 @@ def _spec_with(**overrides) -> RemoteVllmServiceSpec:
     return RemoteVllmServiceSpec(**values)
 
 
-def test_qwen3_32b_main_service_uses_data_disk_paths() -> None:
-    spec = QWEN3_32B_MAIN_SERVICE
-
-    assert spec.model_repo == "Qwen/Qwen3-32B-AWQ"
-    assert spec.model_dir == "/data/trade_models/Qwen/Qwen3-32B-AWQ"
-    assert spec.start_script_path == "/data/trade_ai/scripts/start_qwen3_32b_main.sh"
-    assert spec.staged_service_path == "/data/trade_ai/systemd/qwen3-32b-main.service"
-    assert spec.log_path == "/data/trade_ai/logs/qwen3_32b_main.log"
-
-
 def test_dual_14b_services_use_data_disk_and_separate_ports() -> None:
     qwen = QWEN3_14B_TRADE_SERVICE
     r1 = DEEPSEEK_R1_14B_RISK_SERVICE
@@ -48,7 +37,7 @@ def test_dual_14b_services_use_data_disk_and_separate_ports() -> None:
     assert qwen.model_repo == "Qwen/Qwen3-14B-AWQ"
     assert qwen.model_dir == "/data/trade_models/Qwen/Qwen3-14B-AWQ"
     assert qwen.served_model_name == "qwen3-14b-trade"
-    assert qwen.service_name == "qwen3-14b-trade.service"
+    assert qwen.service_name == "bb-phase3-llm-decision.service"
     assert qwen.port == 8000
     assert qwen.max_model_len == 8192
     assert qwen.gpu_memory_utilization == 0.34
@@ -58,7 +47,7 @@ def test_dual_14b_services_use_data_disk_and_separate_ports() -> None:
     assert r1.model_repo == "casperhansen/deepseek-r1-distill-qwen-14b-awq"
     assert r1.model_dir == "/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq"
     assert r1.served_model_name == "deepseek-r1-14b-risk"
-    assert r1.service_name == "deepseek-r1-14b-risk.service"
+    assert r1.service_name == "bb-phase3-llm-risk-review.service"
     assert r1.port == 8002
     assert r1.max_model_len == 4096
     assert r1.gpu_memory_utilization == 0.62
@@ -91,15 +80,15 @@ def test_remote_service_spec_rejects_path_traversal_and_unsafe_names() -> None:
 
 
 def test_qwen3_start_script_keeps_vllm_parameters_short_and_awq() -> None:
-    script = QWEN3_32B_MAIN_SERVICE.render_start_script()
+    script = QWEN3_14B_TRADE_SERVICE.render_start_script()
 
     assert script.startswith("#!/usr/bin/env bash\n")
-    assert "--model /data/trade_models/Qwen/Qwen3-32B-AWQ" in script
-    assert "--served-model-name qwen3-32b-trade" in script
-    assert "--max-model-len 4096" in script
-    assert "--gpu-memory-utilization 0.88" in script
+    assert "--model /data/trade_models/Qwen/Qwen3-14B-AWQ" in script
+    assert "--served-model-name qwen3-14b-trade" in script
+    assert "--max-model-len 8192" in script
+    assert "--gpu-memory-utilization 0.34" in script
     assert "--quantization awq_marlin" in script
-    assert "--max-num-seqs 8" in script
+    assert "--max-num-seqs 2" in script
     assert "--max-num-batched-tokens 8192" in script
     assert "--enable-prefix-caching" in script
     assert "--enable-chunked-prefill" in script
@@ -109,17 +98,17 @@ def test_qwen3_start_script_keeps_vllm_parameters_short_and_awq() -> None:
 
 
 def test_qwen3_systemd_service_points_to_staged_data_disk_script() -> None:
-    unit = QWEN3_32B_MAIN_SERVICE.render_systemd_service()
+    unit = QWEN3_14B_TRADE_SERVICE.render_systemd_service()
 
-    assert "Description=Qwen3 32B AWQ vLLM OpenAI API" in unit
+    assert "Description=Qwen3 14B AWQ vLLM trade experts API" in unit
     assert "WorkingDirectory=/data/trade_ai" in unit
-    assert "ExecStart=/data/trade_ai/scripts/start_qwen3_32b_main.sh" in unit
+    assert "ExecStart=/data/trade_ai/scripts/start_qwen3_14b_trade.sh" in unit
     assert "Restart=always" in unit
 
 
 def test_qwen3_remote_commands_guard_data_disk_before_start_or_cleanup() -> None:
     guard = data_disk_guard_command()
-    install = QWEN3_32B_MAIN_SERVICE.install_and_restart_command()
+    install = QWEN3_14B_TRADE_SERVICE.install_and_restart_command()
     cleanup = qwen3_main_cleanup_command()
     temp_path_prefix = "/" + "tmp"
 
@@ -140,11 +129,11 @@ def test_qwen3_remote_commands_guard_data_disk_before_start_or_cleanup() -> None
 
 
 def test_qwen3_download_command_uses_quoted_spec_path() -> None:
-    command = QWEN3_32B_MAIN_SERVICE.download_and_run_command()
+    command = QWEN3_14B_TRADE_SERVICE.download_and_run_command()
 
     assert command == (
-        "chmod +x /data/trade_ai/scripts/download_qwen3_32b_awq.sh && "
-        "/data/trade_ai/scripts/download_qwen3_32b_awq.sh"
+        "chmod +x /data/trade_ai/scripts/download_qwen3_14b_awq.sh && "
+        "/data/trade_ai/scripts/download_qwen3_14b_awq.sh"
     )
     assert ";" not in command
     assert ".." not in command
@@ -164,14 +153,14 @@ def test_model_download_scripts_keep_heredoc_markers_unindented() -> None:
 
 
 def test_qwen3_install_command_waits_for_served_model_readiness() -> None:
-    readiness = QWEN3_32B_MAIN_SERVICE.readiness_command(attempts=2, sleep_seconds=1)
-    install = QWEN3_32B_MAIN_SERVICE.install_and_restart_command()
+    readiness = QWEN3_14B_TRADE_SERVICE.readiness_command(attempts=2, sleep_seconds=1)
+    install = QWEN3_14B_TRADE_SERVICE.install_and_restart_command()
 
     assert "http://127.0.0.1:8000/v1/models" in readiness
-    assert "grep -F qwen3-32b-trade" in readiness
-    assert "vLLM readiness failed for qwen3-32b-trade" in readiness
-    assert "systemctl is-active qwen3-32b-main.service && ready=0;" in install
-    assert "vLLM model ready: qwen3-32b-trade" in install
+    assert "grep -F qwen3-14b-trade" in readiness
+    assert "vLLM readiness failed for qwen3-14b-trade" in readiness
+    assert "systemctl is-active bb-phase3-llm-decision.service && ready=0;" in install
+    assert "vLLM model ready: qwen3-14b-trade" in install
 
 
 def test_dual_14b_start_scripts_are_short_context_awq_vllm() -> None:

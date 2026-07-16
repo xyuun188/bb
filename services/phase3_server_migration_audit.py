@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.phase3_model_contract import PHASE3_APPROVED_RUNTIME_MODEL_PATHS
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
 from services.model_server_config import (
@@ -91,22 +92,18 @@ LEGACY_PROCESS_HINTS_ALWAYS_BLOCK = (
     "qwen3_5_122b",
     "qwen3-5-122b",
     "122b",
+    "qwen3-32b",
+    "deepseek-r1-distill-qwen-32b",
+    "deepseek_32b",
+    "qwen3_32b",
     "/data/trade_ai/",
-    "/data/trade_models/",
     "open-webui",
     "text-generation-webui",
     "ollama",
     "finquant_expert_alias.py",
 )
 
-LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3 = (
-    "qwen3-32b",
-    "deepseek-r1-distill-qwen-32b",
-    "deepseek_32b",
-    "qwen3_32b",
-    "/data/trade_models/qwen/qwen3-14b-awq",
-    "/data/trade_models/deepseek/deepseek-r1-distill-qwen-14b-awq",
-)
+LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3: tuple[str, ...] = ()
 
 APPROVED_MIGRATION_CATEGORIES = (
     "platform_secure_settings_reference",
@@ -208,7 +205,11 @@ def _compact_process_evidence(value: Any, *, limit: int = PROCESS_EVIDENCE_TEXT_
 
 def _is_phase3_allowed_process(value: Any) -> bool:
     line = _process_lower(value)
-    if not line or PHASE3_ROOT.lower() not in line:
+    if not line:
+        return False
+    if any(path.lower() in line for path in PHASE3_APPROVED_RUNTIME_MODEL_PATHS):
+        return True
+    if PHASE3_ROOT.lower() not in line:
         return False
     return any(hint.lower() in line for hint in PHASE3_ALLOWED_PROCESS_HINTS)
 
@@ -471,7 +472,7 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "can_mutate_remote": False,
         "can_delete_remote_data": False,
         "phase3_go_live_blocked": bool(blockers),
-        "deployment_contract": "phase3_full_model_server",
+        "deployment_contract": "evidence_driven_model_runtime",
         "policy_id": PHASE3_RESOURCE_POLICY_ID,
         "resource_release_marker_path": RESOURCE_RELEASE_MARKER_PATH,
         "reset_marker_path": RESOURCE_RELEASE_MARKER_PATH,
@@ -481,8 +482,9 @@ def evaluate_phase3_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             "legacy_resource_release_required": True,
             "keep_existing_model_server_data": True,
             "legacy_model_or_cache_allowed_as_isolated_data": True,
-            "phase3_data_root": PHASE3_ROOT,
-            "target_usage": "full_capacity_for_phase3_quant_plan",
+            "phase3_control_plane_root": PHASE3_ROOT,
+            "approved_runtime_model_paths": list(PHASE3_APPROVED_RUNTIME_MODEL_PATHS),
+            "target_usage": "verified_phase3_runtime_only",
         },
         "migration_policy": {
             "whitelist_only": True,
@@ -557,6 +559,9 @@ def render_phase3_server_probe() -> str:
         )
         PHASE3_ROOT = {json.dumps(PHASE3_ROOT)}
         PHASE3_ALLOWED_PROCESS_HINTS = {json.dumps(PHASE3_ALLOWED_PROCESS_HINTS)}
+        PHASE3_APPROVED_RUNTIME_MODEL_PATHS = {
+            json.dumps(PHASE3_APPROVED_RUNTIME_MODEL_PATHS)
+        }
         AUDIT_PROBE_PROCESS_HINTS = {json.dumps(AUDIT_PROBE_PROCESS_HINTS)}
         LEGACY_PROCESS_HINTS_ALWAYS_BLOCK = {json.dumps(LEGACY_PROCESS_HINTS_ALWAYS_BLOCK)}
         LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3 = {
@@ -577,7 +582,11 @@ def render_phase3_server_probe() -> str:
 
         def is_phase3_allowed_process(line):
             lowered = str(line or "").strip().lower()
-            if not lowered or PHASE3_ROOT.lower() not in lowered:
+            if not lowered:
+                return False
+            if any(path.lower() in lowered for path in PHASE3_APPROVED_RUNTIME_MODEL_PATHS):
+                return True
+            if PHASE3_ROOT.lower() not in lowered:
                 return False
             return any(hint.lower() in lowered for hint in PHASE3_ALLOWED_PROCESS_HINTS)
 

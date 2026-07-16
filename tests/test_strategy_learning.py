@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,8 +12,26 @@ from services.strategy_learning import (
     StrategyFeedback,
     StrategyLearningEngine,
     StrategyProfile,
+    _json_safe,
     _runtime_prior_usage,
 )
+
+
+def test_strategy_learning_json_payload_replaces_nested_non_finite_values() -> None:
+    payload = _json_safe(
+        {
+            "score": float("-inf"),
+            "nested": [float("nan"), {"upside": float("inf"), "valid": 0.25}],
+            "generated_at": datetime(2026, 7, 15, tzinfo=UTC),
+        }
+    )
+
+    assert payload == {
+        "score": None,
+        "nested": [None, {"upside": None, "valid": 0.25}],
+        "generated_at": "2026-07-15T00:00:00+00:00",
+    }
+    json.dumps(payload, allow_nan=False)
 
 
 def _sample(

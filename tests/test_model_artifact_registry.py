@@ -98,7 +98,20 @@ def _metadata() -> dict:
             "decision_group_disjoint": True,
             "chronological_label_disjoint": True,
             "model_refit_per_fold": True,
-            "folds": [{"fold": 1, "decision_group_overlap_count": 0}],
+            "folds": [
+                {
+                    "fold": 1,
+                    "decision_group_overlap_count": 0,
+                    "sides": {
+                        "long": {"promotion_math_ready": True},
+                        "short": {"promotion_math_ready": True},
+                    },
+                }
+            ],
+            "sides": {
+                "long": {"promotion_math_ready": True},
+                "short": {"promotion_math_ready": True},
+            },
             "stable": True,
         },
         "leave_one_symbol_out_report": {
@@ -396,6 +409,7 @@ def test_live_activation_requires_bound_return_evidence(tmp_path) -> None:
     readiness = {
         "state": "ready",
         "allow_live_position_influence": True,
+        "live_enabled_sides": ["long", "short"],
         "blocking_reasons": [],
     }
     current = registry.promote_candidate(
@@ -403,6 +417,7 @@ def test_live_activation_requires_bound_return_evidence(tmp_path) -> None:
             "activation_stage": "live",
             "readiness_state": "ready",
             "production_influence_authorized": True,
+            "live_enabled_sides": ["long", "short"],
             "blocking_reasons": [],
             "return_evidence_report": readiness,
         }
@@ -445,10 +460,9 @@ def test_live_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
         model_id="local_ml_profit_quality",
     )
     metadata = _metadata()
-    metadata["walk_forward_report"] = {
-        **metadata["walk_forward_report"],
-        "stable": False,
-    }
+    metadata["walk_forward_report"]["sides"]["short"][
+        "promotion_math_ready"
+    ] = False
     registry.persist_candidate_joblib(
         {"weights": [1]},
         metadata,
@@ -458,6 +472,7 @@ def test_live_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
     readiness = {
         "state": "ready",
         "allow_live_position_influence": True,
+        "live_enabled_sides": ["long", "short"],
         "blocking_reasons": [],
     }
 
@@ -467,6 +482,7 @@ def test_live_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
                 "activation_stage": "live",
                 "readiness_state": "ready",
                 "production_influence_authorized": True,
+                "live_enabled_sides": ["long", "short"],
                 "blocking_reasons": [],
                 "return_evidence_report": readiness,
             }
@@ -474,6 +490,53 @@ def test_live_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
 
     assert registry.resolve_current() is None
     assert registry.resolve_candidate() is not None
+
+
+def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    metadata = _metadata()
+    metadata["walk_forward_report"]["sides"]["short"][
+        "promotion_math_ready"
+    ] = False
+    metadata["walk_forward_report"]["folds"][0]["sides"]["short"][
+        "promotion_math_ready"
+    ] = False
+    metadata["leave_one_symbol_out_report"]["short"]["stable"] = False
+    metadata["oos_return_evaluation"]["short"]["promotion_math_ready"] = False
+    registry.persist_candidate_joblib(
+        {"weights": [1]},
+        metadata,
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    readiness = {
+        "state": "partial_ready",
+        "allow_live_position_influence": True,
+        "live_enabled_sides": ["long"],
+        "blocking_reasons": [],
+        "side_blocking_reasons": {
+            "long": [],
+            "short": [{"code": "short_walk_forward_return_stability_failed"}],
+        },
+    }
+
+    current = registry.promote_candidate(
+        {
+            "activation_stage": "canary",
+            "readiness_state": "partial_ready",
+            "production_influence_authorized": True,
+            "live_enabled_sides": ["long"],
+            "blocking_reasons": [],
+            "return_evidence_report": readiness,
+        }
+    )
+
+    assert current.activation_manifest["activation_stage"] == "canary"
+    assert current.activation_manifest["live_enabled_sides"] == ["long"]
+    assert current.activation_manifest["production_influence_authorized"] is True
 
 
 def test_default_loader_does_not_fall_back_to_retired_legacy_artifact(tmp_path) -> None:

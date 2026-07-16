@@ -2346,7 +2346,7 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
             if url == "http://127.0.0.1:18000/v1/models":
                 return httpx.Response(
                     200,
-                    json={"data": [{"id": "qwen3-32b-trade"}]},
+                    json={"data": [{"id": "qwen3-14b-trade"}]},
                     request=request,
                 )
             if url == "http://127.0.0.1:18002/v1/models":

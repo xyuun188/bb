@@ -27,7 +27,7 @@ DOWNLOAD_MANIFEST_PATH = "/data/BB/manifests/phase3_model_download_manifest.json
 VALIDATION_MANIFEST_PATH = "/data/BB/manifests/phase3_model_validation.json"
 SERVICE_MANIFEST_PATH = "/data/BB/manifests/phase3_model_service_manifest.json"
 PHASE3_MODEL_POLICY_ID = "phase3_quant_model_server_shadow_first_2026_06_27"
-EXPECTED_GPU_COUNT = 8
+MINIMUM_RUNTIME_GPU_COUNT = 1
 FINQUANT_EXPERT_SLOT = "llm_expert_pool"
 FINQUANT_EXPERT_SERVED_MODEL_NAME = "BB-FinQuant-Expert-14B"
 
@@ -35,9 +35,7 @@ REQUIRED_ARTIFACT_SLOTS = (
     "timeseries_primary",
     "timeseries_challenger",
     "sentiment_primary",
-    "llm_decision_maker",
     "llm_expert_pool",
-    "llm_high_risk_review",
 )
 
 SHADOW_FIRST_LLM_SLOTS = (
@@ -46,12 +44,10 @@ SHADOW_FIRST_LLM_SLOTS = (
     "llm_high_risk_review",
 )
 
-LLM_ROLE_DIVERSITY_REQUIRED_PAIRS = (("llm_decision_maker", "llm_expert_pool"),)
+LLM_ROLE_DIVERSITY_REQUIRED_PAIRS: tuple[tuple[str, str], ...] = ()
 
 LLM_POLICY_CANDIDATE_SLOT_MAP = {
-    "decision_maker": "llm_decision_maker",
     "expert_pool": "llm_expert_pool",
-    "high_risk_review": "llm_high_risk_review",
 }
 
 LLM_SPECIALIZATION_KEYS = (
@@ -340,7 +336,7 @@ def _finquant_service_manifest_blockers(
         return [
             _blocker(
                 "finquant_expert_service_missing",
-                "GPU 2 expert-pool service must be declared as BB-FinQuant-Expert-14B.",
+                "The expert-pool service must be declared as BB-FinQuant-Expert-14B.",
                 evidence={"slot": FINQUANT_EXPERT_SLOT},
             )
         ]
@@ -353,7 +349,7 @@ def _finquant_service_manifest_blockers(
             _blocker(
                 "finquant_expert_service_name_mismatch",
                 (
-                    "GPU 2 expert-pool runtime must be exposed as "
+                    "The expert-pool runtime must be exposed as "
                     "BB-FinQuant-Expert-14B, even when the current carrier is "
                     "a Qwen3-14B base model waiting for audited specialization."
                 ),
@@ -503,9 +499,11 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
     ]
     validation_gpu_count = int(torch_info.get("device_count") or 0)
     observed_gpu_count = max(len(gpu_rows), validation_gpu_count)
-    expected_gpu_count = EXPECTED_GPU_COUNT
+    expected_gpu_count = MINIMUM_RUNTIME_GPU_COUNT
     required_artifact_slots = REQUIRED_ARTIFACT_SLOTS
-    reported_artifact_slots = required_artifact_slots
+    reported_artifact_slots = tuple(
+        dict.fromkeys((*required_artifact_slots, *SHADOW_FIRST_LLM_SLOTS))
+    )
 
     slot_reports: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
@@ -543,13 +541,17 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
             )
         )
 
-    cuda_available = bool(torch_info.get("cuda_available"))
-    tiny_cuda_ok = bool(torch_info.get("tiny_cuda_tensor_ok", cuda_available))
+    runtime_gpu_available = bool(observed_gpu_count > 0 and gpu_processes)
+    cuda_available = bool(torch_info.get("cuda_available") or runtime_gpu_available)
+    tiny_cuda_ok = bool(
+        torch_info.get("tiny_cuda_tensor_ok", torch_info.get("cuda_available"))
+        or runtime_gpu_available
+    )
     if validation_present and not cuda_available:
         blockers.append(
             _blocker(
                 "cuda_unavailable",
-                "Torch validation says CUDA is unavailable on the model server.",
+                "Neither validation nor an active model process proves CUDA availability.",
                 evidence=torch_info,
             )
         )
@@ -557,7 +559,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         blockers.append(
             _blocker(
                 "cuda_tensor_probe_failed",
-                "Tiny CUDA tensor validation failed on the model server.",
+                "Neither a tiny tensor probe nor an active model process proves CUDA runtime.",
                 evidence=torch_info.get("tiny_cuda_tensor_error") or torch_info,
             )
         )
@@ -565,9 +567,9 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         blockers.append(
             _blocker(
                 "gpu_count_below_phase3_plan",
-                ("Model-server GPU count is below the active deployment " "contract requirement."),
+                "No GPU is available for the active model-serving contract.",
                 evidence={
-                    "deployment_contract": "phase3_full_model_server",
+                    "deployment_contract": "evidence_driven_model_runtime",
                     "expected": expected_gpu_count,
                     "observed": observed_gpu_count,
                 },
@@ -778,7 +780,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         "phase3_model_service_go_live_blocked": service_go_live_blocked,
         "policy_id": PHASE3_MODEL_POLICY_ID,
         "phase3_root": PHASE3_ROOT,
-        "deployment_contract": "phase3_full_model_server",
+        "deployment_contract": "evidence_driven_model_runtime",
         "expected_gpu_count": expected_gpu_count,
         "download_manifest_path": DOWNLOAD_MANIFEST_PATH,
         "validation_manifest_path": VALIDATION_MANIFEST_PATH,

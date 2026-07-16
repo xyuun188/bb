@@ -285,7 +285,7 @@ def _make_classifier(y: pd.Series) -> Pipeline:
             min_samples_leaf=8,
             class_weight="balanced_subsample",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
         )
     return Pipeline(
         [
@@ -304,7 +304,7 @@ def _make_regressor(y: pd.Series) -> Pipeline:
             max_depth=8,
             min_samples_leaf=8,
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
         )
     return Pipeline(
         [
@@ -334,6 +334,18 @@ def _optional_positive_proba(model: Any, x: pd.DataFrame, *, default: float = 0.
             error=safe_error_text(exc),
         )
         return np.full(len(x), float(default), dtype=float)
+
+
+def _configure_single_row_inference(bundle: dict[str, Any]) -> None:
+    """Avoid process-wide joblib fan-out for latency-sensitive single-row scoring."""
+
+    for value in bundle.values():
+        named_steps = getattr(value, "named_steps", None)
+        if not isinstance(named_steps, dict):
+            continue
+        estimator = named_steps.get("model")
+        if estimator is not None and hasattr(estimator, "n_jobs"):
+            estimator.n_jobs = 1
 
 
 def _safe_auc(y_true: pd.Series, y_score: np.ndarray) -> float | None:
@@ -2364,11 +2376,24 @@ class MLSignalService:
                     trained_metadata,
                     trained_influence,
                 )
+                production_authorized = bool(
+                    trained_readiness.get("allow_live_position_influence")
+                    and trained_readiness.get("state") in {"ready", "partial_ready"}
+                    and trained_readiness.get("live_enabled_sides")
+                    and not trained_readiness.get("blocking_reasons")
+                )
+                activation_stage = "canary" if production_authorized else "shadow"
+                live_enabled_sides = (
+                    list(trained_readiness.get("live_enabled_sides") or [])
+                    if production_authorized
+                    else []
+                )
                 activated_artifact = self.artifact_registry.promote_candidate(
                     {
-                        "activation_stage": "shadow",
+                        "activation_stage": activation_stage,
                         "readiness_state": trained_readiness.get("state"),
-                        "production_influence_authorized": False,
+                        "production_influence_authorized": production_authorized,
+                        "live_enabled_sides": live_enabled_sides,
                         "blocking_reasons": trained_readiness.get("blocking_reasons") or [],
                         "return_evidence_report": trained_readiness,
                         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -2377,10 +2402,14 @@ class MLSignalService:
                 self._bundle = None
                 self._loaded_mtime = None
                 self._ensure_loaded()
-                allow_live_position_influence = False
+                allow_live_position_influence = production_authorized
                 result = {
                     "trained": True,
-                    "reason": "trained_shadow_activated",
+                    "reason": (
+                        "trained_canary_activated"
+                        if production_authorized
+                        else "trained_shadow_activated"
+                    ),
                     "completed_sample_count": completed_count,
                     "previous_sample_count": last_sample_count,
                     "previous_completed_sample_count": last_completed_count,
@@ -2405,11 +2434,15 @@ class MLSignalService:
                     "influence_policy": trained_influence,
                     "artifact_persisted": bool(trained_metadata.get("artifact_persisted")),
                     "artifact_version": activated_artifact.version,
-                    "artifact_activation_stage": "shadow",
+                    "artifact_activation_stage": activation_stage,
+                    "live_enabled_sides": live_enabled_sides,
                     "trained_at": trained_metadata.get("trained_at"),
                     "message": (
-                        "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
-                        "生产影响保持关闭，等待独立晋升证据。"
+                        "本地 ML 候选已通过费后收益证据并原子激活为 canary，"
+                        "仅允许证据达标方向影响生产。"
+                        if production_authorized
+                        else "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
+                        "生产影响保持关闭，等待收益证据达标。"
                     ),
                 }
                 self._last_train_result = result
@@ -2892,6 +2925,7 @@ class MLSignalService:
                 trusted_root=trusted_root,
                 expected_type=dict,
             )
+            _configure_single_row_inference(self._bundle)
             metadata = _safe_dict(self._bundle.get("metadata"))
             if (
                 metadata.get("objective_name") != RETURN_OBJECTIVE_NAME

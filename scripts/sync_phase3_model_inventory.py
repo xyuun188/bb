@@ -13,6 +13,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
+from core.phase3_model_contract import (  # noqa: E402
+    PHASE3_APPROVED_RUNTIME_MODEL_PATHS,
+    PHASE3_DECISION_MODEL_ID,
+    PHASE3_DECISION_REPO_ID,
+    PHASE3_EXPERT_MODEL_ID,
+    PHASE3_RISK_MODEL_ID,
+    PHASE3_RISK_REPO_ID,
+)
 from core.remote_server_info import parse_remote_server_info  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
@@ -28,43 +36,37 @@ REPORT_VALIDATION_MANIFEST = (
 )
 
 EXPECTED_LLM_CANDIDATES = {
-    "decision_maker": "Qwen/Qwen3-32B-AWQ",
-    "expert_pool": "BB-FinQuant-Expert-14B",
-    "high_risk_review": "casperhansen/deepseek-r1-distill-qwen-14b-awq",
+    "decision_maker": PHASE3_DECISION_REPO_ID,
+    "expert_pool": PHASE3_EXPERT_MODEL_ID,
+    "high_risk_review": PHASE3_RISK_REPO_ID,
 }
 
 EXPECTED_LLM_SLOTS = {
     "llm_decision_maker": {
-        "repo_id": "Qwen/Qwen3-32B-AWQ",
-        "served_model_name": "qwen3-32b-trade",
-        "path": f"{PHASE3_ROOT}/models/llm_decision_maker/Qwen--Qwen3-32B-AWQ",
-        "target": f"{PHASE3_ROOT}/models/llm_decision_maker/Qwen--Qwen3-32B-AWQ",
-        "role": "decision_maker",
+        "repo_id": PHASE3_DECISION_REPO_ID,
+        "served_model_name": PHASE3_DECISION_MODEL_ID,
+        "path": PHASE3_APPROVED_RUNTIME_MODEL_PATHS[0],
+        "target": PHASE3_APPROVED_RUNTIME_MODEL_PATHS[0],
+        "role": "decision_fallback_and_finquant_carrier",
         "stage": "shadow_candidate_not_live",
     },
     "llm_expert_pool": {
-        "repo_id": "Qwen/Qwen3-14B-AWQ",
-        "served_model_name": "BB-FinQuant-Expert-14B",
-        "path": f"{PHASE3_ROOT}/models/llm_expert_pool/Qwen--Qwen3-14B-AWQ",
-        "target": f"{PHASE3_ROOT}/models/llm_expert_pool/Qwen--Qwen3-14B-AWQ",
+        "repo_id": PHASE3_DECISION_REPO_ID,
+        "served_model_name": PHASE3_EXPERT_MODEL_ID,
+        "path": PHASE3_APPROVED_RUNTIME_MODEL_PATHS[0],
+        "target": PHASE3_APPROVED_RUNTIME_MODEL_PATHS[0],
         "role": "expert_pool",
         "stage": "shadow_candidate_not_live",
         "specialization_required": True,
-        "specialization_target": "BB-FinQuant-Expert-14B",
+        "specialization_target": PHASE3_EXPERT_MODEL_ID,
         "specialization_status": "pending",
-        "base_model_carrier": "Qwen/Qwen3-14B-AWQ",
+        "base_model_carrier": PHASE3_DECISION_REPO_ID,
     },
     "llm_high_risk_review": {
-        "repo_id": "casperhansen/deepseek-r1-distill-qwen-14b-awq",
-        "served_model_name": "deepseek-r1-14b-risk",
-        "path": (
-            f"{PHASE3_ROOT}/models/llm_high_risk_review/"
-            "casperhansen--deepseek-r1-distill-qwen-14b-awq"
-        ),
-        "target": (
-            f"{PHASE3_ROOT}/models/llm_high_risk_review/"
-            "casperhansen--deepseek-r1-distill-qwen-14b-awq"
-        ),
+        "repo_id": PHASE3_RISK_REPO_ID,
+        "served_model_name": PHASE3_RISK_MODEL_ID,
+        "path": PHASE3_APPROVED_RUNTIME_MODEL_PATHS[1],
+        "target": PHASE3_APPROVED_RUNTIME_MODEL_PATHS[1],
         "role": "high_risk_review",
         "stage": "shadow_candidate_not_live",
     },
@@ -94,6 +96,7 @@ def render_remote_inventory_sync() -> str:
         REPORT_VALIDATION_MANIFEST = Path({REPORT_VALIDATION_MANIFEST!r})
         EXPECTED_LLM_CANDIDATES = {EXPECTED_LLM_CANDIDATES!r}
         EXPECTED_LLM_SLOTS = {EXPECTED_LLM_SLOTS!r}
+        HEALTH_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 
 
         def now_iso() -> str:
@@ -196,6 +199,7 @@ def render_remote_inventory_sync() -> str:
                 row = by_slot.get(slot, {{}})
                 model_path = Path(str(expected["path"]))
                 row.update(expected)
+                row["slot"] = slot
                 row["live_routing_enabled"] = False
                 row["checked_at"] = now_iso()
                 row["validation_note"] = "Phase 3 inventory synchronized from canonical /data/BB manifest."
@@ -219,10 +223,26 @@ def render_remote_inventory_sync() -> str:
             return data
 
 
+        def assert_expected_llm_slots(data: dict, *, manifest_name: str) -> None:
+            rows = data.get("models")
+            observed = {{
+                str(row.get("slot") or "")
+                for row in rows if isinstance(row, dict)
+            }} if isinstance(rows, list) else set()
+            missing = sorted(set(EXPECTED_LLM_SLOTS) - observed)
+            if missing:
+                raise RuntimeError(
+                    f"{{manifest_name}} is missing expected LLM slots after sync: {{missing}}"
+                )
+
+
         def health_probe() -> dict:
             try:
                 with urllib.request.urlopen("http://127.0.0.1:8101/health", timeout=8) as response:
-                    payload = json.loads(response.read(256_000).decode("utf-8", "replace"))
+                    raw = response.read(HEALTH_RESPONSE_MAX_BYTES + 1)
+                    if len(raw) > HEALTH_RESPONSE_MAX_BYTES:
+                        raise ValueError("phase3 quant API health response exceeds 4 MiB")
+                    payload = json.loads(raw.decode("utf-8", "replace"))
             except Exception as exc:
                 return {{"ok": False, "error": str(exc)[:240]}}
             if not isinstance(payload, dict):
@@ -255,6 +275,9 @@ def render_remote_inventory_sync() -> str:
                 download["validation"] = update_llm_rows(download["validation"], validation=True)
             validation = update_llm_rows(read_json(VALIDATION_MANIFEST), validation=True)
 
+            assert_expected_llm_slots(download, manifest_name="download manifest")
+            assert_expected_llm_slots(validation, manifest_name="validation manifest")
+
             write_json(DOWNLOAD_MANIFEST, download)
             write_json(VALIDATION_MANIFEST, validation)
             write_json(REPORT_DOWNLOAD_MANIFEST, download)
@@ -270,12 +293,9 @@ def render_remote_inventory_sync() -> str:
                 "report_validation_manifest": str(REPORT_VALIDATION_MANIFEST),
                 "policy_llm_candidates": download.get("policy", {{}}).get("llm_candidates"),
                 "llm_rows": llm_rows(validation),
-                "health_decision_model": next((
-                    item.get("repo_id")
-                    for item in health.get("model_status", [])
-                    if isinstance(item, dict) and item.get("slot") == "llm_decision_maker"
-                ), ""),
                 "health_ok": bool(health.get("ok")),
+                "quant_api_service": health.get("service"),
+                "quant_api_artifact_model_id": health.get("artifact_model_id"),
                 "checked_at": now_iso(),
             }}, ensure_ascii=False, indent=2, sort_keys=True))
 

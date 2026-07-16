@@ -259,16 +259,16 @@ def test_phase3_model_server_rejects_legacy_one_gpu_topology() -> None:
     warning_codes = {item["code"] for item in report["warnings"]}
 
     assert report["status"] == "blocked"
-    assert report["deployment_contract"] == "phase3_full_model_server"
+    assert report["deployment_contract"] == "evidence_driven_model_runtime"
     assert report["artifact_ready"] is False
     assert report["runtime_ready"] is False
     assert report["phase3_model_service_go_live_blocked"] is True
-    assert report["expected_gpu_count"] == 8
+    assert report["expected_gpu_count"] == 1
     assert report["gpu_count"] == 1
-    assert report["required_slot_count"] == 6
+    assert report["required_slot_count"] == 4
     assert report["required_slot_ready_count"] == 3
-    assert "gpu_count_below_phase3_plan" in blocker_codes
-    assert "cuda_unavailable" in blocker_codes
+    assert "gpu_count_below_phase3_plan" not in blocker_codes
+    assert "cuda_unavailable" not in blocker_codes
     assert "required_model_slot_not_ready" in blocker_codes
     assert "model_service_manifest_missing" in warning_codes
     assert all("takeover" not in str(item).lower() for item in report["warnings"])
@@ -385,7 +385,7 @@ async def test_phase3_model_server_readiness_falls_back_to_platform_bridge_when_
     assert report["remote_probe_available"] is True
 
 
-def test_phase3_model_server_blocks_duplicate_decision_and_expert_base_model() -> None:
+def test_phase3_model_server_allows_specialized_expert_to_share_fallback_carrier() -> None:
     snapshot = _artifact_ready_snapshot(runtime_ready=True)
     duplicate_repo = "Qwen/Qwen3-14B-AWQ"
     for manifest_key in ("download_manifest", "validation_manifest"):
@@ -396,11 +396,11 @@ def test_phase3_model_server_blocks_duplicate_decision_and_expert_base_model() -
     report = evaluate_phase3_model_server_snapshot(snapshot)
     blocker_codes = {item["code"] for item in report["blockers"]}
 
-    assert report["status"] == "blocked"
-    assert report["artifact_ready"] is False
+    assert report["status"] == "ready"
+    assert report["artifact_ready"] is True
     assert report["runtime_ready"] is True
-    assert report["phase3_model_service_go_live_blocked"] is True
-    assert "llm_role_diversity_missing" in blocker_codes
+    assert report["phase3_model_service_go_live_blocked"] is False
+    assert "llm_role_diversity_missing" not in blocker_codes
 
 
 def test_phase3_model_server_allows_distinct_decision_and_expert_models() -> None:
@@ -441,7 +441,7 @@ def test_phase3_model_server_blocks_policy_candidate_mismatch() -> None:
     snapshot = _artifact_ready_snapshot(runtime_ready=True)
     snapshot["download_manifest"]["data"]["policy"]["llm_candidates"] = {
         "decision_maker": "Qwen/Qwen3-14B-AWQ",
-        "expert_pool": "Qwen/Qwen3-14B-AWQ",
+        "expert_pool": "Qwen/Qwen3-32B-AWQ",
         "high_risk_review": "test/llm_high_risk_review",
     }
     for manifest_key in ("download_manifest", "validation_manifest"):
@@ -614,7 +614,7 @@ def test_phase3_model_server_blocks_cuda_and_missing_required_slot() -> None:
     snapshot["validation_manifest"]["data"]["models"] = [
         row
         for row in snapshot["validation_manifest"]["data"]["models"]
-        if row["slot"] != "llm_high_risk_review"
+        if row["slot"] != "sentiment_primary"
     ]
 
     report = evaluate_phase3_model_server_snapshot(snapshot)

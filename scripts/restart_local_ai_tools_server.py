@@ -1,4 +1,4 @@
-"""Restart remote local-AI-tools service and print health."""
+"""Restart the Phase 3 quant API and print its bounded health summary."""
 
 from __future__ import annotations
 
@@ -20,14 +20,12 @@ def main() -> None:
     try:
         cmd = "\n".join(
             [
-                "sudo systemctl restart local-ai-tools.service",
+                "sudo systemctl restart bb-phase3-quant-api.service",
                 "sleep 3",
-                "systemctl is-active local-ai-tools.service",
-                "set -a; . /data/trade_ai/local_ai_tools.env; set +a; "
+                "systemctl is-active bb-phase3-quant-api.service",
+                "set -a; . /data/BB/env/phase3.env; set +a; "
                 'curl -sS -H "Authorization: Bearer ${LOCAL_AI_TOOLS_API_KEY}" '
-                "http://127.0.0.1:8001/health",
-                "echo",
-                "grep -n 'review_backend\\|RISK_REVIEW_BASE\\|local_review_backend' /data/trade_ai/tools/local_ai_tools_api.py | head -20",
+                "http://127.0.0.1:8101/health",
             ]
         )
         safe_print(run_remote_text(ssh, cmd, timeout=90, check=False))

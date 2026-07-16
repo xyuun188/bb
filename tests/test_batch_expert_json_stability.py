@@ -23,7 +23,7 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
         {"review_positions": True, "open_positions": [{"symbol": "BTC/USDT"}]},
     )
 
-    assert "BATCH_EXPERT_JSON_V8" in prompt
+    assert "BATCH_EXPERT_JSON_V9" in prompt
     assert (
         "Required experts: trend_expert, momentum_expert, sentiment_expert, position_expert, risk_expert"
         in prompt
@@ -31,6 +31,8 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
     assert "do not copy one expert's opinion into all experts" in prompt
     assert "Missing governed return evidence holds" in prompt
     assert "cross_check_for must be null in batch mode" in prompt
+    assert "cannot set size, leverage, stop loss, or take profit" in prompt
+    assert "position_size_pct" not in prompt
     assert "12-28字" in prompt
     assert '"action":"hold","confidence":0.50' not in prompt
     assert "daily_target" not in prompt
@@ -197,6 +199,9 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     )
     assert decisions["risk_expert"].raw_response["batch_repair_retry"] is True
     assert not decisions["risk_expert"].raw_response.get("batch_expert_fallback")
+    assert decisions["risk_expert"].position_size_pct == 0.0
+    assert decisions["risk_expert"].suggested_leverage == 1.0
+    assert all(kwargs["max_tokens"] == 900 for kwargs in json_kwargs)
 
 
 @pytest.mark.asyncio

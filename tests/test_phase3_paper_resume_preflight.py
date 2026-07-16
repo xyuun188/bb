@@ -68,9 +68,9 @@ def _platform_runtime_ready_with_models() -> dict[str, Any]:
     runtime = _platform_runtime_ready()
     runtime["ai_models"] = [
         {
-            "model": "qwen3-32b-trade",
+            "model": "qwen3-14b-trade",
             "available": True,
-            "models": ["qwen3-32b-trade"],
+            "models": ["qwen3-14b-trade"],
         },
         {
             "model": "deepseek-r1-14b-risk",

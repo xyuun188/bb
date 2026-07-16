@@ -4,7 +4,7 @@ The online platform must not call the model server through fragile public port
 forwarding for high-volume POST traffic. This process runs on the platform
 server and forwards loopback-only ports to the model server's loopback services:
 
-- 127.0.0.1:18000 -> model server 127.0.0.1:8000 (qwen3-32b-trade)
+- 127.0.0.1:18000 -> model server 127.0.0.1:8000 (qwen3-14b-trade)
 - 127.0.0.1:18001 -> model server 127.0.0.1:8101 (phase3 quant API health)
 - 127.0.0.1:18002 -> model server 127.0.0.1:8002 (deepseek-r1-14b-risk)
 - 127.0.0.1:18003 -> model server 127.0.0.1:8003 (BB-FinQuant-Expert-14B)
@@ -128,7 +128,7 @@ def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
 
     return [
         TunnelSpec(
-            name="qwen3-32b-trade",
+            name="qwen3-14b-trade",
             local_host=local_host,
             local_port=18_000,
             remote_host="127.0.0.1",
@@ -225,7 +225,7 @@ def main(argv: list[str] | None = None) -> None:
             name=spec.name,
             local_host=spec.local_host,
             local_port={
-                "qwen3-32b-trade": args.qwen_local_port,
+                "qwen3-14b-trade": args.qwen_local_port,
                 "phase3-quant-api": args.quant_api_local_port,
                 "deepseek-r1-14b-risk": args.deepseek_local_port,
                 "BB-FinQuant-Expert-14B": args.expert_local_port,

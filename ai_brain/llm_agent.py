@@ -1128,19 +1128,10 @@ class LLMAgent(AbstractAIModel):
                 action=Action.from_string(str(payload.get("action", "hold"))),
                 confidence=min(max(float(payload.get("confidence", 0.5) or 0.5), 0.0), 1.0),
                 reasoning=str(payload.get("reasoning") or "暂无分析内容。")[:150],
-                position_size_pct=min(
-                    max(float(payload.get("position_size_pct", 0.0) or 0.0), 0.0), 1.0
-                ),
-                suggested_leverage=max(
-                    float(payload.get("suggested_leverage", 1.0) or 1.0),
-                    1.0,
-                ),
-                stop_loss_pct=min(
-                    max(float(payload.get("stop_loss_pct", 0.0) or 0.0), 0.0), 1.0
-                ),
-                take_profit_pct=min(
-                    max(float(payload.get("take_profit_pct", 0.0) or 0.0), 0.0), 1.0
-                ),
+                position_size_pct=0.0,
+                suggested_leverage=1.0,
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
                 cross_check_for=payload.get("cross_check_for"),
                 raw_response=payload,
                 feature_snapshot=features.to_dict(),

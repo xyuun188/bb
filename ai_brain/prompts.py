@@ -610,13 +610,13 @@ def build_batch_experts_user_prompt(
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
     max_payload_chars = 760
-    return f"""BATCH_EXPERT_JSON_V8
+    return f"""BATCH_EXPERT_JSON_V9
 Return one minified JSON object only. No markdown, no prose, no <think>. Keep it short enough to finish in one response.
 Schema: {{"experts":{{{requested_schema}}}}}
 Required experts: {requested_list}. {omitted_rule.rstrip()}
 Each expert value must contain exactly:
-{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-28字，写方向/收益/风险要点","position_size_pct":0-1,"suggested_leverage":"positive number, account-capped later","stop_loss_pct":"0-1 dynamic market risk distance","take_profit_pct":"0-1 dynamic fee-after expected move","cross_check_for":null}}
-Rules: Missing governed return evidence holds; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
+{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-28字，写方向/收益/风险要点","cross_check_for":null}}
+Rules: Experts are diagnostic and cannot set size, leverage, stop loss, or take profit. Missing governed return evidence holds; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
 Payload JSON, truncated to {max_payload_chars} chars:
 {text[:max_payload_chars]}
 JSON:"""

@@ -37,7 +37,7 @@ def _clean_market_fact() -> dict:
             "executable_quotes_verified": True,
             "tick_alignment_verified": True,
             "reference_prices_verified": True,
-            "one_minute_path_verified": True,
+            "market_continuity_verified": True,
         },
     }
     return build_market_fact(
@@ -151,6 +151,19 @@ def test_entry_market_data_quality_policy_fails_closed_without_native_fact():
 
     assert issue is not None
     assert issue.code == "native_market_fact_missing"
+
+
+def test_entry_market_data_quality_policy_rejects_stale_consistency_contract():
+    snapshot = _valid_snapshot()
+    snapshot["market_fact"]["source_consistency"]["version"] = (
+        "2026-07-14.okx-source-consistency.v1"
+    )
+
+    issue = EntryMarketDataQualityPolicy().issue(snapshot)
+
+    assert issue is not None
+    assert issue.code == "native_market_fact_invalid"
+    assert "source_consistency_contract_missing_or_stale" in issue.reason
 
 
 def test_zero_turnover_robo_native_fact_cannot_reach_production_entry():

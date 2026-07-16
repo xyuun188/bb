@@ -6705,7 +6705,7 @@ function renderServerModelRuntime(data, container) {
     const toolsHealthLine = runtimeEndpointSummary(tools.health);
     const platformModels = Array.isArray(platformRuntime.ai_models) ? platformRuntime.ai_models : [];
     const MODEL_PUBLIC_ENDPOINTS = {
-        'qwen3-32b-trade': 'platform loopback 18000',
+        'qwen3-14b-trade': 'platform loopback 18000',
         'deepseek-r1-14b-risk': 'platform loopback 18002',
         'BB-FinQuant-Expert-14B': 'platform loopback 18003',
         phase3_quant_api: 'platform loopback 18001',

@@ -101,3 +101,86 @@ async def test_unknown_artifact_without_manifest_requires_retirement(tmp_path) -
     assert sample["classification"] == "missing_manifest"
     assert "missing_phase3_metadata" in sample["reasons"]
     assert sample["can_delete"] is False
+
+
+@pytest.mark.asyncio
+async def test_unreferenced_registry_version_is_retired_without_hiding_unknown_artifacts(
+    tmp_path,
+) -> None:
+    model_root = tmp_path / "model_artifacts" / "local_ml_profit_quality"
+    active_version = "20260716T051245774293Z-f783c19b"
+    orphan_version = "20260712T090034389927Z-3cd65b9c"
+    active_root = model_root / "versions" / active_version
+    orphan_root = model_root / "versions" / orphan_version
+    active_root.mkdir(parents=True)
+    orphan_root.mkdir(parents=True)
+    active_manifest = active_root / "manifest.json"
+    active_manifest.write_text(
+        json.dumps(
+            {
+                "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
+                "artifact_model_id": "local_ml_profit_quality",
+                "artifact_version": active_version,
+                "phase": "phase3_model_factory",
+                "training_policy": "clean_training_view_only",
+                "model_stage": "shadow",
+                "artifact_persisted": True,
+                "promotion_flow": "shadow_to_canary_to_live",
+                "quality_report": {"data_quality_version": "2026-07-16.v1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_root / "current.json").write_text(
+        json.dumps(
+            {
+                "model_id": "local_ml_profit_quality",
+                "pointer_role": "current",
+                "version": active_version,
+                "manifest_path": f"versions/{active_version}/manifest.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    orphan = orphan_root / "model.joblib"
+    orphan.write_bytes(b"pre-registry-orphan")
+
+    report = await ArtifactRetirementAuditService(root=tmp_path).report()
+
+    assert orphan.exists()
+    assert report["status"] == "ready_with_retired_legacy"
+    assert report["unresolved_artifact_count"] == 0
+    assert report["retired_unreferenced_count"] == 1
+    rows = {item["relative_path"]: item for item in report["artifacts"]}
+    orphan_row = rows[
+        f"model_artifacts/local_ml_profit_quality/versions/{orphan_version}/model.joblib"
+    ]
+    assert orphan_row["classification"] == "retired_unreferenced"
+    assert "unreferenced_registry_version" in orphan_row["reasons"]
+    assert orphan_row["can_influence_live"] is False
+
+
+@pytest.mark.asyncio
+async def test_registry_orphan_stays_blocked_when_current_pointer_is_not_valid(tmp_path) -> None:
+    model_root = tmp_path / "model_artifacts" / "local_ml_profit_quality"
+    orphan_version = "20260712T090034389927Z-3cd65b9c"
+    orphan_root = model_root / "versions" / orphan_version
+    orphan_root.mkdir(parents=True)
+    (orphan_root / "model.joblib").write_bytes(b"unknown")
+    (model_root / "current.json").write_text(
+        json.dumps(
+            {
+                "model_id": "local_ml_profit_quality",
+                "pointer_role": "current",
+                "version": "20260716T051245774293Z-f783c19b",
+                "manifest_path": "versions/missing/manifest.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = await ArtifactRetirementAuditService(root=tmp_path).report()
+
+    assert report["status"] == "retired_required"
+    assert report["unresolved_artifact_count"] == 1
+    assert report["retired_unreferenced_count"] == 0

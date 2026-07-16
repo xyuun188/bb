@@ -473,6 +473,51 @@ async def test_system_audit_runs_database_diagnostics_serially() -> None:
 
 
 @pytest.mark.asyncio
+async def test_system_audit_uses_section_contract_timeout_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    async def slow_model_training() -> dict[str, Any]:
+        await asyncio.sleep(0.03)
+        return system_audit._audit_card(
+            "model_training",
+            "model_training",
+            "ok",
+            "completed within its declared budget",
+        )
+
+    monkeypatch.setattr(system_audit, "SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setitem(
+        system_audit.SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES,
+        "model_training",
+        0.1,
+    )
+
+    result = await system_audit._run_audit_specs(
+        [("model_training", slow_model_training)],
+        max_concurrency=1,
+    )
+
+    assert result["model_training"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_model_training_background_probe_exception_is_consumed() -> None:
+    import asyncio
+
+    async def fail() -> None:
+        raise TimeoutError("probe timeout")
+
+    task = asyncio.create_task(fail())
+    task.add_done_callback(system_audit._consume_background_task_exception)
+    await asyncio.sleep(0)
+
+    assert task.done() is True
+    assert isinstance(task.exception(), TimeoutError)
+
+
+@pytest.mark.asyncio
 async def test_system_audit_collect_uses_process_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

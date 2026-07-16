@@ -128,3 +128,23 @@ def test_phase3_rebuild_readiness_blocks_untrusted_artifacts() -> None:
 
     assert report["status"] == "blocked"
     assert "unresolved_or_untrusted_artifacts_block_rebuild" in report["blockers"]
+
+
+def test_phase3_rebuild_readiness_fails_closed_when_contamination_is_unverified() -> None:
+    report = Phase3RebuildReadinessService().report(
+        local_ai_tools={
+            "shadow_sample_count": 500,
+            "trade_sample_count": 80,
+            "evaluation_policy": {
+                "promotion_flow": "shadow_to_canary_to_live",
+                "live_mutation": False,
+            },
+        },
+        governance={"status": "quarantined", "contamination_risk": "unknown"},
+        historical_trade_fact_audit={"status": "clean", "trainable_closed_positions": 80},
+        artifact_retirement_audit={"status": "ready", "retired_or_untrusted_count": 0},
+        runtime_probe={"status": "ok"},
+    )
+
+    assert report["status"] == "blocked"
+    assert "contamination_risk_unverified" in report["blockers"]

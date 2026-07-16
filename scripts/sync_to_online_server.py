@@ -34,6 +34,7 @@ REMOTE_APP_DIR = "/data/bb/app"
 REMOTE_SERVICE_NAME = "bb-paper-trading.service"
 REMOTE_DASHBOARD_SERVICE_NAME = "bb-dashboard.service"
 REMOTE_MODEL_TUNNEL_SERVICE_NAME = "bb-model-tunnels.service"
+REMOTE_MODEL_READINESS_SERVICE_NAME = "bb-phase3-model-server-readiness.service"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REMOTE_OWNER = "bb:bb"
 
@@ -164,7 +165,7 @@ def _online_tunnel_ai_models_json() -> str:
         name = str(slot["name"])
         if name == "decision_maker":
             api_base = "http://127.0.0.1:18000/v1"
-            model = "qwen3-32b-trade"
+            model = "qwen3-14b-trade"
         else:
             api_base = "http://127.0.0.1:18003/v1"
             model = "BB-FinQuant-Expert-14B"
@@ -477,6 +478,8 @@ def _install_split_service_command(
     trading_dropin = f"""[Service]
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+StandardOutput=journal
+StandardError=journal
 """
     cleanup_prefix = (
         f'trap "rm -f {_remote_quote(local_ai_tools_key_file)}" EXIT; '
@@ -858,11 +861,18 @@ def main() -> None:
                 if args.require_model_tunnels
                 else f"(systemctl is-active {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)} || true) && "
             )
+            model_readiness_refresh = (
+                f"if systemctl cat {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)} "
+                ">/dev/null 2>&1; then "
+                f"systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}; "
+                "fi; "
+            )
             command = (
                 model_tunnel_restart
                 + (
                 f"systemctl restart {_remote_quote(args.service)} && "
                 f"systemctl restart {_remote_quote(args.dashboard_service)} && "
+                f"{model_readiness_refresh}"
                 f"{model_tunnel_active_check}"
                 f"systemctl is-active {_remote_quote(args.service)} && "
                 f"systemctl is-active {_remote_quote(args.dashboard_service)} && "

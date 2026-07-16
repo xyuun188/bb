@@ -395,7 +395,7 @@ def test_server_monitor_ui_uses_dynamic_provider_label_and_endpoint_health() -> 
     assert "DeepSeek 14B / vLLM" not in source
     assert "const vllmInstanceCards = vllmRows.map(item =>" in source
     assert "item.label || item.provider_model || 'vLLM'" in source
-    assert "qwen3-32b-trade" in source
+    assert "qwen3-14b-trade" in source
     assert "deepseek-r1-14b-risk" in source
     assert "BB-FinQuant-Expert-14B" in source
     assert "runtimeEndpointSummary" in source

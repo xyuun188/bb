@@ -29,6 +29,7 @@ from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
+    _configure_single_row_inference,
     _leave_one_symbol_out_stability,
     _training_data_sha256,
     build_training_frame,
@@ -56,6 +57,15 @@ from services.training_data_quality import (
     MARKET_FACT_CONTRACT_VERSION,
     quality_report,
 )
+
+
+def test_loaded_local_ml_estimators_disable_parallel_single_row_inference() -> None:
+    estimator = SimpleNamespace(n_jobs=-1)
+    bundle = {"long_regressor": SimpleNamespace(named_steps={"model": estimator})}
+
+    _configure_single_row_inference(bundle)
+
+    assert estimator.n_jobs == 1
 
 
 def _with_return_objective(metadata: dict) -> dict:
@@ -1096,8 +1106,14 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     }
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
     service._ensure_loaded = lambda: ensure_load_calls.append("load")  # type: ignore[method-assign]
+    promotion_evidence: list[dict[str, object]] = []
+
+    def promote_candidate(evidence: dict[str, object]) -> SimpleNamespace:
+        promotion_evidence.append(evidence)
+        return SimpleNamespace(version="candidate-v1")
+
     service.artifact_registry = SimpleNamespace(
-        promote_candidate=lambda _evidence: SimpleNamespace(version="candidate-v1")
+        promote_candidate=promote_candidate
     )
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
@@ -1160,8 +1176,14 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     }
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
     service._ensure_loaded = lambda: ensure_load_calls.append("load")  # type: ignore[method-assign]
+    promotion_evidence: list[dict[str, object]] = []
+
+    def promote_candidate(evidence: dict[str, object]) -> SimpleNamespace:
+        promotion_evidence.append(evidence)
+        return SimpleNamespace(version="candidate-v1")
+
     service.artifact_registry = SimpleNamespace(
-        promote_candidate=lambda _evidence: SimpleNamespace(version="candidate-v1")
+        promote_candidate=promote_candidate
     )
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
@@ -1173,12 +1195,15 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     assert calls == [False, True]
     assert ensure_load_calls == ["load"]
     assert result["trained"] is True
-    assert result["reason"] == "trained_shadow_activated"
+    assert result["reason"] == "trained_canary_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["allow_live_position_influence"] is True
-    assert result["allow_live_position_influence"] is False
-    assert result["artifact_activation_stage"] == "shadow"
+    assert result["allow_live_position_influence"] is True
+    assert result["artifact_activation_stage"] == "canary"
+    assert result["live_enabled_sides"] == ["long", "short"]
+    assert promotion_evidence[0]["production_influence_authorized"] is True
+    assert promotion_evidence[0]["live_enabled_sides"] == ["long", "short"]
 
 
 def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -> None:

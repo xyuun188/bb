@@ -32,23 +32,6 @@ class _FakeRegistry:
         return _FakeDecisionMaker()
 
 
-@pytest.mark.asyncio
-
-
-@pytest.mark.asyncio
-
-
-
-
-
-
-
-
-
-
-@pytest.mark.asyncio
-
-
 def test_position_close_evidence_locks_small_profitable_weak_continuation_position() -> None:
     coordinator = EnsembleCoordinator(SimpleNamespace())
 

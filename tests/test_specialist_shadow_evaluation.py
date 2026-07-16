@@ -451,6 +451,22 @@ def test_specialist_shadow_only_evidence_can_never_promote() -> None:
     assert "authoritative_fee_after_return_lcb_not_positive" in model["promotion_blockers"]
 
 
+def test_specialist_report_bounds_event_rows_without_changing_full_window_metrics() -> None:
+    report = summarize_specialist_shadow_evaluation(
+        [_row(index=index, realized=0.4) for index in range(1, 35)]
+    )
+    model = next(
+        row
+        for row in report["models"]
+        if row["model"] == "google/timesfm-2.5-200m-pytorch"
+    )
+
+    assert model["shadow_event_count"] == 34
+    assert len(model["shadow_events"]) == 8
+    assert model["shadow_events_truncated"] is True
+    assert model["direction_count"] == 34
+
+
 def test_authoritative_return_is_not_assigned_to_opposite_prediction() -> None:
     report = summarize_specialist_shadow_evaluation(
         [_row(index=index, realized=0.4) for index in range(1, 35)],

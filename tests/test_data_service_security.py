@@ -35,10 +35,66 @@ def _service() -> DataService:
     service._derivatives_refresh_tasks = {}
     service._ticker_persisted_at = {}
     service._ticker_persist_inflight = set()
+    service._ticker_persist_semaphore = asyncio.Semaphore(
+        data_service_module.TICKER_PERSIST_CONCURRENCY
+    )
     service._available_symbols_cache = []
     service._available_symbols_cache_updated_at = None
     service._available_symbols_refresh_task = None
     return service
+
+
+@pytest.mark.asyncio
+async def test_ticker_persistence_is_bounded_below_database_pool_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    active_sessions = 0
+    peak_sessions = 0
+    persisted_symbols: list[str] = []
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> object:
+            nonlocal active_sessions, peak_sessions
+            active_sessions += 1
+            peak_sessions = max(peak_sessions, active_sessions)
+            await asyncio.sleep(0)
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            nonlocal active_sessions
+            await asyncio.sleep(0.01)
+            active_sessions -= 1
+
+    class FakeMarketRepository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def upsert_ticker(self, symbol: str, _payload: dict[str, Any]) -> None:
+            persisted_symbols.append(symbol)
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(data_service_module, "get_session_ctx", FakeSessionContext)
+    monkeypatch.setattr(data_service_module, "MarketRepository", FakeMarketRepository)
+
+    await asyncio.gather(
+        *(
+            service._persist_ticker_snapshot(
+                f"COIN{index}/USDT",
+                {
+                    "last_price": index + 1,
+                    "bid": index + 0.9,
+                    "ask": index + 1.1,
+                    "timestamp": "2026-07-16T00:00:00Z",
+                },
+            )
+            for index in range(40)
+        )
+    )
+
+    assert peak_sessions == data_service_module.TICKER_PERSIST_CONCURRENCY
+    assert peak_sessions < int(data_service_module.settings.database_pool_size)
+    assert len(persisted_symbols) == 40
 
 
 def test_indicator_snapshot_ignores_incomplete_latest_kline(
@@ -1031,6 +1087,38 @@ async def test_ticker_snapshot_refreshes_fresh_but_inconsistent_ws_cache() -> No
     assert snapshot["last_price"] == pytest.approx(0.5531)
     assert snapshot["source"] == "rest"
     assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5531)
+
+
+def test_last_trade_outside_current_book_is_not_cache_corruption() -> None:
+    service = _service()
+
+    issue = service._ticker_snapshot_consistency_issue(
+        {
+            "last_price": 0.5530,
+            "bid": 0.5531,
+            "ask": 0.5532,
+            "high_24h": 0.56,
+            "low_24h": 0.54,
+        }
+    )
+
+    assert issue is None
+
+
+@pytest.mark.asyncio
+async def test_market_batch_does_not_schedule_derivatives_refresh() -> None:
+    service = _service()
+    scheduled: list[str] = []
+    service._schedule_derivatives_background_refresh = scheduled.append  # type: ignore[method-assign]
+
+    result = await service._get_derivatives_snapshot(
+        "PROS/USDT",
+        block_on_remote=False,
+        allow_background_refresh=False,
+    )
+
+    assert result == {}
+    assert scheduled == []
 
 
 @pytest.mark.asyncio

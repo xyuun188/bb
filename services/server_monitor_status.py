@@ -23,6 +23,13 @@ import httpx
 import paramiko
 
 from config.settings import settings
+from core.phase3_model_contract import (
+    PHASE3_DECISION_MODEL_ID,
+    PHASE3_EXPERT_MODEL_ID,
+    PHASE3_PLATFORM_ENDPOINTS,
+    PHASE3_QUANT_API_ID,
+    PHASE3_RISK_MODEL_ID,
+)
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
 from core.server_monitor_probe import (
@@ -57,36 +64,36 @@ PLATFORM_SERVICE_NAMES = (
     "redis-server.service",
     "redis.service",
 )
-ONLINE_PHASE3_QUANT_API_PLATFORM_BASE = "http://127.0.0.1:18001"
+ONLINE_PHASE3_QUANT_API_PLATFORM_BASE = PHASE3_PLATFORM_ENDPOINTS[PHASE3_QUANT_API_ID]
 ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE = ONLINE_PHASE3_QUANT_API_PLATFORM_BASE
 ONLINE_PHASE3_DEFAULT_AI_MODELS = (
     {
         "name": "phase3_decision_maker",
         "label": "Phase 3 decision maker",
-        "api_base": "http://127.0.0.1:18000/v1",
-        "model": "qwen3-32b-trade",
+        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_DECISION_MODEL_ID],
+        "model": PHASE3_DECISION_MODEL_ID,
     },
     {
         "name": "phase3_high_risk_review",
         "label": "Phase 3 high-risk review",
-        "api_base": "http://127.0.0.1:18002/v1",
-        "model": "deepseek-r1-14b-risk",
+        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_RISK_MODEL_ID],
+        "model": PHASE3_RISK_MODEL_ID,
     },
     {
         "name": "phase3_finquant_expert",
         "label": "Phase 3 FinQuant expert",
-        "api_base": "http://127.0.0.1:18003/v1",
-        "model": "BB-FinQuant-Expert-14B",
+        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_EXPERT_MODEL_ID],
+        "model": PHASE3_EXPERT_MODEL_ID,
     },
 )
 ONLINE_PHASE3_TUNNEL_CONTRACTS = (
     {
-        "name": "qwen3-32b-trade",
+        "name": PHASE3_DECISION_MODEL_ID,
         "role": "decision_maker",
         "capability": "create_strategy",
         "local_port": 18_000,
-        "api_base": "http://127.0.0.1:18000/v1",
-        "model": "qwen3-32b-trade",
+        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_DECISION_MODEL_ID],
+        "model": PHASE3_DECISION_MODEL_ID,
     },
     {
         "name": "phase3-quant-api",
@@ -97,20 +104,20 @@ ONLINE_PHASE3_TUNNEL_CONTRACTS = (
         "model": "",
     },
     {
-        "name": "deepseek-r1-14b-risk",
+        "name": PHASE3_RISK_MODEL_ID,
         "role": "risk_review",
         "capability": "risk_review",
         "local_port": 18_002,
-        "api_base": "http://127.0.0.1:18002/v1",
-        "model": "deepseek-r1-14b-risk",
+        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_RISK_MODEL_ID],
+        "model": PHASE3_RISK_MODEL_ID,
     },
     {
-        "name": "BB-FinQuant-Expert-14B",
+        "name": PHASE3_EXPERT_MODEL_ID,
         "role": "expert_pool",
         "capability": "finquant_expert",
         "local_port": 18_003,
-        "api_base": "http://127.0.0.1:18003/v1",
-        "model": "BB-FinQuant-Expert-14B",
+        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_EXPERT_MODEL_ID],
+        "model": PHASE3_EXPERT_MODEL_ID,
     },
 )
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -959,9 +966,9 @@ def _platform_model_tunnel_summary(
             unavailable.append(row)
 
     by_name = {str(row.get("name") or ""): row for row in tunnels}
-    local_decision_available = bool(by_name.get("qwen3-32b-trade", {}).get("available"))
+    local_decision_available = bool(by_name.get(PHASE3_DECISION_MODEL_ID, {}).get("available"))
     can_call_decision = bool(decision_available or local_decision_available)
-    can_call_expert = bool(by_name.get("BB-FinQuant-Expert-14B", {}).get("available"))
+    can_call_expert = bool(by_name.get(PHASE3_EXPERT_MODEL_ID, {}).get("available"))
     can_call_quant_tool = bool(by_name.get("phase3-quant-api", {}).get("available"))
     blocker_codes = [
         f"tunnel_port_{int(row['local_port'])}_{str(row['status'] or 'unavailable')}"
@@ -1056,7 +1063,11 @@ def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict
     primary = next(
         (row for row in endpoint_rows if row.get("name") == "decision_maker"),
         next(
-            (row for row in endpoint_rows if row.get("provider_model") == "qwen3-32b-trade"),
+            (
+                row
+                for row in endpoint_rows
+                if row.get("provider_model") == PHASE3_DECISION_MODEL_ID
+            ),
             endpoint_rows[0] if endpoint_rows else {},
         ),
     )

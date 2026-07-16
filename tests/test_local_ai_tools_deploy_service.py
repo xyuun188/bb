@@ -9,10 +9,6 @@ import pytest
 
 from scripts import deploy_local_ai_tools_service as deploy
 from scripts.deploy_local_ai_tools_service import SERVICE_CODE
-from scripts.fix_local_ai_tools_service_path import (
-    normalize_remote_python_path,
-    render_local_ai_tools_service,
-)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -2207,31 +2203,3 @@ def test_phase3_quant_api_remote_smoke_checks_shadow_contract() -> None:
     assert "profit.get('production_permission') is False" in command
     assert "item.get('production_eligible') is False" in command
     assert "'loss_probability' in profit" in command
-
-
-def test_local_ai_tools_fix_service_uses_remote_posix_python_path() -> None:
-    service = render_local_ai_tools_service("/home/linux/anaconda3/envs/trade_ml/bin/python\n")
-
-    assert "Environment=PATH=/home/linux/anaconda3/envs/trade_ml/bin:" in service
-    assert (
-        "ExecStart=/home/linux/anaconda3/envs/trade_ml/bin/python -m uvicorn "
-        "local_ai_tools_api:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 5"
-    ) in service
-    assert "LimitNOFILE=65535" in service
-    assert "EnvironmentFile=-/data/trade_ai/local_ai_tools.env" in service
-    assert "LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true" in service
-    assert "qwen3-32b-main.service" in service
-    assert "\\home\\linux" not in service
-
-
-def test_normalize_remote_python_path_rejects_unsafe_values() -> None:
-    assert (
-        normalize_remote_python_path(
-            "\n/home/linux/anaconda3/envs/trade_ml/bin/python\n/usr/bin/python3\n"
-        )
-        == "/home/linux/anaconda3/envs/trade_ml/bin/python"
-    )
-    with pytest.raises(ValueError, match="absolute"):
-        normalize_remote_python_path("python3")
-    with pytest.raises(ValueError, match="unsupported"):
-        normalize_remote_python_path("/home/linux/bad path/python")

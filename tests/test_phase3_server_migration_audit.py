@@ -145,19 +145,20 @@ def test_phase3_server_migration_snapshot_ready() -> None:
     assert report["warnings"][0]["code"] == "legacy_data_paths_preserved"
 
 
-def test_phase3_server_migration_rejects_legacy_one_gpu_topology() -> None:
+def test_phase3_server_migration_accepts_current_carriers_but_requires_control_evidence() -> None:
     report = evaluate_phase3_server_snapshot(_old_takeover_snapshot())
     blocker_codes = {item["code"] for item in report["blockers"]}
 
     assert report["status"] == "blocked"
-    assert report["deployment_contract"] == "phase3_full_model_server"
+    assert report["deployment_contract"] == "evidence_driven_model_runtime"
     assert report["phase3_go_live_blocked"] is True
     assert "old_takeover" not in report
-    assert report["legacy_process_count"] == 2
+    assert report["legacy_process_count"] == 0
+    assert report["phase3_allowed_process_count"] == 3
     assert "resource_release_marker_missing" in blocker_codes
     assert "migration_manifest_missing" in blocker_codes
     assert "phase3_required_roots_missing" in blocker_codes
-    assert "legacy_processes_running" in blocker_codes
+    assert "legacy_processes_running" not in blocker_codes
 
 
 def test_phase3_server_migration_legacy_topology_also_blocks_32b_process() -> None:
@@ -173,10 +174,11 @@ def test_phase3_server_migration_legacy_topology_also_blocks_32b_process() -> No
     assert report["status"] == "blocked"
     assert report["phase3_go_live_blocked"] is True
     assert "legacy_processes_running" in blocker_codes
-    assert report["legacy_process_count"] == 3
+    assert report["legacy_process_count"] == 1
+    assert report["phase3_allowed_process_count"] == 3
 
 
-def test_phase3_server_migration_allows_phase3_vllm_under_data_bb() -> None:
+def test_phase3_server_migration_blocks_obsolete_32b_even_under_data_bb() -> None:
     snapshot = _ready_snapshot()
     process = (
         "324221 /data/BB/envs/phase3-quant/bin/python -m "
@@ -188,11 +190,11 @@ def test_phase3_server_migration_allows_phase3_vllm_under_data_bb() -> None:
 
     report = evaluate_phase3_server_snapshot(snapshot)
 
-    assert report["status"] == "ready"
-    assert report["phase3_go_live_blocked"] is False
-    assert report["legacy_process_count"] == 0
-    assert report["phase3_allowed_process_count"] == 1
-    assert report["phase3_allowed_processes"] == [process]
+    assert report["status"] == "blocked"
+    assert report["phase3_go_live_blocked"] is True
+    assert report["legacy_process_count"] == 1
+    assert report["phase3_allowed_process_count"] == 0
+    assert report["legacy_processes"] == [process]
 
 
 def test_phase3_server_migration_blocks_legacy_processes_outside_data_bb() -> None:

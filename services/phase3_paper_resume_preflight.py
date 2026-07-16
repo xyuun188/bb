@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.phase3_model_contract import PHASE3_REQUIRED_LLM_MODEL_IDS
 from core.safe_output import safe_error_text
 from executor.okx_executor import OKXExecutor
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
@@ -96,11 +98,7 @@ def _platform_model_runtime_ready(runtime: dict[str, Any]) -> bool:
     rows = [
         item for item in _safe_list(runtime.get("ai_models")) if isinstance(item, dict)
     ]
-    required = {
-        "qwen3-32b-trade",
-        "deepseek-r1-14b-risk",
-        "bb-finquant-expert-14b",
-    }
+    required = PHASE3_REQUIRED_LLM_MODEL_IDS
     available: set[str] = set()
     for row in rows:
         if not bool(row.get("available")):
@@ -541,25 +539,27 @@ class Phase3PaperResumePreflightService:
             self.okx_integrity_provider,
             self._default_okx_integrity,
         )
-        model_server = await self._collect(
-            "phase3_model_server_readiness",
-            self.model_server_provider,
-            self._default_model_server,
-        )
-        platform_runtime = await self._collect(
-            "platform_runtime",
-            self.platform_runtime_provider,
-            collect_platform_runtime_status,
-        )
-        platform_server = await self._collect(
-            "platform_server",
-            self.platform_server_provider,
-            self._default_platform_server,
-        )
-        specialist = await self._collect(
-            "specialist_shadow_evaluation",
-            self.specialist_shadow_provider,
-            self._default_specialist_shadow,
+        model_server, platform_runtime, platform_server, specialist = await asyncio.gather(
+            self._collect(
+                "phase3_model_server_readiness",
+                self.model_server_provider,
+                self._default_model_server,
+            ),
+            self._collect(
+                "platform_runtime",
+                self.platform_runtime_provider,
+                collect_platform_runtime_status,
+            ),
+            self._collect(
+                "platform_server",
+                self.platform_server_provider,
+                self._default_platform_server,
+            ),
+            self._collect(
+                "specialist_shadow_evaluation",
+                self.specialist_shadow_provider,
+                self._default_specialist_shadow,
+            ),
         )
         account_equity = await self._collect(
             "account_equity_truth",
