@@ -3661,6 +3661,7 @@ class TradingService:
         become stale while earlier symbols are analyzed. This keeps executable
         signals tied to a recent market snapshot.
         """
+        _ = fallback
         try:
             fresh = await asyncio.wait_for(
                 self._get_feature_vector_snapshot(
@@ -3675,19 +3676,30 @@ class TradingService:
                 timeout=8.0,
             )
             if self._is_valid_feature_vector(fresh):
-                return fresh
-            logger.warning("fresh feature vector invalid; using queued snapshot", symbol=symbol)
+                quality_policy = getattr(self, "entry_market_data_quality", None)
+                quality_issue = (
+                    quality_policy.issue(fresh, stage_label="AI分析前")
+                    if quality_policy is not None
+                    else None
+                )
+                if quality_issue is None:
+                    return fresh
+                logger.warning(
+                    "fresh feature vector failed entry market data quality; deferring symbol",
+                    symbol=symbol,
+                    diagnostic_code=getattr(quality_issue, "code", "market_data_quality"),
+                )
+                return None
+            logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
-            logger.warning(
-                "fresh feature vector refresh timed out; using queued snapshot", symbol=symbol
-            )
+            logger.warning("fresh feature vector refresh timed out; deferring symbol", symbol=symbol)
         except Exception as e:
             logger.warning(
-                "fresh feature vector refresh failed; using queued snapshot",
+                "fresh feature vector refresh failed; deferring symbol",
                 symbol=symbol,
                 error=safe_error_text(e),
             )
-        return fallback
+        return None
 
     async def _fresh_feature_vector_for_price_recheck(self, symbol: str) -> Any | None:
         try:

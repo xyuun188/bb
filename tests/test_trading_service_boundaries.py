@@ -802,6 +802,42 @@ async def test_final_market_candidate_refresh_blocks_on_complete_market_sources(
     }
 
 
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_defers_market_data_quality_failure() -> None:
+    service = TradingService.__new__(TradingService)
+    fresh = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        indicator_snapshot_available=False,
+    )
+    fallback = SimpleNamespace(
+        current_price=99.0,
+        close=99.0,
+        bid=98.9,
+        ask=99.1,
+        indicator_snapshot_available=True,
+    )
+
+    class QualityPolicy:
+        def issue(self, vector: Any, *, stage_label: str) -> Any:
+            assert vector is fresh
+            assert stage_label == "AI分析前"
+            return SimpleNamespace(code="short_cycle_features_missing")
+
+    async def feature_snapshot(symbol: str, **kwargs: Any) -> Any:
+        assert symbol == "ATOM/USDT"
+        return fresh
+
+    service.entry_market_data_quality = QualityPolicy()  # type: ignore[assignment]
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("ATOM/USDT", fallback)
+
+    assert result is None
+
+
 def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)

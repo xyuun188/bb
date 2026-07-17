@@ -582,6 +582,101 @@ async def test_indicator_snapshot_uses_cached_klines_before_okx_fetch(
 
 
 @pytest.mark.asyncio
+async def test_indicator_snapshot_does_not_wait_for_kline_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    persistence_started = asyncio.Event()
+    release_persistence = asyncio.Event()
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self,
+            symbol: str,
+            timeframe: str = "1h",
+            limit: int = 100,
+        ) -> list[list[float]]:
+            return [
+                [
+                    1_700_000_000_000 + index * 60_000,
+                    100.0,
+                    101.0,
+                    99.0,
+                    100.0 + index * 0.01,
+                    10.0,
+                ]
+                for index in range(limit)
+            ]
+
+    async def no_cache(symbol: str, timeframe: str, limit: int) -> list[list[float]]:
+        return []
+
+    async def slow_persist(symbol: str, timeframe: str, klines: list[Any]) -> None:
+        persistence_started.set()
+        await release_persistence.wait()
+
+    service.rest_client = FakeRestClient()
+    service._load_recent_cached_klines = no_cache  # type: ignore[method-assign]
+    service._persist_klines = slow_persist  # type: ignore[method-assign]
+    monkeypatch.setattr(data_service_module, "compute_all_indicators", lambda df: df)
+    monkeypatch.setattr(
+        data_service_module,
+        "extract_latest_features",
+        lambda df: {
+            "close": float(df["close"].iloc[-1]),
+            "returns_1": 0.001,
+            "returns_5": 0.002,
+            "returns_20": 0.003,
+            "volatility_20": 0.004,
+        },
+    )
+    monkeypatch.setattr(service, "_kline_anomaly_snapshot", lambda df: {"abnormal": 0})
+
+    features = await asyncio.wait_for(
+        service._get_indicator_snapshot("ATOM/USDT"),
+        timeout=0.3,
+    )
+
+    assert features["indicator_snapshot_available"] is True
+    assert features["short_returns_timeframe"] == "1m"
+    await asyncio.wait_for(persistence_started.wait(), timeout=0.2)
+    persistence_tasks = list(service._kline_persist_task_map().values())
+    assert persistence_tasks
+    release_persistence.set()
+    await asyncio.gather(*persistence_tasks)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_indicator_wait_keeps_shared_build_tracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    build_started = asyncio.Event()
+    release_build = asyncio.Event()
+
+    async def slow_build(symbol: str) -> dict[str, Any]:
+        assert symbol == "BTC/USDT"
+        build_started.set()
+        await release_build.wait()
+        return {"indicator_snapshot_available": True}
+
+    monkeypatch.setattr(service, "_build_indicator_snapshot", slow_build)
+
+    request = asyncio.create_task(service._get_indicator_snapshot("BTC/USDT"))
+    await asyncio.wait_for(build_started.wait(), timeout=0.2)
+    request.cancel()
+    await asyncio.gather(request, return_exceptions=True)
+
+    tracked = service._indicator_snapshot_tasks.get("BTC/USDT")
+    assert tracked is not None
+    assert tracked.done() is False
+    release_build.set()
+    await tracked
+    await asyncio.sleep(0)
+    assert "BTC/USDT" not in service._indicator_snapshot_tasks
+
+
+@pytest.mark.asyncio
 async def test_indicator_snapshot_nonblocking_returns_stale_cache_and_refreshes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

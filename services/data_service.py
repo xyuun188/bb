@@ -127,6 +127,7 @@ class DataService:
         )
         self._kline_fetch_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_background_refresh_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._kline_persist_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_refresh_scheduled_at: dict[tuple[str, str], datetime] = {}
         self._kline_persist_semaphore = asyncio.Semaphore(KLINE_PERSIST_CONCURRENCY)
         self._ticker_persist_semaphore = asyncio.Semaphore(TICKER_PERSIST_CONCURRENCY)
@@ -273,6 +274,7 @@ class DataService:
     async def stop(self) -> None:
         """Stop all data feed connections."""
         await self._stop_kline_coverage_refresh()
+        await self._stop_kline_persistence()
         await self.ws_client.close()
         await self.rest_client.close()
         await self.news_fetcher.close()
@@ -1351,11 +1353,17 @@ class DataService:
 
         task = asyncio.create_task(self._build_indicator_snapshot(normalized))
         tasks[normalized] = task
+
+        def cleanup(_task: asyncio.Task, refresh_symbol: str = normalized) -> None:
+            if tasks.get(refresh_symbol) is _task:
+                tasks.pop(refresh_symbol, None)
+
+        task.add_done_callback(cleanup)
         try:
             result = await asyncio.shield(task)
             return dict(result or {})
         finally:
-            if tasks.get(normalized) is task:
+            if task.done() and tasks.get(normalized) is task:
                 tasks.pop(normalized, None)
 
     def _indicator_snapshot_cache_map(self) -> dict[str, dict[str, Any]]:
@@ -1400,6 +1408,49 @@ class DataService:
         gate = asyncio.Semaphore(KLINE_PERSIST_CONCURRENCY)
         self._kline_persist_semaphore = gate
         return gate
+
+    def _kline_persist_task_map(self) -> dict[tuple[str, str], asyncio.Task]:
+        tasks = getattr(self, "_kline_persist_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._kline_persist_tasks = tasks
+        return tasks
+
+    def _schedule_kline_persistence(
+        self,
+        symbol: str,
+        timeframe: str,
+        klines: list,
+    ) -> None:
+        if not klines:
+            return
+        normalized = self._normalize_symbols([symbol])[0]
+        key = (normalized, timeframe)
+        tasks = self._kline_persist_task_map()
+        existing = tasks.get(key)
+        if existing and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._persist_klines(normalized, timeframe, klines))
+        tasks[key] = task
+
+        def cleanup(_task: asyncio.Task, persist_key: tuple[str, str] = key) -> None:
+            if tasks.get(persist_key) is _task:
+                tasks.pop(persist_key, None)
+
+        task.add_done_callback(cleanup)
+
+    async def _stop_kline_persistence(self) -> None:
+        tasks = list(self._kline_persist_task_map().values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._kline_persist_task_map().clear()
 
     def _kline_refresh_schedule_map(self) -> dict[tuple[str, str], datetime]:
         scheduled = getattr(self, "_kline_refresh_scheduled_at", None)
@@ -1526,7 +1577,7 @@ class DataService:
             async with gate:
                 kline_results = await asyncio.gather(
                     *(
-                        self._fetch_and_persist_klines(symbol, timeframe, limit)
+                        self._fetch_indicator_klines(symbol, timeframe, limit)
                         for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
                     ),
                     return_exceptions=True,
@@ -1744,6 +1795,35 @@ class DataService:
         timeframe: str,
         limit: int,
     ) -> list:
+        return await self._fetch_remote_klines_with_cache(
+            symbol,
+            timeframe,
+            limit,
+            persist_before_return=True,
+        )
+
+    async def _fetch_indicator_klines(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> tuple[str, list]:
+        rows = await self._fetch_remote_klines_with_cache(
+            symbol,
+            timeframe,
+            limit,
+            persist_before_return=False,
+        )
+        return timeframe, rows
+
+    async def _fetch_remote_klines_with_cache(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        *,
+        persist_before_return: bool,
+    ) -> list:
         try:
             timeout = max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 0.5)
             klines = await asyncio.wait_for(
@@ -1755,7 +1835,10 @@ class DataService:
                 timeout=timeout,
             )
             if klines:
-                await self._persist_klines(symbol, timeframe, klines)
+                if persist_before_return:
+                    await self._persist_klines(symbol, timeframe, klines)
+                else:
+                    self._schedule_kline_persistence(symbol, timeframe, klines)
                 return klines
             cached = await self._load_recent_cached_klines(symbol, timeframe, limit)
             return cached
