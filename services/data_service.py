@@ -1918,6 +1918,7 @@ class DataService:
             if (
                 isinstance(updated_at, datetime)
                 and (now - updated_at).total_seconds() <= DERIVATIVES_STALE_MAX_AGE_SECONDS
+                and not block_on_remote
             ):
                 if allow_background_refresh:
                     self._schedule_derivatives_background_refresh(normalized)

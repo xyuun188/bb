@@ -3666,8 +3666,11 @@ class TradingService:
                 self._get_feature_vector_snapshot(
                     symbol,
                     wait_for_sentiment=False,
-                    block_on_remote_indicators=False,
+                    block_on_remote_indicators=True,
                     block_on_remote_derivatives=True,
+                    allow_cached_indicator_build=False,
+                    allow_indicator_background_refresh=False,
+                    allow_derivatives_background_refresh=False,
                 ),
                 timeout=8.0,
             )

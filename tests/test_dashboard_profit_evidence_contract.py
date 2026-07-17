@@ -104,6 +104,94 @@ def test_missing_position_risk_contract_is_not_rendered_as_zero() -> None:
     }
 
 
+def test_current_management_archives_legacy_entry_evidence_gaps() -> None:
+    envelope = dashboard._dashboard_position_risk_envelope(
+        {
+            "current_management_contract": {
+                "contract_version": "2026-07-15.current-position-management.v1",
+                "management_eligible": True,
+                "blockers": [],
+            }
+        },
+        contracts=[],
+        blockers=["entry_decision_risk_contract_missing"],
+    )
+
+    assert envelope["available"] is False
+    assert envelope["effective_available"] is True
+    assert envelope["current_management_authoritative"] is True
+    assert envelope["historical_entry_incomplete"] is True
+    assert envelope["blockers"] == []
+    assert envelope["historical_blockers"] == ["entry_decision_risk_contract_missing"]
+    assert "旧版已归档" in SCRIPT
+    assert "旧版入场合同缺口已保留" in SCRIPT
+    assert "OKX 原生保护单（无需本地关联）" in SCRIPT
+
+
+@pytest.mark.asyncio
+async def test_split_dashboard_uses_lightweight_executor_for_oco_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle: list[str] = []
+
+    class LightweightExecutor:
+        def __init__(self, *, mode: str, load_markets_on_initialize: bool) -> None:
+            assert mode == "paper"
+            assert load_markets_on_initialize is False
+
+        async def initialize(self) -> None:
+            lifecycle.append("initialize")
+
+        async def shutdown(self) -> None:
+            lifecycle.append("shutdown")
+
+        async def get_positions_strict(self) -> list[dict]:
+            return [
+                {
+                    "symbol": "EDGE/USDT",
+                    "side": "long",
+                    "contracts": "2",
+                    "info": {"instId": "EDGE-USDT-SWAP", "pos": "2"},
+                }
+            ]
+
+        async def get_position_protection_orders(self) -> list[dict]:
+            return [
+                {
+                    "symbol": "EDGE/USDT",
+                    "position_side": "long",
+                    "algo_id": "oco-edge-fallback",
+                    "contracts": "2",
+                    "reduce_only": True,
+                    "state": "live",
+                    "order_type": "oco",
+                    "stop_loss_price": 96.0,
+                    "take_profit_price": 112.0,
+                    "created_at_ms": 1,
+                }
+            ]
+
+        async def get_open_orders_strict(self) -> list[dict]:
+            return []
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "OKXExecutor", LightweightExecutor)
+    rows = [{"symbol": "EDGE/USDT", "side": "long"}]
+
+    inventory = await dashboard._dashboard_open_position_protection_evidence(
+        rows,
+        mode="paper",
+    )
+
+    assert lifecycle == ["initialize", "shutdown"]
+    assert inventory["available"] is True
+    assert inventory["blockers"] == []
+    assert rows[0]["protection_contract"]["available"] is True
+    assert rows[0]["protection_contract"]["orders"][0]["algo_id"] == (
+        "oco-edge-fallback"
+    )
+
+
 def test_prediction_economics_reads_persisted_distribution_and_cost_once() -> None:
     raw = {
         "opportunity_score": {

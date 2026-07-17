@@ -14,7 +14,7 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symb
 
 MARKET_FACT_SCHEMA_VERSION = "2026-07-14.okx-native-market-fact.v1"
 MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
-MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-16.okx-source-consistency.v2"
+MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-17.okx-source-consistency.v4"
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -462,6 +462,59 @@ def build_market_source_consistency(
         max(float(item["bid"]) for item in valid_intervals)
         <= min(float(item["ask"]) for item in valid_intervals) + (_safe_float(tick_size, 0.0) or 0.0)
     )
+    quote_timestamps = [
+        timestamp
+        for item in valid_intervals
+        if (timestamp := _timestamp_ms(item.get("source_timestamp_ms"))) is not None
+    ]
+    quote_time_span_ms = (
+        max(quote_timestamps) - min(quote_timestamps)
+        if len(quote_timestamps) == len(valid_intervals) and quote_timestamps
+        else None
+    )
+    quote_gap = max(
+        max((float(item["bid"]) for item in valid_intervals), default=0.0)
+        - min((float(item["ask"]) for item in valid_intervals), default=0.0),
+        0.0,
+    )
+    max_interval_spread = max(
+        (
+            float(item["ask"]) - float(item["bid"])
+            for item in valid_intervals
+        ),
+        default=0.0,
+    )
+    quote_reference_price = (
+        sum(
+            (float(item["bid"]) + float(item["ask"])) / 2.0
+            for item in valid_intervals
+        )
+        / len(valid_intervals)
+        if valid_intervals
+        else 0.0
+    )
+    source_skew_tolerance = (
+        quote_reference_price * 0.0005 * (quote_time_span_ms / 1_000.0)
+        if quote_time_span_ms is not None
+        else 0.0
+    )
+    relative_tolerance_cap = quote_reference_price * 0.001
+    temporal_quote_tolerance = min(
+        max(
+            max_interval_spread * 1.5,
+            (_safe_float(tick_size, 0.0) or 0.0),
+            source_skew_tolerance,
+        ),
+        relative_tolerance_cap,
+    )
+    quotes_temporally_reconciled = bool(
+        not quotes_overlap
+        and quote_time_span_ms is not None
+        and quote_time_span_ms <= 2_000
+        and temporal_quote_tolerance > 0
+        and quote_gap <= temporal_quote_tolerance
+    )
+    quotes_reconciled = quotes_overlap or quotes_temporally_reconciled
 
     normalized_bars = [bar for row in bars if (bar := _bar_payload(row)) is not None]
     normalized_bars.sort(key=lambda item: item["open_time_ms"])
@@ -525,12 +578,12 @@ def build_market_source_consistency(
     executable_quotes_verified = bool(
         valid_intervals
         and len(valid_intervals) == len(intervals)
-        and (quotes_overlap or prices_within_path)
+        and (quotes_reconciled or prices_within_path)
     )
     if not executable_quotes_verified:
         reasons.append("executable_quote_sources_not_reconciled")
 
-    native_quote_continuity = bool(quotes_overlap and tick_alignment_verified)
+    native_quote_continuity = bool(quotes_reconciled and tick_alignment_verified)
     market_continuity_verified = bool(native_quote_continuity or prices_within_path)
     if native_quote_continuity:
         reference_warnings.extend(path_reasons)
@@ -585,6 +638,15 @@ def build_market_source_consistency(
         ],
         "executable_intervals": valid_intervals,
         "quotes_overlap": quotes_overlap,
+        "quotes_temporally_reconciled": quotes_temporally_reconciled,
+        "quote_reconciliation": {
+            "time_span_ms": quote_time_span_ms,
+            "gap": quote_gap,
+            "tolerance": temporal_quote_tolerance,
+            "max_interval_spread": max_interval_spread,
+            "source_skew_tolerance": source_skew_tolerance,
+            "relative_tolerance_cap": relative_tolerance_cap,
+        },
         "path": {
             "source": "okx_native_swap_candles_1m",
             "bar_count": len(normalized_bars),
@@ -594,7 +656,9 @@ def build_market_source_consistency(
             "observed_prices_within_path": prices_within_path,
             "continuity_accepted_via": (
                 "native_executable_quote_overlap"
-                if native_quote_continuity and not prices_within_path
+                if quotes_overlap and native_quote_continuity and not prices_within_path
+                else "native_executable_quote_temporal_reconciliation"
+                if quotes_temporally_reconciled and not prices_within_path
                 else "native_one_minute_path"
                 if prices_within_path
                 else ""

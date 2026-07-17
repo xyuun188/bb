@@ -236,6 +236,64 @@ def test_current_candle_lag_is_warning_when_native_executable_quotes_overlap() -
     ) == []
 
 
+def test_subsecond_native_quote_movement_uses_spread_bounded_reconciliation() -> None:
+    timestamp = 1_783_990_859_000
+    rest = build_market_fact(
+        "ROBO/USDT",
+        _snapshot(2.23360, timestamp),
+        contract_spec=_spec(),
+    )
+    websocket = build_market_fact(
+        "ROBO/USDT",
+        {
+            **_snapshot(2.23360, timestamp),
+            "source": "websocket",
+            "source_endpoint": "okx_ws_public",
+        },
+        contract_spec=_spec(),
+    )
+    auxiliary = _source_consistency_auxiliary(timestamp, 2.23435)
+    auxiliary["orderbook_fact"].update(
+        {
+            "source_timestamp_ms": timestamp + 650,
+            "bid": 2.23410,
+            "ask": 2.23411,
+        }
+    )
+
+    contract = build_market_source_consistency(
+        rest,
+        [websocket],
+        **auxiliary,
+        bars=[[timestamp, 2.23320, 2.23361, 2.23310, 2.23360, 10_000]],
+    )
+
+    assert contract["quotes_overlap"] is False
+    assert contract["quotes_temporally_reconciled"] is True
+    assert contract["quote_reconciliation"]["time_span_ms"] == 650
+    assert contract["quote_reconciliation"]["source_skew_tolerance"] > contract[
+        "quote_reconciliation"
+    ]["gap"]
+    assert contract["path"]["observed_prices_within_path"] is False
+    assert contract["path"]["continuity_accepted_via"] == (
+        "native_executable_quote_temporal_reconciliation"
+    )
+    assert contract["status"] == "clean"
+    assert contract["reasons"] == []
+    assert "observed_price_outside_recent_native_path" in contract["reference_warnings"]
+
+    auxiliary["orderbook_fact"]["source_timestamp_ms"] = timestamp + 2_500
+    stale_contract = build_market_source_consistency(
+        rest,
+        [websocket],
+        **auxiliary,
+        bars=[[timestamp, 2.23320, 2.23361, 2.23310, 2.23360, 10_000]],
+    )
+    assert stale_contract["quotes_temporally_reconciled"] is False
+    assert stale_contract["status"] == "quarantined"
+    assert "executable_quote_sources_not_reconciled" in stale_contract["reasons"]
+
+
 def test_missing_index_reference_is_visible_without_corrupting_swap_path() -> None:
     timestamp = 1_783_990_800_000
     rest = build_market_fact(

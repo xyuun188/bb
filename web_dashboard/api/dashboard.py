@@ -2358,11 +2358,11 @@ async def _dashboard_open_position_risk_evidence(
     }
     if not position_ids:
         for item in positions:
-            item["risk_contract"] = {
-                "available": False,
-                "contracts": [],
-                "blockers": ["local_position_lineage_missing"],
-            }
+            item["risk_contract"] = _dashboard_position_risk_envelope(
+                item,
+                contracts=[],
+                blockers=["local_position_lineage_missing"],
+            )
         return
 
     async with get_session_ctx() as session:
@@ -2453,14 +2453,41 @@ async def _dashboard_open_position_risk_evidence(
         )
         if not contracts and not blockers:
             blockers.append("entry_decision_risk_contract_missing")
-        item["risk_contract"] = {
-            "available": bool(contracts) and all(
-                contract.get("available") is True for contract in contracts
-            ),
-            "contract_count": len(contracts),
-            "contracts": contracts,
-            "blockers": list(dict.fromkeys(blockers)),
-        }
+        item["risk_contract"] = _dashboard_position_risk_envelope(
+            item,
+            contracts=contracts,
+            blockers=blockers,
+        )
+
+
+def _dashboard_position_risk_envelope(
+    position: dict[str, Any],
+    *,
+    contracts: list[dict[str, Any]],
+    blockers: list[str],
+) -> dict[str, Any]:
+    historical_blockers = list(dict.fromkeys(value for value in blockers if value))
+    entry_available = bool(contracts) and all(
+        contract.get("available") is True for contract in contracts
+    )
+    management = _safe_dict(position.get("current_management_contract"))
+    management_blockers = [
+        value for value in _safe_list(management.get("blockers")) if value
+    ]
+    current_management_authoritative = bool(management.get("contract_version")) and (
+        management.get("management_eligible") is True and not management_blockers
+    )
+    historical_entry_incomplete = not entry_available
+    return {
+        "available": entry_available,
+        "effective_available": entry_available or current_management_authoritative,
+        "current_management_authoritative": current_management_authoritative,
+        "historical_entry_incomplete": historical_entry_incomplete,
+        "contract_count": len(contracts),
+        "contracts": contracts,
+        "blockers": [] if current_management_authoritative else historical_blockers,
+        "historical_blockers": historical_blockers if historical_entry_incomplete else [],
+    }
 
 
 async def _dashboard_open_position_protection_evidence(
@@ -2472,23 +2499,23 @@ async def _dashboard_open_position_protection_evidence(
 
     selected_mode = "live" if mode == "live" else "paper"
     executor = _dashboard_okx_executor_for_mode(selected_mode)
-    if executor is None:
-        for item in positions:
-            item["protection_contract"] = {
-                "available": False,
-                "orders": [],
-                "blockers": ["okx_executor_unavailable"],
-            }
-        return {
-            "available": False,
-            "blockers": ["okx_executor_unavailable"],
-            "orphan_keys": [],
-            "split_coverage_keys": [],
-        }
+    owns_executor = executor is None
+    if owns_executor:
+        executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
 
     try:
+        if owns_executor:
+            await asyncio.wait_for(
+                executor.initialize(),
+                timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
+            )
+        positions_coro = (
+            _fetch_dashboard_okx_positions_uncached(selected_mode, executor=executor)
+            if owns_executor
+            else _fetch_dashboard_okx_positions(selected_mode)
+        )
         raw_positions, protection_orders, pending_orders = await asyncio.gather(
-            _fetch_dashboard_okx_positions(selected_mode),
+            positions_coro,
             asyncio.wait_for(
                 executor.get_position_protection_orders(),
                 timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
@@ -2519,6 +2546,16 @@ async def _dashboard_open_position_protection_evidence(
             "orphan_keys": [],
             "split_coverage_keys": [],
         }
+    finally:
+        if owns_executor:
+            try:
+                await executor.shutdown()
+            except Exception as exc:
+                _log_dashboard_fallback(
+                    "dashboard okx protection fallback shutdown failed",
+                    exc,
+                    mode=selected_mode,
+                )
 
     orders_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for order in _safe_list(audit.get("protection_orders")):

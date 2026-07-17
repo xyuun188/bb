@@ -775,6 +775,33 @@ def test_market_scope_skips_pending_exit_recovery_before_ai() -> None:
     assert TradingService._should_recover_pending_exits_for_scope("full") is True
 
 
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_blocks_on_complete_market_sources() -> None:
+    service = TradingService.__new__(TradingService)
+    received: dict[str, Any] = {}
+    vector = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
+
+    async def feature_snapshot(symbol: str, **kwargs: Any) -> Any:
+        received["symbol"] = symbol
+        received.update(kwargs)
+        return vector
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT")
+
+    assert result is vector
+    assert received == {
+        "symbol": "BTC/USDT",
+        "wait_for_sentiment": False,
+        "block_on_remote_indicators": True,
+        "block_on_remote_derivatives": True,
+        "allow_cached_indicator_build": False,
+        "allow_indicator_background_refresh": False,
+        "allow_derivatives_background_refresh": False,
+    }
+
+
 def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)

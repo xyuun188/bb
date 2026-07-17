@@ -4311,6 +4311,7 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     authoritative_profit_factor_below_unity: '权威成交盈亏比低于自然盈亏平衡线 1',
     child_endpoint_contract_missing_or_not_ready: '量化子接口尚未返回就绪契约',
     legacy_data_paths_preserved: '旧数据路径按策略只读隔离保留，不影响当前运行',
+    historical_entry_contract_incomplete_preserved: '旧版入场合同缺口已保留',
     deterministic_position_order_match: '历史仓位与订单可确定匹配，等待受控补链',
     missing_matching_entry_order: '历史仓位缺少可确认的开仓订单链接',
     missing_matching_close_order: '历史仓位缺少可确认的平仓订单链接',
@@ -8216,7 +8217,8 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             `data-side="${escHtml(p.side || '')}"`,
             'title="手动平掉该持仓"',
         ].filter(Boolean).join(' ');
-        const riskBlockers = Array.isArray(p.risk_contract?.blockers) ? p.risk_contract.blockers : [];
+        const riskEnvelope = p.risk_contract || {};
+        const riskBlockers = Array.isArray(riskEnvelope.blockers) ? riskEnvelope.blockers : [];
         const protectionBlockers = Array.isArray(p.protection_contract?.blockers) ? p.protection_contract.blockers : [];
         const management = p.current_management_contract || {};
         const managementBlockers = Array.isArray(management.blockers) ? management.blockers : [];
@@ -8225,7 +8227,9 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             && !managementBlockers.length
             && !protectionBlockers.length;
         const evidenceLabel = evidenceReady
-            ? (riskBlockers.length ? '接管/OCO 完整' : '风险/OCO 完整')
+            ? (riskEnvelope.current_management_authoritative === true && riskEnvelope.available !== true
+                ? '接管/OCO 完整'
+                : '风险/OCO 完整')
             : '存在证据阻断';
         return `
         <tr>
@@ -8337,6 +8341,8 @@ function openPositionEvidenceModal(positionIndex) {
     const protection = position.protection_contract || {};
     const protectionOrders = Array.isArray(protection.orders) ? protection.orders : [];
     const inventory = state.protectionInventory || {};
+    const historicalEntryArchived = riskEnvelope.historical_entry_incomplete === true
+        && riskEnvelope.current_management_authoritative === true;
     const title = document.getElementById('position-linked-orders-modal-title');
     const body = document.getElementById('position-linked-orders-modal-body');
     const overlay = document.getElementById('position-linked-orders-modal-overlay');
@@ -8363,16 +8369,21 @@ function openPositionEvidenceModal(positionIndex) {
                     <div><span>当前止盈</span><strong>${management.take_profit_price == null ? '证据缺失' : fmtPrice(management.take_profit_price)}</strong></div>
                     <div><span>允许扩大仓位</span><strong>${management.can_expand_position === false ? '禁止' : '证据缺失'}</strong></div>
                     <div><span>允许提高杠杆</span><strong>${management.can_increase_leverage === false ? '禁止' : '证据缺失'}</strong></div>
-                    <div><span>历史入场状态</span><strong>${escHtml(management.original_entry_contract_status || '证据缺失')}</strong></div>
-                    <div><span>允许动作</span><strong>${managementActions.length ? managementActions.map(item => escHtml(item)).join(' / ') : '证据缺失'}</strong></div>
+                    <div><span>历史入场状态</span><strong>${escHtml(dashboardReasonText(management.original_entry_contract_status || 'unavailable'))}</strong></div>
+                    <div><span>允许动作</span><strong>${managementActions.length ? managementActions.map(item => escHtml(({ hold: '保持', reduce: '减仓', close: '平仓', protection_repair: '修复保护单' })[item] || dashboardReasonText(item))).join(' / ') : '未授权任何动作'}</strong></div>
                 </div>
                 <div class="position-evidence-provenance"><span>版本 ${escHtml(management.contract_version || '缺失')}</span><span>接管时间 ${escHtml(management.takeover_at || '缺失')}</span><span>指纹 ${escHtml(management.policy_provenance?.contract_fingerprint || '缺失')}</span></div>
                 ${positionEvidenceBlockers(managementBlockers)}
             </article>`
         : '<div class="position-evidence-empty">当前仓位尚未生成只减仓接管合同。</div>';
 
-    const riskHtml = contracts.length
-        ? contracts.map(contract => {
+    const archivedDecisionIds = contracts
+        .map(contract => contract.decision_id)
+        .filter(Boolean);
+    const riskHtml = historicalEntryArchived
+        ? `<div class="position-evidence-empty">该持仓创建于独立风险合同上线前，旧版入场证据已归档${archivedDecisionIds.length ? `（历史决策 #${archivedDecisionIds.map(item => escHtml(item)).join(' / #')}）` : ''}；当前只减仓接管合同与 OKX 保护证据继续作为有效管理依据。</div>`
+        : contracts.length
+            ? contracts.map(contract => {
             const portfolio = contract.portfolio_risk_snapshot || {};
             const adjustments = Array.isArray(contract.adjustment_reasons)
                 ? contract.adjustment_reasons : [];
@@ -8400,8 +8411,8 @@ function openPositionEvidenceModal(positionIndex) {
                     <div class="position-evidence-provenance"><span>版本 ${escHtml(contract.contract_version || '缺失')}</span><span>指纹 ${escHtml(contract.policy_provenance?.contract_fingerprint || '缺失')}</span></div>
                     ${positionEvidenceBlockers(contract.blockers)}
                 </article>`;
-        }).join('')
-        : `<div class="position-evidence-empty">无法追溯入场订单对应的独立风险合同。${positionEvidenceBlockers(riskEnvelope.blockers)}</div>`;
+            }).join('')
+            : `<div class="position-evidence-empty">无法追溯入场订单对应的独立风险合同。${positionEvidenceBlockers(riskEnvelope.blockers)}</div>`;
 
     const protectionHtml = protectionOrders.length
         ? protectionOrders.map(order => `
@@ -8412,7 +8423,7 @@ function openPositionEvidenceModal(positionIndex) {
                 <div><span>止盈触发价</span><strong>${order.take_profit_price == null ? '证据缺失' : fmtPrice(order.take_profit_price)}</strong></div>
                 <div><span>移动触发价</span><strong>${order.trigger_price == null ? '未设置' : fmtPrice(order.trigger_price)}</strong></div>
                 <div><span>保护合约数</span><strong>${positionEvidenceValue(order.contracts)}</strong></div>
-                <div><span>关联订单 ID</span><strong>${escHtml(order.linked_order_id || '证据缺失')}</strong></div>
+                <div><span>关联订单 ID</span><strong>${escHtml(order.linked_order_id || 'OKX 原生保护单（无需本地关联）')}</strong></div>
                 <div><span>唯一性</span><strong>${protection.unique ? '唯一一张' : protection.split_coverage ? `精确分片 ${protection.order_count ?? protectionOrders.length} 张` : `异常多张 ${protection.order_count ?? protectionOrders.length} 张`}</strong></div>
             </article>`).join('')
         : '<div class="position-evidence-empty">没有加载到该持仓的 OKX 原生 OCO/止盈止损保护单。</div>';
@@ -8424,7 +8435,7 @@ function openPositionEvidenceModal(positionIndex) {
             <div><strong>${positionEvidenceValue(position.quantity)}</strong><span>持仓数量</span></div>
             <div><strong>${positionEvidenceValue(position.unrealized_pnl, ' U')}</strong><span>当前浮盈亏</span></div>
             <div><strong>${management.management_eligible === true ? '有效' : '阻断'}</strong><span>当前接管</span></div>
-            <div><strong>${riskEnvelope.available === true ? '完整' : '历史缺口'}</strong><span>入场合同</span></div>
+            <div><strong>${riskEnvelope.available === true ? '完整' : historicalEntryArchived ? '旧版已归档' : '历史缺口'}</strong><span>入场合同</span></div>
             <div><strong>${protection.available === true ? `${protection.order_count ?? 0} 张` : '读取失败'}</strong><span>OKX 保护</span></div>
         </div>
         ${positionEvidenceBlockers([...(management.blockers || []), ...(protection.blockers || [])])}

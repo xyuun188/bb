@@ -3,13 +3,13 @@
 This repository has a project-specific Hindsight memory bank:
 
 - Bank ID: `bb`
-- Project root: `F:\bb`
+- Project root: `E:\code\bb`
 - Scope: only memories about this project. Do not store this project's memories in `codex` or another project bank.
 - Hindsight API/MCP base: `http://45.207.197.48:18888`
-- Hindsight MCP endpoint: `http://45.207.197.48:18888/mcp/`
+- Hindsight MCP endpoint: `http://45.207.197.48:18888/mcp/bb/`
 - Hindsight control panel: `http://45.207.197.48:19999/zh-CN`
 
-Use the persistent CODEX++ MCP server `hindsight_bb` for this repository. The old `.codex-memory` scripts are not present in this checkout and must not be called.
+Use the project-level MCP server `hindsight_bb` for this repository. The old `.codex-memory` scripts are not present in this checkout and must not be called.
 
 At the beginning of a session, do not run broad live recall by default. Use `hindsight_bb.recall` only when current context is needed, with `budget="low"` and a small `max_tokens` limit first. Escalate to broader recall only when the user explicitly asks for deeper historical context.
 
@@ -28,7 +28,7 @@ python scripts/sync_to_online_server.py --split-services
 
 Use narrower options such as `--skip-restart`, `--include-tests`, or `--only` only when the task explicitly calls for staged validation.
 
-3. Commit and push the change to GitHub from `F:\BB`:
+3. Commit and push the change to GitHub from `E:\code\bb`:
 
 ```powershell
 rtk git status --short
@@ -38,6 +38,8 @@ rtk git push origin main
 ```
 
 4. Update project memory for meaningful durable facts with the online `bb` Hindsight bank. Prefer `hindsight_bb` MCP when available; otherwise use the remote endpoint `http://45.207.197.48:18888/mcp/bb/` or the Hindsight API at `http://45.207.197.48:18888`. Never store secrets. Do not call `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; that local sync script is not part of this setup.
+
+After completing work that creates durable knowledge, call `hindsight_bb.retain` once with a concise summary. Store architecture decisions, setup steps, important paths, service ports, verified fixes, and non-obvious debugging results. Do not retain secrets, temporary guesses, noisy logs, or casual conversation.
 
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
@@ -182,7 +184,7 @@ Overall average: **60-90% token reduction** on common development operations.
 For this repository, use the project-specific Hindsight MCP server `hindsight_bb` and bank `bb` automatically.
 Hindsight reads and writes must use `http://45.207.197.48:18888/mcp/bb/` by default.
 
-Do not run old `D:\code\Hindsight\codex_memory_*.ps1` scripts. Do not run `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; that local sync path is obsolete for this project. Project memory lives on the online Hindsight service, with project bank `bb` at `http://45.207.197.48:18888/mcp/bb/`.
+Do not run old `D:\code\Hindsight\codex_memory_*.ps1` scripts or `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; those paths belong to earlier machines. Persist durable changes with `hindsight_bb.retain` through the project-level MCP server.
 
 Only call live recall when it is needed for the current task. Prefer `hindsight_bb.recall` with `budget="low"` and `max_tokens` around `1200` first; avoid `budget="high"` at session start because it commonly takes 30+ seconds on this remote Hindsight server.
 
@@ -191,7 +193,7 @@ Keep all memories for this repository in `bb`; do not store this project's facts
 ## Project Tooling
 
 - Semble is available globally through the Codex MCP server. Use Semble first for semantic code discovery in this project.
-- Use mcp__semble.search with repo="F:\\bb" for broad codebase questions.
+- Use mcp__semble.search with repo="E:\\code\\bb" for broad codebase questions.
 - If the current Codex session has not hot-loaded `mcp__semble`, use the local CLI fallback before broad `rg`/file reads:
 
 ```powershell
@@ -202,7 +204,7 @@ $env:SEMBLE_MODEL_NAME='F:\SemblevsRTK\models\potion-code-16M'
 ```
 
 - For any request asking "where", "how", architecture flow, similar code, risk/strategy/service relationships, or unknown symbols, run Semble search first and use returned file locations to narrow follow-up reads.
-- Codebase Memory MCP is available globally as `codebase_memory`; use repo path `F:\BB` for indexing, architecture queries, call-path tracing, code snippets, graph searches, and change detection.
+- Codebase Memory MCP is available globally as `codebase_memory`; use repo path `E:\code\bb` for indexing, architecture queries, call-path tracing, code snippets, graph searches, and change detection.
 - `Codex-CodebaseMemory-AutoIndex` refreshes this project's Codebase Memory graph every 30 minutes and at logon. Already-open Codex sessions cannot hot-load native MCP tools; use the fallback script `C:\Users\Administrator\.codex\codebase-memory\invoke-codebase-memory-tool.ps1` if needed.
 - Treat Codebase Memory as structural code intelligence. Keep durable project decisions and preferences in `hindsight_bb`, not in another project's memory bank.
 - RTK is available globally from F:\SemblevsRTK\bin\rtk.exe. Prefer RTK for supported shell commands that produce large output.

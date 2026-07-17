@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -1119,6 +1119,32 @@ async def test_market_batch_does_not_schedule_derivatives_refresh() -> None:
 
     assert result == {}
     assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_blocking_derivatives_read_refreshes_stale_cache() -> None:
+    service = _service()
+    service._derivatives_update_interval = 20.0
+    service._derivatives_cache["PROS/USDT"] = {
+        "updated_at": datetime.now(UTC) - timedelta(seconds=30),
+        "data": {"funding_rate": 0.001},
+    }
+    refresh_calls: list[str] = []
+
+    async def refresh(symbol: str) -> dict[str, Any]:
+        refresh_calls.append(symbol)
+        return {"funding_rate": 0.002, "source": "fresh_rest"}
+
+    service._refresh_derivatives_snapshot = refresh  # type: ignore[method-assign]
+
+    result = await service._get_derivatives_snapshot(
+        "PROS/USDT",
+        block_on_remote=True,
+    )
+
+    assert refresh_calls == ["PROS/USDT"]
+    assert result == {"funding_rate": 0.002, "source": "fresh_rest"}
+    assert "derivatives_snapshot_stale" not in result
 
 
 @pytest.mark.asyncio
