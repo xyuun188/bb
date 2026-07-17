@@ -6,6 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_price_guard import EntryPriceGuardPolicy
+from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
 
 
 def _decision(*, return_lcb: float = 0.6, expected_net: float = 0.8) -> DecisionOutput:
@@ -105,6 +106,59 @@ async def test_missing_authoritative_return_budget_fails_closed() -> None:
         _decision(return_lcb=0.0, expected_net=9.0)
     )
     assert "return budget is missing" in reason
+
+
+@pytest.mark.asyncio
+async def test_paper_canary_uses_empirical_distribution_drift_budget_only_in_paper() -> None:
+    decision = _decision(return_lcb=0.0, expected_net=-1.0)
+    decision.raw_response["paper_bootstrap_canary"] = {
+        "version": PAPER_BOOTSTRAP_CANARY_VERSION,
+        "authorized": True,
+        "requested": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "source_sample_count": 1200,
+        "selected_observation": {
+            "objective_expected_return_pct": -1.0,
+            "lower_quantile_return_pct": -1.5,
+            "dispersion_pct": 0.8,
+        },
+    }
+
+    assert await _policy(latest=100.2).guard_reason(decision, "paper") is None
+    price_check = decision.raw_response["pre_execution_price_check"]
+    assert price_check["allowed_adverse_move_fraction"] == pytest.approx(0.005)
+    assert price_check["contract_lifecycle"] == "paper_bootstrap_canary"
+    assert price_check["production_permission"] is False
+
+    live_decision = _decision(return_lcb=0.0, expected_net=-1.0)
+    live_decision.raw_response["paper_bootstrap_canary"] = dict(
+        decision.raw_response["paper_bootstrap_canary"]
+    )
+    reason = await _policy(latest=100.0).guard_reason(live_decision, "live")
+    assert "fee-after return budget is missing" in reason
+
+
+@pytest.mark.asyncio
+async def test_paper_canary_rejects_drift_beyond_empirical_uncertainty_band() -> None:
+    decision = _decision(return_lcb=0.0, expected_net=-1.0)
+    decision.raw_response["paper_bootstrap_canary"] = {
+        "version": PAPER_BOOTSTRAP_CANARY_VERSION,
+        "authorized": True,
+        "requested": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "source_sample_count": 1200,
+        "selected_observation": {
+            "objective_expected_return_pct": -1.0,
+            "lower_quantile_return_pct": -1.5,
+            "dispersion_pct": 0.8,
+        },
+    }
+
+    reason = await _policy(latest=100.6).guard_reason(decision, "paper")
+
+    assert "exceeds" in reason
 
 
 @pytest.mark.asyncio

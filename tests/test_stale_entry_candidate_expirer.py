@@ -16,6 +16,7 @@ from services.stale_entry_candidate_expirer import (
     STALE_ENTRY_MAINTENANCE_BATCH_LIMIT,
     STALE_ENTRY_MAINTENANCE_LOOKBACK,
     StaleEntryCandidateExpirer,
+    _stale_entry_row_from_mapping,
     action_label,
     is_pending_execution_reason,
     pending_execution_failed_reason,
@@ -179,6 +180,83 @@ async def test_stale_candidate_loader_bounds_one_background_batch() -> None:
     compiled_open_state = statements[1].compile()
     assert "ai_decisions.created_at >=" in str(compiled_open_state)
     assert since in compiled_open_state.params.values()
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_projection_preserves_fresh_paper_canary_horizon() -> None:
+    now = datetime(2026, 7, 17, 10, 30, 0)
+    canary = {
+        "authorized": True,
+        "requested": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "selected_observation": {"horizon_minutes": 10},
+        "policy_provenance": {"generated_at": "2026-07-17T10:28:00+00:00"},
+    }
+    row = _stale_entry_row_from_mapping(
+        {
+            "id": 41,
+            "symbol": "PI/USDT",
+            "action": "short",
+            "execution_reason": "waiting",
+            "created_at": now - timedelta(minutes=2),
+            "updated_at": now - timedelta(minutes=1),
+            "stale_entry_raw__expected_net_return_pct": 0.0,
+            "stale_entry_raw__paper_bootstrap_canary": canary,
+        }
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        [row],
+        [],
+        now=now,
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 0
+    assert row.raw_llm_response["paper_bootstrap_canary"] == canary
+    assert row.execution_reason == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_projection_expires_paper_canary_by_model_horizon() -> None:
+    now = datetime(2026, 7, 17, 10, 40, 0)
+    row = _stale_entry_row_from_mapping(
+        {
+            "id": 42,
+            "symbol": "PI/USDT",
+            "action": "short",
+            "execution_reason": "waiting",
+            "created_at": now - timedelta(minutes=12),
+            "updated_at": now - timedelta(minutes=11),
+            "stale_entry_raw__expected_net_return_pct": 0.0,
+            "stale_entry_raw__paper_bootstrap_canary": {
+                "authorized": True,
+                "requested": True,
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "selected_observation": {"horizon_minutes": 10},
+                "policy_provenance": {"generated_at": "2026-07-17T10:28:00+00:00"},
+            },
+        }
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        [row],
+        [],
+        now=now,
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    assert "600-second model-bound validity horizon" in row.execution_reason
+    assert "0.0000%" not in row.execution_reason
 
 
 @pytest.mark.asyncio

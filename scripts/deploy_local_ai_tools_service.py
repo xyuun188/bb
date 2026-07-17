@@ -5300,7 +5300,7 @@ def render_phase3_quant_api_service() -> str:
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:18001
             EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
-            ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 5
+            ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 30
             KillMode=mixed
             TimeoutStopSec=20
             Restart=always

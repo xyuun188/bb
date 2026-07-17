@@ -955,6 +955,9 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     async def count_rows() -> int:
         return 80
 
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
+
     def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
         calls.append(kwargs)
         return {"artifact_persisted": kwargs["persist_artifact"]}
@@ -966,6 +969,11 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     monkeypatch.setattr(train_ml_signal_script, "shadow_training_quality_report", quality_report)
     monkeypatch.setattr(train_ml_signal_script, "build_training_frame", build_frame)
     monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
+    monkeypatch.setattr(
+        train_ml_signal_script,
+        "load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
     monkeypatch.setattr(train_ml_signal_script, "train_from_frame", train_frame)
 
     result = await train_ml_signal_script.run_training(skip_quarantine=False)
@@ -1034,6 +1042,9 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
     async def count_rows() -> int:
         return 80
 
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
+
     def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
         calls.append(kwargs)
         return {"artifact_persisted": kwargs["persist_artifact"]}
@@ -1052,6 +1063,11 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
     monkeypatch.setattr(train_ml_signal_script, "shadow_training_quality_report", quality_report)
     monkeypatch.setattr(train_ml_signal_script, "build_training_frame", build_frame)
     monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
+    monkeypatch.setattr(
+        train_ml_signal_script,
+        "load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
     monkeypatch.setattr(train_ml_signal_script, "train_from_frame", train_frame)
 
     result = await train_ml_signal_script.run_training(
@@ -1084,6 +1100,9 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
 
     async def load_rows() -> list[object]:
         return [object()]
+
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
         return {"quality_report": {"totals": {"total": 1}}}
@@ -1119,18 +1138,25 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
 
     result = await service.maybe_auto_train(force=True)
 
     assert calls == [False, True]
     assert ensure_load_calls == ["load"]
     assert result["trained"] is True
-    assert result["reason"] == "trained_shadow_activated"
+    assert result["reason"] == "trained_paper_bootstrap_canary_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["allow_live_position_influence"] is False
     assert result["allow_live_position_influence"] is False
-    assert result["artifact_activation_stage"] == "shadow"
+    assert result["artifact_activation_stage"] == "canary"
+    assert result["paper_canary_authorized"] is True
+    assert promotion_evidence[0]["paper_canary_authorized"] is True
+    assert promotion_evidence[0]["production_influence_authorized"] is False
     assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_lcb_not_positive" in reason_codes
@@ -1153,6 +1179,9 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
 
     async def load_rows() -> list[object]:
         return [object()]
+
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
         return {"quality_report": {"totals": {"total": 1}}}
@@ -1189,6 +1218,10 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
 
     result = await service.maybe_auto_train(force=True)
 
@@ -1587,6 +1620,18 @@ def test_ml_readiness_blocks_high_win_rate_negative_fee_after_return() -> None:
     assert readiness["allow_live_position_influence"] is False
     assert "long_top_return_lcb_not_positive" in codes
     assert "short_top_profit_factor_not_above_one" in codes
+
+
+def test_ml_readiness_separates_paper_bootstrap_from_live_profit_gate() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=False)
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": False})
+
+    assert readiness["allow_live_position_influence"] is False
+    assert readiness["paper_canary"]["authorized"] is True
+    assert readiness["paper_canary"]["execution_scope"] == "paper_only"
+    assert readiness["paper_canary"]["production_permission"] is False
+    assert set(readiness["paper_canary"]["eligible_sides"]) == {"long", "short"}
 
 
 def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration() -> None:

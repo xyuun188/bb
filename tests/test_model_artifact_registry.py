@@ -539,6 +539,44 @@ def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> N
     assert current.activation_manifest["production_influence_authorized"] is True
 
 
+def test_paper_canary_activation_does_not_grant_production_permission(tmp_path) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    registry.persist_candidate_joblib(
+        {"weights": [1]},
+        _metadata(),
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    paper_report = {
+        "state": "ready",
+        "authorized": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "eligible_sides": ["long", "short"],
+        "blocking_reasons": [],
+    }
+
+    current = registry.promote_candidate(
+        {
+            "activation_stage": "canary",
+            "readiness_state": "paper_canary_ready",
+            "production_influence_authorized": False,
+            "paper_canary_authorized": True,
+            "blocking_reasons": [],
+            "paper_canary_report": paper_report,
+            "return_evidence_report": {},
+        }
+    )
+
+    activation = current.activation_manifest
+    assert activation["activation_stage"] == "canary"
+    assert activation["paper_canary_authorized"] is True
+    assert activation["production_influence_authorized"] is False
+
+
 def test_default_loader_does_not_fall_back_to_retired_legacy_artifact(tmp_path) -> None:
     legacy_root = tmp_path / "ml_signal"
     legacy_root.mkdir()

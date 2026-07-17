@@ -104,6 +104,48 @@ def test_missing_position_risk_contract_is_not_rendered_as_zero() -> None:
     }
 
 
+def test_legacy_paper_canary_risk_scope_uses_recorded_zero_open_canary_guard() -> None:
+    decision = SimpleNamespace(
+        id=97557,
+        raw_llm_response={
+            "paper_bootstrap_canary": {
+                "authorized": True,
+                "runtime_guard": {"open_position_count": 0},
+            },
+            "profit_risk_sizing": {
+                "production_eligible": True,
+                "contract_lifecycle": "paper_bootstrap_canary",
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "risk_budget_usdt": 0.5,
+                "planned_stressed_loss_usdt": 0.5,
+                "target_notional_usdt": 20.0,
+                "final_notional_usdt": 20.0,
+                "current_portfolio_stressed_loss_usdt": 0.0,
+                "policy_provenance": {
+                    "strategy_version": "2026-07-17.paper-bootstrap-sizing.v1",
+                    "contract_fingerprint": "canary-fingerprint",
+                },
+            },
+        },
+    )
+
+    contract = dashboard._dashboard_position_risk_contract(decision)
+
+    assert contract["available"] is True
+    assert contract["evidence_gaps"] == []
+    assert contract["contract_version"] == "2026-07-17.paper-bootstrap-sizing.v1"
+    assert contract["portfolio_risk_snapshot"]["gross_notional_usdt"] == 0.0
+
+    decision.raw_llm_response["paper_bootstrap_canary"]["runtime_guard"][
+        "open_position_count"
+    ] = 1
+    incomplete = dashboard._dashboard_position_risk_contract(decision)
+    assert incomplete["available"] is False
+    assert "risk_contract_version_missing" in incomplete["evidence_gaps"]
+    assert "portfolio_gross_notional_missing" in incomplete["evidence_gaps"]
+
+
 def test_current_management_archives_legacy_entry_evidence_gaps() -> None:
     envelope = dashboard._dashboard_position_risk_envelope(
         {

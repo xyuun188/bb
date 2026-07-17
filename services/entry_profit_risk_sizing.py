@@ -421,6 +421,21 @@ def _portfolio_risk_snapshot(
     }, list(dict.fromkeys(blockers))
 
 
+def build_portfolio_risk_snapshot(
+    positions: list[dict[str, Any]],
+    *,
+    candidate_side: str,
+    contract_specs: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Expose the shared native portfolio valuation contract to bounded entry policies."""
+
+    return _portfolio_risk_snapshot(
+        positions,
+        candidate_side=candidate_side,
+        contract_specs=contract_specs,
+    )
+
+
 def _correlation_pressure(
     decision: DecisionOutput,
     positions: list[dict[str, Any]],
@@ -506,10 +521,15 @@ def reconcile_profit_risk_sizing(
         }
     )
     provenance = dict(_safe_dict(sizing.get("policy_provenance")))
+    strategy_version = str(
+        sizing.get("contract_version")
+        or provenance.get("strategy_version")
+        or RISK_SIZING_VERSION
+    )
     provenance.update(
         {
             "generated_at": generated_at,
-            "strategy_version": RISK_SIZING_VERSION,
+            "strategy_version": strategy_version,
             "fallback_reason": "" if eligible else ",".join(reasons),
             "contract_fingerprint": _fingerprint(
                 {

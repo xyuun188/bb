@@ -2186,6 +2186,58 @@ def test_shadow_backtest_service_is_not_a_trading_service_private_rule():
 def test_stale_entry_candidate_expirer_is_not_a_trading_service_private_rule():
     assert callable(StaleEntryCandidateExpirer(lambda _value, default=0.0: default).expire)
     assert not hasattr(TradingService, "_expire_stale_waiting_entry_candidates")
+
+
+@pytest.mark.asyncio
+async def test_paper_market_shortlist_uses_private_instrument_availability() -> None:
+    service = TradingService.__new__(TradingService)
+    service._last_auto_feature_rank_diagnostics = {
+        "selected": 4,
+        "ranked_symbol_sample": [
+            {"symbol": symbol, "selected": True}
+            for symbol in ("PI/USDT", "BTC/USDT", "LUNA/USDT", "ETH/USDT")
+        ],
+    }
+
+    class FakeExecutor:
+        async def entry_instrument_availability(self, symbol: str) -> dict[str, Any]:
+            available = symbol in {"BTC/USDT", "ETH/USDT"}
+            return {
+                "available": available,
+                "reason": (
+                    "okx_private_account_instrument_verified"
+                    if available
+                    else "okx_private_entry_instrument_unavailable"
+                ),
+                "error_code": None if available else "51001",
+                "cache_hit": False,
+            }
+
+    async def executor_provider(_mode: str) -> FakeExecutor:
+        return FakeExecutor()
+
+    service._get_okx_executor_for_mode = executor_provider
+    features = {
+        "PI/USDT": object(),
+        "BTC/USDT": object(),
+        "LUNA/USDT": object(),
+        "ETH/USDT": object(),
+    }
+
+    selected = await service._filter_paper_entry_instrument_shortlist(features, 2)
+
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    diagnostics = service._last_auto_feature_rank_diagnostics
+    assert diagnostics["selected"] == 2
+    assert diagnostics["execution_availability"]["probed_count"] == 4
+    assert diagnostics["execution_availability"]["available_count"] == 2
+    pi = next(
+        item
+        for item in diagnostics["ranked_symbol_sample"]
+        if item["symbol"] == "PI/USDT"
+    )
+    assert pi["selected"] is False
+    assert pi["non_selected_reason"] == "paper_execution_instrument_unavailable"
     assert not hasattr(TradingService, "_is_pending_execution_reason")
     assert not hasattr(TradingService, "_pending_execution_failed_reason")
     assert not hasattr(TradingService, "_action_label")
@@ -3897,7 +3949,9 @@ async def test_ml_signal_service_completed_shadow_sample_boundary_calls_internal
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_auto_train_skips_when_authoritative_cursor_has_no_new_samples() -> None:
+async def test_ml_signal_auto_train_skips_when_authoritative_cursor_has_no_new_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = MLSignalService()
 
     async def completed_shadow_sample_count() -> int:
@@ -3925,6 +3979,14 @@ async def test_ml_signal_auto_train_skips_when_authoritative_cursor_has_no_new_s
 
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = current_metadata  # type: ignore[method-assign]
+
+    async def load_trade_samples() -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
 
     result = await service.maybe_auto_train()
 
@@ -3958,6 +4020,9 @@ async def test_ml_signal_auto_train_quarantines_before_training(
         assert limit is None
         calls.append("load_rows")
         return [object()]
+
+    async def load_trade_samples() -> list[dict[str, Any]]:
+        return []
 
     def quality_report(_rows: list[Any]) -> dict[str, Any]:
         calls.append("quality_report")
@@ -4013,6 +4078,10 @@ async def test_ml_signal_auto_train_quarantines_before_training(
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
 
     result = await service.maybe_auto_train(force=True)
 

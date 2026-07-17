@@ -2233,15 +2233,42 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
         for item in _safe_list(sizing.get("execution_reconciliations"))
         if isinstance(item, dict)
     ]
-    portfolio = _safe_dict(sizing.get("portfolio_risk_snapshot"))
     provenance = _safe_dict(sizing.get("policy_provenance"))
+    portfolio = _safe_dict(sizing.get("portfolio_risk_snapshot"))
+    paper_canary = _safe_dict(raw.get("paper_bootstrap_canary"))
+    runtime_guard = _safe_dict(
+        sizing.get("runtime_guard") or paper_canary.get("runtime_guard")
+    )
+    legacy_paper_canary = bool(
+        sizing.get("contract_lifecycle") == "paper_bootstrap_canary"
+        and sizing.get("execution_scope") == "paper_only"
+        and sizing.get("production_permission") is False
+        and paper_canary.get("authorized") is True
+        and runtime_guard.get("open_position_count") == 0
+    )
+    contract_version = sizing.get("contract_version")
+    if legacy_paper_canary and not contract_version:
+        from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_SIZING_VERSION
+
+        contract_version = PAPER_BOOTSTRAP_SIZING_VERSION
+    if legacy_paper_canary and portfolio.get("gross_notional_usdt") is None:
+        portfolio = {
+            "scope": "paper_bootstrap_canary_positions_only",
+            "current_stressed_loss_usdt": 0.0,
+            "current_margin_usdt": 0.0,
+            "gross_notional_usdt": 0.0,
+            "same_side_notional_usdt": 0.0,
+            "direction_concentration": 0.0,
+            "positions": [],
+            "legacy_contract_reconstructed_from_runtime_guard": True,
+        }
     risk_budget = sizing.get("risk_budget_usdt")
     if risk_budget is None:
         risk_budget = sizing.get("single_trade_risk_budget_usdt")
     evidence_gaps = [
         name
         for name, value in (
-            ("risk_contract_version_missing", sizing.get("contract_version")),
+            ("risk_contract_version_missing", contract_version),
             ("independent_risk_budget_missing", risk_budget),
             ("planned_stressed_loss_missing", sizing.get("planned_stressed_loss_usdt")),
             ("target_notional_missing", sizing.get("target_notional_usdt")),
@@ -2293,7 +2320,7 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
         "evidence_complete": not evidence_gaps,
         "evidence_gaps": evidence_gaps,
         "decision_id": decision_id,
-        "contract_version": sizing.get("contract_version"),
+        "contract_version": contract_version,
         "production_eligible": sizing.get("production_eligible") is True,
         "reason": sizing.get("reason"),
         "blockers": blockers,

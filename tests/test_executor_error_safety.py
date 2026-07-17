@@ -285,6 +285,34 @@ class _FailingOpenOrdersCcxt:
         raise RuntimeError(self.error_text)
 
 
+class _EntryInstrumentAvailabilityCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.fetch_leverage_calls: list[str] = []
+
+    def market(self, symbol: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "id": okx_module.okx_inst_id_from_symbol(symbol),
+            "info": {"instId": okx_module.okx_inst_id_from_symbol(symbol)},
+        }
+
+    async def fetch_leverage(
+        self,
+        symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.fetch_leverage_calls.append(symbol)
+        if symbol.startswith("PI/"):
+            raise ExchangeAPIError(
+                "OKX API error [51001]: Instrument ID doesn't exist.",
+                code="51001",
+            )
+        return {"longLeverage": 1.0, "shortLeverage": 1.0, "info": []}
+
+
 class _ReloadableMarketCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -1163,6 +1191,26 @@ def _entry_decision() -> DecisionOutput:
     )
 
 
+@pytest.mark.asyncio
+async def test_okx_entry_symbol_resolution_failure_returns_structured_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(object())
+
+    async def fail_symbol_resolution(_symbol: str) -> str:
+        raise ExchangeAPIError("OKX instrument resolution failed", code="51001")
+
+    monkeypatch.setattr(executor, "_resolve_swap_symbol", fail_symbol_resolution)
+
+    result = await executor.place_order(_entry_decision())
+
+    assert result.status == OrderStatus.REJECTED
+    assert result.order_id == "okx_rejected"
+    assert result.raw_response["execution_blocker"] == "okx_exchange_rejection"
+    assert result.raw_response["okx_error_code"] == "51001"
+    assert result.raw_response["leverage_check"] == {}
+
+
 def _shib_entry_decision() -> DecisionOutput:
     return DecisionOutput(
         model_name="ensemble_trader",
@@ -1306,6 +1354,27 @@ async def test_okx_open_orders_failure_is_logged_and_redacted(
     assert hidden_value not in rendered
     assert "Authorization: ***" in fields["error"]
     assert "password=***" in fields["error"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_instrument_availability_uses_private_account_and_cache() -> None:
+    exchange = _EntryInstrumentAvailabilityCcxt()
+    executor = _executor(exchange)
+
+    btc = await executor.entry_instrument_availability("BTC/USDT")
+    btc_cached = await executor.entry_instrument_availability("BTC/USDT")
+    pi = await executor.entry_instrument_availability("PI/USDT")
+    pi_cached = await executor.entry_instrument_availability("PI/USDT")
+
+    assert btc["available"] is True
+    assert btc["source"] == "okx_private_account_leverage_info"
+    assert btc_cached["available"] is True
+    assert btc_cached["cache_hit"] is True
+    assert pi["available"] is False
+    assert pi["reason"] == "okx_private_entry_instrument_unavailable"
+    assert pi["error_code"] == "51001"
+    assert pi_cached["cache_hit"] is True
+    assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT", "PI/USDT:USDT"]
 
 
 @pytest.mark.asyncio

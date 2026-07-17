@@ -2382,7 +2382,19 @@ class MLSignalService:
                     and trained_readiness.get("live_enabled_sides")
                     and not trained_readiness.get("blocking_reasons")
                 )
-                activation_stage = "canary" if production_authorized else "shadow"
+                paper_canary = _safe_dict(trained_readiness.get("paper_canary"))
+                paper_canary_authorized = bool(
+                    not production_authorized
+                    and paper_canary.get("authorized") is True
+                    and paper_canary.get("state") == "ready"
+                    and paper_canary.get("eligible_sides")
+                    and not paper_canary.get("blocking_reasons")
+                )
+                activation_stage = (
+                    "canary"
+                    if production_authorized or paper_canary_authorized
+                    else "shadow"
+                )
                 live_enabled_sides = (
                     list(trained_readiness.get("live_enabled_sides") or [])
                     if production_authorized
@@ -2391,11 +2403,23 @@ class MLSignalService:
                 activated_artifact = self.artifact_registry.promote_candidate(
                     {
                         "activation_stage": activation_stage,
-                        "readiness_state": trained_readiness.get("state"),
+                        "readiness_state": (
+                            trained_readiness.get("state")
+                            if production_authorized
+                            else "paper_canary_ready"
+                            if paper_canary_authorized
+                            else trained_readiness.get("state")
+                        ),
                         "production_influence_authorized": production_authorized,
+                        "paper_canary_authorized": paper_canary_authorized,
                         "live_enabled_sides": live_enabled_sides,
-                        "blocking_reasons": trained_readiness.get("blocking_reasons") or [],
+                        "blocking_reasons": (
+                            []
+                            if paper_canary_authorized
+                            else trained_readiness.get("blocking_reasons") or []
+                        ),
                         "return_evidence_report": trained_readiness,
+                        "paper_canary_report": paper_canary,
                         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
                     }
                 )
@@ -2408,6 +2432,8 @@ class MLSignalService:
                     "reason": (
                         "trained_canary_activated"
                         if production_authorized
+                        else "trained_paper_bootstrap_canary_activated"
+                        if paper_canary_authorized
                         else "trained_shadow_activated"
                     ),
                     "completed_sample_count": completed_count,
@@ -2435,12 +2461,17 @@ class MLSignalService:
                     "artifact_persisted": bool(trained_metadata.get("artifact_persisted")),
                     "artifact_version": activated_artifact.version,
                     "artifact_activation_stage": activation_stage,
+                    "paper_canary_authorized": paper_canary_authorized,
+                    "paper_canary": paper_canary,
                     "live_enabled_sides": live_enabled_sides,
                     "trained_at": trained_metadata.get("trained_at"),
                     "message": (
                         "本地 ML 候选已通过费后收益证据并原子激活为 canary，"
                         "仅允许证据达标方向影响生产。"
                         if production_authorized
+                        else "本地 ML 候选已通过数据治理与时间滚动完整性检查，原子激活为"
+                        "仅限模拟盘的 bootstrap canary；该阶段不拥有生产权限。"
+                        if paper_canary_authorized
                         else "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
                         "生产影响保持关闭，等待收益证据达标。"
                     ),
@@ -2787,6 +2818,18 @@ class MLSignalService:
         live_prediction_influence = bool(
             allow_live_position_influence and current_prediction_ready
         )
+        activation = _safe_dict(
+            self._resolved_artifact.activation_manifest
+            if self._resolved_artifact is not None
+            else None
+        )
+        paper_canary = _safe_dict(readiness.get("paper_canary"))
+        paper_canary_authorized = bool(
+            activation.get("activation_stage") == "canary"
+            and activation.get("paper_canary_authorized") is True
+            and activation.get("production_influence_authorized") is not True
+            and paper_canary.get("authorized") is True
+        )
         return {
             "available": True,
             "route_mode": (
@@ -2806,6 +2849,8 @@ class MLSignalService:
                 else None
             ).get("activation_stage")
             or "unregistered",
+            "paper_canary_authorized": paper_canary_authorized,
+            "paper_canary": paper_canary,
             "return_distribution_contract_version": (
                 RETURN_DISTRIBUTION_CONTRACT_VERSION
             ),

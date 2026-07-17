@@ -437,6 +437,106 @@ def _side_artifact_evidence_blockers(
     return blockers
 
 
+_PAPER_CANARY_GLOBAL_EXEMPTIONS = frozenset(
+    {
+        "authoritative_trade_return_evidence_missing",
+        "authoritative_return_supervision_missing",
+    }
+)
+
+
+def _paper_canary_side_blockers(
+    metadata: dict[str, Any],
+    metrics: dict[str, Any],
+    side: str,
+) -> list[dict[str, Any]]:
+    """Require a useful, governed ranker without pretending it is profitable.
+
+    Paper bootstrap exists to collect the authoritative fills needed by the
+    production gate. It therefore requires clean data, complete chronological
+    evaluation and a better top score bucket, but deliberately does not require
+    a positive fee-after LCB or profit factor before the first paper sample.
+    """
+
+    blockers = [
+        item
+        for item in _side_metric_blockers(metrics, side)
+        if item.get("code")
+        in {
+            f"{side}_top_return_not_above_bottom",
+            f"{side}_top_tail_loss_not_improved",
+        }
+    ]
+    walk_forward = _safe_dict(metadata.get("walk_forward_report"))
+    walk_side = _safe_dict(_safe_dict(walk_forward.get("sides")).get(side))
+    fold_sides = [
+        _safe_dict(_safe_dict(fold).get("sides")).get(side)
+        for fold in list(walk_forward.get("folds") or [])
+        if isinstance(fold, dict)
+    ]
+    if (
+        not walk_side
+        or not fold_sides
+        or any(not isinstance(item, dict) or not item for item in fold_sides)
+    ):
+        blockers.append(
+            _reason(
+                f"{side}_paper_canary_walk_forward_evidence_missing",
+                f"{_side_label(side)}缺少可用于模拟盘采样的逐折时间滚动证据。",
+            )
+        )
+    oos = _safe_dict(_safe_dict(metadata.get("oos_return_evaluation")).get(side))
+    if not oos or any(
+        _safe_float(oos.get(field), None) is None
+        for field in ("return_lcb_pct", "cvar_10_pct", "max_drawdown_pct")
+    ):
+        blockers.append(
+            _reason(
+                f"{side}_paper_canary_oos_distribution_incomplete",
+                f"{_side_label(side)}样本外收益与尾部风险分布不完整，不能进入模拟盘采样。",
+            )
+        )
+    return blockers
+
+
+def _paper_canary_readiness(
+    metadata: dict[str, Any],
+    metrics: dict[str, Any],
+    global_blockers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    paper_global_blockers = [
+        item
+        for item in global_blockers
+        if item.get("code") not in _PAPER_CANARY_GLOBAL_EXEMPTIONS
+    ]
+    side_blockers = {
+        side: _paper_canary_side_blockers(metadata, metrics, side)
+        for side in ("long", "short")
+    }
+    eligible_sides = [
+        side for side in ("long", "short") if not side_blockers[side]
+    ]
+    authorized = bool(not paper_global_blockers and eligible_sides)
+    blockers = list(paper_global_blockers)
+    if not eligible_sides:
+        blockers.extend(side_blockers["long"])
+        blockers.extend(side_blockers["short"])
+    return {
+        "version": "2026-07-17.paper-bootstrap-readiness.v1",
+        "state": "ready" if authorized else "blocked",
+        "authorized": authorized,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "eligible_sides": eligible_sides,
+        "blocking_reasons": blockers,
+        "side_blocking_reasons": side_blockers,
+        "promotion_requirements": (
+            "paper canary collects version-bound realized cost and return evidence; "
+            "live promotion still requires positive walk-forward, OOS and authoritative fee-after LCB"
+        ),
+    }
+
+
 def build_ml_readiness_report(
     metadata: dict[str, Any],
     influence: dict[str, Any],
@@ -620,6 +720,12 @@ def build_ml_readiness_report(
             )
         )
 
+    paper_canary = _paper_canary_readiness(
+        metadata,
+        metrics,
+        global_blockers,
+    )
+
     live_enabled_sides = [side for side, enabled in side_enabled.items() if enabled]
     partial_live_influence_allowed = bool(
         not global_blockers and live_enabled_sides and influence.get("enabled")
@@ -651,6 +757,7 @@ def build_ml_readiness_report(
     return {
         "state": state,
         "allow_live_position_influence": partial_live_influence_allowed,
+        "paper_canary": paper_canary,
         "live_enabled_sides": live_enabled_sides,
         "side_blocking_reasons": side_blockers,
         "blocking_reasons": blockers,
@@ -742,6 +849,16 @@ def disabled_ml_readiness(reason_code: str, message: str) -> dict[str, Any]:
     return {
         "state": "disabled",
         "allow_live_position_influence": False,
+        "paper_canary": {
+            "version": "2026-07-17.paper-bootstrap-readiness.v1",
+            "state": "blocked",
+            "authorized": False,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "eligible_sides": [],
+            "blocking_reasons": [_reason(reason_code, message)],
+            "side_blocking_reasons": {"long": [], "short": []},
+        },
         "blocking_reasons": [_reason(reason_code, message)],
         "next_training_conditions": {
             "trigger": "new_authoritative_cost_complete_sample_or_data_contract_change",

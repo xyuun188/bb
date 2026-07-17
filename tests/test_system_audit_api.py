@@ -2116,6 +2116,35 @@ def test_system_audit_primary_user_facing_reasons_are_chinese() -> None:
     assert "Shadow missed opportunity" not in visible_text
 
 
+@pytest.mark.asyncio
+async def test_production_source_health_card_exposes_continuous_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProductionSourceHealthService:
+        async def report(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "status": "critical",
+                "reason": "continuous_no_production_return_source",
+                "continuous_no_source_seconds": 7200.0,
+                "production_source_decision_count": 0,
+                "paper_bootstrap_executed_count": 1,
+                "recovery_state": "paper_bootstrap_collecting",
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ProductionSourceHealthService",
+        FakeProductionSourceHealthService,
+    )
+
+    card = await system_audit._production_source_health_audit()
+
+    assert card["key"] == "production_source_health"
+    assert card["status"] == "critical"
+    assert "bootstrap canary" in card["summary"]
+    assert card["details"]["continuous_no_source_seconds"] == 7200.0
+
+
 
 
 

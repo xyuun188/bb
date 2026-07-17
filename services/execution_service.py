@@ -22,6 +22,7 @@ from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.okx_error_classifier import is_okx_temporary_service_error
+from services.paper_bootstrap_canary import PaperBootstrapCanaryPolicy
 from services.strategy_arbitration import arbitrate_decision
 from services.trading_policies import PolicyGateResult
 
@@ -56,11 +57,33 @@ def _governance_complete(value: dict[str, Any]) -> bool:
     )
 
 
-def _return_entry_contract_result(decision: DecisionOutput) -> PolicyGateResult:
+def _return_entry_contract_result(
+    decision: DecisionOutput,
+    model_mode: str = "",
+) -> PolicyGateResult:
     """Fail closed unless the dynamic fee-after-return contract is complete."""
 
     if not decision.is_entry:
         return PolicyGateResult.allow({"return_execution_contract": "not_entry"})
+
+    if PaperBootstrapCanaryPolicy.is_claimed(decision):
+        assessment = PaperBootstrapCanaryPolicy.assess(decision, model_mode)
+        if assessment.eligible:
+            return PolicyGateResult.allow(
+                {
+                    "return_execution_contract": "paper_bootstrap_canary",
+                    "production_permission": False,
+                    "paper_bootstrap_canary": assessment.details,
+                }
+            )
+        return PolicyGateResult.block(
+            "paper_bootstrap_canary_contract_incomplete",
+            assessment.reason,
+            {
+                "stage_status": "blocked",
+                "paper_bootstrap_canary": assessment.details,
+            },
+        )
 
     raw = _safe_dict(decision.raw_response)
     candidate = _safe_dict(raw.get("authoritative_return_candidate"))
@@ -1098,7 +1121,7 @@ class ExecutionService:
                 )
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
-            return_contract_result = _return_entry_contract_result(decision)
+            return_contract_result = _return_entry_contract_result(decision, model_mode)
             if not return_contract_result.passed:
                 return await block_before_submit(return_contract_result)
             if decision_db_id is not None:

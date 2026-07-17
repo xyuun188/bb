@@ -45,6 +45,8 @@ _MAX_CIRCUIT_BREAKER_FAILURES = 20
 _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
 _STATUS_CACHE_TTL_SECONDS = 8.0
 _MAX_TIMESERIES_SEQUENCE_LENGTH = 80
+_HTTP_MAX_KEEPALIVE_CONNECTIONS = 4
+_HTTP_MAX_CONNECTIONS = 8
 
 
 class LocalAIToolsClient:
@@ -61,6 +63,8 @@ class LocalAIToolsClient:
         self._last_success_at: datetime | None = None
         self._status_cache: tuple[float, dict[str, Any]] | None = None
         self._inference_lock = asyncio.Lock()
+        self._http_client: httpx.AsyncClient | None = None
+        self._http_client_base: str = ""
 
     def _request_timeout(self) -> float:
         return min(max(self._timeout, 0.5), _MAX_REQUEST_TIMEOUT_SECONDS)
@@ -183,7 +187,13 @@ class LocalAIToolsClient:
         # starts its own timeout only after it owns the inference slot.
         results: list[dict[str, Any]] = []
         async with self._inference_lock:
-            for name, path in tool_specs:
+            core_specs = tool_specs[:2]
+            results.extend(
+                await asyncio.gather(
+                    *(call_tool(name, path) for name, path in core_specs)
+                )
+            )
+            for name, path in tool_specs[len(core_specs) :]:
                 results.append(await call_tool(name, path))
         data: dict[str, Any] = {
             "enabled": True,
@@ -802,8 +812,12 @@ class LocalAIToolsClient:
     async def _get(self, path: str, request_timeout: float | None = None) -> dict[str, Any]:
         base = self._api_base()
         try:
-            async with httpx.AsyncClient(timeout=request_timeout or self._timeout) as client:
-                response = await client.get(f"{base}{path}", headers=self._auth_headers())
+            client = await self._shared_http_client(base)
+            response = await client.get(
+                f"{base}{path}",
+                headers=self._auth_headers(),
+                timeout=request_timeout or self._timeout,
+            )
         except httpx.RequestError as exc:
             raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
@@ -827,12 +841,13 @@ class LocalAIToolsClient:
                 pool=timeout_seconds,
             )
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{base}{path}",
-                    json=payload,
-                    headers=self._auth_headers(),
-                )
+            client = await self._shared_http_client(base)
+            response = await client.post(
+                f"{base}{path}",
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=timeout,
+            )
         except httpx.RequestError as exc:
             raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
@@ -854,10 +869,32 @@ class LocalAIToolsClient:
 
     def _auth_headers(self) -> dict[str, str]:
         key = str(settings.local_ai_tools_api_key or "").strip()
-        headers = {"Connection": "close"}
+        headers: dict[str, str] = {}
         if key:
             headers["Authorization"] = f"Bearer {key}"
         return headers
+
+    async def _shared_http_client(self, base: str) -> httpx.AsyncClient:
+        if self._http_client is not None and self._http_client_base != base:
+            await self._http_client.aclose()
+            self._http_client = None
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_keepalive_connections=_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+                    max_connections=_HTTP_MAX_CONNECTIONS,
+                    keepalive_expiry=30.0,
+                )
+            )
+            self._http_client_base = base
+        return self._http_client
+
+    async def close(self) -> None:
+        client = self._http_client
+        self._http_client = None
+        self._http_client_base = ""
+        if client is not None:
+            await client.aclose()
 
     def _parse_response(self, response: httpx.Response, path: str) -> dict[str, Any]:
         if not response.is_success:

@@ -58,6 +58,7 @@ class EntryPolicy:
         entry_price_guard: Any | None = None,
         entry_opportunity_gate: Any | None = None,
         high_risk_review_gate: Any | None = None,
+        paper_bootstrap_canary: Any | None = None,
     ) -> None:
         self.decision_freshness = decision_freshness
         self.entry_priority = entry_priority
@@ -66,6 +67,7 @@ class EntryPolicy:
         self.entry_price_guard = entry_price_guard
         self.entry_opportunity_gate = entry_opportunity_gate
         self.high_risk_review_gate_policy = high_risk_review_gate
+        self.paper_bootstrap_canary = paper_bootstrap_canary
 
     def score_candidate(
         self,
@@ -174,6 +176,16 @@ class EntryPolicy:
         """Build the dynamic sizing contract before the hard risk engine runs."""
 
         if not decision.is_entry:
+            return
+        if (
+            self.paper_bootstrap_canary is not None
+            and self.paper_bootstrap_canary.is_claimed(decision)
+        ):
+            await self.paper_bootstrap_canary.prepare(
+                decision,
+                model_mode,
+                open_positions or [],
+            )
             return
         self.ensure_opportunity_score(
             decision,
@@ -323,6 +335,36 @@ class EntryPolicy:
                 "stale_decision",
                 stale_reason,
                 {"pipeline_context": context.public_data()},
+            )
+
+        if (
+            self.paper_bootstrap_canary is not None
+            and self.paper_bootstrap_canary.is_claimed(decision)
+        ):
+            await self.paper_bootstrap_canary.prepare(
+                decision,
+                model_mode,
+                open_positions or [],
+            )
+            paper_assessment = self.paper_bootstrap_canary.assess(decision, model_mode)
+            if not paper_assessment.eligible:
+                return PolicyGateResult.block(
+                    "paper_bootstrap_canary_policy",
+                    paper_assessment.reason,
+                    {
+                        "pipeline_context": context.public_data(),
+                        "stage_status": "skipped",
+                        "skip_kind": "paper_bootstrap_canary_policy",
+                        "paper_bootstrap_canary": paper_assessment.details,
+                    },
+                )
+            return PolicyGateResult.allow(
+                {
+                    "intent": "paper_bootstrap_entry",
+                    "pipeline_context": context.public_data(),
+                    "paper_bootstrap_canary": paper_assessment.details,
+                    "production_permission": False,
+                }
             )
 
         await self.prepare_dynamic_risk_contract(

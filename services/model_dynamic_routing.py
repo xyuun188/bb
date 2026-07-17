@@ -216,8 +216,10 @@ def _canary_route_blockers(
     governance: dict[str, Any],
 ) -> list[str]:
     blockers: list[str] = []
-    if _ml_readiness_blocks_route(context):
-        blockers.append("ml_readiness_blocks_live_route")
+    if _paper_canary_readiness_blocks_route(context):
+        blockers.append("paper_canary_readiness_blocked")
+        if _ml_readiness_blocks_route(context):
+            blockers.append("ml_readiness_blocks_live_route")
     if competition.get("can_apply_live_weight") is False:
         blockers.append("competition_not_live_applicable")
     if "baseline_missing" in {
@@ -245,6 +247,8 @@ def _live_route_blockers(
     governance: dict[str, Any],
 ) -> list[str]:
     blockers = _canary_route_blockers(context, competition, coverage, governance)
+    if _ml_readiness_blocks_route(context):
+        blockers.append("ml_readiness_blocks_live_route")
     if governance.get("model_stage") != "live":
         blockers.append("model_stage_not_live")
     if governance.get("requires_walk_forward") and governance.get("training_mode") != "walk_forward":
@@ -261,6 +265,14 @@ def _ml_readiness_blocks_route(context: dict[str, Any]) -> bool:
     if _safe_dict(context.get("readiness")).get("allow_live_position_influence") is False:
         return True
     return False
+
+
+def _paper_canary_readiness_blocks_route(context: dict[str, Any]) -> bool:
+    readiness = _safe_dict(_safe_dict(context.get("ml_signal")).get("readiness"))
+    paper = _safe_dict(readiness.get("paper_canary"))
+    if paper:
+        return paper.get("authorized") is not True
+    return bool(readiness and readiness.get("allow_live_position_influence") is False)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:

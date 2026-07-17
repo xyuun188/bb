@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.paper_bootstrap_canary import (
+    PAPER_BOOTSTRAP_CANARY_VERSION,
+    PaperBootstrapCanaryPolicy,
+)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -97,10 +101,23 @@ class EntryPriceGuardPolicy:
         if latest_price <= 0:
             return "Fresh pre-order native price is unavailable; entry fails closed."
 
-        return_budget = self._return_budget_fraction(decision)
+        paper_canary = bool(
+            str(model_mode or "").lower() == "paper"
+            and PaperBootstrapCanaryPolicy.is_claimed(decision)
+        )
+        return_budget = (
+            self._paper_canary_price_budget_fraction(decision)
+            if paper_canary
+            else self._return_budget_fraction(decision)
+        )
         allowed = return_budget
         if allowed <= 0:
-            return "Authoritative fee-after return budget is missing; entry fails closed."
+            return (
+                "Authoritative paper bootstrap distribution drift budget is missing; "
+                "entry fails closed."
+                if paper_canary
+                else "Authoritative fee-after return budget is missing; entry fails closed."
+            )
 
         move = (latest_price - snapshot_price) / snapshot_price
         adverse = self._adverse_move(decision.action, move)
@@ -114,10 +131,22 @@ class EntryPriceGuardPolicy:
             "return_budget_fraction": round(return_budget, 8),
             "allowed_adverse_move_fraction": round(allowed, 8),
             "decision_age_seconds": round(self.decision_age_seconds_provider(decision), 3),
+            "contract_lifecycle": (
+                "paper_bootstrap_canary" if paper_canary else "production_return"
+            ),
+            "production_permission": False if paper_canary else True,
             "policy_provenance": {
-                "source": "authoritative_fee_after_return_lcb",
+                "source": (
+                    "paper_bootstrap_empirical_distribution_uncertainty"
+                    if paper_canary
+                    else "authoritative_fee_after_return_lcb"
+                ),
                 "observation_window": "current_pre_order_refresh",
-                "sample_count": self._return_sample_count(decision),
+                "sample_count": (
+                    self._paper_canary_sample_count(decision)
+                    if paper_canary
+                    else self._return_sample_count(decision)
+                ),
                 "generated_at": raw.get("generated_at") or "decision_runtime",
                 "strategy_version": "2026-07-12.dynamic-price-budget.v1",
                 "fallback_reason": "",
@@ -206,6 +235,36 @@ class EntryPriceGuardPolicy:
         if expected_net <= 0 or return_lcb <= 0:
             return 0.0
         return min(expected_net, return_lcb) / 100.0
+
+    @staticmethod
+    def _paper_canary_contract(decision: DecisionOutput) -> dict[str, Any]:
+        raw = _safe_dict(decision.raw_response)
+        contract = _safe_dict(raw.get("paper_bootstrap_canary"))
+        if (
+            contract.get("version") != PAPER_BOOTSTRAP_CANARY_VERSION
+            or contract.get("authorized") is not True
+            or contract.get("requested") is not True
+            or contract.get("execution_scope") != "paper_only"
+            or contract.get("production_permission") is not False
+        ):
+            return {}
+        return contract
+
+    def _paper_canary_price_budget_fraction(self, decision: DecisionOutput) -> float:
+        observation = _safe_dict(
+            self._paper_canary_contract(decision).get("selected_observation")
+        )
+        dispersion_pct = max(_safe_float(observation.get("dispersion_pct")), 0.0)
+        objective_pct = _safe_float(observation.get("objective_expected_return_pct"))
+        lower_quantile_pct = _safe_float(observation.get("lower_quantile_return_pct"))
+        quantile_gap_pct = abs(objective_pct - lower_quantile_pct)
+        if dispersion_pct <= 0 or quantile_gap_pct <= 0:
+            return 0.0
+        return min(dispersion_pct, quantile_gap_pct) / 100.0
+
+    def _paper_canary_sample_count(self, decision: DecisionOutput) -> int:
+        contract = self._paper_canary_contract(decision)
+        return max(int(_safe_float(contract.get("source_sample_count"))), 0)
 
     def _return_sample_count(self, decision: DecisionOutput) -> int:
         return max(int(_safe_float(self._side_evidence(decision).get("production_source_count"))), 0)

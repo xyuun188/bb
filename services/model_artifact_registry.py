@@ -452,12 +452,40 @@ class ModelArtifactRegistry:
         if stage not in _ACTIVATION_STAGES:
             raise ValueError("activation_stage must be shadow, canary, or live")
         production_authorized = evidence.get("production_influence_authorized") is True
+        paper_canary_authorized = evidence.get("paper_canary_authorized") is True
         readiness_state = str(evidence.get("readiness_state") or "").strip()
         blockers = evidence.get("blocking_reasons")
         blockers = blockers if isinstance(blockers, list) else []
         if stage == "shadow" and production_authorized:
             raise ValueError("shadow artifact cannot receive production influence")
-        if stage in {"canary", "live"}:
+        if paper_canary_authorized:
+            if stage != "canary" or production_authorized:
+                raise ValueError(
+                    "paper canary activation must be canary without production authorization"
+                )
+            if readiness_state != "paper_canary_ready" or blockers:
+                raise ValueError("paper canary activation requires clean readiness evidence")
+            paper_report = evidence.get("paper_canary_report")
+            if not isinstance(paper_report, dict) or (
+                paper_report.get("authorized") is not True
+                or paper_report.get("state") != "ready"
+                or paper_report.get("execution_scope") != "paper_only"
+                or paper_report.get("production_permission") is not False
+                or list(paper_report.get("blocking_reasons") or [])
+                or not list(paper_report.get("eligible_sides") or [])
+            ):
+                raise ValueError("paper canary readiness report is incomplete")
+            walk_forward = candidate.manifest.get("walk_forward_report")
+            if (
+                not isinstance(walk_forward, dict)
+                or walk_forward.get("status") != "complete"
+                or walk_forward.get("decision_group_disjoint") is not True
+                or walk_forward.get("chronological_label_disjoint") is not True
+                or walk_forward.get("model_refit_per_fold") is not True
+                or not list(walk_forward.get("folds") or [])
+            ):
+                raise ValueError("paper canary activation requires complete walk-forward evidence")
+        elif stage in {"canary", "live"}:
             if not production_authorized:
                 raise ValueError(f"{stage} activation requires production authorization")
             if readiness_state not in {"ready", "partial_ready"}:
@@ -553,8 +581,12 @@ class ModelArtifactRegistry:
             "return_evidence_report_sha256": _payload_sha256(
                 evidence.get("return_evidence_report") or {}
             ),
+            "paper_canary_report_sha256": _payload_sha256(
+                evidence.get("paper_canary_report") or {}
+            ),
             "activation_stage": stage,
             "production_influence_authorized": production_authorized,
+            "paper_canary_authorized": paper_canary_authorized,
             "blocking_reasons": blockers,
             "activated_at": datetime.now(UTC).isoformat(),
         }
@@ -749,21 +781,41 @@ class ModelArtifactRegistry:
             activation.get("return_evidence_report") or {}
         ):
             raise ValueError("artifact activation return-evidence identity mismatch")
+        if activation.get("paper_canary_report_sha256") is not None and (
+            activation.get("paper_canary_report_sha256")
+            != _payload_sha256(activation.get("paper_canary_report") or {})
+        ):
+            raise ValueError("artifact activation paper-canary identity mismatch")
         stage = activation.get("activation_stage")
         if stage not in _ACTIVATION_STAGES:
             raise ValueError("artifact activation stage is invalid")
         production_authorized = activation.get("production_influence_authorized") is True
+        paper_canary_authorized = activation.get("paper_canary_authorized") is True
         blockers = activation.get("blocking_reasons")
         blockers = blockers if isinstance(blockers, list) else []
         if stage == "shadow" and production_authorized:
             raise ValueError("shadow artifact has production authorization")
-        if stage in {"canary", "live"} and (
+        if paper_canary_authorized:
+            paper_report = activation.get("paper_canary_report")
+            if (
+                stage != "canary"
+                or production_authorized
+                or activation.get("readiness_state") != "paper_canary_ready"
+                or blockers
+                or not isinstance(paper_report, dict)
+                or paper_report.get("authorized") is not True
+                or paper_report.get("execution_scope") != "paper_only"
+                or paper_report.get("production_permission") is not False
+                or list(paper_report.get("blocking_reasons") or [])
+            ):
+                raise ValueError("paper canary artifact activation evidence is incomplete")
+        elif stage in {"canary", "live"} and (
             not production_authorized
             or activation.get("readiness_state") not in {"ready", "partial_ready"}
             or blockers
         ):
             raise ValueError("production artifact activation evidence is incomplete")
-        if stage in {"canary", "live"}:
+        if stage in {"canary", "live"} and not paper_canary_authorized:
             return_evidence = activation.get("return_evidence_report")
             if not isinstance(return_evidence, dict) or (
                 return_evidence.get("allow_live_position_influence") is not True

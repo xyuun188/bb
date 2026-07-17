@@ -52,6 +52,8 @@ OKX_REST_CALL_TIMEOUT = 10.0
 OKX_TIME_DIFFERENCE_SYNC_TIMEOUT = 3.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
+OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
+OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
 
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
@@ -94,6 +96,9 @@ class OKXExecutor(AbstractExecutor):
         self._markets_loaded = False
         self._leverage_cache: dict[tuple[str, str], tuple[float, float]] = {}
         self._contract_delivery_locks: dict[str, tuple[float, str]] = {}
+        self._entry_instrument_availability_cache: dict[
+            str, tuple[dict[str, Any], float, float]
+        ] = {}
 
     @property
     def executor_mode(self) -> str:
@@ -538,6 +543,7 @@ class OKXExecutor(AbstractExecutor):
         base_quantity = 0.0
         okx_order_rules: dict[str, Any] = {}
         params: dict[str, Any] = {}
+        leverage_check: dict[str, Any] | None = None
         protection_submit_requested_at: datetime | None = None
         protection_submission: dict[str, Any] = {}
 
@@ -1003,8 +1009,6 @@ class OKXExecutor(AbstractExecutor):
                             },
                         )
             params: dict[str, Any] = {"tdMode": "cross"}
-            leverage_check: dict[str, Any] | None = None
-
             if decision.is_entry:
                 quantity_leverage = self._safe_float(decision.suggested_leverage, 1.0)
                 leverage_check = await self._set_leverage_if_needed(decision)
@@ -4591,10 +4595,13 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(symbol)
         position_symbols = [str(position.get("symbol") or "") for position in positions or []]
         requested_symbols = [symbol, *position_symbols]
-        balance_snapshot, contract_specs, leverage_tiers = await asyncio.gather(
+        balance_snapshot, contract_specs, leverage_tiers, instrument_availability = (
+            await asyncio.gather(
             self.get_balance_snapshot(),
             self._native_facts_client().fetch_contract_specs(symbols=requested_symbols),
             self._fetch_okx_leverage_tiers(okx_symbol),
+            self.entry_instrument_availability(symbol, okx_symbol=okx_symbol),
+            )
         )
         tier_leverages = [
             self._safe_float(tier.get("maxLeverage"), 0.0) for tier in leverage_tiers
@@ -4621,6 +4628,13 @@ class OKXExecutor(AbstractExecutor):
             reasons.append("target_okx_contract_spec_missing")
         if missing_specs:
             reasons.append("open_position_okx_contract_spec_missing")
+        if instrument_availability.get("available") is not True:
+            reasons.append(
+                str(
+                    instrument_availability.get("reason")
+                    or "okx_private_entry_instrument_availability_unverified"
+                )
+            )
         generated_at = datetime.now(UTC).isoformat()
         return {
             "production_eligible": not reasons,
@@ -4632,6 +4646,7 @@ class OKXExecutor(AbstractExecutor):
             "target_inst_id": target_inst_id,
             "contract_specs": contract_specs,
             "missing_contract_specs": missing_specs,
+            "entry_instrument_availability": instrument_availability,
             "balance_snapshot": balance_snapshot,
             "policy_provenance": {
                 "source": "okx_native_balance_contract_specs_and_leverage_tiers",
@@ -4642,6 +4657,75 @@ class OKXExecutor(AbstractExecutor):
                 "fallback_reason": ",".join(reasons),
             },
         }
+
+    async def entry_instrument_availability(
+        self,
+        symbol: str,
+        *,
+        okx_symbol: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Verify that this account and execution mode can address the instrument."""
+
+        inst_id = okx_inst_id_from_symbol(symbol)
+        now = time.monotonic()
+        cached = self._entry_instrument_availability_cache.get(inst_id)
+        if not force and cached and now - cached[1] <= cached[2]:
+            return {**cached[0], "cache_hit": True}
+
+        generated_at = datetime.now(UTC).isoformat()
+        try:
+            ccxt = await self._get_ccxt()
+            fetch_leverage = getattr(ccxt, "fetch_leverage", None)
+            if not callable(fetch_leverage):
+                raise ExchangeAPIError("OKX private account leverage API is unavailable")
+            resolved_symbol = okx_symbol or await self._resolve_swap_symbol(symbol)
+            response = await self._with_retry(
+                fetch_leverage,
+                resolved_symbol,
+                {"mgnMode": "cross"},
+            )
+            result = {
+                "available": True,
+                "reason": "okx_private_account_instrument_verified",
+                "source": "okx_private_account_leverage_info",
+                "symbol": normalize_trading_symbol(symbol),
+                "inst_id": inst_id,
+                "mode": self.executor_mode,
+                "demo": settings.is_okx_demo(self.executor_mode),
+                "reported_leverage": self._extract_verified_leverage(response),
+                "generated_at": generated_at,
+                "cache_hit": False,
+            }
+            ttl = OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS
+        except Exception as exc:
+            error_text = safe_error_text(exc, limit=220)
+            error_code = str(getattr(exc, "code", "") or "")
+            unavailable = error_code == "51001" or "[51001]" in error_text
+            result = {
+                "available": False,
+                "reason": (
+                    "okx_private_entry_instrument_unavailable"
+                    if unavailable
+                    else "okx_private_entry_instrument_probe_failed"
+                ),
+                "source": "okx_private_account_leverage_info",
+                "symbol": normalize_trading_symbol(symbol),
+                "inst_id": inst_id,
+                "mode": self.executor_mode,
+                "demo": settings.is_okx_demo(self.executor_mode),
+                "error_code": error_code or None,
+                "error": error_text,
+                "generated_at": generated_at,
+                "cache_hit": False,
+            }
+            ttl = (
+                OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS
+                if unavailable
+                else OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS
+            )
+        self._entry_instrument_availability_cache[inst_id] = (dict(result), now, ttl)
+        return result
 
     async def pre_order_execution_facts(
         self,

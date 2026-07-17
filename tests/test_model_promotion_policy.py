@@ -225,9 +225,11 @@ def test_phase3_promotion_uses_return_report_not_sample_count_or_win_rate() -> N
     assert recommendation["live_mutation"] is False
 
 
-def test_phase3_promotion_fails_closed_without_return_report() -> None:
+def test_phase3_promotion_allows_paper_canary_but_blocks_live_without_return_report() -> None:
     recommendation = _recommendation({})
 
-    assert recommendation["canary_ready"] is False
+    assert recommendation["canary_ready"] is True
+    assert recommendation["canary_execution_scope"] == "paper_only"
+    assert recommendation["canary_production_permission"] is False
     assert recommendation["live_ready"] is False
-    assert "return_objective_report_missing" in recommendation["canary_blocking_reasons"]
+    assert "return_objective_report_missing" in recommendation["live_blocking_reasons"]

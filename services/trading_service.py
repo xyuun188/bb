@@ -138,6 +138,7 @@ from services.okx_order_fact_sync import OkxOrderFactSyncService
 from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncService
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
+from services.paper_bootstrap_canary import PaperBootstrapCanaryPolicy
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -644,6 +645,10 @@ class TradingService:
             allocated_order_balance=self.allocated_order_balance,
             exchange_risk_facts=self.entry_exchange_risk_facts,
         )
+        self.paper_bootstrap_canary = PaperBootstrapCanaryPolicy(
+            allocated_order_balance=self.allocated_order_balance,
+            exchange_risk_facts=self.entry_exchange_risk_facts,
+        )
         self._open_positions_context_cache: dict[str, Any] = {}
         self._open_positions_context_refresh_task: asyncio.Task | None = None
         self._new_pair_pause_context_cache: dict[str, Any] = {}
@@ -675,6 +680,7 @@ class TradingService:
             entry_profit_risk_sizing=self.entry_profit_risk_sizing,
             entry_price_guard=self.entry_price_guard,
             entry_opportunity_gate=self.entry_opportunity_gate,
+            paper_bootstrap_canary=self.paper_bootstrap_canary,
         )
         self.entry_candidate_queue = EntryCandidateQueuePolicy(
             score_candidate=self.entry_policy.score_candidate,
@@ -4546,6 +4552,96 @@ class TradingService:
         self._last_auto_feature_rank_diagnostics = result.diagnostics
         return result.selected
 
+    async def _filter_paper_entry_instrument_shortlist(
+        self,
+        feature_vectors: dict[str, Any],
+        limit: int,
+    ) -> dict[str, Any]:
+        """Keep only symbols the OKX demo account can address through private APIs."""
+
+        target = max(0, int(limit or 0))
+        if target <= 0 or not feature_vectors:
+            return {}
+        executor = await self._get_okx_executor_for_mode("paper")
+        semaphore = asyncio.Semaphore(4)
+
+        async def probe(symbol: str) -> tuple[str, dict[str, Any]]:
+            async with semaphore:
+                try:
+                    result = await executor.entry_instrument_availability(symbol)
+                except Exception as exc:
+                    result = {
+                        "available": False,
+                        "reason": "okx_private_entry_instrument_probe_failed",
+                        "error": safe_error_text(exc, limit=180),
+                    }
+                return symbol, result
+
+        probe_results = await asyncio.gather(
+            *(probe(symbol) for symbol in feature_vectors),
+        )
+        availability = {symbol: facts for symbol, facts in probe_results}
+        selected = {
+            symbol: feature_vectors[symbol]
+            for symbol in feature_vectors
+            if self._safe_dict(availability.get(symbol)).get("available") is True
+        }
+        selected = dict(list(selected.items())[:target])
+        selected_symbols = set(selected)
+        unavailable = [
+            {
+                "symbol": symbol,
+                "reason": self._safe_dict(facts).get("reason"),
+                "error_code": self._safe_dict(facts).get("error_code"),
+                "cache_hit": self._safe_dict(facts).get("cache_hit"),
+            }
+            for symbol, facts in probe_results
+            if self._safe_dict(facts).get("available") is not True
+        ]
+        diagnostics = self._safe_dict(
+            getattr(self, "_last_auto_feature_rank_diagnostics", None)
+        )
+        diagnostics["execution_availability"] = {
+            "source": "okx_private_account_leverage_info",
+            "mode": "paper",
+            "probed_count": len(probe_results),
+            "available_count": sum(
+                self._safe_dict(facts).get("available") is True
+                for _symbol, facts in probe_results
+            ),
+            "selected_count": len(selected),
+            "target_count": target,
+            "unavailable": unavailable,
+        }
+        diagnostics["selected_before_execution_availability"] = int(
+            diagnostics.get("selected") or len(feature_vectors)
+        )
+        diagnostics["selected"] = len(selected)
+        diagnostics["market_symbol_limit"] = target
+        ranked_sample = diagnostics.get("ranked_symbol_sample")
+        if isinstance(ranked_sample, list):
+            for item in ranked_sample:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("symbol") or "")
+                facts = self._safe_dict(availability.get(symbol))
+                item["execution_instrument_available"] = facts.get("available") is True
+                item["execution_instrument_reason"] = facts.get("reason")
+                item["selected"] = symbol in selected_symbols
+                if facts.get("available") is not True:
+                    item["non_selected_reason"] = "paper_execution_instrument_unavailable"
+        diagnostics["symbols"] = [
+            item
+            for item in (ranked_sample or [])
+            if isinstance(item, dict) and str(item.get("symbol") or "") in selected_symbols
+        ]
+        self._last_auto_feature_rank_diagnostics = diagnostics
+        logger.info(
+            "paper execution instrument shortlist",
+            **diagnostics["execution_availability"],
+        )
+        return selected
+
     def _market_candidate_funnel_snapshot(
         self,
         *,
@@ -5382,9 +5478,23 @@ class TradingService:
                     market_feature_vectors = {}
                     market_feature_vectors_after_rank = {}
                 elif mode_manager.is_auto_scan:
+                    model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
+                    rank_limit = market_symbol_budget
+                    if model_mode == "paper":
+                        rank_limit = min(
+                            len(market_feature_vectors),
+                            max(market_symbol_budget * 4, market_symbol_budget),
+                        )
                     market_feature_vectors = self._rank_auto_feature_vectors(
-                        market_feature_vectors, market_symbol_budget
+                        market_feature_vectors, rank_limit
                     )
+                    if model_mode == "paper":
+                        market_feature_vectors = (
+                            await self._filter_paper_entry_instrument_shortlist(
+                                market_feature_vectors,
+                                market_symbol_budget,
+                            )
+                        )
                     rank_diagnostics_snapshot = self._safe_dict(
                         getattr(self, "_last_auto_feature_rank_diagnostics", None)
                     )
@@ -6356,6 +6466,10 @@ class TradingService:
                     await okx.shutdown()
                 except Exception as exc:
                     logger.debug("OKX executor shutdown failed", error=safe_error_text(exc))
+        try:
+            await self.local_ai_tools.close()
+        except Exception as exc:
+            logger.debug("local AI tools client shutdown failed", error=safe_error_text(exc))
         await self.models.shutdown_all()
         logger.info("trading service stopped")
 

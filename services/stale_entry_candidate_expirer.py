@@ -78,6 +78,9 @@ def _stale_entry_scan_columns() -> tuple[Any, ...]:
         raw["entry_candidate_evidence"]["expected_net_return_pct"].label(
             f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}direct_expected_net_return_pct"
         ),
+        raw["paper_bootstrap_canary"].label(
+            f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}paper_bootstrap_canary"
+        ),
         raw["decision_state_machine"]["stages"].label(
             f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}stages"
         ),
@@ -101,12 +104,15 @@ def _stale_entry_row_from_mapping(mapping: Any) -> SimpleNamespace:
     direct_expected = mapping.get(f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}direct_expected_net_return_pct")
     if direct_expected is not None:
         evidence["expected_net_return_pct"] = direct_expected
+    paper_canary = mapping.get(f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}paper_bootstrap_canary")
     stages = mapping.get(f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}stages")
     raw: dict[str, Any] = {}
     if opportunity:
         raw["opportunity_score"] = opportunity
     if evidence:
         raw["entry_candidate_evidence"] = evidence
+    if isinstance(paper_canary, dict):
+        raw["paper_bootstrap_canary"] = paper_canary
     if isinstance(stages, list):
         raw["decision_state_machine"] = {"stages": stages}
     return SimpleNamespace(
@@ -502,6 +508,14 @@ class StaleEntryCandidateExpirer:
     def _waiting_expiration_reason(self, row: Any) -> str:
         raw = _safe_raw_response(row.raw_llm_response)
         valid_for = entry_validity_seconds_from_raw(raw)
+        paper_canary = raw.get("paper_bootstrap_canary")
+        if isinstance(paper_canary, dict) and paper_canary.get("authorized") is True:
+            if valid_for <= 0:
+                return "Paper bootstrap canary is missing its model-bound validity horizon."
+            return (
+                f"Paper bootstrap canary exceeded its {valid_for:.0f}-second model-bound "
+                "validity horizon; a fresh observation is required."
+            )
         opportunity = raw.get("opportunity_score")
         if not isinstance(opportunity, dict):
             opportunity = {}

@@ -298,15 +298,6 @@ def build_phase3_promotion_recommendation(
         )
     if effective_weight is not None and effective_weight <= 0:
         blockers.append("effective_training_weight_zero")
-    if return_report.get("promotion_ready") is not True:
-        blockers.extend(
-            str(reason)
-            for reason in _safe_list(return_report.get("blocking_reasons"))
-            if reason
-        )
-        if not return_report:
-            blockers.append("return_objective_report_missing")
-
     paper_required = bool(policy.get("requires_paper_observation", True))
     if paper_required and not bool(paper.get("can_use_for_promotion")):
         blockers.append("paper_observation_not_healthy")
@@ -316,6 +307,14 @@ def build_phase3_promotion_recommendation(
 
     canary_blockers = list(dict.fromkeys(blockers))
     live_blockers = list(canary_blockers)
+    if return_report.get("promotion_ready") is not True:
+        live_blockers.extend(
+            str(reason)
+            for reason in _safe_list(return_report.get("blocking_reasons"))
+            if reason
+        )
+        if not return_report:
+            live_blockers.append("return_objective_report_missing")
     if str(training_mode or "").lower() != "walk_forward":
         live_blockers.append("walk_forward_required")
     if str(model_stage or "").lower() != "live":
@@ -334,6 +333,8 @@ def build_phase3_promotion_recommendation(
         "training_mode": str(training_mode or "shadow").lower(),
         "recommended_stage": recommended_stage,
         "canary_ready": not canary_blockers,
+        "canary_execution_scope": "paper_only",
+        "canary_production_permission": False,
         "live_ready": not live_blockers,
         "canary_blocking_reasons": canary_blockers,
         "live_blocking_reasons": live_blockers,

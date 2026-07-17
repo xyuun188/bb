@@ -89,6 +89,36 @@ def test_entry_freshness_fails_closed_without_dynamic_horizon() -> None:
     )
 
 
+def test_paper_canary_freshness_uses_version_bound_prediction_horizon() -> None:
+    now = datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
+    decision = _decision(
+        now=now,
+        generated_at=datetime(2026, 7, 17, 8, 0, tzinfo=UTC),
+        valid_for_seconds=0,
+    )
+    decision.raw_response["paper_bootstrap_canary"] = {
+        "authorized": True,
+        "requested": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "generated_at": "2026-07-17T09:56:00+00:00",
+        "selected_observation": {"horizon_minutes": 10},
+        "policy_provenance": {"generated_at": "2026-07-17T09:56:00+00:00"},
+    }
+    policy = DecisionFreshnessPolicy(clock=lambda: now)
+
+    assert policy.max_age_seconds(decision) == 600.0
+    assert policy.decision_reference_time(decision) == datetime(
+        2026, 7, 17, 9, 56, tzinfo=UTC
+    )
+    assert policy.stale_decision_reason(decision) is None
+
+    decision.raw_response["paper_bootstrap_canary"]["policy_provenance"][
+        "generated_at"
+    ] = "2026-07-17T09:49:00+00:00"
+    assert policy.stale_decision_reason(decision) is not None
+
+
 def test_confidence_and_score_cannot_extend_return_horizon() -> None:
     now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
     decision = _decision(

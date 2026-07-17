@@ -2325,7 +2325,7 @@ def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
     assert "LimitNOFILE=65535" in source
-    assert "--timeout-keep-alive 5" in source
+    assert "--timeout-keep-alive 30" in source
 
 
 def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:

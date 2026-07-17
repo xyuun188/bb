@@ -54,6 +54,7 @@ from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
 from services.phase3_server_migration_audit import Phase3ServerMigrationAuditService
 from services.phase3_stage_handoff import Phase3StageHandoffService
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
+from services.production_source_health import ProductionSourceHealthService
 from services.server_monitor_status import collect_platform_runtime_status
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
@@ -144,6 +145,7 @@ DB_AUDIT_KEYS = (
     "strategy_quality",
     "strategy_closed_loop",
     "strategy_signal_root_cause",
+    "production_source_health",
     "model_training",
     "model_dynamic_routing",
     "high_risk_review_audit",
@@ -172,6 +174,7 @@ CARD_OWNER_PATHS = {
     "strategy_quality": "web_dashboard/api/system_audit.py",
     "strategy_closed_loop": "web_dashboard/api/system_audit.py",
     "strategy_signal_root_cause": "services/strategy_signal_root_cause_audit.py",
+    "production_source_health": "services/production_source_health.py",
     "strategy_gate_contract": "services/return_execution_policy.py",
     "model_training": "web_dashboard/api/data_collection.py",
     "model_expert_health": "services/model_expert_health.py",
@@ -201,6 +204,7 @@ NODE_OWNER_PATHS = {
     "strategy_decision": "services/trading_policies.py",
     "strategy_closed_loop": "web_dashboard/api/system_audit.py",
     "strategy_signal_root_cause": "services/strategy_signal_root_cause_audit.py",
+    "production_source_health": "services/production_source_health.py",
     "strategy_gate_contract": "services/return_execution_policy.py",
     "risk_guard": "services/trading_policies.py",
     "okx_execution": "services/execution_service.py",
@@ -2892,6 +2896,55 @@ async def _strategy_quality_audit() -> dict[str, Any]:
     )
 
 
+async def _production_source_health_audit() -> dict[str, Any]:
+    try:
+        report = await ProductionSourceHealthService().report(
+            hours=AUDIT_WINDOWS["strategy_hours"],
+            limit=5000,
+            decision_interval_seconds=int(settings.decision_interval_seconds or 60),
+        )
+    except Exception as exc:
+        return _audit_card(
+            "production_source_health",
+            "连续无生产收益源",
+            "warning",
+            "生产收益源连续性审计不可用；正式开仓继续失败关闭。",
+            details={"error": safe_error_text(exc, limit=180)},
+            owner_path="services/production_source_health.py",
+        )
+    status = str(report.get("status") or "warning")
+    duration = report.get("continuous_no_source_seconds")
+    if status == "ok":
+        summary = "近期存在通过治理的生产收益源。"
+    elif report.get("recovery_state") == "paper_bootstrap_collecting":
+        summary = "正式生产收益源仍为空，模拟盘 bootstrap canary 正在采集恢复证据。"
+    else:
+        summary = "连续没有通过治理的生产收益源，系统已告警并保持正式开仓失败关闭。"
+    return _audit_card(
+        "production_source_health",
+        "连续无生产收益源",
+        status if status in {"ok", "warning", "critical"} else "warning",
+        summary,
+        details=report,
+        evidence=[
+            {"label": "连续无源秒数", "value": duration},
+            {
+                "label": "生产源决策",
+                "value": int(report.get("production_source_decision_count") or 0),
+            },
+            {
+                "label": "canary 已执行",
+                "value": int(report.get("paper_bootstrap_executed_count") or 0),
+            },
+        ],
+        next_actions=[
+            "检查 paper bootstrap canary 的运行时熔断、成交和版本归因。",
+            "只有 walk-forward、样本外和权威成交费后收益下界转正后才恢复正式生产源。",
+        ],
+        owner_path="services/production_source_health.py",
+    )
+
+
 async def _strategy_closed_loop_audit() -> dict[str, Any]:
     try:
         root_report, contract_report = await asyncio.gather(
@@ -5219,6 +5272,7 @@ async def _collect_system_audit_status_unlocked(
         ("strategy_quality", _strategy_quality_audit),
         ("strategy_closed_loop", _strategy_closed_loop_audit),
         ("strategy_signal_root_cause", _strategy_signal_root_cause_audit),
+        ("production_source_health", _production_source_health_audit),
         ("model_training", _model_training_audit),
         ("model_expert_health", _model_expert_health_audit),
         ("model_expert_competition", _model_expert_competition_audit),

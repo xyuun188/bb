@@ -141,7 +141,7 @@ async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_secon
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_serializes_overlapping_batches_and_tool_calls(
+async def test_local_ai_tools_serializes_batches_but_parallelizes_core_inference(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,7 +172,7 @@ async def test_local_ai_tools_serializes_overlapping_batches_and_tool_calls(
 
     assert first["status"] == "completed"
     assert second["status"] == "completed"
-    assert max_active_calls == 1
+    assert max_active_calls == 2
     assert len(calls) == 6
     symbols = [symbol for symbol, _path in calls]
     assert sum(left != right for left, right in zip(symbols, symbols[1:], strict=False)) == 1
@@ -332,10 +332,9 @@ async def test_local_ai_tools_train_builds_default_promotion_recommendation(
     recommendation = captured["payload"]["promotion_recommendation"]
     return_objective_report = captured["payload"]["return_objective_report"]
     assert recommendation["policy"] == "2026-07-14.separated-return-promotion.v2"
-    assert recommendation["canary_ready"] is False
-    assert "authoritative_realized_return_distribution_missing" in recommendation[
-        "canary_blocking_reasons"
-    ]
+    assert recommendation["canary_ready"] is True
+    assert recommendation["canary_execution_scope"] == "paper_only"
+    assert recommendation["canary_production_permission"] is False
     assert recommendation["live_ready"] is False
     assert "walk_forward_required" in recommendation["live_blocking_reasons"]
     assert captured["payload"]["paper_observation_report"]["status"] == "healthy"
@@ -1046,17 +1045,14 @@ async def test_local_ai_tools_status_uses_short_cache(
     assert second["child_endpoints"]["profit_prediction"]["available"] is True
 
 
-def test_local_ai_tools_auth_headers_close_connections(
+def test_local_ai_tools_auth_headers_allow_keepalive(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "local_ai_tools_api_key", "  local-secret-token  ")
     headers = LocalAIToolsClient()._auth_headers()
 
-    assert headers == {
-        "Authorization": "Bearer local-secret-token",
-        "Connection": "close",
-    }
+    assert headers == {"Authorization": "Bearer local-secret-token"}
 
 
 @pytest.mark.asyncio
