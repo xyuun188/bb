@@ -264,12 +264,14 @@ class PaperBootstrapCanaryPolicy:
             and contract.get("requested") is True
         )
 
-    async def prepare(
+    async def preflight(
         self,
         decision: DecisionOutput,
         model_mode: str,
         open_positions: list[dict[str, Any]],
     ) -> PaperBootstrapAssessment:
+        """Evaluate lifecycle guards before an entry action is persisted."""
+
         raw = _safe_dict(decision.raw_response)
         contract = _safe_dict(raw.get("paper_bootstrap_canary"))
         reasons = PaperBootstrapCanaryPolicy._contract_reasons(
@@ -279,6 +281,90 @@ class PaperBootstrapCanaryPolicy:
         )
         runtime_guard = await self._runtime_guard(contract, open_positions)
         reasons.extend(runtime_guard["blocking_reasons"])
+        reasons = list(dict.fromkeys(reasons))
+        eligible = not reasons
+        contract = dict(contract)
+        contract["runtime_guard"] = runtime_guard
+        contract["runtime_preflight_authorized"] = eligible
+        contract["runtime_preflight_blocking_reasons"] = reasons
+        if not eligible:
+            contract["runtime_authorized"] = False
+            contract["runtime_blocking_reasons"] = reasons
+            raw["profit_risk_sizing"] = {
+                "production_eligible": False,
+                "contract_lifecycle": "paper_bootstrap_canary",
+                "reasons": reasons,
+                "policy_provenance": {
+                    **_safe_dict(contract.get("policy_provenance")),
+                    "fallback_reason": ",".join(reasons),
+                },
+            }
+            decision.position_size_pct = 0.0
+            decision.suggested_leverage = 1.0
+        raw["paper_bootstrap_canary"] = contract
+        decision.raw_response = raw
+        return PaperBootstrapAssessment(
+            eligible=eligible,
+            reason=(
+                "paper_bootstrap_canary_runtime_preflight_ready" if eligible else ",".join(reasons)
+            ),
+            details={
+                "contract": contract,
+                "runtime_guard": runtime_guard,
+                "sizing": _safe_dict(raw.get("profit_risk_sizing")),
+            },
+        )
+
+    @staticmethod
+    def demote_blocked_candidate_to_hold(
+        decision: DecisionOutput,
+        assessment: PaperBootstrapAssessment,
+    ) -> bool:
+        """Persist a blocked canary as hold while retaining its shadow direction."""
+
+        if assessment.eligible or not PaperBootstrapCanaryPolicy.is_claimed(decision):
+            return False
+        candidate_action = decision.action.value
+        raw = _safe_dict(decision.raw_response)
+        contract = _safe_dict(raw.get("paper_bootstrap_canary"))
+        contract["candidate_action"] = candidate_action
+        contract["persisted_action"] = Action.HOLD.value
+        contract["execution_intent"] = "observation_only_hold"
+        contract["candidate_blocking_reason"] = assessment.reason
+        raw["paper_bootstrap_canary"] = contract
+        raw["paper_bootstrap_canary_observation"] = {
+            "candidate_action": candidate_action,
+            "persisted_action": Action.HOLD.value,
+            "selected_side": contract.get("selected_side"),
+            "reason": assessment.reason,
+            "shadow_direction_preserved": True,
+            "exchange_submission_allowed": False,
+        }
+        decision.action = Action.HOLD
+        decision.position_size_pct = 0.0
+        decision.suggested_leverage = 1.0
+        decision.stop_loss_pct = 0.0
+        decision.take_profit_pct = 0.0
+        decision.reasoning = (
+            "paper canary \u8fd0\u884c\u65f6\u98ce\u63a7\u672a\u6388\u6743\u672c\u8f6e\u5f00\u4ed3\uff0c"
+            "\u5019\u9009\u65b9\u5411\u4ec5\u4fdd\u7559\u4e3a\u89c2\u5bdf\u8bc1\u636e\uff0c\u672c\u8f6e\u88c1\u51b3\u4e3a\u89c2\u671b\u3002"
+        )
+        decision.raw_response = raw
+        return True
+
+    async def prepare(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+        open_positions: list[dict[str, Any]],
+    ) -> PaperBootstrapAssessment:
+        preflight = await self.preflight(decision, model_mode, open_positions)
+        if not preflight.eligible:
+            return preflight
+        raw = _safe_dict(decision.raw_response)
+        contract = _safe_dict(raw.get("paper_bootstrap_canary"))
+        runtime_guard = _safe_dict(preflight.details.get("runtime_guard"))
+        reasons: list[str] = []
         facts: dict[str, Any] = {}
         allocated_margin = 0.0
         if not reasons:
@@ -441,9 +527,7 @@ class PaperBootstrapCanaryPolicy:
             if _safe_dict(_row_raw(row).get("paper_bootstrap_canary")).get("authorized") is True
         ]
         open_canary_rows = [
-            row
-            for row in canary_rows
-            if not str(_row_value(row, "outcome") or "").strip()
+            row for row in canary_rows if not str(_row_value(row, "outcome") or "").strip()
         ]
         if len(open_canary_rows) >= PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS:
             reasons.append("paper_canary_open_position_limit_reached")
@@ -501,9 +585,9 @@ class PaperBootstrapCanaryPolicy:
             "consecutive_loss_count": consecutive_losses,
             "max_consecutive_losses": PAPER_BOOTSTRAP_MAX_CONSECUTIVE_LOSSES,
             "cooldown_seconds": cooldown_seconds,
-            "last_executed_at": last_executed.isoformat()
-            if isinstance(last_executed, datetime)
-            else None,
+            "last_executed_at": (
+                last_executed.isoformat() if isinstance(last_executed, datetime) else None
+            ),
         }
 
     def _attach_risk_contract(
@@ -653,9 +737,7 @@ class PaperBootstrapCanaryPolicy:
             "account_portfolio_risk_snapshot": account_portfolio,
             "exchange_contract_specs": contract_specs,
             "exchange_risk_facts_provenance": facts.get("policy_provenance"),
-            "entry_instrument_availability": facts.get(
-                "entry_instrument_availability"
-            ),
+            "entry_instrument_availability": facts.get("entry_instrument_availability"),
             "leverage_tier_selection": leverage_tier_selection,
             "runtime_guard": runtime_guard,
             "reasons": reasons,

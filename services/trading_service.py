@@ -1643,6 +1643,7 @@ class TradingService:
                     "error": error,
                     "checked_count": 0,
                     "reconciled_count": 0,
+                    "decision_outcome_count": 0,
                     "exception_count": 0,
                     "skipped_count": 0,
                     "samples": [],
@@ -5890,6 +5891,16 @@ class TradingService:
                     skills=market_agent_skills,
                     note="市场分析前的 Agent/Skills 证据快照。",
                 )
+                if self.paper_bootstrap_canary.is_claimed(decision):
+                    canary_preflight = await self.paper_bootstrap_canary.preflight(
+                        decision,
+                        model_mode,
+                        open_positions,
+                    )
+                    self.paper_bootstrap_canary.demote_blocked_candidate_to_hold(
+                        decision,
+                        canary_preflight,
+                    )
                 decision_db_id = await self._log_decision(
                     decision, is_paper=(model_mode == "paper")
                 )
@@ -6024,15 +6035,28 @@ class TradingService:
                         executed.feature_snapshot or decision.feature_snapshot
                     )
                 if executed.is_hold:
+                    executed_raw = (
+                        executed.raw_response
+                        if isinstance(executed.raw_response, dict)
+                        else {}
+                    )
+                    hold_reason = (
+                        executed.reasoning
+                        if isinstance(
+                            executed_raw.get("paper_bootstrap_canary_observation"),
+                            dict,
+                        )
+                        else "多模型裁决结果为观望，未提交订单。"
+                    )
                     if decision_db_id is not None:
-                        if isinstance(executed.raw_response, dict):
+                        if executed_raw:
                             await self._mark_decision_raw_response(
                                 decision_db_id,
-                                executed.raw_response,
+                                executed_raw,
                             )
                         await self._mark_decision_reason(
                             decision_db_id,
-                            "多模型裁决结果为观望，未提交订单。",
+                            hold_reason,
                         )
                     self.market_decision_result_recorder.append_result(
                         results=results,
@@ -6042,6 +6066,7 @@ class TradingService:
                         model_mode=model_mode,
                         approved=True,
                         confidence=executed.confidence,
+                        reason=hold_reason,
                     )
                     continue
 

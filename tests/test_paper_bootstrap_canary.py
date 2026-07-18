@@ -145,9 +145,7 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
             "account_equity_usdt": 1000.0,
             "available_margin_usdt": 500.0,
             "target_inst_id": "BTC-USDT-SWAP",
-            "contract_specs": {
-                "BTC-USDT-SWAP": {"ctVal": "0.01", "ctMult": "1"}
-            },
+            "contract_specs": {"BTC-USDT-SWAP": {"ctVal": "0.01", "ctMult": "1"}},
             "leverage_tiers": [{"maxLeverage": 100, "maxNotional": 10000}],
             "entry_instrument_availability": {"available": True},
         }
@@ -178,9 +176,7 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     assert sizing["leverage_tier_selection"]["contract_spec"]["ctVal"] == "0.01"
     assert sizing["contract_version"] == PAPER_BOOTSTRAP_SIZING_VERSION
     assert sizing["portfolio_risk_snapshot"]["gross_notional_usdt"] == 0.0
-    assert sizing["portfolio_risk_snapshot"]["scope"] == (
-        "paper_bootstrap_canary_positions_only"
-    )
+    assert sizing["portfolio_risk_snapshot"]["scope"] == ("paper_bootstrap_canary_positions_only")
     assert sizing["entry_instrument_availability"]["available"] is True
     assert decision.suggested_leverage == 1.0
     assert decision.stop_loss_pct > 0
@@ -195,9 +191,10 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
         source="test_exchange_precision",
     )
     assert reconciled["eligible"] is True
-    assert decision.raw_response["profit_risk_sizing"]["policy_provenance"][
-        "strategy_version"
-    ] == PAPER_BOOTSTRAP_SIZING_VERSION
+    assert (
+        decision.raw_response["profit_risk_sizing"]["policy_provenance"]["strategy_version"]
+        == PAPER_BOOTSTRAP_SIZING_VERSION
+    )
 
 
 @pytest.mark.asyncio
@@ -215,9 +212,7 @@ async def test_non_canary_account_positions_do_not_consume_canary_position_slot(
             "account_equity_usdt": 1000.0,
             "available_margin_usdt": 500.0,
             "target_inst_id": "BTC-USDT-SWAP",
-            "contract_specs": {
-                "BTC-USDT-SWAP": {"ctVal": "0.01", "ctMult": "1"}
-            },
+            "contract_specs": {"BTC-USDT-SWAP": {"ctVal": "0.01", "ctMult": "1"}},
             "leverage_tiers": [{"maxLeverage": 100, "maxNotional": 10000}],
             "entry_instrument_availability": {"available": True},
         }
@@ -286,6 +281,55 @@ async def test_unsettled_canary_entry_consumes_canary_position_slot() -> None:
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
     assert guard["open_position_count"] == 1
     assert guard["account_open_position_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_blocked_canary_is_persisted_as_hold_with_candidate_direction_evidence() -> None:
+    async def unused_balance(_mode: str, _decision: DecisionOutput) -> float:
+        raise AssertionError("preflight must not request account capacity")
+
+    async def unused_facts(
+        _mode: str,
+        _decision: DecisionOutput,
+        _positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise AssertionError("preflight must not request exchange facts")
+
+    now = datetime.now(UTC)
+
+    async def history() -> list[Any]:
+        return [
+            SimpleNamespace(
+                id=101,
+                raw_llm_response={"paper_bootstrap_canary": {"authorized": True}},
+                outcome=None,
+                executed_at=now,
+                created_at=now,
+            )
+        ]
+
+    decision = _decision()
+    original_action = decision.action
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=unused_balance,
+        exchange_risk_facts=unused_facts,
+        history_provider=history,
+    )
+
+    preflight = await policy.preflight(decision, "paper", [])
+    changed = policy.demote_blocked_candidate_to_hold(decision, preflight)
+
+    assert changed is True
+    assert original_action == Action.LONG
+    assert decision.action == Action.HOLD
+    contract = decision.raw_response["paper_bootstrap_canary"]
+    assert contract["selected_side"] == "long"
+    assert contract["candidate_action"] == "long"
+    assert contract["persisted_action"] == "hold"
+    assert contract["runtime_authorized"] is False
+    observation = decision.raw_response["paper_bootstrap_canary_observation"]
+    assert observation["shadow_direction_preserved"] is True
+    assert observation["exchange_submission_allowed"] is False
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,10 @@ from core.symbols import (
 from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.trade import Position
+from services.entry_decision_settlement import (
+    backfill_settled_entry_decision_outcomes,
+    sync_settled_entry_decision_outcome,
+)
 from services.okx_native_facts import OkxNativeAccountBill, OkxNativeFactsClient
 from services.okx_position_history_store import upsert_okx_position_history_row
 from services.position_settlement import (
@@ -95,6 +99,7 @@ class OkxPositionSettlementSyncSummary:
     mode: str
     checked_count: int
     reconciled_count: int
+    decision_outcome_count: int
     exception_count: int
     skipped_count: int
     samples: tuple[dict[str, Any], ...]
@@ -106,6 +111,7 @@ class OkxPositionSettlementSyncSummary:
             "mode": self.mode,
             "checked_count": self.checked_count,
             "reconciled_count": self.reconciled_count,
+            "decision_outcome_count": self.decision_outcome_count,
             "exception_count": self.exception_count,
             "skipped_count": self.skipped_count,
             "samples": list(self.samples),
@@ -128,15 +134,20 @@ class OkxPositionSettlementSyncService:
         session_context_factory: SessionContextFactory = get_session_ctx,
     ) -> None:
         self.mode = "live" if str(mode or "").lower() == "live" else "paper"
-        self.lookback_hours = max(1, min(int(lookback_hours or DEFAULT_SETTLEMENT_LOOKBACK_HOURS), 24 * 14))
+        self.lookback_hours = max(
+            1, min(int(lookback_hours or DEFAULT_SETTLEMENT_LOOKBACK_HOURS), 24 * 14)
+        )
         self.limit = max(1, min(int(limit or DEFAULT_SETTLEMENT_LIMIT), 100))
         self.retry_seconds = max(1.0, float(retry_seconds or DEFAULT_SETTLEMENT_RETRY_SECONDS))
-        self.timeout_seconds = max(1.0, float(timeout_seconds or DEFAULT_SETTLEMENT_TIMEOUT_SECONDS))
+        self.timeout_seconds = max(
+            1.0, float(timeout_seconds or DEFAULT_SETTLEMENT_TIMEOUT_SECONDS)
+        )
         self.executor_factory = executor_factory or OKXExecutor
         self.session_context_factory = session_context_factory
 
     async def sync_once(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
+        decision_outcome_changes = await self._backfill_decision_outcomes(started_at)
         candidates = await self._load_candidates(started_at)
         if not candidates:
             return OkxPositionSettlementSyncSummary(
@@ -144,17 +155,20 @@ class OkxPositionSettlementSyncService:
                 mode=self.mode,
                 checked_count=0,
                 reconciled_count=0,
+                decision_outcome_count=len(decision_outcome_changes),
                 exception_count=0,
                 skipped_count=0,
-                samples=(),
+                samples=tuple(decision_outcome_changes[-10:]),
             ).as_dict()
 
         executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
         samples: list[dict[str, Any]] = []
         checked = 0
         reconciled = 0
+        decision_outcome_count = len(decision_outcome_changes)
         exceptions = 0
         skipped = 0
+        samples.extend(decision_outcome_changes[-10:])
         fatal_error: str | None = None
         try:
             await asyncio.wait_for(executor.initialize(), timeout=min(self.timeout_seconds, 3.0))
@@ -163,7 +177,14 @@ class OkxPositionSettlementSyncService:
                 checked += 1
                 result = await self._settle_candidate(candidate, native_facts, started_at)
                 if isinstance(result, SettlementSuccess):
-                    changed = await self._apply_success(candidate, result, started_at)
+                    changed, outcome_change = await self._apply_success(
+                        candidate,
+                        result,
+                        started_at,
+                    )
+                    if outcome_change:
+                        decision_outcome_count += 1
+                        samples.append(outcome_change)
                     if changed:
                         reconciled += 1
                         samples.append(
@@ -221,11 +242,21 @@ class OkxPositionSettlementSyncService:
             mode=self.mode,
             checked_count=checked,
             reconciled_count=reconciled,
+            decision_outcome_count=decision_outcome_count,
             exception_count=exceptions,
             skipped_count=skipped,
             samples=tuple(samples[-10:]),
             error=fatal_error,
         ).as_dict()
+
+    async def _backfill_decision_outcomes(self, now: datetime) -> list[dict[str, Any]]:
+        async with self.session_context_factory() as session:
+            return await backfill_settled_entry_decision_outcomes(
+                session,
+                mode=self.mode,
+                now=now,
+                lookback_hours=self.lookback_hours,
+            )
 
     async def _load_candidates(self, now: datetime) -> list[SettlementCandidate]:
         since = now - timedelta(hours=self.lookback_hours)
@@ -370,15 +401,21 @@ class OkxPositionSettlementSyncService:
                 return funding_result
             funding_value, funding_source = funding_result
         fee_value, fee_key = _first_present_float(row, ("fee", "fees", "totalFee", "total_fee"))
-        fee_source = f"okx_positions_history.{fee_key}" if fee_key else "local_position_fee_snapshot"
-        total_fee_abs = abs(fee_value) if fee_key else abs(candidate.entry_fee) + abs(candidate.close_fee)
+        fee_source = (
+            f"okx_positions_history.{fee_key}" if fee_key else "local_position_fee_snapshot"
+        )
+        total_fee_abs = (
+            abs(fee_value) if fee_key else abs(candidate.entry_fee) + abs(candidate.close_fee)
+        )
         entry_fee, close_fee = _allocate_total_fee(
             total_fee_abs,
             candidate_entry_fee=candidate.entry_fee,
             candidate_close_fee=candidate.close_fee,
         )
         gross_value, gross_key = _first_present_float(row, ("pnl", "closePnl", "close_pnl"))
-        gross_source = f"okx_positions_history.{gross_key}" if gross_key else "derived_from_realized_pnl"
+        gross_source = (
+            f"okx_positions_history.{gross_key}" if gross_key else "derived_from_realized_pnl"
+        )
         if gross_key is None:
             gross_value = realized_value - funding_value + entry_fee + close_fee
         computed = gross_value + funding_value - entry_fee - close_fee
@@ -470,19 +507,19 @@ class OkxPositionSettlementSyncService:
         candidate: SettlementCandidate,
         success: SettlementSuccess,
         now: datetime,
-    ) -> bool:
+    ) -> tuple[bool, dict[str, Any] | None]:
         async with self.session_context_factory() as session:
             position = await session.get(Position, candidate.position_id)
             if position is None or bool(position.is_open):
-                return False
+                return False, None
             raw = getattr(position, "settlement_raw", None)
             raw = raw if isinstance(raw, dict) else {}
             if _has_superseded_position_metadata(position, raw):
                 _restore_superseded_position_status(position, raw, now=now)
                 await session.flush()
-                return False
+                return False, None
             if is_final_settlement_status(getattr(position, "settlement_status", None)):
-                return False
+                return False, None
             apply_position_settlement_snapshot(position, success.snapshot)
             row_inst_id = _position_history_inst_id(success.row)
             row_pos_id = _position_history_pos_id(success.row)
@@ -494,7 +531,7 @@ class OkxPositionSettlementSyncService:
             row_side = _position_history_side(success.row)
             if row_side in {"long", "short"}:
                 position.side = row_side
-            await upsert_okx_position_history_row(
+            history = await upsert_okx_position_history_row(
                 session,
                 success.row,
                 mode=self.mode,
@@ -505,9 +542,18 @@ class OkxPositionSettlementSyncService:
                 match_status=success.match_reason,
                 synced_at=now,
             )
+            outcome_change = await sync_settled_entry_decision_outcome(
+                session,
+                position=position,
+                history=history,
+                now=now,
+            )
             position.updated_at = now
             await session.flush()
-            return True
+            return (
+                True,
+                outcome_change if outcome_change.get("changed") is True else None,
+            )
 
     async def _apply_failure(
         self,
@@ -621,7 +667,9 @@ def _match_position_history_row(
             reasons.append("entry_order_id")
         if score <= 0:
             continue
-        scored.append((score, closed_delta if closed_delta is not None else 1e12, row, ",".join(reasons)))
+        scored.append(
+            (score, closed_delta if closed_delta is not None else 1e12, row, ",".join(reasons))
+        )
     if not scored:
         return SettlementFailure(
             code="positions_history_no_matching_row",
