@@ -223,11 +223,10 @@ async def _drop_removed_expert_memory_policy_columns(conn: Any) -> None:
     """Permanently remove expert-memory fields that once changed live policy."""
 
     if "postgresql" in settings.database_url:
-        for ddl in (
-            "ALTER TABLE expert_memories DROP COLUMN IF EXISTS confidence_adjustment",
-            "ALTER TABLE expert_memories DROP COLUMN IF EXISTS position_size_multiplier",
-        ):
-            await conn.execute(text(ddl))
+        existing = await _postgres_table_columns(conn, "expert_memories")
+        for name in ("confidence_adjustment", "position_size_multiplier"):
+            if name in existing:
+                await conn.execute(text(f"ALTER TABLE expert_memories DROP COLUMN {name}"))
         return
 
     if "sqlite" not in settings.database_url:
@@ -438,20 +437,43 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
     """Persist compact health evidence alongside each large decision payload."""
 
     column_ddls = (
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_timings JSONB",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_fallback_timings JSONB",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_experts JSONB",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_opinions JSONB",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_has_ml_signal BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_has_local_ml_signal BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_has_local_ai_tools BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS model_health_snapshot_version INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS decision_learning_snapshot JSONB",
-        "ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS decision_learning_snapshot_version INTEGER NOT NULL DEFAULT 0",
+        ("model_health_timings", "ALTER TABLE ai_decisions ADD COLUMN model_health_timings JSONB"),
+        (
+            "model_health_fallback_timings",
+            "ALTER TABLE ai_decisions ADD COLUMN model_health_fallback_timings JSONB",
+        ),
+        ("model_health_experts", "ALTER TABLE ai_decisions ADD COLUMN model_health_experts JSONB"),
+        ("model_health_opinions", "ALTER TABLE ai_decisions ADD COLUMN model_health_opinions JSONB"),
+        (
+            "model_health_has_ml_signal",
+            "ALTER TABLE ai_decisions ADD COLUMN model_health_has_ml_signal BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "model_health_has_local_ml_signal",
+            "ALTER TABLE ai_decisions ADD COLUMN model_health_has_local_ml_signal BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "model_health_has_local_ai_tools",
+            "ALTER TABLE ai_decisions ADD COLUMN model_health_has_local_ai_tools BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "model_health_snapshot_version",
+            "ALTER TABLE ai_decisions ADD COLUMN model_health_snapshot_version INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "decision_learning_snapshot",
+            "ALTER TABLE ai_decisions ADD COLUMN decision_learning_snapshot JSONB",
+        ),
+        (
+            "decision_learning_snapshot_version",
+            "ALTER TABLE ai_decisions ADD COLUMN decision_learning_snapshot_version INTEGER NOT NULL DEFAULT 0",
+        ),
     )
     if "postgresql" in settings.database_url:
-        for ddl in column_ddls:
-            await conn.execute(text(ddl))
+        existing = await _postgres_table_columns(conn, "ai_decisions")
+        for name, ddl in column_ddls:
+            if name not in existing:
+                await conn.execute(text(ddl))
         await conn.execute(
             text(
                 """
@@ -575,24 +597,25 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
     from core.training_contracts import SHADOW_LABEL_VERSION
 
     if "postgresql" in settings.database_url:
-        await conn.execute(
-            text(
-                "ALTER TABLE shadow_backtests "
-                "ADD COLUMN IF NOT EXISTS training_feature_snapshot JSONB"
-            )
+        specs = await _postgres_table_column_specs(conn, "shadow_backtests")
+        column_ddls = (
+            (
+                "training_feature_snapshot",
+                "ALTER TABLE shadow_backtests ADD COLUMN training_feature_snapshot JSONB",
+            ),
+            (
+                "training_feature_snapshot_version",
+                "ALTER TABLE shadow_backtests ADD COLUMN training_feature_snapshot_version "
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "label_version",
+                "ALTER TABLE shadow_backtests ADD COLUMN label_version VARCHAR(80)",
+            ),
         )
-        await conn.execute(
-            text(
-                "ALTER TABLE shadow_backtests "
-                "ADD COLUMN IF NOT EXISTS training_feature_snapshot_version INTEGER NOT NULL DEFAULT 0"
-            )
-        )
-        await conn.execute(
-            text(
-                "ALTER TABLE shadow_backtests "
-                "ADD COLUMN IF NOT EXISTS label_version VARCHAR(80)"
-            )
-        )
+        for name, ddl in column_ddls:
+            if name not in specs:
+                await conn.execute(text(ddl))
         await conn.execute(
             text(
                 "UPDATE shadow_backtests "
@@ -600,26 +623,31 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
                 "WHERE label_version IS NULL OR label_version = ''"
             )
         )
-        await conn.execute(
-            text(
-                "ALTER TABLE shadow_backtests "
-                f"ALTER COLUMN label_version SET DEFAULT '{SHADOW_LABEL_VERSION}'"
+        label_spec = specs.get("label_version", {})
+        label_added = "label_version" not in specs
+        if label_added or SHADOW_LABEL_VERSION not in str(label_spec.get("column_default") or ""):
+            await conn.execute(
+                text(
+                    "ALTER TABLE shadow_backtests "
+                    f"ALTER COLUMN label_version SET DEFAULT '{SHADOW_LABEL_VERSION}'"
+                )
             )
-        )
-        await conn.execute(
-            text(
-                "ALTER TABLE shadow_backtests "
-                "ALTER COLUMN label_version SET NOT NULL"
+        if label_added or label_spec.get("is_nullable") != "NO":
+            await conn.execute(
+                text(
+                    "ALTER TABLE shadow_backtests "
+                    "ALTER COLUMN label_version SET NOT NULL"
+                )
             )
-        )
-        await conn.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                "uq_shadow_decision_horizon_label_version "
-                "ON shadow_backtests (decision_id, horizon_minutes, label_version) "
-                "WHERE decision_id IS NOT NULL"
+        index_names = await _postgres_index_names(conn)
+        if "uq_shadow_decision_horizon_label_version" not in index_names:
+            await conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX uq_shadow_decision_horizon_label_version "
+                    "ON shadow_backtests (decision_id, horizon_minutes, label_version) "
+                    "WHERE decision_id IS NOT NULL"
+                )
             )
-        )
         await conn.execute(
             text(
                 """
@@ -746,6 +774,13 @@ async def _ensure_okx_position_history_column_widths(conn: Any) -> None:
 
     if "postgresql" not in settings.database_url:
         return
+    specs = await _postgres_table_column_specs(conn, "okx_position_history")
+    match_status = specs.get("match_status")
+    if not match_status:
+        return
+    current_length = match_status.get("character_maximum_length")
+    if current_length is None or int(current_length) >= 160:
+        return
     await conn.execute(
         text(
             "ALTER TABLE okx_position_history "
@@ -796,6 +831,37 @@ async def _postgres_table_columns(conn: Any, table_name: str) -> set[str]:
         {"table_name": table_name},
     )
     return {str(row[0]) for row in result.fetchall()}
+
+
+async def _postgres_table_column_specs(
+    conn: Any,
+    table_name: str,
+) -> dict[str, dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT
+                column_name,
+                data_type,
+                character_maximum_length,
+                is_nullable,
+                column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    )
+    return {
+        str(row[0]): {
+            "data_type": row[1],
+            "character_maximum_length": row[2],
+            "is_nullable": row[3],
+            "column_default": row[4],
+        }
+        for row in result.fetchall()
+    }
 
 
 async def _postgres_index_names(conn: Any) -> set[str]:

@@ -72,7 +72,7 @@ async def test_sqlite_engine_keeps_sqlite_specific_connection_options(
 
 
 @pytest.mark.asyncio
-async def test_postgres_history_status_migration_expands_match_status(
+async def test_postgres_history_status_migration_expands_short_match_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     statements: list[str] = []
@@ -83,8 +83,42 @@ async def test_postgres_history_status_migration_expands_match_status(
 
     monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://example/bb")
 
+    async def short_match_status(*_args, **_kwargs):
+        return {"match_status": {"character_maximum_length": 80}}
+
+    monkeypatch.setattr(
+        session_module,
+        "_postgres_table_column_specs",
+        short_match_status,
+    )
+
     await session_module._ensure_okx_position_history_column_widths(FakeConnection())
 
     assert statements == [
         "ALTER TABLE okx_position_history ALTER COLUMN match_status TYPE VARCHAR(160)"
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_history_status_migration_skips_current_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+
+    class FakeConnection:
+        async def execute(self, statement) -> None:
+            statements.append(str(statement))
+
+    async def current_match_status(*_args, **_kwargs):
+        return {"match_status": {"character_maximum_length": 160}}
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://example/bb")
+    monkeypatch.setattr(
+        session_module,
+        "_postgres_table_column_specs",
+        current_match_status,
+    )
+
+    await session_module._ensure_okx_position_history_column_widths(FakeConnection())
+
+    assert statements == []

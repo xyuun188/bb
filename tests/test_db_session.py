@@ -8,10 +8,16 @@ class _FakeConnection:
         self,
         *,
         table_columns: dict[str, set[str]] | None = None,
+        table_column_specs: dict[str, dict[str, dict[str, object]]] | None = None,
         index_names: set[str] | None = None,
     ) -> None:
         self.statements: list[str] = []
-        self.table_columns = table_columns or {}
+        self.table_column_specs = table_column_specs or {}
+        derived_columns = {
+            table_name: set(specs)
+            for table_name, specs in self.table_column_specs.items()
+        }
+        self.table_columns = table_columns or derived_columns
         self.index_names = index_names or set()
 
     async def execute(self, statement, params=None):
@@ -19,6 +25,20 @@ class _FakeConnection:
         self.statements.append(statement_text)
         if "information_schema.columns" in statement_text:
             table_name = (params or {}).get("table_name", "")
+            if "character_maximum_length" in statement_text:
+                specs = self.table_column_specs.get(table_name, {})
+                return _FakeResult(
+                    [
+                        (
+                            name,
+                            spec.get("data_type", ""),
+                            spec.get("character_maximum_length"),
+                            spec.get("is_nullable", "YES"),
+                            spec.get("column_default"),
+                        )
+                        for name, spec in specs.items()
+                    ]
+                )
             return _FakeResult([(name,) for name in self.table_columns.get(table_name, set())])
         if "pg_indexes" in statement_text:
             return _FakeResult([(name,) for name in self.index_names])
@@ -132,14 +152,41 @@ async def test_postgres_drops_removed_expert_memory_policy_columns(
         "database_url",
         "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
     )
-    fake_conn = _FakeConnection()
+    fake_conn = _FakeConnection(
+        table_columns={
+            "expert_memories": {
+                "confidence_adjustment",
+                "position_size_multiplier",
+            }
+        }
+    )
 
     await session_module._drop_removed_expert_memory_policy_columns(fake_conn)
 
-    assert fake_conn.statements == [
-        "ALTER TABLE expert_memories DROP COLUMN IF EXISTS confidence_adjustment",
-        "ALTER TABLE expert_memories DROP COLUMN IF EXISTS position_size_multiplier",
+    assert [
+        statement
+        for statement in fake_conn.statements
+        if statement.startswith("ALTER TABLE")
+    ] == [
+        "ALTER TABLE expert_memories DROP COLUMN confidence_adjustment",
+        "ALTER TABLE expert_memories DROP COLUMN position_size_multiplier",
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_removed_expert_columns_skip_steady_state_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection(table_columns={"expert_memories": {"id"}})
+
+    await session_module._drop_removed_expert_memory_policy_columns(fake_conn)
+
+    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
 
 
 @pytest.mark.asyncio
@@ -345,7 +392,7 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     await session_module._ensure_ai_decision_model_health_columns(fake_conn)
 
     assert any(
-        "ADD COLUMN IF NOT EXISTS model_health_timings JSONB" in statement
+        "ADD COLUMN model_health_timings JSONB" in statement
         for statement in fake_conn.statements
     )
     assert any(
@@ -363,6 +410,34 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
 
 
 @pytest.mark.asyncio
+async def test_postgres_model_health_snapshot_skips_steady_state_alters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    columns = {
+        "model_health_timings",
+        "model_health_fallback_timings",
+        "model_health_experts",
+        "model_health_opinions",
+        "model_health_has_ml_signal",
+        "model_health_has_local_ml_signal",
+        "model_health_has_local_ai_tools",
+        "model_health_snapshot_version",
+        "decision_learning_snapshot",
+        "decision_learning_snapshot_version",
+    }
+    fake_conn = _FakeConnection(table_columns={"ai_decisions": columns})
+
+    await session_module._ensure_ai_decision_model_health_columns(fake_conn)
+
+    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+
+
+@pytest.mark.asyncio
 async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_backfill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -376,7 +451,7 @@ async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_ba
     await session_module._ensure_shadow_backtest_training_snapshot_columns(fake_conn)
 
     assert any(
-        "ADD COLUMN IF NOT EXISTS training_feature_snapshot JSONB" in statement
+        "ADD COLUMN training_feature_snapshot JSONB" in statement
         for statement in fake_conn.statements
     )
     assert any(
@@ -390,4 +465,43 @@ async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_ba
     assert any(
         "UPDATE shadow_backtests" in statement and "training_feature_snapshot_version < 1" in statement
         for statement in fake_conn.statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_shadow_snapshot_skips_steady_state_schema_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.training_contracts import SHADOW_LABEL_VERSION
+
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection(
+        table_column_specs={
+            "shadow_backtests": {
+                "training_feature_snapshot": {"data_type": "jsonb"},
+                "training_feature_snapshot_version": {
+                    "data_type": "integer",
+                    "is_nullable": "NO",
+                    "column_default": "0",
+                },
+                "label_version": {
+                    "data_type": "character varying",
+                    "character_maximum_length": 80,
+                    "is_nullable": "NO",
+                    "column_default": f"'{SHADOW_LABEL_VERSION}'::character varying",
+                },
+            }
+        },
+        index_names={"uq_shadow_decision_horizon_label_version"},
+    )
+
+    await session_module._ensure_shadow_backtest_training_snapshot_columns(fake_conn)
+
+    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+    assert not any(
+        statement.startswith("CREATE UNIQUE INDEX") for statement in fake_conn.statements
     )
