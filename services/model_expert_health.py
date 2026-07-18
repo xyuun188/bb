@@ -300,6 +300,64 @@ def _extract_component_rows(decision: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _expert_output_diversity(decisions: list[Any]) -> dict[str, Any]:
+    decision_count = 0
+    complete_count = 0
+    low_information_count = 0
+    action_diverse_count = 0
+    distinct_action_total = 0
+    distinct_reasoning_total = 0
+    for decision in decisions:
+        rows = [
+            row
+            for row in _expert_rows(decision)
+            if _component_name(row, "expert_name", "model_name", "name")
+            in REQUIRED_ENTRY_EXPERTS
+        ]
+        if not rows:
+            continue
+        decision_count += 1
+        names = {
+            _component_name(row, "expert_name", "model_name", "name")
+            for row in rows
+        }
+        actions = {_action(row.get("action")) for row in rows}
+        confidences = [_safe_float(row.get("confidence"), 0.0) for row in rows]
+        reasonings = {
+            str(row.get("reasoning") or "").strip()
+            for row in rows
+            if str(row.get("reasoning") or "").strip()
+        }
+        confidence_span = max(confidences) - min(confidences) if confidences else 0.0
+        if REQUIRED_ENTRY_EXPERTS.issubset(names):
+            complete_count += 1
+        if len(actions) > 1:
+            action_diverse_count += 1
+        if len(rows) >= 3 and len(actions) <= 1 and confidence_span <= 0.05:
+            low_information_count += 1
+        distinct_action_total += len(actions)
+        distinct_reasoning_total += len(reasonings)
+    return {
+        "decisions_with_experts": decision_count,
+        "complete_five_expert_decisions": complete_count,
+        "low_information_consensus_count": low_information_count,
+        "low_information_consensus_rate": (
+            round(low_information_count / decision_count, 4) if decision_count else 0.0
+        ),
+        "action_diverse_decision_count": action_diverse_count,
+        "action_diverse_decision_rate": (
+            round(action_diverse_count / decision_count, 4) if decision_count else 0.0
+        ),
+        "avg_distinct_actions": (
+            round(distinct_action_total / decision_count, 4) if decision_count else 0.0
+        ),
+        "avg_distinct_reasonings": (
+            round(distinct_reasoning_total / decision_count, 4) if decision_count else 0.0
+        ),
+        "production_permission": False,
+    }
+
+
 def summarize_model_expert_health(
     decisions: list[Any],
     shadows: list[Any] | None = None,
@@ -408,6 +466,7 @@ def summarize_model_expert_health(
             "decisions": len(decisions),
             "shadows": len(shadows or []),
             "recommended_state_counts": dict(state_counts),
+            "expert_output_diversity": _expert_output_diversity(decisions),
         },
         "components": final_components,
         "handling_states": ["observation_only"],

@@ -2410,6 +2410,7 @@ async def _model_expert_health_audit() -> dict[str, Any]:
             "live_weight_mutation": bool(report.get("live_weight_mutation", False)),
             "component_count": int(summary.get("components") or len(components)),
             "recommended_state_counts": counts,
+            "expert_output_diversity": summary.get("expert_output_diversity") or {},
             "top_components": top_components,
             "windows_hours": report.get("windows_hours") or [],
         },

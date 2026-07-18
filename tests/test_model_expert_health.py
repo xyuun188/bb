@@ -218,6 +218,10 @@ def test_model_expert_health_does_not_count_successful_independent_retry_as_json
         assert component["windows"]["24h"]["json_error_count"] == 0
         assert component["windows"]["24h"]["no_return_count"] == 0
         assert component["stability"]["json_error_rate"] == 0.0
+    diversity = report["summary"]["expert_output_diversity"]
+    assert diversity["decisions_with_experts"] == 3
+    assert diversity["low_information_consensus_count"] == 3
+    assert diversity["production_permission"] is False
 
 
 @pytest.mark.asyncio

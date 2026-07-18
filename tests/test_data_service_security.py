@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +24,9 @@ def _service() -> DataService:
         max(1, int(data_service_module.INDICATOR_REMOTE_REFRESH_CONCURRENCY))
     )
     service._indicator_snapshot_build_semaphore = asyncio.Semaphore(
+        max(1, int(data_service_module.INDICATOR_SNAPSHOT_BUILD_CONCURRENCY))
+    )
+    service._indicator_snapshot_priority_gate = data_service_module._PriorityBuildGate(
         max(1, int(data_service_module.INDICATOR_SNAPSHOT_BUILD_CONCURRENCY))
     )
     service._kline_fetch_tasks = {}
@@ -436,7 +440,10 @@ async def test_available_symbols_returns_stale_cache_while_refreshing_background
 
     assert symbols == [{"symbol": "BTC/USDT"}]
     assert elapsed < 0.05
-    await asyncio.sleep(0)
+    for _ in range(3):
+        await asyncio.sleep(0)
+        if rest_calls:
+            break
     assert rest_calls == ["called"]
 
     release_refresh.set()
@@ -558,14 +565,27 @@ async def test_indicator_snapshot_uses_cached_klines_before_okx_fetch(
             fetch_calls += 1
             return []
 
-    async def cached_klines(symbol: str, timeframe: str, limit: int) -> list[list[float]]:
-        return [
-            [1_700_000_000_000 + index * 60_000, 100.0, 101.0, 99.0, 100.5, 10.0]
-            for index in range(limit)
-        ]
+    async def cached_klines(
+        symbol: str,
+        timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
+        return {
+            timeframe: [
+                [
+                    1_700_000_000_000 + index * 60_000,
+                    100.0,
+                    101.0,
+                    99.0,
+                    100.5,
+                    10.0,
+                ]
+                for index in range(limit)
+            ]
+            for timeframe, limit in timeframe_limits.items()
+        }
 
     service.rest_client = FakeRestClient()
-    service._load_recent_cached_klines = cached_klines  # type: ignore[method-assign]
+    service._load_recent_cached_klines_for_timeframes = cached_klines  # type: ignore[method-assign]
     monkeypatch.setattr(data_service_module, "compute_all_indicators", lambda df: df)
     monkeypatch.setattr(
         data_service_module,
@@ -1426,3 +1446,122 @@ def test_sentiment_cache_never_exposes_unsafe_news_urls() -> None:
     assert "" in urls
     assert "javascript:alert(1)" not in urls
     assert "https://news.example.invalid/btc?src=unit" in urls
+
+
+@pytest.mark.asyncio
+async def test_cached_indicator_timeframes_use_one_repository_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    session_entries = 0
+    repository_calls: list[tuple[str, dict[str, int]]] = []
+    now = datetime.now(UTC)
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> object:
+            nonlocal session_entries
+            session_entries += 1
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeMarketRepository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def get_klines_for_timeframes(
+            self,
+            symbol: str,
+            timeframe_limits: dict[str, int],
+        ) -> dict[str, list[SimpleNamespace]]:
+            repository_calls.append((symbol, dict(timeframe_limits)))
+            return {
+                timeframe: [
+                    SimpleNamespace(
+                        open_time=now - timedelta(seconds=30),
+                        open=100.0,
+                        high=101.0,
+                        low=99.0,
+                        close=100.5,
+                        volume=10.0,
+                    )
+                ]
+                for timeframe in timeframe_limits
+            }
+
+    monkeypatch.setattr(data_service_module, "get_session_ctx", FakeSessionContext)
+    monkeypatch.setattr(data_service_module, "MarketRepository", FakeMarketRepository)
+
+    grouped = await service._load_recent_cached_klines_for_timeframes(
+        "BTC/USDT",
+        {"1m": 120, "1h": 100},
+    )
+
+    assert session_entries == 1
+    assert repository_calls == [("BTC/USDT", {"1m": 120, "1h": 100})]
+    assert set(grouped) == {"1m", "1h"}
+
+
+@pytest.mark.asyncio
+async def test_candidate_indicator_build_overtakes_queued_background_work() -> None:
+    service = _service()
+    service._indicator_snapshot_priority_gate = data_service_module._PriorityBuildGate(1)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    build_order: list[str] = []
+
+    async def build(symbol: str) -> dict[str, Any]:
+        build_order.append(symbol)
+        if symbol == "BACKGROUND-1/USDT":
+            first_started.set()
+            await release_first.wait()
+        return {"indicator_snapshot_available": True}
+
+    service._build_indicator_snapshot_uncached = build  # type: ignore[method-assign]
+    first = asyncio.create_task(service._build_indicator_snapshot("BACKGROUND-1/USDT"))
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+    queued_background = asyncio.create_task(
+        service._build_indicator_snapshot("BACKGROUND-2/USDT")
+    )
+    priority_candidate = asyncio.create_task(
+        service._build_indicator_snapshot("CANDIDATE/USDT", priority=True)
+    )
+    await asyncio.sleep(0)
+    release_first.set()
+
+    await asyncio.gather(first, queued_background, priority_candidate)
+
+    assert build_order == [
+        "BACKGROUND-1/USDT",
+        "CANDIDATE/USDT",
+        "BACKGROUND-2/USDT",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_candidate_indicator_prewarm_reports_unavailable_symbols() -> None:
+    service = _service()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def indicator_snapshot(symbol: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append((symbol, dict(kwargs)))
+        if symbol == "ETH/USDT":
+            return service._unavailable_indicator_snapshot("no_recent_klines")
+        return {
+            "indicator_snapshot_available": True,
+            "indicator_snapshot_quality": "full",
+        }
+
+    service._get_indicator_snapshot = indicator_snapshot  # type: ignore[method-assign]
+
+    diagnostics = await service.prewarm_indicator_snapshots(
+        ["BTC/USDT", "ETH/USDT", "BTC/USDT"],
+        timeout_seconds=0.2,
+    )
+
+    assert diagnostics["status"] == "partial"
+    assert diagnostics["requested_count"] == 2
+    assert diagnostics["available_count"] == 1
+    assert diagnostics["unavailable_symbols"] == ["ETH/USDT"]
+    assert all(kwargs["prioritize_build"] is True for _symbol, kwargs in calls)

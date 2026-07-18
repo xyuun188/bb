@@ -7,6 +7,7 @@ and fails closed when frequency, portfolio, or loss-streak guards are unavailabl
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -33,6 +34,13 @@ PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES = 4
 PAPER_BOOTSTRAP_MAX_CONSECUTIVE_LOSSES = 2
 PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK = 0.0005
 PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK = 0.001
+PAPER_BOOTSTRAP_PREFLIGHT_TIMEOUT_SECONDS = 3.0
+PAPER_BOOTSTRAP_HISTORY_TIMEOUT_SECONDS = 2.5
+PAPER_BOOTSTRAP_PREPARE_TIMEOUT_SECONDS = 15.0
+PAPER_BOOTSTRAP_EXCHANGE_FACTS_TIMEOUT_SECONDS = 8.0
+PAPER_BOOTSTRAP_BALANCE_TIMEOUT_SECONDS = 3.0
+PAPER_BOOTSTRAP_DEADLINE_RESERVE_SECONDS = 0.05
+PAPER_BOOTSTRAP_CANARY_HISTORY_START = datetime(2026, 7, 17, tzinfo=UTC)
 
 BalanceProvider = Callable[[str, DecisionOutput], Awaitable[float | None]]
 ExchangeFactsProvider = Callable[
@@ -40,6 +48,84 @@ ExchangeFactsProvider = Callable[
     Awaitable[dict[str, Any]],
 ]
 HistoryProvider = Callable[[], Awaitable[list[Any]]]
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Retrieve late cancellation results without extending the caller deadline."""
+
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        return
+
+
+async def _bounded_policy_call(
+    stage: str,
+    provider: Callable[[], Awaitable[Any]],
+    *,
+    fallback: Any,
+    timeout_seconds: float,
+    deadline_monotonic: float,
+    timeout_reason: str,
+    budget_reason: str,
+    unavailable_reason_prefix: str,
+    message_zh: str,
+) -> tuple[Any, dict[str, Any], str | None]:
+    """Run one policy evidence provider without crossing its shared deadline."""
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    requested_timeout = max(float(timeout_seconds or 0.0), 0.0)
+    remaining_at_start = max(float(deadline_monotonic) - started, 0.0)
+    allowed_timeout = min(
+        requested_timeout,
+        max(remaining_at_start - PAPER_BOOTSTRAP_DEADLINE_RESERVE_SECONDS, 0.0),
+    )
+    timing: dict[str, Any] = {
+        "stage": stage,
+        "status": "pending",
+        "requested_timeout_seconds": round(requested_timeout, 6),
+        "allowed_timeout_seconds": round(allowed_timeout, 6),
+        "remaining_seconds_at_start": round(remaining_at_start, 6),
+        "message_zh": message_zh,
+    }
+    reason: str | None = None
+    task: asyncio.Task[Any] | None = None
+    try:
+        if allowed_timeout <= 0.0:
+            timing["status"] = "budget_exhausted"
+            reason = budget_reason
+            return fallback, timing, reason
+
+        task = asyncio.create_task(provider())
+        done, pending = await asyncio.wait({task}, timeout=allowed_timeout)
+        if pending:
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+            timing["status"] = "timeout"
+            reason = timeout_reason
+            return fallback, timing, reason
+
+        timing["status"] = "ok"
+        return task.result(), timing, None
+    except asyncio.CancelledError:
+        if task is not None and not task.done():
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+        raise
+    except Exception as exc:
+        timing["status"] = "error"
+        timing["error_type"] = type(exc).__name__
+        reason = f"{unavailable_reason_prefix}:{type(exc).__name__}"
+        return fallback, timing, reason
+    finally:
+        timing["duration_seconds"] = round(max(loop.time() - started, 0.0), 6)
+        timing["remaining_seconds_at_end"] = round(
+            max(float(deadline_monotonic) - loop.time(), 0.0),
+            6,
+        )
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -261,12 +347,8 @@ def annotate_paper_bootstrap_opportunity(decision: DecisionOutput) -> float | No
             "observation_only": True,
             "execution_scope": "paper_only",
             "canary_objective_expected_return_pct": score,
-            "canary_observed_net_return_pct": _finite(
-                selected.get("observed_net_return_pct")
-            ),
-            "canary_lower_quantile_return_pct": _finite(
-                selected.get("lower_quantile_return_pct")
-            ),
+            "canary_observed_net_return_pct": _finite(selected.get("observed_net_return_pct")),
+            "canary_lower_quantile_return_pct": _finite(selected.get("lower_quantile_return_pct")),
             "canary_artifact_version": contract.get("artifact_version"),
             "canary_policy_provenance": _safe_dict(contract.get("policy_provenance")),
         }
@@ -292,10 +374,23 @@ class PaperBootstrapCanaryPolicy:
         allocated_order_balance: BalanceProvider,
         exchange_risk_facts: ExchangeFactsProvider,
         history_provider: HistoryProvider | None = None,
+        preflight_timeout_seconds: float = PAPER_BOOTSTRAP_PREFLIGHT_TIMEOUT_SECONDS,
+        history_timeout_seconds: float = PAPER_BOOTSTRAP_HISTORY_TIMEOUT_SECONDS,
+        prepare_timeout_seconds: float = PAPER_BOOTSTRAP_PREPARE_TIMEOUT_SECONDS,
+        exchange_facts_timeout_seconds: float = PAPER_BOOTSTRAP_EXCHANGE_FACTS_TIMEOUT_SECONDS,
+        balance_timeout_seconds: float = PAPER_BOOTSTRAP_BALANCE_TIMEOUT_SECONDS,
     ) -> None:
         self.allocated_order_balance = allocated_order_balance
         self.exchange_risk_facts = exchange_risk_facts
         self.history_provider = history_provider or self._load_history
+        self.preflight_timeout_seconds = max(float(preflight_timeout_seconds or 0.0), 0.05)
+        self.history_timeout_seconds = max(float(history_timeout_seconds or 0.0), 0.05)
+        self.prepare_timeout_seconds = max(float(prepare_timeout_seconds or 0.0), 0.05)
+        self.exchange_facts_timeout_seconds = max(
+            float(exchange_facts_timeout_seconds or 0.0),
+            0.05,
+        )
+        self.balance_timeout_seconds = max(float(balance_timeout_seconds or 0.0), 0.05)
 
     @staticmethod
     def is_claimed(decision: DecisionOutput) -> bool:
@@ -311,9 +406,20 @@ class PaperBootstrapCanaryPolicy:
         decision: DecisionOutput,
         model_mode: str,
         open_positions: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        timing_scope: str = "runtime_preflight",
     ) -> PaperBootstrapAssessment:
         """Evaluate lifecycle guards before an entry action is persisted."""
 
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        policy_deadline = started + self.preflight_timeout_seconds
+        effective_deadline = (
+            min(policy_deadline, float(deadline_monotonic))
+            if deadline_monotonic is not None
+            else policy_deadline
+        )
         raw = _safe_dict(decision.raw_response)
         contract = _safe_dict(raw.get("paper_bootstrap_canary"))
         reasons = PaperBootstrapCanaryPolicy._contract_reasons(
@@ -321,11 +427,42 @@ class PaperBootstrapCanaryPolicy:
             model_mode,
             contract,
         )
-        runtime_guard = await self._runtime_guard(contract, open_positions)
+        runtime_guard = await self._runtime_guard(
+            contract,
+            open_positions,
+            deadline_monotonic=effective_deadline,
+        )
         reasons.extend(runtime_guard["blocking_reasons"])
         reasons = list(dict.fromkeys(reasons))
         eligible = not reasons
         contract = dict(contract)
+        history_status = str(_safe_dict(runtime_guard.get("history_query")).get("status") or "")
+        preflight_timing = {
+            "stage": "paper_bootstrap_canary_preflight",
+            "scope": timing_scope,
+            "status": "completed" if history_status == "ok" else "failed_closed",
+            "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+            "policy_timeout_seconds": round(self.preflight_timeout_seconds, 6),
+            "deadline_remaining_seconds": round(
+                max(effective_deadline - loop.time(), 0.0),
+                6,
+            ),
+            "history_query_status": history_status,
+            "authorized": eligible,
+            "blocking_reasons": reasons,
+            "message_zh": (
+                "paper canary 运行时风控证据已在时限内完成。"
+                if history_status == "ok"
+                else "paper canary 运行时风控证据未在时限内完整取得，已按失败关闭处理。"
+            ),
+        }
+        previous_timings = [
+            item
+            for item in _safe_list(contract.get("runtime_preflight_timings"))
+            if isinstance(item, dict)
+        ]
+        contract["runtime_preflight_timings"] = [*previous_timings[-4:], preflight_timing]
+        contract["runtime_preflight_timing"] = preflight_timing
         contract["runtime_guard"] = runtime_guard
         contract["runtime_preflight_authorized"] = eligible
         contract["runtime_preflight_blocking_reasons"] = reasons
@@ -343,6 +480,13 @@ class PaperBootstrapCanaryPolicy:
             }
             decision.position_size_pct = 0.0
             decision.suggested_leverage = 1.0
+        if timing_scope == "market_decision_persistence":
+            market_timings = [
+                item
+                for item in _safe_list(raw.get("market_context_timings"))
+                if isinstance(item, dict)
+            ]
+            raw["market_context_timings"] = [*market_timings, preflight_timing]
         raw["paper_bootstrap_canary"] = contract
         decision.raw_response = raw
         return PaperBootstrapAssessment(
@@ -400,7 +544,16 @@ class PaperBootstrapCanaryPolicy:
         model_mode: str,
         open_positions: list[dict[str, Any]],
     ) -> PaperBootstrapAssessment:
-        preflight = await self.preflight(decision, model_mode, open_positions)
+        loop = asyncio.get_running_loop()
+        prepare_started = loop.time()
+        prepare_deadline = prepare_started + self.prepare_timeout_seconds
+        preflight = await self.preflight(
+            decision,
+            model_mode,
+            open_positions,
+            deadline_monotonic=prepare_deadline,
+            timing_scope="risk_contract_prepare",
+        )
         if not preflight.eligible:
             return preflight
         raw = _safe_dict(decision.raw_response)
@@ -409,16 +562,39 @@ class PaperBootstrapCanaryPolicy:
         reasons: list[str] = []
         facts: dict[str, Any] = {}
         allocated_margin = 0.0
+        prepare_timings: list[dict[str, Any]] = []
+        facts_value, facts_timing, facts_reason = await _bounded_policy_call(
+            "exchange_risk_facts",
+            lambda: self.exchange_risk_facts(model_mode, decision, open_positions),
+            fallback={},
+            timeout_seconds=self.exchange_facts_timeout_seconds,
+            deadline_monotonic=prepare_deadline,
+            timeout_reason="paper_canary_exchange_facts_timeout",
+            budget_reason="paper_canary_prepare_budget_exhausted",
+            unavailable_reason_prefix="paper_canary_exchange_facts_unavailable",
+            message_zh="读取 OKX 账户、合约规格、杠杆档位和交易资格证据。",
+        )
+        prepare_timings.append(facts_timing)
+        facts = _safe_dict(facts_value)
+        if facts_reason:
+            reasons.append(facts_reason)
+
         if not reasons:
-            try:
-                facts = _safe_dict(
-                    await self.exchange_risk_facts(model_mode, decision, open_positions)
-                )
-                allocated_margin = _positive(
-                    await self.allocated_order_balance(model_mode, decision)
-                )
-            except Exception as exc:
-                reasons.append(f"paper_canary_exchange_facts_unavailable:{type(exc).__name__}")
+            balance_value, balance_timing, balance_reason = await _bounded_policy_call(
+                "allocated_order_balance",
+                lambda: self.allocated_order_balance(model_mode, decision),
+                fallback=None,
+                timeout_seconds=self.balance_timeout_seconds,
+                deadline_monotonic=prepare_deadline,
+                timeout_reason="paper_canary_allocated_balance_timeout",
+                budget_reason="paper_canary_prepare_budget_exhausted",
+                unavailable_reason_prefix="paper_canary_allocated_balance_unavailable",
+                message_zh="读取当前策略可分配的账户保证金证据。",
+            )
+            prepare_timings.append(balance_timing)
+            allocated_margin = _positive(balance_value)
+            if balance_reason:
+                reasons.append(balance_reason)
 
         if not reasons:
             self._attach_risk_contract(
@@ -434,6 +610,25 @@ class PaperBootstrapCanaryPolicy:
 
         eligible = not reasons
         contract = dict(contract)
+        prepare_timing = {
+            "stage": "paper_bootstrap_canary_prepare",
+            "status": "completed" if eligible else "failed_closed",
+            "duration_seconds": round(max(loop.time() - prepare_started, 0.0), 6),
+            "policy_timeout_seconds": round(self.prepare_timeout_seconds, 6),
+            "deadline_remaining_seconds": round(
+                max(prepare_deadline - loop.time(), 0.0),
+                6,
+            ),
+            "authorized": eligible,
+            "blocking_reasons": list(dict.fromkeys(reasons)),
+            "stages": prepare_timings,
+            "message_zh": (
+                "paper canary 风险合同已在时限内完成。"
+                if eligible
+                else "paper canary 风险合同证据不完整，已按失败关闭处理。"
+            ),
+        }
+        contract["runtime_prepare_timing"] = prepare_timing
         contract["runtime_guard"] = runtime_guard
         contract["runtime_authorized"] = eligible
         contract["runtime_blocking_reasons"] = list(dict.fromkeys(reasons))
@@ -550,6 +745,8 @@ class PaperBootstrapCanaryPolicy:
         self,
         contract: dict[str, Any],
         open_positions: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float,
     ) -> dict[str, Any]:
         account_open_positions = [
             item
@@ -557,16 +754,29 @@ class PaperBootstrapCanaryPolicy:
             if item.get("is_open", True) is not False and _positive(item.get("quantity", 1.0)) > 0
         ]
         reasons: list[str] = []
-        try:
-            history = list(await self.history_provider())
-        except Exception as exc:
-            history = []
-            reasons.append(f"paper_canary_history_unavailable:{type(exc).__name__}")
+        history_value, history_timing, history_reason = await _bounded_policy_call(
+            "canary_history_query",
+            self.history_provider,
+            fallback=[],
+            timeout_seconds=self.history_timeout_seconds,
+            deadline_monotonic=deadline_monotonic,
+            timeout_reason="paper_canary_history_timeout",
+            budget_reason="paper_canary_preflight_budget_exhausted",
+            unavailable_reason_prefix="paper_canary_history_unavailable",
+            message_zh="读取已执行 paper canary 的仓位、日频、连亏和冷却风控证据。",
+        )
+        history = list(history_value or [])
+        if history_reason:
+            reasons.append(history_reason)
 
         canary_rows = [
             row
             for row in history
-            if _safe_dict(_row_raw(row).get("paper_bootstrap_canary")).get("authorized") is True
+            if (
+                _row_value(row, "paper_canary_authorized") is True
+                or _row_value(row, "paper_canary_authorized") == 1
+                or _safe_dict(_row_raw(row).get("paper_bootstrap_canary")).get("authorized") is True
+            )
         ]
         open_canary_rows = [
             row for row in canary_rows if not str(_row_value(row, "outcome") or "").strip()
@@ -618,6 +828,8 @@ class PaperBootstrapCanaryPolicy:
                 reasons.append("paper_canary_cooldown_active")
         return {
             "blocking_reasons": list(dict.fromkeys(reasons)),
+            "status": "available" if history_reason is None else "failed_closed",
+            "history_query": history_timing,
             "open_position_count": len(open_canary_rows),
             "max_open_positions": PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
             "account_open_position_count": len(account_open_positions),
@@ -815,16 +1027,30 @@ class PaperBootstrapCanaryPolicy:
             decision.take_profit_pct = max(stress * 1.5, cost_pct * 2.0 / 100.0)
 
     @staticmethod
+    def _history_statement() -> Any:
+        authorized = AIDecision.raw_llm_response["paper_bootstrap_canary"][
+            "authorized"
+        ].as_boolean()
+        return (
+            select(
+                authorized.label("paper_canary_authorized"),
+                AIDecision.outcome,
+                AIDecision.executed_at,
+                AIDecision.created_at,
+            )
+            .where(
+                AIDecision.is_paper.is_(True),
+                AIDecision.action.in_(("long", "short")),
+                AIDecision.was_executed.is_(True),
+                AIDecision.created_at >= PAPER_BOOTSTRAP_CANARY_HISTORY_START,
+                authorized.is_(True),
+            )
+            .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
+            .limit(200)
+        )
+
+    @staticmethod
     async def _load_history() -> list[Any]:
         async with get_read_session_ctx() as session:
-            result = await session.execute(
-                select(AIDecision)
-                .where(
-                    AIDecision.is_paper.is_(True),
-                    AIDecision.action.in_(("long", "short")),
-                    AIDecision.was_executed.is_(True),
-                )
-                .order_by(AIDecision.created_at.desc())
-                .limit(200)
-            )
-        return list(result.scalars().all())
+            result = await session.execute(PaperBootstrapCanaryPolicy._history_statement())
+        return list(result.all())

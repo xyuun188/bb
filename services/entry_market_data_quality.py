@@ -78,6 +78,7 @@ class EntryMarketDataQualityPolicy:
             )
 
         for checker in (
+            self._indicator_snapshot_issue,
             self._price_source_split_issue,
             self._outside_24h_range_issue,
             self._depth_issue,
@@ -97,7 +98,7 @@ class EntryMarketDataQualityPolicy:
             or snapshot["ask"]
         )
 
-    def _snapshot(self, source: Any) -> dict[str, float | int]:
+    def _snapshot(self, source: Any) -> dict[str, Any]:
         return {
             "current_price": self._read_float(source, "current_price"),
             "close_price": self._read_float(source, "close"),
@@ -113,10 +114,53 @@ class EntryMarketDataQualityPolicy:
             "bid_depth": self._read_float(source, "orderbook_bid_depth"),
             "ask_depth": self._read_float(source, "orderbook_ask_depth"),
             "imbalance": self._read_float(source, "orderbook_imbalance"),
+            "indicator_snapshot_available": self.market_value_reader(
+                source,
+                "indicator_snapshot_available",
+                None,
+            ),
+            "indicator_snapshot_quality": str(
+                self.market_value_reader(source, "indicator_snapshot_quality", "") or ""
+            ),
+            "indicator_snapshot_reason": str(
+                self.market_value_reader(source, "indicator_snapshot_reason", "") or ""
+            ),
         }
 
     def _read_float(self, source: Any, key: str) -> float:
         return _safe_float(self.market_value_reader(source, key, 0.0), 0.0)
+
+    def _indicator_snapshot_issue(
+        self,
+        snapshot: dict[str, Any],
+        _price: float,
+        stage_label: str,
+    ) -> MarketDataQualityIssue | None:
+        marker = snapshot.get("indicator_snapshot_available")
+        if marker is None:
+            return None
+        if isinstance(marker, str):
+            marker = marker.strip().lower() in {"1", "true", "yes", "y"}
+        if bool(marker):
+            return None
+        reason_code = str(
+            snapshot.get("indicator_snapshot_reason") or "indicator_snapshot_unavailable"
+        )
+        return self._issue(
+            "indicator_snapshot_unavailable",
+            stage_label,
+            (
+                "技术指标快照不可用，当前 RSI、ADX、波动率和成交量比仅是数据结构默认值，"
+                "不能作为方向判断或开仓证据，本次不送入开仓专家分析。"
+            ),
+            {
+                "indicator_snapshot_available": False,
+                "indicator_snapshot_quality": str(
+                    snapshot.get("indicator_snapshot_quality") or "unavailable"
+                ),
+                "indicator_snapshot_reason": reason_code,
+            },
+        )
 
     def _price_source_split_issue(
         self,

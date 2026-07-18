@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -217,7 +218,7 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
     assert by_key["runtime_model_qwen3-14b-trade"]["details"]["required"] is True
 
 
-def test_expert_model_diversity_flags_shared_expert_provider() -> None:
+def test_expert_model_diversity_recognizes_dedicated_expert_pool() -> None:
     monitor_status = {
         "platform_runtime": {
             "ai_models": [
@@ -240,12 +241,106 @@ def test_expert_model_diversity_flags_shared_expert_provider() -> None:
 
     item = system_health._expert_model_diversity_item(monitor_status)
 
-    assert item["status"] == "warning"
+    assert item["status"] == "ok"
     assert item["key"] == "expert_model_diversity"
     assert item["details"]["configured_expert_count"] == 5
     assert item["details"]["unique_provider_count"] == 1
     assert item["details"]["largest_shared_provider_count"] == 5
+    assert item["details"]["same_provider_risk"] is False
+    assert item["details"]["shared_provider_layout"] is True
+    assert item["details"]["dedicated_expert_pool"] is True
+
+
+def test_expert_model_diversity_flags_shared_generic_provider() -> None:
+    monitor_status = {
+        "platform_runtime": {
+            "ai_models": [
+                {
+                    "name": name,
+                    "label": name,
+                    "api_base": "http://127.0.0.1:18003/v1",
+                    "model": "generic-14b",
+                }
+                for name in (
+                    "trend_expert",
+                    "momentum_expert",
+                    "sentiment_expert",
+                    "position_expert",
+                    "risk_expert",
+                )
+            ]
+        }
+    }
+
+    item = system_health._expert_model_diversity_item(monitor_status)
+
+    assert item["status"] == "warning"
     assert item["details"]["same_provider_risk"] is True
+    assert item["details"]["dedicated_expert_pool"] is False
+
+
+@pytest.mark.asyncio
+async def test_self_check_serializes_database_heavy_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    database_section_active = False
+
+    async def database_section(name: str, result: Any) -> Any:
+        nonlocal database_section_active
+        assert database_section_active is False
+        database_section_active = True
+        order.append(f"{name}:start")
+        await asyncio.sleep(0)
+        order.append(f"{name}:end")
+        database_section_active = False
+        return result
+
+    monkeypatch.setattr(
+        system_health,
+        "_data_source_items",
+        lambda: database_section("data", []),
+    )
+    monkeypatch.setattr(
+        system_health,
+        "_recent_execution_items",
+        lambda: database_section("recent", []),
+    )
+    monkeypatch.setattr(
+        system_health,
+        "_model_training_identity_item",
+        lambda: database_section(
+            "identity",
+            system_health._check_item("model_training_identity", "identity", "ok", "ok"),
+        ),
+    )
+
+    async def trading_item() -> dict[str, Any]:
+        return system_health._check_item("trading_service", "trading", "ok", "ok")
+
+    async def monitor_status() -> dict[str, Any]:
+        return {"available": True, "platform_runtime": {"ai_models": []}}
+
+    monkeypatch.setattr(system_health, "_trading_service_running_item", trading_item)
+    monkeypatch.setattr(system_health, "get_server_monitor_status_async", monitor_status)
+    monkeypatch.setattr(system_health, "_configured_endpoint_items", lambda *_args: [])
+    monkeypatch.setattr(system_health, "_server_monitor_items", lambda _status: [])
+    monkeypatch.setattr(
+        system_health,
+        "_okx_config_item",
+        lambda mode: system_health._check_item(f"okx_{mode}", mode, "ok", "ok"),
+    )
+
+    await system_health.system_self_check()
+
+    assert order == [
+        "data:start",
+        "data:end",
+        "recent:start",
+        "recent:end",
+        "identity:start",
+        "identity:end",
+    ]
 
 
 @pytest.mark.asyncio
@@ -374,9 +469,7 @@ async def test_data_source_self_check_reports_market_news_and_social_freshness(
                     ]
                 )
             if self.calls == 3:
-                return FakeResult(one_row=(200, 3, now))
-            if self.calls == 4:
-                return FakeResult(one_row=(40, 8, now))
+                return FakeResult(one_row=(200, 3, now, 5, 3, now))
             return FakeResult(one_row=(0, 0, None))
 
     @asynccontextmanager
@@ -384,6 +477,21 @@ async def test_data_source_self_check_reports_market_news_and_social_freshness(
         yield FakeSession()
 
     monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(
+        system_health,
+        "load_external_event_source_health",
+        lambda: {
+            "version": system_health.EXTERNAL_EVENT_SOURCE_HEALTH_VERSION,
+            "checked_at": now.isoformat(),
+            "enabled": True,
+            "configured_source_count": 14,
+            "healthy_source_count": 14,
+            "sources": [
+                {"name": f"source_{index}", "status": "ok", "http_status": 200}
+                for index in range(14)
+            ],
+        },
+    )
 
     items = await system_health._data_source_items()
     by_key = {item["key"]: item for item in items}
@@ -394,8 +502,12 @@ async def test_data_source_self_check_reports_market_news_and_social_freshness(
     assert by_key["external_event_source_freshness"]["status"] == "ok"
     assert by_key["social_source_freshness"]["status"] == "warning"
     assert by_key["market_kline_coverage"]["details"]["missing_timeframes"] == []
-    assert by_key["external_event_source_freshness"]["details"]["source_count"] == 8
+    external_event = by_key["external_event_source_freshness"]
+    assert external_event["details"]["source_count"] == 3
+    assert external_event["details"]["effective_healthy_source_count"] == 14
+    assert external_event["details"]["collection_health"]["healthy_source_count"] == 14
     assert by_key["social_source_freshness"]["details"]["platform_count"] == 0
+    assert by_key["market_kline_coverage"]["details"]["coverage_window_hours"] == 24
 
 
 @pytest.mark.asyncio

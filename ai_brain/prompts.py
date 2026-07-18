@@ -486,7 +486,7 @@ JSON:"""
 
 
 def build_batch_experts_user_prompt(
-    feature_context: str,
+    feature_context: str | dict[str, str],
     context: dict,
     expert_names: list[str] | tuple[str, ...] | None = None,
 ) -> str:
@@ -513,6 +513,46 @@ def build_batch_experts_user_prompt(
         if omitted_experts
         else ""
     )
+    role_contract_by_expert = {
+        "trend_expert": (
+            "Role=direction. Action is a diagnostic direction label, never execution permission. "
+            "Use long/short whenever the scoped indicators have a net directional bias; use hold "
+            "only for genuinely flat, conflicting or missing trend evidence. Ignore production "
+            "return eligibility because momentum_expert owns that separate question."
+        ),
+        "momentum_expert": (
+            "Role=profit_quality. Use long/short only when that side has positive "
+            "cost-complete payoff quality; otherwise hold."
+        ),
+        "sentiment_expert": (
+            "Role=short_timeseries. Action is a diagnostic next-window path label, never execution "
+            "permission. Use long/short whenever returns, momentum or event shock have a net bias; "
+            "use hold only for genuinely neutral or missing timing evidence. Do not inherit the "
+            "profit-quality or production-return gate."
+        ),
+        "position_expert": (
+            "Role=position_exit. With no matching position always hold; with a position "
+            "use close_long/close_short only for supported exit evidence."
+        ),
+        "risk_expert": (
+            "Role=risk_anomaly. Use hold for hard risk or neutral/insufficient risk "
+            "evidence; otherwise use long/short only to identify the lower-risk side."
+        ),
+    }
+    role_contracts = "\n".join(
+        f"- {name}: {role_contract_by_expert[name]}"
+        for name in requested_experts
+    )
+    if isinstance(feature_context, dict):
+        market_by_expert = {
+            name: _short_text(feature_context.get(name, ""), 640)
+            for name in requested_experts
+        }
+    else:
+        market_by_expert = {
+            name: _short_text(feature_context, 420)
+            for name in requested_experts
+        }
 
     strategy_mode = (
         context.get("strategy_mode") if isinstance(context.get("strategy_mode"), dict) else {}
@@ -563,6 +603,7 @@ def build_batch_experts_user_prompt(
         ),
     }
     payload = {
+        "market_by_expert": market_by_expert,
         "evidence": compact_value(
             context.get("entry_candidate_evidence") or {},
             depth=2,
@@ -575,7 +616,6 @@ def build_batch_experts_user_prompt(
             dict_limit=8,
             list_limit=2,
         ),
-        "market": _short_text(feature_context, 420),
         "analysis_type": "position" if context.get("review_positions") else "market",
         "positions": compact_value(context.get("open_positions", [])[:2], depth=1, dict_limit=8),
         "regime": compact_value(context.get("market_regime") or {}, depth=1, dict_limit=8),
@@ -601,24 +641,37 @@ def build_batch_experts_user_prompt(
             dict_limit=8,
         ),
         "rules": (
-            "Judge EV after fee/slippage, payoff quality, loss probability, liquidity, tail risk. "
-            "If the chosen side lacks a positive fee-after return LCB or complete provenance, return hold or an eligible opposite side. "
+            "Each expert reports an independent diagnostic verdict from only its scoped role and market context; these actions never authorize execution. "
+            "Do not force every expert to hold solely because production permission or governed return evidence is absent. "
+            "Only momentum_expert owns fee-after payoff quality and must hold when cost-complete positive return evidence is absent. "
+            "trend_expert and sentiment_expert use long/short as diagnostic bias labels whenever their scoped evidence has a net bias; they do not apply momentum_expert's return gate. "
             "Use a governed scheduled return profile only as a historical prior; it never replaces current symbol return evidence. "
             "Memory and expert history are observation-only; current return, costs and account risk own execution. "
-            "position_expert holds when no matching position. Missing governed return evidence holds."
+            "position_expert holds when no matching position. risk_expert holds for hard risk or neutral/insufficient risk evidence, not as a production permission signal."
         ),
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    max_payload_chars = 760
-    return f"""BATCH_EXPERT_JSON_V9
+    max_payload_chars = 8_000
+    if len(text) > max_payload_chars:
+        payload["memory"] = {}
+        payload["local_ai_tools"] = {}
+        payload["portfolio"] = {}
+        payload["market_by_expert"] = {
+            name: _short_text(value, 220)
+            for name, value in market_by_expert.items()
+        }
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+    return f"""BATCH_EXPERT_JSON_V11
 Return one minified JSON object only. No markdown, no prose, no <think>. Keep it short enough to finish in one response.
 Schema: {{"experts":{{{requested_schema}}}}}
 Required experts: {requested_list}. {omitted_rule.rstrip()}
+Role contracts; do not copy or merge them:
+{role_contracts}
 Each expert value must contain exactly:
 {{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-28字，写方向/收益/风险要点","cross_check_for":null}}
-Rules: Experts are diagnostic and cannot set size, leverage, stop loss, or take profit. Missing governed return evidence holds; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
-Payload JSON, truncated to {max_payload_chars} chars:
-{text[:max_payload_chars]}
+Rules: Experts are diagnostic and cannot set size, leverage, stop loss, or take profit. Follow only each role contract; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
+Payload JSON (complete and valid):
+{text}
 JSON:"""
 
 

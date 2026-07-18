@@ -11,7 +11,10 @@ HIGH_RISK_REVIEW_TOKEN_CAP = 600
 COMPLETION_TOKEN_CAPS = {
     "expert": 360,
     "decision_maker": 320,
-    "batch_expert": 900,
+    # The dedicated expert pool has a 4096-token context window. Production
+    # prompts use about 3200 input tokens, so 560 leaves explicit transport and
+    # tokenizer headroom while still fitting five compact expert JSON objects.
+    "batch_expert": 560,
     "consultation": 700,
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 700,

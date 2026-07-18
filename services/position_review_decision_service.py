@@ -34,6 +34,8 @@ class PositionReviewDecisionRequest:
     strategy_mode_context: dict[str, Any]
     portfolio_symbol_context: dict[str, Any]
     position_profit_peak_context: dict[str, Any]
+    analysis_deadline_monotonic: float | None = None
+    analysis_budget_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +161,7 @@ class PositionReviewDecisionService:
         ml_signal_context: dict[str, Any],
         local_ai_tools_context: dict[str, Any],
     ) -> dict[str, Any]:
-        return {
+        context = {
             "open_positions": request.open_positions,
             "trading_mode": request.trading_mode,
             "review_positions": True,
@@ -175,6 +177,15 @@ class PositionReviewDecisionService:
             "portfolio_profit_protection": request.portfolio_symbol_context,
             "position_profit_peak": request.position_profit_peak_context,
         }
+        if request.analysis_deadline_monotonic is not None:
+            context.update(
+                {
+                    "_analysis_deadline_monotonic": request.analysis_deadline_monotonic,
+                    "_analysis_budget_scope": "position_review",
+                    "_analysis_budget_seconds": request.analysis_budget_seconds,
+                }
+            )
+        return context
 
     @staticmethod
     def _single_model_context(

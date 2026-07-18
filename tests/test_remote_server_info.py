@@ -162,6 +162,23 @@ def test_find_server_info_file_uses_account_info_dir(tmp_path, monkeypatch) -> N
     assert find_server_info_file(tmp_path / "project") == platform_path
 
 
+def test_find_server_info_file_uses_project_account_info_subdirectory(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    project_root = tmp_path / "project"
+    account_dir = project_root / "\u8d26\u6237\u4fe1\u606f"
+    account_dir.mkdir(parents=True)
+    platform_path = account_dir / "\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt"
+    platform_path.write_text(
+        "IP\uff1a10.0.0.1\n\u7528\u6237\u540d\uff1aadmin\n\u5bc6\u7801\uff1asecret\n\u7aef\u53e3\uff1a22",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("BB_ACCOUNT_INFO_DIR", raising=False)
+
+    assert find_server_info_file(project_root) == platform_path
+
+
 def test_find_model_server_info_file_prefers_model_file(tmp_path) -> None:
     model_path = tmp_path / "\u5927\u6a21\u578b\u670d\u52a1\u5668\u4fe1\u606f.txt"
     model_path.write_text(

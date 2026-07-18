@@ -144,6 +144,23 @@ def test_entry_market_data_quality_policy_allows_consistent_market_data():
     assert EntryMarketDataQualityPolicy().reason(_valid_snapshot()) is None
 
 
+def test_entry_market_data_quality_policy_rejects_indicator_placeholders():
+    issue = EntryMarketDataQualityPolicy().issue(
+        _valid_snapshot(
+            indicator_snapshot_available=False,
+            indicator_snapshot_quality="unavailable",
+            indicator_snapshot_reason="candidate_indicator_prewarm_timeout",
+        ),
+        stage_label="AI分析前",
+    )
+
+    assert issue is not None
+    assert issue.code == "indicator_snapshot_unavailable"
+    assert issue.details["indicator_snapshot_reason"] == "candidate_indicator_prewarm_timeout"
+    assert issue.as_dict()["exclude_from_training"] is True
+    assert "默认值" in issue.reason
+
+
 def test_entry_market_data_quality_policy_fails_closed_without_native_fact():
     issue = EntryMarketDataQualityPolicy().issue(
         {key: value for key, value in _valid_snapshot().items() if key != "market_fact"}

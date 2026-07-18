@@ -81,6 +81,8 @@ class FeatureVector:
     indicator_snapshot_available: bool = False
     indicator_snapshot_stale: bool = False
     indicator_snapshot_refresh_in_background: bool = False
+    indicator_snapshot_quality: str = "unavailable"
+    indicator_snapshot_reason: str = "indicator_snapshot_not_collected"
 
     # --- Technical indicators (from latest candle) ---
     rsi_14: float = 50.0
@@ -203,6 +205,7 @@ Spread: {self.spread_pct:.4f}%
 24h Volume: base={self.volume_24h:.2f}, notional_usdt={self.notional_24h_usdt:.2f}
 
 Technical Indicators:
+  Snapshot Evidence: available={self.indicator_snapshot_available}, quality={self.indicator_snapshot_quality}, reason={self.indicator_snapshot_reason}
   RSI(14): {self.rsi_14:.1f} | RSI(7): {self.rsi_7:.1f}
   MACD: {self.macd:.6f} / Signal: {self.macd_signal:.6f} / Diff: {self.macd_diff:.6f}
   Stochastic K: {self.stoch_k:.1f}

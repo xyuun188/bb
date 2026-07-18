@@ -23,6 +23,10 @@ from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.trade import Order
 from services.execution_result_classifier import UNTRADABLE_EXCHANGE_ERROR_MARKERS
+from services.external_event_service import (
+    EXTERNAL_EVENT_SOURCE_HEALTH_VERSION,
+    load_external_event_source_health,
+)
 from services.server_monitor_status import (
     clear_server_monitor_cache,
     get_server_monitor_status_async,
@@ -50,10 +54,13 @@ TICKER_FRESH_SECONDS = 10 * 60
 KLINE_FRESH_SECONDS = 2 * 60 * 60
 NEWS_FRESH_SECONDS = 24 * 60 * 60
 EXTERNAL_EVENT_FRESH_SECONDS = 72 * 60 * 60
+EXTERNAL_EVENT_MIN_HEALTHY_SOURCES = 4
+EXTERNAL_EVENT_HEALTH_MIN_MAX_AGE_SECONDS = 15 * 60
 SOCIAL_FRESH_SECONDS = 24 * 60 * 60
 ISSUE_ORDER = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SELF_CHECK_SECTION_TIMEOUT_SECONDS = 6.0
 SERVER_MONITOR_SELF_CHECK_TIMEOUT_SECONDS = 18.0
+MODEL_IDENTITY_SELF_CHECK_TIMEOUT_SECONDS = 12.0
 UNRESOLVED_ORDER_STATUSES = {"open", "pending", "partial", "partially_filled"}
 TERMINAL_FAILED_ORDER_STATUSES = {
     "rejected",
@@ -749,7 +756,13 @@ def _expert_model_diversity_item(
     unique_provider_count = len(provider_counts)
     largest_shared_count = max(provider_counts.values(), default=0)
     configured_count = len(expert_rows)
-    same_provider_risk = configured_count >= 3 and largest_shared_count >= 3
+    shared_provider_layout = configured_count >= 3 and largest_shared_count >= 3
+    dedicated_expert_pool = bool(
+        configured_count == len(EXPERT_MODEL_SLOT_NAMES)
+        and unique_provider_count == 1
+        and all(row["model"] == "BB-FinQuant-Expert-14B" for row in expert_rows)
+    )
+    same_provider_risk = shared_provider_layout and not dedicated_expert_pool
     status = "warning" if same_provider_risk else "ok"
     if not expert_rows:
         status = "warning"
@@ -761,6 +774,12 @@ def _expert_model_diversity_item(
             f"{largest_shared_count} expert slots share the same api_base/model; prompts still "
             "separate roles, but judgment correlation risk is high. Keep live routing unchanged "
             "until a shadow comparison proves a split model layout improves net PnL."
+        )
+    elif dedicated_expert_pool:
+        message = (
+            "All fixed roles use the dedicated BB-FinQuant expert-pool artifact. "
+            "They remain one correlated provider source, use role-scoped prompts and "
+            "observation-only permission, and persist output-diversity evidence for audit."
         )
     else:
         message = (
@@ -778,8 +797,10 @@ def _expert_model_diversity_item(
             "unique_provider_count": unique_provider_count,
             "largest_shared_provider_count": largest_shared_count,
             "same_provider_risk": same_provider_risk,
+            "shared_provider_layout": shared_provider_layout,
+            "dedicated_expert_pool": dedicated_expert_pool,
             "experts": expert_rows,
-            "policy": "shadow_compare_before_live_routing_change",
+            "policy": "role_scoped_observation_pool_with_persisted_output_diversity",
         },
     )
 
@@ -796,7 +817,55 @@ def _required_runtime_models() -> set[str]:
     return {model for model in required if model}
 
 
+def _external_event_collection_health(now: datetime) -> dict[str, Any]:
+    payload = load_external_event_source_health()
+    checked_at = _as_utc_datetime(payload.get("checked_at"))
+    age_seconds = (
+        max((now - checked_at).total_seconds(), 0.0) if checked_at is not None else None
+    )
+    max_age_seconds = max(
+        int(settings.external_event_scraper_interval_seconds or 0) * 3,
+        EXTERNAL_EVENT_HEALTH_MIN_MAX_AGE_SECONDS,
+    )
+    raw_sources = payload.get("sources")
+    source_rows = raw_sources if isinstance(raw_sources, list) else []
+    sources = [row for row in source_rows if isinstance(row, dict)]
+    healthy_sources = [row for row in sources if str(row.get("status") or "") == "ok"]
+    unhealthy_sources = [row for row in sources if str(row.get("status") or "") != "ok"]
+    version_valid = payload.get("version") == EXTERNAL_EVENT_SOURCE_HEALTH_VERSION
+    fresh = age_seconds is not None and age_seconds <= max_age_seconds
+    available = bool(version_valid and fresh and sources)
+    return {
+        "available": available,
+        "version": payload.get("version"),
+        "version_valid": version_valid,
+        "checked_at": checked_at.isoformat() if checked_at else None,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "max_age_seconds": max_age_seconds,
+        "fresh": fresh,
+        "enabled": bool(payload.get("enabled")),
+        "configured_source_count": int(payload.get("configured_source_count") or len(sources)),
+        "healthy_source_count": len(healthy_sources),
+        "unhealthy_source_count": len(unhealthy_sources),
+        "healthy_source_names": [str(row.get("name") or "") for row in healthy_sources],
+        "unhealthy_sources": [
+            {
+                "name": str(row.get("name") or ""),
+                "status": str(row.get("status") or "unknown"),
+                "http_status": int(row.get("http_status") or 0),
+                "error": str(row.get("error") or "") or None,
+            }
+            for row in unhealthy_sources
+        ],
+    }
+
+
 async def _data_source_items() -> list[dict[str, Any]]:
+    now = datetime.now(UTC)
+    external_event_collection = _external_event_collection_health(now)
+    kline_since = now - timedelta(hours=24)
+    news_since = now - timedelta(seconds=EXTERNAL_EVENT_FRESH_SECONDS)
+    social_since = now - timedelta(seconds=SOCIAL_FRESH_SECONDS)
     async with get_session_ctx() as session:
         ticker_row = (
             await session.execute(
@@ -815,7 +884,10 @@ async def _data_source_items() -> list[dict[str, Any]]:
                         func.count(func.distinct(Kline.symbol)),
                         func.max(Kline.open_time),
                     )
-                    .where(Kline.timeframe.in_(EXPECTED_KLINE_TIMEFRAMES))
+                    .where(
+                        Kline.timeframe.in_(EXPECTED_KLINE_TIMEFRAMES),
+                        Kline.open_time >= kline_since,
+                    )
                     .group_by(Kline.timeframe)
                 )
             ).all()
@@ -826,16 +898,20 @@ async def _data_source_items() -> list[dict[str, Any]]:
                     func.count(NewsArticle.id),
                     func.count(func.distinct(NewsArticle.source)),
                     func.max(func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)),
+                    func.count(NewsArticle.id).filter(
+                        NewsArticle.source.like(f"{SCRAPLING_SOURCE_PREFIX}%")
+                    ),
+                    func.count(func.distinct(NewsArticle.source)).filter(
+                        NewsArticle.source.like(f"{SCRAPLING_SOURCE_PREFIX}%")
+                    ),
+                    func.max(
+                        func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)
+                    ).filter(NewsArticle.source.like(f"{SCRAPLING_SOURCE_PREFIX}%")),
                 )
-            )
-        ).one()
-        external_event_row = (
-            await session.execute(
-                select(
-                    func.count(NewsArticle.id),
-                    func.count(func.distinct(NewsArticle.source)),
-                    func.max(func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)),
-                ).where(NewsArticle.source.like(f"{SCRAPLING_SOURCE_PREFIX}%"))
+                .where(
+                    func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)
+                    >= news_since
+                )
             )
         ).one()
         social_row = (
@@ -845,6 +921,7 @@ async def _data_source_items() -> list[dict[str, Any]]:
                     func.count(func.distinct(SocialPost.platform)),
                     func.max(SocialPost.posted_at),
                 )
+                .where(SocialPost.posted_at >= social_since)
             )
         ).one()
 
@@ -874,9 +951,9 @@ async def _data_source_items() -> list[dict[str, Any]]:
     news_source_count = int(news_row[1] or 0)
     news_latest = _utc_datetime(news_row[2])
     news_age = _age_seconds(news_latest)
-    external_event_count = int(external_event_row[0] or 0)
-    external_event_source_count = int(external_event_row[1] or 0)
-    external_event_latest = _utc_datetime(external_event_row[2])
+    external_event_count = int(news_row[3] or 0)
+    external_event_source_count = int(news_row[4] or 0)
+    external_event_latest = _utc_datetime(news_row[5])
     external_event_age = _age_seconds(external_event_latest)
     social_count = int(social_row[0] or 0)
     social_platform_count = int(social_row[1] or 0)
@@ -929,6 +1006,7 @@ async def _data_source_items() -> list[dict[str, Any]]:
                     }
                     for key, value in kline_by_timeframe.items()
                 },
+                "coverage_window_hours": 24,
             },
         )
     )
@@ -951,6 +1029,7 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 "age_minutes": _age_minutes(news_latest),
                 "fresh_limit_hours": round(NEWS_FRESH_SECONDS / 3600, 1),
                 "source_diversity_ok": news_diverse,
+                "sample_window_hours": round(EXTERNAL_EVENT_FRESH_SECONDS / 3600, 1),
             },
         )
     )
@@ -959,16 +1038,35 @@ async def _data_source_items() -> list[dict[str, Any]]:
         and external_event_age is not None
         and external_event_age <= EXTERNAL_EVENT_FRESH_SECONDS
     )
-    external_event_diverse = external_event_source_count >= 4
+    collection_health_available = bool(external_event_collection.get("available"))
+    collection_healthy_source_count = int(
+        external_event_collection.get("healthy_source_count") or 0
+    )
+    effective_source_count = (
+        collection_healthy_source_count
+        if collection_health_available
+        else external_event_source_count
+    )
+    external_event_diverse = effective_source_count >= EXTERNAL_EVENT_MIN_HEALTHY_SOURCES
+    external_event_status_ok = external_event_ok and external_event_diverse
     items.append(
         _check_item(
             "external_event_source_freshness",
             "Scrapling external event sources",
-            "ok" if external_event_ok and external_event_diverse else "warning",
+            "ok" if external_event_status_ok else "warning",
             (
-                f"Scrapling events have {external_event_source_count} sources and "
-                f"{external_event_count} samples; latest about "
-                f"{_age_minutes(external_event_latest)} minutes ago."
+                (
+                    f"Scrapling collection has {collection_healthy_source_count}/"
+                    f"{external_event_collection.get('configured_source_count', 0)} healthy "
+                    f"sources; {external_event_source_count} sources published "
+                    f"{external_event_count} new samples in the last 72 hours."
+                )
+                if external_event_ok and collection_health_available
+                else (
+                    f"Scrapling events have {external_event_source_count} recent-content "
+                    f"sources and {external_event_count} samples; latest about "
+                    f"{_age_minutes(external_event_latest)} minutes ago."
+                )
                 if external_event_ok
                 else (
                     "Scrapling external event samples are empty or stale; official "
@@ -979,13 +1077,18 @@ async def _data_source_items() -> list[dict[str, Any]]:
             details={
                 "event_count": external_event_count,
                 "source_count": external_event_source_count,
+                "recent_content_source_count": external_event_source_count,
+                "effective_healthy_source_count": effective_source_count,
                 "latest_at": (
                     external_event_latest.isoformat() if external_event_latest else None
                 ),
                 "age_minutes": _age_minutes(external_event_latest),
                 "fresh_limit_hours": round(EXTERNAL_EVENT_FRESH_SECONDS / 3600, 1),
                 "source_diversity_ok": external_event_diverse,
+                "minimum_healthy_source_count": EXTERNAL_EVENT_MIN_HEALTHY_SOURCES,
+                "collection_health": external_event_collection,
                 "source_prefix": SCRAPLING_SOURCE_PREFIX,
+                "sample_window_hours": round(EXTERNAL_EVENT_FRESH_SECONDS / 3600, 1),
             },
         )
     )
@@ -1008,6 +1111,7 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 "age_minutes": _age_minutes(social_latest),
                 "fresh_limit_hours": round(SOCIAL_FRESH_SECONDS / 3600, 1),
                 "platform_diversity_ok": social_diverse,
+                "sample_window_hours": round(SOCIAL_FRESH_SECONDS / 3600, 1),
             },
         )
     )
@@ -1405,15 +1509,32 @@ async def _model_training_identity_item() -> dict[str, Any]:
 @router.get("/system/self-check")
 async def system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
-    trading_result, monitor_result, data_result, recent_result, model_identity_result = await asyncio.gather(
-        _run_self_check_section(_trading_service_running_item()),
+    trading_task = asyncio.create_task(
+        _run_self_check_section(_trading_service_running_item())
+    )
+    monitor_task = asyncio.create_task(
         _run_self_check_section(
             get_server_monitor_status_async(),
             timeout=SERVER_MONITOR_SELF_CHECK_TIMEOUT_SECONDS,
-        ),
-        _run_self_check_section(_data_source_items()),
-        _run_self_check_section(_recent_execution_items()),
-        _run_self_check_section(_model_training_identity_item()),
+        )
+    )
+
+    database_results: list[Any] = []
+    for section_factory, timeout in (
+        (_data_source_items, SELF_CHECK_SECTION_TIMEOUT_SECONDS),
+        (_recent_execution_items, SELF_CHECK_SECTION_TIMEOUT_SECONDS),
+        (_model_training_identity_item, MODEL_IDENTITY_SELF_CHECK_TIMEOUT_SECONDS),
+    ):
+        try:
+            database_results.append(
+                await _run_self_check_section(section_factory(), timeout=timeout)
+            )
+        except Exception as exc:
+            database_results.append(exc)
+    data_result, recent_result, model_identity_result = database_results
+    trading_result, monitor_result = await asyncio.gather(
+        trading_task,
+        monitor_task,
         return_exceptions=True,
     )
 

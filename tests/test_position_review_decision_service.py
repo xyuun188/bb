@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -93,6 +94,38 @@ async def test_position_review_decision_service_builds_ensemble_context_and_meta
     attach_kwargs = next(value for name, value in calls if name == "attach")[1]
     assert attach_kwargs["phase"] == "position_review"
     assert attach_kwargs["skills"] == ["skill"]
+
+
+@pytest.mark.asyncio
+async def test_position_review_decision_passes_shared_group_deadline_to_ensemble() -> None:
+    contexts: list[dict[str, Any]] = []
+
+    async def ensemble_decider(_feature_vector: Any, context: dict[str, Any]) -> tuple[Any, Any]:
+        contexts.append(context)
+        return _decision(), []
+
+    service = PositionReviewDecisionService(
+        default_model_name="ensemble_trader",
+        expert_memory_context_provider=lambda _symbol: _async_dict({}),
+        ml_signal_predictor=lambda _feature_vector: {},
+        local_ai_tools_context_provider=lambda *_args, **_kwargs: _async_dict({}),
+        position_skills_provider=lambda **_kwargs: [],
+        agent_skills_attacher=lambda *_args, **_kwargs: {},
+        ensemble_decider=ensemble_decider,
+        model_provider=lambda _name: None,
+    )
+    request = replace(
+        _request(),
+        analysis_deadline_monotonic=123.5,
+        analysis_budget_seconds=24.0,
+    )
+
+    result = await service.decide(request)
+
+    assert result is not None
+    assert contexts[0]["_analysis_deadline_monotonic"] == 123.5
+    assert contexts[0]["_analysis_budget_scope"] == "position_review"
+    assert contexts[0]["_analysis_budget_seconds"] == 24.0
 
 
 @pytest.mark.asyncio

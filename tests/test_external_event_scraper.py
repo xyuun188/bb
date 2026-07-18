@@ -230,6 +230,14 @@ async def test_external_event_scraper_parses_meta_and_event_links(
     assert articles[0]["symbols_mentioned"] == ["ETH"]
     assert articles[1]["url"] == "https://blog.ethereum.org/2026/06/upgrade"
     assert "upgrade launch" in articles[1]["title"]
+    report = scraper.last_source_reports[0]
+    assert report["name"] == "ethereum_blog"
+    assert report["status"] == "ok"
+    assert report["http_status"] == 200
+    assert report["response_chars"] == len(FakeFetcher.html)
+    assert report["parsed_article_count"] == 2
+    assert report["emitted_article_count"] == 2
+    assert report["error"] is None
 
 
 @pytest.mark.asyncio
@@ -245,8 +253,10 @@ async def test_external_event_service_persists_articles_once(
         symbols=("ETH",),
         weight=0.72,
     )
+    health_path = tmp_path / "external-event-source-health.json"
     service = ExternalEventService(
-        scraper=ExternalEventScraper(sources=[source], fetcher=FakeFetcher)
+        scraper=ExternalEventScraper(sources=[source], fetcher=FakeFetcher),
+        health_path=health_path,
     )
 
     try:
@@ -261,3 +271,39 @@ async def test_external_event_service_persists_articles_once(
     assert second == {"fetched": 2, "stored": 0, "skipped": 2}
     assert len(rows) == 2
     assert rows[0].source == "scrapling:ethereum_blog"
+    health = external_event_service_module.load_external_event_source_health(health_path)
+    assert health["healthy_source_count"] == 1
+    assert health["configured_source_count"] == 1
+    assert health["sources"][0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_external_event_health_snapshot_uses_collector_that_finished_the_round(
+    tmp_path: Path,
+) -> None:
+    health_path = tmp_path / "external-event-source-health.json"
+
+    class ReplacedDuringFetchScraper:
+        last_source_reports = [
+            {
+                "name": "ethereum_blog",
+                "status": "ok",
+                "http_status": 200,
+            }
+        ]
+
+        async def fetch_all(self) -> list[dict[str, Any]]:
+            service.scraper = ExternalEventScraper()
+            return []
+
+    service = ExternalEventService(
+        scraper=ReplacedDuringFetchScraper(),  # type: ignore[arg-type]
+        health_path=health_path,
+    )
+
+    result = await service.collect_once()
+
+    assert result == {"fetched": 0, "stored": 0, "skipped": 0}
+    health = external_event_service_module.load_external_event_source_health(health_path)
+    assert health["configured_source_count"] == 1
+    assert health["healthy_source_count"] == 1

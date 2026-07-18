@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -172,9 +173,7 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
 
     decision = _decision()
     decision.feature_snapshot["atr_14"] = 2.443918123
-    decision.raw_response["opportunity_score"] = {
-        "execution_cost": {"total_pct": 0.15}
-    }
+    decision.raw_response["opportunity_score"] = {"execution_cost": {"total_pct": 0.15}}
     policy = PaperBootstrapCanaryPolicy(
         allocated_order_balance=balance,
         exchange_risk_facts=facts,
@@ -399,3 +398,161 @@ async def test_paper_canary_opens_circuit_after_two_completed_losses() -> None:
 
     assert result.eligible is False
     assert "paper_canary_consecutive_loss_circuit_open" in result.reason
+
+
+def test_canary_history_query_projects_only_runtime_guard_columns() -> None:
+    statement = PaperBootstrapCanaryPolicy._history_statement()
+
+    selected_columns = {column.key for column in statement.selected_columns}
+
+    assert selected_columns == {
+        "paper_canary_authorized",
+        "outcome",
+        "executed_at",
+        "created_at",
+    }
+    assert "raw_llm_response" not in selected_columns
+    assert any(
+        str(criterion.left) == "ai_decisions.created_at"
+        for criterion in statement.whereclause.clauses
+    )
+
+
+@pytest.mark.asyncio
+async def test_canary_preflight_history_timeout_fails_closed_with_timing() -> None:
+    history_cancelled = asyncio.Event()
+
+    async def unused_balance(_mode: str, _decision: DecisionOutput) -> float:
+        raise AssertionError("history timeout must block before account calls")
+
+    async def unused_facts(
+        _mode: str,
+        _decision: DecisionOutput,
+        _positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise AssertionError("history timeout must block before exchange calls")
+
+    async def slow_history() -> list[Any]:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            history_cancelled.set()
+        return []
+
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=unused_balance,
+        exchange_risk_facts=unused_facts,
+        history_provider=slow_history,
+        preflight_timeout_seconds=0.1,
+        history_timeout_seconds=0.05,
+    )
+    decision = _decision()
+    started = asyncio.get_running_loop().time()
+
+    result = await policy.preflight(decision, "paper", [])
+    await asyncio.sleep(0)
+
+    elapsed = asyncio.get_running_loop().time() - started
+    contract = decision.raw_response["paper_bootstrap_canary"]
+    history_timing = contract["runtime_guard"]["history_query"]
+    preflight_timing = contract["runtime_preflight_timing"]
+    assert result.eligible is False
+    assert "paper_canary_history_timeout" in result.reason
+    assert elapsed < 0.3
+    assert history_cancelled.is_set() is True
+    assert history_timing["status"] == "timeout"
+    assert history_timing["allowed_timeout_seconds"] == pytest.approx(0.05, abs=0.01)
+    assert preflight_timing["status"] == "failed_closed"
+    assert preflight_timing["history_query_status"] == "timeout"
+    assert preflight_timing["message_zh"]
+
+
+@pytest.mark.asyncio
+async def test_canary_preflight_exhausted_market_deadline_skips_history_query() -> None:
+    history_called = False
+
+    async def unused_balance(_mode: str, _decision: DecisionOutput) -> float:
+        raise AssertionError("exhausted preflight must block before account calls")
+
+    async def unused_facts(
+        _mode: str,
+        _decision: DecisionOutput,
+        _positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise AssertionError("exhausted preflight must block before exchange calls")
+
+    async def history() -> list[Any]:
+        nonlocal history_called
+        history_called = True
+        return []
+
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=unused_balance,
+        exchange_risk_facts=unused_facts,
+        history_provider=history,
+    )
+    decision = _decision()
+
+    result = await policy.preflight(
+        decision,
+        "paper",
+        [],
+        deadline_monotonic=asyncio.get_running_loop().time(),
+        timing_scope="market_decision_persistence",
+    )
+
+    contract = decision.raw_response["paper_bootstrap_canary"]
+    assert result.eligible is False
+    assert "paper_canary_preflight_budget_exhausted" in result.reason
+    assert history_called is False
+    assert contract["runtime_guard"]["history_query"]["status"] == "budget_exhausted"
+    assert decision.raw_response["market_context_timings"][-1]["scope"] == (
+        "market_decision_persistence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_canary_exchange_facts_timeout_fails_closed_before_balance() -> None:
+    facts_cancelled = asyncio.Event()
+    balance_called = False
+
+    async def balance(_mode: str, _decision: DecisionOutput) -> float:
+        nonlocal balance_called
+        balance_called = True
+        return 500.0
+
+    async def slow_facts(
+        _mode: str,
+        _decision: DecisionOutput,
+        _positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            facts_cancelled.set()
+        return {}
+
+    async def history() -> list[Any]:
+        return []
+
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=balance,
+        exchange_risk_facts=slow_facts,
+        history_provider=history,
+        prepare_timeout_seconds=0.3,
+        exchange_facts_timeout_seconds=0.05,
+    )
+    decision = _decision()
+
+    result = await policy.prepare(decision, "paper", [])
+    await asyncio.sleep(0)
+
+    contract = decision.raw_response["paper_bootstrap_canary"]
+    prepare_timing = contract["runtime_prepare_timing"]
+    assert result.eligible is False
+    assert "paper_canary_exchange_facts_timeout" in result.reason
+    assert facts_cancelled.is_set() is True
+    assert balance_called is False
+    assert prepare_timing["status"] == "failed_closed"
+    assert prepare_timing["stages"][0]["stage"] == "exchange_risk_facts"
+    assert prepare_timing["stages"][0]["status"] == "timeout"

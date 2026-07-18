@@ -9,6 +9,7 @@ import asyncio
 import json
 import math
 import re
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
@@ -96,6 +97,64 @@ TICKER_CACHE_MAX_AGE_SECONDS = max(
     float(_MARKET_DATA_PARAMS.indicator_snapshot_cache_ttl_seconds),
 )
 AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS = 600.0
+CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
+    float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) + 2.0,
+    7.0,
+)
+
+
+class _PriorityBuildGate:
+    """Bound indicator work while always serving queued market candidates first."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._priority_waiters: deque[asyncio.Future[None]] = deque()
+        self._normal_waiters: deque[asyncio.Future[None]] = deque()
+
+    async def acquire(self, *, priority: bool) -> None:
+        if (
+            self._active < self._limit
+            and not self._priority_waiters
+            and not self._normal_waiters
+        ):
+            self._active += 1
+            return
+
+        future = asyncio.get_running_loop().create_future()
+        waiters = self._priority_waiters if priority else self._normal_waiters
+        waiters.append(future)
+        try:
+            await future
+        except BaseException:
+            if future.done() and not future.cancelled():
+                self.release()
+            else:
+                future.cancel()
+                self._wake_next()
+            raise
+
+    def release(self) -> None:
+        if self._active <= 0:
+            raise RuntimeError("indicator build gate released without acquisition")
+        self._active -= 1
+        self._wake_next()
+
+    def _wake_next(self) -> None:
+        while self._active < self._limit:
+            future = self._next_waiter()
+            if future is None:
+                return
+            self._active += 1
+            future.set_result(None)
+
+    def _next_waiter(self) -> asyncio.Future[None] | None:
+        for waiters in (self._priority_waiters, self._normal_waiters):
+            while waiters:
+                future = waiters.popleft()
+                if not future.done():
+                    return future
+        return None
 
 
 class DataService:
@@ -122,6 +181,9 @@ class DataService:
         self._kline_cache: dict[str, pd.DataFrame] = {}  # symbol:tf -> DataFrame
         self._indicator_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._indicator_snapshot_tasks: dict[str, asyncio.Task] = {}
+        self._indicator_snapshot_priority_gate = _PriorityBuildGate(
+            INDICATOR_SNAPSHOT_BUILD_CONCURRENCY
+        )
         self._indicator_remote_refresh_semaphore = asyncio.Semaphore(
             max(1, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY))
         )
@@ -635,6 +697,7 @@ class DataService:
         allow_cached_indicator_build: bool = True,
         allow_indicator_background_refresh: bool = True,
         allow_derivatives_background_refresh: bool = True,
+        prioritize_indicator_build: bool = False,
     ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
         sentiment_task = asyncio.create_task(
@@ -683,6 +746,7 @@ class DataService:
                     block_on_remote=block_on_remote_indicators,
                     allow_cached_build=allow_cached_indicator_build,
                     allow_background_refresh=allow_indicator_background_refresh,
+                    prioritize_build=prioritize_indicator_build,
                 ),
             )
         )
@@ -727,6 +791,73 @@ class DataService:
             headlines=headlines,
             derivatives=derivatives,
         )
+
+    async def prewarm_indicator_snapshots(
+        self,
+        symbols: list[str],
+        *,
+        timeout_seconds: float = CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Populate real indicator snapshots for the final market shortlist."""
+
+        normalized_symbols = list(dict.fromkeys(self._normalize_symbols(symbols)))
+        if not normalized_symbols:
+            return {
+                "status": "skipped",
+                "requested_count": 0,
+                "available_count": 0,
+                "unavailable_symbols": [],
+            }
+
+        per_symbol_timeout = max(float(timeout_seconds or 0.0), 0.5)
+
+        async def prewarm(symbol: str) -> tuple[str, dict[str, Any]]:
+            try:
+                snapshot = await asyncio.wait_for(
+                    self._get_indicator_snapshot(
+                        symbol,
+                        block_on_remote=True,
+                        allow_cached_build=True,
+                        allow_background_refresh=False,
+                        prioritize_build=True,
+                    ),
+                    timeout=per_symbol_timeout,
+                )
+                return symbol, dict(snapshot or {})
+            except TimeoutError:
+                logger.warning(
+                    "candidate indicator prewarm timed out",
+                    symbol=symbol,
+                    timeout_seconds=per_symbol_timeout,
+                )
+                return symbol, self._unavailable_indicator_snapshot(
+                    "candidate_indicator_prewarm_timeout"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "candidate indicator prewarm failed",
+                    symbol=symbol,
+                    error=safe_error_text(exc),
+                )
+                return symbol, self._unavailable_indicator_snapshot(
+                    "candidate_indicator_prewarm_failed"
+                )
+
+        results = await asyncio.gather(*(prewarm(symbol) for symbol in normalized_symbols))
+        unavailable = [
+            symbol
+            for symbol, snapshot in results
+            if not bool(snapshot.get("indicator_snapshot_available"))
+        ]
+        return {
+            "status": "ok" if not unavailable else "partial",
+            "requested_count": len(normalized_symbols),
+            "available_count": len(normalized_symbols) - len(unavailable),
+            "unavailable_count": len(unavailable),
+            "unavailable_symbols": unavailable,
+            "timeout_seconds": round(per_symbol_timeout, 3),
+            "priority_queue_enabled": True,
+        }
 
     async def _ensure_sentiment_for_analysis(
         self,
@@ -1235,8 +1366,21 @@ class DataService:
         block_on_remote: bool = True,
         allow_cached_build: bool = True,
         allow_background_refresh: bool = True,
+        prioritize_build: bool = False,
     ) -> dict[str, Any]:
         getter = self._get_indicator_snapshot
+        if prioritize_build:
+            try:
+                return await getter(
+                    symbol,
+                    block_on_remote=block_on_remote,
+                    allow_cached_build=allow_cached_build,
+                    allow_background_refresh=allow_background_refresh,
+                    prioritize_build=True,
+                )
+            except TypeError as exc:
+                if "prioritize_build" not in safe_error_text(exc):
+                    raise
         try:
             return await getter(
                 symbol,
@@ -1305,6 +1449,7 @@ class DataService:
         block_on_remote: bool = True,
         allow_cached_build: bool = True,
         allow_background_refresh: bool = True,
+        prioritize_build: bool = False,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         cache = self._indicator_snapshot_cache_map()
@@ -1332,6 +1477,8 @@ class DataService:
                 return dict(result or {})
             return {
                 "indicator_snapshot_available": False,
+                "indicator_snapshot_quality": "unavailable",
+                "indicator_snapshot_reason": "indicator_snapshot_build_in_progress",
                 "indicator_snapshot_refresh_in_background": True,
             }
 
@@ -1345,13 +1492,18 @@ class DataService:
                     return cached_features
             if allow_background_refresh:
                 self._schedule_indicator_snapshot_refresh(normalized)
-            return {
-                "indicator_snapshot_available": False,
-                "indicator_snapshot_refresh_in_background": bool(allow_background_refresh),
-                "indicator_snapshot_background_refresh_deferred": not allow_background_refresh,
-            }
+            return self._unavailable_indicator_snapshot(
+                "indicator_snapshot_cache_miss",
+                refresh_in_background=bool(allow_background_refresh),
+                background_refresh_deferred=not allow_background_refresh,
+            )
 
-        task = asyncio.create_task(self._build_indicator_snapshot(normalized))
+        if prioritize_build:
+            task = asyncio.create_task(
+                self._build_indicator_snapshot(normalized, priority=True)
+            )
+        else:
+            task = asyncio.create_task(self._build_indicator_snapshot(normalized))
         tasks[normalized] = task
 
         def cleanup(_task: asyncio.Task, refresh_symbol: str = normalized) -> None:
@@ -1387,12 +1539,29 @@ class DataService:
             self._indicator_remote_refresh_semaphore = gate
         return gate
 
-    def _indicator_snapshot_build_gate(self) -> asyncio.Semaphore:
-        gate = getattr(self, "_indicator_snapshot_build_semaphore", None)
-        if not isinstance(gate, asyncio.Semaphore):
-            gate = asyncio.Semaphore(max(1, int(INDICATOR_SNAPSHOT_BUILD_CONCURRENCY)))
-            self._indicator_snapshot_build_semaphore = gate
+    def _indicator_snapshot_build_gate(self) -> _PriorityBuildGate:
+        gate = getattr(self, "_indicator_snapshot_priority_gate", None)
+        if not isinstance(gate, _PriorityBuildGate):
+            gate = _PriorityBuildGate(INDICATOR_SNAPSHOT_BUILD_CONCURRENCY)
+            self._indicator_snapshot_priority_gate = gate
         return gate
+
+    @staticmethod
+    def _unavailable_indicator_snapshot(
+        reason: str,
+        *,
+        refresh_in_background: bool = False,
+        background_refresh_deferred: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "indicator_snapshot_available": False,
+            "indicator_snapshot_quality": "unavailable",
+            "indicator_snapshot_reason": str(reason or "indicator_snapshot_unavailable"),
+            "indicator_snapshot_refresh_in_background": bool(refresh_in_background),
+            "indicator_snapshot_background_refresh_deferred": bool(
+                background_refresh_deferred
+            ),
+        }
 
     def _kline_fetch_task_map(self) -> dict[tuple[str, str], asyncio.Task]:
         tasks = getattr(self, "_kline_fetch_tasks", None)
@@ -1560,10 +1729,18 @@ class DataService:
                 error=safe_error_text(exc),
             )
 
-    async def _build_indicator_snapshot(self, symbol: str) -> dict[str, Any]:
+    async def _build_indicator_snapshot(
+        self,
+        symbol: str,
+        *,
+        priority: bool = False,
+    ) -> dict[str, Any]:
         gate = self._indicator_snapshot_build_gate()
-        async with gate:
+        await gate.acquire(priority=priority)
+        try:
             return await self._build_indicator_snapshot_uncached(symbol)
+        finally:
+            gate.release()
 
     async def _build_indicator_snapshot_uncached(self, symbol: str) -> dict[str, Any]:
         try:
@@ -1612,22 +1789,10 @@ class DataService:
             return await getter(symbol)
 
     async def _indicator_features_from_cached_klines(self, symbol: str) -> dict[str, Any]:
-        cached_results = await asyncio.gather(
-            *(
-                self._load_recent_cached_klines(symbol, timeframe, limit)
-                for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
-            ),
-            return_exceptions=True,
+        cached_klines_by_timeframe = await self._load_recent_cached_klines_for_timeframes(
+            symbol,
+            KLINE_PERSIST_TIMEFRAME_LIMITS,
         )
-        cached_klines_by_timeframe = {
-            timeframe: rows
-            for (timeframe, _limit), rows in zip(
-                KLINE_PERSIST_TIMEFRAME_LIMITS.items(),
-                cached_results,
-                strict=False,
-            )
-            if isinstance(rows, list) and rows
-        }
         return self._indicator_features_from_timeframes(cached_klines_by_timeframe)
 
     def _indicator_features_from_timeframes(
@@ -1666,6 +1831,8 @@ class DataService:
         elif short_features:
             features["volume_ratio_timeframe"] = short_timeframe
         features["indicator_snapshot_available"] = True
+        features["indicator_snapshot_quality"] = "full"
+        features["indicator_snapshot_reason"] = "recent_complete_klines"
         sequence_df = short_df if not short_df.empty else trend_df
         sequence_timeframe = short_timeframe or trend_timeframe
         features.update(self._kline_sequence_snapshot(sequence_df, sequence_timeframe))
@@ -1858,41 +2025,59 @@ class DataService:
         timeframe: str,
         limit: int,
     ) -> list[list[float]]:
+        grouped = await self._load_recent_cached_klines_for_timeframes(
+            symbol,
+            {timeframe: limit},
+        )
+        return list(grouped.get(timeframe) or [])
+
+    async def _load_recent_cached_klines_for_timeframes(
+        self,
+        symbol: str,
+        timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
         try:
             normalized = self._normalize_symbols([symbol])[0]
             async with get_session_ctx() as session:
                 repo = MarketRepository(session)
-                rows = await repo.get_klines(normalized, timeframe, limit)
-            if not rows:
-                return []
-            latest = rows[-1].open_time
-            if latest.tzinfo is None:
-                latest = latest.replace(tzinfo=UTC)
-            max_age_seconds = max(
-                TIMEFRAME_SECONDS.get(timeframe, 60) * KLINE_CACHE_MAX_AGE_MULTIPLIER,
-                KLINE_CACHE_MIN_MAX_AGE_SECONDS,
-            )
-            if (datetime.now(UTC) - latest).total_seconds() > max_age_seconds:
-                return []
-            return [
-                [
-                    row.open_time.timestamp() * 1000.0,
-                    row.open,
-                    row.high,
-                    row.low,
-                    row.close,
-                    row.volume,
+                grouped_rows = await repo.get_klines_for_timeframes(
+                    normalized,
+                    timeframe_limits,
+                )
+            now = datetime.now(UTC)
+            grouped: dict[str, list[list[float]]] = {}
+            for timeframe, rows in grouped_rows.items():
+                if not rows:
+                    continue
+                latest = rows[-1].open_time
+                if latest.tzinfo is None:
+                    latest = latest.replace(tzinfo=UTC)
+                max_age_seconds = max(
+                    TIMEFRAME_SECONDS.get(timeframe, 60) * KLINE_CACHE_MAX_AGE_MULTIPLIER,
+                    KLINE_CACHE_MIN_MAX_AGE_SECONDS,
+                )
+                if (now - latest).total_seconds() > max_age_seconds:
+                    continue
+                grouped[timeframe] = [
+                    [
+                        row.open_time.timestamp() * 1000.0,
+                        row.open,
+                        row.high,
+                        row.low,
+                        row.close,
+                        row.volume,
+                    ]
+                    for row in rows
                 ]
-                for row in rows
-            ]
+            return grouped
         except Exception as exc:
             logger.debug(
-                "load cached klines failed",
+                "load cached kline timeframes failed",
                 symbol=symbol,
-                timeframe=timeframe,
+                timeframes=list(timeframe_limits),
                 error=safe_error_text(exc),
             )
-            return []
+            return {}
 
     def _kline_anomaly_snapshot(self, df: pd.DataFrame) -> dict[str, float]:
         """Detect repeat extreme wicks that can make stop losses fill far away."""

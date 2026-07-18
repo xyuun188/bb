@@ -811,7 +811,87 @@ async def test_final_market_candidate_refresh_blocks_on_complete_market_sources(
         "allow_cached_indicator_build": False,
         "allow_indicator_background_refresh": False,
         "allow_derivatives_background_refresh": False,
+        "prioritize_indicator_build": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_market_candidate_prewarm_uses_bounded_priority_api() -> None:
+    service = TradingService.__new__(TradingService)
+    received: dict[str, Any] = {}
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+
+    async def prewarm(symbols: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        received["symbols"] = symbols
+        received["timeout_seconds"] = timeout_seconds
+        return {
+            "status": "ok",
+            "requested_count": len(symbols),
+            "available_count": len(symbols),
+            "unavailable_symbols": [],
+        }
+
+    service.data_service = SimpleNamespace(prewarm_indicator_snapshots=prewarm)
+
+    diagnostics = await service._prewarm_market_candidate_indicators(
+        ["BTC/USDT", "ETH/USDT", "BTC/USDT"]
+    )
+
+    assert received == {
+        "symbols": ["BTC/USDT", "ETH/USDT"],
+        "timeout_seconds": trading_service.MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS,
+    }
+    assert diagnostics["status"] == "ok"
+    assert diagnostics["available_count"] == 2
+    assert diagnostics["is_entry_permission"] is False
+    assert diagnostics["changes_trading_thresholds"] is False
+
+
+@pytest.mark.asyncio
+async def test_prewarmed_market_candidates_are_hydrated_from_full_indicators() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    full = SimpleNamespace(
+        symbol="BTC/USDT",
+        current_price=100.0,
+        close=100.0,
+        indicator_snapshot_available=True,
+        indicator_snapshot_quality="full",
+    )
+    unavailable = SimpleNamespace(
+        symbol="ETH/USDT",
+        current_price=200.0,
+        close=200.0,
+        indicator_snapshot_available=False,
+        indicator_snapshot_reason="candidate_indicator_prewarm_timeout",
+    )
+
+    async def feature_snapshot(symbol: str, **kwargs: Any) -> Any:
+        calls.append((symbol, dict(kwargs)))
+        return full if symbol == "BTC/USDT" else unavailable
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    hydrated, diagnostics = await service._hydrate_prewarmed_market_candidates(
+        {
+            "BTC/USDT": SimpleNamespace(current_price=100.0),
+            "ETH/USDT": SimpleNamespace(current_price=200.0),
+        }
+    )
+
+    assert hydrated == {"BTC/USDT": full}
+    assert diagnostics["status"] == "partial"
+    assert diagnostics["hydrated_count"] == 1
+    assert diagnostics["unavailable_symbols"] == [
+        {
+            "symbol": "ETH/USDT",
+            "reason": "candidate_indicator_prewarm_timeout",
+        }
+    ]
+    assert all(kwargs["block_on_remote_indicators"] is False for _symbol, kwargs in calls)
+    assert all(kwargs["prioritize_indicator_build"] is True for _symbol, kwargs in calls)
 
 
 @pytest.mark.asyncio
@@ -3877,6 +3957,74 @@ def test_position_round_watchdog_follows_position_review_cadence(
     assert service.position_review_stage_timeout_seconds() == 63.0
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
     assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
+
+
+@pytest.mark.asyncio
+async def test_position_review_group_deadline_shares_remaining_round_budget() -> None:
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    round_deadline = started + 90.0
+
+    group_deadline = TradingService._position_review_group_deadline(
+        round_deadline,
+        groups_remaining=3,
+    )
+
+    assert group_deadline is not None
+    assert group_deadline - started == pytest.approx(30.0, abs=0.05)
+    assert group_deadline < round_deadline
+
+
+@pytest.mark.asyncio
+async def test_market_context_stage_uses_shared_deadline_and_fallback() -> None:
+    service = TradingService.__new__(TradingService)
+    cancelled = False
+    timings: list[dict[str, Any]] = []
+
+    async def slow_context() -> dict[str, Any]:
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        return {"status": "late"}
+
+    fallback = {"status": "analysis_budget_deferred"}
+    result = await service._bounded_market_context_value(
+        "memory_vector_context",
+        slow_context(),
+        fallback,
+        deadline_monotonic=asyncio.get_running_loop().time() + 0.5,
+        timeout_seconds=0.02,
+        timings=timings,
+    )
+
+    assert result == fallback
+    assert cancelled is True
+    assert timings[0]["status"] == "timeout"
+    assert timings[0]["allowed_timeout_seconds"] == 0.02
+
+
+@pytest.mark.asyncio
+async def test_market_local_ml_context_does_not_queue_behind_position_inference() -> None:
+    service = TradingService.__new__(TradingService)
+    lock = asyncio.Lock()
+    await lock.acquire()
+    service._local_ml_inference_lock = lock
+    service.ml_signal_service = SimpleNamespace(
+        predict=lambda _features: pytest.fail("queued market inference must not run")
+    )
+
+    result = await service._local_ml_signal_context(
+        SimpleNamespace(symbol="BTC/USDT"),
+        lock_wait_seconds=0.01,
+    )
+
+    assert result["status"] == "analysis_budget_deferred"
+    assert result["reason"] == "local_ml_inference_queue_busy"
+    assert lock.locked() is True
+    lock.release()
 
 
 

@@ -378,7 +378,7 @@ class Settings(BaseSettings):
     ai_expert_max_completion_tokens: int = 360
     ai_decision_maker_max_completion_tokens: int = 320
     ai_batch_experts_enabled: bool = True
-    ai_batch_expert_max_completion_tokens: int = 900
+    ai_batch_expert_max_completion_tokens: int = 560
     ai_batch_expert_timeout_seconds: float = 35.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0

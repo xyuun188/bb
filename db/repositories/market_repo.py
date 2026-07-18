@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from db.repositories.base import BaseRepository
 from models.market_data import Kline, Ticker
@@ -95,6 +95,50 @@ class MarketRepository(BaseRepository):
             .limit(limit)
         )
         return list(result.scalars().all())[::-1]
+
+    async def get_klines_for_timeframes(
+        self,
+        symbol: str,
+        timeframe_limits: dict[str, int],
+    ) -> dict[str, list[Kline]]:
+        """Load recent candles for multiple timeframes in one database query."""
+
+        limits = {
+            str(timeframe): max(1, int(limit))
+            for timeframe, limit in timeframe_limits.items()
+            if str(timeframe).strip() and int(limit or 0) > 0
+        }
+        if not limits:
+            return {}
+
+        row_number = func.row_number().over(
+            partition_by=Kline.timeframe,
+            order_by=Kline.open_time.desc(),
+        ).label("timeframe_row_number")
+        ranked = (
+            select(Kline.id.label("kline_id"), row_number)
+            .where(
+                Kline.symbol == symbol,
+                Kline.timeframe.in_(list(limits)),
+            )
+            .subquery()
+        )
+        result = await self.session.execute(
+            select(Kline)
+            .join(ranked, Kline.id == ranked.c.kline_id)
+            .where(ranked.c.timeframe_row_number <= max(limits.values()))
+            .order_by(Kline.timeframe.asc(), Kline.open_time.asc())
+        )
+        grouped: dict[str, list[Kline]] = {timeframe: [] for timeframe in limits}
+        for row in result.scalars().all():
+            timeframe = str(row.timeframe)
+            if timeframe in grouped:
+                grouped[timeframe].append(row)
+        return {
+            timeframe: rows[-limits[timeframe] :]
+            for timeframe, rows in grouped.items()
+            if rows
+        }
 
     async def clean_old_klines(self, symbol: str, timeframe: str, keep: int = 1000) -> int:
         """Delete klines beyond the keep count for a given symbol/timeframe."""

@@ -216,6 +216,11 @@ class _AnalysisRuntimeState:
 
 
 PENDING_FEATURE_CANCEL_DRAIN_SECONDS = 0.25
+MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS = 3.0
+MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS = 1.0
+MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
+MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
+MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 
 
 async def drain_cancelled_tasks(
@@ -333,9 +338,7 @@ class TradingService:
             candidate_executor=self._execute_candidate,
             is_paper_provider=lambda: mode_manager.is_paper,
         )
-        self.model_training_state_store = (
-            model_training_state_store or MODEL_TRAINING_STATE_STORE
-        )
+        self.model_training_state_store = model_training_state_store or MODEL_TRAINING_STATE_STORE
         self.ml_signal_service = MLSignalService(
             training_state_store=self.model_training_state_store
         )
@@ -1060,17 +1063,13 @@ class TradingService:
                 last_success_at.isoformat() if isinstance(last_success_at, datetime) else None
             ),
             "last_success_age_seconds": (
-                round(last_success_age_seconds, 3)
-                if last_success_age_seconds is not None
-                else None
+                round(last_success_age_seconds, 3) if last_success_age_seconds is not None else None
             ),
             "last_failure_at": (
                 last_failure_at.isoformat() if isinstance(last_failure_at, datetime) else None
             ),
             "last_failure_age_seconds": (
-                round(last_failure_age_seconds, 3)
-                if last_failure_age_seconds is not None
-                else None
+                round(last_failure_age_seconds, 3) if last_failure_age_seconds is not None else None
             ),
             "fresh_success_available": bool(fresh_success_available),
             "last_failure_covered_by_fresh_success": bool(
@@ -1101,9 +1100,7 @@ class TradingService:
             "last_degraded_count": int(
                 getattr(self, "_okx_authoritative_sync_last_degraded_count", 0) or 0
             ),
-            "last_samples": list(
-                getattr(self, "_okx_authoritative_sync_last_samples", []) or []
-            ),
+            "last_samples": list(getattr(self, "_okx_authoritative_sync_last_samples", []) or []),
             "success_count": int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_authoritative_sync_failure_count", 0) or 0),
             "order_fact_sync": self._okx_order_fact_sync_status_payload(now),
@@ -1350,12 +1347,16 @@ class TradingService:
                     "degraded": bool(row.get("degraded") is True),
                     "status": row.get("status"),
                     "okx_pull_available": row.get("okx_pull_available"),
-                    "error": safe_error_text(row.get("error"), limit=180)
-                    if row.get("error") is not None
-                    else None,
-                    "note": safe_error_text(row.get("note"), limit=180)
-                    if row.get("note") is not None
-                    else None,
+                    "error": (
+                        safe_error_text(row.get("error"), limit=180)
+                        if row.get("error") is not None
+                        else None
+                    ),
+                    "note": (
+                        safe_error_text(row.get("note"), limit=180)
+                        if row.get("note") is not None
+                        else None
+                    ),
                 }
             )
         return {
@@ -1386,7 +1387,9 @@ class TradingService:
         position_confirmed_count = int(report.get("position_confirmed_count") or 0)
         okx_pull_available = bool(report.get("okx_pull_available") is not False)
         local_checked = int(report.get("local_checked") or 0)
-        pull_error = safe_error_text(report.get("error"), limit=180) if report.get("error") else None
+        pull_error = (
+            safe_error_text(report.get("error"), limit=180) if report.get("error") else None
+        )
         degraded = not okx_pull_available
         requires_attention = unverified_count > 0 or (
             okx_pull_available and status in {"critical", "error", "unavailable"}
@@ -1507,15 +1510,19 @@ class TradingService:
             self._okx_order_fact_sync_success_count = (
                 int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0) + 1
             )
-            self._okx_order_fact_sync_last_row = row if isinstance(row, dict) else {
-                "kind": "order_fact_sync",
-                "requires_attention": False,
-                "degraded": True,
-                "status": "degraded",
-                "okx_pull_available": False,
-                "error": "invalid_order_fact_sync_result",
-                "note": "OKX 订单事实后台同步返回了无效结果；当前持仓对账不受影响。",
-            }
+            self._okx_order_fact_sync_last_row = (
+                row
+                if isinstance(row, dict)
+                else {
+                    "kind": "order_fact_sync",
+                    "requires_attention": False,
+                    "degraded": True,
+                    "status": "degraded",
+                    "okx_pull_available": False,
+                    "error": "invalid_order_fact_sync_result",
+                    "note": "OKX 订单事实后台同步返回了无效结果；当前持仓对账不受影响。",
+                }
+            )
         if getattr(self, "_okx_order_fact_sync_task", None) is task:
             self._okx_order_fact_sync_task = None
 
@@ -1668,7 +1675,9 @@ class TradingService:
         started_at = getattr(self, "_shadow_backtest_update_last_started_at", None)
         finished_at = getattr(self, "_shadow_backtest_update_last_finished_at", None)
         running_seconds = None
-        if isinstance(started_at, datetime) and (not isinstance(finished_at, datetime) or finished_at < started_at):
+        if isinstance(started_at, datetime) and (
+            not isinstance(finished_at, datetime) or finished_at < started_at
+        ):
             running_seconds = round(max((datetime.now(UTC) - started_at).total_seconds(), 0.0), 3)
         return {
             "read_only": True,
@@ -1808,9 +1817,7 @@ class TradingService:
 
         task = getattr(self, "_stale_entry_expire_task", None)
         if task is not None and not task.done():
-            results["stale_entry_maintenance"] = (
-                self._stale_entry_candidate_maintenance_status()
-            )
+            results["stale_entry_maintenance"] = self._stale_entry_candidate_maintenance_status()
             return
 
         task = asyncio.create_task(self._run_stale_entry_candidate_expire())
@@ -1945,6 +1952,67 @@ class TradingService:
                     "status": status,
                 }
 
+    async def _bounded_market_context_value(
+        self,
+        label: str,
+        awaitable: Any,
+        fallback: Any,
+        *,
+        deadline_monotonic: float,
+        timeout_seconds: float,
+        timings: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Bound optional per-symbol context to the shared market-AI deadline."""
+
+        loop = asyncio.get_running_loop()
+        started_monotonic = loop.time()
+        requested_timeout = max(float(timeout_seconds or 0.0), 0.0)
+        remaining_seconds = max(float(deadline_monotonic) - started_monotonic, 0.0)
+        allowed_timeout = min(
+            requested_timeout,
+            max(remaining_seconds - MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS, 0.0),
+        )
+        status = "ok"
+        try:
+            if allowed_timeout <= 0.0:
+                if inspect.iscoroutine(awaitable):
+                    awaitable.close()
+                status = "analysis_budget_deferred"
+                return fallback
+            task = asyncio.ensure_future(awaitable)
+            done, pending = await asyncio.wait({task}, timeout=allowed_timeout)
+            if pending:
+                await drain_cancelled_tasks(pending, timeout_seconds=0.05)
+                status = "timeout"
+                logger.warning(
+                    "market context stage timed out; using observation fallback",
+                    stage=label,
+                    timeout_seconds=round(allowed_timeout, 3),
+                    remaining_seconds=round(remaining_seconds, 3),
+                )
+                return fallback
+            return next(iter(done)).result()
+        except Exception as exc:
+            status = "error"
+            logger.warning(
+                "market context stage failed; using observation fallback",
+                stage=label,
+                error=safe_error_text(exc),
+            )
+            return fallback
+        finally:
+            if timings is not None:
+                timings.append(
+                    {
+                        "stage": label,
+                        "status": status,
+                        "duration_seconds": round(max(loop.time() - started_monotonic, 0.0), 6),
+                        "requested_timeout_seconds": round(requested_timeout, 6),
+                        "allowed_timeout_seconds": round(allowed_timeout, 6),
+                        "remaining_seconds_at_start": round(remaining_seconds, 6),
+                    }
+                )
+
     def _strategy_context_io_gate(self) -> asyncio.Semaphore:
         """Bound concurrent history queries shared by market and position loops."""
 
@@ -2015,27 +2083,35 @@ class TradingService:
             if remaining_seconds <= 0.0:
                 status = "queue_timeout"
                 error = "background_refresh_queue_timeout"
-                return label, False, None, {
-                    "status": status,
-                    "duration_seconds": round(max(loop.time() - started, 0.0), 6),
-                    "queue_wait_seconds": round(queue_wait_seconds, 6),
-                    "error": error,
-                }
+                return (
+                    label,
+                    False,
+                    None,
+                    {
+                        "status": status,
+                        "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+                        "queue_wait_seconds": round(queue_wait_seconds, 6),
+                        "error": error,
+                    },
+                )
             value = await asyncio.wait_for(
                 loader(),
                 timeout=remaining_seconds,
             )
-            return label, True, value, {
-                "status": status,
-                "duration_seconds": round(max(loop.time() - started, 0.0), 6),
-                "queue_wait_seconds": round(queue_wait_seconds, 6),
-            }
+            return (
+                label,
+                True,
+                value,
+                {
+                    "status": status,
+                    "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+                    "queue_wait_seconds": round(queue_wait_seconds, 6),
+                },
+            )
         except TimeoutError:
             status = "queue_timeout" if not acquired else "timeout"
             error = (
-                "background_refresh_queue_timeout"
-                if not acquired
-                else "background_refresh_timeout"
+                "background_refresh_queue_timeout" if not acquired else "background_refresh_timeout"
             )
         except Exception as exc:
             status = "error"
@@ -2050,12 +2126,17 @@ class TradingService:
             status=status,
             error=error,
         )
-        return label, False, None, {
-            "status": status,
-            "duration_seconds": round(max(loop.time() - started, 0.0), 6),
-            "queue_wait_seconds": round(queue_wait_seconds, 6),
-            "error": error,
-        }
+        return (
+            label,
+            False,
+            None,
+            {
+                "status": status,
+                "duration_seconds": round(max(loop.time() - started, 0.0), 6),
+                "queue_wait_seconds": round(queue_wait_seconds, 6),
+                "error": error,
+            },
+        )
 
     def _start_strategy_context_performance_refresh(self, mode: str) -> asyncio.Task:
         """Start one bounded performance snapshot refresh per execution mode."""
@@ -2084,9 +2165,7 @@ class TradingService:
             cache = self._strategy_context_performance_snapshot_store()
             previous = cache.get(selected_mode)
             previous_values = (
-                dict(previous.get("values") or {})
-                if isinstance(previous, dict)
-                else {}
+                dict(previous.get("values") or {}) if isinstance(previous, dict) else {}
             )
             values = dict(previous_values)
             timings: dict[str, Any] = {}
@@ -2223,7 +2302,9 @@ class TradingService:
             }
         return dict(values), {
             "status": (
-                "fresh" if age_seconds <= STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS else "stale"
+                "fresh"
+                if age_seconds <= STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS
+                else "stale"
             ),
             "source": "background_performance_snapshot",
             "available": True,
@@ -2303,6 +2384,21 @@ class TradingService:
         reserve = min(2.0, max(0.25, stage_timeout * 0.03), remaining * reserve_ratio)
         return max(0.0, min(stage_timeout, remaining - reserve))
 
+    @staticmethod
+    def _position_review_group_deadline(
+        round_deadline: float | None,
+        groups_remaining: int,
+    ) -> float | None:
+        """Share the remaining position-round budget fairly across unreviewed groups."""
+
+        if round_deadline is None:
+            return None
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        remaining = max(float(round_deadline) - now, 0.0)
+        group_budget = remaining / max(1, int(groups_remaining or 1))
+        return min(float(round_deadline), now + group_budget)
+
     def _append_position_review_budget_warning(
         self,
         *,
@@ -2323,9 +2419,7 @@ class TradingService:
             "kind": "position_review_round_budget_exhausted",
             "symbol": symbol_label,
             "remaining_budget_seconds": (
-                round(float(remaining_seconds), 3)
-                if remaining_seconds is not None
-                else None
+                round(float(remaining_seconds), 3) if remaining_seconds is not None else None
             ),
             "message": message,
         }
@@ -2404,9 +2498,7 @@ class TradingService:
                 self._okx_authoritative_sync_last_requires_attention_count = result_summary[
                     "requires_attention_count"
                 ]
-                self._okx_authoritative_sync_last_degraded_count = result_summary[
-                    "degraded_count"
-                ]
+                self._okx_authoritative_sync_last_degraded_count = result_summary["degraded_count"]
                 self._okx_authoritative_sync_last_samples = result_summary["samples"]
                 self._okx_authoritative_sync_success_count = (
                     int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0) + 1
@@ -2474,8 +2566,7 @@ class TradingService:
 
             parameters = signature(self._review_open_positions).parameters
             if any(
-                parameter.kind == Parameter.VAR_KEYWORD
-                or name == "round_deadline_monotonic"
+                parameter.kind == Parameter.VAR_KEYWORD or name == "round_deadline_monotonic"
                 for name, parameter in parameters.items()
             ):
                 review_kwargs["round_deadline_monotonic"] = round_deadline_monotonic
@@ -3051,9 +3142,7 @@ class TradingService:
                 execution_result,
             )
         finally:
-            self._invalidate_okx_balance_snapshot_cache_for_model(
-                decision_model_name or model_name
-            )
+            self._invalidate_okx_balance_snapshot_cache_for_model(decision_model_name or model_name)
 
     async def get_account_balance(self, model_name: str) -> float:
         """Return account balance through an explicit execution boundary."""
@@ -3187,15 +3276,44 @@ class TradingService:
                 "error": error_text,
             }
 
-    async def _local_ml_signal_context(self, features: Any) -> dict[str, Any]:
+    async def _local_ml_signal_context(
+        self,
+        features: Any,
+        *,
+        lock_wait_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Run CPU-bound local ML inference without starving the event loop."""
 
         lock = getattr(self, "_local_ml_inference_lock", None)
         if lock is None:
             lock = asyncio.Lock()
             self._local_ml_inference_lock = lock
-        async with lock:
+        acquired = False
+        try:
+            if lock_wait_seconds is None:
+                await lock.acquire()
+            else:
+                wait_seconds = max(float(lock_wait_seconds or 0.0), 0.0)
+                if wait_seconds <= 0.0:
+                    raise TimeoutError
+                await asyncio.wait_for(lock.acquire(), timeout=wait_seconds)
+            acquired = True
             return await asyncio.to_thread(self.ml_signal_service.predict, features)
+        except TimeoutError:
+            logger.warning(
+                "local ML inference queue exceeded market context budget",
+                symbol=getattr(features, "symbol", None),
+                lock_wait_seconds=round(max(float(lock_wait_seconds or 0.0), 0.0), 3),
+            )
+            return {
+                "available": False,
+                "status": "analysis_budget_deferred",
+                "reason": "local_ml_inference_queue_busy",
+                "production_permission": False,
+            }
+        finally:
+            if acquired:
+                lock.release()
 
     def _entry_direction_competition_policy(self) -> EntryDirectionCompetitionPolicy:
         policy = getattr(self, "entry_direction_competition", None)
@@ -3350,6 +3468,7 @@ class TradingService:
         allow_cached_indicator_build: bool = True,
         allow_indicator_background_refresh: bool = True,
         allow_derivatives_background_refresh: bool = True,
+        prioritize_indicator_build: bool = False,
     ) -> Any:
         """Read a feature vector while preserving compatibility with older test doubles."""
 
@@ -3376,6 +3495,9 @@ class TradingService:
             accepts_derivatives_background_refresh_option = (
                 "allow_derivatives_background_refresh" in parameters or accepts_var_kwargs
             )
+            accepts_indicator_priority_option = (
+                "prioritize_indicator_build" in parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             accepts_options = True
             accepts_ticker_option = True
@@ -3384,6 +3506,7 @@ class TradingService:
             accepts_cached_indicator_build_option = True
             accepts_indicator_background_refresh_option = True
             accepts_derivatives_background_refresh_option = True
+            accepts_indicator_priority_option = True
 
         kwargs: dict[str, Any] = {}
         if accepts_options:
@@ -3399,9 +3522,9 @@ class TradingService:
         if accepts_indicator_background_refresh_option:
             kwargs["allow_indicator_background_refresh"] = allow_indicator_background_refresh
         if accepts_derivatives_background_refresh_option:
-            kwargs["allow_derivatives_background_refresh"] = (
-                allow_derivatives_background_refresh
-            )
+            kwargs["allow_derivatives_background_refresh"] = allow_derivatives_background_refresh
+        if accepts_indicator_priority_option:
+            kwargs["prioritize_indicator_build"] = prioritize_indicator_build
         if kwargs:
             return await getter(symbol, **kwargs)
         return await getter(symbol)
@@ -3679,6 +3802,7 @@ class TradingService:
                     allow_cached_indicator_build=False,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
+                    prioritize_indicator_build=True,
                 ),
                 timeout=8.0,
             )
@@ -3699,7 +3823,9 @@ class TradingService:
                 return None
             logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
-            logger.warning("fresh feature vector refresh timed out; deferring symbol", symbol=symbol)
+            logger.warning(
+                "fresh feature vector refresh timed out; deferring symbol", symbol=symbol
+            )
         except Exception as e:
             logger.warning(
                 "fresh feature vector refresh failed; deferring symbol",
@@ -3707,6 +3833,164 @@ class TradingService:
                 error=safe_error_text(e),
             )
         return None
+
+    async def _prewarm_market_candidate_indicators(
+        self,
+        symbols: list[str],
+    ) -> dict[str, Any]:
+        """Give the final shortlist priority access to complete indicator snapshots."""
+
+        requested = self.entry_symbol_universe.dedupe_symbols(symbols)
+        if not requested:
+            return {
+                "status": "skipped",
+                "requested_count": 0,
+                "available_count": 0,
+                "unavailable_symbols": [],
+            }
+        warmer = getattr(self.data_service, "prewarm_indicator_snapshots", None)
+        if not callable(warmer):
+            return {
+                "status": "unsupported",
+                "requested_count": len(requested),
+                "available_count": 0,
+                "unavailable_symbols": requested,
+            }
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timeout_seconds = max(float(MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS), 0.5)
+        try:
+            try:
+                parameters = inspect.signature(warmer).parameters
+                accepts_timeout = "timeout_seconds" in parameters or any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_timeout = True
+            kwargs = {"timeout_seconds": timeout_seconds} if accepts_timeout else {}
+            result = await asyncio.wait_for(
+                warmer(requested, **kwargs),
+                timeout=timeout_seconds + 0.5,
+            )
+            diagnostics = self._safe_dict(result)
+            diagnostics.setdefault("status", "ok")
+            diagnostics.setdefault("requested_count", len(requested))
+        except TimeoutError:
+            diagnostics = {
+                "status": "timeout",
+                "requested_count": len(requested),
+                "available_count": 0,
+                "unavailable_symbols": requested,
+                "timeout_seconds": timeout_seconds,
+            }
+            logger.warning(
+                "market candidate indicator prewarm exceeded round budget",
+                symbol_count=len(requested),
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            diagnostics = {
+                "status": "error",
+                "requested_count": len(requested),
+                "available_count": 0,
+                "unavailable_symbols": requested,
+                "error": safe_error_text(exc),
+            }
+            logger.warning(
+                "market candidate indicator prewarm failed",
+                symbol_count=len(requested),
+                error=safe_error_text(exc),
+            )
+        diagnostics["duration_seconds"] = round(max(loop.time() - started, 0.0), 6)
+        diagnostics["is_entry_permission"] = False
+        diagnostics["changes_trading_thresholds"] = False
+        return diagnostics
+
+    async def _hydrate_prewarmed_market_candidates(
+        self,
+        feature_vectors: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Rebuild shortlisted vectors from the prewarmed indicator cache."""
+
+        if not feature_vectors:
+            return {}, {
+                "status": "skipped",
+                "requested_count": 0,
+                "hydrated_count": 0,
+                "unavailable_symbols": [],
+            }
+        timeout_seconds = max(
+            float(MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS),
+            0.5,
+        )
+        concurrency = min(
+            max(1, int(AUTO_SCAN_FEATURE_FETCH_CONCURRENCY)),
+            4,
+        )
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def hydrate(symbol: str) -> tuple[str, Any | None, str]:
+            async with semaphore:
+                try:
+                    refreshed = await asyncio.wait_for(
+                        self._get_feature_vector_snapshot(
+                            symbol,
+                            wait_for_sentiment=False,
+                            block_on_remote_ticker=False,
+                            block_on_remote_indicators=False,
+                            block_on_remote_derivatives=False,
+                            allow_cached_indicator_build=True,
+                            allow_indicator_background_refresh=False,
+                            allow_derivatives_background_refresh=False,
+                            prioritize_indicator_build=True,
+                        ),
+                        timeout=timeout_seconds,
+                    )
+                except TimeoutError:
+                    return symbol, None, "prewarmed_feature_refresh_timeout"
+                except Exception as exc:
+                    logger.warning(
+                        "prewarmed market candidate hydration failed",
+                        symbol=symbol,
+                        error=safe_error_text(exc),
+                    )
+                    return symbol, None, "prewarmed_feature_refresh_failed"
+                if not self._is_valid_feature_vector(refreshed):
+                    return symbol, None, "prewarmed_feature_invalid"
+                if not bool(getattr(refreshed, "indicator_snapshot_available", False)):
+                    return (
+                        symbol,
+                        None,
+                        str(
+                            getattr(refreshed, "indicator_snapshot_reason", "")
+                            or "indicator_snapshot_unavailable"
+                        ),
+                    )
+                return symbol, refreshed, ""
+
+        rows = await asyncio.gather(
+            *(hydrate(symbol) for symbol in feature_vectors),
+        )
+        hydrated = {
+            symbol: refreshed for symbol, refreshed, _reason in rows if refreshed is not None
+        }
+        unavailable = [
+            {"symbol": symbol, "reason": reason}
+            for symbol, refreshed, reason in rows
+            if refreshed is None
+        ]
+        return hydrated, {
+            "status": "ok" if not unavailable else "partial",
+            "requested_count": len(feature_vectors),
+            "hydrated_count": len(hydrated),
+            "unavailable_count": len(unavailable),
+            "unavailable_symbols": unavailable,
+            "timeout_seconds": round(timeout_seconds, 3),
+            "source": "prewarmed_indicator_cache",
+            "is_entry_permission": False,
+            "changes_trading_thresholds": False,
+        }
 
     async def _fresh_feature_vector_for_price_recheck(self, symbol: str) -> Any | None:
         try:
@@ -3877,7 +4161,6 @@ class TradingService:
             )
         return ranker.feature_opportunity_score(fv)
 
-
     def _entry_market_regime_context_policy(self) -> EntryMarketRegimeContextPolicy:
         policy = getattr(self, "entry_market_regime_context", None)
         if policy is not None:
@@ -3996,9 +4279,7 @@ class TradingService:
         side_perf = self._safe_dict(performance_values.get("today_side_perf"))
         side_perf_multiday = self._safe_dict(performance_values.get("multiday_side_perf"))
         symbol_side_perf = self._safe_dict(performance_values.get("symbol_side_perf"))
-        model_contribution_perf = self._safe_dict(
-            performance_values.get("model_contribution_perf")
-        )
+        model_contribution_perf = self._safe_dict(performance_values.get("model_contribution_perf"))
         account_equity = await self._bounded_strategy_context_value(
             "account_equity",
             self._strategy_context_account_equity(selected_mode),
@@ -4137,9 +4418,7 @@ class TradingService:
                             "策略学习上下文超过交易轮次预算，已使用最近一次可用学习上下文，"
                             "后台继续刷新，不阻塞开仓决策。"
                         ),
-                        "strategy_learning_runtime_timeout_seconds": (
-                            wait_timeout
-                        ),
+                        "strategy_learning_runtime_timeout_seconds": (wait_timeout),
                     }
                 )
                 logger.warning(
@@ -4157,9 +4436,7 @@ class TradingService:
                 "策略学习上下文超过交易轮次预算且暂无缓存，本轮使用基础策略上下文，"
                 "不会因为学习慢查询阻塞市场扫描。"
             )
-            context["strategy_learning_runtime_timeout_seconds"] = (
-                wait_timeout
-            )
+            context["strategy_learning_runtime_timeout_seconds"] = wait_timeout
             logger.warning(
                 "strategy learning context timed out; using baseline strategy context",
                 timeout_seconds=round(wait_timeout, 3),
@@ -4218,8 +4495,7 @@ class TradingService:
             ),
             "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
             "market_regime": strategy_mode_context.get("market_regime"),
-            "production_influence_enabled": runtime.get("production_influence_enabled")
-            is True,
+            "production_influence_enabled": runtime.get("production_influence_enabled") is True,
             "strategy_learning": learning,
         }
         decision.raw_response = raw
@@ -4412,9 +4688,7 @@ class TradingService:
         primary_source = (
             "authoritative_fee_after_return_distribution"
             if decision.is_entry
-            else "position_economics_dynamic_exit"
-            if decision.is_exit
-            else "observation_only_hold"
+            else "position_economics_dynamic_exit" if decision.is_exit else "observation_only_hold"
         )
 
         raw["decision_source"] = {
@@ -4575,10 +4849,7 @@ class TradingService:
             for symbol in (shortlist.get("selected_symbols") or [])
             if str(symbol) in feature_vectors
         ]
-        selected = {
-            symbol: feature_vectors[symbol]
-            for symbol in selected_order
-        }
+        selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
         unavailable = [
             {
@@ -4590,21 +4861,16 @@ class TradingService:
             for symbol, facts in availability.items()
             if self._safe_dict(facts).get("available") is False
         ]
-        diagnostics = self._safe_dict(
-            getattr(self, "_last_auto_feature_rank_diagnostics", None)
-        )
+        diagnostics = self._safe_dict(getattr(self, "_last_auto_feature_rank_diagnostics", None))
         diagnostics["execution_availability"] = {
             "source": "okx_private_account_leverage_info",
             "mode": "paper",
             "evaluated_count": int(shortlist.get("evaluated_count") or 0),
             "probed_count": int(shortlist.get("probed_count") or 0),
             "cache_hit_count": int(shortlist.get("cache_hit_count") or 0),
-            "skipped_after_target_count": int(
-                shortlist.get("skipped_after_target_count") or 0
-            ),
+            "skipped_after_target_count": int(shortlist.get("skipped_after_target_count") or 0),
             "available_count": sum(
-                self._safe_dict(facts).get("available") is True
-                for facts in availability.values()
+                self._safe_dict(facts).get("available") is True for facts in availability.values()
             ),
             "selected_count": len(selected),
             "target_count": target,
@@ -5069,9 +5335,7 @@ class TradingService:
                     round_decision_ids,
                 )
             else:
-                results.setdefault("pending_exit_recovery", {})[
-                    "market_round_skipped"
-                ] = {
+                results.setdefault("pending_exit_recovery", {})["market_round_skipped"] = {
                     "read_only": True,
                     "is_entry_gate": False,
                     "reason": (
@@ -5335,16 +5599,14 @@ class TradingService:
                 for _symbol, fv in fv_results
                 if fv is not None and self._is_valid_feature_vector(fv)
             )
-            early_quorum_met, early_quorum_diagnostics = (
-                self._auto_scan_feature_fetch_early_quorum(
-                    completed_valid_count=early_valid_count,
-                    total_fetch_count=len(fetch_symbols),
-                    configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
-                    run_market_analysis=run_market_analysis,
-                    run_position_analysis=run_position_analysis,
-                    auto_scan=mode_manager.is_auto_scan,
-                    feature_fetch_budget_diagnostics=feature_fetch_budget_diagnostics,
-                )
+            early_quorum_met, early_quorum_diagnostics = self._auto_scan_feature_fetch_early_quorum(
+                completed_valid_count=early_valid_count,
+                total_fetch_count=len(fetch_symbols),
+                configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
+                run_market_analysis=run_market_analysis,
+                run_position_analysis=run_position_analysis,
+                auto_scan=mode_manager.is_auto_scan,
+                feature_fetch_budget_diagnostics=feature_fetch_budget_diagnostics,
             )
             early_quorum_diagnostics.update(
                 {
@@ -5395,13 +5657,13 @@ class TradingService:
                     )
                 elif not early_quorum_met:
                     logger.warning(
-                    "feature vector batch reached time budget; cancelling slow sources",
-                    symbol_count=len(fetch_symbols),
-                    completed=len(tasks) - len(pending),
-                    pending=len(pending),
-                    timeout_seconds=round(batch_timeout, 3),
-                    early_quorum_met=early_quorum_met,
-                )
+                        "feature vector batch reached time budget; cancelling slow sources",
+                        symbol_count=len(fetch_symbols),
+                        completed=len(tasks) - len(pending),
+                        pending=len(pending),
+                        timeout_seconds=round(batch_timeout, 3),
+                        early_quorum_met=early_quorum_met,
+                    )
                 results.setdefault("warnings", []).append(
                     {
                         "model": ENSEMBLE_TRADER_NAME,
@@ -5457,8 +5719,8 @@ class TradingService:
                 market_regime_context,
                 open_positions,
             )
-            strategy_mode_context["portfolio_correlation"] = (
-                build_portfolio_correlation_context(feature_vectors, open_positions)
+            strategy_mode_context["portfolio_correlation"] = build_portfolio_correlation_context(
+                feature_vectors, open_positions
             )
             analysis_budget_context = self._position_review_budget_context(
                 open_positions,
@@ -5511,6 +5773,62 @@ class TradingService:
                     market_feature_vectors,
                     analysis_budget_context=analysis_budget_context,
                 )
+            if run_market_analysis and market_feature_vectors:
+                market_indicator_prewarm = await self._prewarm_market_candidate_indicators(
+                    list(market_feature_vectors)
+                )
+            else:
+                market_indicator_prewarm = {
+                    "status": "skipped",
+                    "requested_count": 0,
+                    "available_count": 0,
+                    "unavailable_symbols": [],
+                    "is_entry_permission": False,
+                    "changes_trading_thresholds": False,
+                }
+            results["market_indicator_prewarm"] = market_indicator_prewarm
+            if run_market_analysis and market_feature_vectors:
+                hydrated_market_feature_vectors, hydration_diagnostics = (
+                    await self._hydrate_prewarmed_market_candidates(market_feature_vectors)
+                )
+                market_feature_vectors = hydrated_market_feature_vectors
+                feature_vectors.update(hydrated_market_feature_vectors)
+                if mode_manager.is_auto_scan and market_feature_vectors:
+                    market_feature_vectors = self._rank_auto_feature_vectors(
+                        market_feature_vectors,
+                        len(market_feature_vectors),
+                    )
+                    hydration_diagnostics["post_prewarm_rank"] = self._safe_dict(
+                        getattr(self, "_last_auto_feature_rank_diagnostics", None)
+                    )
+                    market_feature_vectors_after_rank = dict(market_feature_vectors)
+                    rank_diagnostics_snapshot = self._safe_dict(
+                        getattr(self, "_last_auto_feature_rank_diagnostics", None)
+                    )
+                if market_feature_vectors:
+                    market_regime_context = self._market_regime_context(market_feature_vectors)
+                    strategy_mode_context = await self._strategy_mode_context(
+                        self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
+                        market_regime_context,
+                        open_positions,
+                    )
+                    strategy_mode_context["portfolio_correlation"] = (
+                        build_portfolio_correlation_context(
+                            feature_vectors,
+                            open_positions,
+                        )
+                    )
+                    hydration_diagnostics["regime_recomputed_after_prewarm"] = True
+            else:
+                hydration_diagnostics = {
+                    "status": "skipped",
+                    "requested_count": 0,
+                    "hydrated_count": 0,
+                    "unavailable_symbols": [],
+                    "is_entry_permission": False,
+                    "changes_trading_thresholds": False,
+                }
+            results["market_prewarmed_feature_hydration"] = hydration_diagnostics
             market_feature_vectors_after_dedupe = dict(market_feature_vectors)
             market_candidate_funnel = self._market_candidate_funnel_snapshot(
                 scan_symbols=list(scan_symbols or []),
@@ -5566,9 +5884,7 @@ class TradingService:
                 refresh_diagnostics = await self.okx_sync_service.refresh_position_prices(
                     feature_vectors
                 )
-                self._last_position_price_refresh_diagnostics = self._safe_dict(
-                    refresh_diagnostics
-                )
+                self._last_position_price_refresh_diagnostics = self._safe_dict(refresh_diagnostics)
                 results["position_price_refresh"] = {
                     "read_only": True,
                     "is_entry_gate": False,
@@ -5731,13 +6047,64 @@ class TradingService:
                     market_ai_started_at=market_ai_started_at,
                     strategy_context=strategy_mode_context,
                 )
-                memory_context = await self._memory_context_with_vector_feedback(symbol)
-                ml_signal_context = await self._local_ml_signal_context(fv)
-                local_ai_tools_context = await self._local_ai_tools_context(
+                market_context_timings: list[dict[str, Any]] = []
+                memory_context = await self._bounded_market_context_value(
+                    "memory_vector_context",
+                    self._memory_context_with_vector_feedback(symbol),
+                    {
+                        "memory_feedback": {
+                            "status": "analysis_budget_deferred",
+                            "production_permission": False,
+                        }
+                    },
+                    deadline_monotonic=market_ai_deadline_monotonic,
+                    timeout_seconds=MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
+                    timings=market_context_timings,
+                )
+                ml_started_monotonic = asyncio.get_running_loop().time()
+                ml_remaining_seconds = max(
+                    market_ai_deadline_monotonic - ml_started_monotonic,
+                    0.0,
+                )
+                ml_lock_wait_seconds = min(
+                    MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS,
+                    max(
+                        ml_remaining_seconds - MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS,
+                        0.0,
+                    ),
+                )
+                ml_signal_context = await self._local_ml_signal_context(
                     fv,
-                    ml_signal_context,
-                    open_positions=open_positions,
-                    include_exit_advice=False,
+                    lock_wait_seconds=ml_lock_wait_seconds,
+                )
+                market_context_timings.append(
+                    {
+                        "stage": "local_ml_context",
+                        "status": str(ml_signal_context.get("status") or "ok"),
+                        "duration_seconds": round(
+                            max(asyncio.get_running_loop().time() - ml_started_monotonic, 0.0),
+                            6,
+                        ),
+                        "allowed_lock_wait_seconds": round(ml_lock_wait_seconds, 6),
+                        "remaining_seconds_at_start": round(ml_remaining_seconds, 6),
+                    }
+                )
+                local_ai_tools_context = await self._bounded_market_context_value(
+                    "local_ai_tools_context",
+                    self._local_ai_tools_context(
+                        fv,
+                        ml_signal_context,
+                        open_positions=open_positions,
+                        include_exit_advice=False,
+                    ),
+                    {
+                        "enabled": bool(settings.local_ai_tools_enabled),
+                        "status": "analysis_budget_deferred",
+                        "production_permission": False,
+                    },
+                    deadline_monotonic=market_ai_deadline_monotonic,
+                    timeout_seconds=float(settings.local_ai_tools_timeout_seconds or 0.0),
+                    timings=market_context_timings,
                 )
                 direction_competition_context = self._direction_competition_context(
                     fv,
@@ -5790,6 +6157,7 @@ class TradingService:
                         "local_ai_tools": local_ai_tools_context,
                         "direction_competition": direction_competition_context,
                         "entry_candidate_evidence": entry_candidate_evidence,
+                        "market_context_timings": market_context_timings,
                         "market_candidate_funnel": market_candidate_funnel,
                         "agent_skills": {
                             "version": 1,
@@ -5844,34 +6212,73 @@ class TradingService:
                     )
                     continue
                 analysis_started = datetime.now(UTC)
-                decision, _opinions = await self.ensemble.decide(
-                    fv,
-                    {
-                        "open_positions": open_positions,
-                        "trading_mode": mode_manager.mode.value,
-                        **memory_context,
-                        "market_regime": market_regime_context,
-                        "strategy_mode": strategy_mode_context,
-                        "direction_competition": direction_competition_context,
-                        "entry_candidate_evidence": entry_candidate_evidence,
-                        "ml_signal": {} if PRE_AGENT_SKILLS_ROLLBACK_MODE else ml_signal_context,
-                        "local_ai_tools": (
-                            {} if PRE_AGENT_SKILLS_ROLLBACK_MODE else local_ai_tools_context
-                        ),
-                        "ml_signal_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
-                        "local_ai_tools_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
-                        # The registry and final trader use this cooperative deadline to
-                        # bound batch fallbacks and arbitration to the current symbol's
-                        # remaining market-AI budget.  It is not a trading gate.
-                        "_analysis_deadline_monotonic": market_ai_deadline_monotonic,
-                        "_analysis_budget_scope": "market_ai",
-                        "_analysis_budget_seconds": market_ai_budget_seconds,
-                    },
+                ensemble_result = await self._bounded_market_context_value(
+                    "ensemble_decision",
+                    self.ensemble.decide(
+                        fv,
+                        {
+                            "open_positions": open_positions,
+                            "trading_mode": mode_manager.mode.value,
+                            **memory_context,
+                            "market_regime": market_regime_context,
+                            "strategy_mode": strategy_mode_context,
+                            "direction_competition": direction_competition_context,
+                            "entry_candidate_evidence": entry_candidate_evidence,
+                            "ml_signal": (
+                                {} if PRE_AGENT_SKILLS_ROLLBACK_MODE else ml_signal_context
+                            ),
+                            "local_ai_tools": (
+                                {} if PRE_AGENT_SKILLS_ROLLBACK_MODE else local_ai_tools_context
+                            ),
+                            "ml_signal_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
+                            "local_ai_tools_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
+                            # The registry and final trader use this cooperative deadline to
+                            # bound batch fallbacks and arbitration to the current symbol's
+                            # remaining market-AI budget.  It is not a trading gate.
+                            "_analysis_deadline_monotonic": market_ai_deadline_monotonic,
+                            "_analysis_budget_scope": "market_ai",
+                            "_analysis_budget_seconds": market_ai_budget_seconds,
+                        },
+                    ),
+                    None,
+                    deadline_monotonic=market_ai_deadline_monotonic,
+                    timeout_seconds=max(
+                        market_ai_deadline_monotonic - asyncio.get_running_loop().time(),
+                        0.0,
+                    ),
+                    timings=market_context_timings,
                 )
+                if not isinstance(ensemble_result, tuple) or len(ensemble_result) != 2:
+                    remaining_symbols = [
+                        item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
+                    ]
+                    market_round_skipped_by_budget = remaining_symbols
+                    self._remember_market_budget_deferred_symbols(remaining_symbols)
+                    logger.warning(
+                        "market ensemble decision exceeded shared round deadline",
+                        symbol=symbol,
+                        deferred_symbols=remaining_symbols[:10],
+                        budget_seconds=round(market_ai_budget_seconds, 3),
+                    )
+                    results.setdefault("warnings", []).append(
+                        {
+                            "model": ENSEMBLE_TRADER_NAME,
+                            "symbol": symbol,
+                            "warning": (
+                                "市场模型调用未在本轮共享截止时间内完成，当前及剩余候选已顺延到后续轮次；"
+                                "该调度边界不改变开仓、收益或风控门槛。"
+                            ),
+                            "diagnostic_code": "market_ensemble_deadline_exceeded",
+                            "market_context_timings": market_context_timings,
+                        }
+                    )
+                    break
+                decision, _opinions = ensemble_result
                 if isinstance(decision.raw_response, dict):
                     decision.raw_response.setdefault(
                         "entry_candidate_evidence", entry_candidate_evidence
                     )
+                    decision.raw_response["market_context_timings"] = market_context_timings
                 self._attach_market_candidate_funnel(
                     decision,
                     market_candidate_funnel,
@@ -5892,6 +6299,8 @@ class TradingService:
                         decision,
                         model_mode,
                         open_positions,
+                        deadline_monotonic=market_ai_deadline_monotonic,
+                        timing_scope="market_decision_persistence",
                     )
                     self.paper_bootstrap_canary.demote_blocked_candidate_to_hold(
                         decision,
@@ -6032,9 +6441,7 @@ class TradingService:
                     )
                 if executed.is_hold:
                     executed_raw = (
-                        executed.raw_response
-                        if isinstance(executed.raw_response, dict)
-                        else {}
+                        executed.raw_response if isinstance(executed.raw_response, dict) else {}
                     )
                     hold_reason = (
                         executed.reasoning
@@ -6427,9 +6834,7 @@ class TradingService:
             self.market_analysis_service.loop(self.market_loop_interval_seconds)
         )
         self._runtime_heartbeat_task = asyncio.create_task(self._runtime_heartbeat_loop())
-        self._okx_authoritative_sync_task = asyncio.create_task(
-            self._okx_authoritative_sync_loop()
-        )
+        self._okx_authoritative_sync_task = asyncio.create_task(self._okx_authoritative_sync_loop())
         self._okx_position_history_mirror_sync_task = asyncio.create_task(
             self._okx_position_history_mirror_sync_loop()
         )
@@ -6633,11 +7038,15 @@ class TradingService:
                 ),
                 "training_process_isolated": True,
             }
-        result = dict(payload) if isinstance(payload, dict) else {
-            "trained": False,
-            "reason": "error",
-            "error": "isolated local ML training response was not an object",
-        }
+        result = (
+            dict(payload)
+            if isinstance(payload, dict)
+            else {
+                "trained": False,
+                "reason": "error",
+                "error": "isolated local ML training response was not an object",
+            }
+        )
         if process.returncode != 0 and str(result.get("reason") or "") != "error":
             result.update(
                 {
@@ -6691,9 +7100,7 @@ class TradingService:
                 "timeout",
             }
             delay = (
-                AUTO_TRAIN_RETRY_INTERVAL_SECONDS
-                if failed
-                else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
+                AUTO_TRAIN_RETRY_INTERVAL_SECONDS if failed else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
             )
             state_store.finish_check(
                 scheduler_id="local_ai_tools_auto_train",
@@ -6726,9 +7133,7 @@ class TradingService:
             self._local_tools_active_training_run_id = None
             lease.release()
 
-    async def _maybe_train_local_ai_tools_process(
-        self, *, force: bool = False
-    ) -> dict[str, Any]:
+    async def _maybe_train_local_ai_tools_process(self, *, force: bool = False) -> dict[str, Any]:
         """Push fresh history to the server-side profit/time-series/exit models."""
         if not self.local_ai_tools.enabled():
             return {"trained": False, "reason": "disabled"}
@@ -6790,9 +7195,7 @@ class TradingService:
             )
             new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
             new_trade = max(completed_trade_total - previous_completed_trade_total, 0)
-            shadow_training_view_rebased = (
-                completed_shadow_total < previous_completed_shadow_total
-            )
+            shadow_training_view_rebased = completed_shadow_total < previous_completed_shadow_total
             learning_only = not bool(
                 (status or {}).get("model_bundle_available", (status or {}).get("available"))
             )
@@ -6812,19 +7215,14 @@ class TradingService:
                 training_policy["status_probe_error"] = status_probe_error
                 training_policy["status_probe_fallback"] = "train_when_due_from_local_counts"
             if not (
-                learning_only
-                or shadow_training_view_rebased
-                or new_shadow > 0
-                or new_trade > 0
+                learning_only or shadow_training_view_rebased or new_shadow > 0 or new_trade > 0
             ):
                 return {
                     "trained": False,
                     "reason": "not_due",
                     "server_shadow_sample_count": server_shadow_count,
                     "completed_shadow_sample_count": completed_shadow_total,
-                    "last_trained_completed_shadow_sample_count": (
-                        previous_completed_shadow_total
-                    ),
+                    "last_trained_completed_shadow_sample_count": (previous_completed_shadow_total),
                     "completed_trade_sample_count": completed_trade_total,
                     "last_trained_completed_trade_sample_count": previous_completed_trade_total,
                     "new_shadow_sample_count": new_shadow,
@@ -6847,14 +7245,10 @@ class TradingService:
                 )
 
             result = await self._run_local_ai_tools_training_subprocess()
-            reported_shadow_total = result.get(
-                "last_trained_completed_shadow_sample_count"
-            )
+            reported_shadow_total = result.get("last_trained_completed_shadow_sample_count")
             if reported_shadow_total is None:
                 reported_shadow_total = result.get("completed_shadow_sample_count")
-            reported_trade_total = result.get(
-                "last_trained_completed_trade_sample_count"
-            )
+            reported_trade_total = result.get("last_trained_completed_trade_sample_count")
             if reported_trade_total is None:
                 reported_trade_total = result.get("completed_trade_sample_count")
             authoritative_shadow_total = self._safe_int(
@@ -6872,12 +7266,8 @@ class TradingService:
             result["training_policy"] = training_policy
             result["training_process_isolated"] = True
             if result.get("trained"):
-                result["last_trained_completed_shadow_sample_count"] = (
-                    authoritative_shadow_total
-                )
-                result["last_trained_completed_trade_sample_count"] = (
-                    authoritative_trade_total
-                )
+                result["last_trained_completed_shadow_sample_count"] = authoritative_shadow_total
+                result["last_trained_completed_trade_sample_count"] = authoritative_trade_total
                 self._local_tools_last_completed_shadow_count = authoritative_shadow_total
             return result
 
@@ -6891,9 +7281,7 @@ class TradingService:
         }
         if status_probe_error:
             result["training_policy"]["status_probe_error"] = status_probe_error
-            result["training_policy"]["status_probe_fallback"] = (
-                "train_in_isolated_process"
-            )
+            result["training_policy"]["status_probe_fallback"] = "train_in_isolated_process"
         return result
 
     async def _run_local_ai_tools_training_subprocess(self) -> dict[str, Any]:
@@ -6946,10 +7334,14 @@ class TradingService:
                 "reason": "invalid_training_response",
                 "error": safe_error_text(exc, limit=180),
             }
-        return dict(payload) if isinstance(payload, dict) else {
-            "trained": False,
-            "reason": "invalid_training_response",
-        }
+        return (
+            dict(payload)
+            if isinstance(payload, dict)
+            else {
+                "trained": False,
+                "reason": "invalid_training_response",
+            }
+        )
 
     async def _run_local_ai_tools_training_cursor_subprocess(self) -> dict[str, Any]:
         command = [
@@ -7001,11 +7393,15 @@ class TradingService:
                 "error": safe_error_text(exc, limit=180),
                 "training_process_isolated": True,
             }
-        result = dict(payload) if isinstance(payload, dict) else {
-            "trained": False,
-            "reason": "error",
-            "error": "isolated Local AI cursor response was not an object",
-        }
+        result = (
+            dict(payload)
+            if isinstance(payload, dict)
+            else {
+                "trained": False,
+                "reason": "error",
+                "error": "isolated Local AI cursor response was not an object",
+            }
+        )
         result["training_process_isolated"] = True
         return result
 
@@ -8080,8 +8476,7 @@ class TradingService:
             adverse_returns = [
                 value
                 for value in returns
-                if (side == "long" and value < 0.0)
-                or (side == "short" and value > 0.0)
+                if (side == "long" and value < 0.0) or (side == "short" and value > 0.0)
             ]
             hold_minutes = self.position_time.position_age_minutes(
                 position_open_time(position) or position.get("created_at")
@@ -8109,9 +8504,7 @@ class TradingService:
             trigger = (
                 "stop_loss"
                 if stop_crossed
-                else "take_profit"
-                if target_crossed
-                else "dynamic_position_scan"
+                else "take_profit" if target_crossed else "dynamic_position_scan"
             )
             close_decision = DecisionOutput(
                 model_name=model_name,
@@ -8129,9 +8522,7 @@ class TradingService:
                     "close_evidence": {
                         "hard_risk": stop_crossed,
                         "continuation_deteriorated": bool(adverse_returns),
-                        "peak_unrealized_pnl_usdt": position_snapshot[
-                            "peak_unrealized_pnl"
-                        ],
+                        "peak_unrealized_pnl_usdt": position_snapshot["peak_unrealized_pnl"],
                     },
                 },
                 feature_snapshot=(
@@ -8256,9 +8647,13 @@ class TradingService:
                     )[:8]
                 ],
             )
-        for (model_name, symbol), positions in grouped_items:
-            group_timeout = self._position_review_stage_timeout_seconds(
+        for group_index, ((model_name, symbol), positions) in enumerate(grouped_items):
+            group_deadline_monotonic = self._position_review_group_deadline(
                 round_deadline_monotonic,
+                len(grouped_items) - group_index,
+            )
+            group_timeout = self._position_review_stage_timeout_seconds(
+                group_deadline_monotonic,
                 strategy_context=strategy_mode_context,
                 stage="position_review_group",
                 symbol=symbol,
@@ -8268,9 +8663,7 @@ class TradingService:
                     results=results,
                     stage="position_review_group",
                     symbol=symbol,
-                    remaining_seconds=self._remaining_monotonic_seconds(
-                        round_deadline_monotonic
-                    ),
+                    remaining_seconds=self._remaining_monotonic_seconds(round_deadline_monotonic),
                 )
                 break
             normalized_symbol = self._normalize_position_symbol(symbol)
@@ -8288,7 +8681,7 @@ class TradingService:
             fv = feature_vectors.get(symbol) or feature_vectors.get(normalized_symbol)
             if fv is None:
                 feature_timeout = self._position_review_stage_timeout_seconds(
-                    round_deadline_monotonic,
+                    group_deadline_monotonic,
                     fallback_timeout=AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS,
                     strategy_context=strategy_mode_context,
                     stage="position_feature_refresh",
@@ -8360,7 +8753,7 @@ class TradingService:
 
             try:
                 decision_timeout = self._position_review_stage_timeout_seconds(
-                    round_deadline_monotonic,
+                    group_deadline_monotonic,
                     strategy_context=strategy_mode_context,
                     stage="position_review_decision",
                     symbol=normalized_symbol or symbol,
@@ -8389,6 +8782,8 @@ class TradingService:
                             strategy_mode_context=strategy_mode_context,
                             portfolio_symbol_context=portfolio_symbol_context,
                             position_profit_peak_context=position_profit_peak_context,
+                            analysis_deadline_monotonic=group_deadline_monotonic,
+                            analysis_budget_seconds=group_timeout,
                         )
                     ),
                     timeout=decision_timeout,
@@ -8401,9 +8796,7 @@ class TradingService:
                     results=results,
                     stage="position_review_decision",
                     symbol=normalized_symbol or symbol,
-                    remaining_seconds=self._remaining_monotonic_seconds(
-                        round_deadline_monotonic
-                    ),
+                    remaining_seconds=self._remaining_monotonic_seconds(round_deadline_monotonic),
                 )
                 logger.warning(
                     "position review decision timed out within round budget",
@@ -8547,8 +8940,6 @@ class TradingService:
                         },
                     )
 
-
-
     def _position_review_priority_policy(self) -> PositionReviewPriorityPolicy:
         policy = getattr(self, "position_review_priority", None)
         if policy is not None:
@@ -8602,7 +8993,6 @@ class TradingService:
         return PositionReviewBatchPolicy(
             urgent_exit_checker=self._is_urgent_position_exit_scan,
         )
-
 
     def _analysis_budget_policy(self) -> AnalysisBudgetPolicy:
         policy = getattr(self, "analysis_budget", None)
@@ -8980,9 +9370,7 @@ class TradingService:
             self._remember_new_pair_pause_context_reason(cache_key, reason)
             return reason
         if okx_available <= 0:
-            reason = (
-                f"OKX 没有可交易余额：当前可用 {okx_available:.2f} USDT，暂停分析新的交易对。"
-            )
+            reason = f"OKX 没有可交易余额：当前可用 {okx_available:.2f} USDT，暂停分析新的交易对。"
             self._remember_new_pair_pause_context_reason(cache_key, reason)
             return reason
         self._remember_new_pair_pause_context_reason(cache_key, None)
@@ -9331,10 +9719,14 @@ class TradingService:
                     return fallback_snapshot
                 return None
             try:
-                snapshot = await asyncio.wait_for(executor.get_balance_snapshot("USDT"), timeout=8.0)
+                snapshot = await asyncio.wait_for(
+                    executor.get_balance_snapshot("USDT"), timeout=8.0
+                )
                 if snapshot.get("error"):
                     reason = safe_error_text(snapshot.get("error"))
-                    fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(reason)
+                    fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(
+                        reason
+                    )
                     if fallback_snapshot:
                         return fallback_snapshot
                     return None
@@ -10001,11 +10393,11 @@ class TradingService:
             "position_current_stage": position_state.current_stage,
             "position_round_active": position_state.active,
             "position_last_error": position_state.last_error,
-                "market_stage_durations": self._recent_stage_durations(market_state),
-                "position_stage_durations": self._recent_stage_durations(position_state),
-                "last_position_price_refresh_diagnostics": self._safe_dict(
-                    getattr(self, "_last_position_price_refresh_diagnostics", {})
-                ),
+            "market_stage_durations": self._recent_stage_durations(market_state),
+            "position_stage_durations": self._recent_stage_durations(position_state),
+            "last_position_price_refresh_diagnostics": self._safe_dict(
+                getattr(self, "_last_position_price_refresh_diagnostics", {})
+            ),
             "last_round_started_at": (
                 self._last_round_started_at.isoformat() if self._last_round_started_at else None
             ),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -26,6 +27,9 @@ from services.secure_runtime_config import load_secure_settings_into_runtime
 
 logger = structlog.get_logger(__name__)
 
+EXTERNAL_EVENT_SOURCE_HEALTH_VERSION = "2026-07-18.external-event-source-health.v1"
+EXTERNAL_EVENT_SOURCE_HEALTH_FILE = "external_event_source_health.json"
+
 _SCRAPER_SETTING_KEYS = (
     "EXTERNAL_EVENT_SCRAPER_ENABLED",
     "EXTERNAL_EVENT_SCRAPER_INTERVAL_SECONDS",
@@ -41,6 +45,21 @@ _SCRAPER_SETTING_KEYS = (
 
 def _project_env_path() -> Path:
     return Path(settings.project_root) / ".env"
+
+
+def external_event_source_health_path() -> Path:
+    return Path(settings.data_dir) / EXTERNAL_EVENT_SOURCE_HEALTH_FILE
+
+
+def load_external_event_source_health(path: Path | None = None) -> dict[str, Any]:
+    """Load the collector-owned source health snapshot without raising."""
+
+    snapshot_path = path or external_event_source_health_path()
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _bool_env(value: Any, default: bool) -> bool:
@@ -134,8 +153,14 @@ def load_external_event_settings_from_env() -> dict[str, Any]:
 class ExternalEventService:
     """Collect external event pages in the background and persist them as news."""
 
-    def __init__(self, scraper: ExternalEventScraper | None = None) -> None:
+    def __init__(
+        self,
+        scraper: ExternalEventScraper | None = None,
+        *,
+        health_path: Path | None = None,
+    ) -> None:
         self.scraper = scraper or ExternalEventScraper()
+        self._health_path = health_path
         self._task: asyncio.Task | None = None
         self._settings_task: asyncio.Task | None = None
         self._running = False
@@ -224,13 +249,44 @@ class ExternalEventService:
         return loaded
 
     async def collect_once(self) -> dict[str, int]:
-        articles = await self.scraper.fetch_all()
+        scraper = self.scraper
+        articles = await scraper.fetch_all()
         stored = await self._persist_articles(articles)
+        self._write_source_health_snapshot(scraper.last_source_reports)
         return {
             "fetched": len(articles),
             "stored": stored,
             "skipped": max(len(articles) - stored, 0),
         }
+
+    def _write_source_health_snapshot(self, reports: list[dict[str, Any]]) -> None:
+        checked_at = datetime.now(UTC)
+        normalized_reports = [dict(report) for report in reports if isinstance(report, dict)]
+        payload = {
+            "version": EXTERNAL_EVENT_SOURCE_HEALTH_VERSION,
+            "checked_at": checked_at.isoformat(),
+            "enabled": bool(settings.external_event_scraper_enabled),
+            "configured_source_count": len(normalized_reports),
+            "healthy_source_count": sum(
+                str(report.get("status") or "") == "ok" for report in normalized_reports
+            ),
+            "sources": normalized_reports,
+        }
+        path = self._health_path or external_event_source_health_path()
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(path)
+        except OSError as exc:
+            logger.warning(
+                "external event source health snapshot write failed",
+                error=safe_error_text(exc),
+            )
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def _loop(self) -> None:
         while self._running:

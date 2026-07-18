@@ -510,6 +510,7 @@ class ExternalEventScraper:
         self._fetcher = fetcher
         self._last_fetch_at: datetime | None = None
         self._last_articles: list[dict[str, Any]] = []
+        self._last_source_reports: list[dict[str, Any]] = []
         self._seen_keys: set[str] = set()
         self._symbol_aliases: dict[str, set[str]] = {
             base: {base, *aliases} for base, aliases in _DEFAULT_SYMBOL_ALIASES.items()
@@ -520,6 +521,12 @@ class ExternalEventScraper:
             base = str(symbol or "").split("/")[0].split("-")[0].upper()
             if base:
                 self._symbol_aliases.setdefault(base, {base}).add(base)
+
+    @property
+    def last_source_reports(self) -> list[dict[str, Any]]:
+        """Return the latest per-source collection evidence."""
+
+        return [dict(report) for report in self._last_source_reports]
 
     async def fetch_all(self) -> list[dict[str, Any]]:
         if not settings.external_event_scraper_enabled and self._sources is None:
@@ -540,23 +547,36 @@ class ExternalEventScraper:
 
         semaphore = asyncio.Semaphore(min(len(sources), 2))
 
-        async def guarded_fetch(source: ExternalEventSource) -> list[dict[str, Any]]:
+        async def guarded_fetch(
+            source: ExternalEventSource,
+        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             async with semaphore:
-                return await self._fetch_source(fetcher, source)
+                try:
+                    return await self._fetch_source_with_report(fetcher, source)
+                except Exception as exc:
+                    return [], self._source_report(
+                        source,
+                        status="internal_error",
+                        error=safe_error_text(exc),
+                    )
 
         results = await asyncio.gather(
             *(guarded_fetch(source) for source in sources),
-            return_exceptions=True,
         )
         articles: list[dict[str, Any]] = []
-        for result in results:
-            if isinstance(result, Exception):
-                logger.debug("external event source failed", error=safe_error_text(result))
-            else:
-                articles.extend(result)
+        source_reports: list[dict[str, Any]] = []
+        for source_articles, source_report in results:
+            articles.extend(source_articles)
+            source_reports.append(source_report)
         self._last_fetch_at = now
         self._last_articles = articles[: self._max_items_total()]
-        logger.info("external events fetched", count=len(self._last_articles))
+        self._last_source_reports = source_reports
+        logger.info(
+            "external events fetched",
+            count=len(self._last_articles),
+            healthy_sources=sum(report.get("status") == "ok" for report in source_reports),
+            source_count=len(source_reports),
+        )
         return list(self._last_articles)
 
     async def _fetch_source(
@@ -564,7 +584,17 @@ class ExternalEventScraper:
         fetcher: type[AsyncFetcherLike],
         source: ExternalEventSource,
     ) -> list[dict[str, Any]]:
+        articles, _report = await self._fetch_source_with_report(fetcher, source)
+        return articles
+
+    async def _fetch_source_with_report(
+        self,
+        fetcher: type[AsyncFetcherLike],
+        source: ExternalEventSource,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         timeout = max(float(settings.external_event_scraper_timeout_seconds or 0.0), 1.0)
+        started_at = datetime.now(UTC)
+        started_monotonic = asyncio.get_running_loop().time()
         try:
             response_or_awaitable = fetcher.get(
                 source.url,
@@ -578,26 +608,90 @@ class ExternalEventScraper:
                 else response_or_awaitable
             )
         except Exception as exc:
+            error = safe_error_text(exc)
             logger.debug(
                 "external event fetch failed",
                 source=source.name,
-                error=safe_error_text(exc),
+                error=error,
             )
-            return []
+            return [], self._source_report(
+                source,
+                status="fetch_error",
+                checked_at=started_at,
+                elapsed_seconds=asyncio.get_running_loop().time() - started_monotonic,
+                error=error,
+            )
 
         status = int(getattr(response, "status", getattr(response, "status_code", 0)) or 0)
         if status and not 200 <= status < 300:
             logger.debug("external event fetch non-2xx", source=source.name, status=status)
-            return []
+            return [], self._source_report(
+                source,
+                status="http_error",
+                checked_at=started_at,
+                elapsed_seconds=asyncio.get_running_loop().time() - started_monotonic,
+                http_status=status,
+                error=f"HTTP {status}",
+            )
 
         html_text = self._response_text(response)
         if not html_text:
-            return []
-        return self._extract_articles(source, html_text)
+            return [], self._source_report(
+                source,
+                status="empty_response",
+                checked_at=started_at,
+                elapsed_seconds=asyncio.get_running_loop().time() - started_monotonic,
+                http_status=status,
+            )
+        articles, parsed_article_count = self._extract_articles_with_metrics(source, html_text)
+        report_status = "ok" if parsed_article_count else "parsed_empty"
+        return articles, self._source_report(
+            source,
+            status=report_status,
+            checked_at=started_at,
+            elapsed_seconds=asyncio.get_running_loop().time() - started_monotonic,
+            http_status=status,
+            response_chars=len(html_text),
+            parsed_article_count=parsed_article_count,
+            emitted_article_count=len(articles),
+        )
+
+    @staticmethod
+    def _source_report(
+        source: ExternalEventSource,
+        *,
+        status: str,
+        checked_at: datetime | None = None,
+        elapsed_seconds: float = 0.0,
+        http_status: int = 0,
+        response_chars: int = 0,
+        parsed_article_count: int = 0,
+        emitted_article_count: int = 0,
+        error: str = "",
+    ) -> dict[str, Any]:
+        checked = checked_at or datetime.now(UTC)
+        return {
+            "name": source.name,
+            "category": source.category,
+            "status": str(status or "unknown"),
+            "checked_at": checked.isoformat(),
+            "elapsed_seconds": round(max(float(elapsed_seconds or 0.0), 0.0), 3),
+            "http_status": int(http_status or 0),
+            "response_chars": max(int(response_chars or 0), 0),
+            "parsed_article_count": max(int(parsed_article_count or 0), 0),
+            "emitted_article_count": max(int(emitted_article_count or 0), 0),
+            "error": str(error or "")[:240] or None,
+        }
 
     def _extract_articles(
         self, source: ExternalEventSource, html_text: str
     ) -> list[dict[str, Any]]:
+        articles, _parsed_article_count = self._extract_articles_with_metrics(source, html_text)
+        return articles
+
+    def _extract_articles_with_metrics(
+        self, source: ExternalEventSource, html_text: str
+    ) -> tuple[list[dict[str, Any]], int]:
         html_text = html_text[:_MAX_HTML_CHARS]
         meta = self._extract_meta(html_text)
         page_title = self._first_text(
@@ -627,17 +721,21 @@ class ExternalEventScraper:
                 ),
             )
         deduped: list[dict[str, Any]] = []
+        parsed_keys: set[str] = set()
         for article in articles:
             if not article.get("title"):
                 continue
             key = self._dedup_key(article)
+            if key in parsed_keys:
+                continue
+            parsed_keys.add(key)
             if key in self._seen_keys:
                 continue
             self._seen_keys.add(key)
             deduped.append(article)
             if len(deduped) >= max(int(settings.external_event_scraper_max_items_per_source), 1):
                 break
-        return deduped
+        return deduped, len(parsed_keys)
 
     def _extract_anchor_articles(
         self,

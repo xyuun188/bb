@@ -23,13 +23,19 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
         {"review_positions": True, "open_positions": [{"symbol": "BTC/USDT"}]},
     )
 
-    assert "BATCH_EXPERT_JSON_V9" in prompt
+    assert "BATCH_EXPERT_JSON_V11" in prompt
     assert (
         "Required experts: trend_expert, momentum_expert, sentiment_expert, position_expert, risk_expert"
         in prompt
     )
     assert "do not copy one expert's opinion into all experts" in prompt
-    assert "Missing governed return evidence holds" in prompt
+    assert "Only momentum_expert owns fee-after payoff quality" in prompt
+    assert "Do not force every expert to hold" in prompt
+    assert "diagnostic direction label, never execution permission" in prompt
+    assert "do not apply momentum_expert's return gate" in prompt
+    assert "Role contracts; do not copy or merge them" in prompt
+    assert "Role=direction" in prompt
+    assert "Role=profit_quality" in prompt
     assert "cross_check_for must be null in batch mode" in prompt
     assert "cannot set size, leverage, stop loss, or take profit" in prompt
     assert "position_size_pct" not in prompt
@@ -37,8 +43,50 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
     assert '"action":"hold","confidence":0.50' not in prompt
     assert "daily_target" not in prompt
     assert "STRICT_COMPACT_BATCH_JSON_V3" not in prompt
-    assert "Payload JSON, truncated to 760 chars" in prompt
-    assert len(prompt) < 1800
+    assert "Payload JSON (complete and valid)" in prompt
+    assert len(prompt) < 8_000
+
+
+def test_batch_expert_prompt_keeps_role_scoped_market_contexts() -> None:
+    prompt = build_batch_experts_user_prompt(
+        {
+            "trend_expert": "trend-only-context",
+            "momentum_expert": "profit-only-context",
+            "sentiment_expert": "timeseries-only-context",
+            "position_expert": "position-only-context",
+            "risk_expert": "risk-only-context",
+        },
+        {"review_positions": False},
+    )
+
+    for marker in (
+        "trend-only-context",
+        "profit-only-context",
+        "timeseries-only-context",
+        "position-only-context",
+        "risk-only-context",
+    ):
+        assert marker in prompt
+
+
+def test_batch_expert_prompt_preserves_role_signal_tail_beyond_legacy_limit() -> None:
+    context = "symbol=BTC/USDT;" + ("x" * 390) + ";role-signal-tail"
+
+    prompt = build_batch_experts_user_prompt(
+        {
+            name: context
+            for name in (
+                "trend_expert",
+                "momentum_expert",
+                "sentiment_expert",
+                "position_expert",
+                "risk_expert",
+            )
+        },
+        {"review_positions": False},
+    )
+
+    assert "role-signal-tail" in prompt
 
 
 def test_batch_expert_prompt_can_scope_to_provider_group() -> None:
@@ -201,7 +249,7 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     assert not decisions["risk_expert"].raw_response.get("batch_expert_fallback")
     assert decisions["risk_expert"].position_size_pct == 0.0
     assert decisions["risk_expert"].suggested_leverage == 1.0
-    assert all(kwargs["max_tokens"] == 900 for kwargs in json_kwargs)
+    assert all(kwargs["max_tokens"] == 560 for kwargs in json_kwargs)
 
 
 @pytest.mark.asyncio

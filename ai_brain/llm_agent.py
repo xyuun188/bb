@@ -680,7 +680,7 @@ def _build_fast_expert_user_prompt(
 
 
 BATCH_EXPERT_SYSTEM_PROMPT = """Return only the requested minified JSON object. No markdown, no prose, no <think>.
-Use 12-28 Chinese chars per reasoning. Set cross_check_for to null. Prefer hold when evidence is weak."""
+Use 12-28 Chinese chars per reasoning. Set cross_check_for to null. Actions are role-scoped diagnostic labels, not execution permission. Use hold only under that role's explicit contract."""
 
 
 class LLMAgent(AbstractAIModel):
@@ -1054,8 +1054,18 @@ class LLMAgent(AbstractAIModel):
             "position_expert": "position_exit",
             "risk_expert": "risk_anomaly",
         }
-        feature_text = _build_compact_feature_context(features, "final_decision")
-        user_prompt = build_batch_experts_user_prompt(feature_text, context, expert_names)
+        feature_contexts = {
+            name: _build_compact_feature_context(
+                features,
+                role_by_name.get(name, "final_decision"),
+            )
+            for name in expert_names
+        }
+        user_prompt = build_batch_experts_user_prompt(
+            feature_contexts,
+            context,
+            expert_names,
+        )
         repair_error = ""
         try:
             experts_payload = await _invoke_batch(user_prompt)
@@ -1068,7 +1078,7 @@ class LLMAgent(AbstractAIModel):
         ]
         if missing_names:
             repair_prompt = build_batch_experts_user_prompt(
-                feature_text,
+                feature_contexts,
                 {**context, "batch_repair_retry": True},
                 missing_names,
             )
