@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from config.settings import settings
+from tests.paper_canary_fixtures import complete_paper_canary_raw
 from web_dashboard.api import dashboard, system_health
 
 
@@ -441,6 +442,53 @@ async def test_recent_execution_self_check_flags_entry_without_opportunity_score
     assert by_key["entry_opportunity_score_coverage"]["status"] == "critical"
     assert by_key["entry_opportunity_score_coverage"]["details"]["sample_decision_ids"] == [101]
     assert by_key["entry_opportunity_score_coverage"]["details"]["latest_scored_entry_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_recent_execution_self_check_accepts_complete_legacy_canary_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _stmt: Any) -> FakeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult([])
+            raw = complete_paper_canary_raw()
+            raw["decision_state_machine"] = {"stages": [{"status": "passed"}]}
+            return FakeResult(
+                [
+                    SimpleNamespace(
+                        id=102,
+                        action="long",
+                        created_at=system_health.datetime(2026, 7, 17, 8, 0),
+                        raw_llm_response=raw,
+                    )
+                ]
+            )
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+
+    items = await system_health._recent_execution_items()
+    by_key = {item["key"]: item for item in items}
+
+    assert "entry_opportunity_score_coverage" not in by_key
 
 
 @pytest.mark.asyncio

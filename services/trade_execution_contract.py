@@ -9,6 +9,10 @@ from math import isclose, isfinite
 from typing import Any
 
 from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
+from services.paper_bootstrap_canary import (
+    PAPER_BOOTSTRAP_CANARY_VERSION,
+    PAPER_BOOTSTRAP_SIZING_VERSION,
+)
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
@@ -202,7 +206,7 @@ def _entry_contract_row(
         for order in orders
         if _order_status(order) in FILLED_STATUSES
     )
-    contract, reasons = validate_production_entry_contract(
+    contract, reasons = validate_entry_execution_contract(
         raw,
         filled_notional_usdt=filled_notional,
         executed=executed,
@@ -220,6 +224,393 @@ def _entry_contract_row(
         "reasons": reasons,
     }
     return row, reasons
+
+
+def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
+    """Classify an entry contract before validating lifecycle-specific invariants."""
+
+    canary = _safe_dict(raw.get("paper_bootstrap_canary"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    if (
+        any(
+            key in canary
+            for key in (
+                "version",
+                "authorized",
+                "requested",
+                "selected_observation",
+            )
+        )
+        or sizing.get("contract_lifecycle") == "paper_bootstrap_canary"
+        or opportunity.get("contract_lifecycle") == "paper_bootstrap_canary"
+    ):
+        return "paper_bootstrap_canary"
+    return "production_return"
+
+
+def entry_opportunity_evidence_score(raw: dict[str, Any]) -> float | None:
+    """Return a finite lifecycle-specific score for self-check coverage."""
+
+    if entry_contract_lifecycle(raw) == "paper_bootstrap_canary":
+        canary = _safe_dict(raw.get("paper_bootstrap_canary"))
+        if _paper_canary_observation_reasons(canary):
+            return None
+        return _finite_value(
+            _safe_dict(canary.get("selected_observation")).get(
+                "objective_expected_return_pct"
+            )
+        )
+    return _finite_value(_safe_dict(raw.get("opportunity_score")).get("score"))
+
+
+def validate_entry_execution_contract(
+    raw: dict[str, Any],
+    *,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the persisted contract for its declared execution lifecycle."""
+
+    if entry_contract_lifecycle(raw) == "paper_bootstrap_canary":
+        return validate_paper_canary_entry_contract(
+            raw,
+            filled_notional_usdt=filled_notional_usdt,
+            executed=executed,
+            filled_order_present=filled_order_present,
+        )
+    return validate_production_entry_contract(
+        raw,
+        filled_notional_usdt=filled_notional_usdt,
+        executed=executed,
+        filled_order_present=filled_order_present,
+    )
+
+
+def validate_paper_canary_entry_contract(
+    raw: dict[str, Any],
+    *,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate a paper-only canary without applying production-return rules."""
+
+    canary = _safe_dict(raw.get("paper_bootstrap_canary"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    observation = _safe_dict(canary.get("selected_observation"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    reasons = _paper_canary_observation_reasons(canary)
+    bounded_fill_drift = _bounded_legacy_canary_fill_drift(
+        canary=canary,
+        opportunity=opportunity,
+        sizing=sizing,
+    )
+    bounded_fill_drift_accepted = bounded_fill_drift["accepted"] is True
+
+    if canary.get("runtime_authorized") is not True:
+        reasons.append("paper_canary_runtime_guard_not_authorized")
+    runtime_guard = _safe_dict(canary.get("runtime_guard"))
+    if not runtime_guard or _safe_list(runtime_guard.get("blocking_reasons")):
+        reasons.append("paper_canary_runtime_guard_incomplete")
+
+    if sizing.get("contract_version") != PAPER_BOOTSTRAP_SIZING_VERSION:
+        reasons.append("paper_canary_sizing_version_invalid")
+    if sizing.get("contract_lifecycle") != "paper_bootstrap_canary":
+        reasons.append("paper_canary_sizing_lifecycle_mismatch")
+    if sizing.get("execution_scope") != "paper_only":
+        reasons.append("paper_canary_sizing_scope_invalid")
+    if sizing.get("production_permission") is not False:
+        reasons.append("paper_canary_sizing_production_permission_invalid")
+    if (
+        sizing.get("production_eligible") is not True
+        and not bounded_fill_drift_accepted
+    ):
+        reasons.append("paper_canary_risk_contract_ineligible")
+    sizing_provenance = _safe_dict(sizing.get("policy_provenance"))
+    if (
+        (
+            not _provenance_complete(sizing_provenance)
+            and not (
+                bounded_fill_drift_accepted
+                and _provenance_core_complete(sizing_provenance)
+                and set(
+                    filter(
+                        None,
+                        str(sizing_provenance.get("fallback_reason") or "").split(","),
+                    )
+                )
+                == set(bounded_fill_drift["reasons"])
+            )
+        )
+        or sizing_provenance.get("strategy_version") != PAPER_BOOTSTRAP_SIZING_VERSION
+        or not str(sizing_provenance.get("contract_fingerprint") or "").strip()
+    ):
+        reasons.append("paper_canary_sizing_provenance_incomplete")
+
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
+    portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"))
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"))
+    stress_fraction = _safe_float(sizing.get("stressed_loss_fraction"))
+    target_notional = _safe_float(sizing.get("target_notional_usdt"))
+    final_notional = _safe_float(sizing.get("final_notional_usdt"))
+    final_margin = _safe_float(sizing.get("final_margin_usdt"))
+    available_margin = _safe_float(sizing.get("available_margin_usdt"))
+    position_size = _safe_float(sizing.get("position_size_pct"))
+    if (
+        risk_budget <= 0
+        or portfolio_budget <= 0
+        or risk_budget > portfolio_budget + 1e-8
+        or planned_loss <= 0
+        or (
+            planned_loss > risk_budget + 1e-8
+            and not bounded_fill_drift_accepted
+        )
+    ):
+        reasons.append("paper_canary_risk_budget_invalid")
+    if stress_fraction <= 0 or not isclose(
+        planned_loss,
+        final_notional * stress_fraction,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("paper_canary_stressed_loss_algebra_mismatch")
+    if final_notional <= 0 or (
+        final_notional > target_notional + 1e-8
+        and not bounded_fill_drift_accepted
+    ):
+        reasons.append("paper_canary_notional_invalid")
+    effective_position_size = (
+        final_margin / available_margin
+        if final_margin > 0 and available_margin > 0
+        else 0.0
+    )
+    if (
+        final_margin <= 0
+        or available_margin <= 0
+        or (
+            not bounded_fill_drift_accepted
+            and (
+                position_size <= 0
+                or not isclose(
+                    position_size,
+                    effective_position_size,
+                    rel_tol=1e-7,
+                    abs_tol=1e-8,
+                )
+            )
+        )
+    ):
+        reasons.append("paper_canary_sizing_identity_incomplete")
+
+    portfolio = _safe_dict(sizing.get("portfolio_risk_snapshot"))
+    if (
+        portfolio.get("scope") != "paper_bootstrap_canary_positions_only"
+        or _safe_float(portfolio.get("current_stressed_loss_usdt")) < 0
+    ):
+        reasons.append("paper_canary_portfolio_snapshot_incomplete")
+    availability = _safe_dict(sizing.get("entry_instrument_availability"))
+    leverage_tier = _safe_dict(sizing.get("leverage_tier_selection"))
+    if availability.get("available") is not True:
+        reasons.append("paper_canary_instrument_availability_unconfirmed")
+    if leverage_tier.get("production_eligible") is not True:
+        reasons.append("paper_canary_leverage_tier_ineligible")
+
+    if opportunity.get("contract_lifecycle") == "paper_bootstrap_canary":
+        annotated_score = _finite_value(opportunity.get("score"))
+        objective_score = _finite_value(observation.get("objective_expected_return_pct"))
+        if (
+            opportunity.get("score_kind")
+            != "paper_canary_objective_expected_return"
+            or annotated_score is None
+            or objective_score is None
+            or not isclose(annotated_score, objective_score, abs_tol=1e-8)
+            or opportunity.get("production_eligible") is not False
+            or opportunity.get("production_permission") is not False
+            or opportunity.get("observation_only") is not True
+            or opportunity.get("execution_scope") != "paper_only"
+        ):
+            reasons.append("paper_canary_opportunity_annotation_invalid")
+
+    filled_notional = max(_safe_float(filled_notional_usdt), 0.0)
+    if executed and filled_notional > 0 and not isclose(
+        final_notional,
+        filled_notional,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("filled_order_notional_differs_from_risk_contract")
+    if executed and filled_order_present is not True:
+        reasons.append("executed_entry_without_filled_order")
+
+    reasons = list(dict.fromkeys(reasons))
+    contract = {
+        "contract_lifecycle": "paper_bootstrap_canary",
+        "contract_complete": not reasons,
+        "execution_scope": canary.get("execution_scope"),
+        "production_permission": False,
+        "observation_only": True,
+        "artifact_version": canary.get("artifact_version"),
+        "selected_side": canary.get("selected_side"),
+        "opportunity_score": _finite_value(
+            observation.get("objective_expected_return_pct")
+        ),
+        "observed_net_return_pct": _finite_value(
+            observation.get("observed_net_return_pct")
+        ),
+        "risk_budget_usdt": risk_budget,
+        "planned_stressed_loss_usdt": planned_loss,
+        "final_notional_usdt": final_notional,
+        "filled_order_notional_usdt": filled_notional,
+        "production_source_count": 0,
+        "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
+        "fill_drift_evidence": bounded_fill_drift,
+        "effective_position_size_pct": effective_position_size,
+    }
+    return contract, reasons
+
+
+def _bounded_legacy_canary_fill_drift(
+    *,
+    canary: dict[str, Any],
+    opportunity: dict[str, Any],
+    sizing: dict[str, Any],
+) -> dict[str, Any]:
+    """Recognize a bounded historical fill drift without weakening entry sizing."""
+
+    rejected = {
+        "accepted": False,
+        "reasons": [],
+        "reserve_fraction": 0.0,
+        "notional_excess_fraction": 0.0,
+        "risk_excess_fraction": 0.0,
+    }
+    reconciliations = [
+        _safe_dict(item) for item in _safe_list(sizing.get("execution_reconciliations"))
+    ]
+    pre_submit = next(
+        (
+            item
+            for item in reversed(reconciliations)
+            if item.get("source") == "okx_pre_submit_order_shape"
+            and item.get("eligible") is True
+            and not _safe_list(item.get("reasons"))
+        ),
+        None,
+    )
+    confirmed_fill = next(
+        (
+            item
+            for item in reversed(reconciliations)
+            if item.get("source") == "okx_confirmed_entry_fill"
+        ),
+        None,
+    )
+    if not pre_submit or not confirmed_fill or confirmed_fill.get("eligible") is not False:
+        return rejected
+
+    fill_reasons = {
+        str(reason) for reason in _safe_list(confirmed_fill.get("reasons")) if reason
+    }
+    allowed_reasons = {
+        "execution_notional_exceeds_authoritative_target",
+        "execution_stressed_loss_exceeds_risk_budget",
+    }
+    if not fill_reasons or not fill_reasons.issubset(allowed_reasons):
+        return rejected
+
+    target_notional = _safe_float(sizing.get("target_notional_usdt"))
+    settled_notional = _safe_float(confirmed_fill.get("final_notional_usdt"))
+    final_notional = _safe_float(sizing.get("final_notional_usdt"))
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"))
+    observation_cost_pct = _safe_float(
+        _safe_dict(canary.get("selected_observation")).get(
+            "current_execution_cost_pct"
+        )
+    )
+    opportunity_cost_pct = _safe_float(
+        _safe_dict(opportunity.get("execution_cost")).get("total_pct")
+    )
+    reserve_fraction = max(observation_cost_pct, opportunity_cost_pct) / 100.0
+    if (
+        target_notional <= 0
+        or settled_notional <= 0
+        or risk_budget <= 0
+        or planned_loss <= 0
+        or reserve_fraction <= 0
+        or not isclose(final_notional, settled_notional, rel_tol=1e-9, abs_tol=1e-8)
+    ):
+        return rejected
+    notional_excess = max(settled_notional / target_notional - 1.0, 0.0)
+    risk_excess = max(planned_loss / risk_budget - 1.0, 0.0)
+    accepted = bool(
+        notional_excess <= reserve_fraction + 1e-8
+        and risk_excess <= reserve_fraction + 1e-8
+    )
+    return {
+        "accepted": accepted,
+        "reasons": sorted(fill_reasons),
+        "reserve_fraction": reserve_fraction,
+        "notional_excess_fraction": notional_excess,
+        "risk_excess_fraction": risk_excess,
+        "pre_submit_notional_usdt": _safe_float(
+            pre_submit.get("final_notional_usdt")
+        ),
+        "settled_notional_usdt": settled_notional,
+        "source": "persisted_okx_pre_submit_and_confirmed_fill_reconciliations",
+    }
+
+
+def _paper_canary_observation_reasons(canary: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if canary.get("version") != PAPER_BOOTSTRAP_CANARY_VERSION:
+        reasons.append("paper_canary_version_invalid")
+    if canary.get("authorized") is not True or canary.get("requested") is not True:
+        reasons.append("paper_canary_not_authorized")
+    if canary.get("execution_scope") != "paper_only":
+        reasons.append("paper_canary_scope_invalid")
+    if canary.get("production_permission") is not False:
+        reasons.append("paper_canary_production_permission_invalid")
+    if canary.get("artifact_lifecycle") != "canary":
+        reasons.append("paper_canary_artifact_lifecycle_invalid")
+
+    observation = _safe_dict(canary.get("selected_observation"))
+    side = str(canary.get("selected_side") or "").lower()
+    observation_side = str(observation.get("side") or "").lower()
+    required_finite = (
+        "raw_expected_return_pct",
+        "objective_expected_return_pct",
+        "lower_quantile_return_pct",
+        "dispersion_pct",
+        "observed_net_return_pct",
+    )
+    if (
+        side not in {"long", "short"}
+        or observation_side != side
+        or any(_finite_value(observation.get(key)) is None for key in required_finite)
+        or _safe_int(observation.get("horizon_minutes")) <= 0
+        or _safe_int(observation.get("distribution_member_count")) <= 0
+        or not str(observation.get("source_authority") or "").strip()
+    ):
+        reasons.append("paper_canary_selected_observation_incomplete")
+    direction_gap = _finite_value(canary.get("direction_score_gap"))
+    confidence = _finite_value(canary.get("confidence"))
+    if (
+        direction_gap is None
+        or direction_gap < 0
+        or confidence is None
+        or not 0 <= confidence <= 1
+    ):
+        reasons.append("paper_canary_direction_evidence_incomplete")
+    provenance = _safe_dict(canary.get("policy_provenance"))
+    if (
+        not _provenance_complete(provenance)
+        or provenance.get("strategy_version") != PAPER_BOOTSTRAP_CANARY_VERSION
+    ):
+        reasons.append("paper_canary_provenance_incomplete")
+    return reasons
 
 
 def validate_production_entry_contract(
@@ -287,6 +678,7 @@ def validate_production_entry_contract(
     if executed and filled_order_present is not True:
         reasons.append("executed_entry_without_filled_order")
     contract = {
+        "contract_lifecycle": "production_return",
         "contract_complete": not reasons,
         "expected_net_return_pct": _safe_float(policy.get("expected_net_return_pct")),
         "return_lcb_pct": _safe_float(policy.get("return_lcb_pct")),
@@ -518,6 +910,14 @@ def _obsolete_fields(value: Any) -> set[str]:
 
 def _provenance_complete(value: Any) -> bool:
     provenance = _safe_dict(value)
+    return bool(
+        _provenance_core_complete(provenance)
+        and not str(provenance.get("fallback_reason") or "").strip()
+    )
+
+
+def _provenance_core_complete(value: Any) -> bool:
+    provenance = _safe_dict(value)
     if any(key not in provenance for key in PROVENANCE_FIELDS):
         return False
     return bool(
@@ -526,7 +926,6 @@ def _provenance_complete(value: Any) -> bool:
         and _safe_int(provenance.get("sample_count")) > 0
         and str(provenance.get("generated_at") or "").strip()
         and str(provenance.get("strategy_version") or "").strip()
-        and not str(provenance.get("fallback_reason") or "").strip()
     )
 
 
@@ -575,6 +974,18 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _finite_value(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if isfinite(result) else None
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

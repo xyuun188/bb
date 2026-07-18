@@ -469,6 +469,10 @@ def reconcile_profit_risk_sizing(
     raw = _safe_dict(decision.raw_response)
     sizing = dict(_safe_dict(raw.get("profit_risk_sizing")))
     original_target = max(_safe_float(sizing.get("target_notional_usdt"), 0.0), 0.0)
+    fill_notional_ceiling = max(
+        _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0),
+        0.0,
+    )
     risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
     stress = max(_safe_float(sizing.get("stressed_loss_fraction"), 0.0), 0.0)
     margin_basis = max(_safe_float(sizing.get("available_margin_usdt"), 0.0), 0.0)
@@ -486,7 +490,12 @@ def reconcile_profit_risk_sizing(
         reasons.append("execution_leverage_tier_contract_missing")
     elif leverage > tier_max_leverage + 1e-8:
         reasons.append("execution_leverage_exceeds_selected_okx_tier")
-    if original_target <= 0 or notional > original_target + 1e-8:
+    notional_ceiling = (
+        fill_notional_ceiling
+        if source == "okx_confirmed_entry_fill" and fill_notional_ceiling > 0
+        else original_target
+    )
+    if original_target <= 0 or notional > notional_ceiling + 1e-8:
         reasons.append("execution_notional_exceeds_authoritative_target")
     planned_loss = notional * stress
     if risk_budget <= 0 or planned_loss > risk_budget + 1e-8:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -28,6 +27,7 @@ from services.server_monitor_status import (
     clear_server_monitor_cache,
     get_server_monitor_status_async,
 )
+from services.trade_execution_contract import entry_opportunity_evidence_score
 from web_dashboard.api import dashboard as _dash
 from web_dashboard.api.text_sanitize import sanitize_payload
 
@@ -185,13 +185,6 @@ def _overall_status(items: list[dict[str, Any]]) -> str:
 
 def _mask_endpoint(value: Any) -> str:
     return str(value or "").strip()
-
-
-def _finite_score(value: Any) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
 
 
 def _is_entry_opportunity_score_decision(decision: Any, raw: dict[str, Any], action: str) -> bool:
@@ -1179,11 +1172,10 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
     for decision in decisions:
         raw = decision.raw_llm_response if isinstance(decision.raw_llm_response, dict) else {}
         action = str(getattr(decision, "action", "") or "").lower()
-        opportunity = raw.get("opportunity_score") if isinstance(raw, dict) else {}
-        score = opportunity.get("score") if isinstance(opportunity, dict) else None
+        score = entry_opportunity_evidence_score(raw)
         if _is_entry_opportunity_score_decision(decision, raw, action):
             created_at = getattr(decision, "created_at", None)
-            if _finite_score(score):
+            if score is not None:
                 if isinstance(created_at, datetime) and (
                     latest_scored_entry_at is None or created_at > latest_scored_entry_at
                 ):

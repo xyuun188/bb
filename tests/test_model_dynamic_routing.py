@@ -4,6 +4,7 @@ from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
 from data_feed.feature_vector import FeatureVector
 from services.model_dynamic_routing import plan_dynamic_model_route, summarize_dynamic_model_routing
+from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
 def test_dynamic_route_preserves_all_experts_without_baseline() -> None:
@@ -248,3 +249,29 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
     )
     assert report["blocking_reason_counts"]["competition_baseline_missing"] == 1
     assert report["blocking_reason_counts"]["feature_coverage_missing"] == 1
+
+
+def test_dynamic_routing_does_not_count_valid_canary_as_ineligible_execution() -> None:
+    raw = complete_paper_canary_raw()
+    raw["dynamic_model_routing"] = {
+        "mode": "canary_ready",
+        "selected_experts": ["trend_expert"],
+        "skipped_experts": [],
+        "blocking_reasons": [],
+        "live_blocking_reasons": [],
+        "applied_to_live_calls": False,
+        "live_route_mutation": False,
+    }
+    report = summarize_dynamic_model_routing(
+        [
+            {
+                "action": "long",
+                "was_executed": True,
+                "raw_llm_response": raw,
+            }
+        ]
+    )
+
+    assert report["safety_observations"][
+        "ineligible_return_contract_executed_count"
+    ] == 0

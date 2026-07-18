@@ -234,6 +234,48 @@ def select_paper_bootstrap_candidate(context: dict[str, Any] | None) -> dict[str
     }
 
 
+def annotate_paper_bootstrap_opportunity(decision: DecisionOutput) -> float | None:
+    """Persist the canary observation score without granting production eligibility."""
+
+    raw = _safe_dict(decision.raw_response)
+    contract = _safe_dict(raw.get("paper_bootstrap_canary"))
+    if (
+        contract.get("version") != PAPER_BOOTSTRAP_CANARY_VERSION
+        or contract.get("requested") is not True
+    ):
+        return None
+
+    selected = _safe_dict(contract.get("selected_observation"))
+    score = _finite(selected.get("objective_expected_return_pct"))
+    opportunity = dict(_safe_dict(raw.get("opportunity_score")))
+    production_score = _finite(opportunity.get("score"))
+    opportunity.update(
+        {
+            "contract_lifecycle": "paper_bootstrap_canary",
+            "score_kind": "paper_canary_objective_expected_return",
+            "score": round(score, 8) if score is not None else None,
+            "production_score": production_score,
+            "production_score_policy": opportunity.get("score_policy"),
+            "production_eligible": False,
+            "production_permission": False,
+            "observation_only": True,
+            "execution_scope": "paper_only",
+            "canary_objective_expected_return_pct": score,
+            "canary_observed_net_return_pct": _finite(
+                selected.get("observed_net_return_pct")
+            ),
+            "canary_lower_quantile_return_pct": _finite(
+                selected.get("lower_quantile_return_pct")
+            ),
+            "canary_artifact_version": contract.get("artifact_version"),
+            "canary_policy_provenance": _safe_dict(contract.get("policy_provenance")),
+        }
+    )
+    raw["opportunity_score"] = opportunity
+    decision.raw_response = raw
+    return score
+
+
 @dataclass(frozen=True, slots=True)
 class PaperBootstrapAssessment:
     eligible: bool
@@ -642,7 +684,13 @@ class PaperBootstrapCanaryPolicy:
 
         risk_budget = equity * PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK
         portfolio_budget = equity * PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK
-        target_notional = risk_budget / stress if stress > 0 else 0.0
+        fill_drift_reserve_fraction = cost_pct / 100.0
+        fill_notional_ceiling = risk_budget / stress if stress > 0 else 0.0
+        target_notional = (
+            fill_notional_ceiling / (1.0 + fill_drift_reserve_fraction)
+            if fill_notional_ceiling > 0
+            else 0.0
+        )
         final_notional = min(target_notional, available_margin)
         final_margin = final_notional
         position_size = final_margin / available_margin if available_margin > 0 else 0.0
@@ -724,6 +772,8 @@ class PaperBootstrapCanaryPolicy:
             "planned_stressed_loss_usdt": planned_loss,
             "stressed_loss_fraction": stress,
             "target_notional_usdt": target_notional,
+            "fill_notional_ceiling_usdt": fill_notional_ceiling,
+            "estimated_fill_drift_reserve_fraction": fill_drift_reserve_fraction,
             "final_notional_usdt": final_notional,
             "final_margin_usdt": final_margin,
             "position_size_pct": position_size,

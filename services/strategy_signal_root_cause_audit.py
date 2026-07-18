@@ -14,7 +14,10 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from services.ml_signal_service import MLSignalService
-from services.trade_execution_contract import validate_production_entry_contract
+from services.trade_execution_contract import (
+    entry_contract_lifecycle,
+    validate_entry_execution_contract,
+)
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 class StrategySignalRootCauseAuditService:
@@ -81,19 +84,25 @@ class StrategySignalRootCauseAuditService:
         expected_returns: list[float] = []
         return_lcbs: list[float] = []
         ready_count = 0
+        lifecycle_counts: Counter[str] = Counter()
+        lifecycle_ready_counts: Counter[str] = Counter()
         for row in entries:
             raw = _safe_dict(getattr(row, "raw_llm_response", None))
-            policy = _safe_dict(raw.get("production_return_policy"))
-            expected = _maybe_float(policy.get("expected_net_return_pct"))
-            lcb = _maybe_float(policy.get("return_lcb_pct"))
-            if expected is not None:
-                expected_returns.append(expected)
-            if lcb is not None:
-                return_lcbs.append(lcb)
-            _, reasons = validate_production_entry_contract(raw)
+            lifecycle = entry_contract_lifecycle(raw)
+            lifecycle_counts[lifecycle] += 1
+            if lifecycle == "production_return":
+                policy = _safe_dict(raw.get("production_return_policy"))
+                expected = _maybe_float(policy.get("expected_net_return_pct"))
+                lcb = _maybe_float(policy.get("return_lcb_pct"))
+                if expected is not None:
+                    expected_returns.append(expected)
+                if lcb is not None:
+                    return_lcbs.append(lcb)
+            _, reasons = validate_entry_execution_contract(raw)
             blocker_counts.update(reasons)
             if not reasons:
                 ready_count += 1
+                lifecycle_ready_counts[lifecycle] += 1
 
         causes = [
             {
@@ -123,9 +132,18 @@ class StrategySignalRootCauseAuditService:
             "can_change_ml_readiness": False,
             "can_bypass_risk_controls": False,
             "entry_decision_count": len(entries),
-            "high_quality_entry_count": ready_count,
-            "production_return_ready_count": ready_count,
-            "production_return_blocked_count": len(entries) - ready_count,
+            "entry_contract_ready_count": ready_count,
+            "high_quality_entry_count": lifecycle_ready_counts["production_return"],
+            "production_return_ready_count": lifecycle_ready_counts["production_return"],
+            "production_return_blocked_count": (
+                lifecycle_counts["production_return"]
+                - lifecycle_ready_counts["production_return"]
+            ),
+            "paper_canary_entry_count": lifecycle_counts["paper_bootstrap_canary"],
+            "paper_canary_ready_count": lifecycle_ready_counts[
+                "paper_bootstrap_canary"
+            ],
+            "entry_contract_lifecycle_counts": dict(lifecycle_counts),
             "contract_blocker_counts": dict(blocker_counts),
             "expected_net_return_distribution": _distribution(expected_returns),
             "return_lcb_distribution": _distribution(return_lcbs),

@@ -29,6 +29,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution_eligibility,
 )
 from services.execution_cost_model import execution_cost_estimate
+from services.paper_bootstrap_canary import annotate_paper_bootstrap_opportunity
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
@@ -633,5 +634,6 @@ class EntryOpportunityScoringPolicy:
             "strategy_context_observation_only": safe_dict(strategy),
         }
         decision.raw_response = raw
+        paper_canary_score = annotate_paper_bootstrap_opportunity(decision)
         self.annotate_decision_source(decision)
-        return score
+        return paper_canary_score if paper_canary_score is not None else score

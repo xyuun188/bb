@@ -18,6 +18,7 @@ from services.return_objective import (
     RETURN_OBJECTIVE_VERSION,
     standardized_return_distribution,
 )
+from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
 def _scorer() -> EntryOpportunityScoringPolicy:
@@ -257,6 +258,20 @@ def test_live_models_use_equal_empirical_observations_and_live_cost() -> None:
     )
     assert opportunity["policy_provenance"]["valid_for_seconds"] > 0
     assert opportunity["policy_provenance"]["fallback_reason"] == ""
+
+
+def test_scoring_path_persists_lifecycle_specific_paper_canary_score() -> None:
+    decision = _decision()
+    decision.raw_response = complete_paper_canary_raw()
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert score == pytest.approx(-0.32)
+    assert opportunity["score"] == pytest.approx(-0.32)
+    assert opportunity["production_score"] is None
+    assert opportunity["contract_lifecycle"] == "paper_bootstrap_canary"
+    assert opportunity["production_eligible"] is False
 
 
 def test_diagnostic_win_rate_cannot_change_expected_return_or_score() -> None:

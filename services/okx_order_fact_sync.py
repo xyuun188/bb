@@ -59,7 +59,7 @@ from services.position_settlement import (
     is_final_settlement_status,
     settlement_payload_fields,
 )
-from services.trade_execution_contract import validate_production_entry_contract
+from services.trade_execution_contract import validate_entry_execution_contract
 
 logger = structlog.get_logger(__name__)
 
@@ -4255,7 +4255,7 @@ def _original_entry_contract_evidence(
             )
             for order in orders
         )
-        _, reasons = validate_production_entry_contract(
+        _, reasons = validate_entry_execution_contract(
             raw,
             filled_notional_usdt=filled_notional,
             executed=True,

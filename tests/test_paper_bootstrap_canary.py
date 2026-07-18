@@ -16,6 +16,7 @@ from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
     PaperBootstrapCanaryPolicy,
+    annotate_paper_bootstrap_opportunity,
     select_paper_bootstrap_candidate,
 )
 
@@ -106,6 +107,22 @@ def test_negative_shadow_objective_can_request_paper_sample_without_production_p
     assert canary["version"] == PAPER_BOOTSTRAP_CANARY_VERSION
 
 
+def test_paper_canary_opportunity_annotation_is_finite_and_observation_only() -> None:
+    decision = _decision()
+
+    score = annotate_paper_bootstrap_opportunity(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert score == pytest.approx(-0.12)
+    assert opportunity["score"] == pytest.approx(-0.12)
+    assert opportunity["score_kind"] == "paper_canary_objective_expected_return"
+    assert opportunity["contract_lifecycle"] == "paper_bootstrap_canary"
+    assert opportunity["production_eligible"] is False
+    assert opportunity["production_permission"] is False
+    assert opportunity["observation_only"] is True
+    assert opportunity["execution_scope"] == "paper_only"
+
+
 def test_paper_canary_selection_is_forbidden_in_live_mode() -> None:
     context = _context()
     context["trading_mode"] = "live"
@@ -155,6 +172,9 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
 
     decision = _decision()
     decision.feature_snapshot["atr_14"] = 2.443918123
+    decision.raw_response["opportunity_score"] = {
+        "execution_cost": {"total_pct": 0.15}
+    }
     policy = PaperBootstrapCanaryPolicy(
         allocated_order_balance=balance,
         exchange_risk_facts=facts,
@@ -178,6 +198,11 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     assert sizing["portfolio_risk_snapshot"]["gross_notional_usdt"] == 0.0
     assert sizing["portfolio_risk_snapshot"]["scope"] == ("paper_bootstrap_canary_positions_only")
     assert sizing["entry_instrument_availability"]["available"] is True
+    assert sizing["estimated_fill_drift_reserve_fraction"] == pytest.approx(0.0015)
+    assert sizing["fill_notional_ceiling_usdt"] > sizing["target_notional_usdt"]
+    assert sizing["target_notional_usdt"] * (
+        1.0 + sizing["estimated_fill_drift_reserve_fraction"]
+    ) == pytest.approx(sizing["fill_notional_ceiling_usdt"])
     assert decision.suggested_leverage == 1.0
     assert decision.stop_loss_pct > 0
     assert decision.take_profit_pct > decision.stop_loss_pct

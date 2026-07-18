@@ -437,6 +437,44 @@ async def test_execution_reconciliation_rejects_notional_enlargement() -> None:
     assert decision.position_size_pct == 0.0
 
 
+@pytest.mark.asyncio
+async def test_confirmed_fill_can_use_reserved_ceiling_but_other_enlargement_cannot() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    risk_ceiling = sizing["risk_budget_usdt"] / sizing["stressed_loss_fraction"]
+    reserved_target = risk_ceiling / 1.002
+    sizing["target_notional_usdt"] = reserved_target
+    sizing["fill_notional_ceiling_usdt"] = risk_ceiling
+    sizing["final_notional_usdt"] = reserved_target
+    decision.raw_response["profit_risk_sizing"] = sizing
+    confirmed_notional = reserved_target * 1.001
+
+    confirmed = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=confirmed_notional,
+        final_leverage=decision.suggested_leverage,
+        source="okx_confirmed_entry_fill",
+    )
+
+    assert confirmed["eligible"] is True
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    sizing["final_notional_usdt"] = reserved_target
+    sizing["production_eligible"] = True
+    decision.raw_response["profit_risk_sizing"] = sizing
+    non_fill = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=confirmed_notional,
+        final_leverage=decision.suggested_leverage,
+        source="test_non_fill_enlargement",
+    )
+
+    assert non_fill["eligible"] is False
+    assert "execution_notional_exceeds_authoritative_target" in non_fill["reasons"]
+
+
 def test_portfolio_correlation_is_side_aware() -> None:
     features = {
         "BTC/USDT": {"close_sequence": [100.0, 101.0, 102.0, 103.0]},

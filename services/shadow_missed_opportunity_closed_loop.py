@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from services.dynamic_policy_values import empirical_policy_value
-from services.trade_execution_contract import validate_production_entry_contract
+from services.trade_execution_contract import validate_entry_execution_contract
 
 DEFAULT_REPORT_WINDOW_HOURS = 24
 DEFAULT_REPORT_LIMIT = 200
@@ -111,12 +111,14 @@ def _executed_return_contract_gaps(decisions: Sequence[Any]) -> list[dict[str, A
         if action not in {"long", "short"} or not bool(_row_get(row, "was_executed")):
             continue
         raw = _safe_dict(_row_get(row, "raw_llm_response"))
-        _, contract_blockers = validate_production_entry_contract(raw)
+        contract, contract_blockers = validate_entry_execution_contract(raw)
         if contract_blockers:
+            lifecycle = str(contract.get("contract_lifecycle") or "unknown")
             gaps.append(
                 {
                     "decision_id": _row_get(row, "id"),
-                    "reason": "executed_without_complete_production_entry_contract",
+                    "reason": f"executed_without_complete_{lifecycle}_entry_contract",
+                    "contract_lifecycle": lifecycle,
                     "contract_blockers": contract_blockers,
                 }
             )

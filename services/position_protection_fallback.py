@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from models.decision import AIDecision
 from models.trade import Order
-from services.trade_execution_contract import validate_production_entry_contract
+from services.trade_execution_contract import validate_entry_execution_contract
 
 
 def _default_float_parser(value: Any, default: float = 0.0) -> float:
@@ -48,7 +48,7 @@ class PositionProtectionFallbackPolicy:
         sizing = sizing if isinstance(sizing, dict) else {}
         provenance = sizing.get("policy_provenance")
         provenance = provenance if isinstance(provenance, dict) else {}
-        _, contract_blockers = validate_production_entry_contract(raw)
+        _, contract_blockers = validate_entry_execution_contract(raw)
         stop_loss_pct = self.float_parser(sizing.get("stressed_loss_fraction"), 0.0)
         if contract_blockers or stop_loss_pct <= 0:
             return {}

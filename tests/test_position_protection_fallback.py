@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
+from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
 class _FakeResult:
@@ -127,3 +128,18 @@ async def test_incomplete_or_legacy_plan_is_rejected() -> None:
     )
 
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_exact_order_canary_risk_plan_recovers_stop() -> None:
+    decision = _decision(id=404, raw_llm_response=complete_paper_canary_raw())
+    result = await PositionProtectionFallbackPolicy().protection_from_decision(
+        _FakeSession(decision),
+        symbol="BTC/USDT",
+        side="long",
+        entry_price=100.0,
+        order=SimpleNamespace(decision_id=404),
+    )
+
+    assert result["stop_loss_price"] == 99.0
+    assert result["decision_id"] == 404

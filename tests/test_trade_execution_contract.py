@@ -3,6 +3,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from services.trade_execution_contract import summarize_trade_execution_contract
+from tests.paper_canary_fixtures import (
+    bounded_legacy_fill_drift_raw,
+    complete_paper_canary_raw,
+)
 
 
 def _provenance(*, samples: int = 8, fallback_reason: str = "") -> dict[str, object]:
@@ -130,6 +134,89 @@ def test_executed_entry_requires_real_filled_order_link() -> None:
     report = summarize_trade_execution_contract([decision], orders=[])
 
     assert report["violation_reason_counts"]["executed_entry_without_filled_order"] == 1
+
+
+def test_complete_executed_paper_canary_uses_its_own_entry_contract() -> None:
+    report = summarize_trade_execution_contract(
+        [_decision(11, "long", complete_paper_canary_raw())],
+        orders=[
+            SimpleNamespace(
+                decision_id=11,
+                status="filled",
+                quantity=0.5,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["entry_contracts"][0]["contract_lifecycle"] == (
+        "paper_bootstrap_canary"
+    )
+    assert report["entry_contracts"][0]["production_permission"] is False
+
+
+def test_malformed_executed_paper_canary_still_fails_closed() -> None:
+    raw = complete_paper_canary_raw()
+    raw["paper_bootstrap_canary"]["production_permission"] = True
+    raw["profit_risk_sizing"]["planned_stressed_loss_usdt"] = 4.0
+
+    report = summarize_trade_execution_contract(
+        [_decision(12, "long", raw)],
+        orders=[
+            SimpleNamespace(
+                decision_id=12,
+                status="filled",
+                quantity=0.5,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["entry_contract_ready_count"] == 0
+    assert report["violation_reason_counts"][
+        "paper_canary_production_permission_invalid"
+    ] == 1
+    assert report["violation_reason_counts"]["paper_canary_risk_budget_invalid"] == 1
+
+
+def test_bounded_legacy_canary_fill_drift_uses_persisted_cost_evidence() -> None:
+    raw = bounded_legacy_fill_drift_raw(excess_fraction=0.001)
+    final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]
+    report = summarize_trade_execution_contract(
+        [_decision(13, "long", raw)],
+        orders=[
+            SimpleNamespace(
+                decision_id=13,
+                status="filled",
+                quantity=final_notional / 100.0,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["entry_contracts"][0]["bounded_fill_drift_accepted"] is True
+
+
+def test_canary_fill_drift_beyond_persisted_cost_evidence_fails_closed() -> None:
+    raw = bounded_legacy_fill_drift_raw(excess_fraction=0.003)
+    final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]
+    report = summarize_trade_execution_contract(
+        [_decision(14, "long", raw)],
+        orders=[
+            SimpleNamespace(
+                decision_id=14,
+                status="filled",
+                quantity=final_notional / 100.0,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["entry_contract_ready_count"] == 0
+    assert report["violation_reason_counts"]["paper_canary_risk_contract_ineligible"] == 1
 
 
 def test_dynamic_exit_requires_position_economics_and_filled_order() -> None:
