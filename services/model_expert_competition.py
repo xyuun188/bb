@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from services.model_expert_health import (
+    _MODEL_HEALTH_RAW_COLUMN_PREFIX,
     DEFAULT_WINDOWS_HOURS,
     _action,
     _created_at,
     _expert_rows,
     _extract_component_rows,
+    _model_health_decision_from_mapping,
     _safe_float,
 )
 
@@ -204,19 +207,55 @@ class ModelExpertCompetitionService:
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with self._session_context_factory() as session:
             decisions_result = await session.execute(
-                select(AIDecision)
-                .where(AIDecision.created_at >= since)
+                select(
+                    AIDecision.id,
+                    AIDecision.action,
+                    AIDecision.was_executed,
+                    AIDecision.outcome_pnl_pct,
+                    AIDecision.created_at,
+                    AIDecision.model_health_timings.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}model_timings"
+                    ),
+                    AIDecision.model_health_fallback_timings.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}_model_timings"
+                    ),
+                    AIDecision.model_health_experts.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}experts"
+                    ),
+                    AIDecision.model_health_opinions.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}opinions"
+                    ),
+                    AIDecision.model_health_has_ml_signal.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_ml_signal"
+                    ),
+                    AIDecision.model_health_has_local_ml_signal.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_local_ml_signal"
+                    ),
+                    AIDecision.model_health_has_local_ai_tools.label(
+                        f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_local_ai_tools"
+                    ),
+                )
+                .where(
+                    AIDecision.created_at >= since,
+                    AIDecision.model_health_snapshot_version >= 1,
+                )
                 .order_by(AIDecision.created_at.desc())
                 .limit(capped_limit)
             )
             shadows_result = await session.execute(
-                select(ShadowBacktest)
+                select(
+                    ShadowBacktest.status,
+                    ShadowBacktest.created_at,
+                )
                 .where(ShadowBacktest.created_at >= since)
                 .order_by(ShadowBacktest.created_at.desc())
                 .limit(capped_limit)
             )
         return summarize_model_expert_competition(
-            list(decisions_result.scalars().all()),
-            list(shadows_result.scalars().all()),
+            [
+                _model_health_decision_from_mapping(row)
+                for row in decisions_result.mappings().all()
+            ],
+            [SimpleNamespace(**dict(row)) for row in shadows_result.mappings().all()],
             window_hours=capped_hours,
         )

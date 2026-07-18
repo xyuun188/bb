@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from math import isfinite
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -42,30 +43,40 @@ class StrategySignalRootCauseAuditService:
             since = since.replace(tzinfo=UTC)
         since = (since.astimezone(UTC) - timedelta(hours=self.lookback_hours)).replace(tzinfo=None)
         async with get_session_ctx() as session:
-            decisions = list(
-                (
-                    await session.execute(
-                        select(AIDecision)
-                        .where(AIDecision.created_at >= since)
-                        .order_by(AIDecision.created_at.desc())
-                        .limit(self.limit)
-                    )
+            decision_result = await session.execute(
+                select(
+                    AIDecision.id,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.created_at,
+                    AIDecision.decision_learning_snapshot.label("raw_llm_response"),
                 )
-                .scalars()
-                .all()
-            )
-            shadows = list(
-                (
-                    await session.execute(
-                        select(ShadowBacktest)
-                        .where(ShadowBacktest.created_at >= since, ShadowBacktest.status == "completed")
-                        .order_by(ShadowBacktest.created_at.desc())
-                        .limit(self.limit)
-                    )
+                .where(
+                    AIDecision.created_at >= since,
+                    AIDecision.decision_learning_snapshot_version >= 1,
                 )
-                .scalars()
-                .all()
+                .order_by(AIDecision.created_at.desc())
+                .limit(self.limit)
             )
+            shadow_result = await session.execute(
+                select(
+                    ShadowBacktest.id,
+                    ShadowBacktest.missed_opportunity,
+                )
+                .where(
+                    ShadowBacktest.created_at >= since,
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.training_feature_snapshot_version >= 1,
+                )
+                .order_by(ShadowBacktest.created_at.desc())
+                .limit(self.limit)
+            )
+            decisions = [
+                SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()
+            ]
+            shadows = [
+                SimpleNamespace(**dict(row)) for row in shadow_result.mappings().all()
+            ]
         try:
             ml_status = self._ml_status_provider()
         except Exception as exc:  # pragma: no cover

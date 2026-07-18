@@ -474,6 +474,30 @@ async def test_system_audit_runs_database_diagnostics_serially() -> None:
 
 
 @pytest.mark.asyncio
+async def test_system_audit_records_section_timings() -> None:
+    import asyncio
+
+    timings: dict[str, float] = {}
+
+    async def make_card(key: str) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        return system_audit._audit_card(key, key, "ok", f"{key} ok")
+
+    result = await system_audit._run_audit_specs(
+        [
+            ("trade_loop", lambda: make_card("trade_loop")),
+            ("market_data", lambda: make_card("market_data")),
+        ],
+        max_concurrency=2,
+        timings=timings,
+    )
+
+    assert set(result) == {"trade_loop", "market_data"}
+    assert set(timings) == {"trade_loop", "market_data"}
+    assert all(value >= 0 for value in timings.values())
+
+
+@pytest.mark.asyncio
 async def test_system_audit_uses_section_contract_timeout_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

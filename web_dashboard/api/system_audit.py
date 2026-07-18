@@ -7,6 +7,7 @@ import asyncio
 import copy
 import inspect
 import json
+import time
 from collections import Counter
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -1039,6 +1040,7 @@ async def _run_audit_specs(
     specs: list[tuple[str, Any]],
     *,
     max_concurrency: int = SYSTEM_AUDIT_MAX_CONCURRENCY,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, dict[str, Any] | Exception]:
     if not specs:
         return {}
@@ -1046,6 +1048,7 @@ async def _run_audit_specs(
     if concurrency == 1:
         results: dict[str, dict[str, Any] | Exception] = {}
         for key, factory in specs:
+            started = time.perf_counter()
             try:
                 results[key] = await _audit_maybe_async(
                     factory,
@@ -1053,12 +1056,16 @@ async def _run_audit_specs(
                 )
             except Exception as exc:
                 results[key] = exc
+            finally:
+                if timings is not None:
+                    timings[key] = round(time.perf_counter() - started, 4)
         return results
 
     semaphore = asyncio.Semaphore(concurrency)
 
     async def run_one(key: str, factory: Any) -> tuple[str, dict[str, Any] | Exception]:
         async with semaphore:
+            started = time.perf_counter()
             try:
                 return key, await _audit_maybe_async(
                     factory,
@@ -1066,6 +1073,9 @@ async def _run_audit_specs(
                 )
             except Exception as exc:
                 return key, exc
+            finally:
+                if timings is not None:
+                    timings[key] = round(time.perf_counter() - started, 4)
 
     pairs = await asyncio.gather(*(run_one(key, factory) for key, factory in specs))
     return dict(pairs)
@@ -5258,6 +5268,7 @@ async def collect_system_audit_status(
 async def _collect_system_audit_status_unlocked(
     *, record_history: bool = True, source: str = "api"
 ) -> dict[str, Any]:
+    collection_started = time.perf_counter()
     audit_specs = [
         ("trade_loop", _trade_loop_audit),
         ("okx_reconciliation", _okx_reconciliation_audit),
@@ -5308,16 +5319,36 @@ async def _collect_system_audit_status_unlocked(
         and key not in HEAVY_AUDIT_KEYS
         and key not in DB_AUDIT_KEYS
     ]
+    section_timings: dict[str, float] = {}
     result_by_key: dict[str, dict[str, Any] | Exception] = {}
-    result_by_key.update(await _run_audit_specs(priority_specs, max_concurrency=1))
-    result_by_key.update(await _run_audit_specs(db_specs, max_concurrency=1))
+    result_by_key.update(
+        await _run_audit_specs(
+            priority_specs,
+            max_concurrency=1,
+            timings=section_timings,
+        )
+    )
+    result_by_key.update(
+        await _run_audit_specs(
+            db_specs,
+            max_concurrency=1,
+            timings=section_timings,
+        )
+    )
     result_by_key.update(
         await _run_audit_specs(
             regular_specs,
             max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
+            timings=section_timings,
         )
     )
-    result_by_key.update(await _run_audit_specs(heavy_specs, max_concurrency=1))
+    result_by_key.update(
+        await _run_audit_specs(
+            heavy_specs,
+            max_concurrency=1,
+            timings=section_timings,
+        )
+    )
     cards: list[dict[str, Any]] = []
     for section_key, _factory in audit_specs:
         result = result_by_key[section_key]
@@ -5372,6 +5403,18 @@ async def _collect_system_audit_status_unlocked(
                 "enabled": bool(settings.system_audit_history_enabled),
                 "interval_seconds": int(settings.system_audit_history_interval_seconds or 300),
                 "max_records": int(settings.system_audit_history_max_records or 500),
+            },
+            "performance": {
+                "total_seconds": round(time.perf_counter() - collection_started, 4),
+                "section_seconds": dict(
+                    sorted(section_timings.items(), key=lambda item: item[1], reverse=True)
+                ),
+                "group_concurrency": {
+                    "priority": 1,
+                    "database": 1,
+                    "regular": SYSTEM_AUDIT_MAX_CONCURRENCY,
+                    "heavy": 1,
+                },
             },
             "safety_note": "根因雷达当前只读巡检；补历史仓位、重启服务、批量训练等动作必须人工确认。",
         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from models.decision import _compact_decision_learning_snapshot
 from services.trade_execution_contract import summarize_trade_execution_contract
 from tests.paper_canary_fixtures import (
     bounded_legacy_fill_drift_raw,
@@ -155,6 +156,25 @@ def test_complete_executed_paper_canary_uses_its_own_entry_contract() -> None:
         "paper_bootstrap_canary"
     )
     assert report["entry_contracts"][0]["production_permission"] is False
+
+
+def test_compact_decision_projection_preserves_paper_canary_contract() -> None:
+    compact = _compact_decision_learning_snapshot(complete_paper_canary_raw())
+
+    report = summarize_trade_execution_contract(
+        [_decision(13, "long", compact)],
+        orders=[
+            SimpleNamespace(
+                decision_id=13,
+                status="filled",
+                quantity=0.5,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
 
 
 def test_malformed_executed_paper_canary_still_fails_closed() -> None:

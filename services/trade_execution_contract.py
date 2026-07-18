@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from math import isclose, isfinite
+from types import SimpleNamespace
 from typing import Any
 
 from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
@@ -62,15 +63,27 @@ class TradeExecutionContractService:
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
             decisions = list(
-                (
+                SimpleNamespace(**dict(row))
+                for row in (
                     await session.execute(
-                        select(AIDecision)
-                        .where(AIDecision.created_at >= since_naive)
+                        select(
+                            AIDecision.id,
+                            AIDecision.symbol,
+                            AIDecision.action,
+                            AIDecision.was_executed,
+                            AIDecision.decision_learning_snapshot.label(
+                                "raw_llm_response"
+                            ),
+                        )
+                        .where(
+                            AIDecision.created_at >= since_naive,
+                            AIDecision.decision_learning_snapshot_version >= 1,
+                        )
                         .order_by(AIDecision.id.desc())
                         .limit(capped_limit)
                     )
                 )
-                .scalars()
+                .mappings()
                 .all()
             )
             orders = list(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -138,16 +139,22 @@ class ProductionSourceHealthService:
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with get_read_session_ctx() as session:
             result = await session.execute(
-                select(AIDecision)
+                select(
+                    AIDecision.created_at,
+                    AIDecision.analysis_type,
+                    AIDecision.was_executed,
+                    AIDecision.decision_learning_snapshot.label("raw_llm_response"),
+                )
                 .where(
                     AIDecision.created_at >= since,
                     AIDecision.analysis_type == "market",
+                    AIDecision.decision_learning_snapshot_version >= 1,
                 )
                 .order_by(AIDecision.created_at.desc())
                 .limit(capped_limit)
             )
         report = summarize_production_source_health(
-            list(result.scalars().all()),
+            [SimpleNamespace(**dict(row)) for row in result.mappings().all()],
             decision_interval_seconds=decision_interval_seconds,
         )
         report["window_hours"] = capped_hours

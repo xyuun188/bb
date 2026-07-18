@@ -9,6 +9,7 @@ import sys
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from db.session import get_session_ctx  # noqa: E402
+from db.session import get_read_session_ctx  # noqa: E402
 from models.decision import AIDecision  # noqa: E402
 from models.learning import (  # noqa: E402
     ExpertMemory,
@@ -28,7 +29,12 @@ from models.learning import (  # noqa: E402
 from services.text_integrity import looks_like_mojibake, repair_mojibake  # noqa: E402
 
 TEXT_AUDIT_FIELDS: dict[str, tuple[str, ...]] = {
-    "ai_decisions": ("reasoning", "execution_reason", "feature_snapshot", "raw_llm_response"),
+    "ai_decisions": (
+        "reasoning",
+        "execution_reason",
+        "feature_snapshot",
+        "decision_learning_snapshot",
+    ),
     "strategy_learning_events": (
         "reason",
         "scheduler_reason",
@@ -40,7 +46,7 @@ TEXT_AUDIT_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "expert_memories": ("market_pattern", "lesson", "recommended_action", "extra"),
     "trade_reflections": ("mistake_summary", "improvement_summary", "expert_lessons"),
-    "shadow_backtests": ("feature_snapshot", "raw_llm_response", "note"),
+    "shadow_backtests": ("training_feature_snapshot", "note"),
 }
 
 MODEL_BY_TABLE = {
@@ -171,16 +177,23 @@ async def collect_runtime_text_integrity_report(
 ) -> dict[str, Any]:
     since = datetime.now(UTC) - timedelta(hours=max(1, int(hours or 24)))
     collected: list[tuple[str, Any]] = []
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         for table, model in MODEL_BY_TABLE.items():
-            stmt = (
-                select(model).order_by(model.id.desc()).limit(max(1, int(limit_per_table or 200)))
+            selected_columns = [model.id, model.created_at, model.updated_at]
+            selected_columns.extend(
+                getattr(model, field) for field in TEXT_AUDIT_FIELDS.get(table, ())
+            )
+            stmt = select(*selected_columns).order_by(model.id.desc()).limit(
+                max(1, int(limit_per_table or 200))
             )
             created_at = getattr(model, "created_at", None)
             if created_at is not None:
                 stmt = stmt.where(created_at >= since)
             result = await session.execute(stmt)
-            collected.extend((table, row) for row in result.scalars().all())
+            collected.extend(
+                (table, SimpleNamespace(**dict(row)))
+                for row in result.mappings().all()
+            )
     return build_runtime_text_integrity_report(collected, example_limit=example_limit)
 
 

@@ -91,6 +91,15 @@ def test_build_runtime_text_integrity_report_returns_ok_for_clean_rows() -> None
     assert report["examples"] == []
 
 
+def test_runtime_text_scan_uses_compact_decision_and_shadow_projections() -> None:
+    assert "decision_learning_snapshot" in audit_module.TEXT_AUDIT_FIELDS["ai_decisions"]
+    assert "raw_llm_response" not in audit_module.TEXT_AUDIT_FIELDS["ai_decisions"]
+    assert audit_module.TEXT_AUDIT_FIELDS["shadow_backtests"] == (
+        "training_feature_snapshot",
+        "note",
+    )
+
+
 @pytest.mark.asyncio
 async def test_async_main_reports_structured_warning_when_scan_fails(
     monkeypatch: pytest.MonkeyPatch,
