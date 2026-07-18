@@ -20,6 +20,12 @@ class _FakeLogger:
     def warning(self, message: str, **kwargs: Any) -> None:
         self.events.append(("warning", message, kwargs))
 
+    def debug(self, message: str, **kwargs: Any) -> None:
+        self.events.append(("debug", message, kwargs))
+
+    def error(self, message: str, **kwargs: Any) -> None:
+        self.events.append(("error", message, kwargs))
+
 
 class _FailingBalanceCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
@@ -1375,6 +1381,43 @@ async def test_okx_entry_instrument_availability_uses_private_account_and_cache(
     assert pi["error_code"] == "51001"
     assert pi_cached["cache_hit"] is True
     assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT", "PI/USDT:USDT"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_instrument_shortlist_stops_after_ranked_target() -> None:
+    exchange = _EntryInstrumentAvailabilityCcxt()
+    executor = _executor(exchange)
+
+    result = await executor.entry_instrument_availability_shortlist(
+        ["PI/USDT", "BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        target_count=1,
+        concurrency=4,
+    )
+
+    assert result["selected_symbols"] == ["BTC/USDT"]
+    assert result["evaluated_count"] == 2
+    assert result["probed_count"] == 2
+    assert result["skipped_after_target_count"] == 2
+    assert exchange.fetch_leverage_calls == ["PI/USDT:USDT", "BTC/USDT:USDT"]
+    assert result["availability"]["ETH/USDT"]["available"] is None
+
+
+@pytest.mark.asyncio
+async def test_okx_expected_instrument_rejection_is_not_logged_as_exchange_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(okx_module, "logger", fake_logger)
+
+    result = await _executor(_EntryInstrumentAvailabilityCcxt()).entry_instrument_availability(
+        "PI/USDT"
+    )
+
+    assert result["reason"] == "okx_private_entry_instrument_unavailable"
+    assert not [event for event in fake_logger.events if event[0] == "error"]
+    assert ("debug", "OKX SDK expected capability rejection") == tuple(
+        fake_logger.events[-1][:2]
+    )
 
 
 @pytest.mark.asyncio

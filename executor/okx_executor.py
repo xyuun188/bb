@@ -53,6 +53,7 @@ OKX_TIME_DIFFERENCE_SYNC_TIMEOUT = 3.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
+OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
 
 class TokenBucket:
@@ -392,10 +393,21 @@ class OKXExecutor(AbstractExecutor):
         self._markets_loaded = False
         await self.initialize()
 
-    async def _with_retry(self, fn, *args, **kwargs):
+    async def _with_retry(
+        self,
+        fn,
+        *args,
+        _expected_error_codes: set[str] | frozenset[str] | None = None,
+        **kwargs,
+    ):
         """Execute an API call with retry + rate limit handling."""
         last_error = None
         method_name = getattr(fn, "__name__", "")
+        expected_error_codes = {
+            str(code).strip()
+            for code in (_expected_error_codes or set())
+            if str(code).strip()
+        }
         for attempt in range(MAX_RETRIES):
             try:
                 await self._rate_limiter.wait_for_token()
@@ -421,6 +433,7 @@ class OKXExecutor(AbstractExecutor):
                 ) from e
             except ExchangeAPIError as e:
                 message = safe_error_text(e)
+                error_code = self._exchange_error_code(e, message)
                 if self._is_time_difference_error(message) and attempt < MAX_RETRIES - 1:
                     logger.warning(
                         "OKX SDK time drift detected; resyncing and retrying",
@@ -447,10 +460,17 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
-                logger.error("OKX SDK exchange error", error=message)
+                if error_code in expected_error_codes:
+                    logger.debug(
+                        "OKX SDK expected capability rejection",
+                        method=method_name,
+                        error_code=error_code,
+                    )
+                else:
+                    logger.error("OKX SDK exchange error", error=message)
                 raise ExchangeAPIError(
                     message,
-                    code=getattr(e, "code", None),
+                    code=error_code or getattr(e, "code", None),
                     payload=getattr(e, "payload", None),
                 ) from e
             except Exception as e:
@@ -486,6 +506,14 @@ class OKXExecutor(AbstractExecutor):
                 raise
 
         raise RateLimitError(f"Max retries exceeded: {safe_error_text(last_error)}")
+
+    @staticmethod
+    def _exchange_error_code(exc: BaseException, message: str = "") -> str:
+        code = str(getattr(exc, "code", "") or "").strip()
+        if code:
+            return code
+        match = re.search(r"\[(\d{5})\]", str(message or ""))
+        return match.group(1) if match else ""
 
     @staticmethod
     def _is_rate_limit_error(message: Any) -> bool:
@@ -4684,6 +4712,7 @@ class OKXExecutor(AbstractExecutor):
                 fetch_leverage,
                 resolved_symbol,
                 {"mgnMode": "cross"},
+                _expected_error_codes={"51001"},
             )
             result = {
                 "available": True,
@@ -4700,7 +4729,7 @@ class OKXExecutor(AbstractExecutor):
             ttl = OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS
         except Exception as exc:
             error_text = safe_error_text(exc, limit=220)
-            error_code = str(getattr(exc, "code", "") or "")
+            error_code = self._exchange_error_code(exc, error_text)
             unavailable = error_code == "51001" or "[51001]" in error_text
             result = {
                 "available": False,
@@ -4720,12 +4749,74 @@ class OKXExecutor(AbstractExecutor):
                 "cache_hit": False,
             }
             ttl = (
-                OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS
+                OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
                 if unavailable
                 else OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS
             )
         self._entry_instrument_availability_cache[inst_id] = (dict(result), now, ttl)
         return result
+
+    async def entry_instrument_availability_shortlist(
+        self,
+        symbols: list[str],
+        *,
+        target_count: int,
+        concurrency: int = 4,
+    ) -> dict[str, Any]:
+        """Probe ranked instruments in bounded batches and stop once the target is met."""
+
+        target = max(0, int(target_count or 0))
+        ordered_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols if str(symbol)))
+        if target <= 0 or not ordered_symbols:
+            return {
+                "selected_symbols": [],
+                "availability": {},
+                "evaluated_count": 0,
+                "probed_count": 0,
+                "cache_hit_count": 0,
+                "skipped_after_target_count": len(ordered_symbols),
+            }
+
+        batch_size = max(1, min(int(concurrency or 1), target, len(ordered_symbols)))
+        selected: list[str] = []
+        availability: dict[str, dict[str, Any]] = {}
+        evaluated_count = 0
+        probed_count = 0
+        cache_hit_count = 0
+
+        for offset in range(0, len(ordered_symbols), batch_size):
+            if len(selected) >= target:
+                break
+            batch = ordered_symbols[offset : offset + batch_size]
+            facts_rows = await asyncio.gather(
+                *(self.entry_instrument_availability(symbol) for symbol in batch)
+            )
+            for symbol, facts in zip(batch, facts_rows, strict=True):
+                normalized_facts = dict(facts) if isinstance(facts, dict) else {}
+                availability[symbol] = normalized_facts
+                evaluated_count += 1
+                if normalized_facts.get("cache_hit") is True:
+                    cache_hit_count += 1
+                else:
+                    probed_count += 1
+                if normalized_facts.get("available") is True and len(selected) < target:
+                    selected.append(symbol)
+
+        for symbol in ordered_symbols[evaluated_count:]:
+            availability[symbol] = {
+                "available": None,
+                "reason": "okx_private_entry_instrument_not_probed_after_target_filled",
+                "cache_hit": False,
+            }
+
+        return {
+            "selected_symbols": selected,
+            "availability": availability,
+            "evaluated_count": evaluated_count,
+            "probed_count": probed_count,
+            "cache_hit_count": cache_hit_count,
+            "skipped_after_target_count": max(len(ordered_symbols) - evaluated_count, 0),
+        }
 
     async def pre_order_execution_facts(
         self,

@@ -2200,17 +2200,38 @@ async def test_paper_market_shortlist_uses_private_instrument_availability() -> 
     }
 
     class FakeExecutor:
-        async def entry_instrument_availability(self, symbol: str) -> dict[str, Any]:
-            available = symbol in {"BTC/USDT", "ETH/USDT"}
+        async def entry_instrument_availability_shortlist(
+            self,
+            symbols: list[str],
+            *,
+            target_count: int,
+            concurrency: int,
+        ) -> dict[str, Any]:
+            assert target_count == 2
+            assert concurrency == 4
+            availability = {}
+            selected = []
+            for symbol in symbols:
+                available = symbol in {"BTC/USDT", "ETH/USDT"}
+                availability[symbol] = {
+                    "available": available,
+                    "reason": (
+                        "okx_private_account_instrument_verified"
+                        if available
+                        else "okx_private_entry_instrument_unavailable"
+                    ),
+                    "error_code": None if available else "51001",
+                    "cache_hit": False,
+                }
+                if available and len(selected) < target_count:
+                    selected.append(symbol)
             return {
-                "available": available,
-                "reason": (
-                    "okx_private_account_instrument_verified"
-                    if available
-                    else "okx_private_entry_instrument_unavailable"
-                ),
-                "error_code": None if available else "51001",
-                "cache_hit": False,
+                "selected_symbols": selected,
+                "availability": availability,
+                "evaluated_count": len(symbols),
+                "probed_count": len(symbols),
+                "cache_hit_count": 0,
+                "skipped_after_target_count": 0,
             }
 
     async def executor_provider(_mode: str) -> FakeExecutor:

@@ -4564,30 +4564,21 @@ class TradingService:
         if target <= 0 or not feature_vectors:
             return {}
         executor = await self._get_okx_executor_for_mode("paper")
-        semaphore = asyncio.Semaphore(4)
-
-        async def probe(symbol: str) -> tuple[str, dict[str, Any]]:
-            async with semaphore:
-                try:
-                    result = await executor.entry_instrument_availability(symbol)
-                except Exception as exc:
-                    result = {
-                        "available": False,
-                        "reason": "okx_private_entry_instrument_probe_failed",
-                        "error": safe_error_text(exc, limit=180),
-                    }
-                return symbol, result
-
-        probe_results = await asyncio.gather(
-            *(probe(symbol) for symbol in feature_vectors),
+        shortlist = await executor.entry_instrument_availability_shortlist(
+            list(feature_vectors),
+            target_count=target,
+            concurrency=4,
         )
-        availability = {symbol: facts for symbol, facts in probe_results}
+        availability = self._safe_dict(shortlist.get("availability"))
+        selected_order = [
+            str(symbol)
+            for symbol in (shortlist.get("selected_symbols") or [])
+            if str(symbol) in feature_vectors
+        ]
         selected = {
             symbol: feature_vectors[symbol]
-            for symbol in feature_vectors
-            if self._safe_dict(availability.get(symbol)).get("available") is True
+            for symbol in selected_order
         }
-        selected = dict(list(selected.items())[:target])
         selected_symbols = set(selected)
         unavailable = [
             {
@@ -4596,8 +4587,8 @@ class TradingService:
                 "error_code": self._safe_dict(facts).get("error_code"),
                 "cache_hit": self._safe_dict(facts).get("cache_hit"),
             }
-            for symbol, facts in probe_results
-            if self._safe_dict(facts).get("available") is not True
+            for symbol, facts in availability.items()
+            if self._safe_dict(facts).get("available") is False
         ]
         diagnostics = self._safe_dict(
             getattr(self, "_last_auto_feature_rank_diagnostics", None)
@@ -4605,10 +4596,15 @@ class TradingService:
         diagnostics["execution_availability"] = {
             "source": "okx_private_account_leverage_info",
             "mode": "paper",
-            "probed_count": len(probe_results),
+            "evaluated_count": int(shortlist.get("evaluated_count") or 0),
+            "probed_count": int(shortlist.get("probed_count") or 0),
+            "cache_hit_count": int(shortlist.get("cache_hit_count") or 0),
+            "skipped_after_target_count": int(
+                shortlist.get("skipped_after_target_count") or 0
+            ),
             "available_count": sum(
                 self._safe_dict(facts).get("available") is True
-                for _symbol, facts in probe_results
+                for facts in availability.values()
             ),
             "selected_count": len(selected),
             "target_count": target,
@@ -4629,7 +4625,7 @@ class TradingService:
                 item["execution_instrument_available"] = facts.get("available") is True
                 item["execution_instrument_reason"] = facts.get("reason")
                 item["selected"] = symbol in selected_symbols
-                if facts.get("available") is not True:
+                if facts.get("available") is False:
                     item["non_selected_reason"] = "paper_execution_instrument_unavailable"
         diagnostics["symbols"] = [
             item
