@@ -4315,6 +4315,31 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     deterministic_position_order_match: '历史仓位与订单可确定匹配，等待受控补链',
     missing_matching_entry_order: '历史仓位缺少可确认的开仓订单链接',
     missing_matching_close_order: '历史仓位缺少可确认的平仓订单链接',
+    okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据',
+    okx_protection_inventory_unavailable: 'OKX 保护单快照读取失败',
+    okx_protection_evidence_unavailable: 'OKX 保护证据读取失败',
+    position_risk_evidence_unavailable: '仓位风险证据读取失败',
+    missing_okx_position_protection: '当前 OKX 仓位缺少止盈止损保护单',
+    okx_protection_quantity_coverage_mismatch: 'OKX 保护单数量未完整覆盖当前仓位',
+    invalid_okx_protection_order: 'OKX 保护单合同无效',
+    profit_risk_sizing_missing: '历史决策未保存独立风险定仓合同',
+    profit_risk_sizing_not_production_eligible: '历史入场风险合同当时未达到生产执行条件',
+    risk_contract_version_missing: '历史入场记录未保存风险合同版本',
+    independent_risk_budget_missing: '历史入场记录未保存独立风险预算',
+    planned_stressed_loss_missing: '历史入场记录未保存计划压力损失',
+    target_notional_missing: '历史入场记录未保存目标仓位名义价值',
+    final_notional_missing: '历史入场记录未保存最终仓位名义价值',
+    portfolio_stressed_loss_missing: '历史入场记录未保存组合压力损失',
+    portfolio_gross_notional_missing: '历史入场记录未保存组合总名义价值',
+    risk_contract_fingerprint_missing: '历史入场记录未保存风险合同指纹',
+    local_position_lineage_missing: '本地仓位缺少可追溯的入场链路',
+    entry_decision_risk_contract_missing: '入场决策缺少可追溯的风险合同',
+    final_notional_reduced_from_dynamic_target: '最终仓位已按下游风险约束缩减',
+    production_return_distribution_missing: '缺少生产收益分布证据',
+    live_execution_cost_missing: '缺少实时执行成本证据',
+    expected_net_breakdown_missing: '缺少费后预期收益拆分',
+    production_return_policy_missing: '缺少生产收益准入合同',
+    'position size capped by stress-stop budget to prevent small-win-big-loss structure': '仓位已按压力止损预算缩小，避免小赚大亏结构',
     'timed out': '请求超时',
     TimeoutError: '请求超时',
     ReadTimeout: '读取响应超时',
@@ -4330,12 +4355,29 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     unavailable: '当前不可用',
 });
 
+function dashboardDiagnosticDetailText(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    if (/[\u3400-\u9fff]/.test(text)) return text;
+    if (/timed?\s*out|timeout|ReadTimeout/i.test(text)) return '请求超时';
+    if (/connection refused|could not connect|connect error|network error/i.test(text)) return '底层连接失败';
+    if (/okx executor unavailable/i.test(text)) return 'OKX 执行器不可用';
+    if (/OCO inventory unavailable/i.test(text)) return 'OCO 保护单快照不可用';
+    if (/risk evidence store unavailable/i.test(text)) return '风险证据存储不可用';
+    return '';
+}
+
 function dashboardReasonText(value) {
     const item = value && typeof value === 'object' ? value : {};
     const code = String(item.code || item.reason || (typeof value === 'string' ? value : '') || '').trim();
     const message = String(item.message || '').trim();
     const rawText = message || code;
-    if (DASHBOARD_REASON_TEXT[code]) return DASHBOARD_REASON_TEXT[code];
+    const [baseCode, ...detailParts] = code.split(':');
+    const registeredText = DASHBOARD_REASON_TEXT[code] || DASHBOARD_REASON_TEXT[baseCode];
+    if (registeredText) {
+        const detailText = dashboardDiagnosticDetailText(detailParts.join(':'));
+        return detailText ? `${registeredText}（${detailText}）` : registeredText;
+    }
     if (code.startsWith('paper_observation_unsafe:')) {
         return `模拟盘观察存在不安全项：${code.split(':').slice(1).join(':')}`;
     }
@@ -4367,6 +4409,14 @@ function dashboardReasonText(value) {
             return_distribution_input_version_mismatch: '收益分布输入版本不匹配',
         };
         if (sideReasons[suffix]) return `${sideText}${sideReasons[suffix]}`;
+    }
+    const dynamicReasons = [
+        [/^position_\d+_entry_order_lineage_missing$/, '历史仓位未保存开仓订单链路'],
+        [/^position_\d+_entry_order_not_loaded$/, '历史仓位关联的开仓订单已不在当前保留窗口'],
+        [/^entry_order_.+_decision_not_loaded$/, '历史开仓订单关联的决策已不在当前保留窗口'],
+    ];
+    for (const [pattern, text] of dynamicReasons) {
+        if (pattern.test(baseCode)) return text;
     }
     if (/Unterminated string/i.test(rawText)) {
         return '状态响应被截断，JSON 不完整；这属于监控读取错误，不代表模型损坏';
@@ -8407,7 +8457,7 @@ function openPositionEvidenceModal(positionIndex) {
                         <div><span>同方向 notional</span><strong>${positionEvidenceValue(portfolio.same_side_notional_usdt, ' U')}</strong></div>
                         <div><span>方向集中度</span><strong>${distributionProbabilityLabel(portfolio.direction_concentration)}</strong></div>
                     </div>
-                    <div class="position-evidence-reasons"><b>调整原因</b><span>${adjustments.length ? adjustments.map(item => escHtml(item)).join(' / ') : '目标与最终仓位一致，无下游缩减记录'}</span></div>
+                    <div class="position-evidence-reasons"><b>调整原因</b><span>${adjustments.length ? adjustments.map(item => escHtml(dashboardReasonText(item))).join(' / ') : '目标与最终仓位一致，无下游缩减记录'}</span></div>
                     <div class="position-evidence-provenance"><span>版本 ${escHtml(contract.contract_version || '缺失')}</span><span>指纹 ${escHtml(contract.policy_provenance?.contract_fingerprint || '缺失')}</span></div>
                     ${positionEvidenceBlockers(contract.blockers)}
                 </article>`;

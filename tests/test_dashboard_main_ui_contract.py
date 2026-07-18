@@ -477,7 +477,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260715-profit-evidence" in html
+    assert "dashboard.js?v=20260718-reason-catalog" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -617,7 +617,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260715-profit-evidence" in html
+    assert "dashboard.js?v=20260718-reason-catalog" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -774,7 +774,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260715-profit-evidence" in html
+    assert "dashboard.js?v=20260718-reason-catalog" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -963,6 +963,11 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "average_fee_after_return_not_positive: '平均费后收益不为正'" in reason_block
     assert "样本外盈亏比没有高于自然盈亏平衡线 1" in reason_block
     assert "const rawText = message || code" in reason_block
+    assert "const [baseCode, ...detailParts] = code.split(':')" in reason_block
+    assert "DASHBOARD_REASON_TEXT[code] || DASHBOARD_REASON_TEXT[baseCode]" in reason_block
+    assert "okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据'" in reason_block
+    assert "risk_contract_version_missing: '历史入场记录未保存风险合同版本'" in reason_block
+    assert "历史开仓订单关联的决策已不在当前保留窗口" in reason_block
     assert "/Unterminated string/i.test(rawText)" in reason_block
     assert "系统返回了未中文化的异常说明，已按问题处理" in reason_block
     assert "当前新增待训练样本" in overview_block
@@ -972,6 +977,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "const SYSTEM_AUDIT_NODE_LABELS" in script
     assert "upstream.map(systemAuditNodeLabel)" in script
     assert "downstream.map(systemAuditNodeLabel)" in script
+    assert "adjustments.map(item => escHtml(dashboardReasonText(item)))" in script
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
