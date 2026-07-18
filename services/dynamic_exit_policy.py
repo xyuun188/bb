@@ -15,6 +15,7 @@ from services.current_position_management import (
     current_position_management_contract_complete,
 )
 from services.dynamic_policy_values import continuous_budget_fraction
+from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -64,6 +65,9 @@ class DynamicExitAssessment:
     opposite_pressure: float
     portfolio_exposure_pressure: float
     planned_stop_crossed: bool
+    paper_canary_horizon_elapsed: bool
+    paper_canary_horizon_minutes: int
+    paper_canary_expires_at: str | None
     current_management_contract_versions: tuple[str, ...]
     policy_provenance: dict[str, Any]
 
@@ -105,6 +109,7 @@ def assess_dynamic_exit(
     planned_stop_crossed = False
     management_contracts: list[dict[str, Any]] = []
     management_pressure_values: list[float] = []
+    canary_horizon_assessments: list[dict[str, Any]] = []
     for position in matches:
         qty = abs(
             _safe_float(
@@ -141,7 +146,11 @@ def assess_dynamic_exit(
         if reported is not None:
             pnl = _safe_float(reported, 0.0)
         elif qty > 0 and entry > 0 and current > 0:
-            pnl = (current - entry) * qty if _position_side(position) == "long" else (entry - current) * qty
+            pnl = (
+                (current - entry) * qty
+                if _position_side(position) == "long"
+                else (entry - current) * qty
+            )
         else:
             pnl = 0.0
         gross_pnl += pnl
@@ -191,6 +200,7 @@ def assess_dynamic_exit(
         )
         management = _safe_dict(position.get("current_management_contract"))
         management_contracts.append(management)
+        canary_horizon_assessments.append(assess_paper_canary_position_horizon(position))
         if management.get("management_eligible") is True and not management.get("blockers"):
             management_pressure_values.append(
                 _clamp(_safe_float(management.get("portfolio_concentration_pressure"), 0.0))
@@ -206,18 +216,18 @@ def assess_dynamic_exit(
     fee_buffer = entry_fees + close_fee
     net_pnl = gross_pnl - fee_buffer
     peak_profit = max(peak_profit, gross_pnl)
-    retrace = (
-        _clamp((peak_profit - gross_pnl) / peak_profit)
-        if peak_profit > 0
-        else 0.0
-    )
+    retrace = _clamp((peak_profit - gross_pnl) / peak_profit) if peak_profit > 0 else 0.0
     hard_risk = planned_stop_crossed
+    elapsed_canary_horizons = [
+        item
+        for item in canary_horizon_assessments
+        if item.get("authorized") is True and item.get("elapsed") is True
+    ]
+    paper_canary_horizon_elapsed = bool(elapsed_canary_horizons)
     stop_usage = (
         _clamp(max(-net_pnl, 0.0) / planned_risk)
         if planned_risk > 0
-        else _clamp(max(-net_pnl, 0.0) / notional)
-        if notional > 0
-        else 0.0
+        else _clamp(max(-net_pnl, 0.0) / notional) if notional > 0 else 0.0
     )
     target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
     feature_snapshot = _safe_dict(decision.feature_snapshot)
@@ -229,8 +239,7 @@ def assess_dynamic_exit(
     adverse_move = sum(
         abs(value)
         for value in market_returns
-        if (target_side == "long" and value < 0.0)
-        or (target_side == "short" and value > 0.0)
+        if (target_side == "long" and value < 0.0) or (target_side == "short" and value > 0.0)
     )
     continuation = _clamp(adverse_move / total_move) if total_move > 0.0 else 0.0
     opposite = 0.0
@@ -264,7 +273,7 @@ def assess_dynamic_exit(
     )
     close_fraction = (
         1.0
-        if hard_risk
+        if hard_risk or paper_canary_horizon_elapsed
         else continuous_budget_fraction(
             retrace,
             stop_usage,
@@ -278,9 +287,16 @@ def assess_dynamic_exit(
         reasons.append("position_economics_missing")
     if not hard_risk and matches and not current_management_contract_complete:
         reasons.append("current_position_management_contract_incomplete")
-    if not hard_risk and close_fraction <= 0:
+    if not hard_risk and not paper_canary_horizon_elapsed and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
-    if not hard_risk and gross_pnl > 0 and net_pnl <= 0 and stop_usage <= 0 and continuation <= 0:
+    if (
+        not hard_risk
+        and not paper_canary_horizon_elapsed
+        and gross_pnl > 0
+        and net_pnl <= 0
+        and stop_usage <= 0
+        and continuation <= 0
+    ):
         reasons.append("fee_after_profit_not_positive")
     if not hard_risk and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
@@ -311,6 +327,19 @@ def assess_dynamic_exit(
         opposite_pressure=round(opposite, 8),
         portfolio_exposure_pressure=round(portfolio_pressure, 8),
         planned_stop_crossed=planned_stop_crossed,
+        paper_canary_horizon_elapsed=paper_canary_horizon_elapsed,
+        paper_canary_horizon_minutes=max(
+            (int(item.get("horizon_minutes") or 0) for item in elapsed_canary_horizons),
+            default=0,
+        ),
+        paper_canary_expires_at=next(
+            (
+                str(item.get("expires_at"))
+                for item in elapsed_canary_horizons
+                if item.get("expires_at")
+            ),
+            None,
+        ),
         current_management_contract_versions=tuple(
             sorted(
                 {
@@ -335,9 +364,7 @@ def apply_dynamic_exit(
     raw["action_plan"] = (
         "close"
         if assessment.close_fraction >= 1.0
-        else "reduce"
-        if assessment.close_fraction > 0.0
-        else "hold"
+        else "reduce" if assessment.close_fraction > 0.0 else "hold"
     )
     decision.raw_response = raw
     decision.position_size_pct = assessment.close_fraction

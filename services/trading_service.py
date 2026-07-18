@@ -138,7 +138,10 @@ from services.okx_order_fact_sync import OkxOrderFactSyncService
 from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncService
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
-from services.paper_bootstrap_canary import PaperBootstrapCanaryPolicy
+from services.paper_bootstrap_canary import (
+    PaperBootstrapCanaryPolicy,
+    assess_paper_canary_position_horizon,
+)
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -2399,6 +2402,18 @@ class TradingService:
         group_budget = remaining / max(1, int(groups_remaining or 1))
         return min(float(round_deadline), now + group_budget)
 
+    def _position_review_slow_group_capacity(
+        self,
+        round_deadline: float | None,
+    ) -> int | None:
+        """Limit slow reviews to the groups that can fit before the round watchdog."""
+
+        remaining = self._remaining_monotonic_seconds(round_deadline)
+        if remaining is None:
+            return None
+        stage_budget = max(self.position_review_stage_timeout_seconds(), 0.25)
+        return max(1, int(remaining // stage_budget))
+
     def _append_position_review_budget_warning(
         self,
         *,
@@ -4242,8 +4257,6 @@ class TradingService:
         perf_timeout = self.strategy_learning_perf_timeout_seconds()
         account_timeout = self.strategy_learning_account_timeout_seconds()
         context_fetch_timings: dict[str, Any] = {}
-        analysis_scope = _analysis_scope_context.get()
-
         if not open_positions:
             try:
                 self._safe_set_strategy_context_stage("strategy_context:open_positions")
@@ -4263,13 +4276,6 @@ class TradingService:
         performance_refresh = None
         if performance_snapshot.get("status") != "fresh":
             performance_refresh = self._start_strategy_context_performance_refresh(selected_mode)
-        if performance_values is None and analysis_scope != "market":
-            if performance_refresh is not None:
-                done, _pending = await asyncio.wait({performance_refresh}, timeout=perf_timeout)
-                if done:
-                    performance_values, performance_snapshot = (
-                        self._recent_strategy_context_performance_snapshot(selected_mode)
-                    )
         performance_snapshot["refresh_in_flight"] = bool(
             performance_refresh is not None and not performance_refresh.done()
         )
@@ -4325,7 +4331,7 @@ class TradingService:
         try:
             self._safe_set_strategy_context_stage("strategy_context:learning")
             current_scope = _analysis_scope_context.get()
-            if current_scope == "market":
+            if current_scope in {"market", "position"}:
                 cached_context = self._recent_strategy_learning_context(selected_mode)
                 refresh_task = self._start_strategy_learning_context_refresh(
                     mode=selected_mode,
@@ -5740,10 +5746,7 @@ class TradingService:
                     model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
                     rank_limit = market_symbol_budget
                     if model_mode == "paper":
-                        rank_limit = min(
-                            len(market_feature_vectors),
-                            max(market_symbol_budget * 4, market_symbol_budget),
-                        )
+                        rank_limit = len(market_feature_vectors)
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, rank_limit
                     )
@@ -6299,7 +6302,6 @@ class TradingService:
                         decision,
                         model_mode,
                         open_positions,
-                        deadline_monotonic=market_ai_deadline_monotonic,
                         timing_scope="market_decision_persistence",
                     )
                     self.paper_bootstrap_canary.demote_blocked_candidate_to_hold(
@@ -8499,12 +8501,21 @@ class TradingService:
             position_snapshot["peak_unrealized_pnl"] = self._safe_float(
                 peak_state.get("peak_unrealized_pnl"), current_unrealized
             )
+            canary_horizon = assess_paper_canary_position_horizon(position_snapshot)
 
             close_action = Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT
             trigger = (
                 "stop_loss"
                 if stop_crossed
-                else "take_profit" if target_crossed else "dynamic_position_scan"
+                else (
+                    "take_profit"
+                    if target_crossed
+                    else (
+                        "paper_canary_horizon"
+                        if canary_horizon.get("elapsed") is True
+                        else "dynamic_position_scan"
+                    )
+                )
             )
             close_decision = DecisionOutput(
                 model_name=model_name,
@@ -8518,9 +8529,12 @@ class TradingService:
                 take_profit_pct=0.0,
                 raw_response={
                     "fast_risk_trigger": trigger,
-                    "forced_exit": bool(stop_crossed or target_crossed),
+                    "forced_exit": bool(
+                        stop_crossed or target_crossed or canary_horizon.get("elapsed") is True
+                    ),
                     "close_evidence": {
                         "hard_risk": stop_crossed,
+                        "paper_canary_horizon": canary_horizon,
                         "continuation_deteriorated": bool(adverse_returns),
                         "peak_unrealized_pnl_usdt": position_snapshot["peak_unrealized_pnl"],
                     },
@@ -8604,6 +8618,9 @@ class TradingService:
             grouped_items,
             fast_scan,
             max_groups_override=max_groups_override,
+            hard_max_groups_override=self._position_review_slow_group_capacity(
+                round_deadline_monotonic
+            ),
             defer_count_provider=self.position_review_defer_tracker.count,
             position_entry_pause_reason=position_entry_pause_reason,
             cursor=self._position_review_cursor,

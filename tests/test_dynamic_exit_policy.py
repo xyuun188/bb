@@ -1,8 +1,11 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.current_position_management import build_current_position_management_contract
 from services.dynamic_exit_policy import apply_dynamic_exit
+from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 
 
 def _decision(raw: dict | None = None) -> DecisionOutput:
@@ -130,9 +133,7 @@ def test_loss_uses_planned_stop_budget_continuously() -> None:
 
 
 def test_legacy_hard_risk_flag_without_position_economics_fails_closed() -> None:
-    decision = _decision(
-        {"close_evidence": {"hard_risk": True}, "fast_risk_trigger": "stop_loss"}
-    )
+    decision = _decision({"close_evidence": {"hard_risk": True}, "fast_risk_trigger": "stop_loss"})
 
     result = apply_dynamic_exit(decision, [])
 
@@ -212,3 +213,43 @@ def test_non_hard_exit_fails_closed_when_position_changed_after_contract_refresh
     assert result.eligible is False
     assert result.current_management_contract_complete is False
     assert "current_position_management_contract_incomplete" in result.reason
+
+
+def test_expired_paper_canary_horizon_closes_full_position() -> None:
+    position = _position(
+        execution_mode="paper",
+        peak_unrealized_pnl=10.0,
+        paper_canary_lifecycle={
+            "version": PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
+            "kind": "paper_bootstrap_canary_position",
+            "authorized": True,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "horizon_minutes": 10,
+            "expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        },
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.eligible is True
+    assert result.paper_canary_horizon_elapsed is True
+    assert result.close_fraction == 1.0
+
+
+def test_ordinary_position_is_not_closed_only_because_it_is_old() -> None:
+    result = apply_dynamic_exit(
+        _decision(),
+        [
+            _position(
+                execution_mode="paper",
+                created_at=datetime.now(UTC) - timedelta(days=1),
+                peak_unrealized_pnl=10.0,
+            )
+        ],
+    )
+
+    assert result.paper_canary_horizon_elapsed is False
+    assert result.close_fraction == 0.0

@@ -124,3 +124,20 @@ def test_missing_market_anchor_fails_closed_without_fixed_fallback() -> None:
     assert result.selected == {}
     assert result.diagnostics["rank_underfilled"] is True
     assert result.diagnostics["rank_underfill_reason"] == "missing_indicator_snapshot"
+
+
+def test_fallback_market_anchor_score_is_bounded_when_volatility_is_zero() -> None:
+    feature = _feature(
+        "KAITO/USDT",
+        indicator_snapshot_available=False,
+        returns_1=0.0,
+        returns_5=0.0,
+        returns_20=0.0,
+        volatility_20=0.0,
+        change_24h_pct=12.0,
+    )
+
+    score = _ranker().feature_opportunity_score(feature)
+
+    assert score < 20.0
+    assert score > 0.0

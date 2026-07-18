@@ -63,7 +63,14 @@ class EntryFeatureRankerPolicy:
         participation = math.log1p(max(volume_ratio, 0.0))
         trend_quality = math.log1p(max(adx_14, 0.0))
         realized_move = returns_1 + returns_5 + returns_20 + change_24h
-        move_efficiency = realized_move / max(volatility_20, abs(returns_1), 1e-12)
+        move_scale = max(
+            volatility_20,
+            returns_1,
+            returns_5,
+            returns_20,
+            1e-4,
+        )
+        move_efficiency = math.log1p(min(max(realized_move / move_scale, 0.0), 100.0))
         quality_inputs = [liquidity, participation, trend_quality, move_efficiency]
         return sum(quality_inputs) / len(quality_inputs)
 

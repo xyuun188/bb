@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,9 +15,12 @@ from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.execution_service import _return_entry_contract_result
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
+    PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
     PaperBootstrapCanaryPolicy,
     annotate_paper_bootstrap_opportunity,
+    assess_paper_canary_position_horizon,
+    build_paper_canary_position_lifecycle,
     select_paper_bootstrap_candidate,
 )
 
@@ -132,6 +135,52 @@ def test_paper_canary_selection_is_forbidden_in_live_mode() -> None:
 
     assert canary["authorized"] is False
     assert canary["reason"] == "paper_execution_mode_required"
+
+
+def test_executed_paper_canary_builds_expiring_position_lifecycle() -> None:
+    executed_at = datetime.now(UTC) - timedelta(minutes=11)
+    decision = SimpleNamespace(
+        id=123,
+        symbol="BTC/USDT",
+        action="long",
+        is_paper=True,
+        was_executed=True,
+        executed_at=executed_at,
+        raw_llm_response={"paper_bootstrap_canary": select_paper_bootstrap_candidate(_context())},
+    )
+
+    lifecycle = build_paper_canary_position_lifecycle(decision)
+    assessment = assess_paper_canary_position_horizon(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "execution_mode": "paper",
+            "paper_canary_lifecycle": lifecycle,
+        }
+    )
+
+    assert lifecycle["version"] == PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
+    assert lifecycle["horizon_minutes"] == 10
+    assert assessment["authorized"] is True
+    assert assessment["elapsed"] is True
+
+
+def test_paper_canary_horizon_fails_closed_for_malformed_lifecycle() -> None:
+    assessment = assess_paper_canary_position_horizon(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "execution_mode": "paper",
+            "paper_canary_lifecycle": {
+                "version": PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
+                "authorized": True,
+                "expires_at": "not-a-time",
+            },
+        }
+    )
+
+    assert assessment["authorized"] is False
+    assert assessment["elapsed"] is False
 
 
 def test_ensemble_emits_paper_canary_entry_when_production_source_is_absent() -> None:

@@ -93,3 +93,20 @@ def test_position_review_batch_counts_only_governed_priority() -> None:
     assert len(result.selected_items) == 3
     assert result.priority_selected_count == 3
     assert result.skipped_items == []
+
+
+def test_position_review_batch_hard_capacity_caps_urgent_slow_reviews() -> None:
+    items = [_item(f"SYM{index}/USDT") for index in range(5)]
+    fast_scan = {item[0]: _scan(1.0) for item in items}
+
+    result = _policy().select(
+        items,
+        fast_scan,
+        max_groups_override=5,
+        hard_max_groups_override=2,
+    )
+
+    assert result.urgent_exit_count == 5
+    assert result.max_groups == 2
+    assert len(result.selected_items) == 2
+    assert len(result.skipped_items) == 3

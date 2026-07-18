@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from math import sqrt
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -124,10 +125,7 @@ class ModelContributionPerformanceService:
         self._session_factory = session_factory
         self._model_name = model_name
         self._ledger_model_names = tuple(
-            dict.fromkeys(
-                ledger_model_names
-                or (model_name, OKX_AUTHORITATIVE_LEDGER_MODEL)
-            )
+            dict.fromkeys(ledger_model_names or (model_name, OKX_AUTHORITATIVE_LEDGER_MODEL))
         )
         self._lookback_days = float(lookback_days)
         self._position_limit = int(position_limit)
@@ -151,7 +149,22 @@ class ModelContributionPerformanceService:
         try:
             async with self._session_factory() as session:
                 positions_result = await session.execute(
-                    select(Position)
+                    select(
+                        Position.id,
+                        Position.model_name,
+                        Position.execution_mode,
+                        Position.symbol,
+                        Position.side,
+                        Position.realized_pnl,
+                        Position.current_price,
+                        Position.is_open,
+                        Position.created_at,
+                        Position.closed_at,
+                        Position.settlement_status,
+                        Position.settlement_raw,
+                        Position.entry_exchange_order_id,
+                        Position.close_exchange_order_id,
+                    )
                     .where(
                         Position.model_name.in_(self._ledger_model_names),
                         Position.execution_mode == selected_mode,
@@ -162,7 +175,7 @@ class ModelContributionPerformanceService:
                     .order_by(Position.closed_at.desc())
                     .limit(self._position_limit)
                 )
-                positions = list(positions_result.scalars().all())
+                positions = [SimpleNamespace(**dict(row._mapping)) for row in positions_result.all()]
                 if not positions:
                     self._cache_by_mode[selected_mode] = {
                         "expires_at": now + timedelta(minutes=15),
@@ -170,9 +183,7 @@ class ModelContributionPerformanceService:
                     }
                     return stats
 
-                positions = [
-                    pos for pos in positions if closed_position_trade_fact_trusted(pos)
-                ]
+                positions = [pos for pos in positions if closed_position_trade_fact_trusted(pos)]
                 symbols = {p.symbol for p in positions if p.symbol}
                 symbol_variants = symbol_query_variants(symbols)
                 close_times = [
@@ -186,7 +197,20 @@ class ModelContributionPerformanceService:
                     close_window_start = min(close_times) - grace
                     close_window_end = max(close_times) + grace
                     manual_close_result = await session.execute(
-                        select(Order).where(
+                        select(
+                            Order.id,
+                            Order.model_name,
+                            Order.execution_mode,
+                            Order.symbol,
+                            Order.side,
+                            Order.price,
+                            Order.status,
+                            Order.decision_id,
+                            Order.exchange_order_id,
+                            Order.filled_at,
+                            Order.created_at,
+                        )
+                        .where(
                             Order.model_name.in_(self._ledger_model_names),
                             Order.execution_mode == selected_mode,
                             Order.status == "filled",
@@ -201,7 +225,10 @@ class ModelContributionPerformanceService:
                             ),
                         )
                     )
-                    manual_close_orders = list(manual_close_result.scalars().all())
+                    manual_close_orders = [
+                        SimpleNamespace(**dict(row._mapping))
+                        for row in manual_close_result.all()
+                    ]
                 positions = [
                     pos
                     for pos in positions
@@ -227,7 +254,14 @@ class ModelContributionPerformanceService:
                     }
                     return stats
                 orders_result = await session.execute(
-                    select(Order)
+                    select(
+                        Order.id,
+                        Order.symbol,
+                        Order.decision_id,
+                        Order.exchange_order_id,
+                        Order.filled_at,
+                        Order.created_at,
+                    )
                     .where(
                         Order.model_name.in_(self._ledger_model_names),
                         Order.execution_mode == selected_mode,
@@ -237,14 +271,30 @@ class ModelContributionPerformanceService:
                     )
                     .order_by(Order.filled_at.desc(), Order.created_at.desc())
                 )
-                orders = list(orders_result.scalars().all())
+                orders = [SimpleNamespace(**dict(row._mapping)) for row in orders_result.all()]
                 decision_ids = [o.decision_id for o in orders if o.decision_id]
                 decisions: dict[int, AIDecision] = {}
                 if decision_ids:
                     decisions_result = await session.execute(
-                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                        select(
+                            AIDecision.id,
+                            AIDecision.action,
+                            AIDecision.raw_llm_response["opportunity_score"].label(
+                                "opportunity_score"
+                            ),
+                        )
+                        .where(AIDecision.id.in_(decision_ids))
                     )
-                    decisions = {d.id: d for d in decisions_result.scalars().all()}
+                    decisions = {
+                        int(row.id): SimpleNamespace(
+                            id=int(row.id),
+                            action=row.action,
+                            raw_llm_response={
+                                "opportunity_score": _safe_dict(row.opportunity_score)
+                            },
+                        )
+                        for row in decisions_result.all()
+                    }
         except Exception as exc:
             logger.warning(
                 "failed to calculate model contribution performance",
@@ -293,9 +343,7 @@ class ModelContributionPerformanceService:
     ) -> dict[str, Any]:
         """Explain whether realized positions can be linked back to entry decisions."""
 
-        position_list = [
-            pos for pos in positions if closed_position_trade_fact_trusted(pos)
-        ]
+        position_list = [pos for pos in positions if closed_position_trade_fact_trusted(pos)]
         order_list = list(orders)
         linked_orders = [order for order in order_list if getattr(order, "decision_id", None)]
         orders_with_loaded_decisions = [
@@ -447,9 +495,7 @@ class ModelContributionPerformanceService:
         state = (
             "positive_return_observation"
             if lcb > 0 and profit_factor is not None and profit_factor > 1
-            else "negative_return_observation"
-            if lcb < 0
-            else "uncertain_return_observation"
+            else "negative_return_observation" if lcb < 0 else "uncertain_return_observation"
         )
         bucket.update(
             {

@@ -50,6 +50,7 @@ class PositionReviewBatchPolicy:
         fast_scan: dict[tuple[str, str], dict[str, Any]],
         *,
         max_groups_override: int | None = None,
+        hard_max_groups_override: int | None = None,
         defer_count_provider: PositionReviewDeferCountProvider | None = None,
         position_entry_pause_reason: str | None = None,
         cursor: int = 0,
@@ -69,6 +70,8 @@ class PositionReviewBatchPolicy:
                 max_groups,
                 min(total_groups, self.urgent_exit_max_groups_per_round, len(urgent_items)),
             )
+        if hard_max_groups_override is not None:
+            max_groups = min(max_groups, max(1, int(hard_max_groups_override)))
 
         selected_items = self._unique_items(urgent_items)[:max_groups]
         selected_keys = {item[0] for item in selected_items}
@@ -84,20 +87,12 @@ class PositionReviewBatchPolicy:
 
         skipped_items = [item for item in sorted_items if item[0] not in selected_keys]
         defer_count_provider = defer_count_provider or (lambda _key: 0)
-        deferred_exit_count = sum(
-            1
-            for item in urgent_items
-            if defer_count_provider(item[0]) > 0
-        )
+        deferred_exit_count = sum(1 for item in urgent_items if defer_count_provider(item[0]) > 0)
         loss_watch_count = sum(
-            1
-            for item in urgent_items
-            if self._fee_after_pnl(fast_scan.get(item[0], {})) < 0.0
+            1 for item in urgent_items if self._fee_after_pnl(fast_scan.get(item[0], {})) < 0.0
         )
         profit_exit_count = sum(
-            1
-            for item in urgent_items
-            if self._profit_retrace(fast_scan.get(item[0], {})) > 0.0
+            1 for item in urgent_items if self._profit_retrace(fast_scan.get(item[0], {})) > 0.0
         )
         return PositionReviewBatchSelection(
             selected_items=selected_items,
@@ -111,9 +106,7 @@ class PositionReviewBatchPolicy:
             loss_watch_count=loss_watch_count,
             profit_exit_count=profit_exit_count,
             priority_selected_count=sum(
-                1
-                for item in selected_items
-                if self._eligible(fast_scan.get(item[0], {}))
+                1 for item in selected_items if self._eligible(fast_scan.get(item[0], {}))
             ),
         )
 

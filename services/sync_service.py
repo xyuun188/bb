@@ -7,6 +7,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
+from math import isclose
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,9 +26,15 @@ from core.trading_mode import mode_manager
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
+from models.decision import AIDecision
 from models.learning import TradeReflection
 from models.trade import Order, Position
+from services.current_position_management import (
+    CURRENT_POSITION_MANAGEMENT_KIND,
+    CURRENT_POSITION_MANAGEMENT_VERSION,
+)
 from services.exchange_position_state import parse_exchange_position_snapshot
+from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.position_open_time import parse_position_time, serialize_position_time
 from services.position_settlement import (
     SETTLEMENT_STATUS_SETTLING,
@@ -37,6 +44,7 @@ from services.position_settlement import (
     proportional_signed_value,
     settlement_payload_fields,
 )
+from services.trade_fact_trust import TRUSTED_OKX_ORDER_SYNC_STATUSES
 
 logger = structlog.get_logger(__name__)
 
@@ -51,6 +59,13 @@ RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
+
+
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        return
 
 
 def _first_value(*values: Any) -> Any:
@@ -182,7 +197,9 @@ def _merge_local_position_candidates(
         ):
             if merged.get(key) in (None, "") and candidate.get(key) not in (None, ""):
                 merged[key] = candidate.get(key)
-        merged["created_at"] = _merge_created_at(merged.get("created_at"), candidate.get("created_at"))
+        merged["created_at"] = _merge_created_at(
+            merged.get("created_at"), candidate.get("created_at")
+        )
         merged["entry_exchange_order_id"] = _merge_exchange_order_ids(
             merged.get("entry_exchange_order_id"),
             candidate.get("entry_exchange_order_id"),
@@ -195,6 +212,8 @@ def _merge_local_position_candidates(
             merged["current_management_contract"] = _dict_value(
                 candidate.get("current_management_contract")
             )
+        if not _dict_value(merged.get("paper_canary_lifecycle")):
+            merged["paper_canary_lifecycle"] = _dict_value(candidate.get("paper_canary_lifecycle"))
         if _float_value(merged.get("entry_fee"), 0.0) <= 0:
             merged["entry_fee"] = candidate.get("entry_fee")
 
@@ -346,7 +365,9 @@ async def _position_entry_order_is_exchange_close_fill(
     for order in orders:
         raw = _dict_value(getattr(order, "okx_raw_fills", None))
         fill_pnl = _float_value(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
-        contracts = _float_value(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+        contracts = _float_value(
+            raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0
+        )
         confirmed = (
             raw.get("fills_history_confirmed") is True
             or raw.get("execution_result_confirmed") is True
@@ -355,6 +376,80 @@ async def _position_entry_order_is_exchange_close_fill(
         if confirmed and contracts > 0 and abs(fill_pnl) > 1e-12:
             return True
     return False
+
+
+async def _confirmed_local_close_fill_for_position(
+    session: Any,
+    position: Any,
+    *,
+    target_quantity: float | None = None,
+) -> dict[str, Any]:
+    """Reuse a persisted OKX-confirmed close order before querying remote history."""
+
+    side = str(getattr(position, "side", "") or "").lower()
+    close_action = "close_short" if side == "short" else "close_long"
+    close_side = "buy" if side == "short" else "sell"
+    symbol = str(getattr(position, "symbol", "") or "")
+    variants = trading_symbol_variants(symbol) or {symbol}
+    statement = (
+        select(Order)
+        .join(AIDecision, AIDecision.id == Order.decision_id)
+        .where(
+            Order.execution_mode == getattr(position, "execution_mode", None),
+            Order.symbol.in_(variants),
+            Order.side == close_side,
+            Order.status == OrderStatus.FILLED.value,
+            Order.exchange_order_id.is_not(None),
+            Order.exchange_order_id != "",
+            Order.okx_sync_status.in_(TRUSTED_OKX_ORDER_SYNC_STATUSES),
+            AIDecision.action == close_action,
+            AIDecision.was_executed.is_(True),
+        )
+        .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
+        .limit(10)
+    )
+    opened_at = getattr(position, "created_at", None)
+    if opened_at is not None:
+        statement = statement.where(
+            (Order.filled_at.is_(None) & (Order.created_at >= opened_at))
+            | (Order.filled_at >= opened_at)
+        )
+    if not callable(getattr(session, "execute", None)):
+        return {}
+    result = await session.execute(statement)
+    if not callable(getattr(result, "scalars", None)):
+        return {}
+    target = abs(_float_value(target_quantity, 0.0))
+    for order in result.scalars().all():
+        quantity = abs(_float_value(getattr(order, "quantity", None), 0.0))
+        if target > 0 and (quantity <= 0 or quantity < target * 0.2):
+            continue
+        price = _float_value(getattr(order, "price", None), 0.0)
+        if price <= 0:
+            continue
+        raw = _dict_value(getattr(order, "okx_raw_fills", None))
+        return {
+            "price": price,
+            "fee": abs(_float_value(getattr(order, "fee", None), 0.0)),
+            "order_id": str(getattr(order, "exchange_order_id", "") or ""),
+            "timestamp": getattr(order, "filled_at", None) or getattr(order, "created_at", None),
+            "quantity": quantity,
+            "contracts": _float_value(
+                getattr(order, "okx_fill_contracts", None) or raw.get("contracts"),
+                0.0,
+            ),
+            "pnl": _float_value(
+                (
+                    getattr(order, "okx_fill_pnl", None)
+                    if getattr(order, "okx_fill_pnl", None) is not None
+                    else raw.get("fill_pnl")
+                ),
+                0.0,
+            ),
+            "source": "local_okx_confirmed_close_order",
+            "order_info": _dict_value(raw.get("order_info")),
+        }
+    return {}
 
 
 def _okx_close_fill_order_payload(
@@ -406,7 +501,9 @@ def _okx_close_fill_order_payload(
         0.0,
     )
     timestamp = filled_at
-    raw_timestamp = _first_value(fill.get("timestamp"), order_info.get("ts"), fill.get("timestamp_ms"))
+    raw_timestamp = _first_value(
+        fill.get("timestamp"), order_info.get("ts"), fill.get("timestamp_ms")
+    )
     if timestamp is None and isinstance(raw_timestamp, datetime):
         timestamp = raw_timestamp
     raw_payload = {
@@ -496,7 +593,9 @@ def _exchange_position_key(
 
 
 def _position_execution_mode(position: Any) -> str:
-    return "live" if str(getattr(position, "execution_mode", "") or "").lower() == "live" else "paper"
+    return (
+        "live" if str(getattr(position, "execution_mode", "") or "").lower() == "live" else "paper"
+    )
 
 
 def normalized_open_position_context(
@@ -511,9 +610,7 @@ def normalized_open_position_context(
     okx_pos_id = _okx_pos_id_from_position_payload(position_payload)
     entry_exchange_order_id = str(position_payload.get("entry_exchange_order_id") or "").strip()
     entry_legs = _list_of_dicts(position_payload.get("entry_legs"))
-    current_management_contract = _dict_value(
-        position_payload.get("current_management_contract")
-    )
+    current_management_contract = _dict_value(position_payload.get("current_management_contract"))
     entry_fee = abs(float_parser(position_payload.get("entry_fee"), 0.0))
     exit_fee_rate = float_parser(
         current_management_contract.get("exit_fee_rate_proxy"),
@@ -534,6 +631,31 @@ def normalized_open_position_context(
         quantity = float_parser(snapshot.get("quantity"), 0.0)
         contracts = float_parser(snapshot.get("contracts"), 0.0)
         contract_size = float_parser(snapshot.get("contract_size"), 1.0)
+        contract_size_source = "exchange_position_snapshot"
+        management_contracts = abs(float_parser(current_management_contract.get("contracts"), 0.0))
+        management_quantity = abs(float_parser(current_management_contract.get("quantity"), 0.0))
+        contract_symbol = symbol_normalizer(current_management_contract.get("symbol"))
+        if (
+            current_management_contract.get("contract_version")
+            == CURRENT_POSITION_MANAGEMENT_VERSION
+            and current_management_contract.get("kind") == CURRENT_POSITION_MANAGEMENT_KIND
+            and current_management_contract.get("management_eligible") is True
+            and not current_management_contract.get("blockers")
+            and contract_symbol == snapshot.get("symbol")
+            and str(current_management_contract.get("side") or "").lower() == snapshot.get("side")
+            and contracts > 0
+            and management_contracts > 0
+            and management_quantity > 0
+            and isclose(
+                contracts,
+                management_contracts,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            contract_size = management_quantity / management_contracts
+            quantity = contracts * contract_size
+            contract_size_source = "current_management_contract_okx_contract_spec"
         direct_notional = abs(
             float_parser(
                 position_payload.get("notional")
@@ -562,6 +684,7 @@ def normalized_open_position_context(
             "contracts": contracts,
             "contract_size": contract_size,
             "contractSize": contract_size,
+            "contract_size_source": contract_size_source,
             "leverage": float_parser(position_payload.get("leverage") or info.get("lever"), 1.0),
             "notional": notional,
             "notional_usd": notional,
@@ -599,6 +722,7 @@ def normalized_open_position_context(
             "entry_fee_usdt": entry_fee,
             "exit_fee_rate": exit_fee_rate,
             "current_management_contract": current_management_contract,
+            "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
             "execution_mode": position_payload.get("execution_mode"),
             "info": info,
         }
@@ -706,6 +830,7 @@ def normalized_open_position_context(
         "entry_fee_usdt": entry_fee,
         "exit_fee_rate": exit_fee_rate,
         "current_management_contract": current_management_contract,
+        "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
         "execution_mode": position_payload.get("execution_mode"),
         "info": info,
     }
@@ -992,28 +1117,57 @@ class OkxSyncService:
             )
             return []
 
+        previous_deadline = self._reconcile_deadline_monotonic
+        self._reconcile_deadline_monotonic = asyncio.get_running_loop().time() + max(
+            float(timeout_seconds or 0.0), 0.0
+        )
+        task = asyncio.create_task(self.reconcile_exchange_positions())
         try:
-            previous_deadline = self._reconcile_deadline_monotonic
-            self._reconcile_deadline_monotonic = (
-                asyncio.get_running_loop().time() + max(float(timeout_seconds or 0.0), 0.0)
-            )
-            try:
-                return await asyncio.wait_for(
-                    self.reconcile_exchange_positions(),
-                    timeout=timeout_seconds,
-                )
-            finally:
-                self._reconcile_deadline_monotonic = previous_deadline
-                lock.release()
-        except TimeoutError:
+            done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+            if done:
+                return task.result()
+
             timeout_reason = (
                 f"exchange position reconciliation timed out during {reason}; "
-                "continuing with local position state"
+                "the single-flight transaction continues in background"
             )
             if record_timeout_error:
                 self._record_round_error(timeout_reason)
             logger.warning(timeout_reason)
+
+            def finish_background_reconciliation(completed: asyncio.Task[Any]) -> None:
+                self._reconcile_deadline_monotonic = previous_deadline
+                if lock.locked():
+                    lock.release()
+                try:
+                    rows = completed.result()
+                except asyncio.CancelledError:
+                    logger.warning("background exchange position reconciliation was cancelled")
+                except Exception as exc:
+                    logger.warning(
+                        "background exchange position reconciliation failed",
+                        error=safe_error_text(exc),
+                    )
+                else:
+                    logger.info(
+                        "background exchange position reconciliation completed",
+                        reconciled_count=len(rows or []),
+                    )
+
+            task.add_done_callback(finish_background_reconciliation)
             return []
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(_consume_background_task_result)
+            self._reconcile_deadline_monotonic = previous_deadline
+            if lock.locked():
+                lock.release()
+            raise
+        finally:
+            if task.done():
+                self._reconcile_deadline_monotonic = previous_deadline
+                if lock.locked():
+                    lock.release()
 
     async def refresh_position_prices(self, feature_vectors: dict[str, Any]) -> Any:
         """Update persisted open-position prices and unrealized PnL."""
@@ -1070,7 +1224,10 @@ class OkxSyncService:
 
             exchange_fetch_started = time.perf_counter()
             source_snapshots = await asyncio.gather(
-                *(fetch_source_positions(source_mode, executor) for source_mode, executor in candidates)
+                *(
+                    fetch_source_positions(source_mode, executor)
+                    for source_mode, executor in candidates
+                )
             )
             diagnostics["exchange_snapshot_fetch_ms"] = round(
                 (time.perf_counter() - exchange_fetch_started) * 1000,
@@ -1155,9 +1312,7 @@ class OkxSyncService:
                     else:
                         unrealized_pnl = (current_price - pos.entry_price) * pos.quantity
 
-                    price_updates.append(
-                        (pos, float(current_price), float(unrealized_pnl))
-                    )
+                    price_updates.append((pos, float(current_price), float(unrealized_pnl)))
                     open_context.append(
                         {
                             "model_name": pos.model_name,
@@ -1739,12 +1894,20 @@ class OkxSyncService:
                             )
                             try:
                                 reduction_close_fill = (
-                                    await self._find_exchange_close_fill_with_timeout(
-                                        find_exchange_close_fill,
-                                        reduction_probe,
-                                        context="exchange quantity reduction",
+                                    await _confirmed_local_close_fill_for_position(
+                                        session,
+                                        matching_local_positions[0],
+                                        target_quantity=reduced_quantity,
                                     )
                                 )
+                                if not reduction_close_fill:
+                                    reduction_close_fill = (
+                                        await self._find_exchange_close_fill_with_timeout(
+                                            find_exchange_close_fill,
+                                            reduction_probe,
+                                            context="exchange quantity reduction",
+                                        )
+                                    )
                             except Exception as exc:
                                 logger.warning(
                                     "failed to find OKX close fill for reduced open quantity",
@@ -1999,11 +2162,16 @@ class OkxSyncService:
                             )
                             continue
 
-                    close_fill = await self._find_exchange_close_fill_with_timeout(
-                        find_exchange_close_fill,
+                    close_fill = await _confirmed_local_close_fill_for_position(
+                        session,
                         pos,
-                        context="missing exchange position",
                     )
+                    if not close_fill:
+                        close_fill = await self._find_exchange_close_fill_with_timeout(
+                            find_exchange_close_fill,
+                            pos,
+                            context="missing exchange position",
+                        )
                     if close_fill.get("lookup_unavailable"):
                         lookup_error = str(close_fill.get("error") or "").strip().lower()
                         temporary_lookup_unavailable = lookup_error in {
@@ -2039,9 +2207,9 @@ class OkxSyncService:
                         active_order = await self.active_exchange_order_for_local_position(pos)
                         if active_order:
                             if active_order.get("kind") == OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND:
-                                active_order_error = str(
-                                    active_order.get("error") or ""
-                                ).strip().lower()
+                                active_order_error = (
+                                    str(active_order.get("error") or "").strip().lower()
+                                )
                                 temporary_order_unavailable = active_order_error in {
                                     "timeout",
                                     "deadline_budget_exhausted",
@@ -2121,9 +2289,11 @@ class OkxSyncService:
                         )
                         reconciled.append(
                             {
-                                "kind": "orphan_local_position_quarantined"
-                                if quarantined
-                                else "missing_exchange_position_without_close_fill",
+                                "kind": (
+                                    "orphan_local_position_quarantined"
+                                    if quarantined
+                                    else "missing_exchange_position_without_close_fill"
+                                ),
                                 "source": "okx_authoritative_current_position",
                                 "model_name": pos.model_name,
                                 "symbol": pos.symbol,
@@ -2283,11 +2453,11 @@ class OkxSyncService:
                         okx_inst_id=close_okx_inst_id,
                     )
                     if existing_close_order is not None:
-                        _apply_okx_close_fill_order_payload(existing_close_order, close_order_payload)
-                    else:
-                        await trade_repo.create_order(
-                            close_order_payload
+                        _apply_okx_close_fill_order_payload(
+                            existing_close_order, close_order_payload
                         )
+                    else:
+                        await trade_repo.create_order(close_order_payload)
 
                     remove_memory_position(pos.model_name, pos.symbol, pos.side)
 
@@ -2392,9 +2562,7 @@ class OkxSyncService:
                     hold_minutes=max(float(age_seconds or 0.0) / 60.0, 0.0),
                     closed_at=now,
                     outcome="flat",
-                    mistake_summary=(
-                        "local orphan position was absent from OKX current positions"
-                    ),
+                    mistake_summary=("local orphan position was absent from OKX current positions"),
                     improvement_summary=(
                         "exclude this non-OKX-backed local row from training and current capacity"
                     ),
@@ -2477,6 +2645,41 @@ class OkxSyncService:
             close_order_id = (
                 str((close_fill or {}).get("order_id") or "").strip() if fill_matches_slice else ""
             )
+            if close_order_id:
+                existing_slice_result = await session.execute(
+                    select(Position).where(
+                        Position.execution_mode == getattr(pos, "execution_mode", None),
+                        Position.is_open.is_(False),
+                        Position.close_exchange_order_id == close_order_id,
+                    )
+                )
+                existing_slice_rows = (
+                    existing_slice_result.scalars().all()
+                    if callable(getattr(existing_slice_result, "scalars", None))
+                    else []
+                )
+                existing_slice = next(
+                    (
+                        row
+                        for row in existing_slice_rows
+                        if isclose(
+                            abs(_float_value(getattr(row, "quantity", None), 0.0)),
+                            closed_qty,
+                            rel_tol=1e-6,
+                            abs_tol=1e-8,
+                        )
+                    ),
+                    None,
+                )
+                if existing_slice is not None:
+                    logger.info(
+                        "skip duplicate exchange quantity reduction slice",
+                        position_id=getattr(pos, "id", None),
+                        existing_slice_id=getattr(existing_slice, "id", None),
+                        exchange_order_id=close_order_id,
+                        closed_qty=closed_qty,
+                    )
+                    continue
             close_okx_inst_id = _okx_inst_id_from_close_fill(
                 close_fill,
                 fallback=pos.symbol,
@@ -2648,9 +2851,7 @@ class OkxSyncService:
             if existing_close_order is not None:
                 _apply_okx_close_fill_order_payload(existing_close_order, close_order_payload)
             else:
-                await trade_repo.create_order(
-                    close_order_payload
-                )
+                await trade_repo.create_order(close_order_payload)
             reconciled.append(
                 {
                     "kind": "quantity_reduction_closed_slice",
@@ -2696,7 +2897,35 @@ class OkxSyncService:
                     limit=1000,
                     is_open=True,
                 )
+                decision_ids = {
+                    int(decision_id)
+                    for position in db_positions
+                    for decision_id in _dict_value(
+                        getattr(position, "current_management_contract", None)
+                    ).get("original_entry_decision_ids", [])
+                    if str(decision_id or "").isdigit() and int(decision_id) > 0
+                }
+                decisions_by_id: dict[int, Any] = {}
+                if decision_ids:
+                    decisions_result = await session.execute(
+                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                    )
+                    decisions_by_id = {
+                        int(decision.id): decision for decision in decisions_result.scalars().all()
+                    }
                 for p in db_positions:
+                    management_contract = _dict_value(
+                        getattr(p, "current_management_contract", None)
+                    )
+                    canary_lifecycle: dict[str, Any] = {}
+                    for decision_id in management_contract.get("original_entry_decision_ids", []):
+                        decision = decisions_by_id.get(
+                            int(decision_id) if str(decision_id or "").isdigit() else -1
+                        )
+                        lifecycle = build_paper_canary_position_lifecycle(decision)
+                        if lifecycle:
+                            canary_lifecycle = lifecycle
+                            break
                     local_positions.append(
                         {
                             "model_name": p.model_name,
@@ -2715,11 +2944,8 @@ class OkxSyncService:
                             "okx_pos_id": getattr(p, "okx_pos_id", None),
                             "entry_exchange_order_id": getattr(p, "entry_exchange_order_id", None),
                             "entry_fee": getattr(p, "entry_fee", None),
-                            "current_management_contract": getattr(
-                                p,
-                                "current_management_contract",
-                                None,
-                            ),
+                            "current_management_contract": management_contract,
+                            "paper_canary_lifecycle": canary_lifecycle,
                             "execution_mode": getattr(p, "execution_mode", None),
                         }
                     )
@@ -2802,6 +3028,7 @@ class OkxSyncService:
                 ("entry_legs", "entry_legs"),
                 ("entry_fee", "entry_fee"),
                 ("current_management_contract", "current_management_contract"),
+                ("paper_canary_lifecycle", "paper_canary_lifecycle"),
                 ("execution_mode", "execution_mode"),
             ):
                 value = local_position.get(source_key)

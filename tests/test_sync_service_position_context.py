@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from core.symbols import normalize_trading_symbol
+from services.current_position_management import (
+    CURRENT_POSITION_MANAGEMENT_KIND,
+    CURRENT_POSITION_MANAGEMENT_VERSION,
+)
 from services.sync_service import (
+    _confirmed_local_close_fill_for_position,
     _merge_local_position_candidates,
     _okx_close_fill_order_payload,
     normalized_open_position_context,
@@ -95,6 +101,74 @@ def test_normalized_open_position_context_does_not_copy_obsolete_policy_metadata
     assert "profit_first_exit_plan" not in context
 
 
+def _management_contract(*, contracts: float = 109.0, quantity: float = 109.0) -> dict:
+    return {
+        "contract_version": CURRENT_POSITION_MANAGEMENT_VERSION,
+        "kind": CURRENT_POSITION_MANAGEMENT_KIND,
+        "management_eligible": True,
+        "blockers": [],
+        "symbol": "KAITO/USDT",
+        "side": "long",
+        "contracts": contracts,
+        "quantity": quantity,
+    }
+
+
+def test_normalized_context_restores_contract_size_from_matching_management_contract() -> None:
+    context = normalized_open_position_context(
+        {
+            "symbol": "KAITO/USDT:USDT",
+            "side": "long",
+            "contracts": 109.0,
+            "entryPrice": 0.80,
+            "markPrice": 0.81,
+            "notional": 88.225557,
+            "execution_mode": "paper",
+            "current_management_contract": _management_contract(),
+            "info": {
+                "instId": "KAITO-USDT-SWAP",
+                "pos": "109",
+                "avgPx": "0.80",
+                "markPx": "0.81",
+                "notionalUsd": "88.225557",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=_float,
+    )
+
+    assert context["quantity"] == pytest.approx(109.0)
+    assert context["contract_size"] == pytest.approx(1.0)
+    assert context["contract_size_source"] == ("current_management_contract_okx_contract_spec")
+
+
+def test_normalized_context_does_not_restore_contract_size_after_contracts_change() -> None:
+    context = normalized_open_position_context(
+        {
+            "symbol": "KAITO/USDT:USDT",
+            "side": "long",
+            "contracts": 108.0,
+            "entryPrice": 0.80,
+            "markPrice": 0.81,
+            "notional": 87.415557,
+            "execution_mode": "paper",
+            "current_management_contract": _management_contract(),
+            "info": {
+                "instId": "KAITO-USDT-SWAP",
+                "pos": "108",
+                "avgPx": "0.80",
+                "markPx": "0.81",
+                "notionalUsd": "87.415557",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=_float,
+    )
+
+    assert context["quantity"] != pytest.approx(109.0)
+    assert context["contract_size_source"] == "exchange_position_snapshot"
+
+
 def test_merge_local_position_candidates_keeps_order_identity_without_old_plans() -> None:
     merged = _merge_local_position_candidates(
         [
@@ -156,3 +230,49 @@ def test_okx_close_fill_order_payload_persists_native_fill_fact() -> None:
     assert payload["okx_fill_contracts"] == pytest.approx(145.5)
     assert payload["okx_fill_pnl"] == pytest.approx(-3.58808175)
     assert payload["okx_raw_fills"]["fills_history_confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_confirmed_local_close_order_is_reused_before_remote_fill_lookup() -> None:
+    filled_at = datetime.now(UTC)
+    order = SimpleNamespace(
+        quantity=109.0,
+        price=0.81,
+        fee=0.04,
+        exchange_order_id="kaito-close-1",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_fill_contracts=109.0,
+        okx_fill_pnl=0.42,
+        okx_raw_fills={},
+    )
+
+    class ScalarRows:
+        @staticmethod
+        def all():
+            return [order]
+
+    class Result:
+        @staticmethod
+        def scalars():
+            return ScalarRows()
+
+    class Session:
+        @staticmethod
+        async def execute(_statement):
+            return Result()
+
+    fill = await _confirmed_local_close_fill_for_position(
+        Session(),
+        SimpleNamespace(
+            symbol="KAITO/USDT",
+            side="long",
+            execution_mode="paper",
+            quantity=109.0,
+            created_at=filled_at - timedelta(minutes=10),
+        ),
+    )
+
+    assert fill["source"] == "local_okx_confirmed_close_order"
+    assert fill["order_id"] == "kaito-close-1"
+    assert fill["quantity"] == pytest.approx(109.0)
