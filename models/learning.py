@@ -76,6 +76,12 @@ class ShadowBacktest(Base, TimestampMixin):
     feature_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     training_feature_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     training_feature_snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
+    runtime_payload_compaction_version: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    runtime_payload_compacted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     raw_llm_response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

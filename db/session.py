@@ -12,6 +12,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from config.settings import settings
+from core.runtime_data_retention_contract import (
+    RUNTIME_DATA_RETENTION_SOURCE,
+    RUNTIME_DATA_RETENTION_VERSION,
+)
 from models.base import Base
 
 _engine = None
@@ -173,6 +177,7 @@ async def init_db() -> None:
         await _drop_removed_expert_memory_policy_columns(conn)
         await _ensure_ai_decision_model_health_columns(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
+        await _ensure_runtime_data_retention_columns(conn)
         await _ensure_trade_fact_indexes(conn)
         await _ensure_okx_account_bill_indexes(conn)
         await _ensure_okx_position_history_column_widths(conn)
@@ -433,6 +438,129 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
         await conn.execute(text(ddl))
 
 
+async def _ensure_runtime_data_retention_columns(conn: Any) -> None:
+    """Persist compaction lifecycle state outside large TOAST JSON payloads."""
+
+    table_specs = {
+        "ai_decisions": (
+            "idx_ai_decisions_payload_compaction",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_payload_compaction "
+            "ON ai_decisions (runtime_payload_compaction_version, created_at, id)",
+        ),
+        "shadow_backtests": (
+            "idx_shadow_backtests_payload_compaction",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_backtests_payload_compaction "
+            "ON shadow_backtests (runtime_payload_compaction_version, created_at, id)",
+        ),
+    }
+    postgres_backfills = {
+        "ai_decisions": """
+            UPDATE ai_decisions
+            SET runtime_payload_compaction_version = :version,
+                runtime_payload_compacted_at = COALESCE(
+                    updated_at,
+                    created_at,
+                    CURRENT_TIMESTAMP
+                )
+            WHERE raw_llm_response::JSONB #>> '{_retention,source}' = :source
+        """,
+        "shadow_backtests": """
+            UPDATE shadow_backtests
+            SET runtime_payload_compaction_version = :version,
+                runtime_payload_compacted_at = COALESCE(
+                    updated_at,
+                    created_at,
+                    CURRENT_TIMESTAMP
+                )
+            WHERE raw_llm_response::JSONB #>> '{_retention,source}' = :source
+        """,
+    }
+    sqlite_backfills = {
+        "ai_decisions": """
+            UPDATE ai_decisions
+            SET runtime_payload_compaction_version = :version,
+                runtime_payload_compacted_at = COALESCE(
+                    updated_at,
+                    created_at,
+                    CURRENT_TIMESTAMP
+                )
+            WHERE json_extract(raw_llm_response, '$._retention.source') = :source
+        """,
+        "shadow_backtests": """
+            UPDATE shadow_backtests
+            SET runtime_payload_compaction_version = :version,
+                runtime_payload_compacted_at = COALESCE(
+                    updated_at,
+                    created_at,
+                    CURRENT_TIMESTAMP
+                )
+            WHERE json_extract(raw_llm_response, '$._retention.source') = :source
+        """,
+    }
+    if "postgresql" in settings.database_url:
+        index_names = await _postgres_index_names(conn)
+        for table_name, (index_name, index_ddl) in table_specs.items():
+            existing = await _postgres_table_columns(conn, table_name)
+            missing_version = "runtime_payload_compaction_version" not in existing
+            missing_compacted_at = "runtime_payload_compacted_at" not in existing
+            if missing_version:
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} ADD COLUMN "
+                        "runtime_payload_compaction_version VARCHAR(80)"
+                    )
+                )
+            if missing_compacted_at:
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} ADD COLUMN "
+                        "runtime_payload_compacted_at TIMESTAMP WITH TIME ZONE"
+                    )
+                )
+            if missing_version or missing_compacted_at:
+                await conn.execute(
+                    text(postgres_backfills[table_name]),
+                    {
+                        "version": RUNTIME_DATA_RETENTION_VERSION,
+                        "source": RUNTIME_DATA_RETENTION_SOURCE,
+                    },
+                )
+            if index_name not in index_names:
+                await conn.execute(text(index_ddl))
+        return
+
+    if "sqlite" not in settings.database_url:
+        return
+    for table_name, (_index_name, index_ddl) in table_specs.items():
+        result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+        existing = {str(row[1]) for row in result.fetchall()}
+        missing_version = "runtime_payload_compaction_version" not in existing
+        missing_compacted_at = "runtime_payload_compacted_at" not in existing
+        if missing_version:
+            await conn.execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN "
+                    "runtime_payload_compaction_version VARCHAR(80)"
+                )
+            )
+        if missing_compacted_at:
+            await conn.execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN "
+                    "runtime_payload_compacted_at DATETIME"
+                )
+            )
+        if missing_version or missing_compacted_at:
+            await conn.execute(
+                text(sqlite_backfills[table_name]),
+                {
+                    "version": RUNTIME_DATA_RETENTION_VERSION,
+                    "source": RUNTIME_DATA_RETENTION_SOURCE,
+                },
+            )
+        await conn.execute(text(index_ddl))
+
+
 async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
     """Persist compact health evidence alongside each large decision payload."""
 
@@ -483,7 +611,15 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                 AS $$
                 DECLARE
                     raw JSONB := COALESCE(NEW.raw_llm_response::JSONB, '{}'::JSONB);
+                    preserve_retained_projections BOOLEAN := (
+                        raw #>> '{_retention,source}' = 'runtime_data_retention'
+                        AND raw #>> '{_retention,preserve_ai_decision_projections}'
+                            = 'true'
+                    );
                 BEGIN
+                    IF preserve_retained_projections THEN
+                        RETURN NEW;
+                    END IF;
                     NEW.model_health_timings := CASE
                         WHEN jsonb_typeof(raw -> 'model_timings') = 'array'
                         THEN raw -> 'model_timings' ELSE NULL END;

@@ -407,6 +407,13 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     assert any(
         "decision_learning_snapshot_version" in statement for statement in fake_conn.statements
     )
+    retention_trigger = next(
+        statement
+        for statement in fake_conn.statements
+        if "CREATE OR REPLACE FUNCTION bb_sync_ai_decision_model_health" in statement
+    )
+    assert "preserve_ai_decision_projections" in retention_trigger
+    assert "runtime_data_retention" in retention_trigger
 
 
 @pytest.mark.asyncio
@@ -502,6 +509,74 @@ async def test_postgres_shadow_snapshot_skips_steady_state_schema_ddl(
     await session_module._ensure_shadow_backtest_training_snapshot_columns(fake_conn)
 
     assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+
+
+@pytest.mark.asyncio
+async def test_postgres_runtime_retention_columns_backfill_markers_and_add_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._ensure_runtime_data_retention_columns(fake_conn)
+
+    assert any(
+        "ALTER TABLE ai_decisions ADD COLUMN runtime_payload_compaction_version"
+        in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "ALTER TABLE shadow_backtests ADD COLUMN runtime_payload_compacted_at"
+        in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "UPDATE ai_decisions" in statement and "_retention,source" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "idx_ai_decisions_payload_compaction" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "idx_shadow_backtests_payload_compaction" in statement
+        for statement in fake_conn.statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_runtime_retention_schema_skips_steady_state_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    columns = {
+        "runtime_payload_compaction_version",
+        "runtime_payload_compacted_at",
+    }
+    fake_conn = _FakeConnection(
+        table_columns={
+            "ai_decisions": columns,
+            "shadow_backtests": columns,
+        },
+        index_names={
+            "idx_ai_decisions_payload_compaction",
+            "idx_shadow_backtests_payload_compaction",
+        },
+    )
+
+    await session_module._ensure_runtime_data_retention_columns(fake_conn)
+
+    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+    assert not any(statement.startswith("UPDATE ") for statement in fake_conn.statements)
+    assert not any(statement.startswith("CREATE INDEX") for statement in fake_conn.statements)
     assert not any(
         statement.startswith("CREATE UNIQUE INDEX") for statement in fake_conn.statements
     )

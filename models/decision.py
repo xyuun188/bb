@@ -4,6 +4,7 @@ from datetime import datetime
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, event
 from sqlalchemy.orm import Mapped, mapped_column
 
+from core.runtime_data_retention_contract import is_ai_decision_retention_payload
 from models.base import Base, TimestampMixin
 
 
@@ -34,6 +35,12 @@ class AIDecision(Base, TimestampMixin):
     model_health_snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
     decision_learning_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     decision_learning_snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
+    runtime_payload_compaction_version: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    runtime_payload_compacted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     analysis_type: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True)
     was_executed: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -110,6 +117,8 @@ def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> Non
     """Keep SQLite/tests aligned with the PostgreSQL write trigger."""
 
     raw = target.raw_llm_response
+    if is_ai_decision_retention_payload(raw):
+        return
     target.model_health_timings = _model_health_snapshot_value(raw, "model_timings")
     target.model_health_fallback_timings = _model_health_snapshot_value(raw, "_model_timings")
     target.model_health_experts = _model_health_snapshot_value(raw, "experts")

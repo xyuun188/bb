@@ -11,6 +11,7 @@ from scripts import (
     install_phase3_model_server_readiness_timer,
     install_phase3_rebuild_preflight_timer,
     install_phase3_stage_handoff_timer,
+    install_runtime_data_retention_timer,
 )
 
 TIMER_INSTALLERS = (
@@ -20,6 +21,7 @@ TIMER_INSTALLERS = (
     install_phase3_model_server_readiness_timer,
     install_phase3_rebuild_preflight_timer,
     install_phase3_stage_handoff_timer,
+    install_runtime_data_retention_timer,
 )
 
 

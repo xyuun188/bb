@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Install the low-priority daily runtime data-retention systemd timer."""
+
+from __future__ import annotations
+
+import argparse
+import posixpath
+import secrets
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
+from core.runtime_data_retention_contract import (  # noqa: E402
+    RUNTIME_DATA_RETENTION_APPLY_CONFIRMATION,
+)
+from core.safe_output import safe_print  # noqa: E402
+
+REMOTE_APP_DIR = "/data/bb/app"
+REMOTE_OWNER = "bb:bb"
+SERVICE_NAME = "bb-runtime-data-retention.service"
+TIMER_NAME = "bb-runtime-data-retention.timer"
+REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
+REPORT_DIR_REL = "data/runtime_data_retention_reports"
+REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
+DEFAULT_ON_CALENDAR = "*-*-* 18:20:00 UTC"
+
+
+def _remote_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _owner_parts(owner: str) -> tuple[str, str]:
+    user, _sep, group = str(owner or REMOTE_OWNER).partition(":")
+    user = user or "bb"
+    group = group or user
+    return user, group
+
+
+def render_service(*, remote_app_dir: str = REMOTE_APP_DIR, owner: str = REMOTE_OWNER) -> str:
+    user, group = _owner_parts(owner)
+    return f"""[Unit]
+Description=BB bounded runtime data payload retention
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={user}
+Group={group}
+WorkingDirectory={remote_app_dir}
+EnvironmentFile=-{remote_app_dir}/.env
+EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=10
+TimeoutStartSec=45min
+ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_runtime_data_retention.py --apply --confirm {RUNTIME_DATA_RETENTION_APPLY_CONFIRMATION} --batch-size 250 --max-rows-per-table 5000 --batch-pause-seconds 0.05 --skip-byte-estimate --json-indent 0'
+"""
+
+
+def render_timer(*, on_calendar: str = DEFAULT_ON_CALENDAR) -> str:
+    return f"""[Unit]
+Description=Run BB bounded runtime data retention daily
+
+[Timer]
+OnCalendar={on_calendar}
+Persistent=true
+RandomizedDelaySec=600
+Unit={SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _upload_text(ssh, remote_path: str, content: str) -> None:
+    sftp = ssh.open_sftp()
+    try:
+        with sftp.file(remote_path, "w") as remote:
+            remote.write(content)
+        sftp.chmod(remote_path, 0o644)
+    finally:
+        sftp.close()
+
+
+def install_timer(
+    *,
+    remote_app_dir: str = REMOTE_APP_DIR,
+    owner: str = REMOTE_OWNER,
+    on_calendar: str = DEFAULT_ON_CALENDAR,
+    run_now: bool = False,
+    dry_run: bool = False,
+) -> None:
+    service = render_service(remote_app_dir=remote_app_dir, owner=owner)
+    timer = render_timer(on_calendar=on_calendar)
+    safe_print({"service": SERVICE_NAME, "timer": TIMER_NAME, "on_calendar": on_calendar})
+    if dry_run:
+        safe_print(service)
+        safe_print(timer)
+        return
+
+    user, group = _owner_parts(owner)
+    report_dir = posixpath.join(remote_app_dir, REPORT_DIR_REL)
+    staging_dir = posixpath.join(remote_app_dir, REMOTE_STAGING_DIR_REL)
+    nonce = secrets.token_hex(12)
+    staged_service = posixpath.join(staging_dir, f"{SERVICE_NAME}.{nonce}")
+    staged_timer = posixpath.join(staging_dir, f"{TIMER_NAME}.{nonce}")
+    ssh = connect_remote_ssh(ROOT, timeout=20)
+    try:
+        run_remote_text(
+            ssh,
+            " && ".join(
+                [
+                    f"install -d -o {_remote_quote(user)} -g {_remote_quote(group)} -m 0755 {_remote_quote(report_dir)}",
+                    f"install -d -o {_remote_quote(user)} -g {_remote_quote(group)} -m 0700 {_remote_quote(staging_dir)}",
+                    f"chown -R {_remote_quote(owner)} {_remote_quote(report_dir)}",
+                ]
+            ),
+            timeout=60,
+            check=True,
+        )
+        _upload_text(ssh, staged_service, service)
+        _upload_text(ssh, staged_timer, timer)
+        commands = [
+            f"install -m 0644 {_remote_quote(staged_service)} /etc/systemd/system/{SERVICE_NAME}",
+            f"install -m 0644 {_remote_quote(staged_timer)} /etc/systemd/system/{TIMER_NAME}",
+            "systemctl daemon-reload",
+            f"systemctl enable --now {TIMER_NAME}",
+            f"systemctl is-enabled {TIMER_NAME}",
+            f"systemctl is-active {TIMER_NAME}",
+            f"rm -f -- {_remote_quote(staged_service)} {_remote_quote(staged_timer)}",
+        ]
+        if run_now:
+            commands.append(f"systemctl start {SERVICE_NAME}")
+            commands.append(f"systemctl status {SERVICE_NAME} --no-pager -l || true")
+        safe_print(run_remote_text(ssh, " && ".join(commands), timeout=3600, check=True))
+    finally:
+        ssh.close()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--remote-app-dir", default=REMOTE_APP_DIR)
+    parser.add_argument("--owner", default=REMOTE_OWNER)
+    parser.add_argument("--on-calendar", default=DEFAULT_ON_CALENDAR)
+    parser.add_argument("--run-now", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    install_timer(
+        remote_app_dir=args.remote_app_dir,
+        owner=args.owner,
+        on_calendar=args.on_calendar,
+        run_now=bool(args.run_now),
+        dry_run=bool(args.dry_run),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
