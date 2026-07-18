@@ -1296,19 +1296,39 @@ def _resolve_artifact_pointer(
             raise ValueError("Local AI activation return-evidence identity mismatch.")
         stage = activation.get("activation_stage")
         production_authorized = activation.get("production_influence_authorized") is True
-        if stage == "shadow" and production_authorized:
-            raise ValueError("Shadow local AI artifact has production authorization.")
-        if stage in {"canary", "live"} and not production_authorized:
-            raise ValueError("Production local AI activation is not authorized.")
-        if stage in {"canary", "live"}:
+        if stage in {"shadow", "canary"} and production_authorized:
+            raise ValueError("Observation-only local AI artifact has production authorization.")
+        if stage == "canary":
+            recommendation = activation.get("promotion_recommendation") or {}
+            if (
+                activation.get("execution_scope") != "paper_only"
+                or activation.get("production_permission") is not False
+                or activation.get("canary_authorized") is not True
+                or recommendation.get("canary_ready") is not True
+            ):
+                raise ValueError("Canary local AI activation contract is incomplete.")
+        if stage == "live":
+            recommendation = activation.get("promotion_recommendation") or {}
+            if (
+                recommendation.get("recommended_stage") != "live"
+                or recommendation.get("live_ready") is not True
+            ):
+                raise ValueError("Live local AI activation recommendation is incomplete.")
+            if not production_authorized:
+                raise ValueError("Live local AI activation is not authorized.")
             evidence_blockers = _production_return_evidence_blockers(metadata)
             if evidence_blockers:
                 raise ValueError(
-                    "Production local AI activation return evidence is not ready: "
+                    "Live local AI activation return evidence is not ready: "
                     + ",".join(evidence_blockers)
                 )
             if activation.get("return_evidence_ready") is not True:
-                raise ValueError("Production local AI activation evidence was not authorized.")
+                raise ValueError("Live local AI activation evidence was not authorized.")
+            if (
+                activation.get("execution_scope") != "production"
+                or activation.get("production_permission") is not True
+            ):
+                raise ValueError("Live local AI activation permission is incomplete.")
         if stage not in {"shadow", "canary", "live"}:
             raise ValueError("Local AI activation stage is invalid.")
     bundle = None
@@ -1429,7 +1449,32 @@ def persist_candidate_bundle(
     return candidate
 
 
-def activate_candidate_shadow(return_evidence: dict[str, Any]) -> dict[str, Any]:
+def _governed_candidate_activation_stage(
+    promotion_recommendation: dict[str, Any],
+    evidence_blockers: list[str],
+) -> str:
+    recommended = str(promotion_recommendation.get("recommended_stage") or "shadow").lower()
+    if (
+        recommended == "live"
+        and promotion_recommendation.get("live_ready") is True
+        and not evidence_blockers
+    ):
+        return "live"
+    if (
+        recommended in {"canary", "live"}
+        and promotion_recommendation.get("canary_ready") is True
+        and promotion_recommendation.get("canary_execution_scope") == "paper_only"
+        and promotion_recommendation.get("canary_production_permission") is False
+    ):
+        return "canary"
+    return "shadow"
+
+
+def activate_candidate_shadow(
+    return_evidence: dict[str, Any],
+    *,
+    activation_stage: str = "shadow",
+) -> dict[str, Any]:
     candidate = _resolve_artifact_pointer(
         CANDIDATE_POINTER_PATH,
         role="candidate",
@@ -1437,8 +1482,21 @@ def activate_candidate_shadow(return_evidence: dict[str, Any]) -> dict[str, Any]
     )
     if candidate is None:
         raise ValueError("Local AI candidate artifact is not registered.")
-    activation_path = candidate["version_root"] / "activation-shadow.json"
+    if activation_stage not in {"shadow", "canary", "live"}:
+        raise ValueError("Local AI candidate activation stage is invalid.")
     evidence_blockers = _production_return_evidence_blockers(candidate["metadata"])
+    promotion_recommendation = return_evidence.get("promotion_recommendation") or {}
+    governed_stage = _governed_candidate_activation_stage(
+        promotion_recommendation,
+        evidence_blockers,
+    )
+    if activation_stage != governed_stage:
+        raise ValueError(
+            f"Local AI candidate activation stage {activation_stage} is not governed; "
+            f"expected {governed_stage}."
+        )
+    production_authorized = activation_stage == "live"
+    activation_path = candidate["version_root"] / f"activation-{activation_stage}.json"
     activation = {
         "activation_manifest_version": ARTIFACT_ACTIVATION_MANIFEST_VERSION,
         "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
@@ -1450,8 +1508,18 @@ def activate_candidate_shadow(return_evidence: dict[str, Any]) -> dict[str, Any]
         "artifact_return_evidence_sha256": candidate["metadata"].get(
             "artifact_return_evidence_sha256"
         ),
-        "activation_stage": "shadow",
-        "production_influence_authorized": False,
+        "activation_stage": activation_stage,
+        "production_influence_authorized": production_authorized,
+        "execution_scope": (
+            "production"
+            if activation_stage == "live"
+            else "paper_only"
+            if activation_stage == "canary"
+            else "observation_only"
+        ),
+        "production_permission": production_authorized,
+        "canary_authorized": activation_stage == "canary",
+        "promotion_recommendation": promotion_recommendation,
         "return_evidence_report": return_evidence,
         "return_evidence_ready": not evidence_blockers,
         "return_evidence_blockers": evidence_blockers,
@@ -3857,6 +3925,10 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, Any]:
     artifact_status = _model_artifact_status()
+    live_authorized = bool(
+        artifact_status.get("artifact_lifecycle") == "live"
+        and artifact_status.get("production_influence_authorized") is True
+    )
     payload = {
         "ok": True,
         "service": "phase3_quant_api",
@@ -3866,9 +3938,9 @@ def health() -> dict[str, Any]:
         "port": PHASE3_API_PORT,
         "policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
-        "live_trading_mutation": False,
-        "route_mode": "shadow_observation",
+        "live_mutation": live_authorized,
+        "live_trading_mutation": live_authorized,
+        "route_mode": "live" if live_authorized else "shadow_observation",
         "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
         "review_backend": "disabled_use_trading_app_online_model",
         "model_dir": MODEL_DIR.as_posix(),
@@ -4418,8 +4490,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
             **metadata,
         }
     candidate = persist_candidate_bundle(bundle, metadata)
-    current = activate_candidate_shadow(
-        {
+    activation_evidence = {
             "walk_forward_report": walk_forward_report,
             "leave_one_symbol_out_report": leave_one_symbol_out_report,
             "oos_return_evaluation": oos_return_evaluation,
@@ -4429,6 +4500,13 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "promotion_recommendation": req.promotion_recommendation or {},
             "training_mode": str(req.training_mode or "shadow"),
         }
+    activation_stage = _governed_candidate_activation_stage(
+        req.promotion_recommendation or {},
+        return_evidence_blockers,
+    )
+    current = activate_candidate_shadow(
+        activation_evidence,
+        activation_stage=activation_stage,
     )
     global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
     global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
@@ -4439,13 +4517,13 @@ def train(req: TrainRequest) -> dict[str, Any]:
     _STATUS_ARTIFACT_CACHE.clear()
     loaded = load_bundle()
     if loaded is None:
-        raise ValueError("Local AI shadow artifact failed post-activation load verification.")
+        raise ValueError("Local AI artifact failed post-activation load verification.")
     return {
         "trained": True,
         **current["metadata"],
         "artifact_version": current["version"],
-        "artifact_activation_stage": "shadow",
-        "production_influence_authorized": False,
+        "artifact_activation_stage": activation_stage,
+        "production_influence_authorized": activation_stage == "live",
         "candidate_version": candidate["version"],
     }
 
@@ -5457,24 +5535,25 @@ def _remote_smoke_command() -> str:
         "    'volume_ratio': 1.1,\n"
         "}\n"
         "health = get('/health')\n"
+        "live = health.get('artifact_lifecycle') == 'live'\n"
         "profit = post('/profit/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
         "exit_advice = post('/exit/advise', {'symbol': 'BTC/USDT', 'features': features, 'open_positions': []})\n"
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
-        "assert health.get('live_mutation') is False, health\n"
-        "assert health.get('artifact_lifecycle') == 'shadow', health\n"
-        "assert health.get('production_influence_authorized') is False, health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') == 'shadow', health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('production_influence_authorized') is False, health\n"
+        "assert health.get('live_mutation') is live, health\n"
+        "assert health.get('artifact_lifecycle') in {'shadow', 'canary', 'live'}, health\n"
+        "assert health.get('production_influence_authorized') is live, health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') in {'shadow', 'canary', 'live'}, health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('production_influence_authorized') is live, health\n"
         "assert profit.get('trained') is True, profit\n"
         "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"
         "assert profit.get('live_mutation') is False, profit\n"
-        "assert profit.get('production_permission') is False, profit\n"
-        "assert profit.get('promotion_ready') is False, profit\n"
-        "assert profit.get('prediction_quality', {}).get('production_eligible') is False, profit\n"
+        "assert profit.get('production_permission') is live, profit\n"
+        "assert profit.get('promotion_ready') is live, profit\n"
+        "assert profit.get('prediction_quality', {}).get('production_eligible') is live, profit\n"
         "assert profit.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', profit\n"
         "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
-        "assert all(item.get('production_eligible') is False for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
+        "assert all(item.get('production_eligible') is live for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
         "assert 'loss_probability' in profit, profit\n"
         "assert exit_advice.get('action') == 'hold', exit_advice\n"
         "assert exit_advice.get('no_matching_position') is True, exit_advice\n"

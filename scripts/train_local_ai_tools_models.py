@@ -885,7 +885,9 @@ async def _main() -> None:
         "okx_daily_reconciliation_gate": okx_gate,
         "evaluation_policy": {
             "promotion_flow": "shadow_to_canary_to_live",
-            "live_mutation": False,
+            "live_mutation": bool(
+                args.training_mode == "walk_forward" and args.model_stage == "live"
+            ),
             "requires_walk_forward": args.training_mode != "walk_forward",
             "requires_paper_observation": True,
             "phase": "phase3_model_factory",

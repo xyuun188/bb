@@ -355,5 +355,5 @@ def build_phase3_promotion_recommendation(
             "status": paper.get("status") or "missing",
             "can_use_for_promotion": bool(paper.get("can_use_for_promotion")),
         },
-        "live_mutation": False,
+        "live_mutation": bool(policy.get("live_mutation")),
     }

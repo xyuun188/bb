@@ -6901,9 +6901,9 @@ class TradingService:
             sys.executable,
             str(PROJECT_ROOT / "scripts" / "train_local_ai_tools_models.py"),
             "--training-mode",
-            "shadow",
+            "walk_forward",
             "--model-stage",
-            "shadow",
+            "live",
             "--persist-artifact",
             "--confirm-phase3-rebuild",
         ]

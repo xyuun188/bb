@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -46,6 +47,17 @@ from services.sync_service import OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND, OkxSyncServi
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
 from services.trading_service import TradingService, _AnalysisRuntimeState
 from services.training_data_quality import DATA_QUALITY_VERSION
+
+
+def test_local_ai_tools_training_subprocess_requests_governed_walk_forward_live() -> None:
+    source = inspect.getsource(
+        trading_service.TradingService._run_local_ai_tools_training_subprocess
+    )
+
+    assert '"--training-mode"' in source
+    assert '"walk_forward"' in source
+    assert '"--model-stage"' in source
+    assert '"live"' in source
 
 
 def _decision(action: Action) -> DecisionOutput:

@@ -222,7 +222,7 @@ def test_phase3_promotion_uses_return_report_not_sample_count_or_win_rate() -> N
     assert recommendation["live_ready"] is True
     assert recommendation["recommended_stage"] == "live"
     assert recommendation["observed_sample_counts"]["counts_are_diagnostic_only"] is True
-    assert recommendation["live_mutation"] is False
+    assert recommendation["live_mutation"] is True
 
 
 def test_phase3_promotion_allows_paper_canary_but_blocks_live_without_return_report() -> None:

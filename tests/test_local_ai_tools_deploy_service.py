@@ -802,6 +802,12 @@ def test_local_ai_registry_rejects_live_activation_without_return_readiness(
             "activation_stage": "live",
             "production_influence_authorized": True,
             "return_evidence_ready": True,
+            "execution_scope": "production",
+            "production_permission": True,
+            "promotion_recommendation": {
+                "recommended_stage": "live",
+                "live_ready": True,
+            },
         }
     )
     module.write_json_atomic(activation_path, activation)
@@ -814,6 +820,70 @@ def test_local_ai_registry_rejects_live_activation_without_return_readiness(
             module.CURRENT_POINTER_PATH,
             role="current",
         )
+
+
+def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_api_registry_canary_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    metadata = _test_artifact_metadata(module)
+    metadata["oos_return_evaluation"]["long"]["return_lcb_pct"] = -0.5
+    metadata["oos_return_evaluation"]["long"]["promotion_math_ready"] = False
+    metadata["evaluation_report_hashes"] = module._evaluation_report_hashes(metadata)
+    metadata["artifact_return_evidence_sha256"] = module.canonical_sha256(
+        metadata["evaluation_report_hashes"]
+    )
+    module.persist_candidate_bundle(_test_artifact_bundle(), metadata)
+    recommendation = {
+        "recommended_stage": "canary",
+        "canary_ready": True,
+        "canary_execution_scope": "paper_only",
+        "canary_production_permission": False,
+        "live_ready": False,
+    }
+
+    current = module.activate_candidate_shadow(
+        {"promotion_recommendation": recommendation},
+        activation_stage="canary",
+    )
+
+    activation = current["activation_manifest"]
+    assert activation["activation_stage"] == "canary"
+    assert activation["execution_scope"] == "paper_only"
+    assert activation["production_permission"] is False
+    assert activation["production_influence_authorized"] is False
+    assert activation["canary_authorized"] is True
+    assert activation["return_evidence_ready"] is False
+
+
+def test_local_ai_registry_activates_live_only_with_complete_evidence(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_registry_governed_live_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    metadata = _test_artifact_metadata(module)
+    assert module._production_return_evidence_blockers(metadata) == []
+    module.persist_candidate_bundle(_test_artifact_bundle(), metadata)
+    recommendation = {
+        "recommended_stage": "live",
+        "canary_ready": True,
+        "canary_execution_scope": "paper_only",
+        "canary_production_permission": False,
+        "live_ready": True,
+    }
+
+    current = module.activate_candidate_shadow(
+        {"promotion_recommendation": recommendation},
+        activation_stage="live",
+    )
+
+    activation = current["activation_manifest"]
+    assert activation["activation_stage"] == "live"
+    assert activation["execution_scope"] == "production"
+    assert activation["production_permission"] is True
+    assert activation["production_influence_authorized"] is True
+    assert activation["return_evidence_ready"] is True
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -1800,6 +1870,7 @@ def test_local_ai_tools_generated_service_uses_trusted_model_artifact_boundary()
     assert "local_quant_models_metadata.json" not in SERVICE_CODE
     assert "def persist_candidate_bundle(" in SERVICE_CODE
     assert "def activate_candidate_shadow(" in SERVICE_CODE
+    assert "def _governed_candidate_activation_stage(" in SERVICE_CODE
     assert "def rollback_current_artifact(" in SERVICE_CODE
 
 
@@ -1821,6 +1892,7 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
     assert '"promotion_recommendation": req.promotion_recommendation or {}' in SERVICE_CODE
     assert 'PHASE3_REQUIRED_PROMOTION_FLOW = "shadow_to_canary_to_live"' in SERVICE_CODE
     assert 'evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)' in SERVICE_CODE
+    assert '"live_mutation": live_authorized' in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_persists_phase3_artifact_policy() -> None:
@@ -2354,7 +2426,7 @@ def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:
     assert "local-ai-tools.service" not in source
 
 
-def test_phase3_quant_api_remote_smoke_checks_shadow_contract() -> None:
+def test_phase3_quant_api_remote_smoke_checks_governed_activation_contract() -> None:
     command = deploy._remote_smoke_command()
 
     assert "http://127.0.0.1:8101" in command
@@ -2362,13 +2434,13 @@ def test_phase3_quant_api_remote_smoke_checks_shadow_contract() -> None:
     assert "Authorization" in command
     assert "health.get('service') == 'phase3_quant_api'" in command
     assert "health.get('root') == '/data/BB'" in command
-    assert "health.get('live_mutation') is False" in command
-    assert "health.get('artifact_lifecycle') == 'shadow'" in command
-    assert "health.get('production_influence_authorized') is False" in command
+    assert "health.get('live_mutation') is live" in command
+    assert "health.get('artifact_lifecycle') in {'shadow', 'canary', 'live'}" in command
+    assert "health.get('production_influence_authorized') is live" in command
     assert "profit.get('trained') is True" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command
     assert "profit.get('return_distribution_input_version')" in command
     assert "profit.get('return_distribution_inputs')" in command
-    assert "profit.get('production_permission') is False" in command
-    assert "item.get('production_eligible') is False" in command
+    assert "profit.get('production_permission') is live" in command
+    assert "item.get('production_eligible') is live" in command
     assert "'loss_probability' in profit" in command
