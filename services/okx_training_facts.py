@@ -178,6 +178,7 @@ def build_okx_history_training_sample(
     orders_by_exchange_id: dict[str, Any] | None = None,
     decision_raw_by_position_id: dict[int, dict[str, Any]] | None = None,
     decision_raw_by_order_id: dict[str, dict[str, Any]] | None = None,
+    decision_execution_by_order_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Convert one mirrored OKX positions-history lifecycle into one sample."""
 
@@ -185,6 +186,7 @@ def build_okx_history_training_sample(
     orders_by_exchange_id = orders_by_exchange_id or {}
     decision_raw_by_position_id = decision_raw_by_position_id or {}
     decision_raw_by_order_id = decision_raw_by_order_id or {}
+    decision_execution_by_order_id = decision_execution_by_order_id or {}
     raw = dict(_value(history, "raw_row", {}) or {})
     position_ids = [int(value) for value in _list(_value(history, "position_ids")) if value.isdigit()]
     entry_order_ids = _list(_value(history, "entry_order_ids"))
@@ -297,6 +299,31 @@ def build_okx_history_training_sample(
     stop_loss_price = _safe_float(_value(local_position, "stop_loss_price"), None)
     take_profit_price = _safe_float(_value(local_position, "take_profit_price"), None)
     side = _text(_value(history, "side")).lower()
+    exact_execution = next(
+        (
+            decision_execution_by_order_id[order_id]
+            for order_id in entry_order_ids
+            if order_id in decision_execution_by_order_id
+        ),
+        {},
+    )
+    if entry_price > 0 and side in {"long", "short"}:
+        stop_loss_pct = _safe_float(exact_execution.get("stop_loss_pct"), None)
+        take_profit_pct = _safe_float(exact_execution.get("take_profit_pct"), None)
+        if (stop_loss_price is None or stop_loss_price <= 0) and stop_loss_pct and stop_loss_pct > 0:
+            stop_loss_price = (
+                entry_price * (1 - stop_loss_pct)
+                if side == "long"
+                else entry_price * (1 + stop_loss_pct)
+            )
+        if (
+            take_profit_price is None or take_profit_price <= 0
+        ) and take_profit_pct and take_profit_pct > 0:
+            take_profit_price = (
+                entry_price * (1 + take_profit_pct)
+                if side == "long"
+                else entry_price * (1 - take_profit_pct)
+            )
     protection_execution = _first_protection_execution(close_orders)
     protection_submission = _first_protection_submission(entry_orders)
     stop_loss_fill_confirmed = bool(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -568,6 +568,89 @@ async def test_collect_existing_order_decision_link_plans_requires_unique_entry_
     assert plans[0].exchange_order_id == "entry-avax"
     assert plans[0].decision_id > 0
     assert plans[0].side == "sell"
+
+
+@pytest.mark.asyncio
+async def test_collect_existing_order_decision_link_plans_uses_decision_only_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'existing-order-decision-once.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        opened_at = datetime(2026, 6, 28, 23, 2, 54, tzinfo=UTC)
+        closed_at = datetime(2026, 6, 29, 0, 30, tzinfo=UTC)
+        async with get_session_ctx() as session:
+            position = Position(
+                model_name="okx_authoritative_sync",
+                execution_mode="paper",
+                symbol="AVAX/USDT",
+                side="short",
+                quantity=1.0,
+                entry_price=12.0,
+                current_price=12.2,
+                leverage=3.0,
+                realized_pnl=-0.1,
+                is_open=False,
+                created_at=opened_at,
+                closed_at=closed_at,
+                okx_inst_id="AVAX-USDT-SWAP",
+                entry_exchange_order_id="entry-near,entry-far",
+                close_exchange_order_id="close-avax",
+            )
+            session.add(position)
+            for exchange_id, offset in (("entry-near", 0), ("entry-far", 40)):
+                filled_at = opened_at + timedelta(seconds=offset)
+                session.add(
+                    Order(
+                        model_name="okx_authoritative_sync",
+                        execution_mode="paper",
+                        symbol="AVAX/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=0.5,
+                        price=12.0,
+                        status="filled",
+                        fee=0.01,
+                        decision_id=None,
+                        exchange_order_id=exchange_id,
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                        okx_inst_id="AVAX-USDT-SWAP",
+                    )
+                )
+            session.add(
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="AVAX/USDT",
+                    action="short",
+                    confidence=0.8,
+                    position_size_pct=2.0,
+                    suggested_leverage=3.0,
+                    is_paper=True,
+                    was_executed=True,
+                    executed_at=opened_at + timedelta(seconds=2),
+                    execution_price=12.0,
+                    created_at=opened_at + timedelta(seconds=2),
+                )
+            )
+            await session.flush()
+            position_id = int(position.id)
+
+        plans = await repair_script.collect_existing_order_decision_link_plans(
+            days=30,
+            decision_window_seconds=120,
+            position_ids=(position_id,),
+        )
+    finally:
+        await close_db()
+
+    assert [plan.exchange_order_id for plan in plans] == ["entry-near"]
 
 
 @pytest.mark.asyncio

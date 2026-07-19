@@ -1368,7 +1368,21 @@ class OkxOrderFactSyncService:
                 )
                 continue
             if existing is None:
-                session.add(Position(**payload))
+                existing = Position(**payload)
+                session.add(existing)
+                await session.flush()
+                await upsert_okx_position_history_row(
+                    session,
+                    row,
+                    mode=self.mode,
+                    source="okx_order_fact_sync",
+                    entry_order_ids=entry_order_ids,
+                    close_order_ids=close_order_ids,
+                    position_ids=[existing.id],
+                    match_status="okx_order_fact_sync_position_linked",
+                    evidence_gaps=[],
+                    synced_at=now,
+                )
                 backfilled += 1
                 samples.append(
                     {
@@ -1381,6 +1395,26 @@ class OkxOrderFactSyncService:
                 continue
             was_open_position = bool(getattr(existing, "is_open", False))
             _apply_position_history_payload(existing, payload, now=now)
+            await session.flush()
+            await upsert_okx_position_history_row(
+                session,
+                row,
+                mode=self.mode,
+                source="okx_order_fact_sync",
+                entry_order_ids=entry_order_ids,
+                close_order_ids=close_order_ids,
+                position_ids=[existing.id],
+                match_status="okx_order_fact_sync_position_linked",
+                evidence_gaps=(
+                    []
+                    if entry_order_ids and close_order_ids
+                    else [
+                        *([] if entry_order_ids else ["missing_position_history_entry_orders"]),
+                        *([] if close_order_ids else ["missing_position_history_close_orders"]),
+                    ]
+                ),
+                synced_at=now,
+            )
             updated += 1
             samples.append(
                 {
@@ -3080,10 +3114,21 @@ def _position_inst_id(position: Position) -> str:
 
 
 def _is_authoritative_position_history_position(position: Position) -> bool:
+    settlement_source = str(getattr(position, "settlement_source", "") or "").strip()
+    settlement_status = str(getattr(position, "settlement_status", "") or "").strip()
     return (
-        str(getattr(position, "model_name", "") or "").strip() == "okx_authoritative_sync"
-        and bool(str(getattr(position, "okx_pos_id", "") or "").strip())
+        bool(str(getattr(position, "okx_pos_id", "") or "").strip())
         and not bool(getattr(position, "is_open", False))
+        and (
+            str(getattr(position, "model_name", "") or "").strip()
+            == "okx_authoritative_sync"
+            or settlement_source
+            in {
+                "okx_position_history",
+                "okx_position_history_settlement",
+            }
+            or settlement_status == "okx_position_history"
+        )
     )
 
 
@@ -3972,7 +4017,12 @@ def _closed_position_fill_pair_candidates(
 def _apply_position_history_payload(position: Position, payload: dict[str, Any], *, now: datetime) -> None:
     existing_entry_exchange_order_id = getattr(position, "entry_exchange_order_id", None)
     existing_close_exchange_order_id = getattr(position, "close_exchange_order_id", None)
-    position.model_name = str(payload["model_name"])
+    existing_model_name = str(getattr(position, "model_name", "") or "").strip()
+    position.model_name = (
+        existing_model_name
+        if existing_model_name and existing_model_name != "okx_authoritative_sync"
+        else str(payload["model_name"])
+    )
     position.execution_mode = str(payload["execution_mode"])
     position.symbol = str(payload["symbol"])
     position.side = str(payload["side"])

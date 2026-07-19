@@ -114,6 +114,9 @@ async def _main() -> None:
                 "frame_sample_count": result["frame_sample_count"],
                 "loaded_row_count": result["loaded_row_count"],
                 "completed_shadow_sample_count": result["completed_shadow_sample_count"],
+                "authoritative_trade_sample_count": result[
+                    "authoritative_trade_sample_count"
+                ],
             },
             ensure_ascii=False,
             indent=2,

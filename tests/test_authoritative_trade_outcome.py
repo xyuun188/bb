@@ -5,10 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
+from models.trade import OkxPositionHistory
 from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     build_authoritative_trade_outcome,
+    load_authoritative_trade_outcomes,
 )
 from services.training_data_quality import annotate_training_payload
 
@@ -192,3 +196,89 @@ def test_missing_fee_after_label_contract_is_quarantined() -> None:
     assert payload["trade_samples"] == []
     record = payload["authoritative_outcome_manifest"]["records"][0]
     assert record["training_status"] == "excluded"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_loader_deduplicates_legacy_and_canonical_history_rows(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'authoritative-dedupe.db').as_posix()}",
+    )
+    await init_db()
+    raw_row = {
+        "instId": "ICP-USDT-SWAP",
+        "posId": "dedupe-pos",
+        "posSide": "short",
+        "type": "2",
+        "cTime": "1782579311213",
+        "uTime": "1782580080851",
+        "openAvgPx": "2.1",
+        "closeAvgPx": "2.0",
+        "openMaxPos": "10",
+        "closeTotalPos": "10",
+        "realizedPnl": "0.9",
+        "pnl": "1.0",
+        "fee": "-0.1",
+        "fundingFee": "0",
+        "ctVal": "1",
+        "ctMult": "1",
+        "lotSz": "1",
+    }
+    opened_at = datetime.fromtimestamp(1782579311213 / 1000, tz=UTC)
+    closed_at = datetime.fromtimestamp(1782580080851 / 1000, tz=UTC)
+    try:
+        async with get_session_ctx() as session:
+            common = {
+                "mode": "paper",
+                "inst_id": "ICP-USDT-SWAP",
+                "symbol": "ICP/USDT",
+                "pos_id": "dedupe-pos",
+                "pos_side": "short",
+                "side": "short",
+                "close_type": "2",
+                "close_status": "full",
+                "opened_at": opened_at,
+                "updated_at_okx": closed_at,
+                "open_avg_px": 2.1,
+                "close_avg_px": 2.0,
+                "open_max_pos": 10.0,
+                "close_total_pos": 10.0,
+                "realized_pnl": 0.9,
+                "pnl": 1.0,
+                "fee": -0.1,
+                "funding_fee": 0.0,
+                "source": "okx_order_fact_sync",
+                "raw_row": raw_row,
+                "sync_status": "synced",
+            }
+            session.add_all(
+                [
+                    OkxPositionHistory(
+                        **common,
+                        row_identity=(
+                            "paper|ICP-USDT-SWAP|dedupe-pos|short|2|"
+                            "1782579311213|1782580080851|10|10"
+                        ),
+                    ),
+                    OkxPositionHistory(
+                        **common,
+                        row_identity=(
+                            "paper|ICP-USDT-SWAP|dedupe-pos|short|1782579311213"
+                        ),
+                    ),
+                ]
+            )
+
+        outcomes = await load_authoritative_trade_outcomes(mode="paper")
+
+        assert len(outcomes) == 1
+        assert outcomes[0]["lifecycle_key"] == (
+            "paper|ICP-USDT-SWAP|dedupe-pos|short|1782579311213"
+        )
+    finally:
+        await close_db()

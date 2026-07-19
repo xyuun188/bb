@@ -7,6 +7,7 @@ import asyncio
 import json
 import shlex
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,24 @@ from services.authoritative_trade_outcome import (
     load_authoritative_trade_outcomes,
 )
 from services.training_data_quality import annotate_training_payload
+
+LINKAGE_RECOVERY_GAPS = {
+    "missing_position_history_entry_orders",
+    "missing_loaded_entry_order_facts",
+    "missing_position_history_close_orders",
+    "missing_loaded_close_order_facts",
+    "missing_exact_entry_order_decision_link",
+    "missing_exact_entry_order_decision_payload",
+    "missing_local_position_strategy_lineage",
+    "missing_planned_stop_loss_lineage",
+    "missing_planned_take_profit_lineage",
+}
+EXCHANGE_SPEC_RECOVERY_GAPS = {
+    "missing_contract_ct_val",
+    "missing_contract_ct_mult",
+    "missing_contract_lot_size",
+    "missing_fill_or_open_contracts",
+}
 
 
 def _position_ids(outcome: dict[str, Any]) -> set[int]:
@@ -66,7 +85,54 @@ def _outcome_summary(outcome: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def audit(*, mode: str, position_id: int | None = None) -> dict[str, Any]:
+def _gap_summary(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+    gap_counts: Counter[str] = Counter()
+    gap_set_counts: Counter[tuple[str, ...]] = Counter()
+    recovery_counts: Counter[str] = Counter()
+    incomplete_samples: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        gaps = tuple(sorted({str(item) for item in outcome.get("outcome_evidence_gaps") or [] if item}))
+        gap_counts.update(gaps)
+        gap_set_counts[gaps] += 1
+        if not gaps:
+            recovery_counts["complete"] += 1
+            continue
+        gap_set = set(gaps)
+        if gap_set <= LINKAGE_RECOVERY_GAPS:
+            recovery_class = "linkage_only_candidate"
+        elif gap_set <= LINKAGE_RECOVERY_GAPS | EXCHANGE_SPEC_RECOVERY_GAPS:
+            recovery_class = "linkage_and_exchange_spec_candidate"
+        else:
+            recovery_class = "official_fact_or_settlement_gap"
+        recovery_counts[recovery_class] += 1
+        if len(incomplete_samples) < 12:
+            incomplete_samples.append(
+                {
+                    "outcome_id": outcome.get("outcome_id"),
+                    "lifecycle_key": outcome.get("lifecycle_key"),
+                    "symbol": outcome.get("symbol"),
+                    "side": outcome.get("side"),
+                    "recovery_class": recovery_class,
+                    "evidence_gaps": list(gaps),
+                }
+            )
+    return {
+        "gap_counts": dict(gap_counts.most_common()),
+        "gap_set_counts": [
+            {"evidence_gaps": list(gaps), "count": count}
+            for gaps, count in gap_set_counts.most_common(30)
+        ],
+        "recovery_class_counts": dict(recovery_counts),
+        "incomplete_samples": incomplete_samples,
+    }
+
+
+async def audit(
+    *,
+    mode: str,
+    position_id: int | None = None,
+    summary_only: bool = False,
+) -> dict[str, Any]:
     outcomes = await load_authoritative_trade_outcomes(mode=mode)
     annotated = annotate_training_payload(
         shadow_samples=[],
@@ -122,23 +188,34 @@ async def audit(*, mode: str, position_id: int | None = None) -> dict[str, Any]:
         violations.append("shadow_counterfactual_has_production_weight")
     if position_id is not None and not selected:
         violations.append("requested_position_outcome_missing")
+    gap_summary = _gap_summary(outcomes)
     return {
         "status": "ok" if not violations else "blocked",
         "mode": mode,
         "contract_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         "outcome_count": len(outcomes),
         "complete_count": sum(item.get("outcome_complete") is True for item in outcomes),
+        "incomplete_count": sum(item.get("outcome_complete") is not True for item in outcomes),
+        "evidence_gap_summary": gap_summary,
         "violations": violations,
         "manifest": {
             key: value for key, value in manifest.items() if key != "records"
         },
-        "selected_outcomes": [_outcome_summary(item) for item in selected],
-        "selected_training_records": training_records,
-        "selected_expert_memory_bindings": memory_bindings,
+        "selected_outcomes": (
+            [] if summary_only else [_outcome_summary(item) for item in selected]
+        ),
+        "selected_training_records": [] if summary_only else training_records,
+        "selected_expert_memory_bindings": [] if summary_only else memory_bindings,
+        "summary_only": bool(summary_only),
     }
 
 
-def _online_report(*, mode: str, position_id: int | None) -> dict[str, Any]:
+def _online_report(
+    *,
+    mode: str,
+    position_id: int | None,
+    summary_only: bool,
+) -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1]
     remote_args = [
         ".venv/bin/python",
@@ -148,6 +225,8 @@ def _online_report(*, mode: str, position_id: int | None) -> dict[str, Any]:
     ]
     if position_id is not None:
         remote_args.extend(("--position-id", str(position_id)))
+    if summary_only:
+        remote_args.append("--summary-only")
     app_script = "\n".join(
         (
             "cd /data/bb/app",
@@ -178,12 +257,23 @@ def main() -> None:
     parser.add_argument("--mode", choices=("paper", "live"), default="paper")
     parser.add_argument("--position-id", type=int)
     parser.add_argument("--online", action="store_true")
+    parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()
     if args.online:
-        if _online_report(mode=args.mode, position_id=args.position_id).get("status") != "ok":
+        if _online_report(
+            mode=args.mode,
+            position_id=args.position_id,
+            summary_only=bool(args.summary_only),
+        ).get("status") != "ok":
             raise SystemExit(1)
         return
-    report = asyncio.run(audit(mode=args.mode, position_id=args.position_id))
+    report = asyncio.run(
+        audit(
+            mode=args.mode,
+            position_id=args.position_id,
+            summary_only=bool(args.summary_only),
+        )
+    )
     safe_print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     if report["status"] != "ok":
         raise SystemExit(1)

@@ -788,7 +788,24 @@ async def collect_existing_order_decision_link_plans(
                 )
             )
             seen_exchange_ids.add(exchange_id)
-    return plans
+    # A strategy decision can create only one entry-order lineage. Historical
+    # positions may contain several scale-in order ids, so per-order uniqueness
+    # alone is insufficient: the same nearby decision could otherwise be
+    # assigned to multiple orders. Keep only its closest deterministic match.
+    closest_plan_by_decision: dict[int, ExistingOrderDecisionLinkPlan] = {}
+    for plan in sorted(
+        plans,
+        key=lambda item: (
+            float(item.order_decision_delta_seconds or 0.0),
+            int(item.order_id),
+            item.exchange_order_id,
+        ),
+    ):
+        closest_plan_by_decision.setdefault(int(plan.decision_id), plan)
+    return sorted(
+        closest_plan_by_decision.values(),
+        key=lambda item: (item.order_filled_at or datetime.min.replace(tzinfo=UTC), item.order_id),
+    )
 
 
 async def collect_open_position_close_plans(

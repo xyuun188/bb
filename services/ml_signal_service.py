@@ -52,6 +52,7 @@ from services.profit_supervision import (
     MARKET_OPPORTUNITY_TASK,
     PROFIT_SUPERVISION_VERSION,
     authoritative_trade_calibration,
+    profit_supervision_report,
     select_trade_calibration,
 )
 from services.return_objective import (
@@ -1841,26 +1842,19 @@ def train_from_frame(
     authoritative_return_evidence = _authoritative_trade_return_evidence(
         trade_samples or []
     )
-    actual_execution_cost_sample_count = sum(
-        1
-        for sample in (trade_samples or [])
-        if _safe_dict(
-            _safe_dict(
-                _safe_dict(sample.get("profit_supervision")).get("tasks")
-            ).get(COUNTERFACTUAL_EXECUTION_COST_TASK)
-        ).get("eligible")
-        is True
+    supervision_report = profit_supervision_report(
+        frame.to_dict("records"),
+        trade_samples or [],
     )
-    supervision_report = _safe_dict(frame_quality_report.get("profit_supervision"))
     supervision_report = {
         **supervision_report,
-        "actual_execution_cost_sample_count": actual_execution_cost_sample_count,
-        "actual_realized_return_sample_count": int(
-            actual_trade_calibration.get("actual_realized_return_sample_count") or 0
-        ),
         "actual_trade_calibration_fingerprint": actual_trade_calibration.get(
             "data_fingerprint"
         ),
+    }
+    frame_quality_report = {
+        **frame_quality_report,
+        "profit_supervision": supervision_report,
     }
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,

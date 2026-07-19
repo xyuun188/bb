@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from core.runtime_data_retention_contract import is_ai_decision_retention_payload
 from core.training_contracts import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
     AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
@@ -20,7 +21,8 @@ from core.training_contracts import (
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
-from models.trade import OkxPositionHistory, Order, Position
+from models.trade import Order, Position
+from services.okx_position_history_store import load_okx_position_history_records
 from services.okx_training_facts import build_okx_history_training_sample
 
 AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
@@ -379,19 +381,22 @@ async def load_authoritative_trade_outcomes(
     """Load deterministic outcome events; no local-position PnL fallback is allowed."""
 
     async with session_factory() as session:
-        stmt = select(OkxPositionHistory)
-        if mode:
-            stmt = stmt.where(OkxPositionHistory.mode == mode)
+        requested_limit = max(int(limit), 1) if limit is not None else 5000
+        histories = await load_okx_position_history_records(
+            session,
+            mode=mode,
+            limit=requested_limit,
+        )
         since_utc = _as_utc(since)
         if since_utc is not None:
-            stmt = stmt.where(OkxPositionHistory.updated_at_okx >= since_utc.replace(tzinfo=None))
-        stmt = stmt.order_by(
-            OkxPositionHistory.updated_at_okx.desc().nullslast(),
-            OkxPositionHistory.id.desc(),
-        )
+            histories = [
+                history
+                for history in histories
+                if (_as_utc(history.updated_at_okx) or datetime.min.replace(tzinfo=UTC))
+                >= since_utc
+            ]
         if limit is not None:
-            stmt = stmt.limit(max(int(limit), 1))
-        histories = list((await session.execute(stmt)).scalars().all())
+            histories = histories[:requested_limit]
 
         position_ids = {
             int(value)
@@ -472,11 +477,23 @@ async def load_authoritative_trade_outcomes(
     }
     decisions_by_id = {int(row.id): row for row in decisions}
     decision_raw_by_order_id = {
-        str(order.exchange_order_id): _safe_dict(
-            getattr(decisions_by_id.get(int(order.decision_id or 0)), "raw_llm_response", None)
+        str(order.exchange_order_id): _decision_learning_payload(
+            decisions_by_id.get(int(order.decision_id or 0))
         )
         for order in orders
         if str(order.exchange_order_id or "").strip() and int(order.decision_id or 0) > 0
+    }
+    decision_execution_by_order_id = {
+        str(order.exchange_order_id): {
+            "decision_id": int(decision.id or 0),
+            "model_name": str(decision.model_name or ""),
+            "stop_loss_pct": _safe_float(decision.stop_loss_pct, None),
+            "take_profit_pct": _safe_float(decision.take_profit_pct, None),
+        }
+        for order in orders
+        if str(order.exchange_order_id or "").strip()
+        and int(order.decision_id or 0) > 0
+        and (decision := decisions_by_id.get(int(order.decision_id or 0))) is not None
     }
     reflections_by_position_id = {
         int(row.position_id): row
@@ -490,6 +507,7 @@ async def load_authoritative_trade_outcomes(
             positions_by_id=positions_by_id,
             orders_by_exchange_id=orders_by_exchange_id,
             decision_raw_by_order_id=decision_raw_by_order_id,
+            decision_execution_by_order_id=decision_execution_by_order_id,
         )
         reflection = next(
             (
@@ -508,3 +526,12 @@ async def load_authoritative_trade_outcomes(
         )
     results.reverse()
     return results
+
+
+def _decision_learning_payload(decision: Any | None) -> dict[str, Any]:
+    if decision is None:
+        return {}
+    raw = _safe_dict(getattr(decision, "raw_llm_response", None))
+    if raw and not is_ai_decision_retention_payload(raw):
+        return raw
+    return _safe_dict(getattr(decision, "decision_learning_snapshot", None))

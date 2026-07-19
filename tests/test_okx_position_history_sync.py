@@ -10,6 +10,7 @@ from sqlalchemy import select
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.trade import OkxPositionHistory
+from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncService
 
 
@@ -215,6 +216,17 @@ async def test_position_history_mirror_sync_updates_existing_rows(
             records = list(result.scalars().all())
         assert len(records) == 1
         assert records[0].realized_pnl == pytest.approx(2.3)
+        async with get_session_ctx() as session:
+            await upsert_okx_position_history_row(
+                session,
+                dict(ccxt.rows[0]),
+                mode="paper",
+                source="okx_order_fact_sync",
+            )
+        async with get_session_ctx() as session:
+            preserved = (await session.execute(select(OkxPositionHistory))).scalars().one()
+        assert preserved.raw_row["_bb_contract_spec"]["ctVal"] == "0.1"
+        assert preserved.raw_row["_bb_contract_spec"]["ctMult"] == "1"
     finally:
         await close_db()
 

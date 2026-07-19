@@ -158,6 +158,26 @@ def test_authoritative_sample_uses_exact_entry_order_decision_evidence() -> None
     assert sample["raw_llm_response"] == raw
 
 
+def test_exact_entry_decision_recovers_missing_planned_protection_prices() -> None:
+    lineage = _complete_lineage()
+    lineage["positions_by_id"][7].stop_loss_price = None
+    lineage["positions_by_id"][7].take_profit_price = None
+    lineage["decision_execution_by_order_id"] = {
+        "entry-1": {
+            "decision_id": 91,
+            "stop_loss_pct": 0.02,
+            "take_profit_pct": 0.04,
+        }
+    }
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert sample["planned_stop_loss_price"] == pytest.approx(98_000.0)
+    assert sample["planned_take_profit_price"] == pytest.approx(104_000.0)
+    assert "missing_planned_stop_loss_lineage" not in sample["strategy_lineage_gaps"]
+    assert "missing_planned_take_profit_lineage" not in sample["strategy_lineage_gaps"]
+
+
 def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons() -> None:
     history = _history()
     history.raw_row = {

@@ -294,11 +294,25 @@ def _apply_payload(record: OkxPositionHistory, payload: dict[str, Any]) -> None:
         if key in {"entry_order_ids", "close_order_ids", "linked_order_ids", "position_ids"}:
             existing = getattr(record, key, None)
             setattr(record, key, _merge_lists(_list_from_raw(existing), _list_from_raw(value)))
-        elif key == "evidence_gaps":
-            existing = getattr(record, key, None)
-            setattr(record, key, _merge_lists(_list_from_raw(existing), _list_from_raw(value)))
-        else:
+        elif key == "raw_row":
+            existing_raw = dict(getattr(record, "raw_row", None) or {})
+            incoming_raw = dict(value or {})
+            for raw_key, raw_value in existing_raw.items():
+                if raw_key.startswith("_bb_") and raw_key not in incoming_raw:
+                    incoming_raw[raw_key] = raw_value
+            record.raw_row = incoming_raw
+        elif key != "evidence_gaps":
             setattr(record, key, value)
+    evidence_gaps = _clean_list(payload.get("evidence_gaps"))
+    if _list_from_raw(record.entry_order_ids):
+        evidence_gaps = [
+            gap for gap in evidence_gaps if gap != "missing_position_history_entry_orders"
+        ]
+    if _list_from_raw(record.close_order_ids):
+        evidence_gaps = [
+            gap for gap in evidence_gaps if gap != "missing_position_history_close_orders"
+        ]
+    record.evidence_gaps = evidence_gaps
 
 
 def _inst_id(row: dict[str, Any]) -> str:

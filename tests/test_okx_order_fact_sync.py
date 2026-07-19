@@ -11,7 +11,7 @@ from db.session import close_db, get_session_ctx, init_db
 from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import StrategyLearningEvent
-from models.trade import Order, Position
+from models.trade import OkxPositionHistory, Order, Position
 from services.okx_native_facts import OkxNativeFillGroup
 from services.okx_order_fact_sync import (
     OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE,
@@ -2028,6 +2028,15 @@ async def test_order_fact_sync_closes_matching_open_position_from_okx_position_h
                     )
                 )
             ).all()
+            history_rows = list(
+                (
+                    await session.execute(
+                        OkxPositionHistory.__table__.select().where(
+                            OkxPositionHistory.__table__.c.pos_id == "spk-phase3-pos"
+                        )
+                    )
+                ).all()
+            )
 
         assert report["position_history_checked_count"] == 1
         assert report["position_history_backfilled_count"] == 0
@@ -2036,11 +2045,13 @@ async def test_order_fact_sync_closes_matching_open_position_from_okx_position_h
         position = position_rows[0]._mapping
         assert position["is_open"] is False
         assert position["closed_at"] is not None
-        assert position["model_name"] == "okx_authoritative_sync"
+        assert position["model_name"] == "ensemble_trader"
         assert position["settlement_status"] == "okx_position_history"
         assert position["settlement_source"] == "okx_position_history"
         assert position["realized_pnl"] == pytest.approx(1.23)
         assert position["close_exchange_order_id"] == "phase3-order"
+        assert len(history_rows) == 1
+        assert history_rows[0]._mapping["position_ids"] == [str(position["id"])]
     finally:
         await close_db()
 

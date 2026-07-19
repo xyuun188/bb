@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-app-dir", default="/data/bb/app")
     parser.add_argument("--mode", default="paper", choices=("paper", "live"))
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="Optional ISO-8601 lower bound for a one-off historical fact recovery.",
+    )
+    parser.add_argument("--limit", type=int, default=500)
     return parser.parse_args()
 
 
@@ -32,6 +38,7 @@ def main() -> None:
     remote_script = f"""
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 from scripts.runtime_env_bootstrap import load_runtime_env_files, drop_privileges_to_runtime_user_if_needed
@@ -43,7 +50,16 @@ drop_privileges_to_runtime_user_if_needed(project_root=root)
 from services.okx_order_fact_sync import OkxOrderFactSyncService
 
 async def main():
-    report = await OkxOrderFactSyncService(mode={args.mode!r}).sync()
+    since_text = {args.since!r}
+    historical_since = None
+    if since_text:
+        historical_since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
+    report = await OkxOrderFactSyncService(
+        mode={args.mode!r},
+        limit={max(int(args.limit or 1), 1)!r},
+        timeout_seconds={max(float(args.timeout or 1), 1.0)!r},
+        phase3_order_sync_start=historical_since,
+    ).sync()
     status_path = root / "data" / "trading_runtime_status.json"
     status = {{}}
     if status_path.exists():
@@ -59,6 +75,15 @@ async def main():
             "confirmed_count": report.get("confirmed_count"),
             "position_confirmed_count": report.get("position_confirmed_count"),
             "unverified_count": report.get("unverified_count"),
+            "okx_only_backfilled_count": report.get("okx_only_backfilled_count"),
+            "position_history_checked_count": report.get("position_history_checked_count"),
+            "position_history_backfilled_count": report.get("position_history_backfilled_count"),
+            "position_history_updated_count": report.get("position_history_updated_count"),
+            "position_history_skipped_count": report.get("position_history_skipped_count"),
+            "fill_pair_position_backfilled_count": report.get("fill_pair_position_backfilled_count"),
+            "closed_position_pnl_repaired_count": report.get("closed_position_pnl_repaired_count"),
+            "optional_stage_errors": report.get("optional_stage_errors", []),
+            "historical_since": since_text,
             "samples": report.get("samples", [])[:4],
         }},
         "runtime_okx_authoritative_sync": status.get("okx_authoritative_sync", {{}}),

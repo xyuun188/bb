@@ -667,6 +667,15 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["profit_supervision_report"][
         "actual_execution_cost_sample_count"
     ] == 1
+    assert metadata["profit_supervision_report"][
+        "actual_realized_return_sample_count"
+    ] == 1
+    assert metadata["profit_supervision_report"]["authoritative_realized_trade"][
+        "net_return_after_cost_pct"
+    ]["count"] == 1
+    assert metadata["quality_report"]["profit_supervision"][
+        "actual_realized_return_sample_count"
+    ] == 1
     assert metadata["evaluation_policy"]["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
     assert metadata["evaluation_policy"]["live_mutation"] is False
     assert not model_path.exists()
