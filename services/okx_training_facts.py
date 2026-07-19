@@ -162,6 +162,15 @@ def _has_raw_key(raw: dict[str, Any], *keys: str) -> bool:
     return any(key in raw and raw.get(key) not in (None, "") for key in keys)
 
 
+def _canonical_execution_mode(value: Any) -> str:
+    mode = _text(value).lower()
+    if mode in {"paper", "demo", "sim", "simulation"}:
+        return "paper"
+    if mode in {"live", "real", "production"}:
+        return "live"
+    return ""
+
+
 def build_okx_history_training_sample(
     history: Any,
     *,
@@ -222,8 +231,12 @@ def build_okx_history_training_sample(
     ) or 0.0
     settlement_expected = gross_pnl + fee_signed + funding_fee + liquidation_penalty
     settlement_tolerance = max(1e-6, abs(realized_pnl) * 1e-5)
+    source_execution_mode = _text(_value(history, "mode")).lower()
+    execution_mode = _canonical_execution_mode(source_execution_mode)
 
     gaps: list[str] = []
+    if not execution_mode:
+        gaps.append("missing_or_invalid_execution_mode")
     if _text(_value(history, "sync_status")).lower() != "synced":
         gaps.append("history_sync_not_confirmed")
     if _text(_value(history, "close_status")).lower() != "full":
@@ -334,8 +347,13 @@ def build_okx_history_training_sample(
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
     official_ratio_pct = _official_ratio_pct(raw, _value(history, "pnl_ratio"))
     lifecycle_key = _text(_value(history, "row_identity"))
+    history_source = _text(_value(history, "source"))
+    verified_execution_pair = history_source == "okx_verified_execution_pair_settlement"
+    sample_source = (
+        "okx_verified_execution_pair" if verified_execution_pair else "okx_position_history"
+    )
     return {
-        "source": "okx_position_history",
+        "source": sample_source,
         "id": int(_value(history, "id", 0) or 0),
         "lifecycle_key": lifecycle_key,
         "position_id": position_id,
@@ -348,7 +366,8 @@ def build_okx_history_training_sample(
         "linked_order_ids": linked_order_ids,
         "okx_trade_ids": _order_trade_ids(linked_orders),
         "model_name": model_name,
-        "execution_mode": _text(_value(history, "mode")),
+        "execution_mode": execution_mode,
+        "source_execution_mode": source_execution_mode,
         "symbol": _text(_value(history, "symbol")),
         "inst_id": _text(_value(history, "inst_id")),
         "side": side,
@@ -458,10 +477,26 @@ def build_okx_history_training_sample(
         ),
         "raw_llm_response": raw_llm_response,
         "outcome": "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat",
-        "pnl_source": "okx_position_history_realized_pnl",
-        "settlement_source": "okx_position_history_realized_pnl",
-        "funding_fee_source": "okx_positions_history.fundingFee",
-        "fee_source": "okx_positions_history.fee",
+        "pnl_source": (
+            _text(raw.get("_bb_pnl_source"))
+            if verified_execution_pair
+            else "okx_position_history_realized_pnl"
+        ),
+        "settlement_source": (
+            "okx_verified_execution_pair_settlement"
+            if verified_execution_pair
+            else "okx_position_history_realized_pnl"
+        ),
+        "funding_fee_source": (
+            _text(raw.get("_bb_funding_fee_source"))
+            if verified_execution_pair
+            else "okx_positions_history.fundingFee"
+        ),
+        "fee_source": (
+            _text(raw.get("_bb_fee_source"))
+            if verified_execution_pair
+            else "okx_positions_history.fee"
+        ),
         "trade_fact_trusted": not gaps,
         "trade_fact_trust_reason": gaps[0] if gaps else "",
         "strategy_lineage_complete": not lineage_gaps,

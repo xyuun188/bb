@@ -118,14 +118,14 @@ def test_dynamic_route_live_requested_requires_walk_forward_and_explicit_enablem
             "training_mode": "shadow",
             "model_stage": "canary",
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
                 "requires_walk_forward": True,
             },
         },
     )
 
-    assert blocked["mode"] == "live_blocked"
+    assert blocked["mode"] == "active_blocked"
     assert blocked["canary_ready"] is True
     assert blocked["live_ready"] is False
     assert blocked["blocking_reasons"] == [
@@ -144,14 +144,15 @@ def test_dynamic_route_live_requested_requires_walk_forward_and_explicit_enablem
             "training_mode": "walk_forward",
             "model_stage": "live",
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": True,
                 "requires_walk_forward": True,
             },
         },
     )
 
-    assert ready["mode"] == "live_ready"
+    assert ready["mode"] == "active_ready"
+    assert ready["active_ready"] is True
     assert ready["live_ready"] is True
     assert ready["blocking_reasons"] == []
     assert ready["live_route_mutation"] is False

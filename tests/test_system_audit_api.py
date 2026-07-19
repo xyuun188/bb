@@ -1130,7 +1130,7 @@ async def test_model_training_audit_does_not_run_full_self_check(
                     "trained_models_available": True,
                     "trained_at": "2026-07-09T05:00:00+00:00",
                     "evaluation_policy": {
-                        "promotion_flow": "shadow_to_canary_to_live",
+                        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                         "live_mutation": False,
                         "requires_walk_forward": True,
                     },
@@ -1176,7 +1176,7 @@ async def test_model_training_audit_does_not_run_full_self_check(
             "eligible_shadow_count": 12,
             "model_count": 1,
             "live_mutation": False,
-            "promotion_flow": "shadow_to_canary_to_live",
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
             "summary": {"promotion_ready_count": 0, "blocked_count": 1},
             "models": [
                 {
@@ -2167,6 +2167,36 @@ async def test_production_source_health_card_exposes_continuous_alert(
     assert card["status"] == "critical"
     assert "bootstrap canary" in card["summary"]
     assert card["details"]["continuous_no_source_seconds"] == 7200.0
+
+
+@pytest.mark.asyncio
+async def test_production_source_health_card_exposes_sampling_plan_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProductionSourceHealthService:
+        async def report(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "status": "critical",
+                "reason": "paper_bootstrap_sampling_plan_unreachable",
+                "continuous_no_source_seconds": 3600.0,
+                "production_source_decision_count": 0,
+                "paper_bootstrap_executed_count": 2,
+                "sampling_plan_alert_active": True,
+                "recovery_state": "paper_bootstrap_plan_unreachable",
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ProductionSourceHealthService",
+        FakeProductionSourceHealthService,
+    )
+
+    card = await system_audit._production_source_health_audit()
+
+    assert card["key"] == "production_source_health"
+    assert card["status"] == "critical"
+    assert "sampling plan" in card["summary"]
+    assert card["details"]["sampling_plan_alert_active"] is True
 
 
 

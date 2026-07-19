@@ -9,6 +9,7 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import OrderStatus
 from services.entry_fee_provider import proportional_fee
+from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
 from services.position_execution_persistence import PositionExecutionPersistenceService
 
 
@@ -185,7 +186,7 @@ async def test_persist_entry_stores_immutable_paper_canary_lifecycle() -> None:
     decision = _decision(Action.LONG)
     decision.raw_response = {
         "paper_bootstrap_canary": {
-            "version": "2026-07-17.paper-bootstrap-canary.v1",
+            "version": PAPER_BOOTSTRAP_CANARY_VERSION,
             "requested": True,
             "authorized": True,
             "execution_scope": "paper_only",

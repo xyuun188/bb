@@ -214,12 +214,12 @@ class ModelRegistry:
         await registry.initialize_all()
 
         models = registry.get_all()
-        live_model = registry.get_live_model()
+        active_model = registry.get_active_model()
     """
 
     def __init__(self) -> None:
         self._models: dict[str, AbstractAIModel] = {}
-        self._live_model_name: str | None = None
+        self._active_model_name: str | None = None
         self._initialized = False
         self._batch_expert_disabled_until_by_provider: dict[tuple[str, str], float] = {}
         self._batch_expert_last_error_by_provider: dict[tuple[str, str], str] = {}
@@ -245,30 +245,44 @@ class ModelRegistry:
     def model_count(self) -> int:
         return len(self._models)
 
-    def get_live_model(self) -> AbstractAIModel | None:
-        """Get the model currently selected for live trading."""
-        if self._live_model_name:
-            return self._models.get(self._live_model_name)
+    def get_active_model(self) -> AbstractAIModel | None:
+        """Get the unified model selected for paper and live trading."""
+        if self._active_model_name:
+            return self._models.get(self._active_model_name)
         return None
 
-    def set_live_model(self, name: str) -> None:
-        """Promote a model to be the live trading model."""
+    def set_active_model(self, name: str) -> None:
+        """Select the one model used in both execution modes."""
         if name not in self._models:
             raise ValueError(f"Model '{name}' is not registered.")
-        self._live_model_name = name
-        logger.info("live model set", name=name)
+        self._active_model_name = name
+        logger.info("active model set", name=name)
+
+    def get_live_model(self) -> AbstractAIModel | None:
+        """Backward-compatible alias for get_active_model()."""
+
+        return self.get_active_model()
+
+    def set_live_model(self, name: str) -> None:
+        """Backward-compatible alias that cannot create a second model pointer."""
+
+        self.set_active_model(name)
+
+    @property
+    def active_model_name(self) -> str | None:
+        return self._active_model_name
 
     @property
     def live_model_name(self) -> str | None:
-        return self._live_model_name
+        return self._active_model_name
 
     def unregister(self, name: str) -> bool:
         """Remove a model from the registry. Returns True if removed."""
         if name in self._models:
             del self._models[name]
             logger.info("model unregistered", name=name)
-            if self._live_model_name == name:
-                self._live_model_name = next(iter(self._models), None) if self._models else None
+            if self._active_model_name == name:
+                self._active_model_name = next(iter(self._models), None) if self._models else None
             return True
         return False
 
@@ -313,9 +327,9 @@ class ModelRegistry:
 
         self._initialized = True
 
-        # Auto-select first model as live if none set
-        if self._live_model_name is None and self._models:
-            self._live_model_name = list(self._models.keys())[0]
+        # Keep one mode-independent model pointer across registry refreshes.
+        if self._active_model_name not in self._models and self._models:
+            self._active_model_name = list(self._models.keys())[0]
 
     async def shutdown_all(self) -> None:
         """Shutdown all models gracefully."""
@@ -1243,6 +1257,7 @@ class ModelRegistry:
         return {
             "models": self.model_names,
             "model_count": self.model_count,
-            "live_model": self._live_model_name,
+            "active_model": self._active_model_name,
+            "live_model": self._active_model_name,
             "initialized": self._initialized,
         }

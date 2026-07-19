@@ -822,7 +822,13 @@ class EnsembleCoordinator:
             "policy_provenance": policy_provenance,
         }
         if not production_eligible:
-            paper_canary = select_paper_bootstrap_candidate(context)
+            paper_canary = select_paper_bootstrap_candidate(
+                {
+                    **context,
+                    "sampling_symbol": features.symbol,
+                    "sampling_features": features.to_dict(),
+                }
+            )
             if paper_canary.get("authorized") is True:
                 selected_side = str(paper_canary.get("selected_side") or "")
                 action = Action.LONG if selected_side == "long" else Action.SHORT

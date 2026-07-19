@@ -649,7 +649,7 @@ class LocalAIToolsClient:
         if circuit_open:
             return {"trained": False, "reason": "circuit_open", **circuit_open}
         effective_evaluation_policy = evaluation_policy or {
-            "promotion_flow": "shadow_to_canary_to_live",
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
             "live_mutation": False,
             "requires_walk_forward": True,
             "phase": "phase3_model_factory",

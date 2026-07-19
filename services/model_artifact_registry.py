@@ -15,7 +15,16 @@ from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 
 ARTIFACT_REGISTRY_VERSION = "2026-07-15.v2"
 ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-15.v1"
-_ACTIVATION_STAGES = frozenset({"shadow", "canary", "live"})
+_WRITABLE_ACTIVATION_STAGES = frozenset({"shadow", "canary", "active"})
+_READABLE_ACTIVATION_STAGES = frozenset(
+    {*_WRITABLE_ACTIVATION_STAGES, "live"}
+)
+_ALLOWED_STAGE_TRANSITIONS = {
+    "shadow": frozenset({"canary"}),
+    "canary": frozenset({"active"}),
+    # Existing manifests used `live` for the unified production artifact.
+    "live": frozenset({"active"}),
+}
 _MIGRATABLE_REGISTRY_VERSIONS = frozenset({"2026-07-11.v1"})
 
 
@@ -84,6 +93,7 @@ class ResolvedModelArtifact:
     pointer_role: str
     pointer_path: Path
     activation_manifest: dict[str, Any] | None = None
+    rejection_manifest: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -104,8 +114,18 @@ class ModelArtifactRegistry:
         return self.model_root / "candidate.json"
 
     @property
+    def challenger_path(self) -> Path:
+        return self.model_root / "challenger.json"
+
+    @property
     def current_path(self) -> Path:
         return self.model_root / "current.json"
+
+    @property
+    def active_path(self) -> Path:
+        """Canonical unified runtime pointer; shares the legacy current.json file."""
+
+        return self.current_path
 
     @property
     def rollback_path(self) -> Path:
@@ -208,6 +228,18 @@ class ModelArtifactRegistry:
             required=False,
         )
 
+    def resolve_challenger(self) -> ResolvedModelArtifact | None:
+        return self._resolve_pointer(
+            self.challenger_path,
+            expected_role="challenger",
+            required=False,
+        )
+
+    def resolve_active(self) -> ResolvedModelArtifact | None:
+        """Resolve the one artifact used by both paper and live execution."""
+
+        return self.resolve_current()
+
     def resolve_rollback(self) -> ResolvedModelArtifact | None:
         return self._resolve_pointer(
             self.rollback_path,
@@ -219,6 +251,8 @@ class ModelArtifactRegistry:
         self,
         activation_evidence: dict[str, Any],
     ) -> ResolvedModelArtifact:
+        if str(activation_evidence.get("activation_stage") or "") != "shadow":
+            raise ValueError("candidate artifact must first activate as shadow")
         candidate = self.resolve_candidate(required=True)
         assert candidate is not None
         previous_pointer = _read_json(self.current_path) if self.current_path.exists() else None
@@ -297,6 +331,90 @@ class ModelArtifactRegistry:
             raise ValueError("promoted current artifact is unavailable")
         self.candidate_path.unlink(missing_ok=True)
         return current
+
+    def transition_current(
+        self,
+        activation_evidence: dict[str, Any],
+    ) -> ResolvedModelArtifact:
+        """Advance the unified artifact without replacing its version rollback."""
+
+        current = self.resolve_current()
+        if current is None or not isinstance(current.activation_manifest, dict):
+            raise ValueError("current artifact is not registered for transition")
+        current_stage = str(current.activation_manifest.get("activation_stage") or "")
+        target_stage = _required_text(activation_evidence, "activation_stage")
+        allowed_targets = _ALLOWED_STAGE_TRANSITIONS.get(current_stage, frozenset())
+        if target_stage not in allowed_targets:
+            raise ValueError(
+                f"artifact stage transition {current_stage or 'unregistered'} -> "
+                f"{target_stage} is not allowed"
+            )
+        evidence = {
+            **activation_evidence,
+            "transition_from_stage": current_stage,
+        }
+        activation = self._build_activation_manifest(current, evidence)
+        activation_root = current.manifest_path.parent / "activations"
+        activation_path = activation_root / f"a-{uuid.uuid4().hex[:8]}.json"
+        _write_json_once(activation_path, activation)
+        activation_hash = _sha256(activation_path)
+        current_pointer = _read_json(self.current_path)
+        _write_json_atomic(
+            self.current_path,
+            {
+                **current_pointer,
+                "activation_manifest_path": str(
+                    activation_path.relative_to(self.model_root)
+                ),
+                "activation_manifest_sha256": activation_hash,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        transitioned = self.resolve_current()
+        if transitioned is None:
+            raise ValueError("artifact stage transition did not preserve current artifact")
+        return transitioned
+
+    def reject_candidate(
+        self,
+        comparison_report: dict[str, Any],
+    ) -> ResolvedModelArtifact:
+        """Preserve an evaluated challenger without changing the champion pointer."""
+
+        candidate = self.resolve_candidate(required=True)
+        assert candidate is not None
+        rejected_at = datetime.now(UTC)
+        rejection = {
+            "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+            "model_id": self.model_id,
+            "version": candidate.version,
+            "artifact_sha256": candidate.sha256,
+            "comparison_report": comparison_report,
+            "rejected_at": rejected_at.isoformat(),
+        }
+        rejection_path = candidate.manifest_path.parent / "rejections" / (
+            f"r-{uuid.uuid4().hex[:8]}.json"
+        )
+        _write_json_once(rejection_path, rejection)
+        rejection_hash = _sha256(rejection_path)
+        candidate_pointer = _read_json(self.candidate_path)
+        _write_json_atomic(
+            self.challenger_path,
+            {
+                **candidate_pointer,
+                "pointer_role": "challenger",
+                "rejection_manifest_path": str(
+                    rejection_path.relative_to(self.model_root)
+                ),
+                "rejection_manifest_sha256": rejection_hash,
+                "updated_at": rejected_at.isoformat(),
+            },
+        )
+        challenger = self.resolve_challenger()
+        if challenger is None:
+            raise ValueError("rejected challenger artifact is unavailable")
+        self.candidate_path.unlink(missing_ok=True)
+        return challenger
 
     def rollback_current(self) -> ResolvedModelArtifact:
         rollback = self.resolve_rollback()
@@ -449,8 +567,8 @@ class ModelArtifactRegistry:
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
         stage = _required_text(evidence, "activation_stage")
-        if stage not in _ACTIVATION_STAGES:
-            raise ValueError("activation_stage must be shadow, canary, or live")
+        if stage not in _WRITABLE_ACTIVATION_STAGES:
+            raise ValueError("activation_stage must be shadow, canary, or active")
         production_authorized = evidence.get("production_influence_authorized") is True
         paper_canary_authorized = evidence.get("paper_canary_authorized") is True
         readiness_state = str(evidence.get("readiness_state") or "").strip()
@@ -485,7 +603,7 @@ class ModelArtifactRegistry:
                 or not list(walk_forward.get("folds") or [])
             ):
                 raise ValueError("paper canary activation requires complete walk-forward evidence")
-        elif stage in {"canary", "live"}:
+        elif stage in {"canary", "active"}:
             if not production_authorized:
                 raise ValueError(f"{stage} activation requires production authorization")
             if readiness_state not in {"ready", "partial_ready"}:
@@ -519,6 +637,8 @@ class ModelArtifactRegistry:
                 raise ValueError(f"{stage} ready activation requires both live sides")
             if return_evidence.get("state") == "partial_ready" and len(live_sides) != 1:
                 raise ValueError(f"{stage} partial-ready activation requires exactly one live side")
+            if stage == "active" and return_evidence.get("state") != "ready":
+                raise ValueError("active activation requires ready return evidence")
             evidence_sides = evidence.get("live_enabled_sides")
             if not isinstance(evidence_sides, list) or set(evidence_sides) != live_sides:
                 raise ValueError(f"{stage} activation sides must match return evidence")
@@ -537,9 +657,18 @@ class ModelArtifactRegistry:
                 raise ValueError(f"{stage} activation requires complete walk-forward evidence")
             walk_sides = walk_forward["sides"]
             folds = walk_forward["folds"]
+            if len(folds) < 2:
+                raise ValueError(
+                    f"{stage} activation requires multiple walk-forward windows"
+                )
             if any(
                 not isinstance(walk_sides.get(side), dict)
                 or walk_sides[side].get("promotion_math_ready") is not True
+                or not isinstance(
+                    walk_sides[side].get("market_regime_stability"), dict
+                )
+                or walk_sides[side]["market_regime_stability"].get("stable")
+                is not True
                 or any(
                     not isinstance(fold, dict)
                     or not isinstance(fold.get("sides"), dict)
@@ -657,6 +786,7 @@ class ModelArtifactRegistry:
         self._validate_embedded_identity(embedded_metadata, metadata)
 
         activation = None
+        rejection = None
         if expected_role in {"current", "rollback"}:
             activation_relative = _required_text(pointer, "activation_manifest_path")
             activation_path = (self.model_root / activation_relative).resolve(strict=True)
@@ -672,6 +802,23 @@ class ModelArtifactRegistry:
                 actual_hash,
                 expected_manifest_hash,
             )
+        elif expected_role == "challenger":
+            rejection_relative = _required_text(pointer, "rejection_manifest_path")
+            rejection_path = (self.model_root / rejection_relative).resolve(strict=True)
+            rejection_path.relative_to(version_root)
+            if _sha256(rejection_path) != _required_text(
+                pointer, "rejection_manifest_sha256"
+            ):
+                raise ValueError("artifact rejection manifest hash verification failed")
+            rejection = _read_json(rejection_path)
+            if (
+                rejection.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+                or rejection.get("model_id") != self.model_id
+                or rejection.get("version") != version
+                or rejection.get("artifact_sha256") != actual_hash
+                or not isinstance(rejection.get("comparison_report"), dict)
+            ):
+                raise ValueError("artifact rejection manifest identity mismatch")
         return ResolvedModelArtifact(
             model_id=self.model_id,
             version=version,
@@ -683,6 +830,7 @@ class ModelArtifactRegistry:
             pointer_role=expected_role,
             pointer_path=pointer_path,
             activation_manifest=activation,
+            rejection_manifest=rejection,
         )
 
     def _validate_metadata_identity(
@@ -787,7 +935,7 @@ class ModelArtifactRegistry:
         ):
             raise ValueError("artifact activation paper-canary identity mismatch")
         stage = activation.get("activation_stage")
-        if stage not in _ACTIVATION_STAGES:
+        if stage not in _READABLE_ACTIVATION_STAGES:
             raise ValueError("artifact activation stage is invalid")
         production_authorized = activation.get("production_influence_authorized") is True
         paper_canary_authorized = activation.get("paper_canary_authorized") is True
@@ -809,13 +957,15 @@ class ModelArtifactRegistry:
                 or list(paper_report.get("blocking_reasons") or [])
             ):
                 raise ValueError("paper canary artifact activation evidence is incomplete")
-        elif stage in {"canary", "live"} and (
+        elif stage in {"canary", "active", "live"} and (
             not production_authorized
             or activation.get("readiness_state") not in {"ready", "partial_ready"}
             or blockers
         ):
             raise ValueError("production artifact activation evidence is incomplete")
-        if stage in {"canary", "live"} and not paper_canary_authorized:
+        if stage == "active" and activation.get("readiness_state") != "ready":
+            raise ValueError("active artifact requires ready return evidence")
+        if stage in {"canary", "active", "live"} and not paper_canary_authorized:
             return_evidence = activation.get("return_evidence_report")
             if not isinstance(return_evidence, dict) or (
                 return_evidence.get("allow_live_position_influence") is not True
@@ -827,7 +977,7 @@ class ModelArtifactRegistry:
     def status(self) -> dict[str, Any]:
         pointer_status = {
             role: self._pointer_status(role)
-            for role in ("candidate", "current", "rollback")
+            for role in ("candidate", "challenger", "current", "rollback")
         }
         current = pointer_status["current"]
         return {
@@ -835,7 +985,9 @@ class ModelArtifactRegistry:
             "model_id": self.model_id,
             "registry_version": ARTIFACT_REGISTRY_VERSION,
             "candidate_pointer": str(self.candidate_path),
+            "challenger_pointer": str(self.challenger_path),
             "current_pointer": str(self.current_path),
+            "active_pointer": str(self.active_path),
             "rollback_pointer": str(self.rollback_path),
             "pointers": pointer_status,
             **(
@@ -858,6 +1010,7 @@ class ModelArtifactRegistry:
     def _pointer_status(self, role: str) -> dict[str, Any]:
         resolver = {
             "candidate": self.resolve_candidate,
+            "challenger": self.resolve_challenger,
             "current": self.resolve_current,
             "rollback": self.resolve_rollback,
         }[role]
@@ -880,4 +1033,5 @@ class ModelArtifactRegistry:
             "sha256": resolved.sha256,
             "manifest": resolved.manifest,
             "activation_manifest": resolved.activation_manifest,
+            "rejection_manifest": resolved.rejection_manifest,
         }

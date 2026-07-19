@@ -70,6 +70,7 @@ ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-15.local-ai-tools-activation.v2"
 ARTIFACT_MODEL_ID = "local_ai_tools_quant_bundle"
 VERSIONS_ROOT = MODEL_DIR / "versions"
 CANDIDATE_POINTER_PATH = MODEL_DIR / "candidate.json"
+CHALLENGER_POINTER_PATH = MODEL_DIR / "challenger.json"
 CURRENT_POINTER_PATH = MODEL_DIR / "current.json"
 ROLLBACK_POINTER_PATH = MODEL_DIR / "rollback.json"
 PHASE3_VALIDATION_REPORT_PATH = (
@@ -80,7 +81,7 @@ PHASE3_DOWNLOAD_REPORT_PATH = (
 )
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
 PHASE3_REQUIRED_TRAINING_POLICY = "clean_training_view_only"
-PHASE3_REQUIRED_PROMOTION_FLOW = "shadow_to_canary_to_live"
+PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
 LOCAL_REVIEW_DISABLED_DETAIL = (
     "Local AI tools do not provide high-risk trade review. "
     "Configure HIGH_RISK_REVIEW_* in the trading app to an online reviewer."
@@ -598,6 +599,36 @@ def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: float(row["score"]))[-selected_count:]
 
 
+def _market_regime_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        regime = str(row.get("market_regime") or "").strip().lower()
+        if regime and regime != "unknown":
+            grouped.setdefault(regime, []).append(row)
+    reports = {
+        regime: _return_evidence(_select_top_return_rows(regime_rows))
+        for regime, regime_rows in sorted(grouped.items())
+    }
+    stable = bool(len(reports) >= 2) and all(
+        report.get("promotion_math_ready") is True for report in reports.values()
+    )
+    return {
+        "stable": stable,
+        "observed_regime_count": len(reports),
+        "required_regime_count": 2,
+        "regimes": reports,
+        "blocking_reasons": (
+            []
+            if stable
+            else [
+                "insufficient_market_regime_coverage"
+                if len(reports) < 2
+                else "market_regime_fee_after_return_unstable"
+            ]
+        ),
+    }
+
+
 def _leave_one_symbol_out_stability(
     rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -668,9 +699,10 @@ def _fit_walk_forward_side(
         - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
     )
     evaluated_rows = [
-        {
-            "symbol": str(row.get("symbol") or ""),
-            "decision_group": str(row.get("decision_group") or ""),
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "market_regime": str(row.get("market_regime") or "unknown"),
+                "decision_group": str(row.get("decision_group") or ""),
             "label_timestamp": str(row.get("label_timestamp") or ""),
             "return_pct": float(row[net_key]),
             "gross_market_return_pct": float(row[return_key]),
@@ -802,6 +834,7 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         side_reports[side] = {
             **evidence,
             "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
+            "market_regime_stability": _market_regime_stability(oos_rows[side]),
         }
     return {
         "version": version,
@@ -820,10 +853,11 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "model_refit_per_fold": True,
         "chronological": True,
         "sides": side_reports,
-        "stable": bool(folds)
+        "stable": len(folds) >= 2
         and all(
             report["promotion_math_ready"]
             and report["leave_one_symbol_out"]["stable"]
+            and report["market_regime_stability"]["stable"]
             and all(
                 fold["sides"][side]["promotion_math_ready"]
                 for fold in folds
@@ -954,7 +988,7 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         or walk_forward.get("decision_group_disjoint") is not True
         or walk_forward.get("chronological_label_disjoint") is not True
         or walk_forward.get("model_refit_per_fold") is not True
-        or not folds
+        or len(folds) < 2
     ):
         blockers.append("walk_forward_evidence_incomplete")
     loso_report = metadata.get("leave_one_symbol_out_report") or {}
@@ -967,6 +1001,10 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
     for side in ("long", "short"):
         if (walk_sides.get(side) or {}).get("promotion_math_ready") is not True:
             blockers.append(f"{side}_walk_forward_return_evidence_not_ready")
+        if (
+            (walk_sides.get(side) or {}).get("market_regime_stability") or {}
+        ).get("stable") is not True:
+            blockers.append(f"{side}_market_regime_stability_not_ready")
         if any(
             ((fold.get("sides") or {}).get(side) or {}).get(
                 "promotion_math_ready"
@@ -1038,6 +1076,29 @@ def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None)
         "horizon_minutes": float(horizon_minutes if horizon_minutes is not None else f(features, "horizon_minutes", 10.0)),
     }
     return {key: float(values.get(key, 0.0)) for key in FEATURE_KEYS}
+
+
+def _market_regime_label(features: dict[str, Any]) -> str:
+    explicit = str(
+        features.get("market_regime")
+        or features.get("regime")
+        or features.get("market_state")
+        or ""
+    ).strip().lower()
+    if explicit:
+        return explicit[:80]
+    volatility = abs(f(features, "volatility_20"))
+    if volatility <= 0:
+        price = max(f(features, "current_price"), f(features, "close"))
+        volatility = abs(f(features, "atr_14")) / price if price > 0 else 0.0
+    returns_20 = abs(f(features, "returns_20"))
+    return (
+        "volatile"
+        if volatility >= 0.03
+        else "trending"
+        if returns_20 >= 0.01
+        else "ranging"
+    )
 
 
 def model_x(features: dict[str, Any], *, horizon_minutes: int | None = None) -> list[float]:
@@ -1266,6 +1327,7 @@ def _resolve_artifact_pointer(
         if metadata.get(field) != manifest.get(field):
             raise ValueError(f"Local AI artifact metadata/manifest {field} mismatch.")
     activation = None
+    rejection = None
     if role in {"current", "rollback"}:
         activation_path = (
             MODEL_DIR / _required_text(pointer, "activation_manifest_path")
@@ -1307,30 +1369,51 @@ def _resolve_artifact_pointer(
                 or recommendation.get("canary_ready") is not True
             ):
                 raise ValueError("Canary local AI activation contract is incomplete.")
-        if stage == "live":
+        if stage in {"active", "live"}:
             recommendation = activation.get("promotion_recommendation") or {}
             if (
-                recommendation.get("recommended_stage") != "live"
-                or recommendation.get("live_ready") is not True
+                recommendation.get("recommended_stage") not in {"active", "live"}
+                or recommendation.get(
+                    "active_ready", recommendation.get("live_ready")
+                )
+                is not True
             ):
-                raise ValueError("Live local AI activation recommendation is incomplete.")
+                raise ValueError("Active local AI activation recommendation is incomplete.")
             if not production_authorized:
-                raise ValueError("Live local AI activation is not authorized.")
+                raise ValueError("Active local AI activation is not authorized.")
             evidence_blockers = _production_return_evidence_blockers(metadata)
             if evidence_blockers:
                 raise ValueError(
-                    "Live local AI activation return evidence is not ready: "
+                    "Active local AI activation return evidence is not ready: "
                     + ",".join(evidence_blockers)
                 )
             if activation.get("return_evidence_ready") is not True:
-                raise ValueError("Live local AI activation evidence was not authorized.")
+                raise ValueError("Active local AI activation evidence was not authorized.")
             if (
                 activation.get("execution_scope") != "production"
                 or activation.get("production_permission") is not True
             ):
-                raise ValueError("Live local AI activation permission is incomplete.")
-        if stage not in {"shadow", "canary", "live"}:
+                raise ValueError("Active local AI activation permission is incomplete.")
+        if stage not in {"shadow", "canary", "active", "live"}:
             raise ValueError("Local AI activation stage is invalid.")
+    elif role == "challenger":
+        rejection_path = (
+            MODEL_DIR / _required_text(pointer, "rejection_manifest_path")
+        ).resolve(strict=True)
+        rejection_path.relative_to(version_root)
+        if sha256_file(rejection_path) != _required_text(
+            pointer, "rejection_manifest_sha256"
+        ):
+            raise ValueError("Local AI rejection manifest hash verification failed.")
+        rejection = read_json_object(rejection_path)
+        if (
+            rejection.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+            or rejection.get("artifact_model_id") != ARTIFACT_MODEL_ID
+            or rejection.get("artifact_version") != version
+            or rejection.get("artifact_sha256") != artifact_hash
+            or not isinstance(rejection.get("comparison_report"), dict)
+        ):
+            raise ValueError("Local AI rejection manifest identity mismatch.")
     bundle = None
     if deserialize_bundle:
         bundle = load_trusted_joblib_bundle(model_path)
@@ -1360,6 +1443,7 @@ def _resolve_artifact_pointer(
         "metadata_path": metadata_path,
         "metadata": metadata,
         "activation_manifest": activation,
+        "rejection_manifest": rejection,
         "bundle": bundle,
     }
 
@@ -1454,20 +1538,181 @@ def _governed_candidate_activation_stage(
     evidence_blockers: list[str],
 ) -> str:
     recommended = str(promotion_recommendation.get("recommended_stage") or "shadow").lower()
+    active_ready = promotion_recommendation.get(
+        "active_ready", promotion_recommendation.get("live_ready")
+    )
     if (
-        recommended == "live"
-        and promotion_recommendation.get("live_ready") is True
+        recommended in {"active", "live"}
+        and active_ready is True
         and not evidence_blockers
     ):
-        return "live"
+        return "active"
     if (
-        recommended in {"canary", "live"}
+        recommended in {"canary", "active", "live"}
         and promotion_recommendation.get("canary_ready") is True
         and promotion_recommendation.get("canary_execution_scope") == "paper_only"
         and promotion_recommendation.get("canary_production_permission") is False
     ):
         return "canary"
     return "shadow"
+
+
+def _local_artifact_stage_rank(stage: str) -> int:
+    return {"shadow": 0, "canary": 1, "active": 2, "live": 2}.get(
+        str(stage or "").lower(),
+        -1,
+    )
+
+
+def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
+    values: dict[str, list[float]] = {
+        "avg_return_pct": [],
+        "return_lcb_pct": [],
+        "profit_factor": [],
+        "cvar_10_pct": [],
+        "max_drawdown_pct": [],
+    }
+    evidence = metadata.get("oos_return_evaluation") or {}
+    for side in ("long", "short"):
+        row = evidence.get(side) if isinstance(evidence, dict) else None
+        if not isinstance(row, dict):
+            continue
+        for key in values:
+            try:
+                value = float(row.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values[key].append(value)
+    return {
+        key: sum(items) / len(items) if items else None
+        for key, items in values.items()
+    }
+
+
+def _compare_candidate_to_current(
+    candidate_metadata: dict[str, Any],
+    *,
+    candidate_stage: str,
+) -> dict[str, Any]:
+    current = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=False,
+    )
+    report: dict[str, Any] = {
+        "policy": "local_ai_tools_fee_after_champion_v1",
+        "candidate_stage": candidate_stage,
+        "accepted": False,
+        "blocking_reasons": [],
+    }
+    if current is None:
+        return {**report, "accepted": True, "reason": "initial_champion"}
+    current_stage = str(
+        (current.get("activation_manifest") or {}).get("activation_stage") or ""
+    ).lower()
+    candidate_rank = _local_artifact_stage_rank(candidate_stage)
+    champion_rank = _local_artifact_stage_rank(current_stage)
+    if candidate_rank < champion_rank:
+        return {
+            **report,
+            "reason": "champion_retained",
+            "blocking_reasons": ["candidate_lifecycle_regression"],
+            "champion_version": current.get("version"),
+        }
+    if candidate_rank > champion_rank:
+        return {
+            **report,
+            "accepted": True,
+            "reason": "governed_lifecycle_upgrade",
+            "champion_version": current.get("version"),
+        }
+    candidate = _local_oos_aggregate(candidate_metadata)
+    champion = _local_oos_aggregate(current.get("metadata") or {})
+    report["candidate_metrics"] = candidate
+    report["champion_metrics"] = champion
+    if any(candidate.get(key) is None or champion.get(key) is None for key in candidate):
+        return {
+            **report,
+            "reason": "champion_retained",
+            "blocking_reasons": ["champion_comparison_metric_missing"],
+            "champion_version": current.get("version"),
+        }
+    blockers: list[str] = []
+    primary = ("avg_return_pct", "return_lcb_pct", "profit_factor")
+    if champion_rank == _local_artifact_stage_rank("active"):
+        if candidate_stage != "active":
+            blockers.append("active_champion_requires_active_challenger")
+        for key in primary:
+            if candidate[key] <= champion[key]:
+                blockers.append(f"candidate_{key}_not_improved")
+        if candidate["return_lcb_pct"] <= 0:
+            blockers.append("candidate_return_lcb_not_positive")
+        if candidate["profit_factor"] <= 1:
+            blockers.append("candidate_profit_factor_not_above_one")
+        if candidate["cvar_10_pct"] < champion["cvar_10_pct"]:
+            blockers.append("candidate_cvar_worsened")
+        if candidate["max_drawdown_pct"] > champion["max_drawdown_pct"]:
+            blockers.append("candidate_max_drawdown_worsened")
+    else:
+        if not any(candidate[key] > champion[key] for key in primary):
+            blockers.append("candidate_primary_fee_after_metrics_not_improved")
+        if candidate["cvar_10_pct"] < champion["cvar_10_pct"] - 0.05:
+            blockers.append("candidate_cvar_materially_worsened")
+        if candidate["max_drawdown_pct"] > champion["max_drawdown_pct"] + 0.05:
+            blockers.append("candidate_max_drawdown_materially_worsened")
+    return {
+        **report,
+        "accepted": not blockers,
+        "reason": "challenger_quality_improved" if not blockers else "champion_retained",
+        "blocking_reasons": blockers,
+        "champion_version": current.get("version"),
+    }
+
+
+def _local_activation_manifest(
+    artifact: dict[str, Any],
+    return_evidence: dict[str, Any],
+    activation_stage: str,
+    *,
+    transition_from_stage: str | None = None,
+) -> tuple[dict[str, Any], Path]:
+    if activation_stage not in {"shadow", "canary", "active"}:
+        raise ValueError("Local AI artifact activation stage is invalid.")
+    evidence_blockers = _production_return_evidence_blockers(artifact["metadata"])
+    promotion_recommendation = return_evidence.get("promotion_recommendation") or {}
+    production_authorized = activation_stage == "active"
+    activation_path = artifact["version_root"] / f"activation-{activation_stage}.json"
+    activation = {
+        "activation_manifest_version": ARTIFACT_ACTIVATION_MANIFEST_VERSION,
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": artifact["version"],
+        "artifact_sha256": artifact["manifest"]["artifact_sha256"],
+        "training_data_sha256": artifact["manifest"].get("training_data_sha256"),
+        "source_code_sha256": artifact["manifest"].get("source_code_sha256"),
+        "artifact_return_evidence_sha256": artifact["metadata"].get(
+            "artifact_return_evidence_sha256"
+        ),
+        "activation_stage": activation_stage,
+        "transition_from_stage": transition_from_stage,
+        "production_influence_authorized": production_authorized,
+        "execution_scope": (
+            "production"
+            if activation_stage == "active"
+            else "paper_only"
+            if activation_stage == "canary"
+            else "observation_only"
+        ),
+        "production_permission": production_authorized,
+        "canary_authorized": activation_stage == "canary",
+        "promotion_recommendation": promotion_recommendation,
+        "return_evidence_report": return_evidence,
+        "return_evidence_ready": not evidence_blockers,
+        "return_evidence_blockers": evidence_blockers,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return activation, activation_path
 
 
 def activate_candidate_shadow(
@@ -1482,49 +1727,13 @@ def activate_candidate_shadow(
     )
     if candidate is None:
         raise ValueError("Local AI candidate artifact is not registered.")
-    if activation_stage not in {"shadow", "canary", "live"}:
-        raise ValueError("Local AI candidate activation stage is invalid.")
-    evidence_blockers = _production_return_evidence_blockers(candidate["metadata"])
-    promotion_recommendation = return_evidence.get("promotion_recommendation") or {}
-    governed_stage = _governed_candidate_activation_stage(
-        promotion_recommendation,
-        evidence_blockers,
+    if activation_stage != "shadow":
+        raise ValueError("Local AI candidate must first activate as shadow.")
+    activation, activation_path = _local_activation_manifest(
+        candidate,
+        return_evidence,
+        "shadow",
     )
-    if activation_stage != governed_stage:
-        raise ValueError(
-            f"Local AI candidate activation stage {activation_stage} is not governed; "
-            f"expected {governed_stage}."
-        )
-    production_authorized = activation_stage == "live"
-    activation_path = candidate["version_root"] / f"activation-{activation_stage}.json"
-    activation = {
-        "activation_manifest_version": ARTIFACT_ACTIVATION_MANIFEST_VERSION,
-        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
-        "artifact_model_id": ARTIFACT_MODEL_ID,
-        "artifact_version": candidate["version"],
-        "artifact_sha256": candidate["manifest"]["artifact_sha256"],
-        "training_data_sha256": candidate["manifest"].get("training_data_sha256"),
-        "source_code_sha256": candidate["manifest"].get("source_code_sha256"),
-        "artifact_return_evidence_sha256": candidate["metadata"].get(
-            "artifact_return_evidence_sha256"
-        ),
-        "activation_stage": activation_stage,
-        "production_influence_authorized": production_authorized,
-        "execution_scope": (
-            "production"
-            if activation_stage == "live"
-            else "paper_only"
-            if activation_stage == "canary"
-            else "observation_only"
-        ),
-        "production_permission": production_authorized,
-        "canary_authorized": activation_stage == "canary",
-        "promotion_recommendation": promotion_recommendation,
-        "return_evidence_report": return_evidence,
-        "return_evidence_ready": not evidence_blockers,
-        "return_evidence_blockers": evidence_blockers,
-        "activated_at": datetime.now(timezone.utc).isoformat(),
-    }
     write_json_atomic(activation_path, activation)
     if CURRENT_POINTER_PATH.exists():
         current = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
@@ -1558,6 +1767,105 @@ def activate_candidate_shadow(
         raise ValueError("Local AI shadow activation did not produce a current artifact.")
     CANDIDATE_POINTER_PATH.unlink(missing_ok=True)
     return current
+
+
+def transition_current_artifact(
+    return_evidence: dict[str, Any],
+    *,
+    activation_stage: str,
+) -> dict[str, Any]:
+    current = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=False,
+    )
+    if current is None:
+        raise ValueError("Local AI current artifact is not registered.")
+    current_activation = current.get("activation_manifest") or {}
+    current_stage = str(current_activation.get("activation_stage") or "")
+    allowed_targets = {
+        "shadow": {"canary"},
+        "canary": {"active"},
+        "live": {"active"},
+    }
+    if activation_stage not in allowed_targets.get(current_stage, set()):
+        raise ValueError(
+            f"Local AI artifact transition {current_stage or 'unregistered'} -> "
+            f"{activation_stage} is not allowed."
+        )
+    evidence_blockers = _production_return_evidence_blockers(current["metadata"])
+    governed_stage = _governed_candidate_activation_stage(
+        return_evidence.get("promotion_recommendation") or {},
+        evidence_blockers,
+    )
+    if activation_stage == "active" and governed_stage != "active":
+        raise ValueError("Local AI active transition is not governed by return evidence.")
+    if activation_stage == "canary" and governed_stage not in {"canary", "active"}:
+        raise ValueError("Local AI canary transition is not governed by return evidence.")
+    activation, activation_path = _local_activation_manifest(
+        current,
+        return_evidence,
+        activation_stage,
+        transition_from_stage=current_stage,
+    )
+    write_json_atomic(activation_path, activation)
+    write_json_atomic(
+        CURRENT_POINTER_PATH,
+        {
+            **current["pointer"],
+            "pointer_role": "current",
+            "activation_manifest_path": str(activation_path.relative_to(MODEL_DIR)),
+            "activation_manifest_sha256": sha256_file(activation_path),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    transitioned = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=True,
+    )
+    if transitioned is None:
+        raise ValueError("Local AI artifact transition did not preserve current artifact.")
+    return transitioned
+
+
+def reject_candidate_artifact(comparison_report: dict[str, Any]) -> dict[str, Any]:
+    candidate = _resolve_artifact_pointer(
+        CANDIDATE_POINTER_PATH,
+        role="candidate",
+        deserialize_bundle=False,
+    )
+    if candidate is None:
+        raise ValueError("Local AI candidate artifact is not registered.")
+    rejection_path = candidate["version_root"] / "rejection.json"
+    rejection = {
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": candidate["version"],
+        "artifact_sha256": candidate["manifest"]["artifact_sha256"],
+        "comparison_report": comparison_report,
+        "rejected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json_atomic(rejection_path, rejection)
+    write_json_atomic(
+        CHALLENGER_POINTER_PATH,
+        {
+            **candidate["pointer"],
+            "pointer_role": "challenger",
+            "rejection_manifest_path": str(rejection_path.relative_to(MODEL_DIR)),
+            "rejection_manifest_sha256": sha256_file(rejection_path),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    challenger = _resolve_artifact_pointer(
+        CHALLENGER_POINTER_PATH,
+        role="challenger",
+        deserialize_bundle=True,
+    )
+    if challenger is None:
+        raise ValueError("Local AI rejected challenger did not resolve.")
+    CANDIDATE_POINTER_PATH.unlink(missing_ok=True)
+    return challenger
 
 
 def rollback_current_artifact() -> dict[str, Any]:
@@ -1878,6 +2186,7 @@ def _model_artifact_status() -> dict[str, Any]:
     resolved_rows = {}
     for role, path in (
         ("candidate", CANDIDATE_POINTER_PATH),
+        ("challenger", CHALLENGER_POINTER_PATH),
         ("current", CURRENT_POINTER_PATH),
         ("rollback", ROLLBACK_POINTER_PATH),
     ):
@@ -3379,7 +3688,7 @@ def with_model_metadata(
             or "candidate"
         ).lower()
         live_authorized = bool(
-            activation_stage == "live"
+            activation_stage in {"active", "live"}
             and metadata.get("production_influence_authorized") is True
             and not _production_return_evidence_blockers(metadata)
         )
@@ -3926,7 +4235,7 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
 def health() -> dict[str, Any]:
     artifact_status = _model_artifact_status()
     live_authorized = bool(
-        artifact_status.get("artifact_lifecycle") == "live"
+        artifact_status.get("artifact_lifecycle") in {"active", "live"}
         and artifact_status.get("production_influence_authorized") is True
     )
     payload = {
@@ -4041,6 +4350,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "x": model_x(features, horizon_minutes=horizon),
             "id": int(sample.get("id") or 0),
             "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
+            "market_regime": _market_regime_label(features),
             "horizon": horizon,
             "decision_group": decision_group,
             "decision_timestamp": _timestamp_text(sample.get("decision_timestamp")),
@@ -4504,10 +4814,45 @@ def train(req: TrainRequest) -> dict[str, Any]:
         req.promotion_recommendation or {},
         return_evidence_blockers,
     )
-    current = activate_candidate_shadow(
-        activation_evidence,
-        activation_stage=activation_stage,
+    champion_comparison = _compare_candidate_to_current(
+        metadata,
+        candidate_stage=activation_stage,
     )
+    if champion_comparison.get("accepted") is not True:
+        challenger = reject_candidate_artifact(champion_comparison)
+        champion = _resolve_artifact_pointer(
+            CURRENT_POINTER_PATH,
+            role="current",
+            deserialize_bundle=False,
+        )
+        return {
+            "trained": True,
+            "reason": "trained_challenger_rejected",
+            "challenger_rejected": True,
+            "challenger_version": challenger["version"],
+            "champion_retained": True,
+            "champion_version": champion["version"] if champion else None,
+            "champion_comparison": champion_comparison,
+            "artifact_version": champion["version"] if champion else None,
+            "artifact_activation_stage": (
+                (champion.get("activation_manifest") or {}).get("activation_stage")
+                if champion
+                else None
+            ),
+            **metadata,
+        }
+    activation_evidence["champion_comparison"] = champion_comparison
+    current = activate_candidate_shadow(activation_evidence)
+    if activation_stage in {"canary", "active"}:
+        current = transition_current_artifact(
+            activation_evidence,
+            activation_stage="canary",
+        )
+    if activation_stage == "active":
+        current = transition_current_artifact(
+            activation_evidence,
+            activation_stage="active",
+        )
     global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
     global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
     _BUNDLE_CACHE = None
@@ -4523,8 +4868,9 @@ def train(req: TrainRequest) -> dict[str, Any]:
         **current["metadata"],
         "artifact_version": current["version"],
         "artifact_activation_stage": activation_stage,
-        "production_influence_authorized": activation_stage == "live",
+        "production_influence_authorized": activation_stage == "active",
         "candidate_version": candidate["version"],
+        "champion_comparison": champion_comparison,
     }
 
 
@@ -5410,7 +5756,7 @@ def render_phase3_deploy_plan() -> dict[str, Any]:
         "health_url": f"http://127.0.0.1:{PHASE3_API_PORT}/health",
         "shadow_only": True,
         "live_mutation": False,
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "legacy_root_used": False,
     }
 
@@ -5535,15 +5881,15 @@ def _remote_smoke_command() -> str:
         "    'volume_ratio': 1.1,\n"
         "}\n"
         "health = get('/health')\n"
-        "live = health.get('artifact_lifecycle') == 'live'\n"
+        "live = health.get('artifact_lifecycle') in {'active', 'live'}\n"
         "profit = post('/profit/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
         "exit_advice = post('/exit/advise', {'symbol': 'BTC/USDT', 'features': features, 'open_positions': []})\n"
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
         "assert health.get('live_mutation') is live, health\n"
-        "assert health.get('artifact_lifecycle') in {'shadow', 'canary', 'live'}, health\n"
+        "assert health.get('artifact_lifecycle') in {'shadow', 'canary', 'active', 'live'}, health\n"
         "assert health.get('production_influence_authorized') is live, health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') in {'shadow', 'canary', 'live'}, health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') in {'shadow', 'canary', 'active', 'live'}, health\n"
         "assert health.get('artifact_activation_manifest', {}).get('production_influence_authorized') is live, health\n"
         "assert profit.get('trained') is True, profit\n"
         "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"

@@ -91,6 +91,20 @@ def test_shadow_and_okx_trade_authorities_are_mutually_exclusive() -> None:
     assert trade_tasks[AUTHORITATIVE_REALIZED_RETURN_TASK]["eligible"] is True
 
 
+def test_verified_execution_pair_is_authoritative_realized_return() -> None:
+    trade = _trade_sample()
+    trade["source"] = "okx_verified_execution_pair"
+    trade["profit_supervision"] = build_profit_supervision_contract(
+        trade,
+        kind="trade",
+    )
+
+    task = trade["profit_supervision"]["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
+
+    assert task["eligible"] is True
+    assert task["source_authority"] == "okx_verified_execution_pair"
+
+
 def test_multi_horizon_rows_share_one_decision_weight_budget() -> None:
     rows = [
         _shadow_sample(sample_id=index, decision_id=7, horizon=horizon)

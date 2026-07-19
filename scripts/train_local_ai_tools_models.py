@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import settings
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text
+from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from core.url_safety import normalize_http_base_url
 from db.session import get_read_session_ctx, get_session_ctx
 from models.learning import ShadowBacktest, TradeReflection
@@ -587,7 +588,7 @@ def _merge_trade_samples(
     return [
         dict(sample)
         for sample in authoritative_samples
-        if str(sample.get("source") or "").strip() == "okx_position_history"
+        if str(sample.get("source") or "").strip() in AUTHORITATIVE_TRADE_OUTCOME_SOURCES
         and str(sample.get("lifecycle_key") or "").strip()
         and sample.get("event_type") == "AuthoritativeTradeOutcome"
         and sample.get("outcome_version") == AUTHORITATIVE_TRADE_OUTCOME_VERSION
@@ -884,7 +885,7 @@ async def _main() -> None:
         "confirm_phase3_rebuild": bool(args.confirm_phase3_rebuild),
         "okx_daily_reconciliation_gate": okx_gate,
         "evaluation_policy": {
-            "promotion_flow": "shadow_to_canary_to_live",
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
             "live_mutation": bool(
                 args.training_mode == "walk_forward" and args.model_stage == "live"
             ),

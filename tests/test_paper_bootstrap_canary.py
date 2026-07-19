@@ -15,8 +15,9 @@ from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.execution_service import _return_entry_contract_result
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
-    PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS,
+    PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
     PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
+    PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
     PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
@@ -43,6 +44,13 @@ def _context() -> dict[str, Any]:
 
     return {
         "trading_mode": "paper",
+        "sampling_symbol": "BTC/USDT",
+        "sampling_features": {
+            "symbol": "BTC/USDT",
+            "current_price": 100.0,
+            "volatility_20": 0.02,
+            "returns_20": 0.015,
+        },
         "entry_candidate_evidence": {
             "long": {
                 "production_source_count": 0,
@@ -77,8 +85,8 @@ def _context() -> dict[str, Any]:
     }
 
 
-def _decision() -> DecisionOutput:
-    canary = select_paper_bootstrap_candidate(_context())
+def _decision(context: dict[str, Any] | None = None) -> DecisionOutput:
+    canary = select_paper_bootstrap_candidate(context or _context())
     return DecisionOutput(
         model_name="ensemble_trader",
         symbol="BTC/USDT",
@@ -304,6 +312,58 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
 
 
 @pytest.mark.asyncio
+async def test_second_parallel_canary_reserves_first_trade_portfolio_risk() -> None:
+    async def balance(_mode: str, _decision: DecisionOutput) -> float:
+        return 500.0
+
+    async def facts(
+        _mode: str,
+        _decision: DecisionOutput,
+        _positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "production_eligible": True,
+            "account_equity_usdt": 1000.0,
+            "available_margin_usdt": 500.0,
+            "target_inst_id": "BTC-USDT-SWAP",
+            "contract_specs": {"BTC-USDT-SWAP": {"ctVal": "0.01", "ctMult": "1"}},
+            "leverage_tiers": [{"maxLeverage": 100, "maxNotional": 10000}],
+            "entry_instrument_availability": {"available": True},
+        }
+
+    async def history() -> list[Any]:
+        old = datetime.now(UTC) - timedelta(minutes=20)
+        return [
+            SimpleNamespace(
+                paper_canary_authorized=True,
+                outcome=None,
+                executed_at=old,
+                created_at=old,
+            )
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=balance,
+        exchange_risk_facts=facts,
+        history_provider=history,
+    )
+
+    result = await policy.prepare(decision, "paper", [])
+
+    assert result.eligible is True
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["current_portfolio_stressed_loss_usdt"] == pytest.approx(0.5)
+    assert sizing["remaining_portfolio_risk_budget_usdt"] == pytest.approx(0.5)
+    assert sizing["planned_stressed_loss_usdt"] <= 0.5 + 1e-8
+    assert (
+        sizing["current_portfolio_stressed_loss_usdt"]
+        + sizing["planned_stressed_loss_usdt"]
+        <= sizing["portfolio_risk_budget_usdt"] + 1e-8
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_canary_account_positions_do_not_consume_canary_position_slot() -> None:
     async def balance(_mode: str, _decision: DecisionOutput) -> float:
         return 500.0
@@ -349,7 +409,7 @@ async def test_non_canary_account_positions_do_not_consume_canary_position_slot(
 
 
 @pytest.mark.asyncio
-async def test_unsettled_canary_entry_consumes_canary_position_slot() -> None:
+async def test_one_unsettled_canary_entry_leaves_second_parallel_slot() -> None:
     async def unused_balance(_mode: str, _decision: DecisionOutput) -> float:
         raise AssertionError("open canary must block before account calls")
 
@@ -380,13 +440,122 @@ async def test_unsettled_canary_entry_consumes_canary_position_slot() -> None:
         history_provider=history,
     )
 
-    result = await policy.prepare(decision, "paper", [])
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is True
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["open_position_count"] == 1
+    assert guard["max_open_positions"] == PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS
+    assert guard["account_open_position_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_two_unsettled_canary_entries_exhaust_parallel_slots() -> None:
+    now = datetime.now(UTC)
+
+    async def history() -> list[Any]:
+        return [
+            SimpleNamespace(
+                id=101 + index,
+                raw_llm_response={"paper_bootstrap_canary": {"authorized": True}},
+                outcome=None,
+                executed_at=now,
+                created_at=now,
+            )
+            for index in range(PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS)
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
 
     assert result.eligible is False
     assert "paper_canary_open_position_limit_reached" in result.reason
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["open_position_count"] == 1
-    assert guard["account_open_position_count"] == 0
+    assert guard["open_position_count"] == PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS
+
+
+@pytest.mark.asyncio
+async def test_recent_different_stratum_does_not_trigger_global_cooldown() -> None:
+    now = datetime.now(UTC)
+
+    async def history() -> list[Any]:
+        return [
+            SimpleNamespace(
+                paper_canary_authorized=True,
+                symbol="BTC/USDT",
+                action="long",
+                canary_sampling_stratum_key="BTC/USDT|long|medium|trending",
+                canary_volatility_bucket="medium",
+                canary_market_regime="trending",
+                outcome="profit",
+                executed_at=now,
+                created_at=now,
+            )
+        ]
+
+    context = _context()
+    context["sampling_symbol"] = "ETH/USDT"
+    context["sampling_features"] = {
+        **context["sampling_features"],
+        "symbol": "ETH/USDT",
+    }
+    decision = _decision(context)
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is True
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["last_executed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_overrepresented_side_volatility_and_regime_are_stratum_limited() -> None:
+    old = datetime.now(UTC) - timedelta(minutes=20)
+
+    async def history() -> list[Any]:
+        return [
+            SimpleNamespace(
+                paper_canary_authorized=True,
+                symbol="BTC/USDT",
+                action="long",
+                canary_sampling_stratum_key="BTC/USDT|long|medium|trending",
+                canary_volatility_bucket="medium",
+                canary_market_regime="trending",
+                outcome="profit",
+                executed_at=old - timedelta(seconds=index),
+                created_at=old - timedelta(seconds=index),
+            )
+            for index in range(4)
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is False
+    assert "paper_canary_stratum_quota_exhausted" in result.reason
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert set(guard["overrepresented_sampling_dimensions"]) >= {
+        "side",
+        "volatility_bucket",
+        "market_regime",
+    }
 
 
 @pytest.mark.asyncio
@@ -406,12 +575,13 @@ async def test_blocked_canary_is_persisted_as_hold_with_candidate_direction_evid
     async def history() -> list[Any]:
         return [
             SimpleNamespace(
-                id=101,
+                id=101 + index,
                 raw_llm_response={"paper_bootstrap_canary": {"authorized": True}},
                 outcome=None,
                 executed_at=now,
                 created_at=now,
             )
+            for index in range(PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS)
         ]
 
     decision = _decision()
@@ -439,7 +609,7 @@ async def test_blocked_canary_is_persisted_as_hold_with_candidate_direction_evid
 
 
 @pytest.mark.asyncio
-async def test_paper_canary_opens_circuit_after_two_completed_losses() -> None:
+async def test_paper_canary_blocks_after_daily_cumulative_loss_budget() -> None:
     async def unused_balance(_mode: str, _decision: DecisionOutput) -> float:
         raise AssertionError("loss circuit must block before account calls")
 
@@ -458,15 +628,16 @@ async def test_paper_canary_opens_circuit_after_two_completed_losses() -> None:
             SimpleNamespace(
                 raw_llm_response=raw,
                 outcome="loss",
-                executed_at=now,
-                created_at=now,
-            ),
-            SimpleNamespace(
-                raw_llm_response=raw,
-                outcome="loss",
-                executed_at=now,
-                created_at=now,
-            ),
+                outcome_pnl_pct=None,
+                executed_at=now - timedelta(minutes=20, seconds=index),
+                created_at=now - timedelta(minutes=20, seconds=index),
+            )
+            for index in range(
+                int(
+                    PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK
+                    / 0.0005
+                )
+            )
         ]
 
     decision = _decision()
@@ -479,14 +650,12 @@ async def test_paper_canary_opens_circuit_after_two_completed_losses() -> None:
     result = await policy.prepare(decision, "paper", [])
 
     assert result.eligible is False
-    assert "paper_canary_consecutive_loss_circuit_open" in result.reason
+    assert "paper_canary_daily_loss_budget_exhausted" in result.reason
 
 
 @pytest.mark.asyncio
-async def test_paper_canary_loss_circuit_allows_recovery_probe_after_cooldown() -> None:
-    old_loss_at = datetime.now(UTC) - timedelta(
-        seconds=PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS + 60
-    )
+async def test_two_losses_do_not_open_a_fixed_six_hour_circuit() -> None:
+    old_loss_at = datetime.now(UTC) - timedelta(minutes=20)
 
     async def history() -> list[Any]:
         raw = {"paper_bootstrap_canary": {"authorized": True}}
@@ -516,8 +685,8 @@ async def test_paper_canary_loss_circuit_allows_recovery_probe_after_cooldown() 
 
     assert result.eligible is True
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["consecutive_loss_count"] == 2
-    assert guard["loss_circuit_open"] is False
+    assert guard["daily_loss_fraction"] == pytest.approx(0.001)
+    assert guard["daily_loss_budget_exhausted"] is False
 
 
 @pytest.mark.asyncio
@@ -548,10 +717,65 @@ async def test_paper_canary_daily_budget_expands_while_sample_deficit_is_large()
     assert result.eligible is False
     assert "paper_canary_daily_entry_budget_exhausted" in result.reason
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
+    assert guard["max_daily_entries"] <= PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
+    assert guard["absolute_max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
     assert guard["daily_entry_limit_source"] == (
-        "authoritative_sample_deficit_over_collection_horizon"
+        "remaining_sample_deficit_over_remaining_collection_days"
     )
+
+
+@pytest.mark.asyncio
+async def test_initial_sampling_plan_is_reachable_from_zero_samples() -> None:
+    async def history() -> list[Any]:
+        return []
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is True
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["required_daily_entries"] == 15
+    assert guard["max_daily_entries"] == 15
+    assert guard["sampling_plan_reachable"] is True
+    assert guard["sampling_plan_alert_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_overdue_sampling_plan_emits_unreachable_alert_without_stopping_collection() -> None:
+    old = datetime.now(UTC) - timedelta(days=15)
+
+    async def history() -> list[Any]:
+        return [
+            SimpleNamespace(
+                paper_canary_authorized=True,
+                outcome="profit",
+                executed_at=old + timedelta(minutes=index),
+                created_at=old + timedelta(minutes=index),
+            )
+            for index in range(10)
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is True
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["remaining_collection_days"] == 1
+    assert guard["max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
+    assert guard["sampling_plan_reachable"] is False
+    assert guard["sampling_plan_alert_active"] is True
 
 
 def test_canary_history_query_projects_only_runtime_guard_columns() -> None:
@@ -561,7 +785,16 @@ def test_canary_history_query_projects_only_runtime_guard_columns() -> None:
 
     assert selected_columns == {
         "paper_canary_authorized",
+        "symbol",
+        "action",
         "outcome",
+        "outcome_pnl_pct",
+        "position_size_pct",
+        "canary_sampling_stratum_key",
+        "canary_volatility_bucket",
+        "canary_market_regime",
+        "canary_final_notional_usdt",
+        "canary_account_equity_usdt",
         "executed_at",
         "created_at",
     }

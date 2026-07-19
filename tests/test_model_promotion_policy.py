@@ -220,7 +220,8 @@ def test_phase3_promotion_uses_return_report_not_sample_count_or_win_rate() -> N
     recommendation = _recommendation(report)
 
     assert recommendation["live_ready"] is True
-    assert recommendation["recommended_stage"] == "live"
+    assert recommendation["active_ready"] is True
+    assert recommendation["recommended_stage"] == "active"
     assert recommendation["observed_sample_counts"]["counts_are_diagnostic_only"] is True
     assert recommendation["live_mutation"] is True
 

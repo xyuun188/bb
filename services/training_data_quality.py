@@ -14,10 +14,14 @@ from core.market_facts import (
     market_fact_contract_reasons,
 )
 from core.training_contracts import (
+    AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
     SHADOW_LABEL_VERSION,
     shadow_label_contract_reasons,
 )
-from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_LABEL_VERSION,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
 from services.dynamic_policy_values import empirical_policy_value
 from services.execution_cost_model import execution_cost_estimate
 from services.profit_supervision import (
@@ -62,6 +66,7 @@ _TRUSTED_TRADE_PNL_SOURCES = {
     "okx_fill_pnl",
     "okx_order_fact_sync",
     "okx_position_history_settlement",
+    "okx_verified_execution_pair_settlement",
     "okx_authoritative_reconcile",
     "position_settlement_snapshot",
     "position_settlement_snapshot:okx_order_fact_sync",
@@ -439,7 +444,7 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         return _final_assessment(0.0, guard_reasons, exclude=True)
 
     source = _safe_str(sample.get("source")).lower()
-    if source == "okx_position_history":
+    if source in AUTHORITATIVE_TRADE_OUTCOME_SOURCES:
         if (
             sample.get("event_type") != "AuthoritativeTradeOutcome"
             or sample.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION
@@ -460,6 +465,29 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             return _final_assessment(
                 0.0,
                 [f"incomplete_okx_lifecycle:{reason}" for reason in evidence_gaps],
+                exclude=True,
+            )
+        label_contract = _safe_dict(sample.get("training_label_contract"))
+        if (
+            label_contract.get("version") != AUTHORITATIVE_TRADE_LABEL_VERSION
+            or label_contract.get("label_name") != "realized_fee_after_return_pct"
+            or label_contract.get("execution_mode") not in {"paper", "live"}
+            or label_contract.get("complete") is not True
+            or not _safe_str(label_contract.get("fingerprint"))
+            or int(_safe_float(label_contract.get("decision_id"), 0.0) or 0) <= 0
+            or not _safe_str(label_contract.get("lifecycle_key"))
+            or not _safe_list(label_contract.get("entry_order_ids"))
+            or not _safe_list(label_contract.get("close_order_ids"))
+            or _safe_float(label_contract.get("fee_usdt"), None) is None
+            or _safe_float(label_contract.get("funding_fee_usdt"), None) is None
+            or _safe_float(
+                label_contract.get("realized_fee_after_return_pct"), None
+            )
+            is None
+        ):
+            return _final_assessment(
+                0.0,
+                ["missing_authoritative_fee_after_label_contract"],
                 exclude=True,
             )
     model_name = _safe_str(sample.get("model_name")).lower()
@@ -493,7 +521,7 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         fee_source = sample.get("fee")
     if fee_source is None:
         return _final_assessment(0.0, ["missing_fee_estimate"], exclude=True)
-    if source in {"closed_position", "okx_position_history"}:
+    if source in {"closed_position", *AUTHORITATIVE_TRADE_OUTCOME_SOURCES}:
         pnl_source = _trade_pnl_source(sample)
         if not _trade_pnl_source_trusted(pnl_source):
             return _final_assessment(
@@ -1066,6 +1094,10 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
             features.get("training_label_contract")
         ).get("label_fingerprint"),
     }
+    if kind == "trade":
+        authoritative_label = _safe_dict(sample.get("training_label_contract"))
+        label["authoritative_fee_after_return"] = authoritative_label
+        label["label_fingerprint"] = authoritative_label.get("fingerprint")
     if kind == "sequence" and sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
         sequence_facts = {
             "sequence_format": COMPACT_SEQUENCE_SERIES_FORMAT,

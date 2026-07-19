@@ -13,7 +13,7 @@ from core.safe_output import safe_error_text
 
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
 PHASE3_REQUIRED_TRAINING_POLICY = "clean_training_view_only"
-PHASE3_REQUIRED_PROMOTION_FLOW = "shadow_to_canary_to_live"
+PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
 
 ARTIFACT_SUFFIXES = {".joblib", ".pkl", ".pickle", ".onnx", ".pt", ".safetensors", ".bin"}
 METADATA_SUFFIXES = {".json"}
@@ -31,7 +31,12 @@ LEGACY_RELATIVE_PATHS = {
 }
 
 _REGISTRY_VERSION_RE = re.compile(r"^\d{8}T\d{12}Z-[0-9a-f]{8}$")
-_REGISTRY_POINTER_NAMES = ("current.json", "rollback.json", "candidate.json")
+_REGISTRY_POINTER_NAMES = (
+    "current.json",
+    "rollback.json",
+    "candidate.json",
+    "challenger.json",
+)
 
 
 def _now_iso() -> str:

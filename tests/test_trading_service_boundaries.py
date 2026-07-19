@@ -2271,7 +2271,10 @@ def test_stale_entry_candidate_expirer_is_not_a_trading_service_private_rule():
 
 
 @pytest.mark.asyncio
-async def test_paper_market_shortlist_uses_private_instrument_availability() -> None:
+@pytest.mark.parametrize("model_mode", ["paper", "live"])
+async def test_market_shortlist_uses_selected_account_instrument_availability(
+    model_mode: str,
+) -> None:
     service = TradingService.__new__(TradingService)
     service._last_auto_feature_rank_diagnostics = {
         "selected": 4,
@@ -2316,7 +2319,10 @@ async def test_paper_market_shortlist_uses_private_instrument_availability() -> 
                 "skipped_after_target_count": 0,
             }
 
-    async def executor_provider(_mode: str) -> FakeExecutor:
+    selected_modes: list[str] = []
+
+    async def executor_provider(mode: str) -> FakeExecutor:
+        selected_modes.append(mode)
         return FakeExecutor()
 
     service._get_okx_executor_for_mode = executor_provider
@@ -2327,17 +2333,19 @@ async def test_paper_market_shortlist_uses_private_instrument_availability() -> 
         "ETH/USDT": object(),
     }
 
-    selected = await service._filter_paper_entry_instrument_shortlist(features, 2)
+    selected = await service._filter_entry_instrument_shortlist(features, 2, model_mode)
 
     assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    assert selected_modes == [model_mode]
     diagnostics = service._last_auto_feature_rank_diagnostics
     assert diagnostics["selected"] == 2
     assert diagnostics["execution_availability"]["probed_count"] == 4
     assert diagnostics["execution_availability"]["available_count"] == 2
-    assert service._paper_verified_entry_symbols == {"BTC/USDT", "ETH/USDT"}
+    assert diagnostics["execution_availability"]["mode"] == model_mode
+    assert service._verified_entry_symbols_by_mode[model_mode] == {"BTC/USDT", "ETH/USDT"}
     pi = next(item for item in diagnostics["ranked_symbol_sample"] if item["symbol"] == "PI/USDT")
     assert pi["selected"] is False
-    assert pi["non_selected_reason"] == "paper_execution_instrument_unavailable"
+    assert pi["non_selected_reason"] == "execution_instrument_unavailable"
     assert not hasattr(TradingService, "_is_pending_execution_reason")
     assert not hasattr(TradingService, "_pending_execution_failed_reason")
     assert not hasattr(TradingService, "_action_label")
@@ -3417,13 +3425,16 @@ def test_auto_scan_feature_budget_expands_discovery_without_lowering_entry_gates
     assert "not entry permission" in diagnostics["diagnostic_boundary"]
 
 
-def test_auto_scan_feature_budget_keeps_verified_paper_symbols_in_discovery_pool(
+@pytest.mark.parametrize("model_mode", ["paper", "live"])
+def test_auto_scan_feature_budget_keeps_verified_execution_symbols_in_discovery_pool(
     monkeypatch: pytest.MonkeyPatch,
+    model_mode: str,
 ) -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: model_mode
     service._auto_scan_feature_cursor = 0
-    service._paper_verified_entry_symbols = {"S9/USDT"}
+    service._verified_entry_symbols_by_mode = {model_mode: {"S9/USDT"}}
     service.entry_symbol_universe = SimpleNamespace(
         dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
     )
@@ -3440,7 +3451,9 @@ def test_auto_scan_feature_budget_keeps_verified_paper_symbols_in_discovery_pool
     assert len(first) == 4
     assert len(second) == 4
     assert first[1:] != second[1:]
-    assert service._last_auto_feature_fetch_budget_diagnostics["verified_paper_symbol_count"] == 1
+    diagnostics = service._last_auto_feature_fetch_budget_diagnostics
+    assert diagnostics["verified_execution_symbol_count"] == 1
+    assert diagnostics["execution_mode"] == model_mode
 
 
 def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_counts() -> None:
@@ -5652,6 +5665,54 @@ async def test_sync_service_does_not_record_quantity_reduction_without_close_fil
     assert result == []
     assert opened_positions == []
     assert orders == []
+
+
+@pytest.mark.asyncio
+async def test_sync_service_does_not_record_full_close_as_partial_reduction():
+    position = SimpleNamespace(
+        id=1800,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="FIL/USDT",
+        side="long",
+        entry_price=0.73,
+        current_price=0.73,
+        quantity=0.0,
+        leverage=1.0,
+        realized_pnl=0.0,
+        created_at=datetime(2026, 7, 19, 10, 20, tzinfo=UTC),
+        closed_at=None,
+    )
+    opened_positions: list[dict[str, Any]] = []
+
+    class FakeTradeRepository:
+        async def open_position(self, payload):
+            opened_positions.append(payload)
+            return SimpleNamespace(id=1801, **payload)
+
+    result = await OkxSyncService()._record_exchange_quantity_reduction(
+        session=object(),
+        trade_repo=FakeTradeRepository(),
+        positions=[position],
+        quantity_before_by_id={1800: 537.5},
+        exchange_quantity=0.0,
+        exit_price=0.7322,
+        close_fill={
+            "order_id": "fil-close",
+            "price": 0.7322,
+            "fee": 0.196,
+            "quantity": 537.5,
+            "timestamp": datetime(2026, 7, 19, 10, 31, tzinfo=UTC),
+        },
+        entry_fee_for_position=lambda *_args: 0.0,
+        log_exchange_sync_close_decision=lambda **_kwargs: None,
+        record_trade_reflection=lambda *_args, **_kwargs: None,
+        calculate_position_margin=lambda notional, leverage: notional
+        / float(leverage or 1.0),
+    )
+
+    assert result == []
+    assert opened_positions == []
 
 
 @pytest.mark.asyncio

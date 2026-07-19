@@ -17,6 +17,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
+from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 
 RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
@@ -251,7 +252,7 @@ def _actual_trade_calibration(opportunity: dict[str, Any]) -> dict[str, Any]:
         if item.get("included_in_return_distribution") is not True:
             continue
         calibration = _safe_dict(item.get("actual_trade_calibration"))
-        if calibration.get("source_authority") == "okx_position_history":
+        if calibration.get("source_authority") in AUTHORITATIVE_TRADE_OUTCOME_SOURCES:
             rows.append(calibration)
     if not rows:
         return {}

@@ -115,6 +115,29 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["training_evidence_gaps"] == []
     assert sample["strategy_lineage_complete"] is True
 
+    outcome = _outcome(sample)
+    label = outcome["training_label_contract"]
+    assert label["execution_mode"] == "paper"
+    assert label["realized_fee_after_return_pct"] == pytest.approx(8.5 / 2000.0 * 100.0)
+    assert label["realized_net_pnl_usdt"] == 8.5
+
+
+def test_okx_demo_alias_normalizes_to_paper_and_invalid_mode_is_quarantined() -> None:
+    demo = build_okx_history_training_sample(
+        _history(mode="demo"),
+        **_complete_lineage(),
+    )
+    invalid = build_okx_history_training_sample(
+        _history(mode="unknown"),
+        **_complete_lineage(),
+    )
+
+    assert demo["execution_mode"] == "paper"
+    assert demo["source_execution_mode"] == "demo"
+    assert "missing_or_invalid_execution_mode" not in demo["training_evidence_gaps"]
+    assert invalid["execution_mode"] == ""
+    assert "missing_or_invalid_execution_mode" in invalid["training_evidence_gaps"]
+
 
 def test_authoritative_sample_uses_exact_entry_order_decision_evidence() -> None:
     entry = SimpleNamespace(

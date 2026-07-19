@@ -259,6 +259,17 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
             "position_ids": [9],
             "realized_pnl": 0.4,
         },
+        {
+            "source": "okx_verified_execution_pair",
+            "event_type": "AuthoritativeTradeOutcome",
+            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+            "outcome_id": "ato:10",
+            "id": 10,
+            "lifecycle_key": "paper|CCC-USDT-SWAP|pos-10|net|3",
+            "position_id": 10,
+            "position_ids": [10],
+            "realized_pnl": -0.2,
+        },
     ]
 
     merged = _merge_trade_samples(reflection_samples, authoritative_samples)
@@ -266,8 +277,9 @@ def test_local_ai_tools_training_merges_trade_samples_without_duplicate_position
     assert [item["source"] for item in merged] == [
         "okx_position_history",
         "okx_position_history",
+        "okx_verified_execution_pair",
     ]
-    assert [item["position_id"] for item in merged] == [7, 9]
+    assert [item["position_id"] for item in merged] == [7, 9, 10]
     assert merged[0]["hold_minutes"] == 4.0
     assert merged[0]["raw_llm_response"]["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
     assert merged[1]["realized_pnl"] == 0.4
@@ -288,7 +300,7 @@ async def test_local_ai_tools_training_post_preserves_phase3_training_policy() -
             "training_mode": "walk_forward",
             "model_stage": "shadow",
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
                 "requires_walk_forward": False,
             },
@@ -301,7 +313,7 @@ async def test_local_ai_tools_training_post_preserves_phase3_training_policy() -
     assert captured_payload["training_mode"] == "walk_forward"
     assert captured_payload["model_stage"] == "shadow"
     assert captured_payload["evaluation_policy"] == {
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "live_mutation": False,
         "requires_walk_forward": False,
     }
@@ -316,7 +328,7 @@ async def test_local_ai_tools_training_post_preserves_promotion_recommendation()
         return httpx.Response(200, json={"trained": True}, request=request)
 
     promotion = {
-        "policy": "phase3_shadow_to_canary_to_live",
+        "policy": "phase3_candidate_to_shadow_to_canary_to_active",
         "recommended_stage": "canary",
         "canary_ready": True,
         "live_ready": False,

@@ -107,15 +107,19 @@ async def switch_mode(req: ModeSwitchRequest):
             "mode": "paper",
         }
     else:
-        # Live mode uses the unified ensemble execution account.
-        live_model = mode_manager.live_model_name or ENSEMBLE_TRADER_NAME
-        mode_manager._live_model_name = live_model
-        await mode_manager.switch_to_live(live_model)
+        # Model selection is shared by paper/live; this only changes the account.
+        if mode_manager.active_model_name is None:
+            await mode_manager.select_active_model(ENSEMBLE_TRADER_NAME)
+        await mode_manager.switch_to_live()
         return {
             "status": "ok",
-            "message": f"Switched to live trading mode (model: {mode_manager.live_model_name})",
+            "message": (
+                "Switched to live trading mode "
+                f"(active model: {mode_manager.active_model_name})"
+            ),
             "mode": "live",
-            "live_model": mode_manager.live_model_name,
+            "active_model": mode_manager.active_model_name,
+            "live_model": mode_manager.active_model_name,
         }
 
 
@@ -153,17 +157,18 @@ async def resume_trading():
 
 @router.post("/control/select-model")
 async def select_live_model(req: SelectModelRequest):
-    """Select which model to use for live trading."""
+    """Select the unified model used for both paper and live trading."""
     if req.model_name != ENSEMBLE_TRADER_NAME:
         raise HTTPException(
             status_code=400,
             detail=f"Live execution is fixed to '{ENSEMBLE_TRADER_NAME}'.",
         )
-    mode_manager._live_model_name = ENSEMBLE_TRADER_NAME
+    await mode_manager.select_active_model(ENSEMBLE_TRADER_NAME)
 
     return {
         "status": "ok",
-        "message": f"Live model set to '{ENSEMBLE_TRADER_NAME}'",
+        "message": f"Active model set to '{ENSEMBLE_TRADER_NAME}'",
+        "active_model": ENSEMBLE_TRADER_NAME,
         "live_model": ENSEMBLE_TRADER_NAME,
     }
 

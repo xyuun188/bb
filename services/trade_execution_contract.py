@@ -316,7 +316,7 @@ def validate_paper_canary_entry_contract(
     observation = _safe_dict(canary.get("selected_observation"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     reasons = _paper_canary_observation_reasons(canary)
-    bounded_fill_drift = _bounded_legacy_canary_fill_drift(
+    bounded_fill_drift = _bounded_canary_fill_drift(
         canary=canary,
         opportunity=opportunity,
         sizing=sizing,
@@ -485,13 +485,13 @@ def validate_paper_canary_entry_contract(
     return contract, reasons
 
 
-def _bounded_legacy_canary_fill_drift(
+def _bounded_canary_fill_drift(
     *,
     canary: dict[str, Any],
     opportunity: dict[str, Any],
     sizing: dict[str, Any],
 ) -> dict[str, Any]:
-    """Recognize a bounded historical fill drift without weakening entry sizing."""
+    """Validate a confirmed canary fill against its reserved risk ceiling."""
 
     rejected = {
         "accepted": False,
@@ -521,7 +521,7 @@ def _bounded_legacy_canary_fill_drift(
         ),
         None,
     )
-    if not pre_submit or not confirmed_fill or confirmed_fill.get("eligible") is not False:
+    if not pre_submit or not confirmed_fill:
         return rejected
 
     fill_reasons = {
@@ -531,7 +531,12 @@ def _bounded_legacy_canary_fill_drift(
         "execution_notional_exceeds_authoritative_target",
         "execution_stressed_loss_exceeds_risk_budget",
     }
-    if not fill_reasons or not fill_reasons.issubset(allowed_reasons):
+    confirmed_fill_eligible = confirmed_fill.get("eligible") is True
+    if (
+        not fill_reasons.issubset(allowed_reasons)
+        or (confirmed_fill_eligible and fill_reasons)
+        or (not confirmed_fill_eligible and not fill_reasons)
+    ):
         return rejected
 
     target_notional = _safe_float(sizing.get("target_notional_usdt"))
@@ -539,6 +544,10 @@ def _bounded_legacy_canary_fill_drift(
     final_notional = _safe_float(sizing.get("final_notional_usdt"))
     risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
     planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"))
+    declared_reserve_fraction = _safe_float(
+        sizing.get("estimated_fill_drift_reserve_fraction")
+    )
+    declared_fill_ceiling = _safe_float(sizing.get("fill_notional_ceiling_usdt"))
     observation_cost_pct = _safe_float(
         _safe_dict(canary.get("selected_observation")).get(
             "current_execution_cost_pct"
@@ -547,9 +556,30 @@ def _bounded_legacy_canary_fill_drift(
     opportunity_cost_pct = _safe_float(
         _safe_dict(opportunity.get("execution_cost")).get("total_pct")
     )
-    reserve_fraction = max(
+    observed_reserve_fraction = max(
         max(observation_cost_pct, opportunity_cost_pct) / 100.0,
         PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
+    )
+    explicit_reserve_contract = bool(
+        declared_reserve_fraction > 0
+        and declared_fill_ceiling > 0
+        and isclose(
+            target_notional * (1.0 + declared_reserve_fraction),
+            declared_fill_ceiling,
+            rel_tol=1e-7,
+            abs_tol=1e-8,
+        )
+        and declared_reserve_fraction + 1e-8 >= observed_reserve_fraction
+    )
+    reserve_fraction = (
+        declared_reserve_fraction
+        if explicit_reserve_contract
+        else observed_reserve_fraction
+    )
+    fill_ceiling = (
+        declared_fill_ceiling
+        if explicit_reserve_contract
+        else target_notional * (1.0 + reserve_fraction)
     )
     if (
         target_notional <= 0
@@ -564,7 +594,12 @@ def _bounded_legacy_canary_fill_drift(
     risk_excess = max(planned_loss / risk_budget - 1.0, 0.0)
     accepted = bool(
         notional_excess <= reserve_fraction + 1e-8
-        and risk_excess <= reserve_fraction + 1e-8
+        and settled_notional <= fill_ceiling + 1e-8
+        and (
+            planned_loss <= risk_budget + 1e-8
+            if explicit_reserve_contract
+            else risk_excess <= reserve_fraction + 1e-8
+        )
     )
     return {
         "accepted": accepted,
@@ -572,11 +607,17 @@ def _bounded_legacy_canary_fill_drift(
         "reserve_fraction": reserve_fraction,
         "notional_excess_fraction": notional_excess,
         "risk_excess_fraction": risk_excess,
+        "fill_notional_ceiling_usdt": fill_ceiling,
+        "explicit_reserve_contract": explicit_reserve_contract,
         "pre_submit_notional_usdt": _safe_float(
             pre_submit.get("final_notional_usdt")
         ),
         "settled_notional_usdt": settled_notional,
-        "source": "persisted_okx_pre_submit_and_confirmed_fill_reconciliations",
+        "source": (
+            "persisted_canary_fill_reserve_and_okx_reconciliations"
+            if explicit_reserve_contract
+            else "legacy_cost_bound_and_okx_reconciliations"
+        ),
     }
 
 

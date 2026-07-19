@@ -1,4 +1,4 @@
-"""Canonical fee-after outcome events for completed production trades."""
+"""Canonical fee-after outcome events shared by OKX demo and live trades."""
 
 from __future__ import annotations
 
@@ -12,13 +12,17 @@ from typing import Any
 
 from sqlalchemy import select
 
+from core.training_contracts import (
+    AUTHORITATIVE_TRADE_LABEL_VERSION,
+    AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.trade import OkxPositionHistory, Order, Position
 from services.okx_training_facts import build_okx_history_training_sample
 
-AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-15.authoritative-trade-outcome.v1"
 AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
 AUTHORITATIVE_TRADE_OUTCOME_CONSUMERS = (
     "local_ml",
@@ -38,6 +42,7 @@ _DERIVED_OUTCOME_KEYS = {
     "actual_outcome_precedence",
     "reflection",
     "reflection_id",
+    "reflection_status",
     "counterfactual_evidence",
     "counterfactual_production_weight",
     "attribution",
@@ -75,6 +80,57 @@ def _canonical_json(value: Any) -> str:
 
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _canonical_execution_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"paper", "demo", "sim", "simulation"}:
+        return "paper"
+    if mode in {"live", "real", "production"}:
+        return "live"
+    return ""
+
+
+def _fee_after_label_contract(
+    sample: dict[str, Any],
+    *,
+    evidence_gaps: list[str],
+) -> dict[str, Any]:
+    notional = _safe_float(sample.get("notional_usdt"), None)
+    realized_pnl = _safe_float(sample.get("realized_pnl"), None)
+    fee_after_return = None
+    if realized_pnl is not None and notional is not None and notional > 0:
+        fee_after_return = realized_pnl / notional * 100.0
+    if fee_after_return is None:
+        fee_after_return = _safe_float(sample.get("authoritative_pnl_ratio_pct"), None)
+    payload = {
+        "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
+        "label_name": "realized_fee_after_return_pct",
+        "execution_mode": sample.get("execution_mode"),
+        "lifecycle_key": sample.get("lifecycle_key"),
+        "decision_id": int(sample.get("decision_id") or 0),
+        "entry_order_ids": list(sample.get("entry_order_ids") or []),
+        "close_order_ids": list(sample.get("close_order_ids") or []),
+        "label_timestamp": sample.get("label_timestamp"),
+        "realized_fee_after_return_pct": fee_after_return,
+        "okx_pnl_ratio_pct": _safe_float(
+            sample.get("authoritative_pnl_ratio_pct"), None
+        ),
+        "realized_net_pnl_usdt": realized_pnl,
+        "gross_pnl_usdt": _safe_float(sample.get("gross_pnl"), None),
+        "fee_usdt": _safe_float(sample.get("fee"), None),
+        "funding_fee_usdt": _safe_float(sample.get("funding_fee"), None),
+        "liquidation_penalty_usdt": _safe_float(
+            sample.get("liquidation_penalty"), None
+        ),
+        "notional_usdt": notional,
+        "settlement_source": sample.get("settlement_source"),
+        "fee_source": sample.get("fee_source"),
+        "funding_fee_source": sample.get("funding_fee_source"),
+        "complete": not evidence_gaps,
+        "evidence_gaps": list(evidence_gaps),
+    }
+    return {**payload, "fingerprint": _fingerprint(payload)}
 
 
 def _reflection_payload(reflection: Any | None) -> dict[str, Any]:
@@ -190,7 +246,7 @@ def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
             "fee_usdt": _safe_float(sample.get("fee"), 0.0),
             "funding_usdt": _safe_float(sample.get("funding_fee"), 0.0),
             "liquidation_penalty_usdt": _safe_float(sample.get("liquidation_penalty"), 0.0),
-            "source": "okx_positions_history",
+            "source": str(sample.get("fee_source") or "okx_positions_history"),
         },
         "causal_decomposition_complete": False,
         "unknown_components_are_zero": False,
@@ -205,11 +261,18 @@ def build_authoritative_trade_outcome(
 ) -> dict[str, Any]:
     """Promote one OKX lifecycle sample into the only real-trade outcome contract."""
 
+    sample = dict(sample)
     source = str(sample.get("source") or "").strip()
     lifecycle_key = str(sample.get("lifecycle_key") or "").strip()
-    if source != "okx_position_history" or not lifecycle_key:
-        raise ValueError("authoritative outcome requires one OKX position-history lifecycle")
+    if source not in AUTHORITATIVE_TRADE_OUTCOME_SOURCES or not lifecycle_key:
+        raise ValueError("authoritative outcome requires one verified OKX settlement lifecycle")
 
+    source_execution_mode = str(
+        sample.get("source_execution_mode") or sample.get("execution_mode") or ""
+    ).strip().lower()
+    execution_mode = _canonical_execution_mode(sample.get("execution_mode"))
+    sample["source_execution_mode"] = source_execution_mode
+    sample["execution_mode"] = execution_mode
     decision_id = int(sample.get("decision_id") or 0)
     reflection_fact = _reflection_payload(reflection)
     counterfactuals = _shadow_counterfactuals(
@@ -223,11 +286,13 @@ def build_authoritative_trade_outcome(
             if value and str(value) != "missing_trade_reflection_link"
         )
     )
-    if not reflection_fact:
-        gaps.append("missing_trade_reflection_link")
+    if not execution_mode:
+        gaps.append("missing_or_invalid_execution_mode")
     if not decision_id:
         gaps.append("missing_exact_entry_order_decision_link")
     gaps = list(dict.fromkeys(gaps))
+    label_contract = _fee_after_label_contract(sample, evidence_gaps=gaps)
+    sample["training_label_contract"] = label_contract
 
     identity = {
         "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
@@ -245,7 +310,6 @@ def build_authoritative_trade_outcome(
         {
             "outcome_id": outcome_id,
             "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-            "reflection_id": reflection_fact.get("reflection_id"),
         }
     )
     outcome_fingerprint = _fingerprint(immutable_facts)
@@ -262,6 +326,7 @@ def build_authoritative_trade_outcome(
             "actual_outcome_precedence": "authoritative",
             "reflection": reflection_fact,
             "reflection_id": reflection_fact.get("reflection_id"),
+            "reflection_status": "available" if reflection_fact else "pending_optional",
             "counterfactual_evidence": counterfactuals,
             "counterfactual_production_weight": 0.0,
             "attribution": _attribution(sample),
@@ -276,13 +341,17 @@ def build_authoritative_trade_outcome(
                 "contract_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
                 "outcome_id": outcome_id,
                 "outcome_fingerprint": outcome_fingerprint,
+                "training_label_version": AUTHORITATIVE_TRADE_LABEL_VERSION,
+                "training_label_fingerprint": label_contract["fingerprint"],
                 "consumers": list(AUTHORITATIVE_TRADE_OUTCOME_CONSUMERS),
                 "single_owner": "services.authoritative_trade_outcome",
             },
             "learning_summary": {
                 "objective": "maximize_expected_realized_net_return_after_cost",
                 "realized_net_pnl_usdt": sample.get("realized_pnl"),
-                "authoritative_return_pct": sample.get("authoritative_pnl_ratio_pct"),
+                "authoritative_return_pct": label_contract.get(
+                    "realized_fee_after_return_pct"
+                ),
                 "stop_execution_slippage_pct": sample.get("stop_loss_slippage_pct"),
                 "actual_over_budget_loss_usdt": sample.get(
                     "execution_actual_over_budget_loss_usdt"

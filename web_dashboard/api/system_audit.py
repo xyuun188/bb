@@ -998,7 +998,7 @@ def _specialist_shadow_latest_report() -> dict[str, Any]:
         "available": False,
         "ok": False,
         "live_mutation": False,
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "completed_count": 0,
         "eligible_shadow_count": 0,
         "model_count": 0,
@@ -2927,6 +2927,11 @@ async def _production_source_health_audit() -> dict[str, Any]:
     duration = report.get("continuous_no_source_seconds")
     if status == "ok":
         summary = "近期存在通过治理的生产收益源。"
+    elif report.get("sampling_plan_alert_active"):
+        summary = (
+            "Paper bootstrap canary sampling plan is unreachable; the alert is active "
+            "while controlled collection continues."
+        )
     elif report.get("recovery_state") == "paper_bootstrap_collecting":
         summary = "正式生产收益源仍为空，模拟盘 bootstrap canary 正在采集恢复证据。"
     else:
@@ -2947,9 +2952,14 @@ async def _production_source_health_audit() -> dict[str, Any]:
                 "label": "canary 已执行",
                 "value": int(report.get("paper_bootstrap_executed_count") or 0),
             },
+            {
+                "label": "采样计划告警",
+                "value": bool(report.get("sampling_plan_alert_active")),
+            },
         ],
         next_actions=[
             "检查 paper bootstrap canary 的运行时熔断、成交和版本归因。",
+            "采样计划不可达时按剩余样本、剩余天数和每日风险预算重新核算采样容量。",
             "只有 walk-forward、样本外和权威成交费后收益下界转正后才恢复正式生产源。",
         ],
         owner_path="services/production_source_health.py",
@@ -3565,7 +3575,7 @@ async def _model_training_audit() -> dict[str, Any]:
     promotion_flow = (
         local_tools.get("promotion_flow")
         or evaluation_policy.get("promotion_flow")
-        or "shadow_to_canary_to_live"
+        or "candidate_to_shadow_to_canary_to_active"
     )
     phase3_training_governance = {
         "training_mode": local_tools.get("training_mode") or "shadow",
@@ -3698,7 +3708,7 @@ async def _model_training_audit() -> dict[str, Any]:
                 "models": specialist_models[:8],
                 "live_mutation": bool(specialist_shadow_evaluation.get("live_mutation")),
                 "promotion_flow": specialist_shadow_evaluation.get("promotion_flow")
-                or "shadow_to_canary_to_live",
+                or "candidate_to_shadow_to_canary_to_active",
                 "reason": specialist_shadow_evaluation.get("reason"),
             },
             "historical_trade_fact_audit": historical_trade_fact_report,

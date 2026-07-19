@@ -2606,7 +2606,7 @@ class OkxSyncService:
         """Persist closed history when OKX reports a smaller still-open position."""
 
         reconciled: list[dict[str, Any]] = []
-        if not positions or exchange_quantity < 0 or exit_price <= 0:
+        if not positions or exchange_quantity <= 0 or exit_price <= 0:
             return reconciled
 
         for pos in positions:

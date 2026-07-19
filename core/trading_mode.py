@@ -44,7 +44,7 @@ class TradingModeManager:
         self._mode: TradingMode = TradingMode.PAPER
         self._paused: bool = False
         self._scan_mode: str = "auto"
-        self._live_model_name: str | None = None
+        self._active_model_name: str | None = None
         self._mode_changed_at: datetime = datetime.utcnow()
         self._subscribers: list[ModeSubscriber] = []
         self._state_path = state_path or self._default_state_path()
@@ -87,8 +87,14 @@ class TradingModeManager:
 
     @property
     def live_model_name(self) -> str | None:
+        """Backward-compatible alias for the unified active model."""
+
+        return self.active_model_name
+
+    @property
+    def active_model_name(self) -> str | None:
         self._load_state_from_disk()
-        return self._live_model_name
+        return self._active_model_name
 
     @property
     def mode_changed_at(self) -> datetime:
@@ -101,9 +107,24 @@ class TradingModeManager:
         self._persist_state_to_disk()
         await self._notify()
 
-    async def switch_to_live(self, model_name: str) -> None:
+    async def switch_to_live(self, model_name: str | None = None) -> None:
+        """Switch only the execution account; model selection is mode-independent."""
+
+        if model_name:
+            if self._active_model_name is None:
+                self._active_model_name = model_name
+            elif self._active_model_name != model_name:
+                raise ValueError("execution mode switch cannot replace the active model")
         self._mode = TradingMode.LIVE
-        self._live_model_name = model_name
+        self._mode_changed_at = datetime.utcnow()
+        self._persist_state_to_disk()
+        await self._notify()
+
+    async def select_active_model(self, model_name: str) -> None:
+        selected = str(model_name or "").strip()
+        if not selected:
+            raise ValueError("active model name is required")
+        self._active_model_name = selected
         self._mode_changed_at = datetime.utcnow()
         self._persist_state_to_disk()
         await self._notify()
@@ -161,7 +182,8 @@ class TradingModeManager:
             "mode": self._mode.value,
             "paused": self._paused,
             "scan_mode": self._scan_mode,
-            "live_model_name": self._live_model_name,
+            "active_model_name": self._active_model_name,
+            "live_model_name": self._active_model_name,
             "mode_changed_at": self._mode_changed_at.isoformat(),
         }
 
@@ -206,8 +228,21 @@ class TradingModeManager:
             self._paused = bool(payload.get("paused", self._paused))
             scan_mode = str(payload.get("scan_mode") or self._scan_mode)
             self._scan_mode = "auto" if scan_mode != "auto" else scan_mode
-            live_model_name = payload.get("live_model_name")
-            self._live_model_name = str(live_model_name) if live_model_name else None
+            active_model_name = payload.get("active_model_name")
+            legacy_live_model_name = payload.get("live_model_name")
+            if (
+                active_model_name
+                and legacy_live_model_name
+                and str(active_model_name) != str(legacy_live_model_name)
+            ):
+                logger.warning(
+                    "trading control model aliases disagree; using active model",
+                    active_model_name=str(active_model_name),
+                )
+            selected_model_name = active_model_name or legacy_live_model_name
+            self._active_model_name = (
+                str(selected_model_name) if selected_model_name else None
+            )
             changed_at = payload.get("mode_changed_at")
             if isinstance(changed_at, str) and changed_at:
                 try:

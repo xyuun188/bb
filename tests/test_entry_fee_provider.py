@@ -93,6 +93,55 @@ async def test_entry_fee_provider_uses_exact_linked_okx_fill():
 
 
 @pytest.mark.asyncio
+async def test_entry_fee_provider_accepts_verified_okx_execution_result():
+    session = _FakeSession(
+        _order(
+            fee=3.0,
+            quantity=6.0,
+            okx_raw_fills={
+                "fills_history_confirmed": False,
+                "execution_result_confirmed": True,
+                "contract_size_verified": True,
+                "contract_size_source": "okx_public_instruments",
+                "order_id": "entry-1",
+                "fee_abs": 3.0,
+            },
+        )
+    )
+
+    fee = await EntryFeeProvider().entry_fee_for_position(
+        session,
+        _position(),
+        close_qty=2.0,
+    )
+
+    assert fee == 1.0
+
+
+@pytest.mark.asyncio
+async def test_entry_fee_provider_rejects_unverified_execution_result():
+    session = _FakeSession(
+        _order(
+            okx_raw_fills={
+                "fills_history_confirmed": False,
+                "execution_result_confirmed": True,
+                "contract_size_verified": False,
+                "order_id": "entry-1",
+                "fee_abs": 3.0,
+            },
+        )
+    )
+
+    fee = await EntryFeeProvider().entry_fee_for_position(
+        session,
+        _position(),
+        close_qty=2.0,
+    )
+
+    assert fee == 0.0
+
+
+@pytest.mark.asyncio
 async def test_entry_fee_provider_does_not_guess_from_time_window():
     session = _FakeSession(
         _order(

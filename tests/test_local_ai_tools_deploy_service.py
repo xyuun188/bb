@@ -20,6 +20,7 @@ def _configure_local_ai_registry(module: ModuleType, root: Path) -> None:
     module.MODEL_DIR = root
     module.VERSIONS_ROOT = root / "versions"
     module.CANDIDATE_POINTER_PATH = root / "candidate.json"
+    module.CHALLENGER_POINTER_PATH = root / "challenger.json"
     module.CURRENT_POINTER_PATH = root / "current.json"
     module.ROLLBACK_POINTER_PATH = root / "rollback.json"
 
@@ -68,12 +69,19 @@ def _test_artifact_metadata(
                 "sides": {
                     side: dict(ready_evidence) for side in ("long", "short")
                 },
-            }
+            },
+            {
+                "decision_group_overlap_count": 0,
+                "sides": {
+                    side: dict(ready_evidence) for side in ("long", "short")
+                },
+            },
         ],
         "sides": {
             side: {
                 **ready_evidence,
                 "leave_one_symbol_out": dict(ready_loso),
+                "market_regime_stability": {"stable": True},
             }
             for side in ("long", "short")
         },
@@ -375,7 +383,7 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
         features={"returns_1": 0.1, "rsi_14": 55},
     )
 
-    assert payload["promotion_flow"] == "shadow_to_canary_to_live"
+    assert payload["promotion_flow"] == "candidate_to_shadow_to_canary_to_active"
     assert payload["live_mutation"] is False
     assert payload["shadow_payload"]["tool"] == "profit_prediction"
     assert payload["shadow_payload"]["live_mutation"] is False
@@ -799,14 +807,14 @@ def test_local_ai_registry_rejects_live_activation_without_return_readiness(
     activation = module.read_json_object(activation_path)
     activation.update(
         {
-            "activation_stage": "live",
+            "activation_stage": "active",
             "production_influence_authorized": True,
             "return_evidence_ready": True,
             "execution_scope": "production",
             "production_permission": True,
             "promotion_recommendation": {
-                "recommended_stage": "live",
-                "live_ready": True,
+                "recommended_stage": "active",
+                "active_ready": True,
             },
         }
     )
@@ -842,8 +850,10 @@ def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> No
         "live_ready": False,
     }
 
-    current = module.activate_candidate_shadow(
-        {"promotion_recommendation": recommendation},
+    evidence = {"promotion_recommendation": recommendation}
+    module.activate_candidate_shadow(evidence)
+    current = module.transition_current_artifact(
+        evidence,
         activation_stage="canary",
     )
 
@@ -856,7 +866,7 @@ def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> No
     assert activation["return_evidence_ready"] is False
 
 
-def test_local_ai_registry_activates_live_only_with_complete_evidence(
+def test_local_ai_registry_activates_active_only_with_complete_evidence(
     tmp_path: Path,
 ) -> None:
     module = ModuleType("local_ai_tools_api_registry_governed_live_test")
@@ -866,24 +876,147 @@ def test_local_ai_registry_activates_live_only_with_complete_evidence(
     assert module._production_return_evidence_blockers(metadata) == []
     module.persist_candidate_bundle(_test_artifact_bundle(), metadata)
     recommendation = {
-        "recommended_stage": "live",
+        "recommended_stage": "active",
         "canary_ready": True,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
+        "active_ready": True,
         "live_ready": True,
     }
 
-    current = module.activate_candidate_shadow(
-        {"promotion_recommendation": recommendation},
-        activation_stage="live",
+    evidence = {"promotion_recommendation": recommendation}
+    module.activate_candidate_shadow(evidence)
+    module.transition_current_artifact(
+        evidence,
+        activation_stage="canary",
+    )
+    current = module.transition_current_artifact(
+        evidence,
+        activation_stage="active",
     )
 
     activation = current["activation_manifest"]
-    assert activation["activation_stage"] == "live"
+    assert activation["activation_stage"] == "active"
     assert activation["execution_scope"] == "production"
     assert activation["production_permission"] is True
     assert activation["production_influence_authorized"] is True
     assert activation["return_evidence_ready"] is True
+
+
+def test_local_ai_registry_rejects_regressive_active_challenger(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_registry_challenger_rejection_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    champion = _persist_test_shadow_artifact(module, tmp_path)
+    recommendation = {
+        "recommended_stage": "active",
+        "canary_ready": True,
+        "canary_execution_scope": "paper_only",
+        "canary_production_permission": False,
+        "active_ready": True,
+    }
+    evidence = {"promotion_recommendation": recommendation}
+    module.transition_current_artifact(evidence, activation_stage="canary")
+    champion = module.transition_current_artifact(evidence, activation_stage="active")
+    champion_pointer_before = module.read_json_object(module.CURRENT_POINTER_PATH)
+
+    challenger_metadata = _test_artifact_metadata(module)
+    for side in ("long", "short"):
+        challenger_metadata["oos_return_evaluation"][side].update(
+            {
+                "avg_return_pct": 0.2,
+                "return_lcb_pct": 0.05,
+                "profit_factor": 1.5,
+                "cvar_10_pct": -0.2,
+                "max_drawdown_pct": 0.2,
+            }
+        )
+    challenger_metadata["evaluation_report_hashes"] = module._evaluation_report_hashes(
+        challenger_metadata
+    )
+    challenger_metadata["artifact_return_evidence_sha256"] = module.canonical_sha256(
+        challenger_metadata["evaluation_report_hashes"]
+    )
+    candidate = module.persist_candidate_bundle(
+        _test_artifact_bundle(),
+        challenger_metadata,
+    )
+
+    comparison = module._compare_candidate_to_current(
+        challenger_metadata,
+        candidate_stage="active",
+    )
+    rejected = module.reject_candidate_artifact(comparison)
+    champion_pointer_after = module.read_json_object(module.CURRENT_POINTER_PATH)
+
+    assert comparison["accepted"] is False
+    assert comparison["reason"] == "champion_retained"
+    assert rejected["version"] == candidate["version"]
+    assert rejected["rejection_manifest"]["comparison_report"] == comparison
+    assert not module.CANDIDATE_POINTER_PATH.exists()
+    assert module.CHALLENGER_POINTER_PATH.exists()
+    assert champion_pointer_after["version"] == champion["version"]
+    assert champion_pointer_after["artifact_sha256"] == champion_pointer_before[
+        "artifact_sha256"
+    ]
+
+
+def test_local_ai_registry_accepts_strictly_improved_active_challenger(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_registry_challenger_acceptance_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    champion = _persist_test_shadow_artifact(module, tmp_path)
+    recommendation = {
+        "recommended_stage": "active",
+        "canary_ready": True,
+        "canary_execution_scope": "paper_only",
+        "canary_production_permission": False,
+        "active_ready": True,
+    }
+    evidence = {"promotion_recommendation": recommendation}
+    module.transition_current_artifact(evidence, activation_stage="canary")
+    champion = module.transition_current_artifact(evidence, activation_stage="active")
+
+    challenger_metadata = _test_artifact_metadata(module)
+    for side in ("long", "short"):
+        challenger_metadata["oos_return_evaluation"][side].update(
+            {
+                "avg_return_pct": 0.6,
+                "return_lcb_pct": 0.2,
+                "profit_factor": 2.5,
+                "cvar_10_pct": -0.05,
+                "max_drawdown_pct": 0.05,
+            }
+        )
+    challenger_metadata["evaluation_report_hashes"] = module._evaluation_report_hashes(
+        challenger_metadata
+    )
+    challenger_metadata["artifact_return_evidence_sha256"] = module.canonical_sha256(
+        challenger_metadata["evaluation_report_hashes"]
+    )
+    candidate = module.persist_candidate_bundle(
+        _test_artifact_bundle(),
+        challenger_metadata,
+    )
+
+    comparison = module._compare_candidate_to_current(
+        challenger_metadata,
+        candidate_stage="active",
+    )
+    assert comparison["accepted"] is True
+    assert comparison["reason"] == "challenger_quality_improved"
+
+    module.activate_candidate_shadow(
+        {**evidence, "champion_comparison": comparison}
+    )
+    module.transition_current_artifact(evidence, activation_stage="canary")
+    current = module.transition_current_artifact(evidence, activation_stage="active")
+
+    assert current["version"] == candidate["version"]
+    assert current["version"] != champion["version"]
+    assert current["activation_manifest"]["activation_stage"] == "active"
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -1249,7 +1382,7 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
         "best_side": "long",
         "confidence": 0.5,
         "horizon_step": 2,
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "live_mutation": False,
     }
 
@@ -1368,7 +1501,7 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
         "kind": "timeseries",
         "actual_inference": False,
         "reason": "disabled_for_test",
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "live_mutation": False,
     }
 
@@ -1492,7 +1625,7 @@ def test_local_ai_tools_finbert_shadow_adapter_marks_sentiment_shadow_only() -> 
         "label": "positive",
         "disagreement": 0.04,
         "predictions": {},
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "live_mutation": False,
     }
 
@@ -1870,6 +2003,7 @@ def test_local_ai_tools_generated_service_uses_trusted_model_artifact_boundary()
     assert "local_quant_models_metadata.json" not in SERVICE_CODE
     assert "def persist_candidate_bundle(" in SERVICE_CODE
     assert "def activate_candidate_shadow(" in SERVICE_CODE
+    assert "def transition_current_artifact(" in SERVICE_CODE
     assert "def _governed_candidate_activation_stage(" in SERVICE_CODE
     assert "def rollback_current_artifact(" in SERVICE_CODE
 
@@ -1890,7 +2024,10 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
     assert '"requested_model_stage": str(req.model_stage or "shadow")' in SERVICE_CODE
     assert '"model_stage": "candidate"' in SERVICE_CODE
     assert '"promotion_recommendation": req.promotion_recommendation or {}' in SERVICE_CODE
-    assert 'PHASE3_REQUIRED_PROMOTION_FLOW = "shadow_to_canary_to_live"' in SERVICE_CODE
+    assert (
+        'PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"'
+        in SERVICE_CODE
+    )
     assert 'evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)' in SERVICE_CODE
     assert '"live_mutation": live_authorized' in SERVICE_CODE
 
@@ -2435,7 +2572,10 @@ def test_phase3_quant_api_remote_smoke_checks_governed_activation_contract() -> 
     assert "health.get('service') == 'phase3_quant_api'" in command
     assert "health.get('root') == '/data/BB'" in command
     assert "health.get('live_mutation') is live" in command
-    assert "health.get('artifact_lifecycle') in {'shadow', 'canary', 'live'}" in command
+    assert (
+        "health.get('artifact_lifecycle') in {'shadow', 'canary', 'active', 'live'}"
+        in command
+    )
     assert "health.get('production_influence_authorized') is live" in command
     assert "profit.get('trained') is True" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command

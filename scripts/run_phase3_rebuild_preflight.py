@@ -256,7 +256,7 @@ async def collect_phase3_rebuild_preflight(
         collection_errors["training_payload"] = training["collection_error"]
     payload = training["payload"]
     evaluation_policy = {
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "live_mutation": False,
         "requires_walk_forward": True,
         "phase": "phase3_model_factory",
@@ -292,7 +292,7 @@ async def collect_phase3_rebuild_preflight(
         "return_objective_report": return_objective_report,
         "training_mode": "shadow",
         "model_stage": "shadow",
-        "promotion_flow": "shadow_to_canary_to_live",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "live_mutation": False,
         "evaluation_policy": evaluation_policy,
         "promotion_recommendation": promotion,

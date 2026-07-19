@@ -240,7 +240,7 @@ async def test_local_ai_tools_train_sends_training_cursors(
         quarantined_trade_sample_count=24,
         trade_sample_cursor_policy="clean_training_view_only",
         promotion_recommendation={
-            "policy": "phase3_shadow_to_canary_to_live",
+            "policy": "phase3_candidate_to_shadow_to_canary_to_active",
             "recommended_stage": "shadow",
         },
     )
@@ -255,7 +255,10 @@ async def test_local_ai_tools_train_sends_training_cursors(
     assert captured["payload"]["trade_sample_cursor_policy"] == "clean_training_view_only"
     assert captured["payload"]["training_mode"] == "shadow"
     assert captured["payload"]["model_stage"] == "shadow"
-    assert captured["payload"]["evaluation_policy"]["promotion_flow"] == "shadow_to_canary_to_live"
+    assert (
+        captured["payload"]["evaluation_policy"]["promotion_flow"]
+        == "candidate_to_shadow_to_canary_to_active"
+    )
     assert captured["payload"]["evaluation_policy"]["live_mutation"] is False
     assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
     assert captured["payload"]["persist_artifact"] is False

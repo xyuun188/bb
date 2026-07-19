@@ -192,7 +192,7 @@ class MainLoop:
         logger.info(
             "trading mode changed",
             mode=manager.mode.value,
-            live_model=manager.live_model_name,
+            active_model=manager.active_model_name,
         )
 
     def request_shutdown(self) -> None:

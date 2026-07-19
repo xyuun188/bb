@@ -3,7 +3,10 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
-from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
+from services.paper_bootstrap_canary import (
+    PAPER_BOOTSTRAP_CANARY_VERSION,
+    PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
+)
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -169,7 +172,7 @@ def test_open_positions_applier_preserves_canary_lifecycle_after_partial_exit() 
     entry = _decision(Action.LONG)
     entry.raw_response = {
         "paper_bootstrap_canary": {
-            "version": "2026-07-17.paper-bootstrap-canary.v1",
+            "version": PAPER_BOOTSTRAP_CANARY_VERSION,
             "requested": True,
             "authorized": True,
             "execution_scope": "paper_only",

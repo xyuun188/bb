@@ -12,7 +12,7 @@ ALL_ENTRY_EXPERTS = (
     "position_expert",
     "risk_expert",
 )
-VALID_ROUTE_STAGES = {"shadow", "canary", "live"}
+VALID_ROUTE_STAGES = {"shadow", "canary", "active", "live"}
 
 
 class ModelDynamicRoutingService:
@@ -74,11 +74,13 @@ def plan_dynamic_model_route(
     requested = str(requested_stage or governance.get("model_stage") or "shadow").lower()
     if requested not in VALID_ROUTE_STAGES:
         requested = "shadow"
+    if requested == "live":
+        requested = "active"
     canary_blockers = _canary_route_blockers(ctx, competition_report, coverage, governance)
     live_blockers = _live_route_blockers(ctx, competition_report, coverage, governance)
-    blocking_reasons = live_blockers if requested == "live" else canary_blockers
-    if requested == "live":
-        mode = "live_blocked" if live_blockers else "live_ready"
+    blocking_reasons = live_blockers if requested == "active" else canary_blockers
+    if requested == "active":
+        mode = "active_blocked" if live_blockers else "active_ready"
     else:
         mode = "shadow_only" if canary_blockers else "canary_ready"
     selected_list = list(ALL_ENTRY_EXPERTS)
@@ -91,6 +93,7 @@ def plan_dynamic_model_route(
         "can_apply_live_route": False,
         "requested_stage": requested,
         "canary_ready": not bool(canary_blockers),
+        "active_ready": not bool(live_blockers),
         "live_ready": not bool(live_blockers),
         "canary_blocking_reasons": canary_blockers,
         "live_blocking_reasons": live_blockers,
@@ -141,7 +144,9 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
         estimated_call_reduction += int(_safe_float(route.get("estimated_call_reduction"), 0.0))
         if bool(route.get("live_ready")):
             live_ready_count += 1
-        if route.get("mode") == "live_blocked" or _safe_list(route.get("live_blocking_reasons")):
+        if route.get("mode") in {"active_blocked", "live_blocked"} or _safe_list(
+            route.get("live_blocking_reasons")
+        ):
             live_blocked_count += 1
         if bool(route.get("applied_to_live_calls")) or bool(route.get("live_route_mutation")):
             unsafe_live_mutation_attempts += 1
@@ -165,7 +170,9 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
             "shadow_only_count": int(mode_counts.get("shadow_only") or 0),
             "canary_ready_count": int(mode_counts.get("canary_ready") or 0),
             "live_ready_count": live_ready_count,
+            "active_ready_count": live_ready_count,
             "live_blocked_count": live_blocked_count,
+            "active_blocked_count": live_blocked_count,
             "estimated_call_reduction": estimated_call_reduction,
             "unsafe_live_mutation_attempts": unsafe_live_mutation_attempts,
         },
@@ -202,7 +209,7 @@ def _route_governance(
         "model_stage": str(source.get("model_stage") or "shadow").lower(),
         "promotion_flow": source.get("promotion_flow")
         or evaluation_policy.get("promotion_flow")
-        or "shadow_to_canary_to_live",
+        or "candidate_to_shadow_to_canary_to_active",
         "live_mutation": bool(source.get("live_mutation") or evaluation_policy.get("live_mutation")),
         "requires_walk_forward": bool(evaluation_policy.get("requires_walk_forward", True)),
         "evaluation_policy": evaluation_policy,

@@ -90,8 +90,17 @@ def _has_authoritative_fee_fact(order: Any, *, order_id: str) -> bool:
     raw = getattr(order, "okx_raw_fills", None)
     if not isinstance(raw, dict):
         return False
-    return bool(
+    exchange_confirmation = bool(
         raw.get("fills_history_confirmed") is True
+        or (
+            raw.get("execution_result_confirmed") is True
+            and raw.get("contract_size_verified") is True
+            and str(raw.get("contract_size_source") or "").strip()
+            == "okx_public_instruments"
+        )
+    )
+    return bool(
+        exchange_confirmation
         and str(raw.get("order_id") or "").strip() == order_id
         and raw.get("fee_abs") is not None
         and abs(float(getattr(order, "quantity", 0.0) or 0.0)) > 0

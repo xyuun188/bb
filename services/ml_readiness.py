@@ -347,6 +347,7 @@ def _side_artifact_evidence_blockers(
     ]
     if (
         walk_side.get("promotion_math_ready") is not True
+        or len(folds) < 2
         or not fold_side_evidence
         or any(
             not isinstance(evidence, dict)
@@ -358,6 +359,16 @@ def _side_artifact_evidence_blockers(
             _reason(
                 f"{side}_walk_forward_return_stability_failed",
                 f"{side_text}费后收益证据在时间滚动验证各折之间不稳定。",
+            )
+        )
+    regime_stability = _safe_dict(walk_side.get("market_regime_stability"))
+    if regime_stability.get("stable") is not True:
+        blockers.append(
+            _reason(
+                f"{side}_market_regime_stability_failed",
+                "fee-after return evidence is not stable across at least two market regimes",
+                actual=regime_stability,
+                required="two profitable market-regime windows",
             )
         )
     loso = _safe_dict(

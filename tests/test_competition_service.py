@@ -78,7 +78,7 @@ async def test_auto_promote_best_model_is_recommendation_only(
     switched: list[str] = []
 
     class FakeModeManager:
-        live_model_name = "current-live-model"
+        active_model_name = "current-active-model"
 
         async def switch_to_live(self, model_name: str) -> None:
             switched.append(model_name)
@@ -96,9 +96,9 @@ async def test_auto_promote_best_model_is_recommendation_only(
     assert switched == []
     assert fake_logger.info_events == [
         {
-            "event": "best model promotion recommendation recorded without live switch",
+            "event": "best model promotion recommendation recorded without active switch",
             "model": "candidate-model",
-            "current_live_model": "current-live-model",
+            "current_active_model": "current-active-model",
             "live_mutation": False,
             "policy": "phase3_observe_only",
         }

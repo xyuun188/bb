@@ -3230,6 +3230,41 @@ def _order_has_confirmed_okx_fill_fact(
         and raw.get("contract_size_verified") is not True
     ):
         return False
+    return _order_fill_fact_matches_local(order, raw)
+
+
+def authoritative_order_fee_fact_source(
+    order: Order,
+    *,
+    order_id: str,
+) -> str | None:
+    """Return the exact OKX source that authorizes an entry-fee fact."""
+
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if raw.get("fee_abs") is None:
+        return None
+    if str(getattr(order, "exchange_order_id", "") or "").strip() != order_id:
+        return None
+    if str(raw.get("order_id") or "").strip() != order_id:
+        return None
+    if _order_has_confirmed_okx_fill_fact(
+        order,
+        require_verified_contract_size=True,
+    ):
+        return "okx_fills_history"
+    if (
+        not _order_has_okx_execution_result_fact(order)
+        or raw.get("contract_size_verified") is not True
+        or str(raw.get("contract_size_source") or "").strip()
+        != "okx_public_instruments"
+        or not _order_fill_fact_matches_local(order, raw)
+    ):
+        return None
+    return "okx_execution_result"
+
+
+def _order_fill_fact_matches_local(order: Order, raw: dict[str, Any]) -> bool:
     expected_quantity = _stored_fill_base_quantity(raw)
     raw_base_quantity = _safe_float(
         raw.get("base_quantity") or raw.get("filled_base_quantity"),
@@ -4165,6 +4200,7 @@ def _current_position_entry_fee_evidence(
     missing_ids = [order_id for order_id in entry_order_ids if order_id not in orders_by_id]
     ordered = [orders_by_id[order_id] for order_id in entry_order_ids if order_id in orders_by_id]
     exact_fill_ids: list[str] = []
+    fee_sources: dict[str, str] = {}
     fee_fact_missing_ids: list[str] = []
     total_quantity = 0.0
     total_fee = 0.0
@@ -4178,17 +4214,18 @@ def _current_position_entry_fee_evidence(
         quantity = abs(_safe_float(getattr(order, "quantity", None), 0.0))
         price = max(_safe_float(getattr(order, "price", None), 0.0), 0.0)
         fee_present = raw.get("fee_abs") is not None
-        exact = _order_has_confirmed_okx_fill_fact(
+        fee_source = authoritative_order_fee_fact_source(
             order,
-            require_verified_contract_size=True,
+            order_id=order_id,
         )
-        if not exact:
+        if fee_source is None:
             fee_fact_missing_ids.append(order_id)
             continue
         if not fee_present or quantity <= 0 or price <= 0:
             fee_fact_missing_ids.append(order_id)
             continue
         exact_fill_ids.append(order_id)
+        fee_sources[order_id] = fee_source
         total_quantity += quantity
         total_fee += abs(_safe_float(raw.get("fee_abs"), 0.0))
         total_notional += quantity * price
@@ -4211,11 +4248,20 @@ def _current_position_entry_fee_evidence(
         and total_notional > 0
     )
     allocated_fee = total_fee * current_qty / total_quantity if complete else 0.0
+    distinct_sources = sorted(set(fee_sources.values()))
+    source = (
+        distinct_sources[0]
+        if complete and len(distinct_sources) == 1
+        else "okx_fills_history_and_execution_result"
+        if complete
+        else "incomplete_okx_fill_lineage"
+    )
     return {
         "complete": complete,
-        "source": "okx_fills_history" if complete else "incomplete_okx_fill_lineage",
+        "source": source,
         "entry_order_ids": list(entry_order_ids),
         "exact_fill_order_ids": exact_fill_ids,
+        "fee_sources_by_order_id": fee_sources,
         "missing_order_ids": missing_ids,
         "fee_fact_missing_order_ids": fee_fact_missing_ids,
         "full_entry_quantity": total_quantity,

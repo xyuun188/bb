@@ -56,6 +56,11 @@ def _source_count(raw: dict[str, Any]) -> int:
     return max(total, 0)
 
 
+def _paper_bootstrap_guard(raw: dict[str, Any]) -> dict[str, Any]:
+    contract = _safe_dict(raw.get("paper_bootstrap_canary"))
+    return _safe_dict(contract.get("runtime_guard"))
+
+
 def summarize_production_source_health(
     decisions: list[Any],
     *,
@@ -88,9 +93,30 @@ def summarize_production_source_health(
         if _safe_dict(_raw(row).get("paper_bootstrap_canary")).get("requested") is True
     ]
     canary_executed = sum(bool(_row_value(row, "was_executed")) for row in canary_rows)
+    latest_canary_at = (
+        _as_utc(_row_value(canary_rows[0], "created_at")) if canary_rows else None
+    )
+    latest_canary_guard = (
+        _paper_bootstrap_guard(_raw(canary_rows[0])) if canary_rows else {}
+    )
+    sampling_plan_alert_active = bool(
+        latest_canary_guard.get("sampling_plan_alert_active") is True
+        and latest_canary_at is not None
+        and (checked_at - latest_canary_at).total_seconds() <= critical_after
+    )
+    sampling_plan_alert_reason = (
+        "paper_bootstrap_sampling_plan_unreachable"
+        if sampling_plan_alert_active
+        else None
+    )
     if not market_rows:
         status = "warning"
         reason = "market_decision_evidence_unavailable"
+    elif sampling_plan_alert_active and not (
+        source_rows and no_source_seconds is not None and no_source_seconds < warning_after
+    ):
+        status = "critical"
+        reason = sampling_plan_alert_reason
     elif source_rows and no_source_seconds is not None and no_source_seconds < warning_after:
         status = "ok"
         reason = "governed_production_return_source_recent"
@@ -115,8 +141,15 @@ def summarize_production_source_health(
         "critical_after_seconds": critical_after,
         "paper_bootstrap_candidate_count": len(canary_rows),
         "paper_bootstrap_executed_count": canary_executed,
+        "sampling_plan_alert_active": sampling_plan_alert_active,
+        "sampling_plan_alert_reason": sampling_plan_alert_reason,
+        "sampling_plan_alert_observed_at": (
+            latest_canary_at.isoformat() if sampling_plan_alert_active and latest_canary_at else None
+        ),
         "recovery_state": (
-            "paper_bootstrap_collecting"
+            "paper_bootstrap_plan_unreachable"
+            if sampling_plan_alert_active
+            else "paper_bootstrap_collecting"
             if canary_executed
             else "paper_bootstrap_waiting"
             if canary_rows

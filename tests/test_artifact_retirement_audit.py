@@ -64,7 +64,7 @@ async def test_phase3_artifact_with_clean_manifest_is_compatible(tmp_path) -> No
                 "model_stage": "canary",
                 "artifact_persisted": True,
                 "evaluation_policy": {
-                    "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                     "live_mutation": False,
                 },
                 "quality_report": {"data_quality_version": "2026-06-27.phase3"},
@@ -125,7 +125,7 @@ async def test_unreferenced_registry_version_is_retired_without_hiding_unknown_a
                 "training_policy": "clean_training_view_only",
                 "model_stage": "shadow",
                 "artifact_persisted": True,
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "quality_report": {"data_quality_version": "2026-07-16.v1"},
             }
         ),

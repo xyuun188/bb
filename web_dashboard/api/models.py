@@ -20,8 +20,13 @@ async def list_models():
 
     return {
         "models": rankings,
+        "active_model": (
+            _trading_service.models.active_model_name
+            if _trading_service and _trading_service.models
+            else None
+        ),
         "live_model": (
-            _trading_service.models.live_model_name
+            _trading_service.models.active_model_name
             if _trading_service and _trading_service.models
             else None
         ),

@@ -306,23 +306,25 @@ def build_phase3_promotion_recommendation(
             blockers.append(f"paper_observation_unsafe:{unsafe_key}")
 
     canary_blockers = list(dict.fromkeys(blockers))
-    live_blockers = list(canary_blockers)
+    active_blockers = list(canary_blockers)
     if return_report.get("promotion_ready") is not True:
-        live_blockers.extend(
+        active_blockers.extend(
             str(reason)
             for reason in _safe_list(return_report.get("blocking_reasons"))
             if reason
         )
         if not return_report:
-            live_blockers.append("return_objective_report_missing")
+            active_blockers.append("return_objective_report_missing")
     if str(training_mode or "").lower() != "walk_forward":
-        live_blockers.append("walk_forward_required")
-    if str(model_stage or "").lower() != "live":
-        live_blockers.append("model_stage_not_live")
+        active_blockers.append("walk_forward_required")
+    if str(model_stage or "").lower() not in {"active", "live"}:
+        active_blockers.append("model_stage_not_active")
     if not bool(policy.get("live_mutation")):
-        live_blockers.append("live_mutation_not_enabled")
-    live_blockers = list(dict.fromkeys(live_blockers))
-    recommended_stage = "live" if not live_blockers else "canary" if not canary_blockers else "shadow"
+        active_blockers.append("live_mutation_not_enabled")
+    active_blockers = list(dict.fromkeys(active_blockers))
+    recommended_stage = (
+        "active" if not active_blockers else "canary" if not canary_blockers else "shadow"
+    )
     if contamination != "low" or str(model_stage or "").lower() in {"degraded", "retired"}:
         recommended_stage = "degraded"
 
@@ -335,9 +337,11 @@ def build_phase3_promotion_recommendation(
         "canary_ready": not canary_blockers,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
-        "live_ready": not live_blockers,
+        "active_ready": not active_blockers,
+        "live_ready": not active_blockers,
         "canary_blocking_reasons": canary_blockers,
-        "live_blocking_reasons": live_blockers,
+        "active_blocking_reasons": active_blockers,
+        "live_blocking_reasons": active_blockers,
         "observed_sample_counts": {
             "completed_shadow_sample_count": int(completed_shadow_sample_count or 0),
             "completed_trade_sample_count": int(completed_trade_sample_count or 0),

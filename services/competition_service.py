@@ -209,11 +209,11 @@ class CompetitionService:
         after the promotion policy gates pass.
         """
         best = await self.select_best_model()
-        if best and best != mode_manager.live_model_name:
+        if best and best != mode_manager.active_model_name:
             logger.info(
-                "best model promotion recommendation recorded without live switch",
+                "best model promotion recommendation recorded without active switch",
                 model=best,
-                current_live_model=mode_manager.live_model_name,
+                current_active_model=mode_manager.active_model_name,
                 live_mutation=False,
                 policy="phase3_observe_only",
             )

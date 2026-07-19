@@ -409,7 +409,7 @@ async def test_data_collection_marks_available_local_ai_bundle_ready(
                 "training_mode": "walk_forward",
                 "model_stage": "canary",
                 "evaluation_policy": {
-                    "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                     "live_mutation": False,
                     "requires_walk_forward": True,
                 },
@@ -434,7 +434,7 @@ async def test_data_collection_marks_available_local_ai_bundle_ready(
     assert status["trained_at"] == "2026-06-23T16:58:10+00:00"
     assert status["training_mode"] == "walk_forward"
     assert status["model_stage"] == "canary"
-    assert status["promotion_flow"] == "shadow_to_canary_to_live"
+    assert status["promotion_flow"] == "candidate_to_shadow_to_canary_to_active"
     assert status["live_mutation"] is False
     assert status["evaluation_policy"]["requires_walk_forward"] is True
     assert status["promotion_recommendation"]["recommended_stage"] == "canary"

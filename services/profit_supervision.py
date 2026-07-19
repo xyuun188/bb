@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from core.symbols import normalize_trading_symbol
+from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.execution_cost_model import execution_cost_estimate
 
 PROFIT_SUPERVISION_VERSION = "2026-07-14.separated-profit-supervision.v1"
@@ -239,16 +240,17 @@ def build_profit_supervision_contract(
         cost_task = _trade_cost_labels(labels, sample)
         cost_task["eligible"] = bool(quality_eligible and cost_task.get("eligible"))
         net_return = _safe_float(labels.get("net_return_after_cost_pct"))
+        source = _safe_text(sample.get("source"))
         trusted = bool(
             quality_eligible
-            and _safe_text(sample.get("source")) == "okx_position_history"
+            and source in AUTHORITATIVE_TRADE_OUTCOME_SOURCES
             and sample.get("trade_fact_trusted") is True
             and _safe_text(sample.get("lifecycle_key"))
             and net_return is not None
         )
         realized_task = {
             "eligible": trusted,
-            "source_authority": "okx_position_history",
+            "source_authority": source if trusted else "none",
             "actual_execution": True,
             "lifecycle_key": _safe_text(sample.get("lifecycle_key")),
             "side": _safe_text(sample.get("side")).lower(),

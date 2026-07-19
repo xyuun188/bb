@@ -10,6 +10,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 SHADOW_LABEL_VERSION = "2026-07-14.native-shadow-label.v1"
+AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-19.authoritative-trade-outcome.v2"
+AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-07-19.realized-fee-after-return.v1"
+AUTHORITATIVE_TRADE_OUTCOME_SOURCES = frozenset(
+    {
+        "okx_position_history",
+        "okx_verified_execution_pair",
+    }
+)
 
 
 def _dict(value: Any) -> dict[str, Any]:

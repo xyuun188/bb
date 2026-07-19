@@ -26,6 +26,7 @@ from services.okx_order_fact_sync import (
     PHASE3_DEFAULT_ORDER_SYNC_START,
     OkxOrderFactSyncService,
     _apply_position_history_payload,
+    _current_position_entry_fee_evidence,
     _db_naive_since,
     _matching_current_position_entry_orders,
     _matching_native_full_close_pending_fill,
@@ -44,6 +45,86 @@ def test_stored_fill_base_quantity_prefers_okx_contract_size_over_stale_base_qua
             "base_quantity": 15.265700483091791,
         }
     ) == pytest.approx(16.0)
+
+
+def test_current_position_fee_accepts_verified_okx_execution_result() -> None:
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="FIL/USDT",
+        side="buy",
+        order_type="market",
+        quantity=537.5,
+        price=0.73219888,
+        status="filled",
+        fee=0.19677845,
+        exchange_order_id="entry-verified",
+    )
+    order.okx_inst_id = "FIL-USDT-SWAP"
+    order.okx_fill_contracts = 5375.0
+    order.okx_raw_fills = {
+        "source": "okx_execution_result",
+        "fills_history_confirmed": False,
+        "execution_result_confirmed": True,
+        "order_id": "entry-verified",
+        "inst_id": "FIL-USDT-SWAP",
+        "contracts": 5375.0,
+        "contract_size": 0.1,
+        "contract_size_verified": True,
+        "contract_size_source": "okx_public_instruments",
+        "base_quantity": 537.5,
+        "avg_price": 0.73219888,
+        "fee_abs": 0.19677845,
+    }
+
+    evidence = _current_position_entry_fee_evidence(
+        ["entry-verified"],
+        [order],
+        current_quantity=537.5,
+    )
+
+    assert evidence["complete"] is True
+    assert evidence["source"] == "okx_execution_result"
+    assert evidence["allocated_entry_fee_usdt"] == pytest.approx(0.19677845)
+
+
+def test_current_position_fee_rejects_unverified_execution_result_contract_size() -> None:
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="FIL/USDT",
+        side="buy",
+        order_type="market",
+        quantity=537.5,
+        price=0.73219888,
+        status="filled",
+        fee=0.19677845,
+        exchange_order_id="entry-unverified",
+    )
+    order.okx_inst_id = "FIL-USDT-SWAP"
+    order.okx_fill_contracts = 5375.0
+    order.okx_raw_fills = {
+        "source": "okx_execution_result",
+        "fills_history_confirmed": False,
+        "execution_result_confirmed": True,
+        "order_id": "entry-unverified",
+        "inst_id": "FIL-USDT-SWAP",
+        "contracts": 5375.0,
+        "contract_size": 0.1,
+        "contract_size_verified": False,
+        "base_quantity": 537.5,
+        "avg_price": 0.73219888,
+        "fee_abs": 0.19677845,
+    }
+
+    evidence = _current_position_entry_fee_evidence(
+        ["entry-unverified"],
+        [order],
+        current_quantity=537.5,
+    )
+
+    assert evidence["complete"] is False
+    assert evidence["fee_fact_missing_order_ids"] == ["entry-unverified"]
 
 
 def test_current_position_entry_links_reconstruct_multi_entry_net_lifecycle() -> None:

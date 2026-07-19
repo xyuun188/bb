@@ -816,7 +816,10 @@ class TradingService:
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
         self._auto_scan_feature_cursor = 0
-        self._paper_verified_entry_symbols: set[str] = set()
+        self._verified_entry_symbols_by_mode: dict[str, set[str]] = {
+            "paper": set(),
+            "live": set(),
+        }
         self._active_analysis_symbols: set[str] = set()
         self._analysis_symbol_lock = asyncio.Lock()
         self._market_analysis_task: asyncio.Task | None = None
@@ -4065,7 +4068,10 @@ class TradingService:
         )
         max_pool = max(int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX), configured_limit)
         market_budget = min(len(market_symbols), target_market_budget, max_pool)
-        verified_symbols = set(getattr(self, "_paper_verified_entry_symbols", set()) or set())
+        model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
+        verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+        verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
+        verified_symbols = set(verified_by_mode.get(model_mode, set()) or set())
         verified_market_symbols = [
             symbol
             for symbol in market_symbols
@@ -4087,7 +4093,8 @@ class TradingService:
             "pool_multiplier": int(AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER),
             "pool_min": int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
             "pool_max": int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX),
-            "verified_paper_symbol_count": len(verified_market_symbols),
+            "verified_execution_symbol_count": len(verified_market_symbols),
+            "execution_mode": model_mode,
             "diagnostic_boundary": (
                 "Feature-fetch breadth only expands discovery before rank/evidence gates; "
                 "it is not entry permission, leverage, sizing, or ML readiness."
@@ -4857,17 +4864,19 @@ class TradingService:
         self._last_auto_feature_rank_diagnostics = result.diagnostics
         return result.selected
 
-    async def _filter_paper_entry_instrument_shortlist(
+    async def _filter_entry_instrument_shortlist(
         self,
         feature_vectors: dict[str, Any],
         limit: int,
+        model_mode: str,
     ) -> dict[str, Any]:
-        """Keep only symbols the OKX demo account can address through private APIs."""
+        """Keep symbols the selected OKX account can address through private APIs."""
 
         target = max(0, int(limit or 0))
         if target <= 0 or not feature_vectors:
             return {}
-        executor = await self._get_okx_executor_for_mode("paper")
+        selected_mode = "live" if str(model_mode).lower() == "live" else "paper"
+        executor = await self._get_okx_executor_for_mode(selected_mode)
         shortlist = await executor.entry_instrument_availability_shortlist(
             list(feature_vectors),
             target_count=target,
@@ -4881,14 +4890,18 @@ class TradingService:
         ]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
-        verified_symbols = set(getattr(self, "_paper_verified_entry_symbols", set()) or set())
+        verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+        verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
+        verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
         for symbol, facts in availability.items():
             availability_facts = self._safe_dict(facts)
             if availability_facts.get("available") is True:
                 verified_symbols.add(str(symbol))
             elif str(availability_facts.get("error_code") or "") == "51001":
                 verified_symbols.discard(str(symbol))
-        self._paper_verified_entry_symbols = verified_symbols
+        verified_by_mode = dict(verified_by_mode)
+        verified_by_mode[selected_mode] = verified_symbols
+        self._verified_entry_symbols_by_mode = verified_by_mode
         unavailable = [
             {
                 "symbol": symbol,
@@ -4902,7 +4915,7 @@ class TradingService:
         diagnostics = self._safe_dict(getattr(self, "_last_auto_feature_rank_diagnostics", None))
         diagnostics["execution_availability"] = {
             "source": "okx_private_account_leverage_info",
-            "mode": "paper",
+            "mode": selected_mode,
             "evaluated_count": int(shortlist.get("evaluated_count") or 0),
             "probed_count": int(shortlist.get("probed_count") or 0),
             "cache_hit_count": int(shortlist.get("cache_hit_count") or 0),
@@ -4930,7 +4943,7 @@ class TradingService:
                 item["execution_instrument_reason"] = facts.get("reason")
                 item["selected"] = symbol in selected_symbols
                 if facts.get("available") is False:
-                    item["non_selected_reason"] = "paper_execution_instrument_unavailable"
+                    item["non_selected_reason"] = "execution_instrument_unavailable"
         diagnostics["symbols"] = [
             item
             for item in (ranked_sample or [])
@@ -4938,7 +4951,7 @@ class TradingService:
         ]
         self._last_auto_feature_rank_diagnostics = diagnostics
         logger.info(
-            "paper execution instrument shortlist",
+            "execution instrument shortlist",
             **diagnostics["execution_availability"],
         )
         return selected
@@ -5776,19 +5789,17 @@ class TradingService:
                     market_feature_vectors_after_rank = {}
                 elif mode_manager.is_auto_scan:
                     model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
-                    rank_limit = market_symbol_budget
-                    if model_mode == "paper":
-                        rank_limit = len(market_feature_vectors)
+                    rank_limit = len(market_feature_vectors)
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, rank_limit
                     )
-                    if model_mode == "paper":
-                        market_feature_vectors = (
-                            await self._filter_paper_entry_instrument_shortlist(
-                                market_feature_vectors,
-                                market_symbol_budget,
-                            )
+                    market_feature_vectors = (
+                        await self._filter_entry_instrument_shortlist(
+                            market_feature_vectors,
+                            market_symbol_budget,
+                            model_mode,
                         )
+                    )
                     rank_diagnostics_snapshot = self._safe_dict(
                         getattr(self, "_last_auto_feature_rank_diagnostics", None)
                     )

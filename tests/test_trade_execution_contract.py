@@ -220,6 +220,115 @@ def test_bounded_legacy_canary_fill_drift_uses_persisted_cost_evidence() -> None
     assert report["entry_contracts"][0]["bounded_fill_drift_accepted"] is True
 
 
+def test_confirmed_canary_fill_within_reserved_ceiling_keeps_contract_complete() -> None:
+    raw = complete_paper_canary_raw()
+    sizing = raw["profit_risk_sizing"]
+    reserve_fraction = 0.0025
+    fill_ceiling = 50.0
+    target_notional = fill_ceiling / (1.0 + reserve_fraction)
+    settled_notional = target_notional * 1.001
+    sizing.update(
+        {
+            "target_notional_usdt": target_notional,
+            "fill_notional_ceiling_usdt": fill_ceiling,
+            "estimated_fill_drift_reserve_fraction": reserve_fraction,
+            "final_notional_usdt": settled_notional,
+            "final_margin_usdt": settled_notional,
+            "planned_stressed_loss_usdt": settled_notional
+            * float(sizing["stressed_loss_fraction"]),
+            "position_size_pct": settled_notional
+            / float(sizing["available_margin_usdt"]),
+            "execution_reconciliations": [
+                {
+                    "source": "okx_pre_submit_order_shape",
+                    "final_notional_usdt": target_notional,
+                    "eligible": True,
+                    "reasons": [],
+                },
+                {
+                    "source": "okx_confirmed_entry_fill",
+                    "final_notional_usdt": settled_notional,
+                    "eligible": True,
+                    "reasons": [],
+                },
+            ],
+        }
+    )
+
+    report = summarize_trade_execution_contract(
+        [_decision(15, "long", raw)],
+        orders=[
+            SimpleNamespace(
+                decision_id=15,
+                status="filled",
+                quantity=settled_notional / 100.0,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["contract_violation_count"] == 0
+    contract = report["entry_contracts"][0]
+    assert contract["bounded_fill_drift_accepted"] is True
+    assert contract["fill_drift_evidence"]["explicit_reserve_contract"] is True
+
+
+def test_confirmed_canary_fill_beyond_reserved_ceiling_fails_closed() -> None:
+    raw = complete_paper_canary_raw()
+    sizing = raw["profit_risk_sizing"]
+    reserve_fraction = 0.0025
+    fill_ceiling = 50.0
+    target_notional = fill_ceiling / (1.0 + reserve_fraction)
+    settled_notional = fill_ceiling + 0.01
+    drift_reasons = [
+        "execution_notional_exceeds_authoritative_target",
+        "execution_stressed_loss_exceeds_risk_budget",
+    ]
+    sizing.update(
+        {
+            "production_eligible": False,
+            "target_notional_usdt": target_notional,
+            "fill_notional_ceiling_usdt": fill_ceiling,
+            "estimated_fill_drift_reserve_fraction": reserve_fraction,
+            "final_notional_usdt": settled_notional,
+            "final_margin_usdt": settled_notional,
+            "planned_stressed_loss_usdt": settled_notional
+            * float(sizing["stressed_loss_fraction"]),
+            "position_size_pct": 0.0,
+            "execution_reconciliations": [
+                {
+                    "source": "okx_pre_submit_order_shape",
+                    "final_notional_usdt": target_notional,
+                    "eligible": True,
+                    "reasons": [],
+                },
+                {
+                    "source": "okx_confirmed_entry_fill",
+                    "final_notional_usdt": settled_notional,
+                    "eligible": False,
+                    "reasons": drift_reasons,
+                },
+            ],
+        }
+    )
+    sizing["policy_provenance"]["fallback_reason"] = ",".join(drift_reasons)
+
+    report = summarize_trade_execution_contract(
+        [_decision(16, "long", raw)],
+        orders=[
+            SimpleNamespace(
+                decision_id=16,
+                status="filled",
+                quantity=settled_notional / 100.0,
+                price=100.0,
+            )
+        ],
+    )
+
+    assert report["summary"]["entry_contract_ready_count"] == 0
+    assert report["violation_reason_counts"]["paper_canary_notional_invalid"] == 1
+
+
 def test_canary_fill_drift_beyond_persisted_cost_evidence_fails_closed() -> None:
     raw = bounded_legacy_fill_drift_raw(excess_fraction=0.003)
     final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]

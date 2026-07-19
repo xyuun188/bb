@@ -1028,7 +1028,7 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             0,
         )
         evaluation_policy = {
-            "promotion_flow": "shadow_to_canary_to_live",
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
             "live_mutation": False,
             "requires_walk_forward": True,
             "requires_paper_observation": True,

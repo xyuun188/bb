@@ -12,8 +12,9 @@ def _decision(
     source_count: int = 0,
     canary: bool = False,
     executed: bool = False,
+    sampling_plan_alert: bool = False,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    decision = SimpleNamespace(
         created_at=created_at,
         analysis_type="market",
         was_executed=executed,
@@ -24,6 +25,11 @@ def _decision(
             "paper_bootstrap_canary": {"requested": canary},
         },
     )
+    if canary:
+        decision.raw_llm_response["paper_bootstrap_canary"]["runtime_guard"] = {
+            "sampling_plan_alert_active": sampling_plan_alert,
+        }
+    return decision
 
 
 def test_continuous_no_production_source_raises_critical_alert() -> None:
@@ -62,3 +68,22 @@ def test_alert_reports_paper_bootstrap_recovery_progress() -> None:
     assert report["status"] == "critical"
     assert report["recovery_state"] == "paper_bootstrap_collecting"
     assert report["paper_bootstrap_executed_count"] == 1
+
+
+def test_unreachable_sampling_plan_is_promoted_to_health_alert() -> None:
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    rows = [
+        _decision(
+            now - timedelta(minutes=2),
+            canary=True,
+            sampling_plan_alert=True,
+        ),
+        _decision(now - timedelta(minutes=3)),
+    ]
+
+    report = summarize_production_source_health(rows, now=now)
+
+    assert report["status"] == "critical"
+    assert report["reason"] == "paper_bootstrap_sampling_plan_unreachable"
+    assert report["sampling_plan_alert_active"] is True
+    assert report["recovery_state"] == "paper_bootstrap_plan_unreachable"

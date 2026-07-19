@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_LABEL_VERSION,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     build_authoritative_trade_outcome,
 )
@@ -92,10 +93,14 @@ def test_real_outcome_has_stable_identity_and_shadow_is_counterfactual_only() ->
     second = build_authoritative_trade_outcome(
         _sample(), reflection=_reflection(), shadow_rows=[shadow]
     )
+    without_reflection = build_authoritative_trade_outcome(
+        _sample(), shadow_rows=[shadow]
+    )
 
     assert first["outcome_version"] == AUTHORITATIVE_TRADE_OUTCOME_VERSION
     assert first["outcome_id"] == second["outcome_id"]
     assert first["outcome_fingerprint"] == second["outcome_fingerprint"]
+    assert first["outcome_fingerprint"] == without_reflection["outcome_fingerprint"]
     rebuilt = build_authoritative_trade_outcome(first, reflection=_reflection())
     assert rebuilt["outcome_fingerprint"] == first["outcome_fingerprint"]
     assert first["outcome_complete"] is True
@@ -116,7 +121,7 @@ def test_outcome_attribution_preserves_unknowns_and_measures_tail_execution() ->
     )
 
 
-def test_missing_reflection_blocks_training_until_outcome_is_complete() -> None:
+def test_missing_optional_reflection_does_not_block_authoritative_label() -> None:
     outcome = build_authoritative_trade_outcome(_sample())
     payload = annotate_training_payload(
         shadow_samples=[],
@@ -125,11 +130,36 @@ def test_missing_reflection_blocks_training_until_outcome_is_complete() -> None:
         text_sentiment_samples=[],
     )
 
-    assert outcome["outcome_complete"] is False
-    assert "missing_trade_reflection_link" in outcome["outcome_evidence_gaps"]
-    assert payload["trade_samples"] == []
+    assert outcome["outcome_complete"] is True
+    assert outcome["reflection_status"] == "pending_optional"
+    assert "missing_trade_reflection_link" not in outcome["outcome_evidence_gaps"]
+    assert len(payload["trade_samples"]) == 1
     record = payload["authoritative_outcome_manifest"]["records"][0]
-    assert record["training_status"] == "excluded"
+    assert record["training_status"] == "included"
+
+
+def test_demo_and_live_share_one_fee_after_label_schema() -> None:
+    paper = build_authoritative_trade_outcome(_sample(execution_mode="simulation"))
+    live = build_authoritative_trade_outcome(
+        _sample(
+            execution_mode="live",
+            lifecycle_key="live|ICP-USDT-SWAP|pos-live|short|1",
+            okx_pos_id="pos-live",
+        )
+    )
+
+    paper_label = paper["training_label_contract"]
+    live_label = live["training_label_contract"]
+    assert paper["execution_mode"] == "paper"
+    assert live["execution_mode"] == "live"
+    assert paper_label["version"] == AUTHORITATIVE_TRADE_LABEL_VERSION
+    assert set(paper_label) == set(live_label)
+    assert paper_label["realized_fee_after_return_pct"] == live_label[
+        "realized_fee_after_return_pct"
+    ]
+    assert paper_label["realized_net_pnl_usdt"] == live_label[
+        "realized_net_pnl_usdt"
+    ]
 
 
 def test_complete_outcome_is_the_training_manifest_identity() -> None:
@@ -146,3 +176,19 @@ def test_complete_outcome_is_the_training_manifest_identity() -> None:
     assert manifest["record_count"] == 1
     assert manifest["included_count"] == 1
     assert manifest["records"][0]["outcome_id"] == outcome["outcome_id"]
+
+
+def test_missing_fee_after_label_contract_is_quarantined() -> None:
+    outcome = build_authoritative_trade_outcome(_sample())
+    outcome.pop("training_label_contract")
+
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[outcome],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert payload["trade_samples"] == []
+    record = payload["authoritative_outcome_manifest"]["records"][0]
+    assert record["training_status"] == "excluded"

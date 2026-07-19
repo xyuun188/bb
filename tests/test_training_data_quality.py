@@ -9,7 +9,10 @@ from core.training_contracts import (
     compact_shadow_label_contract,
 )
 from services import training_data_quality
-from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
+from services.authoritative_trade_outcome import (
+    AUTHORITATIVE_TRADE_LABEL_VERSION,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
 from services.model_promotion_policy import build_return_objective_report
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
@@ -462,14 +465,39 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
         shadow_samples=[],
         trade_samples=[
             _trade_sample(
-                source="okx_position_history",
+                source=source,
                 event_type="AuthoritativeTradeOutcome",
                 outcome_version=AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-                outcome_id="ato:test-1",
-                outcome_fingerprint="fingerprint-test-1",
+                outcome_id=f"ato:test-{index}",
+                outcome_fingerprint=f"fingerprint-test-{index}",
                 trade_fact_trusted=True,
-                lifecycle_key="okx-position:test-1",
+                lifecycle_key=f"okx-position:test-{index}",
                 execution_slippage_usdt=0.0,
+                execution_mode="paper",
+                training_evidence_gaps=[],
+                pnl_source=(
+                    "okx_verified_execution_pair_settlement"
+                    if source == "okx_verified_execution_pair"
+                    else "okx_position_history_realized_pnl"
+                ),
+                training_label_contract={
+                    "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
+                    "label_name": "realized_fee_after_return_pct",
+                    "execution_mode": "paper",
+                    "lifecycle_key": f"okx-position:test-{index}",
+                    "decision_id": 1001,
+                    "entry_order_ids": [f"entry-test-{index}"],
+                    "close_order_ids": [f"close-test-{index}"],
+                    "realized_fee_after_return_pct": 10.0,
+                    "fee_usdt": -0.05,
+                    "funding_fee_usdt": 0.0,
+                    "complete": True,
+                    "fingerprint": f"fee-after-label-test-{index}",
+                },
+            )
+            for index, source in enumerate(
+                ("okx_position_history", "okx_verified_execution_pair"),
+                start=1,
             )
         ],
         sequence_samples=[],
@@ -479,7 +507,7 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
     report = build_return_objective_report(trade_samples=payload["trade_samples"])
 
     assert report["available"] is True
-    assert report["sample_count"] == 1
+    assert report["sample_count"] == 2
     assert report["average_net_return_after_cost_pct"] == 10.0
     assert "authoritative_realized_return_distribution_missing" not in report[
         "blocking_reasons"

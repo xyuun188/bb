@@ -9,7 +9,7 @@ def test_phase3_rebuild_readiness_blocks_when_clean_training_inputs_are_weak() -
             "shadow_sample_count": 120,
             "trade_sample_count": 4,
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
             },
         },
@@ -49,7 +49,7 @@ def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() 
                 }
             },
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
             },
         },
@@ -87,7 +87,7 @@ def test_phase3_rebuild_readiness_requires_double_confirmation_for_write() -> No
             "shadow_sample_count": 500,
             "trade_sample_count": 80,
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
             },
         },
@@ -111,7 +111,7 @@ def test_phase3_rebuild_readiness_blocks_untrusted_artifacts() -> None:
             "shadow_sample_count": 500,
             "trade_sample_count": 80,
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
             },
         },
@@ -136,7 +136,7 @@ def test_phase3_rebuild_readiness_fails_closed_when_contamination_is_unverified(
             "shadow_sample_count": 500,
             "trade_sample_count": 80,
             "evaluation_policy": {
-                "promotion_flow": "shadow_to_canary_to_live",
+                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                 "live_mutation": False,
             },
         },

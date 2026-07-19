@@ -192,10 +192,22 @@ def _with_return_objective(metadata: dict) -> dict:
                         side: dict(ready_return_evidence)
                         for side in ("long", "short")
                     },
-                }
+                },
+                {
+                    "fold": 2,
+                    "decision_group_overlap_count": 0,
+                    "sides": {
+                        side: dict(ready_return_evidence)
+                        for side in ("long", "short")
+                    },
+                },
             ],
             "sides": {
-                side: dict(ready_return_evidence) for side in ("long", "short")
+                side: {
+                    **dict(ready_return_evidence),
+                    "market_regime_stability": {"stable": True},
+                }
+                for side in ("long", "short")
             },
         },
     )
@@ -1132,7 +1144,8 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
         return SimpleNamespace(version="candidate-v1")
 
     service.artifact_registry = SimpleNamespace(
-        promote_candidate=promote_candidate
+        promote_candidate=promote_candidate,
+        transition_current=promote_candidate,
     )
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
@@ -1155,8 +1168,12 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert result["allow_live_position_influence"] is False
     assert result["artifact_activation_stage"] == "canary"
     assert result["paper_canary_authorized"] is True
-    assert promotion_evidence[0]["paper_canary_authorized"] is True
-    assert promotion_evidence[0]["production_influence_authorized"] is False
+    assert [item["activation_stage"] for item in promotion_evidence] == [
+        "shadow",
+        "canary",
+    ]
+    assert promotion_evidence[1]["paper_canary_authorized"] is True
+    assert promotion_evidence[1]["production_influence_authorized"] is False
     assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_lcb_not_positive" in reason_codes
@@ -1212,7 +1229,8 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
         return SimpleNamespace(version="candidate-v1")
 
     service.artifact_registry = SimpleNamespace(
-        promote_candidate=promote_candidate
+        promote_candidate=promote_candidate,
+        transition_current=promote_candidate,
     )
     monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
@@ -1228,15 +1246,20 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     assert calls == [False, True]
     assert ensure_load_calls == ["load"]
     assert result["trained"] is True
-    assert result["reason"] == "trained_canary_activated"
+    assert result["reason"] == "trained_active_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["allow_live_position_influence"] is True
     assert result["allow_live_position_influence"] is True
-    assert result["artifact_activation_stage"] == "canary"
+    assert result["artifact_activation_stage"] == "active"
     assert result["live_enabled_sides"] == ["long", "short"]
-    assert promotion_evidence[0]["production_influence_authorized"] is True
-    assert promotion_evidence[0]["live_enabled_sides"] == ["long", "short"]
+    assert [item["activation_stage"] for item in promotion_evidence] == [
+        "shadow",
+        "canary",
+        "active",
+    ]
+    assert promotion_evidence[2]["production_influence_authorized"] is True
+    assert promotion_evidence[2]["live_enabled_sides"] == ["long", "short"]
 
 
 def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -> None:

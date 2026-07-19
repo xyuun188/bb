@@ -40,6 +40,7 @@ from services.artifact_retirement_audit import (
 from services.dynamic_policy_values import empirical_policy_value
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
+from services.model_champion_policy import compare_candidate_to_champion
 from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
@@ -89,6 +90,7 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
 LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 60 * 60
+MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
 
 
 def _training_source_code_version() -> str:
@@ -179,6 +181,33 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return result
     except (TypeError, ValueError):
         return default
+
+
+def _market_regime_label(features: dict[str, Any]) -> str:
+    explicit = str(
+        features.get("market_regime")
+        or features.get("regime")
+        or features.get("market_state")
+        or ""
+    ).strip().lower()
+    if explicit:
+        return explicit[:80]
+    volatility = abs(_safe_float(features.get("volatility_20")))
+    if volatility <= 0:
+        price = max(
+            _safe_float(features.get("current_price")),
+            _safe_float(features.get("close")),
+        )
+        atr = abs(_safe_float(features.get("atr_14")))
+        volatility = atr / price if price > 0 else 0.0
+    returns_20 = abs(_safe_float(features.get("returns_20")))
+    return (
+        "volatile"
+        if volatility >= 0.03
+        else "trending"
+        if returns_20 >= 0.01
+        else "ranging"
+    )
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -661,7 +690,7 @@ def _activation_gated_policy(
         activation_blockers if isinstance(activation_blockers, list) else []
     )
     manifest_authorized = bool(
-        stage in {"canary", "live"}
+        stage in {"canary", "active", "live"}
         and activation.get("production_influence_authorized") is True
         and activation.get("readiness_state") in {"ready", "partial_ready"}
         and not activation_blockers
@@ -716,7 +745,7 @@ def _activation_gated_policy(
             else "The atomic artifact activation manifest does not authorize production influence."
         ),
         "actual": stage,
-        "required": "canary_or_live_activation_with_ready_return_evidence",
+        "required": "canary_or_active_activation_with_ready_return_evidence",
     }
     if not any(
         isinstance(item, dict) and item.get("code") == activation_blocker["code"]
@@ -1126,6 +1155,7 @@ def _top_scored_return_rows(
     rows = [
         {
             "symbol": str(row.get("symbol") or ""),
+            "market_regime": str(row.get("market_regime") or "unknown"),
             "decision_group": str(row.get("decision_group") or ""),
             "label_timestamp": _fingerprint_value(row.get("label_timestamp")),
             "return_pct": float(row[f"{side}_return_pct"])
@@ -1148,6 +1178,7 @@ def _all_scored_return_rows(
     return [
         {
             "symbol": str(row.get("symbol") or ""),
+            "market_regime": str(row.get("market_regime") or "unknown"),
             "decision_group": str(row.get("decision_group") or ""),
             "label_timestamp": _fingerprint_value(row.get("label_timestamp")),
             "return_pct": float(row[f"{side}_return_pct"])
@@ -1218,6 +1249,36 @@ def _return_evidence(
             and profit_factor_value > 1.0
             and cvar_value is not None
             and max_drawdown is not None
+        ),
+    }
+
+
+def _market_regime_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        regime = str(row.get("market_regime") or "").strip().lower()
+        if regime and regime != "unknown":
+            grouped.setdefault(regime, []).append(row)
+    reports = {
+        regime: _return_evidence(_select_top_return_rows(regime_rows))
+        for regime, regime_rows in sorted(grouped.items())
+    }
+    stable = bool(len(reports) >= 2) and all(
+        report.get("promotion_math_ready") is True for report in reports.values()
+    )
+    return {
+        "stable": stable,
+        "observed_regime_count": len(reports),
+        "required_regime_count": 2,
+        "regimes": reports,
+        "blocking_reasons": (
+            []
+            if stable
+            else [
+                "insufficient_market_regime_coverage"
+                if len(reports) < 2
+                else "market_regime_fee_after_return_unstable"
+            ]
         ),
     }
 
@@ -1436,6 +1497,7 @@ def _walk_forward_return_report(
         side_reports[side] = {
             **evidence,
             "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
+            "market_regime_stability": _market_regime_stability(oos_rows[side]),
         }
     return {
         "version": version,
@@ -1454,11 +1516,16 @@ def _walk_forward_return_report(
         "model_refit_per_fold": True,
         "chronological": True,
         "sides": side_reports,
-        "stable": bool(folds)
+        "stable": len(folds) >= MIN_ACTIVE_WALK_FORWARD_FOLDS
         and all(
             evidence["promotion_math_ready"]
             and evidence["leave_one_symbol_out"]["stable"]
-            for evidence in side_reports.values()
+            and evidence["market_regime_stability"]["stable"]
+            and all(
+                fold["sides"][side]["promotion_math_ready"]
+                for fold in folds
+            )
+            for side, evidence in side_reports.items()
         ),
     }
 
@@ -1550,6 +1617,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "label_timestamp": getattr(row, "due_at", None)
                 or getattr(row, "created_at", None),
                 "symbol": str(getattr(row, "symbol", "") or ""),
+                "market_regime": _market_regime_label(snapshot),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
                 "best_action": str(getattr(row, "best_action", "") or ""),
                 "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
@@ -2218,13 +2286,14 @@ class MLSignalService:
                 trade_samples = await load_authoritative_trade_training_samples()
                 completed_trade_count = len(trade_samples)
                 metadata = self._current_metadata()
-                last_sample_count = int(metadata.get("sample_count") or 0)
+                cursor_metadata = self._training_cursor_metadata(metadata)
+                last_sample_count = int(cursor_metadata.get("sample_count") or 0)
                 last_completed_count = self._phase3_cursor_from_metadata(
-                    metadata,
+                    cursor_metadata,
                     completed_count,
                 )
                 last_completed_trade_count = int(
-                    metadata.get("last_trained_completed_trade_sample_count") or 0
+                    cursor_metadata.get("last_trained_completed_trade_sample_count") or 0
                 )
                 influence = _influence_policy(metadata) if metadata else {"enabled": False}
                 readiness = (
@@ -2390,39 +2459,172 @@ class MLSignalService:
                     and paper_canary.get("eligible_sides")
                     and not paper_canary.get("blocking_reasons")
                 )
-                activation_stage = (
-                    "canary"
-                    if production_authorized or paper_canary_authorized
-                    else "shadow"
-                )
                 live_enabled_sides = (
                     list(trained_readiness.get("live_enabled_sides") or [])
                     if production_authorized
                     else []
                 )
+                activation_stage = (
+                    "active"
+                    if production_authorized
+                    and trained_readiness.get("state") == "ready"
+                    and set(live_enabled_sides) == {"long", "short"}
+                    else "canary"
+                    if production_authorized or paper_canary_authorized
+                    else "shadow"
+                )
+                current_artifact = None
+                resolve_current = getattr(self.artifact_registry, "resolve_current", None)
+                if callable(resolve_current):
+                    current_artifact = resolve_current()
+                champion_manifest = (
+                    current_artifact.manifest
+                    if isinstance(current_artifact, ResolvedModelArtifact)
+                    else None
+                )
+                champion_stage = (
+                    str(
+                        _safe_dict(current_artifact.activation_manifest).get(
+                            "activation_stage"
+                        )
+                    )
+                    if isinstance(current_artifact, ResolvedModelArtifact)
+                    else None
+                )
+                champion_comparison = compare_candidate_to_champion(
+                    trained_metadata,
+                    champion_manifest,
+                    candidate_stage=activation_stage,
+                    champion_stage=champion_stage,
+                )
+                if champion_comparison.get("accepted") is not True:
+                    reject_candidate = getattr(
+                        self.artifact_registry, "reject_candidate", None
+                    )
+                    rejected = (
+                        reject_candidate(champion_comparison)
+                        if callable(reject_candidate)
+                        else None
+                    )
+                    current_activation = _safe_dict(
+                        current_artifact.activation_manifest
+                        if isinstance(current_artifact, ResolvedModelArtifact)
+                        else None
+                    )
+                    result = {
+                        "trained": True,
+                        "reason": "trained_challenger_rejected",
+                        "challenger_rejected": True,
+                        "challenger_version": (
+                            rejected.version
+                            if isinstance(rejected, ResolvedModelArtifact)
+                            else None
+                        ),
+                        "champion_retained": True,
+                        "champion_version": (
+                            current_artifact.version
+                            if isinstance(current_artifact, ResolvedModelArtifact)
+                            else None
+                        ),
+                        "champion_comparison": champion_comparison,
+                        "completed_sample_count": completed_count,
+                        "previous_sample_count": last_sample_count,
+                        "previous_completed_sample_count": last_completed_count,
+                        "new_sample_count": new_samples,
+                        "completed_trade_sample_count": completed_trade_count,
+                        "previous_completed_trade_sample_count": last_completed_trade_count,
+                        "new_trade_sample_count": new_trade_samples,
+                        "sample_count": int(trained_metadata.get("sample_count") or 0),
+                        "training_quarantine": quarantine_result,
+                        "training_policy": training_policy,
+                        "candidate": candidate_summary,
+                        "candidate_readiness": candidate_readiness,
+                        "readiness": readiness,
+                        "readiness_state": readiness.get("state"),
+                        "allow_live_position_influence": bool(
+                            readiness.get("allow_live_position_influence")
+                        ),
+                        "influence_enabled": bool(
+                            readiness.get("allow_live_position_influence")
+                        ),
+                        "artifact_persisted": True,
+                        "artifact_version": (
+                            current_artifact.version
+                            if isinstance(current_artifact, ResolvedModelArtifact)
+                            else None
+                        ),
+                        "artifact_activation_stage": current_activation.get(
+                            "activation_stage"
+                        ),
+                        "paper_canary_authorized": bool(
+                            current_activation.get("paper_canary_authorized")
+                        ),
+                        "live_enabled_sides": list(
+                            current_activation.get("live_enabled_sides") or []
+                        ),
+                        "trained_at": trained_metadata.get("trained_at"),
+                        "message": (
+                            "本地 ML challenger 已完成训练，但候选费后收益未满足非退化门槛，"
+                            "保留当前 champion；训练游标已记录，下一轮继续使用新增样本。"
+                        ),
+                    }
+                    self._last_train_result = result
+                    return result
+                common_activation_evidence = {
+                    "return_evidence_report": trained_readiness,
+                    "paper_canary_report": paper_canary,
+                    "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+                    "champion_comparison": champion_comparison,
+                }
                 activated_artifact = self.artifact_registry.promote_candidate(
                     {
-                        "activation_stage": activation_stage,
-                        "readiness_state": (
-                            trained_readiness.get("state")
-                            if production_authorized
-                            else "paper_canary_ready"
-                            if paper_canary_authorized
-                            else trained_readiness.get("state")
-                        ),
-                        "production_influence_authorized": production_authorized,
-                        "paper_canary_authorized": paper_canary_authorized,
-                        "live_enabled_sides": live_enabled_sides,
+                        **common_activation_evidence,
+                        "activation_stage": "shadow",
+                        "readiness_state": trained_readiness.get("state"),
+                        "production_influence_authorized": False,
+                        "paper_canary_authorized": False,
+                        "live_enabled_sides": [],
                         "blocking_reasons": (
-                            []
-                            if paper_canary_authorized
-                            else trained_readiness.get("blocking_reasons") or []
+                            trained_readiness.get("blocking_reasons") or []
                         ),
-                        "return_evidence_report": trained_readiness,
-                        "paper_canary_report": paper_canary,
-                        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+                        "lifecycle_path": ["candidate", "shadow"],
                     }
                 )
+                if activation_stage in {"canary", "active"}:
+                    activated_artifact = self.artifact_registry.transition_current(
+                        {
+                            **common_activation_evidence,
+                            "activation_stage": "canary",
+                            "readiness_state": (
+                                trained_readiness.get("state")
+                                if production_authorized
+                                else "paper_canary_ready"
+                            ),
+                            "production_influence_authorized": production_authorized,
+                            "paper_canary_authorized": paper_canary_authorized,
+                            "live_enabled_sides": live_enabled_sides,
+                            "blocking_reasons": [],
+                            "lifecycle_path": ["candidate", "shadow", "canary"],
+                        }
+                    )
+                if activation_stage == "active":
+                    activated_artifact = self.artifact_registry.transition_current(
+                        {
+                            **common_activation_evidence,
+                            "activation_stage": "active",
+                            "readiness_state": "ready",
+                            "production_influence_authorized": True,
+                            "paper_canary_authorized": False,
+                            "live_enabled_sides": live_enabled_sides,
+                            "blocking_reasons": [],
+                            "lifecycle_path": [
+                                "candidate",
+                                "shadow",
+                                "canary",
+                                "active",
+                            ],
+                        }
+                    )
                 self._bundle = None
                 self._loaded_mtime = None
                 self._ensure_loaded()
@@ -2430,7 +2632,9 @@ class MLSignalService:
                 result = {
                     "trained": True,
                     "reason": (
-                        "trained_canary_activated"
+                        "trained_active_activated"
+                        if activation_stage == "active"
+                        else "trained_canary_activated"
                         if production_authorized
                         else "trained_paper_bootstrap_canary_activated"
                         if paper_canary_authorized
@@ -2451,6 +2655,7 @@ class MLSignalService:
                     "training_quarantine": quarantine_result,
                     "training_policy": training_policy,
                     "candidate": candidate_summary,
+                    "champion_comparison": champion_comparison,
                     "candidate_readiness": candidate_readiness,
                     "candidate_influence_policy": candidate_influence,
                     "readiness": trained_readiness,
@@ -2466,7 +2671,10 @@ class MLSignalService:
                     "live_enabled_sides": live_enabled_sides,
                     "trained_at": trained_metadata.get("trained_at"),
                     "message": (
-                        "本地 ML 候选已通过费后收益证据并原子激活为 canary，"
+                        "本地 ML 候选已通过双边费后收益证据，并按 shadow → canary → "
+                        "active 顺序原子激活为统一生产模型。"
+                        if activation_stage == "active"
+                        else "本地 ML 候选已通过单边费后收益证据并原子激活为 canary，"
                         "仅允许证据达标方向影响生产。"
                         if production_authorized
                         else "本地 ML 候选已通过数据治理与时间滚动完整性检查，原子激活为"
@@ -3060,6 +3268,48 @@ class MLSignalService:
                 error=safe_error_text(exc),
             )
         return {}
+
+    def _training_cursor_metadata(
+        self,
+        current_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Advance scheduling past an evaluated but rejected challenger."""
+
+        selected = dict(current_metadata)
+        resolve_challenger = getattr(self.artifact_registry, "resolve_challenger", None)
+        if not callable(resolve_challenger):
+            return selected
+        try:
+            challenger = resolve_challenger()
+        except Exception as exc:
+            logger.warning(
+                "failed to resolve rejected ML challenger cursor",
+                error=safe_error_text(exc),
+            )
+            return selected
+        if not isinstance(challenger, ResolvedModelArtifact):
+            return selected
+        challenger_metadata = _safe_dict(challenger.manifest)
+        current_cursor = int(
+            selected.get("last_trained_completed_shadow_sample_count") or 0
+        )
+        challenger_cursor = int(
+            challenger_metadata.get("last_trained_completed_shadow_sample_count")
+            or 0
+        )
+        current_trade_cursor = int(
+            selected.get("last_trained_completed_trade_sample_count") or 0
+        )
+        challenger_trade_cursor = int(
+            challenger_metadata.get("last_trained_completed_trade_sample_count")
+            or 0
+        )
+        if (challenger_cursor, challenger_trade_cursor) > (
+            current_cursor,
+            current_trade_cursor,
+        ):
+            return challenger_metadata
+        return selected
 
     async def _completed_shadow_sample_count(self) -> int:
         return await count_shadow_training_rows()

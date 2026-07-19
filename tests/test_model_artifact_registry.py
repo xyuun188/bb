@@ -106,11 +106,25 @@ def _metadata() -> dict:
                         "long": {"promotion_math_ready": True},
                         "short": {"promotion_math_ready": True},
                     },
-                }
+                },
+                {
+                    "fold": 2,
+                    "decision_group_overlap_count": 0,
+                    "sides": {
+                        "long": {"promotion_math_ready": True},
+                        "short": {"promotion_math_ready": True},
+                    },
+                },
             ],
             "sides": {
-                "long": {"promotion_math_ready": True},
-                "short": {"promotion_math_ready": True},
+                "long": {
+                    "promotion_math_ready": True,
+                    "market_regime_stability": {"stable": True},
+                },
+                "short": {
+                    "promotion_math_ready": True,
+                    "market_regime_stability": {"stable": True},
+                },
             },
             "stable": True,
         },
@@ -144,6 +158,29 @@ def _shadow_activation(*, reason: str = "actual_trade_calibration_not_ready") ->
         "production_influence_authorized": False,
         "blocking_reasons": [reason],
         "evidence_contract": "artifact_integrity_and_return_readiness",
+    }
+
+
+def _production_activation(
+    stage: str,
+    *,
+    state: str = "ready",
+    sides: list[str] | None = None,
+) -> dict:
+    enabled_sides = sides or ["long", "short"]
+    readiness = {
+        "state": state,
+        "allow_live_position_influence": True,
+        "live_enabled_sides": enabled_sides,
+        "blocking_reasons": [],
+    }
+    return {
+        "activation_stage": stage,
+        "readiness_state": state,
+        "production_influence_authorized": True,
+        "live_enabled_sides": enabled_sides,
+        "blocking_reasons": [],
+        "return_evidence_report": readiness,
     }
 
 
@@ -286,8 +323,58 @@ def test_candidate_does_not_replace_current_until_atomic_promotion(tmp_path) -> 
 
     assert registry.resolve_current().version == second.version
     assert registry.resolve_rollback().version == first.version
+    registry.transition_current(_production_activation("canary"))
+    registry.transition_current(_production_activation("active"))
+    assert registry.resolve_current().version == second.version
+    assert registry.resolve_current().activation_manifest["activation_stage"] == "active"
+    assert registry.resolve_rollback().version == first.version
     assert registry.rollback_current().version == first.version
     assert registry.resolve_rollback().version == second.version
+
+
+def test_rejected_candidate_is_preserved_as_challenger_without_replacing_champion(
+    tmp_path,
+) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    first = registry.persist_candidate_joblib(
+        {"weights": [1]},
+        _metadata(),
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    registry.promote_candidate(_shadow_activation())
+    second_metadata = _metadata()
+    second_metadata["last_trained_completed_shadow_sample_count"] = 512
+    second = registry.persist_candidate_joblib(
+        {"weights": [2]},
+        second_metadata,
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+
+    challenger = registry.reject_candidate(
+        {
+            "accepted": False,
+            "reason": "active_champion_retained",
+            "blocking_reasons": ["candidate_primary_fee_after_metrics_not_improved"],
+        }
+    )
+
+    assert first.version != second.version
+    assert registry.resolve_current().version == first.version
+    assert challenger.version == second.version
+    assert challenger.pointer_role == "challenger"
+    assert challenger.rejection_manifest["comparison_report"]["accepted"] is False
+    assert registry.resolve_candidate() is None
+    assert registry.status()["pointers"]["challenger"]["available"] is True
+    cursor_metadata = MLSignalService(
+        artifact_registry=registry
+    )._training_cursor_metadata(registry.resolve_current().manifest)
+    assert cursor_metadata["artifact_version"] == second.version
+    assert cursor_metadata["last_trained_completed_shadow_sample_count"] == 512
 
 
 def test_promotion_retires_known_incompatible_current_pointer(tmp_path) -> None:
@@ -384,7 +471,7 @@ def test_registry_rejects_tampered_activation_manifest(tmp_path) -> None:
     assert current.activation_manifest is not None
 
 
-def test_live_activation_requires_bound_return_evidence(tmp_path) -> None:
+def test_active_activation_requires_bound_return_evidence(tmp_path) -> None:
     registry = ModelArtifactRegistry(
         root=tmp_path / "model_artifacts",
         model_id="local_ml_profit_quality",
@@ -396,34 +483,25 @@ def test_live_activation_requires_bound_return_evidence(tmp_path) -> None:
         code_version=SOURCE_CODE_VERSION,
     )
 
+    registry.promote_candidate(_shadow_activation())
+    registry.transition_current(_production_activation("canary"))
+
     with pytest.raises(ValueError, match="requires a return evidence report"):
-        registry.promote_candidate(
+        registry.transition_current(
             {
-                "activation_stage": "live",
+                "activation_stage": "active",
                 "readiness_state": "ready",
                 "production_influence_authorized": True,
                 "blocking_reasons": [],
             }
         )
 
-    readiness = {
-        "state": "ready",
-        "allow_live_position_influence": True,
-        "live_enabled_sides": ["long", "short"],
-        "blocking_reasons": [],
-    }
-    current = registry.promote_candidate(
-        {
-            "activation_stage": "live",
-            "readiness_state": "ready",
-            "production_influence_authorized": True,
-            "live_enabled_sides": ["long", "short"],
-            "blocking_reasons": [],
-            "return_evidence_report": readiness,
-        }
-    )
+    current = registry.transition_current(_production_activation("active"))
 
-    assert current.activation_manifest["return_evidence_report"] == readiness
+    assert current.activation_manifest["return_evidence_report"]["state"] == "ready"
+    assert current.activation_manifest["activation_stage"] == "active"
+    assert registry.resolve_active().sha256 == current.sha256
+    assert registry.active_path == registry.current_path
     assert registry.status()["activation_manifest"][
         "production_influence_authorized"
     ] is True
@@ -454,7 +532,7 @@ def test_candidate_rejects_invalid_training_or_source_fingerprint(tmp_path) -> N
         )
 
 
-def test_live_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
+def test_active_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
     registry = ModelArtifactRegistry(
         root=tmp_path / "model_artifacts",
         model_id="local_ml_profit_quality",
@@ -469,27 +547,16 @@ def test_live_activation_rejects_symbol_unstable_candidate(tmp_path) -> None:
         parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
         code_version=SOURCE_CODE_VERSION,
     )
-    readiness = {
-        "state": "ready",
-        "allow_live_position_influence": True,
-        "live_enabled_sides": ["long", "short"],
-        "blocking_reasons": [],
-    }
+    registry.promote_candidate(_shadow_activation())
+    registry.transition_current(
+        _production_activation("canary", state="partial_ready", sides=["long"])
+    )
 
     with pytest.raises(ValueError, match="stable walk-forward evidence"):
-        registry.promote_candidate(
-            {
-                "activation_stage": "live",
-                "readiness_state": "ready",
-                "production_influence_authorized": True,
-                "live_enabled_sides": ["long", "short"],
-                "blocking_reasons": [],
-                "return_evidence_report": readiness,
-            }
-        )
+        registry.transition_current(_production_activation("active"))
 
-    assert registry.resolve_current() is None
-    assert registry.resolve_candidate() is not None
+    assert registry.resolve_current().activation_manifest["activation_stage"] == "canary"
+    assert registry.resolve_candidate() is None
 
 
 def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> None:
@@ -523,7 +590,8 @@ def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> N
         },
     }
 
-    current = registry.promote_candidate(
+    registry.promote_candidate(_shadow_activation())
+    current = registry.transition_current(
         {
             "activation_stage": "canary",
             "readiness_state": "partial_ready",
@@ -558,8 +626,8 @@ def test_paper_canary_activation_does_not_grant_production_permission(tmp_path) 
         "eligible_sides": ["long", "short"],
         "blocking_reasons": [],
     }
-
-    current = registry.promote_candidate(
+    registry.promote_candidate(_shadow_activation())
+    current = registry.transition_current(
         {
             "activation_stage": "canary",
             "readiness_state": "paper_canary_ready",

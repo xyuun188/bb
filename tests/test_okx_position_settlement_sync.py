@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -10,10 +10,15 @@ from config.settings import settings
 from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
-from models.trade import Order, Position
-from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED
+from models.trade import OkxPositionHistory, Order, Position
+from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
+from services.okx_order_fact_sync import (
+    OKX_SYNC_CONFIRMED,
+    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+)
 from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
+from tests.paper_canary_fixtures import complete_paper_canary_raw
 from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
 
 
@@ -23,11 +28,16 @@ class _FakeCcxt:
         *,
         history_rows: list[dict[str, Any]],
         bills_error: Exception | None = None,
+        position_rows: list[dict[str, Any]] | None = None,
+        positions_error: Exception | None = None,
     ) -> None:
         self.history_rows = history_rows
         self.bills_error = bills_error
+        self.position_rows = list(position_rows or [])
+        self.positions_error = positions_error
         self.history_calls: list[dict[str, Any]] = []
         self.bill_calls: list[dict[str, Any]] = []
+        self.position_calls: list[dict[str, Any]] = []
 
     async def privateGetAccountPositionsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         self.history_calls.append(dict(params))
@@ -38,6 +48,12 @@ class _FakeCcxt:
         if self.bills_error is not None:
             raise self.bills_error
         return {"data": []}
+
+    async def privateGetAccountPositions(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.position_calls.append(dict(params))
+        if self.positions_error is not None:
+            raise self.positions_error
+        return {"data": list(self.position_rows)}
 
 
 async def _seed_okx_position_history_rows(rows: list[dict[str, Any]]) -> None:
@@ -178,6 +194,123 @@ async def _attach_entry_decision(
         return int(decision.id)
 
 
+async def _attach_verified_execution_pair(
+    *,
+    position_id: int,
+    symbol: str,
+    side: str,
+    closed_at: datetime,
+) -> tuple[str, str]:
+    inst_id = symbol.replace("/", "-") + "-SWAP"
+    entry_order_id = f"entry-{symbol.lower().replace('/', '-')}"
+    close_order_id = f"close-{symbol.lower().replace('/', '-')}"
+    opened_at = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+    raw = complete_paper_canary_raw()
+    raw["pre_order_execution_facts"] = {
+        "contract_spec": {
+            "instId": inst_id,
+            "ctVal": "1",
+            "ctMult": "1",
+            "lotSz": "1",
+            "source": "okx_public_instruments",
+        }
+    }
+    async with get_session_ctx() as session:
+        position = await session.get(Position, position_id)
+        assert position is not None
+        position.entry_fee = 0.0
+        position.close_fee = 0.12
+        position.stop_loss_price = 0.9
+        position.take_profit_price = 1.2
+        decision = AIDecision(
+            model_name="ensemble_trader",
+            symbol=symbol,
+            action=side,
+            confidence=0.7,
+            position_size_pct=0.01,
+            suggested_leverage=2.0,
+            stop_loss_pct=0.1,
+            take_profit_pct=0.2,
+            raw_llm_response=raw,
+            is_paper=True,
+            was_executed=True,
+            executed_at=opened_at,
+            execution_price=1.0,
+        )
+        session.add(decision)
+        await session.flush()
+
+        def order_payload(
+            *,
+            order_id: str,
+            order_side: str,
+            price: float,
+            fee: float,
+            fill_pnl: float,
+            filled_at: datetime,
+            decision_id: int | None,
+        ) -> Order:
+            order = Order(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol=symbol,
+                side=order_side,
+                order_type="market",
+                quantity=10.0,
+                price=price,
+                status="filled",
+                fee=fee,
+                decision_id=decision_id,
+                exchange_order_id=order_id,
+                filled_at=filled_at,
+                created_at=filled_at,
+            )
+            order.okx_inst_id = inst_id
+            order.okx_fill_contracts = 10.0
+            order.okx_fill_pnl = fill_pnl
+            order.okx_sync_status = OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+            order.okx_raw_fills = {
+                "source": "okx_execution_result",
+                "fills_history_confirmed": False,
+                "execution_result_confirmed": True,
+                "order_id": order_id,
+                "inst_id": inst_id,
+                "contracts": 10.0,
+                "contract_size": 1.0,
+                "contract_size_verified": True,
+                "contract_size_source": "okx_public_instruments",
+                "base_quantity": 10.0,
+                "avg_price": price,
+                "fee_abs": fee,
+                "fill_pnl": fill_pnl,
+            }
+            return order
+
+        session.add_all(
+            [
+                order_payload(
+                    order_id=entry_order_id,
+                    order_side="buy" if side == "long" else "sell",
+                    price=1.0,
+                    fee=0.08,
+                    fill_pnl=0.0,
+                    filled_at=opened_at,
+                    decision_id=int(decision.id),
+                ),
+                order_payload(
+                    order_id=close_order_id,
+                    order_side="sell" if side == "long" else "buy",
+                    price=1.8,
+                    fee=0.12,
+                    fill_pnl=8.5,
+                    filled_at=closed_at,
+                    decision_id=None,
+                ),
+            ]
+        )
+    return entry_order_id, close_order_id
+
+
 @pytest.mark.asyncio
 async def test_okx_position_settlement_sync_reconciles_official_funding_fee(
     tmp_path,
@@ -190,7 +323,7 @@ async def test_okx_position_settlement_sync_reconciles_official_funding_fee(
         f"sqlite+aiosqlite:///{(tmp_path / 'settlement-success.db').as_posix()}",
     )
     await init_db()
-    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
     try:
         position_id = await _create_closed_position(closed_at=closed_at)
         ccxt = _FakeCcxt(
@@ -199,7 +332,7 @@ async def test_okx_position_settlement_sync_reconciles_official_funding_fee(
                     "instId": "AI16Z-USDT-SWAP",
                     "posId": "pos-ai16z-usdt-1",
                     "posSide": "long",
-                    "cTime": _ms(datetime(2026, 7, 5, 1, 0, tzinfo=UTC)),
+                    "cTime": _ms(closed_at - timedelta(minutes=20)),
                     "uTime": _ms(closed_at),
                     "realizedPnl": "7.93",
                     "pnl": "8.5",
@@ -236,6 +369,366 @@ async def test_okx_position_settlement_sync_reconciles_official_funding_fee(
 
 
 @pytest.mark.asyncio
+async def test_settlement_uses_verified_execution_pair_when_position_history_lags(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-execution-pair.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    try:
+        position_id = await _create_closed_position(
+            symbol="EXACT/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        await _attach_verified_execution_pair(
+            position_id=position_id,
+            symbol="EXACT/USDT",
+            side="long",
+            closed_at=closed_at,
+        )
+        ccxt = _FakeCcxt(history_rows=[])
+
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["reconciled_count"] == 1
+        assert ccxt.bill_calls
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            histories = list(
+                (
+                    await session.execute(
+                        OkxPositionHistory.__table__.select().where(
+                            OkxPositionHistory.__table__.c.position_ids.is_not(None)
+                        )
+                    )
+                ).all()
+            )
+            assert position is not None
+            assert position.settlement_status == "reconciled"
+            assert position.settlement_source == "okx_verified_execution_pair_settlement"
+            assert position.close_fill_pnl == pytest.approx(8.5)
+            assert position.entry_fee == pytest.approx(0.08)
+            assert position.close_fee == pytest.approx(0.12)
+            assert position.funding_fee == pytest.approx(0.0)
+            assert position.realized_pnl == pytest.approx(8.3)
+            assert histories[0]._mapping["source"] == (
+                "okx_verified_execution_pair_settlement"
+            )
+
+        outcomes = await load_authoritative_trade_outcomes(mode="paper")
+        outcome = next(
+            item for item in outcomes if position_id in item.get("position_ids", [])
+        )
+        assert outcome["source"] == "okx_verified_execution_pair"
+        assert outcome["outcome_complete"] is True
+        assert outcome["realized_pnl"] == pytest.approx(8.3)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_execution_pair_uses_fill_times_and_prorates_shared_entry_contracts(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-pair-allocation.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    opened_at = datetime(2026, 7, 5, 1, 0, tzinfo=UTC)
+    try:
+        position_id = await _create_closed_position(
+            symbol="ALLOC/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        entry_order_id, _ = await _attach_verified_execution_pair(
+            position_id=position_id,
+            symbol="ALLOC/USDT",
+            side="long",
+            closed_at=closed_at,
+        )
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            entry_order = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id == entry_order_id
+                    )
+                )
+            ).first()
+            assert position is not None
+            assert entry_order is not None
+            position.created_at = opened_at + timedelta(hours=2)
+            order = await session.get(Order, int(entry_order._mapping["id"]))
+            assert order is not None
+            order.quantity = 20.0
+            order.fee = 0.16
+            order.okx_fill_contracts = 20.0
+            order.okx_raw_fills = {
+                **dict(order.okx_raw_fills or {}),
+                "base_quantity": 20.0,
+                "contracts": 20.0,
+                "fee_abs": 0.16,
+            }
+
+        ccxt = _FakeCcxt(history_rows=[])
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["reconciled_count"] == 1
+        async with get_session_ctx() as session:
+            history = (
+                await session.execute(OkxPositionHistory.__table__.select())
+            ).first()
+            assert history is not None
+            assert history._mapping["opened_at"] == opened_at.replace(tzinfo=None)
+            assert history._mapping["open_max_pos"] == pytest.approx(10.0)
+            assert history._mapping["close_total_pos"] == pytest.approx(10.0)
+            assert history._mapping["fee"] == pytest.approx(-0.2)
+
+            official_row = {
+                **dict(history._mapping["raw_row"]),
+                "realizedPnl": "8.3",
+            }
+            await upsert_okx_position_history_row(
+                session,
+                official_row,
+                mode="paper",
+                source="okx_position_history_sync",
+                match_status="official_pos_id",
+            )
+
+        async with get_session_ctx() as session:
+            histories = list(
+                (await session.execute(OkxPositionHistory.__table__.select())).all()
+            )
+            assert len(histories) == 1
+            assert histories[0]._mapping["source"] == "okx_position_history_sync"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_execution_pair_fallback_rejects_position_lifecycle_still_open(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-pair-still-open.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    try:
+        position_id = await _create_closed_position(
+            symbol="STILLOPEN/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        await _attach_verified_execution_pair(
+            position_id=position_id,
+            symbol="STILLOPEN/USDT",
+            side="long",
+            closed_at=closed_at,
+        )
+        ccxt = _FakeCcxt(
+            history_rows=[],
+            position_rows=[
+                {
+                    "instId": "STILLOPEN-USDT-SWAP",
+                    "posId": "pos-stillopen-usdt-1",
+                    "posSide": "net",
+                    "pos": "10",
+                    "avgPx": "1",
+                    "lever": "2",
+                }
+            ],
+        )
+
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["reconciled_count"] == 0
+        assert summary["exception_count"] == 1
+        assert ccxt.position_calls
+        assert not ccxt.bill_calls
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            assert position is not None
+            assert position.settlement_status == "settlement_exception"
+            assert position.settlement_raw["last_error_code"] == "positions_history_no_rows"
+            assert position.settlement_raw["last_error_context"][
+                "execution_pair_fallback_code"
+            ] == "execution_pair_lifecycle_still_open"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_execution_pair_fallback_requires_successful_funding_bill_audit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-pair-funding-error.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    try:
+        position_id = await _create_closed_position(
+            symbol="PAIRFAIL/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        await _attach_verified_execution_pair(
+            position_id=position_id,
+            symbol="PAIRFAIL/USDT",
+            side="long",
+            closed_at=closed_at,
+        )
+        ccxt = _FakeCcxt(
+            history_rows=[],
+            bills_error=TimeoutError("funding audit unavailable"),
+        )
+
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["reconciled_count"] == 0
+        assert summary["exception_count"] == 1
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            assert position is not None
+            assert position.settlement_status == "settlement_exception"
+            assert position.settlement_raw["last_error_code"] == "funding_fee_api_error"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_history_gap_without_verified_order_pair_remains_unsettled(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-no-pair.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    try:
+        position_id = await _create_closed_position(
+            symbol="NOPAIR/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        ccxt = _FakeCcxt(history_rows=[])
+
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["reconciled_count"] == 0
+        assert summary["exception_count"] == 1
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            assert position is not None
+            assert position.settlement_status == "settlement_exception"
+            assert position.settlement_raw["last_error_code"] == "positions_history_no_rows"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_settlement_retires_duplicate_closed_lifecycle_before_reconciliation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'settlement-duplicate.db').as_posix()}",
+    )
+    await init_db()
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    try:
+        canonical_id = await _create_closed_position(
+            symbol="DUP/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        duplicate_id = await _create_closed_position(
+            symbol="DUP/USDT",
+            status="settlement_exception",
+            closed_at=closed_at,
+        )
+        await _attach_verified_execution_pair(
+            position_id=canonical_id,
+            symbol="DUP/USDT",
+            side="long",
+            closed_at=closed_at,
+        )
+        ccxt = _FakeCcxt(history_rows=[])
+
+        summary = await OkxPositionSettlementSyncService(
+            mode="paper",
+            lookback_hours=24 * 14,
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert summary["checked_count"] == 1
+        assert summary["reconciled_count"] == 1
+        async with get_session_ctx() as session:
+            canonical = await session.get(Position, canonical_id)
+            duplicate = await session.get(Position, duplicate_id)
+            assert canonical is not None
+            assert duplicate is not None
+            assert canonical.settlement_status == "reconciled"
+            assert duplicate.settlement_status == "superseded_position_residual"
+            assert duplicate.settlement_raw["canonical_position_id"] == canonical_id
+            assert duplicate.settlement_raw["reason"] == (
+                "duplicate_local_closed_position_for_same_okx_lifecycle"
+            )
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_final_settlement_backfills_missing_entry_decision_outcome(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -247,7 +740,7 @@ async def test_final_settlement_backfills_missing_entry_decision_outcome(
         f"sqlite+aiosqlite:///{(tmp_path / 'settlement-outcome-backfill.db').as_posix()}",
     )
     await init_db()
-    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
     try:
         position_id = await _create_closed_position(
             status="okx_position_history",
@@ -257,7 +750,7 @@ async def test_final_settlement_backfills_missing_entry_decision_outcome(
             symbol="AI16Z/USDT",
             side="long",
             exchange_order_id="entry-ai16z-usdt",
-            executed_at=datetime(2026, 7, 5, 1, 1, tzinfo=UTC),
+            executed_at=closed_at - timedelta(minutes=19),
         )
         await _seed_okx_position_history_rows(
             [
@@ -266,7 +759,7 @@ async def test_final_settlement_backfills_missing_entry_decision_outcome(
                     "posId": "pos-ai16z-usdt-1",
                     "posSide": "long",
                     "type": "2",
-                    "cTime": _ms(datetime(2026, 7, 5, 1, 0, tzinfo=UTC)),
+                    "cTime": _ms(closed_at - timedelta(minutes=20)),
                     "uTime": _ms(closed_at),
                     "realizedPnl": "7.93",
                     "pnl": "8.5",
@@ -323,7 +816,7 @@ async def test_okx_position_settlement_sync_records_funding_fee_failure_reason(
         f"sqlite+aiosqlite:///{(tmp_path / 'settlement-funding-error.db').as_posix()}",
     )
     await init_db()
-    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
     try:
         position_id = await _create_closed_position(closed_at=closed_at)
         ccxt = _FakeCcxt(
@@ -332,7 +825,7 @@ async def test_okx_position_settlement_sync_records_funding_fee_failure_reason(
                     "instId": "AI16Z-USDT-SWAP",
                     "posId": "pos-ai16z-usdt-1",
                     "posSide": "long",
-                    "cTime": _ms(datetime(2026, 7, 5, 1, 0, tzinfo=UTC)),
+                    "cTime": _ms(closed_at - timedelta(minutes=20)),
                     "uTime": _ms(closed_at),
                     "realizedPnl": "7.93",
                     "pnl": "8.5",
@@ -377,7 +870,7 @@ async def test_settlement_sync_restores_superseded_residual_before_api_call(
         f"sqlite+aiosqlite:///{(tmp_path / 'settlement-superseded.db').as_posix()}",
     )
     await init_db()
-    closed_at = datetime(2026, 7, 5, 1, 20, tzinfo=UTC)
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
     try:
         position_id = await _create_closed_position(
             status="settlement_exception",

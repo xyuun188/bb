@@ -26,6 +26,25 @@ async def test_pause_state_is_shared_across_manager_instances(tmp_path: Path) ->
     assert worker_manager.is_paused is False
 
 
+@pytest.mark.asyncio
+async def test_execution_mode_switch_preserves_unified_active_model(tmp_path: Path) -> None:
+    state_path = tmp_path / "trading-control-state.json"
+    manager = TradingModeManager(state_path=state_path)
+
+    await manager.select_active_model("ensemble_trader")
+    await manager.switch_to_live()
+    await manager.switch_to_paper()
+
+    assert manager.active_model_name == "ensemble_trader"
+    assert manager.live_model_name == manager.active_model_name
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["active_model_name"] == "ensemble_trader"
+    assert persisted["live_model_name"] == persisted["active_model_name"]
+    with pytest.raises(ValueError, match="cannot replace the active model"):
+        await manager.switch_to_live("different_model")
+    assert manager.active_model_name == "ensemble_trader"
+
+
 def test_unchanged_state_file_is_not_reloaded_on_every_property_access(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

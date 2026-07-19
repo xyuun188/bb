@@ -2248,9 +2248,11 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
     )
     contract_version = sizing.get("contract_version")
     if legacy_paper_canary and not contract_version:
-        from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_SIZING_VERSION
+        contract_version = provenance.get("strategy_version")
+        if not contract_version:
+            from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_SIZING_VERSION
 
-        contract_version = PAPER_BOOTSTRAP_SIZING_VERSION
+            contract_version = PAPER_BOOTSTRAP_SIZING_VERSION
     if legacy_paper_canary and portfolio.get("gross_notional_usdt") is None:
         portfolio = {
             "scope": "paper_bootstrap_canary_positions_only",
@@ -5201,7 +5203,8 @@ async def get_status(mode: str | None = None):
         "mode": mode_manager.mode.value,
         "paused": mode_manager.is_paused,
         "scan_mode": mode_manager.scan_mode,
-        "live_model": mode_manager.live_model_name,
+        "active_model": mode_manager.active_model_name,
+        "live_model": mode_manager.active_model_name,
     }
 
 

@@ -210,15 +210,15 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
     )
     runtime_available = bool(status.get("service_available", status.get("available")))
     promotion = _safe_dict(status.get("promotion_recommendation"))
-    live_ready = bool(promotion.get("live_ready"))
+    active_ready = bool(promotion.get("active_ready", promotion.get("live_ready")))
     canary_ready = bool(promotion.get("canary_ready"))
     stage = str(status.get("model_stage") or status.get("training_mode") or "shadow")
     rows: list[dict[str, Any]] = []
     for model_id, display_name, model_key, task in _LOCAL_TOOL_MODELS:
         model_name = str(models.get(model_key) or "").strip()
         artifact_available = bool(bundle_available and model_name)
-        if artifact_available and (live_ready or stage == "live"):
-            lifecycle = "live"
+        if artifact_available and (active_ready or stage in {"active", "live"}):
+            lifecycle = "active"
         elif artifact_available and (canary_ready or stage == "canary"):
             lifecycle = "canary"
         elif artifact_available:

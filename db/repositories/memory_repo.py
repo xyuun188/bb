@@ -6,7 +6,10 @@ from typing import Any
 from sqlalchemy import func, or_, select
 
 from core.symbols import normalize_trading_symbol
-from core.training_contracts import SHADOW_LABEL_VERSION
+from core.training_contracts import (
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+    SHADOW_LABEL_VERSION,
+)
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
@@ -395,7 +398,7 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
     if (
         incoming.get("source") != "authoritative_trade_outcome"
         or incoming.get("authority_level") != "okx_settlement_and_execution"
-        or incoming.get("outcome_version") != "2026-07-15.authoritative-trade-outcome.v1"
+        or incoming.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION
         or incoming.get("production_evidence_eligible") is not True
     ):
         return {**existing, **incoming}
