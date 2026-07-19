@@ -27,17 +27,21 @@ from services.entry_profit_risk_sizing import (
     select_okx_leverage_tier,
 )
 
-PAPER_BOOTSTRAP_CANARY_VERSION = "2026-07-19.paper-bootstrap-canary.v2"
-PAPER_BOOTSTRAP_SIZING_VERSION = "2026-07-19.paper-bootstrap-sizing.v2"
-PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION = "2026-07-19.paper-bootstrap-position-lifecycle.v1"
-PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS = 2
+PAPER_BOOTSTRAP_CANARY_VERSION = "2026-07-19.paper-bootstrap-canary.v3"
+PAPER_BOOTSTRAP_SIZING_VERSION = "2026-07-19.paper-bootstrap-sizing.v3"
+PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION = "2026-07-19.paper-bootstrap-position-lifecycle.v2"
+PAPER_BOOTSTRAP_CAMPAIGN_VERSION = "2026-07-19.authoritative-sample-sprint.v1"
+PAPER_BOOTSTRAP_CAMPAIGN_START = datetime(2026, 7, 19, 15, 10, tzinfo=UTC)
+PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES = 149
+PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE = 0.85
+PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS = 4
 PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES = 4
-PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES = 24
+PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES = 64
 PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES = 200
-PAPER_BOOTSTRAP_COLLECTION_HORIZON_DAYS = 14
+PAPER_BOOTSTRAP_COLLECTION_HORIZON_DAYS = 1
 PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK = 0.0005
-PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK = 0.001
-PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK = 0.003
+PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK = 0.002
+PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK = 0.015
 PAPER_BOOTSTRAP_STRATUM_IMBALANCE_TOLERANCE = 2
 PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
 PAPER_BOOTSTRAP_PREFLIGHT_TIMEOUT_SECONDS = 3.0
@@ -46,7 +50,6 @@ PAPER_BOOTSTRAP_PREPARE_TIMEOUT_SECONDS = 15.0
 PAPER_BOOTSTRAP_EXCHANGE_FACTS_TIMEOUT_SECONDS = 8.0
 PAPER_BOOTSTRAP_BALANCE_TIMEOUT_SECONDS = 3.0
 PAPER_BOOTSTRAP_DEADLINE_RESERVE_SECONDS = 0.05
-PAPER_BOOTSTRAP_CANARY_HISTORY_START = datetime(2026, 7, 17, tzinfo=UTC)
 
 BalanceProvider = Callable[[str, DecisionOutput], Awaitable[float | None]]
 ExchangeFactsProvider = Callable[
@@ -960,16 +963,6 @@ class PaperBootstrapCanaryPolicy:
             reasons.append("paper_canary_open_position_limit_reached")
         now = datetime.now(UTC)
         today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
-        history_times = [
-            timestamp
-            for row in canary_rows
-            if (
-                timestamp := _as_utc(
-                    _row_value(row, "executed_at") or _row_value(row, "created_at")
-                )
-            )
-            is not None
-        ]
         daily_rows = [
             row
             for row in canary_rows
@@ -983,12 +976,16 @@ class PaperBootstrapCanaryPolicy:
             1 for row in daily_rows
         )
         completed = [row for row in canary_rows if _row_value(row, "outcome")]
-        completed_sample_count = len(completed)
+        campaign_completed_sample_count = len(completed)
+        completed_sample_count = (
+            PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+            + campaign_completed_sample_count
+        )
         remaining_sample_count = max(
             PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES - completed_sample_count,
             0,
         )
-        collection_started_at = min(history_times) if history_times else now
+        collection_started_at = PAPER_BOOTSTRAP_CAMPAIGN_START
         collection_deadline = collection_started_at + timedelta(
             days=PAPER_BOOTSTRAP_COLLECTION_HORIZON_DAYS
         )
@@ -997,7 +994,11 @@ class PaperBootstrapCanaryPolicy:
             1,
         )
         required_daily_entries = (
-            ceil(remaining_sample_count / remaining_days)
+            ceil(
+                remaining_sample_count
+                / PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE
+                / remaining_days
+            )
             if remaining_sample_count > 0
             else 0
         )
@@ -1008,8 +1009,14 @@ class PaperBootstrapCanaryPolicy:
                 required_daily_entries,
             ),
         )
-        remaining_capacity = PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES * remaining_days
+        remaining_capacity = int(
+            PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
+            * PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE
+            * remaining_days
+        )
         sampling_plan_reachable = remaining_sample_count <= remaining_capacity
+        if remaining_sample_count <= 0:
+            reasons.append("paper_canary_target_sample_count_reached")
         if daily_entries >= adaptive_daily_limit:
             reasons.append("paper_canary_daily_entry_budget_exhausted")
 
@@ -1109,6 +1116,11 @@ class PaperBootstrapCanaryPolicy:
             "max_daily_entries": adaptive_daily_limit,
             "absolute_max_daily_entries": PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
             "min_daily_entries": PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES,
+            "campaign_version": PAPER_BOOTSTRAP_CAMPAIGN_VERSION,
+            "campaign_authoritative_baseline_sample_count": (
+                PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+            ),
+            "campaign_completed_sample_count": campaign_completed_sample_count,
             "completed_authoritative_sample_count": completed_sample_count,
             "target_authoritative_sample_count": PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
             "remaining_authoritative_sample_count": remaining_sample_count,
@@ -1117,10 +1129,11 @@ class PaperBootstrapCanaryPolicy:
             "remaining_collection_days": remaining_days,
             "required_daily_entries": required_daily_entries,
             "remaining_collection_capacity": remaining_capacity,
+            "expected_completion_rate": PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE,
             "sampling_plan_reachable": sampling_plan_reachable,
             "sampling_plan_alert_active": not sampling_plan_reachable,
             "daily_entry_limit_source": (
-                "remaining_sample_deficit_over_remaining_collection_days"
+                "remaining_sample_deficit_with_completion_reserve_over_remaining_collection_days"
             ),
             "sampling_stratum": current_stratum,
             "sampling_stratum_counts": stratum_counts,
@@ -1342,6 +1355,7 @@ class PaperBootstrapCanaryPolicy:
         canary = AIDecision.raw_llm_response["paper_bootstrap_canary"]
         sizing = AIDecision.raw_llm_response["profit_risk_sizing"]
         authorized = canary["authorized"].as_boolean()
+        version = canary["version"].as_string()
         return (
             select(
                 authorized.label("paper_canary_authorized"),
@@ -1372,8 +1386,9 @@ class PaperBootstrapCanaryPolicy:
                 AIDecision.is_paper.is_(True),
                 AIDecision.action.in_(("long", "short")),
                 AIDecision.was_executed.is_(True),
-                AIDecision.created_at >= PAPER_BOOTSTRAP_CANARY_HISTORY_START,
+                AIDecision.created_at >= PAPER_BOOTSTRAP_CAMPAIGN_START,
                 authorized.is_(True),
+                version == PAPER_BOOTSTRAP_CANARY_VERSION,
             )
             .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
             .limit(200)

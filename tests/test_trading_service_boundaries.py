@@ -36,6 +36,7 @@ from services.execution_service import ExecutionService
 from services.expert_memory_service import ExpertMemoryService
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
+from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.position_margin import PositionMarginCalculator
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
@@ -2663,7 +2664,7 @@ async def test_expired_canary_forces_full_exit_with_incomplete_takeover_contract
             )
 
     lifecycle = {
-        "version": "2026-07-19.paper-bootstrap-position-lifecycle.v1",
+        "version": PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
         "kind": "paper_bootstrap_canary_position",
         "authorized": True,
         "execution_scope": "paper_only",

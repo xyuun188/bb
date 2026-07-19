@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from math import ceil
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,13 +15,17 @@ from risk_manager.engine import RiskEngine
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.execution_service import _return_entry_contract_result
 from services.paper_bootstrap_canary import (
+    PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES,
+    PAPER_BOOTSTRAP_CAMPAIGN_VERSION,
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
+    PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE,
     PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
     PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
     PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
+    PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
     PaperBootstrapCanaryPolicy,
     annotate_paper_bootstrap_opportunity,
     assess_paper_canary_position_horizon,
@@ -278,7 +283,7 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["contract_lifecycle"] == "paper_bootstrap_canary"
     assert sizing["risk_budget_usdt"] == pytest.approx(0.5)
-    assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(1.0)
+    assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(2.0)
     assert sizing["leverage_tier_selection"]["production_eligible"] is True
     assert sizing["leverage_tier_selection"]["contract_spec"]["ctVal"] == "0.01"
     assert sizing["contract_version"] == PAPER_BOOTSTRAP_SIZING_VERSION
@@ -354,7 +359,7 @@ async def test_second_parallel_canary_reserves_first_trade_portfolio_risk() -> N
     assert result.eligible is True
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["current_portfolio_stressed_loss_usdt"] == pytest.approx(0.5)
-    assert sizing["remaining_portfolio_risk_budget_usdt"] == pytest.approx(0.5)
+    assert sizing["remaining_portfolio_risk_budget_usdt"] == pytest.approx(1.5)
     assert sizing["planned_stressed_loss_usdt"] <= 0.5 + 1e-8
     assert (
         sizing["current_portfolio_stressed_loss_usdt"]
@@ -720,7 +725,7 @@ async def test_paper_canary_daily_budget_expands_while_sample_deficit_is_large()
     assert guard["max_daily_entries"] <= PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
     assert guard["absolute_max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
     assert guard["daily_entry_limit_source"] == (
-        "remaining_sample_deficit_over_remaining_collection_days"
+        "remaining_sample_deficit_with_completion_reserve_over_remaining_collection_days"
     )
 
 
@@ -740,14 +745,41 @@ async def test_initial_sampling_plan_is_reachable_from_zero_samples() -> None:
 
     assert result.eligible is True
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["required_daily_entries"] == 15
-    assert guard["max_daily_entries"] == 15
+    expected_entries = ceil(
+        (
+            PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
+            - PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+        )
+        / PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE
+    )
+    assert guard["required_daily_entries"] == expected_entries
+    assert guard["max_daily_entries"] == expected_entries
+    assert guard["campaign_version"] == PAPER_BOOTSTRAP_CAMPAIGN_VERSION
+    assert (
+        guard["campaign_authoritative_baseline_sample_count"]
+        == PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+    )
+    assert guard["campaign_completed_sample_count"] == 0
+    assert (
+        guard["completed_authoritative_sample_count"]
+        == PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+    )
+    assert guard["remaining_authoritative_sample_count"] == (
+        PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
+        - PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+    )
     assert guard["sampling_plan_reachable"] is True
     assert guard["sampling_plan_alert_active"] is False
 
 
 @pytest.mark.asyncio
-async def test_overdue_sampling_plan_emits_unreachable_alert_without_stopping_collection() -> None:
+async def test_overdue_sampling_plan_emits_unreachable_alert_without_stopping_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "services.paper_bootstrap_canary.PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES",
+        0,
+    )
     old = datetime.now(UTC) - timedelta(days=15)
 
     async def history() -> list[Any]:
@@ -776,6 +808,45 @@ async def test_overdue_sampling_plan_emits_unreachable_alert_without_stopping_co
     assert guard["max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
     assert guard["sampling_plan_reachable"] is False
     assert guard["sampling_plan_alert_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_completed_campaign_blocks_additional_canary_entries() -> None:
+    completed_at = datetime.now(UTC) - timedelta(minutes=20)
+    required = (
+        PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
+        - PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
+    )
+
+    async def history() -> list[Any]:
+        return [
+            SimpleNamespace(
+                paper_canary_authorized=True,
+                outcome="profit",
+                executed_at=completed_at - timedelta(seconds=index),
+                created_at=completed_at - timedelta(seconds=index),
+            )
+            for index in range(required)
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is False
+    assert "paper_canary_target_sample_count_reached" in result.reason
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["campaign_completed_sample_count"] == required
+    assert (
+        guard["completed_authoritative_sample_count"]
+        == PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
+    )
+    assert guard["remaining_authoritative_sample_count"] == 0
 
 
 def test_canary_history_query_projects_only_runtime_guard_columns() -> None:
