@@ -2917,15 +2917,22 @@ class OkxSyncService:
                     management_contract = _dict_value(
                         getattr(p, "current_management_contract", None)
                     )
-                    canary_lifecycle: dict[str, Any] = {}
-                    for decision_id in management_contract.get("original_entry_decision_ids", []):
-                        decision = decisions_by_id.get(
-                            int(decision_id) if str(decision_id or "").isdigit() else -1
-                        )
-                        lifecycle = build_paper_canary_position_lifecycle(decision)
-                        if lifecycle:
-                            canary_lifecycle = lifecycle
-                            break
+                    canary_lifecycle = _dict_value(
+                        management_contract.get("paper_canary_lifecycle")
+                    )
+                    if not canary_lifecycle:
+                        for decision_id in management_contract.get(
+                            "original_entry_decision_ids", []
+                        ):
+                            decision = decisions_by_id.get(
+                                int(decision_id)
+                                if str(decision_id or "").isdigit()
+                                else -1
+                            )
+                            lifecycle = build_paper_canary_position_lifecycle(decision)
+                            if lifecycle:
+                                canary_lifecycle = lifecycle
+                                break
                     local_positions.append(
                         {
                             "model_name": p.model_name,

@@ -239,6 +239,36 @@ def test_expired_paper_canary_horizon_closes_full_position() -> None:
     assert result.close_fraction == 1.0
 
 
+def test_expired_paper_canary_horizon_closes_even_when_takeover_contract_is_incomplete() -> None:
+    position = _position(
+        execution_mode="paper",
+        current_management_contract={
+            "kind": "current_position_takeover",
+            "management_eligible": False,
+            "blockers": ["okx_protection_evidence_incomplete"],
+        },
+        paper_canary_lifecycle={
+            "version": PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
+            "kind": "paper_bootstrap_canary_position",
+            "authorized": True,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "horizon_minutes": 10,
+            "expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        },
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.eligible is True
+    assert result.paper_canary_horizon_elapsed is True
+    assert result.current_management_contract_complete is False
+    assert result.close_fraction == 1.0
+    assert "current_position_management_contract_incomplete" not in result.reason
+
+
 def test_ordinary_position_is_not_closed_only_because_it_is_old() -> None:
     result = apply_dynamic_exit(
         _decision(),

@@ -52,6 +52,7 @@ from services.okx_position_history_store import (
     okx_position_history_records_to_rows,
     upsert_okx_position_history_row,
 )
+from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
 from services.position_settlement import (
     apply_position_settlement_snapshot,
@@ -1857,6 +1858,14 @@ class OkxOrderFactSyncService:
                 linked_entry_orders,
                 decisions_by_id=entry_decisions_by_id,
             )
+            paper_canary_lifecycle: dict[str, Any] = {}
+            for decision_id in original_entry["decision_ids"]:
+                lifecycle = build_paper_canary_position_lifecycle(
+                    entry_decisions_by_id.get(int(decision_id))
+                )
+                if lifecycle:
+                    paper_canary_lifecycle = lifecycle
+                    break
             management_facts = {
                 **position_portfolio,
                 "symbol": payload.get("symbol"),
@@ -1881,6 +1890,7 @@ class OkxOrderFactSyncService:
                 ),
                 "account_equity_usdt": portfolio_snapshot.get("account_equity_usdt"),
                 "open_position_count": portfolio_snapshot.get("open_position_count"),
+                "paper_canary_lifecycle": paper_canary_lifecycle,
             }
             previous_management_contract = _safe_mapping(
                 getattr(existing, "current_management_contract", None)

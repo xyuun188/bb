@@ -15,6 +15,9 @@ from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.execution_service import _return_entry_contract_result
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
+    PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS,
+    PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
+    PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
     PaperBootstrapCanaryPolicy,
@@ -183,6 +186,34 @@ def test_paper_canary_horizon_fails_closed_for_malformed_lifecycle() -> None:
     assert assessment["elapsed"] is False
 
 
+def test_paper_canary_horizon_reads_persisted_management_lifecycle() -> None:
+    lifecycle = {
+        "version": PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
+        "kind": "paper_bootstrap_canary_position",
+        "authorized": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "horizon_minutes": 10,
+        "expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+    }
+
+    assessment = assess_paper_canary_position_horizon(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "execution_mode": "paper",
+            "current_management_contract": {
+                "paper_canary_lifecycle": lifecycle,
+            },
+        }
+    )
+
+    assert assessment["authorized"] is True
+    assert assessment["elapsed"] is True
+
+
 def test_ensemble_emits_paper_canary_entry_when_production_source_is_absent() -> None:
     coordinator = EnsembleCoordinator(SimpleNamespace(get=lambda _name: None))
 
@@ -246,7 +277,9 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     assert sizing["portfolio_risk_snapshot"]["gross_notional_usdt"] == 0.0
     assert sizing["portfolio_risk_snapshot"]["scope"] == ("paper_bootstrap_canary_positions_only")
     assert sizing["entry_instrument_availability"]["available"] is True
-    assert sizing["estimated_fill_drift_reserve_fraction"] == pytest.approx(0.0015)
+    assert sizing["estimated_fill_drift_reserve_fraction"] == pytest.approx(
+        PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION
+    )
     assert sizing["fill_notional_ceiling_usdt"] > sizing["target_notional_usdt"]
     assert sizing["target_notional_usdt"] * (
         1.0 + sizing["estimated_fill_drift_reserve_fraction"]
@@ -447,6 +480,78 @@ async def test_paper_canary_opens_circuit_after_two_completed_losses() -> None:
 
     assert result.eligible is False
     assert "paper_canary_consecutive_loss_circuit_open" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_paper_canary_loss_circuit_allows_recovery_probe_after_cooldown() -> None:
+    old_loss_at = datetime.now(UTC) - timedelta(
+        seconds=PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS + 60
+    )
+
+    async def history() -> list[Any]:
+        raw = {"paper_bootstrap_canary": {"authorized": True}}
+        return [
+            SimpleNamespace(
+                raw_llm_response=raw,
+                outcome="loss",
+                executed_at=old_loss_at,
+                created_at=old_loss_at,
+            ),
+            SimpleNamespace(
+                raw_llm_response=raw,
+                outcome="loss",
+                executed_at=old_loss_at - timedelta(minutes=10),
+                created_at=old_loss_at - timedelta(minutes=10),
+            ),
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is True
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["consecutive_loss_count"] == 2
+    assert guard["loss_circuit_open"] is False
+
+
+@pytest.mark.asyncio
+async def test_paper_canary_daily_budget_expands_while_sample_deficit_is_large() -> None:
+    executed_at = datetime.now(UTC) - timedelta(minutes=20)
+
+    async def history() -> list[Any]:
+        raw = {"paper_bootstrap_canary": {"authorized": True}}
+        return [
+            SimpleNamespace(
+                raw_llm_response=raw,
+                outcome="profit",
+                executed_at=executed_at - timedelta(seconds=index),
+                created_at=executed_at - timedelta(seconds=index),
+            )
+            for index in range(PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES)
+        ]
+
+    decision = _decision()
+    policy = PaperBootstrapCanaryPolicy(
+        allocated_order_balance=lambda *_args: None,
+        exchange_risk_facts=lambda *_args: None,
+        history_provider=history,
+    )
+
+    result = await policy.preflight(decision, "paper", [])
+
+    assert result.eligible is False
+    assert "paper_canary_daily_entry_budget_exhausted" in result.reason
+    guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
+    assert guard["max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
+    assert guard["daily_entry_limit_source"] == (
+        "authoritative_sample_deficit_over_collection_horizon"
+    )
 
 
 def test_canary_history_query_projects_only_runtime_guard_columns() -> None:

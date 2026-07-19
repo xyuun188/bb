@@ -62,9 +62,7 @@ def test_takeover_contract_is_reduce_only_and_preserves_historical_gap() -> None
     assert contract["original_entry_contract_status"] == (
         "historical_entry_contract_incomplete_preserved"
     )
-    assert contract["original_entry_contract_gaps"] == [
-        "decision_99:risk_contract_missing"
-    ]
+    assert contract["original_entry_contract_gaps"] == ["decision_99:risk_contract_missing"]
     assert contract["entry_fee_usdt"] == pytest.approx(0.12)
     assert contract["exit_fee_rate_proxy"] == pytest.approx(0.0006)
     assert contract["policy_provenance"]["contract_fingerprint"]
@@ -84,6 +82,27 @@ def test_takeover_timestamp_is_stable_while_current_facts_refresh() -> None:
     assert second["policy_provenance"]["input_fingerprint"] != (
         first["policy_provenance"]["input_fingerprint"]
     )
+
+
+def test_takeover_refresh_preserves_persisted_paper_canary_lifecycle() -> None:
+    lifecycle = {
+        "version": "2026-07-19.paper-bootstrap-position-lifecycle.v1",
+        "kind": "paper_bootstrap_canary_position",
+        "authorized": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "horizon_minutes": 10,
+        "expires_at": "2026-07-15T01:10:00+00:00",
+    }
+
+    contract = build_current_position_management_contract(
+        _facts(current_price=104.0),
+        previous_contract={"paper_canary_lifecycle": lifecycle},
+    )
+
+    assert contract["paper_canary_lifecycle"] == lifecycle
 
 
 def test_zero_actual_fee_is_complete_when_okx_fee_evidence_is_explicit() -> None:

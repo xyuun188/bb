@@ -816,6 +816,7 @@ class TradingService:
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
         self._auto_scan_feature_cursor = 0
+        self._paper_verified_entry_symbols: set[str] = set()
         self._active_analysis_symbols: set[str] = set()
         self._analysis_symbol_lock = asyncio.Lock()
         self._market_analysis_task: asyncio.Task | None = None
@@ -4064,6 +4065,15 @@ class TradingService:
         )
         max_pool = max(int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX), configured_limit)
         market_budget = min(len(market_symbols), target_market_budget, max_pool)
+        verified_symbols = set(getattr(self, "_paper_verified_entry_symbols", set()) or set())
+        verified_market_symbols = [
+            symbol
+            for symbol in market_symbols
+            if self._normalize_position_symbol(symbol) in verified_symbols
+        ]
+        selected_verified = verified_market_symbols[
+            : min(len(verified_market_symbols), max(int(configured_limit), 0), market_budget)
+        ]
         self._last_auto_feature_fetch_budget_diagnostics = {
             "read_only": True,
             "is_entry_gate": False,
@@ -4077,6 +4087,7 @@ class TradingService:
             "pool_multiplier": int(AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER),
             "pool_min": int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
             "pool_max": int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX),
+            "verified_paper_symbol_count": len(verified_market_symbols),
             "diagnostic_boundary": (
                 "Feature-fetch breadth only expands discovery before rank/evidence gates; "
                 "it is not entry permission, leverage, sizing, or ML readiness."
@@ -4085,11 +4096,24 @@ class TradingService:
         if market_budget <= 0:
             return self.entry_symbol_universe.dedupe_symbols(position_symbols)
 
+        selected_verified_set = set(selected_verified)
+        rotating_market_symbols = [
+            symbol for symbol in market_symbols if symbol not in selected_verified_set
+        ]
+        rotating_budget = max(market_budget - len(selected_verified), 0)
         cursor = int(getattr(self, "_auto_scan_feature_cursor", 0) or 0)
-        start = cursor % len(market_symbols)
-        rotated = market_symbols[start:] + market_symbols[:start]
-        selected_market = rotated[:market_budget]
-        self._auto_scan_feature_cursor = (start + market_budget) % len(market_symbols)
+        start = cursor % len(rotating_market_symbols) if rotating_market_symbols else 0
+        rotated = (
+            rotating_market_symbols[start:] + rotating_market_symbols[:start]
+            if rotating_market_symbols
+            else []
+        )
+        selected_market = [*selected_verified, *rotated[:rotating_budget]]
+        self._auto_scan_feature_cursor = (
+            (start + rotating_budget) % len(rotating_market_symbols)
+            if rotating_market_symbols
+            else 0
+        )
         selected = self.entry_symbol_universe.dedupe_symbols([*position_symbols, *selected_market])
         logger.info(
             "auto scan feature fetch budget selected",
@@ -4857,6 +4881,14 @@ class TradingService:
         ]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
+        verified_symbols = set(getattr(self, "_paper_verified_entry_symbols", set()) or set())
+        for symbol, facts in availability.items():
+            availability_facts = self._safe_dict(facts)
+            if availability_facts.get("available") is True:
+                verified_symbols.add(str(symbol))
+            elif str(availability_facts.get("error_code") or "") == "51001":
+                verified_symbols.discard(str(symbol))
+        self._paper_verified_entry_symbols = verified_symbols
         unavailable = [
             {
                 "symbol": symbol,

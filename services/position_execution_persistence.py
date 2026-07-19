@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -22,6 +23,7 @@ from db.session import get_session_ctx
 from services.execution_result_classifier import is_native_full_close_backfill_pending_result
 from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
+from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.position_settlement import (
     SETTLEMENT_STATUS_SETTLING,
     apply_position_settlement_snapshot,
@@ -44,6 +46,16 @@ PositionPeakRemover = Callable[[str, str, str], None]
 
 POSITION_CLOSE_DUST_ABS_TOLERANCE = 1e-8
 POSITION_CLOSE_DUST_REL_TOLERANCE = 1e-9
+
+
+def _management_contract_with_canary_lifecycle(
+    value: Any,
+    lifecycle: dict[str, Any],
+) -> dict[str, Any]:
+    contract = dict(value) if isinstance(value, dict) else {}
+    if lifecycle and not isinstance(contract.get("paper_canary_lifecycle"), dict):
+        contract["paper_canary_lifecycle"] = dict(lifecycle)
+    return contract
 
 
 def _close_quantity_leaves_dust(
@@ -253,6 +265,17 @@ class PositionExecutionPersistenceService:
         entry_exchange_order_id = PositionExecutionPersistenceService._result_exchange_order_id(
             result
         )
+        paper_canary_lifecycle = build_paper_canary_position_lifecycle(
+            SimpleNamespace(
+                id=getattr(decision, "id", None),
+                symbol=symbol,
+                action=side,
+                raw_response=getattr(decision, "raw_response", None),
+                is_paper=execution_mode == "paper",
+                was_executed=True,
+                executed_at=getattr(result, "timestamp", None) or datetime.now(UTC),
+            )
+        )
         stop_loss = (
             result.price * (1 - decision.stop_loss_pct)
             if side == "long"
@@ -284,6 +307,10 @@ class PositionExecutionPersistenceService:
             payload["okx_pos_id"] = okx_pos_id
         if entry_exchange_order_id:
             payload["entry_exchange_order_id"] = entry_exchange_order_id
+        if paper_canary_lifecycle:
+            payload["current_management_contract"] = {
+                "paper_canary_lifecycle": dict(paper_canary_lifecycle)
+            }
         existing_positions = await repo.get_matching_open_positions(
             model_name=model_name,
             symbol=symbol,
@@ -333,6 +360,13 @@ class PositionExecutionPersistenceService:
                     primary.okx_inst_id = okx_inst_id
                 if okx_pos_id:
                     primary.okx_pos_id = okx_pos_id
+                if paper_canary_lifecycle:
+                    primary.current_management_contract = (
+                        _management_contract_with_canary_lifecycle(
+                            getattr(primary, "current_management_contract", None),
+                            paper_canary_lifecycle,
+                        )
+                    )
                 primary.stop_loss_price = (
                     float(getattr(primary, "entry_price", result.price) or result.price)
                     * (1 - decision.stop_loss_pct)
@@ -378,6 +412,11 @@ class PositionExecutionPersistenceService:
                 primary.okx_inst_id = okx_inst_id
             if okx_pos_id:
                 primary.okx_pos_id = okx_pos_id
+            if paper_canary_lifecycle:
+                primary.current_management_contract = _management_contract_with_canary_lifecycle(
+                    getattr(primary, "current_management_contract", None),
+                    paper_canary_lifecycle,
+                )
             primary.entry_exchange_order_id = _merge_exchange_order_ids(
                 getattr(primary, "entry_exchange_order_id", None),
                 entry_exchange_order_id,
@@ -547,6 +586,9 @@ class PositionExecutionPersistenceService:
                     closed_payload["entry_exchange_order_id"] = entry_exchange_order_id
                 if close_exchange_order_id:
                     closed_payload["close_exchange_order_id"] = close_exchange_order_id
+                management_contract = getattr(position, "current_management_contract", None)
+                if isinstance(management_contract, dict):
+                    closed_payload["current_management_contract"] = dict(management_contract)
                 closed_pos = await repo.open_position(closed_payload)
                 await self._record_reflection(
                     session,

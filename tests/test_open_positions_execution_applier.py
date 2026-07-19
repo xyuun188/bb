@@ -3,6 +3,7 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
+from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -161,6 +162,43 @@ def test_open_positions_applier_ignores_unconfirmed_entry() -> None:
     )
 
     assert open_positions == []
+
+
+def test_open_positions_applier_preserves_canary_lifecycle_after_partial_exit() -> None:
+    open_positions: list[dict] = []
+    entry = _decision(Action.LONG)
+    entry.raw_response = {
+        "paper_bootstrap_canary": {
+            "version": "2026-07-17.paper-bootstrap-canary.v1",
+            "requested": True,
+            "authorized": True,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "artifact_version": "artifact-1",
+            "selected_observation": {"horizon_minutes": 10},
+        }
+    }
+
+    _applier().apply(
+        open_positions,
+        "ensemble_trader",
+        entry,
+        _result(OrderStatus.FILLED, quantity=2.0),
+    )
+    lifecycle = open_positions[0]["paper_canary_lifecycle"]
+
+    _applier(exit_progress=True).apply(
+        open_positions,
+        "ensemble_trader",
+        _decision(Action.CLOSE_LONG),
+        _result(OrderStatus.PARTIAL, quantity=0.25),
+    )
+
+    assert open_positions[0]["quantity"] == pytest.approx(1.75)
+    assert open_positions[0]["execution_mode"] == "paper"
+    assert open_positions[0]["paper_canary_lifecycle"] == lifecycle
+    assert lifecycle["version"] == PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
+    assert open_positions[0]["current_management_contract"]["paper_canary_lifecycle"] == lifecycle
 
 
 def test_open_positions_applier_reduces_matching_exit_progress() -> None:

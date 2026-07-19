@@ -285,7 +285,12 @@ def assess_dynamic_exit(
     reasons: list[str] = []
     if not matches:
         reasons.append("position_economics_missing")
-    if not hard_risk and matches and not current_management_contract_complete:
+    if (
+        not hard_risk
+        and not paper_canary_horizon_elapsed
+        and matches
+        and not current_management_contract_complete
+    ):
         reasons.append("current_position_management_contract_incomplete")
     if not hard_risk and not paper_canary_horizon_elapsed and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
@@ -298,7 +303,7 @@ def assess_dynamic_exit(
         and continuation <= 0
     ):
         reasons.append("fee_after_profit_not_positive")
-    if not hard_risk and not execution_cost_complete:
+    if not hard_risk and not paper_canary_horizon_elapsed and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
     eligible = not reasons
     provenance = {

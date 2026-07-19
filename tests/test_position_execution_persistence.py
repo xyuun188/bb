@@ -179,6 +179,37 @@ async def test_persist_entry_opens_position_with_protection_prices() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_entry_stores_immutable_paper_canary_lifecycle() -> None:
+    session = FakeSession()
+    repo = FakeTradeRepo()
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "paper_bootstrap_canary": {
+            "version": "2026-07-17.paper-bootstrap-canary.v1",
+            "requested": True,
+            "authorized": True,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "artifact_version": "artifact-1",
+            "selected_observation": {"horizon_minutes": 10},
+        }
+    }
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=decision,
+        result=_result(price=100.0, quantity=1.5, exchange_order_id="canary-entry"),
+        execution_mode="paper",
+    )
+
+    lifecycle = repo.opened[0]["current_management_contract"]["paper_canary_lifecycle"]
+    assert lifecycle["kind"] == "paper_bootstrap_canary_position"
+    assert lifecycle["symbol"] == "BTC/USDT"
+    assert lifecycle["side"] == "long"
+    assert lifecycle["horizon_minutes"] == 10
+
+
+@pytest.mark.asyncio
 async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
     session = FakeSession()
     repo = FakeTradeRepo()
@@ -470,7 +501,9 @@ async def test_persist_full_exit_does_not_close_on_synthetic_native_close_order_
 
 
 @pytest.mark.asyncio
-async def test_persist_exit_closes_native_full_close_pending_backfill_without_synthetic_id() -> None:
+async def test_persist_exit_closes_native_full_close_pending_backfill_without_synthetic_id() -> (
+    None
+):
     session = FakeSession()
     position = _position(id=1, quantity=2.0)
     repo = FakeTradeRepo([position])

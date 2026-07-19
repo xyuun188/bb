@@ -13,7 +13,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from math import isclose, isfinite
+from math import ceil, isclose, isfinite
 from typing import Any
 
 from sqlalchemy import select
@@ -31,10 +31,15 @@ PAPER_BOOTSTRAP_CANARY_VERSION = "2026-07-17.paper-bootstrap-canary.v1"
 PAPER_BOOTSTRAP_SIZING_VERSION = "2026-07-17.paper-bootstrap-sizing.v1"
 PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION = "2026-07-19.paper-bootstrap-position-lifecycle.v1"
 PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS = 1
-PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES = 4
+PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES = 4
+PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES = 12
+PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES = 200
+PAPER_BOOTSTRAP_COLLECTION_HORIZON_DAYS = 14
 PAPER_BOOTSTRAP_MAX_CONSECUTIVE_LOSSES = 2
+PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS = 6 * 60 * 60
 PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK = 0.0005
 PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK = 0.001
+PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
 PAPER_BOOTSTRAP_PREFLIGHT_TIMEOUT_SECONDS = 3.0
 PAPER_BOOTSTRAP_HISTORY_TIMEOUT_SECONDS = 2.5
 PAPER_BOOTSTRAP_PREPARE_TIMEOUT_SECONDS = 15.0
@@ -217,6 +222,15 @@ def build_paper_canary_position_lifecycle(decision: Any) -> dict[str, Any]:
     }
 
 
+def paper_canary_position_lifecycle(position: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable canary lifecycle from runtime or persisted state."""
+    direct = _safe_dict(position.get("paper_canary_lifecycle"))
+    if direct:
+        return direct
+    management = _safe_dict(position.get("current_management_contract"))
+    return _safe_dict(management.get("paper_canary_lifecycle"))
+
+
 def assess_paper_canary_position_horizon(
     position: dict[str, Any],
     *,
@@ -224,7 +238,7 @@ def assess_paper_canary_position_horizon(
 ) -> dict[str, Any]:
     """Assess whether an attached paper canary position reached its model horizon."""
 
-    lifecycle = _safe_dict(position.get("paper_canary_lifecycle"))
+    lifecycle = paper_canary_position_lifecycle(position)
     current = _as_utc(now) or datetime.now(UTC)
     expires_at_value = lifecycle.get("expires_at")
     try:
@@ -892,16 +906,50 @@ class PaperBootstrapCanaryPolicy:
             )
             >= today_start
         )
-        if daily_entries >= PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES:
+        completed = [row for row in canary_rows if _row_value(row, "outcome")]
+        completed_sample_count = len(completed)
+        remaining_sample_count = max(
+            PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES - completed_sample_count,
+            0,
+        )
+        adaptive_daily_limit = min(
+            PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
+            max(
+                PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES,
+                ceil(remaining_sample_count / PAPER_BOOTSTRAP_COLLECTION_HORIZON_DAYS)
+                if remaining_sample_count > 0
+                else PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES,
+            ),
+        )
+        if daily_entries >= adaptive_daily_limit:
             reasons.append("paper_canary_daily_entry_budget_exhausted")
 
-        completed = [row for row in canary_rows if _row_value(row, "outcome")]
         consecutive_losses = 0
         for row in completed:
             if str(_row_value(row, "outcome") or "").lower() != "loss":
                 break
             consecutive_losses += 1
-        if consecutive_losses >= PAPER_BOOTSTRAP_MAX_CONSECUTIVE_LOSSES:
+        last_completed_at = (
+            _as_utc(
+                _row_value(completed[0], "executed_at")
+                or _row_value(completed[0], "created_at")
+            )
+            if completed
+            else None
+        )
+        loss_circuit_age_seconds = (
+            max((now - last_completed_at).total_seconds(), 0.0)
+            if last_completed_at is not None
+            else None
+        )
+        loss_circuit_open = bool(
+            consecutive_losses >= PAPER_BOOTSTRAP_MAX_CONSECUTIVE_LOSSES
+            and (
+                loss_circuit_age_seconds is None
+                or loss_circuit_age_seconds < PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS
+            )
+        )
+        if loss_circuit_open:
             reasons.append("paper_canary_consecutive_loss_circuit_open")
 
         last_executed = _as_utc(
@@ -933,9 +981,18 @@ class PaperBootstrapCanaryPolicy:
             "account_open_position_count": len(account_open_positions),
             "open_position_source": "executed_canary_decisions_without_outcome",
             "daily_entry_count": daily_entries,
-            "max_daily_entries": PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
+            "max_daily_entries": adaptive_daily_limit,
+            "absolute_max_daily_entries": PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
+            "min_daily_entries": PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES,
+            "completed_authoritative_sample_count": completed_sample_count,
+            "target_authoritative_sample_count": PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
+            "remaining_authoritative_sample_count": remaining_sample_count,
+            "daily_entry_limit_source": "authoritative_sample_deficit_over_collection_horizon",
             "consecutive_loss_count": consecutive_losses,
             "max_consecutive_losses": PAPER_BOOTSTRAP_MAX_CONSECUTIVE_LOSSES,
+            "loss_circuit_open": loss_circuit_open,
+            "loss_circuit_age_seconds": loss_circuit_age_seconds,
+            "loss_circuit_cooldown_seconds": PAPER_BOOTSTRAP_LOSS_CIRCUIT_COOLDOWN_SECONDS,
             "cooldown_seconds": cooldown_seconds,
             "last_executed_at": (
                 last_executed.isoformat() if isinstance(last_executed, datetime) else None
@@ -994,7 +1051,10 @@ class PaperBootstrapCanaryPolicy:
 
         risk_budget = equity * PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK
         portfolio_budget = equity * PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK
-        fill_drift_reserve_fraction = cost_pct / 100.0
+        fill_drift_reserve_fraction = max(
+            cost_pct / 100.0,
+            PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
+        )
         fill_notional_ceiling = risk_budget / stress if stress > 0 else 0.0
         target_notional = (
             fill_notional_ceiling / (1.0 + fill_drift_reserve_fraction)

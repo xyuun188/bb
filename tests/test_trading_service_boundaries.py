@@ -2334,6 +2334,7 @@ async def test_paper_market_shortlist_uses_private_instrument_availability() -> 
     assert diagnostics["selected"] == 2
     assert diagnostics["execution_availability"]["probed_count"] == 4
     assert diagnostics["execution_availability"]["available_count"] == 2
+    assert service._paper_verified_entry_symbols == {"BTC/USDT", "ETH/USDT"}
     pi = next(item for item in diagnostics["ranked_symbol_sample"] if item["symbol"] == "PI/USDT")
     assert pi["selected"] is False
     assert pi["non_selected_reason"] == "paper_execution_instrument_unavailable"
@@ -2620,6 +2621,84 @@ async def test_fixed_take_profit_crossing_cannot_authorize_dynamic_exit():
     assert service._decision_count == 0
     assert auto_closes == []
     assert not any(call[0] == "execute_candidate" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_expired_canary_forces_full_exit_with_incomplete_takeover_contract() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[Any, ...]] = []
+
+    class FakePositionTime:
+        def position_age_minutes(self, _created_at):
+            return 30.0
+
+    class FakeProfitPeaks:
+        def update(self, **_kwargs):
+            return {"peak_unrealized_pnl": 0.0}
+
+    class FakeProcessor:
+        async def execute(self, **kwargs):
+            calls.append(
+                (
+                    kwargs["symbol"],
+                    kwargs["trigger"],
+                    kwargs["close_fraction"],
+                )
+            )
+            return SimpleNamespace(
+                skipped=False,
+                auto_close={
+                    "model_name": kwargs["model_name"],
+                    "symbol": kwargs["symbol"],
+                    "trigger": kwargs["trigger"],
+                },
+            )
+
+    lifecycle = {
+        "version": "2026-07-19.paper-bootstrap-position-lifecycle.v1",
+        "kind": "paper_bootstrap_canary_position",
+        "authorized": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "symbol": "MAGIC/USDT",
+        "side": "long",
+        "horizon_minutes": 10,
+        "expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+    }
+    open_positions = [
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "MAGIC/USDT",
+            "side": "long",
+            "execution_mode": "paper",
+            "is_open": True,
+            "entry_price": 0.04,
+            "current_price": 0.041,
+            "quantity": 9162.0,
+            "leverage": 1.0,
+            "unrealized_pnl": 0.0,
+            "created_at": datetime.now(UTC) - timedelta(minutes=30),
+            "current_management_contract": {
+                "management_eligible": False,
+                "blockers": ["okx_protection_evidence_incomplete"],
+                "paper_canary_lifecycle": lifecycle,
+            },
+        }
+    ]
+    service.position_time = FakePositionTime()
+    service.position_profit_peaks = FakeProfitPeaks()
+    service.fast_risk_exit_execution_processor = FakeProcessor()
+
+    auto_closes = await service._enforce_sl_tp({}, open_positions=open_positions)
+
+    assert calls == [("MAGIC/USDT", "paper_canary_horizon", 1.0)]
+    assert auto_closes == [
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "MAGIC/USDT",
+            "trigger": "paper_canary_horizon",
+        }
+    ]
 
 
 def test_entry_policy_uses_injected_decision_freshness_boundary():
@@ -3336,6 +3415,32 @@ def test_auto_scan_feature_budget_expands_discovery_without_lowering_entry_gates
     assert diagnostics["pool_max"] == 64
     assert diagnostics["is_entry_gate"] is False
     assert "not entry permission" in diagnostics["diagnostic_boundary"]
+
+
+def test_auto_scan_feature_budget_keeps_verified_paper_symbols_in_discovery_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._auto_scan_feature_cursor = 0
+    service._paper_verified_entry_symbols = {"S9/USDT"}
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 20)
+    symbols = [f"S{i}/USDT" for i in range(10)]
+
+    first = service._budget_auto_scan_feature_symbols(symbols, [], configured_limit=2)
+    second = service._budget_auto_scan_feature_symbols(symbols, [], configured_limit=2)
+
+    assert "S9/USDT" in first
+    assert "S9/USDT" in second
+    assert len(first) == 4
+    assert len(second) == 4
+    assert first[1:] != second[1:]
+    assert service._last_auto_feature_fetch_budget_diagnostics["verified_paper_symbol_count"] == 1
 
 
 def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_counts() -> None:

@@ -68,6 +68,17 @@ def build_current_position_management_contract(
 
     generated_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
     previous = _safe_dict(previous_contract)
+    previous_canary_lifecycle = _safe_dict(previous.get("paper_canary_lifecycle"))
+    refreshed_canary_lifecycle = _safe_dict(facts.get("paper_canary_lifecycle"))
+    paper_canary_lifecycle = dict(
+        previous_canary_lifecycle or refreshed_canary_lifecycle
+    )
+    if paper_canary_lifecycle and refreshed_canary_lifecycle:
+        for key in ("decision_id", "artifact_version", "executed_at"):
+            if paper_canary_lifecycle.get(key) in (None, ""):
+                refreshed_value = refreshed_canary_lifecycle.get(key)
+                if refreshed_value not in (None, ""):
+                    paper_canary_lifecycle[key] = refreshed_value
     symbol = normalize_trading_symbol(facts.get("symbol"))
     side = str(facts.get("side") or "").lower().strip()
     quantity = abs(_safe_float(facts.get("quantity")))
@@ -204,6 +215,7 @@ def build_current_position_management_contract(
         "protection_orders": protection_orders,
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
+        "paper_canary_lifecycle": paper_canary_lifecycle,
     }
     provenance = {
         "source": "okx_current_position_fills_protection_account_and_portfolio_facts",
@@ -264,6 +276,8 @@ def build_current_position_management_contract(
         "original_entry_contract_gaps": entry_contract_gaps,
         "policy_provenance": provenance,
     }
+    if paper_canary_lifecycle:
+        contract["paper_canary_lifecycle"] = paper_canary_lifecycle
     contract["policy_provenance"]["contract_fingerprint"] = _fingerprint(contract)
     return contract
 

@@ -12,6 +12,7 @@ from typing import Any
 from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
+    PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
 )
 
@@ -546,7 +547,10 @@ def _bounded_legacy_canary_fill_drift(
     opportunity_cost_pct = _safe_float(
         _safe_dict(opportunity.get("execution_cost")).get("total_pct")
     )
-    reserve_fraction = max(observation_cost_pct, opportunity_cost_pct) / 100.0
+    reserve_fraction = max(
+        max(observation_cost_pct, opportunity_cost_pct) / 100.0,
+        PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
+    )
     if (
         target_notional <= 0
         or settled_notional <= 0
