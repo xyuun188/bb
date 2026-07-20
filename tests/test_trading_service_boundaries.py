@@ -3529,6 +3529,33 @@ def test_auto_scan_feature_budget_keeps_verified_execution_symbols_in_discovery_
     assert diagnostics["execution_mode"] == model_mode
 
 
+def test_market_analysis_value_selection_populates_runtime_budget_diagnostics() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    service.entry_feature_ranker = SimpleNamespace(
+        feature_opportunity_score=lambda feature: float(feature.score)
+    )
+    analysis_budget: dict[str, Any] = {}
+
+    selected = service._select_market_analysis_candidates(
+        {
+            "BTC/USDT": SimpleNamespace(score=10.0),
+            "ETH/USDT": SimpleNamespace(score=9.0),
+            "SOL/USDT": SimpleNamespace(score=8.0),
+        },
+        2,
+        analysis_budget_context=analysis_budget,
+    )
+
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    diagnostics = analysis_budget["market_analysis_selection"]
+    assert diagnostics["selected_symbols"] == ["BTC/USDT", "ETH/USDT"]
+    assert diagnostics["discovery_selected_symbols"] == ["ETH/USDT"]
+    assert diagnostics["is_entry_gate"] is False
+    assert analysis_budget["recent_market_analysis_dedupe"]["skipped_count"] == 0
+
+
 def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_counts() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
@@ -3594,6 +3621,14 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
             "skipped_count": 1,
             "skipped_symbols": ["ETH/USDT"],
         },
+        "market_analysis_selection": {
+            "version": "2026-07-21.marginal-market-analysis-value.v1",
+            "read_only": True,
+            "is_entry_gate": False,
+            "candidate_count": 4,
+            "selected_count": 1,
+            "selected_symbols": ["BTC/USDT"],
+        },
         "market_budget_rotation": {
             "read_only": True,
             "is_entry_gate": False,
@@ -3656,6 +3691,8 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
     )
     assert funnel["filtered_symbol_sample"][0]["non_selected_reason"] == ("feature_filter_rejected")
     assert funnel["recent_analysis_dedupe_count"] == 1
+    assert funnel["market_analysis_selection"]["candidate_count"] == 4
+    assert funnel["market_analysis_selection"]["is_entry_gate"] is False
     assert funnel["market_budget_rotation"]["read_only"] is True
     assert funnel["market_budget_rotation"]["is_entry_gate"] is False
     assert funnel["market_budget_rotation"]["applied"] is True

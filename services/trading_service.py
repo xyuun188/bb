@@ -115,6 +115,7 @@ from services.high_risk_review_service import HighRiskReviewService
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.manual_trade_execution import ManualTradeExecutionProcessor
 from services.manual_trade_risk_assessment import ManualTradeRiskAssessmentPolicy
+from services.market_analysis_selection import MarketAnalysisSelectionPolicy
 from services.market_auto_entry_processor import MarketAutoEntryProcessor
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 from services.market_decision_risk_assessment import MarketDecisionRiskAssessmentPolicy
@@ -302,6 +303,7 @@ AUTO_SCAN_FEATURE_FETCH_POOL_MAX = AUTO_SCAN_PARAMS.feature_fetch_pool_max
 AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS = AUTO_SCAN_PARAMS.feature_fetch_timeout_seconds
 AUTO_SCAN_FEATURE_FETCH_CONCURRENCY = AUTO_SCAN_PARAMS.feature_fetch_concurrency
 ALT_LONG_ALLOWED_SYMBOLS = set(AUTO_SCAN_PARAMS.major_symbols)
+MARKET_ANALYSIS_SELECTION_PARAMS = DEFAULT_TRADING_PARAMS.market_analysis_selection
 
 
 class TradingService:
@@ -643,6 +645,12 @@ class TradingService:
             suspicious_symbol_reason=self.entry_suspicious_symbol.reason,
             major_symbols=frozenset(ALT_LONG_ALLOWED_SYMBOLS),
         )
+        self.market_analysis_selector = MarketAnalysisSelectionPolicy(
+            normalize_symbol=self._normalize_position_symbol,
+            advantage_scorer=self._feature_opportunity_score,
+            params=MARKET_ANALYSIS_SELECTION_PARAMS,
+        )
+        self._last_market_analysis_selection_diagnostics: dict[str, Any] = {}
         self._market_budget_deferred_symbols: list[str] = []
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
@@ -2846,6 +2854,9 @@ class TradingService:
 
         self._decision_count = 0
         self._recent_decisions = []
+        selector = getattr(self, "market_analysis_selector", None)
+        if selector is not None:
+            selector.clear()
 
     def get_model_execution_mode(self, model_name: str) -> str:
         """Return model execution mode through an explicit execution-service boundary."""
@@ -4893,6 +4904,95 @@ class TradingService:
             self.model_contribution_performance_service = service
         return await service.recent(mode)
 
+    def _market_analysis_selector_policy(self) -> MarketAnalysisSelectionPolicy:
+        policy = getattr(self, "market_analysis_selector", None)
+        if policy is not None:
+            return policy
+        policy = MarketAnalysisSelectionPolicy(
+            normalize_symbol=self._normalize_position_symbol,
+            advantage_scorer=self._feature_opportunity_score,
+            params=MARKET_ANALYSIS_SELECTION_PARAMS,
+        )
+        self.market_analysis_selector = policy
+        return policy
+
+    async def _ensure_market_analysis_selection_history(self) -> None:
+        """Hydrate the short cooldown window once after each service start."""
+
+        policy = self._market_analysis_selector_policy()
+        if policy.history_loaded:
+            return
+        cutoff = datetime.now(UTC) - timedelta(
+            seconds=max(int(MARKET_ANALYSIS_SELECTION_PARAMS.cooldown_seconds), 1)
+        )
+        try:
+            async with get_read_session_ctx() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            AIDecision.symbol,
+                            AIDecision.created_at,
+                            AIDecision.feature_snapshot,
+                        )
+                        .where(
+                            AIDecision.model_name == ENSEMBLE_TRADER_NAME,
+                            AIDecision.analysis_type == "market",
+                            AIDecision.created_at >= cutoff,
+                        )
+                        .order_by(AIDecision.created_at.desc())
+                        .limit(max(int(MARKET_ANALYSIS_SELECTION_PARAMS.history_limit), 1))
+                    )
+                ).all()
+        except Exception as exc:
+            logger.warning(
+                "recent market analysis selection history load failed",
+                error=safe_error_text(exc),
+            )
+            return
+        for row in reversed(rows):
+            policy.remember(
+                str(row.symbol or ""),
+                row.feature_snapshot if isinstance(row.feature_snapshot, dict) else {},
+                observed_at=row.created_at,
+            )
+        policy.history_loaded = True
+
+    def _select_market_analysis_candidates(
+        self,
+        feature_vectors: dict[str, Any],
+        limit: int,
+        *,
+        analysis_budget_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = self._market_analysis_selector_policy().select(feature_vectors, limit)
+        diagnostics = self._safe_dict(result.diagnostics)
+        self._last_market_analysis_selection_diagnostics = diagnostics
+        analysis_budget_context["market_analysis_selection"] = diagnostics
+        analysis_budget_context["recent_market_analysis_dedupe"] = {
+            "read_only": True,
+            "is_entry_gate": False,
+            "skipped_count": int(diagnostics.get("skipped_count") or 0),
+            "skipped_symbols": list(diagnostics.get("skipped_symbols") or []),
+            "reason": (
+                "unchanged recent symbols that lost the marginal analysis value selection"
+            ),
+        }
+        logger.info(
+            "market analysis value shortlist",
+            candidate_count=diagnostics.get("candidate_count"),
+            selected_count=diagnostics.get("selected_count"),
+            selected_symbols=diagnostics.get("selected_symbols"),
+            recent_unchanged_candidate_count=diagnostics.get(
+                "recent_unchanged_candidate_count"
+            ),
+            skipped_symbols=diagnostics.get("skipped_symbols"),
+            material_change_bypass_count=diagnostics.get("material_change_bypass_count"),
+        )
+        return result.selected
+
+    def _remember_market_analysis_observation(self, symbol: str, feature: Any) -> None:
+        self._market_analysis_selector_policy().remember(symbol, feature)
+
     def _rank_auto_feature_vectors(
         self,
         feature_vectors: dict[str, Any],
@@ -5029,6 +5129,9 @@ class TradingService:
         budget_rotation = self._safe_dict(
             self._safe_dict(analysis_budget_context).get("market_budget_rotation")
         )
+        analysis_selection = self._safe_dict(
+            self._safe_dict(analysis_budget_context).get("market_analysis_selection")
+        )
         return {
             "read_only": True,
             "is_entry_gate": False,
@@ -5063,6 +5166,7 @@ class TradingService:
             "filtered_symbol_sample": rank_diagnostics.get("filtered_symbol_sample", []),
             "recent_analysis_dedupe_count": int(recent_dedupe.get("skipped_count") or 0),
             "recent_analysis_dedupe_symbols": recent_dedupe.get("skipped_symbols", []),
+            "market_analysis_selection": analysis_selection,
             "market_budget_rotation": budget_rotation,
             "market_feature_after_dedupe_count": len(market_feature_vectors_after_dedupe or {}),
             "market_feature_after_dedupe_symbols": list(
@@ -5814,10 +5918,14 @@ class TradingService:
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, rank_limit
                     )
+                    availability_target = self._market_analysis_selector_policy().candidate_pool_limit(
+                        market_symbol_budget,
+                        len(market_feature_vectors),
+                    )
                     market_feature_vectors = (
                         await self._filter_entry_instrument_shortlist(
                             market_feature_vectors,
-                            market_symbol_budget,
+                            availability_target,
                             model_mode,
                         )
                     )
@@ -5836,10 +5944,6 @@ class TradingService:
                         if self._normalize_position_symbol(s) in allowed_keys
                     }
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
-                market_feature_vectors = self._rotate_market_feature_vectors_for_budget_coverage(
-                    market_feature_vectors,
-                    analysis_budget_context=analysis_budget_context,
-                )
             if run_market_analysis and market_feature_vectors:
                 market_indicator_prewarm = await self._prewarm_market_candidate_indicators(
                     list(market_feature_vectors)
@@ -5896,6 +6000,17 @@ class TradingService:
                     "changes_trading_thresholds": False,
                 }
             results["market_prewarmed_feature_hydration"] = hydration_diagnostics
+            if mode_manager.is_auto_scan and run_market_analysis and market_feature_vectors:
+                await self._ensure_market_analysis_selection_history()
+                market_feature_vectors = self._select_market_analysis_candidates(
+                    market_feature_vectors,
+                    market_symbol_budget,
+                    analysis_budget_context=analysis_budget_context,
+                )
+                market_feature_vectors = self._rotate_market_feature_vectors_for_budget_coverage(
+                    market_feature_vectors,
+                    analysis_budget_context=analysis_budget_context,
+                )
             market_feature_vectors_after_dedupe = dict(market_feature_vectors)
             market_candidate_funnel = self._market_candidate_funnel_snapshot(
                 scan_symbols=list(scan_symbols or []),
@@ -6095,6 +6210,7 @@ class TradingService:
                 if not self._is_valid_feature_vector(fv):
                     logger.warning("skip symbol after fresh feature check failed", symbol=symbol)
                     continue
+                self._remember_market_analysis_observation(symbol, fv)
                 model_name = ENSEMBLE_TRADER_NAME
                 model_mode = self._get_model_execution_mode(model_name)
                 if model_mode not in market_execution_cost_facts:

@@ -69,6 +69,23 @@ class AutoScanParams:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketAnalysisSelectionParams:
+    """Expert-analysis allocation controls that do not grant trade permission."""
+
+    candidate_pool_multiplier: int = 3
+    discovery_slots: int = 1
+    cooldown_seconds: int = 5 * 60
+    unchanged_repeat_penalty_ratio: float = 0.35
+    history_limit: int = 120
+    material_price_change_ratio: float = 0.003
+    material_volume_ratio_change_ratio: float = 0.35
+    material_adx_change: float = 3.0
+    material_return_change: float = 0.003
+    material_volatility_change_ratio: float = 0.35
+    relative_change_floor: float = 1e-6
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyLearningParams:
     """Strategy-learning windows and advisory sample-target policy.
 
@@ -110,8 +127,11 @@ class TradingParameterSnapshot:
     )
     local_ml_training: LocalMLTrainingParams = field(default_factory=LocalMLTrainingParams)
     auto_scan: AutoScanParams = field(default_factory=AutoScanParams)
+    market_analysis_selection: MarketAnalysisSelectionParams = field(
+        default_factory=MarketAnalysisSelectionParams
+    )
     strategy_learning: StrategyLearningParams = field(default_factory=StrategyLearningParams)
-    version: str = "2026-07-12.dynamic-return-policy-v1"
+    version: str = "2026-07-21.market-analysis-value-v2"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
