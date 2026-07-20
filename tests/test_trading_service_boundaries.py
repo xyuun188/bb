@@ -208,6 +208,15 @@ def test_parallel_market_position_runtime_state_is_isolated(
     service._last_market_round_finished_at = None
     service._last_position_round_started_at = None
     service._last_position_round_finished_at = None
+    service._last_market_candidate_funnel = {
+        "market_feature_after_dedupe_count": 0,
+        "rank_underfill_reason": "missing_indicator_snapshot",
+    }
+    service._last_market_round_summary = {
+        "status": "ok",
+        "decision_count": 0,
+        "execution_count": 0,
+    }
     service._okx_authoritative_sync_task = None
     service._okx_authoritative_sync_started_at = None
     service._okx_authoritative_sync_last_success_at = None
@@ -252,6 +261,10 @@ def test_parallel_market_position_runtime_state_is_isolated(
     assert payload["position_stage_durations"]
     assert payload["round_active"] is True
     assert payload["current_stage"] == "fetch_features"
+    assert payload["last_market_candidate_funnel"]["rank_underfill_reason"] == (
+        "missing_indicator_snapshot"
+    )
+    assert payload["last_market_round_summary"]["decision_count"] == 0
     assert payload["okx_authoritative_sync"]["status"] == "pending"
     assert payload["okx_authoritative_sync"]["source"] == "okx_private_api_current_positions"
     assert payload["okx_authoritative_sync"]["last_result_kinds"] == {}
@@ -786,6 +799,38 @@ def test_market_scope_skips_pending_exit_recovery_before_ai() -> None:
     assert TradingService._should_recover_pending_exits_for_scope("market") is False
     assert TradingService._should_recover_pending_exits_for_scope("position") is True
     assert TradingService._should_recover_pending_exits_for_scope("full") is True
+
+
+def test_market_auto_feature_fetch_can_build_cached_indicator_snapshots() -> None:
+    options = TradingService._market_feature_fetch_options(
+        run_market_analysis=True,
+        run_position_analysis=False,
+        auto_scan=True,
+    )
+
+    assert options == {
+        "block_on_remote_ticker": False,
+        "block_on_remote_indicators": False,
+        "block_on_remote_derivatives": False,
+        "allow_cached_indicator_build": True,
+        "allow_indicator_background_refresh": True,
+        "allow_derivatives_background_refresh": True,
+    }
+
+
+def test_non_market_discovery_feature_fetch_keeps_complete_source_policy() -> None:
+    options = TradingService._market_feature_fetch_options(
+        run_market_analysis=False,
+        run_position_analysis=True,
+        auto_scan=True,
+    )
+
+    assert options["block_on_remote_ticker"] is True
+    assert options["block_on_remote_indicators"] is True
+    assert options["block_on_remote_derivatives"] is True
+    assert options["allow_cached_indicator_build"] is True
+    assert options["allow_indicator_background_refresh"] is True
+    assert options["allow_derivatives_background_refresh"] is True
 
 
 @pytest.mark.asyncio
@@ -3424,6 +3469,33 @@ def test_auto_scan_feature_budget_expands_discovery_without_lowering_entry_gates
     assert diagnostics["pool_max"] == 64
     assert diagnostics["is_entry_gate"] is False
     assert "not entry permission" in diagnostics["diagnostic_boundary"]
+
+
+def test_auto_scan_feature_budget_bootstraps_major_symbols_for_private_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._auto_scan_feature_cursor = 0
+    service._verified_entry_symbols_by_mode = {"paper": set()}
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 20)
+    symbols = ["S0/USDT", "BTC/USDT", "S1/USDT", "ETH/USDT", "S2/USDT", "S3/USDT"]
+
+    selected = service._budget_auto_scan_feature_symbols(symbols, [], configured_limit=2)
+
+    assert "BTC/USDT" in selected
+    assert "ETH/USDT" in selected
+    assert len(selected) == 4
+    assert service._last_auto_feature_fetch_budget_diagnostics[
+        "bootstrap_major_symbol_count"
+    ] == 2
+    assert service._last_auto_feature_fetch_budget_diagnostics["selected_priority_symbol_count"] == 2
 
 
 @pytest.mark.parametrize("model_mode", ["paper", "live"])

@@ -789,6 +789,8 @@ class TradingService:
         self._last_position_round_started_at: datetime | None = None
         self._last_position_round_finished_at: datetime | None = None
         self._last_round_error: str | None = None
+        self._last_market_candidate_funnel: dict[str, Any] = {}
+        self._last_market_round_summary: dict[str, Any] = {}
         self._analysis_runtime: dict[str, _AnalysisRuntimeState] = {
             "market": _AnalysisRuntimeState(),
             "position": _AnalysisRuntimeState(),
@@ -3548,6 +3550,28 @@ class TradingService:
             return await getter(symbol, **kwargs)
         return await getter(symbol)
 
+    @staticmethod
+    def _market_feature_fetch_options(
+        *,
+        run_market_analysis: bool,
+        run_position_analysis: bool,
+        auto_scan: bool,
+    ) -> dict[str, bool]:
+        """Build bounded feature-source options for one market discovery fetch."""
+
+        market_only_auto = bool(run_market_analysis and not run_position_analysis and auto_scan)
+        return {
+            "block_on_remote_ticker": not market_only_auto,
+            "block_on_remote_indicators": not market_only_auto,
+            "block_on_remote_derivatives": not market_only_auto,
+            # Cached K-lines and background refreshes are local/read-only. They
+            # keep the ranker from seeing an empty candidate pool while the
+            # final AI/entry gates still require complete current evidence.
+            "allow_cached_indicator_build": True,
+            "allow_indicator_background_refresh": True,
+            "allow_derivatives_background_refresh": True,
+        }
+
     def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:
         resolved_scope = scope or _analysis_scope_context.get() or "full"
         if resolved_scope not in self._analysis_runtime:
@@ -3771,6 +3795,12 @@ class TradingService:
                     else None
                 ),
                 "last_round_error": last_round_error,
+                "last_market_candidate_funnel": self._safe_dict(
+                    getattr(self, "_last_market_candidate_funnel", {})
+                ),
+                "last_market_round_summary": self._safe_dict(
+                    getattr(self, "_last_market_round_summary", {})
+                ),
                 "okx_authoritative_sync": okx_authoritative_sync,
                 "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
                 "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
@@ -4077,9 +4107,22 @@ class TradingService:
             for symbol in market_symbols
             if self._normalize_position_symbol(symbol) in verified_symbols
         ]
-        selected_verified = verified_market_symbols[
-            : min(len(verified_market_symbols), max(int(configured_limit), 0), market_budget)
+        major_symbol_keys = {
+            self._normalize_position_symbol(symbol) for symbol in ALT_LONG_ALLOWED_SYMBOLS
+        }
+        bootstrap_major_symbols = [
+            symbol
+            for symbol in market_symbols
+            if self._normalize_position_symbol(symbol) in major_symbol_keys
         ]
+        priority_market_symbols = self.entry_symbol_universe.dedupe_symbols(
+            [*verified_market_symbols, *bootstrap_major_symbols]
+        )
+        priority_limit = min(
+            market_budget,
+            max(int(configured_limit), len(bootstrap_major_symbols)),
+        )
+        selected_verified = priority_market_symbols[:priority_limit]
         self._last_auto_feature_fetch_budget_diagnostics = {
             "read_only": True,
             "is_entry_gate": False,
@@ -4094,6 +4137,8 @@ class TradingService:
             "pool_min": int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
             "pool_max": int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX),
             "verified_execution_symbol_count": len(verified_market_symbols),
+            "bootstrap_major_symbol_count": len(bootstrap_major_symbols),
+            "selected_priority_symbol_count": len(selected_verified),
             "execution_mode": model_mode,
             "diagnostic_boundary": (
                 "Feature-fetch breadth only expands discovery before rank/evidence gates; "
@@ -5562,40 +5607,16 @@ class TradingService:
             async def fetch_fv(sym):
                 async with sem:
                     try:
+                        feature_options = self._market_feature_fetch_options(
+                            run_market_analysis=run_market_analysis,
+                            run_position_analysis=run_position_analysis,
+                            auto_scan=mode_manager.is_auto_scan,
+                        )
                         return sym, await asyncio.wait_for(
                             self._get_feature_vector_snapshot(
                                 sym,
                                 wait_for_sentiment=False,
-                                block_on_remote_ticker=not (
-                                    run_market_analysis
-                                    and not run_position_analysis
-                                    and mode_manager.is_auto_scan
-                                ),
-                                block_on_remote_indicators=not (
-                                    run_market_analysis
-                                    and not run_position_analysis
-                                    and mode_manager.is_auto_scan
-                                ),
-                                block_on_remote_derivatives=not (
-                                    run_market_analysis
-                                    and not run_position_analysis
-                                    and mode_manager.is_auto_scan
-                                ),
-                                allow_cached_indicator_build=not (
-                                    run_market_analysis
-                                    and not run_position_analysis
-                                    and mode_manager.is_auto_scan
-                                ),
-                                allow_indicator_background_refresh=not (
-                                    run_market_analysis
-                                    and not run_position_analysis
-                                    and mode_manager.is_auto_scan
-                                ),
-                                allow_derivatives_background_refresh=not (
-                                    run_market_analysis
-                                    and not run_position_analysis
-                                    and mode_manager.is_auto_scan
-                                ),
+                                **feature_options,
                             ),
                             timeout=feature_timeout,
                         )
@@ -6826,6 +6847,34 @@ class TradingService:
             claimed_analysis_symbols.clear()
             round_duration = (datetime.now(UTC) - round_start).total_seconds()
             results["duration_ms"] = round(round_duration * 1000)
+            if analysis_scope == "market":
+                funnel = results.get("market_candidate_funnel")
+                if isinstance(funnel, dict):
+                    self._last_market_candidate_funnel = self._safe_dict(funnel)
+                self._last_market_round_summary = {
+                    "status": results.get("status"),
+                    "symbols_processed": int(results.get("symbols_processed") or 0),
+                    "decision_count": len(results.get("decisions") or []),
+                    "execution_count": len(results.get("executions") or []),
+                    "market_indicator_prewarm": self._safe_dict(
+                        results.get("market_indicator_prewarm")
+                    ),
+                    "market_prewarmed_feature_hydration": self._safe_dict(
+                        results.get("market_prewarmed_feature_hydration")
+                    ),
+                    "analysis_budget": {
+                        "market_symbol_limit": self._safe_dict(
+                            results.get("analysis_budget")
+                        ).get("market_symbol_limit"),
+                        "market_limit_policy": self._safe_dict(
+                            results.get("analysis_budget")
+                        ).get("market_limit_policy"),
+                    },
+                }
+                if isinstance(funnel, dict):
+                    self._last_market_round_summary["market_candidate_funnel"] = (
+                        self._safe_dict(funnel)
+                    )
             finished_at = datetime.now(UTC)
             self._finish_runtime_round(
                 analysis_scope,
@@ -10482,6 +10531,12 @@ class TradingService:
             ),
             "last_round_error": (
                 market_state.last_error or position_state.last_error or self._last_round_error
+            ),
+            "last_market_candidate_funnel": self._safe_dict(
+                getattr(self, "_last_market_candidate_funnel", {})
+            ),
+            "last_market_round_summary": self._safe_dict(
+                getattr(self, "_last_market_round_summary", {})
             ),
             "live_model": ENSEMBLE_TRADER_NAME,
             "models": [ENSEMBLE_TRADER_NAME],
