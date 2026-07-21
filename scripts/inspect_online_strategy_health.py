@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -76,6 +77,7 @@ SUMMARY_ONLY = __SUMMARY_ONLY__
 MARKET_SYMBOL_ONLY = __MARKET_SYMBOL_ONLY__
 ENTRY_ONLY = __ENTRY_ONLY__
 DECISION_ID = __DECISION_ID__
+REPLAY_ONLY = __REPLAY_ONLY__
 
 
 async def _read_stage(name, awaitable):
@@ -118,6 +120,25 @@ async def _read_positions_and_protection():
 
 
 async def main():
+    if REPLAY_ONLY:
+        started = time.perf_counter()
+        strategy = await get_strategy_learning(mode="paper", detail="summary")
+        schedule = strategy.get("schedule") if isinstance(strategy, dict) else {}
+        schedule = schedule if isinstance(schedule, dict) else {}
+        feedback = strategy.get("feedback") if isinstance(strategy, dict) else {}
+        feedback = feedback if isinstance(feedback, dict) else {}
+        print(json.dumps({
+            "generated_at": datetime.now(UTC).isoformat(),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "candidate_count": schedule.get("candidate_count"),
+            "governed_candidate_count": schedule.get("governed_candidate_count"),
+            "rejected_candidate_count": schedule.get("rejected_candidate_count"),
+            "scheduler_mode": schedule.get("scheduler_mode"),
+            "historical_model_replay": schedule.get("historical_model_replay") or {},
+            "paper_strategy_champion": strategy.get("paper_strategy_champion") or {},
+            "shadow_feedback": feedback.get("shadow_feedback") or {},
+        }, ensure_ascii=False, default=str))
+        return
     since = datetime.now(UTC) - timedelta(minutes=WINDOW_MINUTES)
     contract = await TradeExecutionContractService().report(since=since, limit=5000)
     try:
@@ -281,6 +302,7 @@ def _build_remote_command(
     summary: bool = False,
     market_symbol_only: bool = False,
     entry_only: bool = False,
+    replay_only: bool = False,
     decision_id: int = 0,
     output_path: str | None = None,
 ) -> str:
@@ -296,6 +318,7 @@ def _build_remote_command(
         .replace("__SUMMARY_ONLY__", "True" if summary else "False")
         .replace("__MARKET_SYMBOL_ONLY__", "True" if market_symbol_only else "False")
         .replace("__ENTRY_ONLY__", "True" if entry_only else "False")
+        .replace("__REPLAY_ONLY__", "True" if replay_only else "False")
         .replace("__DECISION_ID__", str(max(int(decision_id or 0), 0)))
     )
     quoted_sample = shlex.quote(sample_path)
@@ -370,6 +393,8 @@ def _summarize_report(report: dict) -> dict:
                 "entry_policy",
                 "exit_policy",
                 "risk_policy",
+                "training_evidence",
+                "historical_replay_policy",
             )
             if key in strategy_blueprint
         },
@@ -444,6 +469,10 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
     production_strategy = production_strategy if isinstance(production_strategy, dict) else {}
     paper_champion = strategy.get("paper_strategy_champion")
     paper_champion = paper_champion if isinstance(paper_champion, dict) else {}
+    historical_replay = schedule.get("historical_model_replay")
+    historical_replay = (
+        historical_replay if isinstance(historical_replay, dict) else {}
+    )
     protection = positions.get("protection_inventory")
     protection = protection if isinstance(protection, dict) else {}
     return {
@@ -608,6 +637,7 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
                 )
                 if key in paper_champion
             },
+            "historical_model_replay": historical_replay,
             "production_influence_enabled": bool(
                 runtime.get("production_influence_enabled")
             ),
@@ -775,6 +805,7 @@ def main() -> None:
     parser.add_argument("--summary", action="store_true")
     parser.add_argument("--market-symbol-only", action="store_true")
     parser.add_argument("--entry-only", action="store_true")
+    parser.add_argument("--replay-only", action="store_true")
     parser.add_argument("--decision-id", type=int, default=0)
     args = parser.parse_args()
     minutes = max(int(args.minutes or 480), 1)
@@ -786,6 +817,7 @@ def main() -> None:
         summary=args.summary,
         market_symbol_only=args.market_symbol_only,
         entry_only=args.entry_only,
+        replay_only=args.replay_only,
         decision_id=args.decision_id,
         output_path=result_path,
     )
@@ -805,7 +837,9 @@ def main() -> None:
         payload = _decode_remote_json(output)
         safe_print(
             json.dumps(
-                _summarize_report(payload) if args.summary else payload,
+                _summarize_report(payload)
+                if args.summary and not args.replay_only
+                else payload,
                 ensure_ascii=False,
                 indent=2,
             )

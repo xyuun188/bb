@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import ceil, isfinite, sqrt
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import load_only
 
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
@@ -23,7 +26,13 @@ from services.authoritative_trade_outcome import (
     load_authoritative_trade_outcomes,
 )
 from services.paper_strategy_champion import PaperStrategyChampionService
+from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_backtest_service import shadow_fee_after_outcome
+from services.shadow_training_quarantine import assess_shadow_row
+from services.strategy_historical_replay import (
+    ModelPredictor,
+    build_strategy_historical_replay,
+)
 from services.text_integrity import sanitize_runtime_text
 
 logger = structlog.get_logger(__name__)
@@ -118,6 +127,94 @@ def _regime_label(value: Any) -> str:
             if label:
                 return label
     return ""
+
+
+def _shadow_cost_evidence(
+    row: Any,
+    *,
+    snapshot_override: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], float | None, float | None, dict[str, Any], list[str]]:
+    snapshot = (
+        dict(snapshot_override)
+        if isinstance(snapshot_override, dict)
+        else _safe_dict(getattr(row, "feature_snapshot", None))
+    )
+    long_gross = _optional_float(getattr(row, "long_return_pct", None))
+    short_gross = _optional_float(getattr(row, "short_return_pct", None))
+    if long_gross is None or short_gross is None:
+        return snapshot, long_gross, short_gross, {}, ["direction_return_missing"]
+    evidence_row = (
+        SimpleNamespace(
+            feature_snapshot=snapshot,
+            horizon_minutes=getattr(row, "horizon_minutes", 0),
+        )
+        if snapshot_override is not None
+        else row
+    )
+    outcome = shadow_fee_after_outcome(
+        evidence_row,
+        long_return=long_gross / 100.0,
+        short_return=short_gross / 100.0,
+    )
+    if outcome.get("cost_complete") is not True:
+        reasons = [
+            str(value)
+            for value in _safe_list(outcome.get("incomplete_reasons"))
+            if value
+        ] or ["shadow_cost_contract_incomplete"]
+        return snapshot, long_gross, short_gross, outcome, reasons
+    return snapshot, long_gross, short_gross, outcome, []
+
+
+def _historical_replay_observation(row: Any) -> tuple[dict[str, Any] | None, list[str]]:
+    replay_snapshot = _safe_dict(
+        getattr(row, "training_feature_snapshot", None)
+    )
+    snapshot, long_gross, short_gross, outcome, reasons = _shadow_cost_evidence(
+        row,
+        snapshot_override=replay_snapshot,
+    )
+    if reasons or long_gross is None or short_gross is None:
+        return None, reasons
+    created_at = getattr(row, "created_at", None)
+    if isinstance(created_at, datetime) and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    quality = assess_shadow_row(row)
+    training_eligible = bool(
+        isinstance(created_at, datetime)
+        and created_at >= PHASE3_CLEAN_START_UTC
+        and not quality.exclude_from_training
+    )
+    return {
+        "source_id": _safe_int(getattr(row, "id", None)),
+        "decision_id": _safe_int(getattr(row, "decision_id", None)) or None,
+        "symbol": str(getattr(row, "symbol", "") or "").upper(),
+        "market_regime": _regime_label(snapshot.get("market_regime")),
+        "horizon_minutes": _safe_int(getattr(row, "horizon_minutes", None), 10),
+        "created_at": _timestamp_text(created_at),
+        "completed_at": _timestamp_text(getattr(row, "updated_at", None)),
+        "decision_timestamp": _timestamp_text(created_at),
+        "label_timestamp": _timestamp_text(getattr(row, "due_at", None) or created_at),
+        "feature_snapshot": snapshot,
+        "execution_cost_pct": round(
+            _safe_float(outcome.get("fee_return_pct"))
+            + _safe_float(outcome.get("slippage_return_pct")),
+            8,
+        ),
+        "long_gross_return_pct": round(long_gross, 8),
+        "short_gross_return_pct": round(short_gross, 8),
+        "long_net_return_after_cost_pct": outcome.get(
+            "long_net_return_after_cost_pct"
+        ),
+        "short_net_return_after_cost_pct": outcome.get(
+            "short_net_return_after_cost_pct"
+        ),
+        "long_funding_return_pct": outcome.get("funding_return_long_pct"),
+        "short_funding_return_pct": outcome.get("funding_return_short_pct"),
+        "training_eligible": training_eligible,
+        "training_quality_status": quality.status,
+        "training_quality_reasons": list(quality.reasons),
+    }, []
 
 
 def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
@@ -458,12 +555,14 @@ class StrategyFeedback:
     runtime_prior_usage: dict[str, Any] = field(default_factory=dict)
     authoritative_return_samples: list[dict[str, Any]] = field(default_factory=list)
     shadow_return_samples: list[dict[str, Any]] = field(default_factory=list)
+    shadow_replay_observations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self, *, include_samples: bool = False) -> dict[str, Any]:
         payload = {
             name: _json_safe(getattr(self, name))
             for name in self.__dataclass_fields__
-            if include_samples or not name.endswith("_samples")
+            if name != "shadow_replay_observations"
+            and (include_samples or not name.endswith("_samples"))
         }
         if include_samples:
             payload["authoritative_return_samples"] = _json_safe(
@@ -477,8 +576,26 @@ class StrategyCandidateGenerator:
     """Generate a candidate for every observed return partition."""
 
     def generate(self, feedback: StrategyFeedback) -> list[StrategyProfile]:
+        return self.generate_from_samples(
+            feedback.authoritative_return_samples,
+            window_hours=feedback.window_hours,
+            generated_at=feedback.generated_at,
+            evidence_source="trusted_cost_complete_closed_positions",
+            evidence_mode="authoritative_trade_outcomes",
+        )
+
+    def generate_from_samples(
+        self,
+        samples: list[dict[str, Any]],
+        *,
+        window_hours: int,
+        generated_at: str,
+        evidence_source: str,
+        evidence_mode: str,
+        strategy_id: str | None = None,
+    ) -> list[StrategyProfile]:
         partitions: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
-        for sample in feedback.authoritative_return_samples:
+        for sample in samples:
             side = str(sample.get("side") or "").lower()
             symbol = str(sample.get("symbol") or "").upper()
             regime = str(sample.get("market_regime") or "").lower()
@@ -506,10 +623,12 @@ class StrategyCandidateGenerator:
             metrics = _return_metrics(samples)
             version = max(_safe_int(sample.get("source_row_id")) for sample in samples)
             provenance = {
-                "source": "trusted_cost_complete_closed_positions",
-                "observation_window": f"trailing_{feedback.window_hours}_hours",
+                "source": evidence_source,
+                "evidence_mode": evidence_mode,
+                "strategy_id": strategy_id,
+                "observation_window": f"trailing_{window_hours}_hours",
                 "sample_count": len(samples),
-                "generated_at": feedback.generated_at,
+                "generated_at": generated_at,
                 "strategy_version": STRATEGY_SCHEDULER_VERSION,
                 "fallback_reason": "",
                 "position_ids": sorted(
@@ -522,7 +641,11 @@ class StrategyCandidateGenerator:
                     version=version,
                     label=_profile_label(selector),
                     status="candidate",
-                    source="authoritative_fee_after_return_partition",
+                    source=(
+                        "trained_model_historical_replay_partition"
+                        if evidence_mode == "exact_trained_model_historical_replay"
+                        else "authoritative_fee_after_return_partition"
+                    ),
                     description=(
                         "Historical return prior; current live return, execution cost, account "
                         "risk, and position contracts remain mandatory."
@@ -671,26 +794,97 @@ class StrategyLearningEngine:
         *,
         current_context: dict[str, Any] | None = None,
         detail: str = "summary",
+        model_strategy_blueprint: dict[str, Any] | None = None,
+        model_predictor: ModelPredictor | None = None,
     ) -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
         backtest_rows: list[dict[str, Any]] = []
         shadow_rows: list[dict[str, Any]] = []
         include_evidence_rows = detail == "full"
-        for profile in self.generator.generate(feedback):
+        blueprint = _safe_dict(model_strategy_blueprint)
+        model_replay_required = bool(
+            blueprint.get("paper_execution_eligible") is True
+            and blueprint.get("execution_scope") == "paper_only"
+            and blueprint.get("live_execution_permission") is False
+        )
+        replay = build_strategy_historical_replay(
+            blueprint=blueprint,
+            observations=feedback.shadow_replay_observations,
+            predictor=model_predictor,
+        )
+        exact_replay = bool(model_replay_required and replay.get("status") == "complete")
+        replay_development = list(replay.get("development_samples") or [])
+        replay_exam = list(replay.get("exam_samples") or [])
+        if model_replay_required:
+            profiles = (
+                self.generator.generate_from_samples(
+                    replay_development,
+                    window_hours=feedback.window_hours,
+                    generated_at=feedback.generated_at,
+                    evidence_source="exact_current_model_on_immutable_shadow_snapshot",
+                    evidence_mode="exact_trained_model_historical_replay",
+                    strategy_id=str(blueprint.get("strategy_id") or "") or None,
+                )
+                if exact_replay and replay_development
+                else []
+            )
+        else:
+            profiles = self.generator.generate(feedback)
+        for profile in profiles:
             selector = _safe_dict(profile.params.get("selector"))
             authoritative = [
                 sample
-                for sample in feedback.authoritative_return_samples
+                for sample in (
+                    replay_development
+                    if exact_replay and replay_development
+                    else feedback.authoritative_return_samples
+                )
                 if _selector_matches(selector, sample)
             ]
             shadows = [
                 sample
-                for sample in feedback.shadow_return_samples
+                for sample in (
+                    replay_exam
+                    if exact_replay
+                    else []
+                    if model_replay_required
+                    else feedback.shadow_return_samples
+                )
                 if _selector_matches(selector, sample)
             ]
             backtest = _walk_forward_report(authoritative)
+            backtest["evidence_mode"] = (
+                "exact_trained_model_historical_replay"
+                if exact_replay
+                else "authoritative_trade_outcomes"
+            )
+            backtest["evidence_partition"] = (
+                "strategy_development"
+                if exact_replay
+                else "authoritative_closed_positions"
+            )
             shadow = _shadow_report(shadows, include_rows=include_evidence_rows)
+            shadow["validation_method"] = (
+                replay.get("validation_method")
+                if exact_replay
+                else "model_historical_replay_required"
+                if model_replay_required
+                else "legacy_selector_matched_shadow"
+            )
+            shadow["evidence_partition"] = (
+                "strategy_exam" if exact_replay else "legacy_shadow"
+            )
             rejection_reasons = _candidate_rejections(backtest, shadow)
+            if model_replay_required and not exact_replay:
+                rejection_reasons.append(
+                    f"model_historical_replay_{replay.get('status') or 'incomplete'}"
+                )
+            provenance = _safe_dict(profile.params.get("policy_provenance"))
+            if model_replay_required and provenance.get("evidence_mode") != (
+                "exact_trained_model_historical_replay"
+            ):
+                rejection_reasons.append("exact_model_replay_evidence_missing")
+            rejection_reasons = list(dict.fromkeys(rejection_reasons))
             influence_eligible = not rejection_reasons
             profile_payload = profile.to_dict()
             profile_payload["status"] = "governed" if influence_eligible else "shadow_validation"
@@ -729,15 +923,30 @@ class StrategyLearningEngine:
         scheduler_mode = (
             "governed_dynamic_return"
             if influence_enabled
+            else "model_replay_no_fee_after_entries"
+            if model_replay_required
+            and replay.get("status") == "complete"
+            and not candidates
+            else "model_replay_incomplete"
+            if model_replay_required and not candidates
             else "shadow_validation"
             if candidates
             else "insufficient_authoritative_evidence"
         )
         reason = (
-            "Governed fee-after return candidates are available as matching historical priors; "
+            "Governed fee-after return candidates are available from exact model replay; "
+            "the current live return and dynamic risk contracts still own execution."
+            if influence_enabled and exact_replay
+            else "Governed fee-after return candidates are available as matching historical priors; "
             "the current live return and dynamic risk contracts still own execution."
             if influence_enabled
-            else "Candidates remain in shadow because walk-forward or cost-complete shadow evidence is incomplete."
+            else "Exact trained-model historical replay found no fee-after-positive entries; no model strategy candidate was created."
+            if model_replay_required
+            and replay.get("status") == "complete"
+            and not candidates
+            else "The trained-model historical replay is incomplete, so no model strategy candidate can be created."
+            if model_replay_required and not candidates
+            else "Candidates remain in shadow because exact model replay, walk-forward, or cost-complete exam evidence is incomplete."
             if candidates
             else "No trusted cost-complete return-rate samples are available for candidate generation."
         )
@@ -775,9 +984,17 @@ class StrategyLearningEngine:
                 "position_exposure": context.get("position_exposure"),
             },
             "policy_provenance": {
-                "source": "authoritative_walk_forward_and_cost_complete_shadow_scheduler",
+                "source": (
+                    "exact_model_historical_replay_scheduler"
+                    if exact_replay
+                    else "authoritative_walk_forward_and_cost_complete_shadow_scheduler"
+                ),
                 "observation_window": f"trailing_{feedback.window_hours}_hours",
-                "sample_count": len(feedback.authoritative_return_samples),
+                "sample_count": (
+                    len(replay_development)
+                    if exact_replay
+                    else len(feedback.authoritative_return_samples)
+                ),
                 "generated_at": feedback.generated_at,
                 "strategy_version": STRATEGY_SCHEDULER_VERSION,
                 "fallback_reason": "" if influence_enabled else scheduler_mode,
@@ -795,8 +1012,14 @@ class StrategyLearningEngine:
             "backtest": {"rows": backtest_rows},
             "shadow_validation": {
                 "cost_complete_required": True,
+                "exact_model_replay_required": model_replay_required,
                 "can_authorize_entry": False,
                 "rows": shadow_rows,
+            },
+            "historical_model_replay": {
+                key: _json_safe(value)
+                for key, value in replay.items()
+                if key not in {"development_samples", "exam_samples"}
             },
             "scheduler_mode": scheduler_mode,
             "current_production_strategy": production_strategy,
@@ -848,10 +1071,33 @@ class StrategyLearningService:
         *,
         engine: StrategyLearningEngine | None = None,
         champion_service: PaperStrategyChampionService | None = None,
+        replay_model_service: Any | None = None,
         **_: Any,
     ) -> None:
         self.engine = engine or StrategyLearningEngine()
         self.champion_service = champion_service or PaperStrategyChampionService()
+        self._replay_model_service = replay_model_service
+
+    def _default_model_replay_context(
+        self,
+        mode: str,
+    ) -> tuple[dict[str, Any], ModelPredictor | None]:
+        if str(mode).lower() == "live":
+            return {}, None
+        try:
+            if self._replay_model_service is None:
+                from services.ml_signal_service import MLSignalService
+
+                self._replay_model_service = MLSignalService()
+            blueprint = self._replay_model_service.strategy_blueprint()
+            predictor = getattr(self._replay_model_service, "predict", None)
+            return _safe_dict(blueprint), predictor if callable(predictor) else None
+        except Exception as exc:
+            logger.warning(
+                "strategy_historical_replay_model_unavailable",
+                error=safe_error_text(exc, limit=160),
+            )
+            return {}, None
 
     async def dashboard_payload(
         self,
@@ -861,8 +1107,23 @@ class StrategyLearningService:
         limit: int = 500,
         detail: str = "summary",
     ) -> dict[str, Any]:
-        feedback = await self._feedback(mode=mode, hours=hours, limit=limit)
-        payload = self.engine.build_from_feedback(feedback, detail=detail)
+        blueprint, predictor = self._default_model_replay_context(mode)
+        feedback = await self._feedback(
+            mode=mode,
+            hours=hours,
+            limit=limit,
+            include_historical_replay=bool(
+                blueprint.get("paper_execution_eligible") is True
+                and predictor is not None
+            ),
+        )
+        payload = await asyncio.to_thread(
+            self.engine.build_from_feedback,
+            feedback,
+            detail=detail,
+            model_strategy_blueprint=blueprint,
+            model_predictor=predictor,
+        )
         champion = await self.champion_service.current(mode)
         payload.update(
             {
@@ -883,16 +1144,31 @@ class StrategyLearningService:
         strategy_context: dict[str, Any],
         open_positions: list[dict[str, Any]] | None,
         model_strategy_blueprint: dict[str, Any] | None = None,
+        model_predictor: ModelPredictor | None = None,
         hours: int = DEFAULT_LOOKBACK_HOURS,
         limit: int = 500,
     ) -> dict[str, Any]:
-        feedback = await self._feedback(mode=mode, hours=hours, limit=limit)
+        feedback = await self._feedback(
+            mode=mode,
+            hours=hours,
+            limit=limit,
+            include_historical_replay=bool(
+                _safe_dict(model_strategy_blueprint).get(
+                    "paper_execution_eligible"
+                )
+                is True
+                and model_predictor is not None
+            ),
+        )
         if open_positions is not None:
             feedback.open_position_pressure["runtime_open_position_count"] = len(open_positions)
-        payload = self.engine.build_from_feedback(
+        payload = await asyncio.to_thread(
+            self.engine.build_from_feedback,
             feedback,
             current_context=strategy_context,
             detail="summary",
+            model_strategy_blueprint=model_strategy_blueprint,
+            model_predictor=model_predictor,
         )
         champion = await self.champion_service.reconcile(
             mode=mode,
@@ -907,7 +1183,14 @@ class StrategyLearningService:
         result["execution_mode"] = "live" if str(mode).lower() == "live" else "paper"
         return result
 
-    async def _feedback(self, *, mode: str, hours: int, limit: int) -> StrategyFeedback:
+    async def _feedback(
+        self,
+        *,
+        mode: str,
+        hours: int,
+        limit: int,
+        include_historical_replay: bool = False,
+    ) -> StrategyFeedback:
         selected_mode = "live" if str(mode).lower() == "live" else "paper"
         effective_hours = max(int(hours or 1), 1)
         effective_limit = max(int(limit or 1), 1)
@@ -972,6 +1255,58 @@ class StrategyLearningService:
                 )
                 .scalars()
                 .all()
+            )
+            replay_shadows = (
+                list(
+                    (
+                        await session.execute(
+                            select(ShadowBacktest)
+                            .where(
+                                ShadowBacktest.execution_mode == "paper",
+                                ShadowBacktest.status == "completed",
+                                ShadowBacktest.created_at
+                                >= PHASE3_CLEAN_START_UTC.replace(tzinfo=None),
+                                ShadowBacktest.long_return_pct.is_not(None),
+                                ShadowBacktest.short_return_pct.is_not(None),
+                                or_(
+                                    ShadowBacktest.decision_action.in_(["long", "short"]),
+                                    and_(
+                                        ShadowBacktest.missed_opportunity.is_(True),
+                                        ShadowBacktest.best_action.in_(["long", "short"]),
+                                    ),
+                                ),
+                            )
+                            .options(
+                                load_only(
+                                    ShadowBacktest.id,
+                                    ShadowBacktest.decision_id,
+                                    ShadowBacktest.created_at,
+                                    ShadowBacktest.updated_at,
+                                    ShadowBacktest.symbol,
+                                    ShadowBacktest.analysis_type,
+                                    ShadowBacktest.decision_action,
+                                    ShadowBacktest.decision_confidence,
+                                    ShadowBacktest.training_feature_snapshot,
+                                    ShadowBacktest.due_at,
+                                    ShadowBacktest.horizon_minutes,
+                                    ShadowBacktest.label_version,
+                                    ShadowBacktest.long_return_pct,
+                                    ShadowBacktest.short_return_pct,
+                                    ShadowBacktest.best_action,
+                                    ShadowBacktest.missed_opportunity,
+                                )
+                            )
+                            .order_by(
+                                ShadowBacktest.created_at.asc(),
+                                ShadowBacktest.id.asc(),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if selected_mode == "paper" and include_historical_replay
+                else []
             )
             decisions = list(
                 (
@@ -1055,25 +1390,13 @@ class StrategyLearningService:
             )
 
         shadow_samples: list[dict[str, Any]] = []
+        shadow_replay_observations: list[dict[str, Any]] = []
         shadow_excluded: dict[str, int] = {}
         for row in shadows:
-            snapshot = _safe_dict(getattr(row, "feature_snapshot", None))
-            long_gross = _optional_float(getattr(row, "long_return_pct", None))
-            short_gross = _optional_float(getattr(row, "short_return_pct", None))
-            if long_gross is None or short_gross is None:
-                shadow_excluded["direction_return_missing"] = (
-                    shadow_excluded.get("direction_return_missing", 0) + 1
-                )
-                continue
-            outcome = shadow_fee_after_outcome(
-                row,
-                long_return=long_gross / 100.0,
-                short_return=short_gross / 100.0,
+            snapshot, long_gross, short_gross, outcome, reasons = (
+                _shadow_cost_evidence(row)
             )
-            if outcome.get("cost_complete") is not True:
-                reasons = _safe_list(outcome.get("incomplete_reasons")) or [
-                    "shadow_cost_contract_incomplete"
-                ]
+            if reasons or long_gross is None or short_gross is None:
                 for reason in reasons:
                     reason_text = str(reason)
                     shadow_excluded[reason_text] = shadow_excluded.get(reason_text, 0) + 1
@@ -1110,6 +1433,16 @@ class StrategyLearningService:
                     }
                 )
 
+        replay_excluded: dict[str, int] = {}
+        for row in replay_shadows:
+            replay_observation, reasons = _historical_replay_observation(row)
+            if replay_observation is not None:
+                shadow_replay_observations.append(replay_observation)
+                continue
+            for reason in reasons or ["historical_replay_observation_incomplete"]:
+                reason_text = str(reason)
+                replay_excluded[reason_text] = replay_excluded.get(reason_text, 0) + 1
+
         side_performance = {
             side: _legacy_observation_summary(
                 [sample for sample in authoritative_samples if sample.get("side") == side]
@@ -1129,6 +1462,9 @@ class StrategyLearningService:
         ] + [
             {"code": code, "count": count, "kind": "shadow_sample_excluded"}
             for code, count in sorted(shadow_excluded.items())
+        ] + [
+            {"code": code, "count": count, "kind": "historical_replay_excluded"}
+            for code, count in sorted(replay_excluded.items())
         ]
         return StrategyFeedback(
             mode=selected_mode,
@@ -1147,6 +1483,14 @@ class StrategyLearningService:
             shadow_feedback={
                 "completed_row_count": len(shadows),
                 "cost_complete_direction_sample_count": len(shadow_samples),
+                "historical_replay_observation_count": len(
+                    shadow_replay_observations
+                ),
+                "historical_replay_training_eligible_count": sum(
+                    row.get("training_eligible") is True
+                    for row in shadow_replay_observations
+                ),
+                "historical_replay_excluded_reason_counts": replay_excluded,
                 "excluded_reason_counts": shadow_excluded,
                 "can_authorize_entry": False,
             },
@@ -1179,6 +1523,7 @@ class StrategyLearningService:
             runtime_prior_usage=_runtime_prior_usage(decisions),
             authoritative_return_samples=authoritative_samples,
             shadow_return_samples=shadow_samples,
+            shadow_replay_observations=shadow_replay_observations,
         )
 
     async def record_event(

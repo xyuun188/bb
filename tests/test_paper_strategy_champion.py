@@ -64,10 +64,22 @@ def _candidate(
         "params": {
             "selector": selector or {"scope": "side", "side": "long"},
             "historical_return_distribution": metrics,
+            "policy_provenance": {
+                "evidence_mode": "exact_trained_model_historical_replay",
+            },
         },
         "promotion": {"production_influence_eligible": True},
-        "backtest": {"status": "complete", "metrics": metrics},
-        "shadow_validation": {"status": "complete", "metrics": metrics},
+        "backtest": {
+            "status": "complete",
+            "metrics": metrics,
+            "evidence_partition": "strategy_development",
+        },
+        "shadow_validation": {
+            "status": "complete",
+            "metrics": metrics,
+            "evidence_partition": "strategy_exam",
+            "validation_method": "exact_current_model_on_immutable_shadow_snapshot",
+        },
     }
 
 
@@ -75,6 +87,11 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
     metadata = {
         "artifact_version": "model-v1",
         "training_data_sha256": "a" * 64,
+        "training_shadow_sample_count": 24,
+        "train_count": 12,
+        "test_count": 12,
+        "horizons": [10, 30, 60],
+        "evaluation_group_policy": "chronological_disjoint_decision_groups",
         "oos_return_evaluation": {
             "long": {
                 "avg_return_pct": 0.4,
@@ -111,6 +128,8 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
     assert blueprint["paper_execution_eligible"] is True
     assert blueprint["live_execution_permission"] is False
     assert blueprint["eligible_sides"] == ["long"]
+    assert blueprint["training_evidence"]["holdout_sample_count"] == 12
+    assert blueprint["exit_policy"]["historical_replay_horizon_minutes"] == 10
     assert blueprint["risk_policy"]["model_may_change_size_or_leverage"] is False
     assert blueprint["risk_policy"]["model_may_bypass_order_deduplication"] is False
     assert "position_size" not in blueprint
@@ -135,6 +154,21 @@ def test_challenger_requires_strict_improvement_or_strictly_better_model() -> No
     report = compare_paper_strategy_challenger(better_model, champion)
     assert report["accepted"] is True
     assert report["model_strict_improvement"] is True
+
+
+def test_trained_strategy_rejects_legacy_selector_matched_shadow_evidence() -> None:
+    candidate = _candidate("side_long")
+    candidate["params"]["policy_provenance"] = {
+        "evidence_mode": "authoritative_trade_outcomes"
+    }
+    candidate["shadow_validation"]["validation_method"] = (
+        "legacy_selector_matched_shadow"
+    )
+
+    assert build_trained_model_strategy_candidates(
+        _blueprint("v1"),
+        [candidate],
+    ) == []
 
 
 @pytest.mark.asyncio

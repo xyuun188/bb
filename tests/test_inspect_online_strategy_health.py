@@ -26,6 +26,7 @@ def test_remote_template_compiles_and_uses_dynamic_return_contract() -> None:
         .replace("__SUMMARY_ONLY__", "False")
         .replace("__MARKET_SYMBOL_ONLY__", "False")
         .replace("__ENTRY_ONLY__", "False")
+        .replace("__REPLAY_ONLY__", "False")
     )
 
     compile(template, "<strategy-health>", "exec")
@@ -44,6 +45,18 @@ def test_remote_template_compiles_and_uses_dynamic_return_contract() -> None:
     assert "_inherit_dashboard_runtime_environment()" in template
     assert "evidence_tier" not in template
     assert "tradeable_probe" not in template
+
+
+def test_replay_only_command_skips_unrelated_online_audits() -> None:
+    command = inspect_online_strategy_health._build_remote_command(
+        120,
+        token="replay123",
+        replay_only=True,
+    )
+
+    assert "REPLAY_ONLY = True" in command
+    assert "if REPLAY_ONLY:" in command
+    assert 'get_strategy_learning(mode="paper", detail="summary")' in command
 
 
 def test_remote_command_keeps_paths_scoped_and_quotes_output() -> None:

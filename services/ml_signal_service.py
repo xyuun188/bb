@@ -1037,6 +1037,28 @@ def _training_data_sha256(frame: pd.DataFrame) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _compact_integer_ranges(values: list[Any]) -> list[list[int]]:
+    ordered = sorted(
+        {
+            int(number)
+            for value in values
+            if (number := _safe_float(value, 0.0)) > 0
+        }
+    )
+    if not ordered:
+        return []
+    ranges: list[list[int]] = []
+    start = previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append([start, previous])
+        start = previous = value
+    ranges.append([start, previous])
+    return ranges
+
+
 def _chronological_frame(frame: pd.DataFrame) -> pd.DataFrame:
     ordered = frame.copy()
     if ordered["decision_group"].isna().any():
@@ -1736,6 +1758,16 @@ def train_from_frame(
     source_code_sha256 = source_code_version.removeprefix("source-sha256:")
     walk_forward_report = _walk_forward_return_report(frame)
     train, test = _decision_group_split(frame)
+    strategy_replay_holdout = {
+        "version": "2026-07-21.strategy-replay-holdout.v1",
+        "source": "artifact_disjoint_test_partition",
+        "sample_count": int(len(test)),
+        "decision_group_count": int(test["decision_group"].nunique()),
+        "shadow_source_id_ranges": _compact_integer_ranges(test["id"].tolist()),
+        "label_start": _fingerprint_value(test["label_timestamp"].min()),
+        "label_end": _fingerprint_value(test["label_timestamp"].max()),
+        "training_data_sha256": training_data_sha256,
+    }
     x_train = train[FEATURE_KEYS]
     x_test = test[FEATURE_KEYS]
     train_weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
@@ -1901,6 +1933,7 @@ def train_from_frame(
         "tail_loss_scale_pct": tail_scales,
         "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
         "evaluation_group_policy": "chronological_disjoint_decision_groups",
+        "strategy_replay_holdout": strategy_replay_holdout,
         "training_data_sha256": training_data_sha256,
         "source_code_sha256": source_code_sha256,
         "walk_forward_report": walk_forward_report,
@@ -2834,6 +2867,163 @@ class MLSignalService:
                     finished.timestamp() + AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
                     tz=UTC,
                 ).isoformat()
+
+    def predict_strategy_replay_batch(
+        self,
+        feature_rows: list[dict[str, Any]],
+        *,
+        horizon_minutes: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return compact model decisions for historical strategy replay."""
+
+        self._ensure_loaded()
+        if not self._bundle or not feature_rows:
+            return [
+                {
+                    "available": False,
+                    "model_version": None,
+                    "predictions": [],
+                }
+                for _row in feature_rows
+            ]
+        metadata = _safe_dict(self._bundle.get("metadata"))
+        frame = pd.DataFrame(
+            [
+                _feature_row_from_feature_vector(
+                    features,
+                    horizon_minutes=horizon_minutes,
+                )
+                for features in feature_rows
+            ],
+            columns=FEATURE_KEYS,
+        )
+        long_distribution = _regression_prediction_distribution(
+            self._bundle["long_regressor"],
+            frame,
+        )
+        short_distribution = _regression_prediction_distribution(
+            self._bundle["short_regressor"],
+            frame,
+        )
+        long_cost_distribution = _regression_prediction_distribution(
+            self._bundle["long_cost_regressor"],
+            frame,
+        )
+        short_cost_distribution = _regression_prediction_distribution(
+            self._bundle["short_cost_regressor"],
+            frame,
+        )
+        long_tail_model = self._bundle.get("long_tail_classifier")
+        short_tail_model = self._bundle.get("short_tail_classifier")
+        long_tail_probabilities = (
+            _optional_positive_proba(long_tail_model, frame, default=0.0)
+            if long_tail_model is not None
+            else np.asarray([float("nan")] * len(frame), dtype=float)
+        )
+        short_tail_probabilities = (
+            _optional_positive_proba(short_tail_model, frame, default=0.0)
+            if short_tail_model is not None
+            else np.asarray([float("nan")] * len(frame), dtype=float)
+        )
+        tail_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
+        long_tail_scale = max(_safe_float(tail_scales.get("long"), 0.0), 0.0)
+        short_tail_scale = max(_safe_float(tail_scales.get("short"), 0.0), 0.0)
+        model_version = str(
+            self._artifact_version(metadata)
+            or metadata.get("artifact_version")
+            or metadata.get("version")
+            or ""
+        )
+        results: list[dict[str, Any]] = []
+        for index, features in enumerate(feature_rows):
+            long_tail_probability = (
+                None
+                if not math.isfinite(float(long_tail_probabilities[index]))
+                else float(long_tail_probabilities[index])
+            )
+            short_tail_probability = (
+                None
+                if not math.isfinite(float(short_tail_probabilities[index]))
+                else float(short_tail_probabilities[index])
+            )
+            long_contract = _standardized_model_return_distribution(
+                long_distribution,
+                index,
+                side="long",
+                horizon_minutes=horizon_minutes,
+                tail_loss_probability=long_tail_probability,
+                tail_loss_scale_pct=long_tail_scale,
+            )
+            short_contract = _standardized_model_return_distribution(
+                short_distribution,
+                index,
+                side="short",
+                horizon_minutes=horizon_minutes,
+                tail_loss_probability=short_tail_probability,
+                tail_loss_scale_pct=short_tail_scale,
+            )
+            long_objective = _safe_float(
+                long_contract.get("objective_expected_return_pct"),
+                float("nan"),
+            )
+            short_objective = _safe_float(
+                short_contract.get("objective_expected_return_pct"),
+                float("nan"),
+            )
+            long_rank = (
+                long_objective
+                if long_contract.get("production_eligible") is True
+                else float("-inf")
+            )
+            short_rank = (
+                short_objective
+                if short_contract.get("production_eligible") is True
+                else float("-inf")
+            )
+            if not math.isfinite(long_rank) and not math.isfinite(short_rank):
+                long_rank = float(long_distribution["expected"][index])
+                short_rank = float(short_distribution["expected"][index])
+            best_side = "long" if long_rank >= short_rank else "short"
+            symbol = str(features.get("symbol") or "")
+            actual_calibration = {
+                side: select_trade_calibration(
+                    _safe_dict(metadata.get("actual_trade_calibration")),
+                    symbol=symbol,
+                    side=side,
+                )
+                for side in ("long", "short")
+            }
+            long_cost_ready = _distribution_ready_at(long_cost_distribution, index)
+            short_cost_ready = _distribution_ready_at(short_cost_distribution, index)
+            results.append(
+                {
+                    "available": True,
+                    "model_version": model_version,
+                    "predictions": [
+                        {
+                            "horizon_minutes": horizon_minutes,
+                            "best_side": best_side,
+                            "actual_trade_calibration_ready": _actual_calibration_ready(
+                                _safe_dict(actual_calibration.get(best_side))
+                            ),
+                            "return_distribution_contract": {
+                                "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
+                                "long": long_contract,
+                                "short": short_contract,
+                            },
+                            "counterfactual_execution_cost_distribution": {
+                                "long": {
+                                    "distribution_ready": long_cost_ready,
+                                },
+                                "short": {
+                                    "distribution_ready": short_cost_ready,
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
+        return results
 
     def predict(self, features: Any, *, horizons: tuple[int, ...] = (10, 30)) -> dict[str, Any]:
         self._ensure_loaded()

@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-07-21.trained-model-strategy.v1"
+MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-07-21.trained-model-strategy.v2"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -132,15 +132,35 @@ def build_model_strategy_blueprint(
             "require_current_fee_after_return_lcb_positive": True,
             "require_current_execution_cost_complete": True,
             "require_actual_trade_calibration": True,
+            "historical_replay_uses_exact_model_inference": True,
         },
         "exit_policy": {
             "owner": "dynamic_fee_after_exit",
             "model_may_weaken_hard_exit": False,
+            "historical_replay_horizon_minutes": 10,
+            "historical_replay_exit": "model_primary_prediction_horizon",
         },
         "risk_policy": {
             "owner": "dynamic_risk_and_exchange_contracts",
             "model_may_change_size_or_leverage": False,
             "model_may_bypass_order_deduplication": False,
+        },
+        "training_evidence": {
+            "shadow_sample_count": model.get("training_shadow_sample_count"),
+            "fit_sample_count": model.get("train_count"),
+            "holdout_sample_count": model.get("test_count"),
+            "horizons": _safe_list(model.get("horizons")),
+            "partition_policy": model.get("evaluation_group_policy"),
+            "training_data_sha256": model.get("training_data_sha256"),
+            "strategy_replay_holdout": _safe_dict(
+                model.get("strategy_replay_holdout")
+            ),
+        },
+        "historical_replay_policy": {
+            "model_fit_rows_can_promote": False,
+            "candidate_development_and_exam_must_be_disjoint": True,
+            "cost_complete_shadow_required": True,
+            "live_execution_permission": False,
         },
     }
 

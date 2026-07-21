@@ -90,10 +90,19 @@ def build_trained_model_strategy_candidates(
         promotion = _dict(candidate.get("promotion"))
         params = _dict(candidate.get("params"))
         selector = _dict(params.get("selector"))
+        provenance = _dict(params.get("policy_provenance"))
+        backtest = _dict(candidate.get("backtest"))
+        shadow_validation = _dict(candidate.get("shadow_validation"))
         side = str(selector.get("side") or "").lower()
         if (
             promotion.get("production_influence_eligible") is not True
             or side not in eligible_sides
+            or provenance.get("evidence_mode")
+            != "exact_trained_model_historical_replay"
+            or backtest.get("evidence_partition") != "strategy_development"
+            or shadow_validation.get("evidence_partition") != "strategy_exam"
+            or shadow_validation.get("validation_method")
+            != "exact_current_model_on_immutable_shadow_snapshot"
         ):
             continue
         metrics = _conservative_metrics(candidate)

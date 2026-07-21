@@ -2419,6 +2419,11 @@ class TradingService:
                 strategy_context=dict(context),
                 open_positions=open_positions,
                 model_strategy_blueprint=model_strategy_blueprint,
+                model_predictor=(
+                    ml_signal_service.predict
+                    if ml_signal_service is not None
+                    else None
+                ),
                 limit=DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_row_limit,
             )
             champion = self._safe_dict(

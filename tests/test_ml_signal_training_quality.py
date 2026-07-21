@@ -1504,6 +1504,12 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert "expected_return_calibration" not in metadata
     assert "top_long_return_lcb_pct" in metadata["metrics"]
     assert "top_short_profit_factor" in metadata["metrics"]
+    replay_holdout = metadata["strategy_replay_holdout"]
+    assert replay_holdout["sample_count"] == metadata["test_count"]
+    assert replay_holdout["decision_group_count"] == metadata[
+        "test_decision_group_count"
+    ]
+    assert replay_holdout["shadow_source_id_ranges"]
 
 
 def test_quality_report_separates_missed_opportunity_downweight_from_contamination() -> None:
@@ -2306,6 +2312,41 @@ def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() 
     assert "lower_quantile_above_raw_expected" in long_distribution["blockers"]
     assert prediction["allow_live_position_influence"] is False
     assert prediction["prediction_quality"]["production_eligible"] is False
+
+
+def test_strategy_replay_batch_matches_single_prediction_contract() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    service = _service_with_metadata(metadata)
+    service._bundle.update(
+        {
+            "long_classifier": _Classifier(0.8),
+            "short_classifier": _Classifier(0.2),
+            "long_tail_classifier": _Classifier(0.1),
+            "short_tail_classifier": _Classifier(0.1),
+            "long_regressor": _Regressor(0.46, tree_predictions=(0.31, 0.61)),
+            "short_regressor": _Regressor(0.2, tree_predictions=(0.1, 0.3)),
+            "long_cost_regressor": _Regressor(0.08, tree_predictions=(0.04, 0.12)),
+            "short_cost_regressor": _Regressor(0.09, tree_predictions=(0.05, 0.13)),
+        }
+    )
+    features = {"symbol": "BTC/USDT", "current_price": 100.0, "atr_14": 1.0}
+
+    single = service.predict(features, horizons=(10,))
+    batch = service.predict_strategy_replay_batch(
+        [features],
+        horizon_minutes=10,
+    )[0]
+
+    assert batch["model_version"] == single["model_version"]
+    assert batch["predictions"][0]["best_side"] == single["predictions"][0][
+        "best_side"
+    ]
+    assert batch["predictions"][0]["return_distribution_contract"] == single[
+        "predictions"
+    ][0]["return_distribution_contract"]
+    assert batch["predictions"][0]["actual_trade_calibration_ready"] == single[
+        "predictions"
+    ][0]["actual_trade_calibration_ready"]
 
 
 def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_influence() -> None:
