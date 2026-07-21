@@ -19,6 +19,14 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
+from services.paper_exploration import (
+    PAPER_EXPLORATION_MAX_LCB_GAP_RATIO,
+    PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+    PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_EXPLORATION_SIZING_VERSION,
+    is_paper_exploration_decision,
+    paper_exploration_selection_reasons,
+)
 
 RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
 LEVERAGE_TIER_SELECTION_VERSION = "2026-07-15.okx-target-notional-tier.v1"
@@ -525,6 +533,7 @@ def reconcile_profit_risk_sizing(
             "position_size_pct": round(position_size, 8),
             "final_notional_usdt": round(notional, 8),
             "final_margin_usdt": round(notional / leverage, 8) if leverage > 0 else 0.0,
+            "final_leverage": round(leverage, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
             "expected_profit_usdt": round(notional * expected_net / 100.0, 8),
             "execution_reconciliations": history,
@@ -592,6 +601,12 @@ class EntryProfitRiskSizingPolicy:
             raise RuntimeError("EntryProfitRiskSizingPolicy requires allocated_order_balance")
 
         raw = _safe_dict(decision.raw_response)
+        paper_exploration = is_paper_exploration_decision(decision)
+        exploration_selection_reasons = (
+            paper_exploration_selection_reasons(decision, model_mode)
+            if paper_exploration
+            else []
+        )
         opportunity = _safe_dict(raw.get("opportunity_score"))
         distribution = _safe_dict(opportunity.get("return_distribution_contract"))
         execution_cost = _safe_dict(opportunity.get("execution_cost"))
@@ -677,14 +692,16 @@ class EntryProfitRiskSizingPolicy:
         )
         drawdown_pressure = _clamp(_safe_float(strategy.get("drawdown_pressure"), 0.0))
         drawdown_capacity = 1.0 - drawdown_pressure
-        return_quality = positive_lcb / max(
-            positive_lcb + uncertainty_pct + expected_loss_pct + cost_pct,
+        return_quality_basis = positive_return if paper_exploration else positive_lcb
+        return_quality = return_quality_basis / max(
+            return_quality_basis + uncertainty_pct + expected_loss_pct + cost_pct,
             1e-12,
         )
         survival_quality = (1.0 - loss_probability) * (1.0 - tail_risk)
         realized_downside = max(-(rolling_realized_lcb or 0.0), 0.0) / 100.0
-        realized_history_capacity = (positive_lcb / 100.0) / max(
-            positive_lcb / 100.0 + realized_downside,
+        realized_return_basis = positive_return if paper_exploration else positive_lcb
+        realized_history_capacity = (realized_return_basis / 100.0) / max(
+            realized_return_basis / 100.0 + realized_downside,
             1e-12,
         )
         side_depth = max(
@@ -705,6 +722,15 @@ class EntryProfitRiskSizingPolicy:
             * liquidity_budget_share
         )
         portfolio_budget_fraction = _clamp(single_trade_budget_fraction * dependency_capacity)
+        if paper_exploration:
+            single_trade_budget_fraction = min(
+                single_trade_budget_fraction,
+                PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
+            )
+            portfolio_budget_fraction = min(
+                portfolio_budget_fraction,
+                PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+            )
         single_trade_budget = account_equity * single_trade_budget_fraction
         portfolio_risk_budget = account_equity * portfolio_budget_fraction
         remaining_portfolio_budget = max(
@@ -738,6 +764,7 @@ class EntryProfitRiskSizingPolicy:
         )
 
         reasons: list[str] = []
+        reasons.extend(exploration_selection_reasons)
         if facts.get("production_eligible") is not True:
             reasons.append("exchange_risk_facts_ineligible")
         if leverage_tier_selection.get("production_eligible") is not True:
@@ -754,7 +781,17 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("production_return_observations_missing")
         if not isfinite(expected_net) or expected_net <= 0:
             reasons.append("fee_after_expected_return_not_positive")
-        if not isfinite(return_lcb) or return_lcb <= 0:
+        if paper_exploration and (not isfinite(return_lcb) or return_lcb > 0):
+            reasons.append("paper_exploration_return_lcb_not_uncertain")
+        elif (
+            paper_exploration
+            and isfinite(expected_net)
+            and expected_net > 0
+            and max(-return_lcb, 0.0) / expected_net
+            > PAPER_EXPLORATION_MAX_LCB_GAP_RATIO
+        ):
+            reasons.append("paper_exploration_not_close_to_profitable_threshold")
+        elif not paper_exploration and (not isfinite(return_lcb) or return_lcb <= 0):
             reasons.append("fee_after_return_lcb_not_positive")
         if rolling_realized_lcb is None:
             reasons.append("rolling_authoritative_return_distribution_missing")
@@ -795,7 +832,13 @@ class EntryProfitRiskSizingPolicy:
         if leverage_decision.policy_provenance.get("production_eligible") is not True:
             reasons.extend(leverage_decision.reasons)
             eligible = False
-        leverage = float(leverage_decision.final_integer_leverage) if eligible else 1.0
+        leverage = (
+            1.0
+            if paper_exploration
+            else float(leverage_decision.final_integer_leverage)
+            if eligible
+            else 1.0
+        )
         final_notional = (
             min(target_notional, side_depth, available_margin * leverage) if eligible else 0.0
         )
@@ -829,16 +872,33 @@ class EntryProfitRiskSizingPolicy:
             ).get("input_fingerprint"),
         }
         provenance = {
-            "source": "independent_return_drawdown_liquidity_tail_and_portfolio_risk_budget",
+            "source": (
+                "bounded_paper_exploration_return_and_account_risk_budget"
+                if paper_exploration
+                else "independent_return_drawdown_liquidity_tail_and_portfolio_risk_budget"
+            ),
             "observation_window": "current_decision_account_and_okx_native_portfolio",
             "sample_count": source_count,
             "generated_at": generated_at,
-            "strategy_version": RISK_SIZING_VERSION,
+            "strategy_version": (
+                PAPER_EXPLORATION_SIZING_VERSION
+                if paper_exploration
+                else RISK_SIZING_VERSION
+            ),
             "fallback_reason": "" if eligible else ",".join(dict.fromkeys(reasons)),
             "input_fingerprint": _fingerprint(audit_inputs),
         }
         sizing = {
-            "contract_version": RISK_SIZING_VERSION,
+            "contract_version": (
+                PAPER_EXPLORATION_SIZING_VERSION
+                if paper_exploration
+                else RISK_SIZING_VERSION
+            ),
+            "contract_lifecycle": (
+                "paper_exploration" if paper_exploration else "production_return"
+            ),
+            "execution_scope": "paper_only" if paper_exploration else "mode_authoritative",
+            "production_permission": False if paper_exploration else None,
             "production_eligible": eligible,
             "reason": "independent_dynamic_risk_budget_ready" if eligible else provenance["fallback_reason"],
             "account_equity_usdt": round(account_equity, 8),
@@ -855,6 +915,7 @@ class EntryProfitRiskSizingPolicy:
             "target_notional_usdt": round(target_notional, 8),
             "final_notional_usdt": round(final_notional, 8),
             "final_margin_usdt": round(final_margin, 8),
+            "final_leverage": round(leverage, 8),
             "expected_net_return_pct": round(positive_return, 8),
             "expected_profit_usdt": round(final_notional * positive_return / 100.0, 8),
             "declared_stop_loss_fraction": round(declared_stop, 8),
@@ -880,6 +941,21 @@ class EntryProfitRiskSizingPolicy:
                 "liquidity_budget_share": round(liquidity_budget_share, 8),
                 "portfolio_dependency_capacity": round(dependency_capacity, 8),
             },
+            "paper_exploration_risk_caps": (
+                {
+                    "single_trade_equity_fraction": (
+                        PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION
+                    ),
+                    "portfolio_equity_fraction": (
+                        PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION
+                    ),
+                    "leverage_cap": 1,
+                    "sample_target": None,
+                    "daily_sample_quota": None,
+                }
+                if paper_exploration
+                else {}
+            ),
             "portfolio_risk_snapshot": portfolio,
             "exchange_contract_specs": contract_specs,
             "exchange_risk_facts_provenance": facts.get("policy_provenance"),

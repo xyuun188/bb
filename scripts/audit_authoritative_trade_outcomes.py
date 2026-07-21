@@ -186,6 +186,13 @@ async def audit(
         violations.append("mixed_outcome_version")
     if any(float(item.get("counterfactual_production_weight") or 0.0) != 0.0 for item in outcomes):
         violations.append("shadow_counterfactual_has_production_weight")
+    trainable = annotated["trade_samples"]
+    if any(int(item.get("entry_decision_count") or 0) > 1 for item in trainable):
+        violations.append("multiple_entry_decision_outcome_entered_training")
+    if any(item.get("gross_return_price_consistent") is not True for item in trainable):
+        violations.append("gross_return_price_mismatch_entered_training")
+    if any(item.get("strategy_entry_supervision_eligible") is False for item in trainable):
+        violations.append("research_only_outcome_entered_strategy_training")
     if position_id is not None and not selected:
         violations.append("requested_position_outcome_missing")
     gap_summary = _gap_summary(outcomes)
@@ -196,6 +203,23 @@ async def audit(
         "outcome_count": len(outcomes),
         "complete_count": sum(item.get("outcome_complete") is True for item in outcomes),
         "incomplete_count": sum(item.get("outcome_complete") is not True for item in outcomes),
+        "training_integrity": {
+            "trainable_count": len(trainable),
+            "contract_notional_corrected_count": sum(
+                item.get("contract_notional_corrected") is True for item in trainable
+            ),
+            "multiple_entry_decision_trainable_count": sum(
+                int(item.get("entry_decision_count") or 0) > 1 for item in trainable
+            ),
+            "gross_return_price_mismatch_trainable_count": sum(
+                item.get("gross_return_price_consistent") is not True
+                for item in trainable
+            ),
+            "research_only_trainable_count": sum(
+                item.get("strategy_entry_supervision_eligible") is False
+                for item in trainable
+            ),
+        },
         "evidence_gap_summary": gap_summary,
         "violations": violations,
         "manifest": {

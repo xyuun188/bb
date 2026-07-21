@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from services.paper_exploration import paper_exploration_contract_reasons
+
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
     if isinstance(row, dict):
@@ -171,6 +173,92 @@ def _canonical_execution_mode(value: Any) -> str:
     return ""
 
 
+def _directional_price_return_pct(
+    *,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+) -> float | None:
+    if entry_price <= 0 or exit_price <= 0 or side not in {"long", "short"}:
+        return None
+    raw_return = (exit_price - entry_price) / entry_price * 100.0
+    return raw_return if side == "long" else -raw_return
+
+
+def _authoritative_notional_facts(
+    *,
+    inst_id: str,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    gross_pnl: float,
+    contract_notional_usdt: float | None,
+) -> dict[str, Any]:
+    """Prefer the official gross-PnL price path over stale contract multipliers."""
+
+    price_return_pct = _directional_price_return_pct(
+        side=side,
+        entry_price=entry_price,
+        exit_price=exit_price,
+    )
+    pnl_implied_notional = None
+    if (
+        inst_id.upper().endswith("-USDT-SWAP")
+        and price_return_pct is not None
+        and abs(price_return_pct) > 1e-9
+        and abs(gross_pnl) > 1e-9
+    ):
+        pnl_implied_notional = abs(gross_pnl) / (abs(price_return_pct) / 100.0)
+    notional = (
+        pnl_implied_notional
+        if pnl_implied_notional is not None and pnl_implied_notional > 0
+        else contract_notional_usdt
+    )
+    relative_error = None
+    if (
+        pnl_implied_notional is not None
+        and pnl_implied_notional > 0
+        and contract_notional_usdt is not None
+        and contract_notional_usdt > 0
+    ):
+        relative_error = abs(contract_notional_usdt - pnl_implied_notional) / max(
+            pnl_implied_notional,
+            1e-9,
+        )
+    gross_return_pct = (
+        gross_pnl / notional * 100.0
+        if notional is not None and notional > 0
+        else None
+    )
+    return_consistent = bool(
+        price_return_pct is not None
+        and gross_return_pct is not None
+        and math.isclose(
+            gross_return_pct,
+            price_return_pct,
+            rel_tol=0.01,
+            abs_tol=0.05,
+        )
+    )
+    return {
+        "notional_usdt": notional,
+        "notional_source": (
+            "okx_gross_pnl_and_average_price_path"
+            if pnl_implied_notional is not None and pnl_implied_notional > 0
+            else "okx_contract_spec_and_entry_fills"
+        ),
+        "contract_spec_notional_usdt": contract_notional_usdt,
+        "pnl_implied_notional_usdt": pnl_implied_notional,
+        "contract_notional_relative_error": relative_error,
+        "contract_notional_corrected": bool(
+            relative_error is not None and relative_error > 0.05
+        ),
+        "gross_price_return_pct": price_return_pct,
+        "gross_return_on_notional_pct": gross_return_pct,
+        "gross_return_price_consistent": return_consistent,
+    }
+
+
 def build_okx_history_training_sample(
     history: Any,
     *,
@@ -211,6 +299,7 @@ def build_okx_history_training_sample(
     )
     entry_price = _safe_float(_value(history, "open_avg_px"), 0.0) or 0.0
     exit_price = _safe_float(_value(history, "close_avg_px"), 0.0) or 0.0
+    side = _text(_value(history, "side")).lower()
     open_contracts = _safe_float(_value(history, "open_max_pos"), 0.0) or 0.0
     fill_contracts = _entry_fill_contracts(entry_orders)
     contracts = fill_contracts or open_contracts
@@ -218,7 +307,7 @@ def build_okx_history_training_sample(
     ct_val = _safe_float(spec.get("ctVal"), None)
     ct_mult = _safe_float(spec.get("ctMult"), None)
     lot_size = _safe_float(spec.get("lotSz"), None)
-    notional = (
+    contract_notional = (
         abs(contracts * ct_val * ct_mult * entry_price)
         if contracts > 0 and ct_val and ct_mult and entry_price > 0
         else None
@@ -231,6 +320,15 @@ def build_okx_history_training_sample(
     liquidation_penalty = _safe_float(
         raw.get("liqPenalty") or raw.get("liquidationPenalty"), 0.0
     ) or 0.0
+    notional_facts = _authoritative_notional_facts(
+        inst_id=_text(_value(history, "inst_id")),
+        side=side,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        gross_pnl=gross_pnl,
+        contract_notional_usdt=contract_notional,
+    )
+    notional = _safe_float(notional_facts.get("notional_usdt"), None)
     settlement_expected = gross_pnl + fee_signed + funding_fee + liquidation_penalty
     settlement_tolerance = max(1e-6, abs(realized_pnl) * 1e-5)
     source_execution_mode = _text(_value(history, "mode")).lower()
@@ -265,25 +363,44 @@ def build_okx_history_training_sample(
         gaps.append("missing_contract_lot_size")
     if contracts <= 0:
         gaps.append("missing_fill_or_open_contracts")
+    if notional is None or notional <= 0:
+        gaps.append("missing_authoritative_notional")
+    if notional_facts.get("gross_return_price_consistent") is not True:
+        gaps.append("gross_return_price_path_mismatch")
     if abs(realized_pnl - settlement_expected) > settlement_tolerance:
         gaps.append("settlement_algebra_mismatch")
     gaps = list(dict.fromkeys(gaps))
 
     position_id = position_ids[0] if position_ids else 0
+    entry_decision_ids = sorted(
+        {
+            int(_value(orders_by_exchange_id.get(order_id), "decision_id", 0) or 0)
+            for order_id in entry_order_ids
+            if int(
+                _value(orders_by_exchange_id.get(order_id), "decision_id", 0) or 0
+            )
+            > 0
+        }
+    )
     raw_llm_response: dict[str, Any] = {}
-    decision_id = 0
-    decision_lineage_source = "missing"
-    for order_id in entry_order_ids:
-        order = orders_by_exchange_id.get(order_id)
-        order_decision_id = int(_value(order, "decision_id", 0) or 0)
-        if decision_id <= 0 and order_decision_id > 0:
-            decision_id = order_decision_id
-            decision_lineage_source = "exact_entry_order_decision_id"
-        candidate = decision_raw_by_order_id.get(order_id)
-        if isinstance(candidate, dict) and candidate:
-            raw_llm_response = candidate
-            decision_lineage_source = "exact_entry_order_decision_payload"
-            break
+    decision_id = entry_decision_ids[0] if len(entry_decision_ids) == 1 else 0
+    decision_lineage_source = (
+        "exact_entry_order_decision_id"
+        if len(entry_decision_ids) == 1
+        else "multiple_entry_decisions"
+        if len(entry_decision_ids) > 1
+        else "missing"
+    )
+    if len(entry_decision_ids) == 1:
+        for order_id in entry_order_ids:
+            order = orders_by_exchange_id.get(order_id)
+            if int(_value(order, "decision_id", 0) or 0) != decision_id:
+                continue
+            candidate = decision_raw_by_order_id.get(order_id)
+            if isinstance(candidate, dict) and candidate:
+                raw_llm_response = candidate
+                decision_lineage_source = "exact_entry_order_decision_payload"
+                break
     if not raw_llm_response:
         raw_llm_response = next(
             (
@@ -298,7 +415,6 @@ def build_okx_history_training_sample(
 
     stop_loss_price = _safe_float(_value(local_position, "stop_loss_price"), None)
     take_profit_price = _safe_float(_value(local_position, "take_profit_price"), None)
-    side = _text(_value(history, "side")).lower()
     exact_execution = next(
         (
             decision_execution_by_order_id[order_id]
@@ -362,6 +478,8 @@ def build_okx_history_training_sample(
         lineage_gaps.append("missing_loaded_close_order_facts")
     if decision_id <= 0:
         lineage_gaps.append("missing_exact_entry_order_decision_link")
+    if len(entry_decision_ids) > 1:
+        lineage_gaps.append("multiple_entry_decision_lineage")
     if decision_lineage_source != "exact_entry_order_decision_payload":
         lineage_gaps.append("missing_exact_entry_order_decision_payload")
     if local_position is None:
@@ -370,6 +488,27 @@ def build_okx_history_training_sample(
         lineage_gaps.append("missing_planned_stop_loss_lineage")
     if take_profit_price is None or take_profit_price <= 0:
         lineage_gaps.append("missing_planned_take_profit_lineage")
+    paper_canary = _dict(raw_llm_response.get("paper_bootstrap_canary"))
+    obsolete_sampling_entry = bool(
+        paper_canary
+        and (
+            _text(paper_canary.get("trade_kind")) != "normal_strategy_trade"
+            or paper_canary.get("continuous_training_after_settlement") is not True
+        )
+    )
+    if obsolete_sampling_entry:
+        lineage_gaps.append("obsolete_sampling_entry_not_strategy_trainable")
+    paper_exploration = _dict(raw_llm_response.get("paper_exploration"))
+    paper_exploration_gaps = (
+        paper_exploration_contract_reasons(paper_exploration)
+        if paper_exploration
+        else []
+    )
+    valid_paper_exploration = bool(
+        paper_exploration and not paper_exploration_gaps
+    )
+    if paper_exploration_gaps:
+        lineage_gaps.append("invalid_paper_exploration_contract")
     lineage_gaps = list(dict.fromkeys(lineage_gaps))
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
     official_ratio_pct = _official_ratio_pct(raw, _value(history, "pnl_ratio"))
@@ -385,6 +524,8 @@ def build_okx_history_training_sample(
         "lifecycle_key": lifecycle_key,
         "position_id": position_id,
         "decision_id": decision_id,
+        "entry_decision_ids": entry_decision_ids,
+        "entry_decision_count": len(entry_decision_ids),
         "decision_lineage_source": decision_lineage_source,
         "position_ids": position_ids,
         "okx_pos_id": _text(_value(history, "pos_id")),
@@ -408,6 +549,7 @@ def build_okx_history_training_sample(
         "contract_ct_mult": ct_mult,
         "contract_lot_size": lot_size,
         "notional_usdt": notional,
+        **notional_facts,
         "authoritative_pnl_ratio_pct": official_ratio_pct,
         "realized_pnl": realized_pnl,
         "gross_pnl": gross_pnl,
@@ -495,6 +637,42 @@ def build_okx_history_training_sample(
         "execution_actual_over_budget_loss_usdt": budget_facts[
             "actual_over_budget_loss_usdt"
         ],
+        "strategy_entry_kind": (
+            "bounded_risk_paper_exploration"
+            if valid_paper_exploration
+            else "normal_strategy_trade"
+        ),
+        "strategy_selection_reason": (
+            _text(paper_exploration.get("selection_reason"))
+            if valid_paper_exploration
+            else _text(
+                _dict(raw_llm_response.get("entry_permission_policy")).get("source")
+            )
+            or "governed_fee_after_return_strategy"
+        ),
+        "paper_exploration_evidence": (
+            {
+                "version": paper_exploration.get("version"),
+                "selected_side": paper_exploration.get("selected_side"),
+                "expected_net_return_pct": paper_exploration.get(
+                    "expected_net_return_pct"
+                ),
+                "return_lcb_pct": paper_exploration.get("return_lcb_pct"),
+                "information_value_score": paper_exploration.get(
+                    "information_value_score"
+                ),
+                "single_trade_risk_fraction_cap": paper_exploration.get(
+                    "single_trade_risk_fraction_cap"
+                ),
+                "portfolio_risk_fraction_cap": paper_exploration.get(
+                    "portfolio_risk_fraction_cap"
+                ),
+                "sample_target": paper_exploration.get("sample_target"),
+                "daily_sample_quota": paper_exploration.get("daily_sample_quota"),
+            }
+            if valid_paper_exploration
+            else {}
+        ),
         "close_order_types": sorted(
             {
                 _text(_value(order, "order_type")).lower()
@@ -528,6 +706,20 @@ def build_okx_history_training_sample(
         "trade_fact_trust_reason": gaps[0] if gaps else "",
         "strategy_lineage_complete": not lineage_gaps,
         "strategy_lineage_gaps": lineage_gaps,
+        "strategy_entry_supervision_eligible": bool(
+            len(entry_decision_ids) <= 1
+            and not obsolete_sampling_entry
+            and not paper_exploration_gaps
+        ),
+        "strategy_training_role": (
+            "aggregate_position_research_only"
+            if len(entry_decision_ids) > 1
+            else "obsolete_sampling_research_only"
+            if obsolete_sampling_entry
+            else "invalid_exploration_research_only"
+            if paper_exploration_gaps
+            else "entry_strategy"
+        ),
         "training_evidence_gaps": list(dict.fromkeys([*gaps, *lineage_gaps])),
         "label_timestamp": closed_at.isoformat() if closed_at else None,
     }

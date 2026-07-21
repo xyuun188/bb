@@ -11,6 +11,7 @@ import inspect
 import json
 import math
 import os
+import shutil
 import sys
 from collections import Counter
 from collections.abc import Awaitable
@@ -223,13 +224,31 @@ PENDING_FEATURE_CANCEL_DRAIN_SECONDS = 0.25
 MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS = 3.0
 MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS = 1.0
 MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
+VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
+VECTOR_MEMORY_CONTEXT_CACHE_LIMIT = 128
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 4.0
-MARKET_SYMBOL_ANALYSIS_MAX_SECONDS = 14.0
+MARKET_SYMBOL_ANALYSIS_MAX_SECONDS = 18.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
+TRAINING_PROCESS_NICE_LEVEL = 10
+
+
+def _low_priority_training_command(
+    command: list[str],
+    *,
+    platform_name: str | None = None,
+    nice_path: str | None = None,
+) -> list[str]:
+    """Prefer trading latency while allowing training to use idle CPU."""
+
+    selected_platform = platform_name or os.name
+    resolved_nice = nice_path if nice_path is not None else shutil.which("nice")
+    if selected_platform == "posix" and resolved_nice:
+        return [resolved_nice, "-n", str(TRAINING_PROCESS_NICE_LEVEL), *command]
+    return list(command)
 
 
 async def drain_cancelled_tasks(
@@ -660,6 +679,8 @@ class TradingService:
         self._market_indicator_prewarm_queue: list[str] = []
         self._market_indicator_prewarm_task: asyncio.Task | None = None
         self._market_indicator_prewarm_last_diagnostics: dict[str, Any] = {}
+        self._vector_memory_context_cache: dict[str, dict[str, Any]] = {}
+        self._vector_memory_context_tasks: dict[str, asyncio.Task] = {}
         self._market_timeout_retry_not_before: dict[str, datetime] = {}
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
@@ -926,7 +947,7 @@ class TradingService:
         del strategy_context
         requested_symbols = max(self._safe_int(market_symbol_count, 0), 0)
         target_symbols = min(max(requested_symbols, 1), 8)
-        per_symbol_floor = max(8.0, min(14.0, interval * 0.35))
+        per_symbol_floor = max(12.0, min(MARKET_SYMBOL_ANALYSIS_MAX_SECONDS, interval * 0.60))
         market_budget = max(base_budget, target_symbols * per_symbol_floor)
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
         return min(market_budget, watchdog_ceiling)
@@ -974,7 +995,7 @@ class TradingService:
         reserve = min(0.75, max(0.1, fair_share * 0.05))
         ceiling = max(
             MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
-            min(MARKET_SYMBOL_ANALYSIS_MAX_SECONDS, interval * 0.45),
+            min(MARKET_SYMBOL_ANALYSIS_MAX_SECONDS, interval * 0.60),
         )
         return round(max(0.0, min(ceiling, fair_share - reserve)), 3)
 
@@ -3522,22 +3543,14 @@ class TradingService:
     ) -> dict[str, Any]:
         """Return expert memory plus optional zvec/json vector-memory soft evidence."""
 
+        vector_result: dict[str, Any] = {}
+        if bool(settings.vector_memory_enabled):
+            vector_result = self._cached_vector_memory_context(symbol, action)
         context = await self.expert_memory_service.context(symbol)
         if not bool(settings.vector_memory_enabled):
             return context
-        try:
-            vector_result = await get_vector_memory_service().search(
-                f"{symbol} {action} 开仓 亏损 盈利 复盘 三期相似样本",
-                top_k=6,
-                symbol=symbol,
-            )
-        except Exception as exc:
-            vector_result = {
-                "enabled": True,
-                "status": "error",
-                "error": safe_error_text(exc, limit=180),
-                "hits": [],
-            }
+        await asyncio.sleep(0)
+        vector_result = self._cached_vector_memory_context(symbol, action)
         hits = vector_result.get("hits") if isinstance(vector_result, dict) else []
         memory_feedback = (
             dict(context.get("memory_feedback"))
@@ -3561,6 +3574,104 @@ class TradingService:
         context["memory_feedback"] = memory_feedback
         context["vector_memory_feedback"] = memory_feedback["vector_memory"]
         return context
+
+    def _vector_memory_context_key(self, symbol: str, action: str) -> str:
+        normalized_symbol = self._normalize_position_symbol(symbol) or str(symbol or "")
+        return f"{normalized_symbol}|{str(action or '').strip().lower()}"
+
+    def _cached_vector_memory_context(
+        self,
+        symbol: str,
+        action: str = "",
+    ) -> dict[str, Any]:
+        """Return fresh soft evidence or queue one non-blocking refresh."""
+
+        key = self._vector_memory_context_key(symbol, action)
+        now = datetime.now(UTC)
+        cache = getattr(self, "_vector_memory_context_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._vector_memory_context_cache = cache
+        cached = cache.get(key)
+        if isinstance(cached, dict):
+            cached_at = cached.get("cached_at")
+            age_seconds = (
+                max((now - cached_at).total_seconds(), 0.0)
+                if isinstance(cached_at, datetime)
+                else float("inf")
+            )
+            if age_seconds <= VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS:
+                payload = self._safe_dict(cached.get("payload"))
+                return {
+                    **payload,
+                    "context_cache": {
+                        "status": "hit",
+                        "age_seconds": round(age_seconds, 3),
+                        "ttl_seconds": VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS,
+                    },
+                }
+            cache.pop(key, None)
+
+        tasks = getattr(self, "_vector_memory_context_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._vector_memory_context_tasks = tasks
+        task = tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._refresh_vector_memory_context(key, symbol, action)
+            )
+            tasks[key] = task
+        return {
+            "enabled": True,
+            "status": "background_refresh",
+            "hits": [],
+            "context_cache": {
+                "status": "warming",
+                "ttl_seconds": VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS,
+            },
+        }
+
+    async def _refresh_vector_memory_context(
+        self,
+        key: str,
+        symbol: str,
+        action: str,
+    ) -> None:
+        try:
+            try:
+                result = await get_vector_memory_service().search(
+                    f"{symbol} {action} 开仓 亏损 盈利 复盘 三期相似样本",
+                    top_k=6,
+                    symbol=symbol,
+                )
+                payload = result if isinstance(result, dict) else {
+                    "enabled": True,
+                    "status": "error",
+                    "error": "vector_memory_result_invalid",
+                    "hits": [],
+                }
+            except Exception as exc:
+                payload = {
+                    "enabled": True,
+                    "status": "error",
+                    "error": safe_error_text(exc, limit=180),
+                    "hits": [],
+                }
+            cache = getattr(self, "_vector_memory_context_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._vector_memory_context_cache = cache
+            cache[key] = {
+                "cached_at": datetime.now(UTC),
+                "payload": payload,
+            }
+            while len(cache) > VECTOR_MEMORY_CONTEXT_CACHE_LIMIT:
+                cache.pop(next(iter(cache)))
+        finally:
+            tasks = getattr(self, "_vector_memory_context_tasks", None)
+            if isinstance(tasks, dict) and tasks.get(key) is asyncio.current_task():
+                tasks.pop(key, None)
 
     def _is_valid_feature_vector(self, fv: Any) -> bool:
         """Only send market snapshots with usable price data to AI models."""
@@ -4095,6 +4206,17 @@ class TradingService:
             "changes_trading_thresholds": False,
         }
 
+    @staticmethod
+    def _market_indicator_prewarm_symbols(
+        feature_vectors: dict[str, Any],
+    ) -> list[str]:
+        return [
+            symbol
+            for symbol, feature in (feature_vectors or {}).items()
+            if not bool(getattr(feature, "indicator_snapshot_available", False))
+            or bool(getattr(feature, "indicator_snapshot_stale", False))
+        ]
+
     async def _market_indicator_prewarm_worker(self) -> None:
         """Drain rolling prewarm work in bounded batches without blocking analysis."""
 
@@ -4560,7 +4682,7 @@ class TradingService:
         perf_timeout = self.strategy_learning_perf_timeout_seconds()
         account_timeout = self.strategy_learning_account_timeout_seconds()
         context_fetch_timings: dict[str, Any] = {}
-        if not open_positions:
+        if open_positions is None:
             try:
                 self._safe_set_strategy_context_stage("strategy_context:open_positions")
                 open_positions = await self.okx_sync_service.get_open_positions_context()
@@ -6269,8 +6391,14 @@ class TradingService:
                     }
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
             if run_market_analysis and market_feature_vectors:
+                prewarm_symbols = self._market_indicator_prewarm_symbols(
+                    market_feature_vectors
+                )
                 market_indicator_prewarm = self._queue_market_candidate_indicator_prewarm(
-                    list(market_feature_vectors)
+                    prewarm_symbols
+                )
+                market_indicator_prewarm["already_ready_count"] = (
+                    len(market_feature_vectors) - len(prewarm_symbols)
                 )
             else:
                 market_indicator_prewarm = {
@@ -6758,6 +6886,7 @@ class TradingService:
                         {
                             "open_positions": open_positions,
                             "trading_mode": mode_manager.mode.value,
+                            "execution_mode": model_mode,
                             **memory_context,
                             "market_regime": market_regime_context,
                             "strategy_mode": strategy_mode_context,
@@ -7481,6 +7610,15 @@ class TradingService:
         self._shadow_backtest_update_task = None
         self._stale_entry_expire_task = None
         self._market_indicator_prewarm_task = None
+        vector_memory_tasks = list(
+            (getattr(self, "_vector_memory_context_tasks", {}) or {}).values()
+        )
+        self._vector_memory_context_tasks = {}
+        for task in vector_memory_tasks:
+            if task and not task.done():
+                task.cancel()
+        if vector_memory_tasks:
+            await asyncio.gather(*vector_memory_tasks, return_exceptions=True)
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self._okx_paper, self._okx_live):
@@ -7597,7 +7735,7 @@ class TradingService:
         if force:
             command.append("--force")
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *_low_priority_training_command(command),
             cwd=str(PROJECT_ROOT),
             env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,
@@ -7893,7 +8031,7 @@ class TradingService:
             "--confirm-phase3-rebuild",
         ]
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *_low_priority_training_command(command),
             cwd=str(PROJECT_ROOT),
             env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,

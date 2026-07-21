@@ -180,14 +180,14 @@ class LocalAIToolsClient:
             )
             return item
 
-        # Market and position analysis run independently.  Without one shared
-        # client-side queue, their three-tool batches can overlap and turn into
-        # six CPU-heavy requests against the single quant-service process.
-        # Queueing does not consume the per-request read timeout; each request
-        # starts its own timeout only after it owns the inference slot.
+        # Market and position analysis run independently. Without one shared
+        # client-side queue, their batches can overlap and overload the quant
+        # service. The three market inference routes are independent and run
+        # concurrently inside the one admitted batch; optional exit advice stays
+        # sequential because it is only needed for position review.
         results: list[dict[str, Any]] = []
         async with self._inference_lock:
-            core_specs = tool_specs[:2]
+            core_specs = tool_specs[:3]
             results.extend(
                 await asyncio.gather(
                     *(call_tool(name, path) for name, path in core_specs)

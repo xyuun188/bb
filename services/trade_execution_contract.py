@@ -15,6 +15,13 @@ from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
 )
+from services.paper_exploration import (
+    PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+    PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_EXPLORATION_SIZING_VERSION,
+    PAPER_EXPLORATION_VERSION,
+    paper_exploration_contract_reasons,
+)
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
@@ -198,6 +205,11 @@ def summarize_trade_execution_contract(
             "optimization_target": "realized_fee_after_return",
             "entry_requires_positive_fee_after_return": True,
             "entry_requires_positive_return_lcb": True,
+            "normal_entry_requires_positive_fee_after_return": True,
+            "normal_entry_requires_positive_return_lcb": True,
+            "paper_exploration_requires_positive_expected_fee_after_return": True,
+            "paper_exploration_allows_only_bounded_lcb_uncertainty": True,
+            "paper_exploration_live_permission": False,
             "entry_requires_live_execution_cost": True,
             "entry_requires_dynamic_risk_budget": True,
             "entry_requires_complete_provenance": True,
@@ -243,9 +255,15 @@ def _entry_contract_row(
 def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     """Classify an entry contract before validating lifecycle-specific invariants."""
 
+    exploration = _safe_dict(raw.get("paper_exploration"))
     canary = _safe_dict(raw.get("paper_bootstrap_canary"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
+    if (
+        exploration
+        or sizing.get("contract_lifecycle") == "paper_exploration"
+    ):
+        return "paper_exploration"
     if (
         any(
             key in canary
@@ -275,6 +293,10 @@ def entry_opportunity_evidence_score(raw: dict[str, Any]) -> float | None:
                 "objective_expected_return_pct"
             )
         )
+    if entry_contract_lifecycle(raw) == "paper_exploration":
+        return _finite_value(
+            _safe_dict(raw.get("paper_exploration")).get("information_value_score")
+        )
     return _finite_value(_safe_dict(raw.get("opportunity_score")).get("score"))
 
 
@@ -287,8 +309,16 @@ def validate_entry_execution_contract(
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate the persisted contract for its declared execution lifecycle."""
 
-    if entry_contract_lifecycle(raw) == "paper_bootstrap_canary":
+    lifecycle = entry_contract_lifecycle(raw)
+    if lifecycle == "paper_bootstrap_canary":
         return validate_paper_canary_entry_contract(
+            raw,
+            filled_notional_usdt=filled_notional_usdt,
+            executed=executed,
+            filled_order_present=filled_order_present,
+        )
+    if lifecycle == "paper_exploration":
+        return validate_paper_exploration_entry_contract(
             raw,
             filled_notional_usdt=filled_notional_usdt,
             executed=executed,
@@ -567,6 +597,8 @@ def _bounded_canary_fill_drift(
     declared_reserve_fraction = _safe_float(
         sizing.get("estimated_fill_drift_reserve_fraction")
     )
+
+
     declared_fill_ceiling = _safe_float(sizing.get("fill_notional_ceiling_usdt"))
     observation_cost_pct = _safe_float(
         _safe_dict(canary.get("selected_observation")).get(
@@ -639,6 +671,111 @@ def _bounded_canary_fill_drift(
             else "legacy_cost_bound_and_okx_reconciliations"
         ),
     }
+
+
+def validate_paper_exploration_entry_contract(
+    raw: dict[str, Any],
+    *,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate a real paper trade with a bounded exploration risk profile."""
+
+    exploration = _safe_dict(raw.get("paper_exploration"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
+    sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
+    reasons = paper_exploration_contract_reasons(exploration)
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
+    portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"), 0.0)
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
+    stress = _safe_float(sizing.get("stressed_loss_fraction"), 0.0)
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    target_notional = _safe_float(sizing.get("target_notional_usdt"), 0.0)
+    equity = _safe_float(sizing.get("account_equity_usdt"), 0.0)
+    final_leverage = _safe_float(sizing.get("final_leverage"), 0.0)
+
+    if exploration.get("version") != PAPER_EXPLORATION_VERSION:
+        reasons.append("paper_exploration_version_invalid")
+    if sizing.get("contract_version") != PAPER_EXPLORATION_SIZING_VERSION:
+        reasons.append("paper_exploration_sizing_version_invalid")
+    if sizing.get("contract_lifecycle") != "paper_exploration":
+        reasons.append("paper_exploration_sizing_lifecycle_invalid")
+    if sizing.get("execution_scope") != "paper_only":
+        reasons.append("paper_exploration_sizing_scope_invalid")
+    if sizing.get("production_permission") is not False:
+        reasons.append("paper_exploration_sizing_production_permission_invalid")
+    if sizing.get("production_eligible") is not True:
+        reasons.append("paper_exploration_sizing_ineligible")
+    if not _provenance_complete(sizing.get("policy_provenance")):
+        reasons.append("paper_exploration_sizing_provenance_incomplete")
+    if not str(_safe_dict(sizing.get("policy_provenance")).get("contract_fingerprint") or ""):
+        reasons.append("paper_exploration_sizing_fingerprint_missing")
+    if equity <= 0 or risk_budget <= 0 or portfolio_budget <= 0:
+        reasons.append("paper_exploration_account_risk_budget_incomplete")
+    if planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
+        reasons.append("paper_exploration_planned_loss_invalid")
+    if risk_budget > equity * PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8:
+        reasons.append("paper_exploration_single_trade_risk_cap_exceeded")
+    if portfolio_budget > equity * PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION + 1e-8:
+        reasons.append("paper_exploration_portfolio_risk_cap_exceeded")
+    if stress <= 0 or not isclose(
+        planned_loss,
+        final_notional * stress,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("paper_exploration_stressed_loss_algebra_mismatch")
+    if final_notional <= 0 or final_notional > target_notional + 1e-8:
+        reasons.append("paper_exploration_notional_invalid")
+    if not isclose(final_leverage, 1.0, abs_tol=1e-8):
+        reasons.append("paper_exploration_leverage_must_be_one")
+    if execution_cost.get("production_eligible") is not True:
+        reasons.append("paper_exploration_execution_cost_incomplete")
+    if execution_cost.get("order_size_complete") is not True:
+        reasons.append("paper_exploration_order_size_cost_incomplete")
+    if _safe_float(execution_cost.get("order_notional_usdt"), 0.0) + 1e-8 < final_notional:
+        reasons.append("paper_exploration_execution_cost_notional_too_small")
+    if pre_order.get("production_eligible") is not True or not str(
+        pre_order.get("input_fingerprint") or ""
+    ).strip():
+        reasons.append("paper_exploration_pre_order_facts_incomplete")
+    if sizing_pass.get("order_size_complete") is not True:
+        reasons.append("paper_exploration_size_aware_cost_incomplete")
+    filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
+    risk_notional_ceiling = risk_budget / stress if risk_budget > 0 and stress > 0 else 0.0
+    if executed and filled_notional > risk_notional_ceiling + 1e-8:
+        reasons.append("paper_exploration_filled_notional_exceeds_risk_budget")
+    if executed and filled_order_present is False:
+        reasons.append("executed_entry_without_filled_order")
+    reasons = list(dict.fromkeys(reasons))
+    return (
+        {
+            "contract_lifecycle": "paper_exploration",
+            "contract_complete": not reasons,
+            "execution_scope": exploration.get("execution_scope"),
+            "production_permission": exploration.get("production_permission"),
+            "trade_is_normal": exploration.get("trade_is_normal"),
+            "expected_net_return_pct": _safe_float(
+                exploration.get("expected_net_return_pct"),
+                0.0,
+            ),
+            "return_lcb_pct": _safe_float(exploration.get("return_lcb_pct"), 0.0),
+            "information_value_score": _safe_float(
+                exploration.get("information_value_score"),
+                0.0,
+            ),
+            "risk_budget_usdt": risk_budget,
+            "planned_stressed_loss_usdt": planned_loss,
+            "final_notional_usdt": final_notional,
+            "final_leverage": final_leverage,
+            "filled_notional_usdt": filled_notional,
+        },
+        reasons,
+    )
 
 
 def _paper_canary_observation_reasons(canary: dict[str, Any]) -> list[str]:

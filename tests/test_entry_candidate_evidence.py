@@ -228,6 +228,40 @@ def test_no_positive_production_lcb_returns_neutral() -> None:
     assert evidence["short"]["production_eligible"] is False
 
 
+def test_positive_mean_near_threshold_candidate_is_exposed_for_bounded_paper_exploration() -> None:
+    def near_threshold_score(decision: DecisionOutput, _strategy: dict | None) -> float:
+        expected_net = 0.30 if decision.action == Action.LONG else -0.10
+        raw = dict(decision.raw_response)
+        raw["opportunity_score"] = {
+            "score": -0.10,
+            "expected_net_return_pct": expected_net,
+            "return_lcb_pct": -0.10,
+            "return_uncertainty_pct": 0.20,
+            "expected_loss_pct": 0.20,
+            "server_profit_loss_probability": 0.30,
+            "tail_risk_score": 0.20,
+            "production_eligible": True,
+            "execution_cost": {"production_eligible": True, "total_pct": 0.08},
+            "policy_provenance": {
+                "source": "test_return_distribution",
+                "observation_window": "test_window",
+                "sample_count": 3,
+                "generated_at": "2026-07-21T00:00:00+00:00",
+                "strategy_version": "test.v1",
+                "fallback_reason": "",
+            },
+        }
+        decision.raw_response = raw
+        return -0.10
+
+    evidence = _policy(near_threshold_score).build(_Feature(), {}, {}, {}, {}, {})
+
+    assert evidence["preferred_side_by_evidence"] == "neutral"
+    assert evidence["preferred_exploration_side"] == "long"
+    assert evidence["paper_exploration"]["selected"]["eligible"] is True
+    assert evidence["long"]["return_distribution_ready"] is True
+
+
 def test_missing_return_distribution_never_persists_non_finite_score() -> None:
     def unavailable_score(decision: DecisionOutput, _strategy: dict | None) -> float:
         raw = dict(decision.raw_response)

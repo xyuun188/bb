@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import db.repositories.memory_repo as memory_repo_module
 from db.repositories.memory_repo import MemoryRepository
+from models.learning import ExpertMemory
 from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
@@ -137,6 +139,49 @@ def test_memory_outcomes_do_not_fallback_to_legacy_pnl_ratio() -> None:
     )
 
     assert "outcome_aggregation" not in merged
+
+
+@pytest.mark.asyncio
+async def test_bulk_memory_lookup_limits_each_expert_inside_ranked_query() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(ExpertMemory.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with maker() as session:
+            for expert_name in ("trend_expert", "risk_expert"):
+                for index in range(50):
+                    session.add(
+                        ExpertMemory(
+                            expert_name=expert_name,
+                            expert_label=expert_name,
+                            symbol="BTC/USDT",
+                            side="long",
+                            memory_type="shadow_missed_opportunity",
+                            market_pattern=f"pattern-{index}",
+                            lesson=f"lesson-{index}",
+                            recommended_action="observation_only",
+                            evidence_count=1,
+                            memory_key=f"{expert_name}:{index}",
+                            is_active=True,
+                            extra={"authority_rank": 100 if index == 0 else 0},
+                        )
+                    )
+            await session.commit()
+
+            grouped = await MemoryRepository(session).get_relevant_memories_for_experts(
+                ["trend_expert", "risk_expert"],
+                "BTC/USDT",
+                per_expert_limit=3,
+            )
+
+        assert {name: len(rows) for name, rows in grouped.items()} == {
+            "trend_expert": 3,
+            "risk_expert": 3,
+        }
+        assert all(rows[0].extra["authority_rank"] == 100 for rows in grouped.values())
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

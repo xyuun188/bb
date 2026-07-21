@@ -35,7 +35,7 @@ from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-07-14.separated-profit-supervision.v4"
+DATA_QUALITY_VERSION = "2026-07-21.authoritative-trade-integrity.v5"
 PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
 PHASE3_TRAINING_POLICY = "clean_training_view_only"
 MAX_WORST_SAMPLE_COUNT = 8
@@ -442,6 +442,28 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     guard_reasons = _sample_guard_reasons(sample)
     if guard_reasons:
         return _final_assessment(0.0, guard_reasons, exclude=True)
+
+    if int(_safe_float(sample.get("entry_decision_count"), 0.0) or 0) > 1:
+        return _final_assessment(
+            0.0,
+            ["multiple_entry_decisions_require_aggregate_research_only"],
+            exclude=True,
+        )
+    if sample.get("strategy_entry_supervision_eligible") is False:
+        return _final_assessment(
+            0.0,
+            [
+                _safe_str(sample.get("strategy_training_role"))
+                or "entry_strategy_supervision_ineligible"
+            ],
+            exclude=True,
+        )
+    if sample.get("gross_return_price_consistent") is False:
+        return _final_assessment(
+            0.0,
+            ["gross_return_price_path_mismatch"],
+            exclude=True,
+        )
 
     source = _safe_str(sample.get("source")).lower()
     if source in AUTHORITATIVE_TRADE_OUTCOME_SOURCES:
@@ -2368,7 +2390,7 @@ def _authoritative_outcome_manifest(
                 "label_timestamp": sample.get("label_timestamp"),
                 "training_status": sample.get("data_quality_status"),
                 "training_weight": sample.get("training_weight"),
-                "exclusion_reasons": sample.get("data_quality_reasons") or [],
+                "exclusion_reasons": sample.get("quality_reasons") or [],
             }
         )
     canonical = json.dumps(

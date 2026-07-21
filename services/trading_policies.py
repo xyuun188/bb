@@ -14,6 +14,10 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.dynamic_exit_policy import apply_dynamic_exit
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
+from services.paper_exploration import (
+    assess_paper_exploration_entry,
+    is_paper_exploration_decision,
+)
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.return_execution_policy import apply_production_entry_policy
 
@@ -372,6 +376,33 @@ class EntryPolicy:
             model_mode,
             open_positions=open_positions or [],
         )
+        if is_paper_exploration_decision(decision):
+            exploration_assessment = assess_paper_exploration_entry(
+                decision,
+                model_mode,
+            )
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw["paper_exploration_assessment"] = exploration_assessment.to_dict()
+            decision.raw_response = raw
+            if not exploration_assessment.eligible:
+                return PolicyGateResult.block(
+                    "paper_exploration_policy",
+                    exploration_assessment.reason,
+                    {
+                        "pipeline_context": context.public_data(),
+                        "stage_status": "skipped",
+                        "skip_kind": "paper_exploration_policy",
+                        "paper_exploration": exploration_assessment.to_dict(),
+                    },
+                )
+            return PolicyGateResult.allow(
+                {
+                    "intent": "paper_exploration_entry",
+                    "pipeline_context": context.public_data(),
+                    "paper_exploration": exploration_assessment.to_dict(),
+                    "production_permission": False,
+                }
+            )
         production_assessment = apply_production_entry_policy(decision)
         if not production_assessment.eligible:
             return PolicyGateResult.block(

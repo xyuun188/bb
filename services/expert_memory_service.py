@@ -97,14 +97,20 @@ class ExpertMemoryService:
         try:
             async with self.session_factory() as session:
                 repo = MemoryRepository(session)
+                expert_names = [
+                    str(slot.get("name") or "")
+                    for slot in self.model_slots
+                    if str(slot.get("name") or "")
+                ]
+                memories_by_expert = await repo.get_relevant_memories_for_experts(
+                    expert_names,
+                    symbol,
+                )
                 for slot in self.model_slots:
                     expert_name = str(slot.get("name") or "")
                     if not expert_name:
                         continue
-                    rows = await repo.get_relevant_memories(
-                        expert_name=expert_name,
-                        symbol=symbol,
-                    )
+                    rows = memories_by_expert.get(expert_name, [])
                     serialized = [serialize_memory(row) for row in rows]
                     if serialized:
                         by_expert[expert_name] = serialized

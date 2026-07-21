@@ -23,6 +23,10 @@ from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.paper_bootstrap_canary import PaperBootstrapCanaryPolicy
+from services.paper_exploration import (
+    assess_paper_exploration_entry,
+    is_paper_exploration_decision,
+)
 from services.strategy_arbitration import arbitrate_decision
 from services.trading_policies import PolicyGateResult
 
@@ -82,6 +86,25 @@ def _return_entry_contract_result(
             {
                 "stage_status": "blocked",
                 "paper_bootstrap_canary": assessment.details,
+            },
+        )
+
+    if is_paper_exploration_decision(decision):
+        assessment = assess_paper_exploration_entry(decision, model_mode)
+        if assessment.eligible:
+            return PolicyGateResult.allow(
+                {
+                    "return_execution_contract": "paper_exploration",
+                    "production_permission": False,
+                    "paper_exploration": assessment.to_dict(),
+                }
+            )
+        return PolicyGateResult.block(
+            "paper_exploration_contract_incomplete",
+            assessment.reason,
+            {
+                "stage_status": "blocked",
+                "paper_exploration": assessment.to_dict(),
             },
         )
 

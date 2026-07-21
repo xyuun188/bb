@@ -102,6 +102,53 @@ def _return_context(**extra: object) -> dict[str, object]:
     return context
 
 
+def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, object]:
+    provenance = {
+        "source": "test_cost_complete_return_distribution",
+        "observation_window": "current_test_round",
+        "sample_count": 3,
+        "generated_at": "2026-07-21T00:00:00+00:00",
+        "strategy_version": "test",
+        "fallback_reason": "",
+    }
+    selected = {
+        "eligible": True,
+        "side": "long",
+        "expected_net_return_pct": 0.3,
+        "return_lcb_pct": -0.1,
+        "lcb_gap_ratio": 1.0 / 3.0,
+        "loss_probability": 0.3,
+        "tail_risk_score": 0.2,
+        "return_source_count": 3,
+        "feature_opportunity_score": 8.0,
+        "information_value_score": 0.04,
+        "policy_provenance": provenance,
+    }
+    evidence = {
+        "preferred_side_by_evidence": "neutral",
+        "preferred_exploration_side": "long",
+        "feature_opportunity_score": 8.0,
+        "long": {
+            "production_eligible": False,
+            "expected_net_return_pct": 0.3,
+            "return_lcb_pct": -0.1,
+            "production_source_count": 3,
+            "policy_provenance": provenance,
+        },
+        "paper_exploration": {
+            "preferred_side": "long",
+            "selected": selected,
+            "eligible_side_count": 1,
+            "reason": "bounded_paper_exploration_side_selected",
+        },
+        "policy_provenance": provenance,
+    }
+    return {
+        "execution_mode": execution_mode,
+        "entry_candidate_evidence": evidence,
+    }
+
+
 def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote() -> None:
     decision = _coordinator().combine(_features(), _return_context(), _strong_long_opinions())
 
@@ -121,6 +168,34 @@ def test_authoritative_return_candidate_does_not_depend_on_expert_availability()
 
     assert decision.action == Action.LONG
     assert decision.raw_response["authoritative_return_candidate"]["production_eligible"] is True
+
+
+def test_positive_mean_uncertain_candidate_can_only_create_bounded_paper_entry() -> None:
+    decision = _coordinator().combine(
+        _features(),
+        _paper_exploration_context("paper"),
+        _strong_long_opinions(),
+    )
+
+    assert decision.action == Action.LONG
+    assert decision.suggested_leverage == 1.0
+    contract = decision.raw_response["paper_exploration"]
+    assert contract["execution_scope"] == "paper_only"
+    assert contract["production_permission"] is False
+    assert contract["trade_is_normal"] is True
+    assert contract["sample_target"] is None
+    assert contract["daily_sample_quota"] is None
+
+
+def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
+    decision = _coordinator().combine(
+        _features(),
+        _paper_exploration_context("live"),
+        _strong_long_opinions(),
+    )
+
+    assert decision.action == Action.HOLD
+    assert "paper_exploration" not in decision.raw_response
 
 
 def test_expert_diversity_policy_is_carried_into_ensemble_raw() -> None:

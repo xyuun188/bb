@@ -7,6 +7,7 @@ import pytest
 
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.okx_training_facts import build_okx_history_training_sample
+from services.paper_exploration import build_paper_exploration_contract
 from services.training_data_quality import annotate_training_payload
 
 
@@ -20,7 +21,7 @@ def _history(**overrides):
         "pnl": "10",
         "fee": "-1",
         "fundingFee": "-0.5",
-        "pnlRatio": "0.085",
+        "pnlRatio": "0.0085",
         "_bb_contract_spec": {
             "ctVal": "0.01",
             "ctMult": "1",
@@ -39,12 +40,12 @@ def _history(**overrides):
         "opened_at": opened,
         "updated_at_okx": opened + timedelta(hours=1),
         "open_avg_px": 100_000.0,
-        "close_avg_px": 100_850.0,
+        "close_avg_px": 100_500.0,
         "open_max_pos": 2.0,
         "leverage": 2.0,
         "realized_pnl": 8.5,
         "pnl": 10.0,
-        "pnl_ratio": 0.085,
+        "pnl_ratio": 0.0085,
         "funding_fee": -0.5,
         "fee": -1.0,
         "entry_order_ids": ["entry-1"],
@@ -109,7 +110,9 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["quantity"] == 2.0
     assert sample["quantity_unit"] == "contracts"
     assert sample["notional_usdt"] == 2000.0
-    assert sample["authoritative_pnl_ratio_pct"] == 8.5
+    assert sample["notional_source"] == "okx_gross_pnl_and_average_price_path"
+    assert sample["gross_return_price_consistent"] is True
+    assert sample["authoritative_pnl_ratio_pct"] == pytest.approx(0.85)
     assert sample["okx_trade_ids"] == ["trade-entry", "trade-close"]
     assert sample["trade_fact_trusted"] is True
     assert sample["training_evidence_gaps"] == []
@@ -120,6 +123,139 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert label["execution_mode"] == "paper"
     assert label["realized_fee_after_return_pct"] == pytest.approx(8.5 / 2000.0 * 100.0)
     assert label["realized_net_pnl_usdt"] == 8.5
+
+
+def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reason() -> None:
+    provenance = {
+        "source": "test_cost_complete_return_distribution",
+        "observation_window": "current_test_candidate",
+        "sample_count": 3,
+        "generated_at": "2026-07-21T00:00:00+00:00",
+        "strategy_version": "test.v1",
+        "fallback_reason": "",
+    }
+    selected = {
+        "eligible": True,
+        "side": "long",
+        "expected_net_return_pct": 0.3,
+        "return_lcb_pct": -0.1,
+        "lcb_gap_ratio": 1.0 / 3.0,
+        "loss_probability": 0.3,
+        "tail_risk_score": 0.2,
+        "return_source_count": 3,
+        "feature_opportunity_score": 8.0,
+        "information_value_score": 0.04,
+        "policy_provenance": provenance,
+    }
+    evidence = {
+        "preferred_exploration_side": "long",
+        "paper_exploration": {
+            "preferred_side": "long",
+            "selected": selected,
+            "reason": "bounded_paper_exploration_side_selected",
+        },
+    }
+    contract = build_paper_exploration_contract(evidence, symbol="BTC/USDT")
+    lineage = _complete_lineage()
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "entry_candidate_evidence": evidence,
+        "paper_exploration": contract,
+    }
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert sample["strategy_entry_supervision_eligible"] is True
+    assert sample["strategy_training_role"] == "entry_strategy"
+    assert sample["strategy_entry_kind"] == "bounded_risk_paper_exploration"
+    assert sample["strategy_selection_reason"] == (
+        "bounded_paper_exploration_side_selected"
+    )
+    assert sample["paper_exploration_evidence"]["sample_target"] is None
+    assert sample["paper_exploration_evidence"]["daily_sample_quota"] is None
+
+
+def test_stale_contract_multiplier_uses_authoritative_gross_pnl_price_path() -> None:
+    history = _history(
+        inst_id="LIT-USDT-SWAP",
+        symbol="LIT/USDT",
+        open_avg_px=2.5,
+        close_avg_px=2.35,
+        realized_pnl=-4.55,
+        pnl=-4.5,
+        fee=-0.05,
+        funding_fee=0.0,
+        pnl_ratio=-0.0606666667,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "instId": "LIT-USDT-SWAP",
+        "realizedPnl": "-4.55",
+        "pnl": "-4.5",
+        "fee": "-0.05",
+        "fundingFee": "0",
+        "pnlRatio": "-0.0606666667",
+        "_bb_contract_spec": {"ctVal": "1", "ctMult": "1", "lotSz": "1"},
+    }
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-1"].okx_fill_contracts = 3.0
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["contract_spec_notional_usdt"] == pytest.approx(7.5)
+    assert sample["notional_usdt"] == pytest.approx(75.0)
+    assert sample["contract_notional_corrected"] is True
+    assert sample["gross_price_return_pct"] == pytest.approx(-6.0)
+    assert sample["gross_return_on_notional_pct"] == pytest.approx(-6.0)
+    assert sample["gross_return_price_consistent"] is True
+    assert "gross_return_price_path_mismatch" not in sample["training_evidence_gaps"]
+
+
+def test_multiple_entry_decisions_are_quarantined_from_strategy_training() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-2"] = SimpleNamespace(
+        okx_fill_contracts=1.0,
+        okx_trade_ids="trade-entry-2",
+        decision_id=93,
+    )
+    history = _history(entry_order_ids=["entry-1", "entry-2"])
+
+    sample = _outcome(build_okx_history_training_sample(history, **lineage))
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[sample],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert sample["entry_decision_ids"] == [91, 93]
+    assert sample["decision_id"] == 0
+    assert sample["strategy_training_role"] == "aggregate_position_research_only"
+    assert "multiple_entry_decision_lineage" in sample["training_evidence_gaps"]
+    assert payload["trade_samples"] == []
+
+
+def test_obsolete_sampling_entry_is_research_only() -> None:
+    lineage = _complete_lineage()
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "paper_bootstrap_canary": {
+            "trade_kind": "observation_only_probe",
+            "continuous_training_after_settlement": False,
+        }
+    }
+
+    sample = _outcome(build_okx_history_training_sample(_history(), **lineage))
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[sample],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert sample["strategy_training_role"] == "obsolete_sampling_research_only"
+    assert "obsolete_sampling_entry_not_strategy_trainable" in sample[
+        "training_evidence_gaps"
+    ]
+    assert payload["trade_samples"] == []
 
 
 def test_okx_demo_alias_normalizes_to_paper_and_invalid_mode_is_quarantined() -> None:
@@ -218,12 +354,17 @@ def test_training_report_blocks_pnl_return_sign_mismatch() -> None:
 
 
 def test_authoritative_loss_with_exact_entry_lineage_remains_supervision_ready() -> None:
-    history = _history(realized_pnl=-8.5, pnl=-7.0, pnl_ratio=-0.085)
+    history = _history(
+        close_avg_px=99_650.0,
+        realized_pnl=-8.5,
+        pnl=-7.0,
+        pnl_ratio=-0.0085,
+    )
     history.raw_row = {
         **history.raw_row,
         "realizedPnl": "-8.5",
         "pnl": "-7",
-        "pnlRatio": "-0.085",
+        "pnlRatio": "-0.0085",
     }
     sample = _outcome(build_okx_history_training_sample(history, **_complete_lineage()))
 

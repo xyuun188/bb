@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -90,6 +91,65 @@ def test_authoritative_reflection_backfill_deduplicates_exchange_lifecycle() -> 
 
     assert _reflection_lifecycle_key(repaired) == _reflection_lifecycle_key(authoritative)
     assert _reflection_position_rank(authoritative) > _reflection_position_rank(repaired)
+
+
+@pytest.mark.asyncio
+async def test_expert_memory_context_loads_all_experts_in_one_query(monkeypatch) -> None:
+    bulk_calls: list[tuple[list[str], str]] = []
+    used_ids: list[int] = []
+    memory = SimpleNamespace(
+        id=11,
+        expert_name="trend_expert",
+        expert_label="trend",
+        symbol="BTC/USDT",
+        side="long",
+        memory_type="authoritative_trade_outcome",
+        market_pattern="pattern",
+        lesson="lesson",
+        recommended_action="observation_only",
+        evidence_count=1,
+        success_count=1,
+        failure_count=0,
+        confidence_score=0.5,
+        extra={},
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    class FakeMemoryRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_relevant_memories_for_experts(
+            self,
+            expert_names: list[str],
+            symbol: str,
+        ) -> dict[str, list[Any]]:
+            bulk_calls.append((expert_names, symbol))
+            return {"trend_expert": [memory]}
+
+        async def mark_memories_used(self, memory_ids: list[int]) -> None:
+            used_ids.extend(memory_ids)
+
+    @asynccontextmanager
+    async def session_factory():
+        yield object()
+
+    monkeypatch.setattr(expert_memory_module, "MemoryRepository", FakeMemoryRepository)
+    service = ExpertMemoryService(
+        session_factory=session_factory,
+        memory_enabled_provider=lambda: True,
+        model_slots=[
+            {"name": "trend_expert", "label": "trend"},
+            {"name": "risk_expert", "label": "risk"},
+        ],
+    )
+
+    context = await service.context("BTC/USDT")
+
+    assert bulk_calls == [(["trend_expert", "risk_expert"], "BTC/USDT")]
+    assert used_ids == [11]
+    assert context["expert_memories"]["trend_expert"][0]["id"] == 11
 
 
 @pytest.mark.asyncio

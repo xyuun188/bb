@@ -9,6 +9,7 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.paper_exploration import select_paper_exploration_side
 
 CandidateScorer = Callable[[DecisionOutput, dict[str, Any] | None], float]
 FeatureOpportunityScorer = Callable[[Any], float]
@@ -136,6 +137,7 @@ class EntryCandidateEvidencePolicy:
         short_evidence = self._build_side(
             "short", symbol, feature_vector, strategy, base_raw
         )
+        feature_score = _safe_float(self.feature_opportunity_score(feature_vector), 0.0)
         eligible_sides = [
             item
             for item in (long_evidence, short_evidence)
@@ -146,6 +148,10 @@ class EntryCandidateEvidencePolicy:
             if eligible_sides
             else "neutral"
         )
+        exploration = select_paper_exploration_side(
+            {"long": long_evidence, "short": short_evidence},
+            feature_opportunity_score=feature_score,
+        )
         generated_at = datetime.now(UTC).isoformat()
         return {
             "enabled": True,
@@ -153,12 +159,11 @@ class EntryCandidateEvidencePolicy:
             "is_entry_gate": False,
             "symbol": symbol,
             "preferred_side_by_evidence": preferred,
-            "feature_opportunity_score": round(
-                _safe_float(self.feature_opportunity_score(feature_vector), 0.0),
-                8,
-            ),
+            "preferred_exploration_side": exploration["preferred_side"],
+            "feature_opportunity_score": round(feature_score, 8),
             "long": long_evidence,
             "short": short_evidence,
+            "paper_exploration": exploration,
             "memory_feedback_observation": _safe_dict(memory_feedback),
             "policy_provenance": {
                 "source": "authoritative_side_return_opportunity_snapshots",
@@ -169,7 +174,13 @@ class EntryCandidateEvidencePolicy:
                 ),
                 "generated_at": generated_at,
                 "strategy_version": "2026-07-12.candidate-return-evidence.v1",
-                "fallback_reason": "" if eligible_sides else "no_production_eligible_side",
+                "fallback_reason": (
+                    ""
+                    if eligible_sides
+                    else "bounded_paper_exploration_available"
+                    if exploration["preferred_side"] in {"long", "short"}
+                    else "no_production_or_bounded_exploration_side"
+                ),
             },
             "policy": (
                 "Compare fee-after return LCB for long and short. This context cannot grant "
@@ -247,6 +258,7 @@ class EntryCandidateEvidencePolicy:
                 side=side,
             ),
             "production_source_count": source_count,
+            "return_distribution_ready": opportunity.get("production_eligible") is True,
             "production_eligible": production_eligible,
             "recommendation": (
                 "positive_fee_after_return_lcb"

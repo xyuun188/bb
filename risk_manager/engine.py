@@ -13,6 +13,10 @@ from core.symbols import normalize_trading_symbol
 from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
+from services.paper_exploration import (
+    PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+    PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -172,6 +176,27 @@ class RiskEngine:
         leverage = RiskEngine._safe_positive_float(decision.suggested_leverage)
         if sizing.get("production_eligible") is not True:
             return "Dynamic account risk budget is not production eligible."
+        if sizing.get("contract_lifecycle") == "paper_exploration":
+            exploration = raw.get("paper_exploration")
+            exploration = exploration if isinstance(exploration, dict) else {}
+            equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
+            if (
+                sizing.get("execution_scope") != "paper_only"
+                or sizing.get("production_permission") is not False
+                or exploration.get("execution_scope") != "paper_only"
+                or exploration.get("production_permission") is not False
+            ):
+                return "Paper exploration risk contract is not paper-only."
+            if not isclose(leverage, 1.0, abs_tol=1e-8):
+                return "Paper exploration leverage must remain at one."
+            if equity <= 0 or risk_budget > (
+                equity * PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8
+            ):
+                return "Paper exploration exceeds its single-trade equity risk cap."
+            if portfolio_budget > (
+                equity * PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
+            ):
+                return "Paper exploration exceeds its portfolio equity risk cap."
         if not provenance_complete:
             return "Dynamic account risk budget provenance is incomplete."
         if planned_loss <= 0 or risk_budget <= 0 or planned_loss > risk_budget + 1e-8:

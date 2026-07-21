@@ -143,7 +143,6 @@ async def main():
         data_service=data_service,
         redis_client=redis,
     )
-    await trading_service.initialize()
 
     # Initial model evaluation
     print("  Evaluating initial model rankings...")

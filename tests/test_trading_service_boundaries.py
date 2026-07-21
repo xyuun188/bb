@@ -5,6 +5,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -933,6 +934,27 @@ async def test_market_candidate_prewarm_runs_in_background_queue() -> None:
     await service._market_indicator_prewarm_task
     assert service._market_indicator_prewarm_last_diagnostics["background"] is True
     assert service._market_indicator_prewarm_queue == []
+
+
+def test_complete_market_indicator_snapshot_does_not_need_background_prewarm() -> None:
+    features = {
+        "BTC/USDT": SimpleNamespace(
+            indicator_snapshot_available=True,
+            indicator_snapshot_stale=False,
+        ),
+        "ETH/USDT": SimpleNamespace(
+            indicator_snapshot_available=False,
+            indicator_snapshot_stale=False,
+        ),
+        "SOL/USDT": SimpleNamespace(
+            indicator_snapshot_available=True,
+            indicator_snapshot_stale=True,
+        ),
+    }
+
+    prewarm_symbols = TradingService._market_indicator_prewarm_symbols(features)
+
+    assert prewarm_symbols == ["ETH/USDT", "SOL/USDT"]
 
 
 @pytest.mark.asyncio
@@ -3974,6 +3996,21 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
     assert service.market_round_watchdog_seconds() >= 180.0
 
 
+def test_market_round_budget_reserves_full_analysis_time_per_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    assert service.market_round_time_budget_seconds(market_symbol_count=2) == 36.0
+    assert service.market_round_time_budget_seconds(market_symbol_count=3) == 54.0
+
+
 def test_market_symbol_analysis_timeout_fairly_isolates_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3995,7 +4032,7 @@ def test_market_symbol_analysis_timeout_fairly_isolates_candidates(
     )
 
     assert trading_service.MARKET_SYMBOL_ANALYSIS_MIN_SECONDS <= shared < 10.5
-    assert last == pytest.approx(13.5)
+    assert last == pytest.approx(18.0)
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
@@ -4122,6 +4159,33 @@ def test_parallel_loop_intervals_are_not_market_throttles(
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
     assert service.market_loop_interval_seconds() < service.position_loop_interval_seconds()
     assert service.market_loop_interval_seconds() < service.market_round_time_budget_seconds()
+
+
+def test_paper_runner_has_one_trading_service_initialization_owner() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_paper_trading.py"
+    ).read_text(encoding="utf-8")
+
+    assert "await trading_service.initialize()" not in source
+    assert "asyncio.create_task(trading_service.start())" in source
+
+
+def test_training_subprocess_uses_lower_cpu_priority_on_linux() -> None:
+    command = ["/data/bb/app/.venv/bin/python", "scripts/run_local_ml_auto_train.py"]
+
+    lowered = trading_service._low_priority_training_command(
+        command,
+        platform_name="posix",
+        nice_path="/usr/bin/nice",
+    )
+    unchanged = trading_service._low_priority_training_command(
+        command,
+        platform_name="nt",
+        nice_path="/usr/bin/nice",
+    )
+
+    assert lowered == ["/usr/bin/nice", "-n", "10", *command]
+    assert unchanged == command
 
 
 @pytest.mark.asyncio
@@ -4323,6 +4387,55 @@ async def test_position_review_group_deadline_shares_remaining_round_budget() ->
 
 
 @pytest.mark.asyncio
+async def test_strategy_mode_reuses_authoritative_empty_position_snapshot() -> None:
+    service = TradingService.__new__(TradingService)
+    service.strategy_learning_perf_timeout_seconds = lambda: 1.0  # type: ignore[method-assign]
+    service.strategy_learning_account_timeout_seconds = lambda: 1.0  # type: ignore[method-assign]
+    service.entry_position_exposure = SimpleNamespace(context=lambda positions: {})
+    service.entry_symbol_universe = SimpleNamespace(
+        open_position_group_count=lambda positions: len(positions)
+    )
+    service.okx_sync_service = SimpleNamespace(
+        get_open_positions_context=lambda: pytest.fail(
+            "an authoritative empty snapshot must not trigger another exchange read"
+        )
+    )
+    service._recent_strategy_context_performance_snapshot = lambda _mode: (
+        {},
+        {"status": "fresh"},
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+
+    async def account_equity(_mode: str) -> float:
+        return 100.0
+
+    async def bounded_value(
+        _label: str,
+        awaitable: Any,
+        _fallback: Any,
+        _timeout: float,
+        _timings: dict[str, Any],
+    ) -> Any:
+        return await awaitable
+
+    service._strategy_context_account_equity = account_equity  # type: ignore[method-assign]
+    service._bounded_strategy_context_value = bounded_value  # type: ignore[method-assign]
+    service._entry_strategy_mode_context_policy = lambda: SimpleNamespace(
+        build=lambda **_kwargs: {}
+    )
+    service.strategy_learning_service = None
+    service._refresh_dynamic_capacity = lambda **kwargs: kwargs["strategy_context"]
+
+    context = await service._strategy_mode_context(
+        "paper",
+        {"mode": "neutral"},
+        open_positions=[],
+    )
+
+    assert context["account_equity"] == 100.0
+
+
+@pytest.mark.asyncio
 async def test_position_review_slow_group_capacity_matches_watchdog_stage_budget() -> None:
     service = TradingService.__new__(TradingService)
     service.position_review_stage_timeout_seconds = lambda: 63.0  # type: ignore[method-assign]
@@ -4362,6 +4475,54 @@ async def test_market_context_stage_uses_shared_deadline_and_fallback() -> None:
     assert cancelled is True
     assert timings[0]["status"] == "timeout"
     assert timings[0]["allowed_timeout_seconds"] == 0.02
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_runs_in_parallel_with_expert_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._vector_memory_context_cache = {}
+    service._vector_memory_context_tasks = {}
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    release = asyncio.Event()
+
+    class FakeExpertMemoryService:
+        async def context(self, _symbol: str) -> dict[str, Any]:
+            await asyncio.sleep(0)
+            return {
+                "expert_memories": {},
+                "expert_memories_flat": [],
+                "memory_feedback": {},
+            }
+
+    class FakeVectorMemoryService:
+        async def search(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await release.wait()
+            return {"enabled": True, "status": "ok", "hits": [{"id": 1}]}
+
+    service.expert_memory_service = FakeExpertMemoryService()
+    monkeypatch.setattr(trading_service.settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(
+        trading_service,
+        "get_vector_memory_service",
+        lambda: FakeVectorMemoryService(),
+    )
+
+    first = await service._memory_context_with_vector_feedback("BTC/USDT")
+
+    assert first["vector_memory_feedback"]["status"] == "background_refresh"
+    assert first["vector_memory_feedback"]["is_hard_gate"] is False
+    assert len(service._vector_memory_context_tasks) == 1
+
+    release.set()
+    await asyncio.gather(*service._vector_memory_context_tasks.values())
+    second = await service._memory_context_with_vector_feedback("BTC/USDT")
+
+    assert second["vector_memory_feedback"]["status"] == "ok"
+    assert second["vector_memory_feedback"]["matched_count"] == 1
+    assert second["vector_memory_feedback"]["hits"] == [{"id": 1}]
 
 
 @pytest.mark.asyncio

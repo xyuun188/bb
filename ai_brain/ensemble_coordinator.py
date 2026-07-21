@@ -34,6 +34,7 @@ from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
 from services.model_dynamic_routing import plan_dynamic_model_route
+from services.paper_exploration import build_paper_exploration_contract
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -821,6 +822,89 @@ class EnsembleCoordinator:
             "policy_provenance": policy_provenance,
         }
         if not production_eligible:
+            exploration_side = str(
+                candidate_evidence.get("preferred_exploration_side") or ""
+            ).lower()
+            execution_mode = str(context.get("execution_mode") or "").lower()
+            exploration_contract = (
+                build_paper_exploration_contract(
+                    candidate_evidence,
+                    symbol=features.symbol,
+                )
+                if execution_mode == "paper"
+                and exploration_side in {"long", "short"}
+                else {}
+            )
+            if exploration_contract:
+                action = Action.LONG if exploration_side == "long" else Action.SHORT
+                exploration = self._safe_dict(
+                    candidate_evidence.get("paper_exploration")
+                )
+                selected_exploration = self._safe_dict(exploration.get("selected"))
+                information_value = self._safe_float(
+                    selected_exploration.get("information_value_score"),
+                    0.0,
+                )
+                reason = self._reason(
+                    (
+                        "模拟盘候选扣费后期望为正但收益下界仍有轻微不确定，"
+                        "按独立小风险预算执行做多探索"
+                        if action == Action.LONG
+                        else "模拟盘候选扣费后期望为正但收益下界仍有轻微不确定，"
+                        "按独立小风险预算执行做空探索"
+                    ),
+                    decision_score,
+                    disagreement,
+                    raw_opinions,
+                    resolution_brief,
+                )
+                exploration_raw = self._raw(
+                    raw_opinions,
+                    decision_score,
+                    disagreement,
+                    cross_validations,
+                    consultation,
+                )
+                self._attach_expert_diversity_policy(exploration_raw, context)
+                exploration_raw["authoritative_return_candidate"] = raw[
+                    "authoritative_return_candidate"
+                ]
+                exploration_raw["entry_candidate_evidence"] = candidate_evidence
+                exploration_raw["paper_exploration"] = exploration_contract
+                exploration_raw["base_weighted_score_observation"] = round(
+                    normalized_score,
+                    4,
+                )
+                exploration_raw["memory_feedback_observation"] = self._memory_feedback(
+                    context
+                )
+                exploration_raw["ml_signal"] = context.get("ml_signal") or {}
+                exploration_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
+                exploration_raw["direction_competition"] = (
+                    context.get("direction_competition") or {}
+                )
+                exploration_raw["entry_permission_policy"] = {
+                    "source": "bounded_positive_mean_paper_exploration",
+                    "execution_scope": "paper_only",
+                    "production_permission": False,
+                    "sample_target": None,
+                    "daily_sample_quota": None,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "strategy_version": exploration_contract.get("version"),
+                }
+                return DecisionOutput(
+                    model_name=ENSEMBLE_TRADER_NAME,
+                    symbol=features.symbol,
+                    action=action,
+                    confidence=min(max(information_value, 0.0), 1.0),
+                    reasoning=reason,
+                    position_size_pct=0.0,
+                    suggested_leverage=1.0,
+                    stop_loss_pct=0.0,
+                    take_profit_pct=0.0,
+                    raw_response=exploration_raw,
+                    feature_snapshot=features.to_dict(),
+                )
             reason = self._reason(
                 "当前模型没有给出扣除交易成本后仍为正的模拟盘机会，本轮保持观望",
                 decision_score,

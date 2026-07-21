@@ -141,7 +141,7 @@ async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_secon
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_serializes_batches_but_parallelizes_core_inference(
+async def test_local_ai_tools_serializes_batches_but_parallelizes_market_inference(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,7 +172,7 @@ async def test_local_ai_tools_serializes_batches_but_parallelizes_core_inference
 
     assert first["status"] == "completed"
     assert second["status"] == "completed"
-    assert max_active_calls == 2
+    assert max_active_calls == 3
     assert len(calls) == 6
     symbols = [symbol for symbol, _path in calls]
     assert sum(left != right for left, right in zip(symbols, symbols[1:], strict=False)) == 1

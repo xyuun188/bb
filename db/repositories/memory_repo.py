@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Float, cast, func, or_, select
 
 from core.symbols import normalize_trading_symbol
 from core.training_contracts import (
@@ -26,33 +26,74 @@ class MemoryRepository(BaseRepository):
 
     model = ExpertMemory
 
-    async def get_relevant_memories(
+    async def get_relevant_memories_for_experts(
         self,
-        expert_name: str,
+        expert_names: list[str],
         symbol: str,
         side: str | None = None,
-    ) -> list[ExpertMemory]:
-        stmt = (
-            select(ExpertMemory)
+        *,
+        per_expert_limit: int = 12,
+    ) -> dict[str, list[ExpertMemory]]:
+        """Load prompt memories for all experts with one database round trip."""
+
+        names = list(dict.fromkeys(str(name or "").strip() for name in expert_names))
+        names = [name for name in names if name]
+        if not names:
+            return {}
+        limit = max(int(per_expert_limit or 0), 1)
+        candidate_limit = limit * 3
+        authority_rank = cast(
+            ExpertMemory.extra["authority_rank"].as_string(),
+            Float,
+        )
+        ranked_candidates = (
+            select(
+                ExpertMemory.id.label("memory_id"),
+                func.row_number()
+                .over(
+                    partition_by=ExpertMemory.expert_name,
+                    order_by=(
+                        authority_rank.desc().nullslast(),
+                        ExpertMemory.updated_at.desc().nullslast(),
+                        ExpertMemory.id.desc(),
+                    ),
+                )
+                .label("expert_rank"),
+            )
             .where(
-                ExpertMemory.expert_name == expert_name,
+                ExpertMemory.expert_name.in_(names),
                 ExpertMemory.is_active.is_(True),
                 or_(ExpertMemory.symbol.is_(None), ExpertMemory.symbol == symbol),
             )
-            .order_by(ExpertMemory.updated_at.desc().nullslast(), ExpertMemory.id.desc())
+            .subquery()
+        )
+        stmt = (
+            select(ExpertMemory)
+            .join(
+                ranked_candidates,
+                ExpertMemory.id == ranked_candidates.c.memory_id,
+            )
+            .where(ranked_candidates.c.expert_rank <= candidate_limit)
         )
         result = await self.session.execute(stmt)
-        rows = list(result.scalars().all())
         symbol_norm = normalize_trading_symbol(symbol)
         side_norm = str(side or "").lower()
-        filtered = [
-            row
-            for row in rows
-            if (not row.symbol or normalize_trading_symbol(row.symbol) == symbol_norm)
-            and (not row.side or not side_norm or str(row.side or "").lower() == side_norm)
-            and _memory_row_usable(row)
-        ]
-        return sorted(filtered, key=_memory_authority_sort_key, reverse=True)
+        grouped: dict[str, list[ExpertMemory]] = {name: [] for name in names}
+        for row in result.scalars().all():
+            expert_name = str(row.expert_name or "")
+            if expert_name not in grouped:
+                continue
+            if row.symbol and normalize_trading_symbol(row.symbol) != symbol_norm:
+                continue
+            if row.side and side_norm and str(row.side or "").lower() != side_norm:
+                continue
+            if _memory_row_usable(row):
+                grouped[expert_name].append(row)
+        return {
+            name: sorted(rows, key=_memory_authority_sort_key, reverse=True)[:limit]
+            for name, rows in grouped.items()
+            if rows
+        }
 
     async def mark_memories_used(self, memory_ids: list[int]) -> None:
         if not memory_ids:
