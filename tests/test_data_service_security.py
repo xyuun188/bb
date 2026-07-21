@@ -20,6 +20,10 @@ def _service() -> DataService:
     service._news_items_cache = {}
     service._indicator_snapshot_cache = {}
     service._indicator_snapshot_tasks = {}
+    service._indicator_cached_read_tasks = {}
+    service._indicator_cached_read_semaphore = asyncio.Semaphore(
+        data_service_module.INDICATOR_CACHED_READ_CONCURRENCY
+    )
     service._indicator_remote_refresh_semaphore = asyncio.Semaphore(
         max(1, int(data_service_module.INDICATOR_REMOTE_REFRESH_CONCURRENCY))
     )
@@ -45,6 +49,7 @@ def _service() -> DataService:
     service._available_symbols_cache = []
     service._available_symbols_cache_updated_at = None
     service._available_symbols_refresh_task = None
+    service._stopping = False
     return service
 
 
@@ -694,6 +699,207 @@ async def test_cancelled_indicator_wait_keeps_shared_build_tracked(
     await tracked
     await asyncio.sleep(0)
     assert "BTC/USDT" not in service._indicator_snapshot_tasks
+
+
+@pytest.mark.asyncio
+async def test_cached_indicator_timeout_keeps_database_read_running_and_caches_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+
+    async def slow_cached_klines(
+        symbol: str,
+        timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
+        assert symbol == "BTC/USDT"
+        assert timeframe_limits == data_service_module.KLINE_PERSIST_TIMEFRAME_LIMITS
+        read_started.set()
+        await release_read.wait()
+        return {"1m": []}
+
+    service._load_recent_cached_klines_for_timeframes = slow_cached_klines  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        service,
+        "_indicator_features_from_timeframes",
+        lambda _grouped: {"close": 100.5, "indicator_snapshot_available": True},
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service._indicator_features_from_cached_klines("BTC/USDT"),
+            timeout=0.01,
+        )
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+
+    tracked = service._indicator_cached_read_tasks.get("BTC/USDT")
+    assert tracked is not None
+    assert tracked.cancelled() is False
+    assert tracked.done() is False
+    release_read.set()
+    await tracked
+    await asyncio.sleep(0)
+
+    cached = service._indicator_snapshot_cache["BTC/USDT"]
+    assert cached["data"]["close"] == pytest.approx(100.5)
+    assert "BTC/USDT" not in service._indicator_cached_read_tasks
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cached_indicator_reads_reuse_one_database_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    read_calls = 0
+
+    async def slow_cached_klines(
+        _symbol: str,
+        _timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
+        nonlocal read_calls
+        read_calls += 1
+        read_started.set()
+        await release_read.wait()
+        return {"1m": []}
+
+    service._load_recent_cached_klines_for_timeframes = slow_cached_klines  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        service,
+        "_indicator_features_from_timeframes",
+        lambda _grouped: {"indicator_snapshot_available": True},
+    )
+
+    first = asyncio.create_task(
+        service._indicator_features_from_cached_klines("ETH/USDT")
+    )
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+    second = asyncio.create_task(
+        service._indicator_features_from_cached_klines("ETH/USDT")
+    )
+    await asyncio.sleep(0)
+
+    assert read_calls == 1
+    assert len(service._indicator_cached_read_tasks) == 1
+    release_read.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == second_result
+
+
+@pytest.mark.asyncio
+async def test_cached_indicator_database_read_concurrency_and_backlog_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._indicator_cached_read_semaphore = asyncio.Semaphore(2)
+    monkeypatch.setattr(data_service_module, "INDICATOR_CACHED_READ_TASK_LIMIT", 3)
+    two_reads_started = asyncio.Event()
+    release_reads = asyncio.Event()
+    active_reads = 0
+    peak_reads = 0
+
+    async def slow_cached_klines(
+        _symbol: str,
+        _timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
+        nonlocal active_reads, peak_reads
+        active_reads += 1
+        peak_reads = max(peak_reads, active_reads)
+        if active_reads == 2:
+            two_reads_started.set()
+        await release_reads.wait()
+        active_reads -= 1
+        return {"1m": []}
+
+    service._load_recent_cached_klines_for_timeframes = slow_cached_klines  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        service,
+        "_indicator_features_from_timeframes",
+        lambda _grouped: {"indicator_snapshot_available": True},
+    )
+    reads = [
+        asyncio.create_task(
+            service._indicator_features_from_cached_klines(f"COIN-{index}/USDT")
+        )
+        for index in range(3)
+    ]
+    await asyncio.wait_for(two_reads_started.wait(), timeout=0.2)
+
+    overflow_result = await asyncio.wait_for(
+        service._indicator_features_from_cached_klines("OVERFLOW/USDT"),
+        timeout=0.2,
+    )
+    assert overflow_result == {}
+    assert len(service._indicator_cached_read_tasks) == 3
+    assert peak_reads == 2
+
+    release_reads.set()
+    await asyncio.gather(*reads)
+    assert peak_reads == 2
+
+
+@pytest.mark.asyncio
+async def test_data_service_stop_drains_orphaned_cached_indicator_database_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+
+    async def slow_cached_klines(
+        _symbol: str,
+        _timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
+        read_started.set()
+        await release_read.wait()
+        return {"1m": []}
+
+    async def no_op() -> None:
+        return None
+
+    class FakeClosable:
+        async def close(self) -> None:
+            return None
+
+    class FakeExternalEventService:
+        async def stop(self) -> None:
+            return None
+
+    service._load_recent_cached_klines_for_timeframes = slow_cached_klines  # type: ignore[method-assign]
+    service._stop_kline_coverage_refresh = no_op  # type: ignore[method-assign]
+    service._stop_kline_persistence = no_op  # type: ignore[method-assign]
+    service.ws_client = FakeClosable()
+    service.rest_client = FakeClosable()
+    service.news_fetcher = FakeClosable()
+    service.sentiment_scraper = FakeClosable()
+    service.external_event_service = FakeExternalEventService()
+    monkeypatch.setattr(
+        service,
+        "_indicator_features_from_timeframes",
+        lambda _grouped: {"indicator_snapshot_available": True},
+    )
+
+    request = asyncio.create_task(
+        service._indicator_features_from_cached_klines("SOL/USDT")
+    )
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+    request.cancel()
+    await asyncio.gather(request, return_exceptions=True)
+
+    stop_task = asyncio.create_task(service.stop())
+    await asyncio.sleep(0)
+    tracked = service._indicator_cached_read_tasks.get("SOL/USDT")
+    assert service._stopping is True
+    assert tracked is not None
+    assert tracked.cancelled() is False
+    assert stop_task.done() is False
+
+    release_read.set()
+    await asyncio.wait_for(stop_task, timeout=0.2)
+    assert service._indicator_cached_read_tasks == {}
+    assert "SOL/USDT" in service._indicator_snapshot_cache
 
 
 @pytest.mark.asyncio

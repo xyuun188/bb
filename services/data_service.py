@@ -69,6 +69,11 @@ INDICATOR_SNAPSHOT_BUILD_CONCURRENCY = max(
     1,
     min(4, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY)),
 )
+INDICATOR_CACHED_READ_CONCURRENCY = max(
+    1,
+    min(4, int(settings.database_pool_size or 1)),
+)
+INDICATOR_CACHED_READ_TASK_LIMIT = 64
 KLINE_PERSIST_CONCURRENCY = 2
 TICKER_PERSIST_CONCURRENCY = max(
     1,
@@ -181,6 +186,10 @@ class DataService:
         self._kline_cache: dict[str, pd.DataFrame] = {}  # symbol:tf -> DataFrame
         self._indicator_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._indicator_snapshot_tasks: dict[str, asyncio.Task] = {}
+        self._indicator_cached_read_tasks: dict[str, asyncio.Task] = {}
+        self._indicator_cached_read_semaphore = asyncio.Semaphore(
+            INDICATOR_CACHED_READ_CONCURRENCY
+        )
         self._indicator_snapshot_priority_gate = _PriorityBuildGate(
             INDICATOR_SNAPSHOT_BUILD_CONCURRENCY
         )
@@ -212,6 +221,7 @@ class DataService:
         self._available_symbols_refresh_task: asyncio.Task | None = None
         self._instrument_spec_cache: dict[str, dict[str, Any]] = {}
         self._instrument_spec_tasks: dict[str, asyncio.Task] = {}
+        self._stopping = False
 
         # Register ticker callback for real-time price updates
         self.ws_client.on_ticker(self._on_ticker_update)
@@ -310,6 +320,7 @@ class DataService:
 
     async def start(self) -> None:
         """Start all data feed connections."""
+        self._stopping = False
         # Fetch all available USDT pairs for auto mode WS subscription
         try:
             available = await self._refresh_available_symbols_cache()
@@ -335,8 +346,10 @@ class DataService:
 
     async def stop(self) -> None:
         """Stop all data feed connections."""
+        self._stopping = True
         await self._stop_kline_coverage_refresh()
         await self._stop_kline_persistence()
+        await self._stop_indicator_cached_reads()
         await self.ws_client.close()
         await self.rest_client.close()
         await self.news_fetcher.close()
@@ -1531,6 +1544,29 @@ class DataService:
             self._indicator_snapshot_tasks = tasks
         return tasks
 
+    def _indicator_cached_read_task_map(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_indicator_cached_read_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._indicator_cached_read_tasks = tasks
+        return tasks
+
+    def _indicator_cached_read_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_indicator_cached_read_semaphore", None)
+        if not isinstance(gate, asyncio.Semaphore):
+            gate = asyncio.Semaphore(INDICATOR_CACHED_READ_CONCURRENCY)
+            self._indicator_cached_read_semaphore = gate
+        return gate
+
+    async def _stop_indicator_cached_reads(self) -> None:
+        tasks = list(self._indicator_cached_read_task_map().values())
+        if tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
+        self._indicator_cached_read_task_map().clear()
+
     def _indicator_remote_refresh_gate(self) -> asyncio.Semaphore:
         gate = getattr(self, "_indicator_remote_refresh_semaphore", None)
         if not isinstance(gate, asyncio.Semaphore):
@@ -1788,11 +1824,57 @@ class DataService:
             return await getter(symbol)
 
     async def _indicator_features_from_cached_klines(self, symbol: str) -> dict[str, Any]:
-        cached_klines_by_timeframe = await self._load_recent_cached_klines_for_timeframes(
-            symbol,
-            KLINE_PERSIST_TIMEFRAME_LIMITS,
+        normalized = self._normalize_symbols([symbol])[0]
+        tasks = self._indicator_cached_read_task_map()
+        existing = tasks.get(normalized)
+        if existing is not None:
+            result = await asyncio.shield(existing)
+            return dict(result or {})
+
+        if bool(getattr(self, "_stopping", False)):
+            return {}
+
+        for completed_symbol, completed_task in list(tasks.items()):
+            if completed_task.done() and tasks.get(completed_symbol) is completed_task:
+                tasks.pop(completed_symbol, None)
+        if len(tasks) >= INDICATOR_CACHED_READ_TASK_LIMIT:
+            logger.debug(
+                "cached indicator read task limit reached",
+                symbol=normalized,
+                task_limit=INDICATOR_CACHED_READ_TASK_LIMIT,
+            )
+            return {}
+
+        task = asyncio.create_task(
+            self._build_indicator_features_from_cached_klines(normalized)
         )
-        return self._indicator_features_from_timeframes(cached_klines_by_timeframe)
+        tasks[normalized] = task
+
+        def cleanup(_task: asyncio.Task, read_symbol: str = normalized) -> None:
+            if tasks.get(read_symbol) is _task:
+                tasks.pop(read_symbol, None)
+            if not _task.cancelled():
+                _task.exception()
+
+        task.add_done_callback(cleanup)
+        result = await asyncio.shield(task)
+        return dict(result or {})
+
+    async def _build_indicator_features_from_cached_klines(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+        async with self._indicator_cached_read_gate():
+            cached_klines_by_timeframe = (
+                await self._load_recent_cached_klines_for_timeframes(
+                    symbol,
+                    KLINE_PERSIST_TIMEFRAME_LIMITS,
+                )
+            )
+        features = self._indicator_features_from_timeframes(cached_klines_by_timeframe)
+        if features:
+            self._store_indicator_snapshot_cache(symbol, features)
+        return features
 
     def _indicator_features_from_timeframes(
         self,
