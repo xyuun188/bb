@@ -225,6 +225,11 @@ MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS = 1.0
 MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
+MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
+MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
+MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 4.0
+MARKET_SYMBOL_ANALYSIS_MAX_SECONDS = 14.0
+MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
 
 
 async def drain_cancelled_tasks(
@@ -652,6 +657,10 @@ class TradingService:
         )
         self._last_market_analysis_selection_diagnostics: dict[str, Any] = {}
         self._market_budget_deferred_symbols: list[str] = []
+        self._market_indicator_prewarm_queue: list[str] = []
+        self._market_indicator_prewarm_task: asyncio.Task | None = None
+        self._market_indicator_prewarm_last_diagnostics: dict[str, Any] = {}
+        self._market_timeout_retry_not_before: dict[str, datetime] = {}
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
         )
@@ -948,6 +957,26 @@ class TradingService:
             min(max(model_reserve, interval * 0.20), max(6.0, budget_seconds * 0.45)),
             3,
         )
+
+    def market_symbol_analysis_timeout_seconds(
+        self,
+        *,
+        remaining_round_seconds: float,
+        remaining_symbol_count: int,
+    ) -> float:
+        """Give each candidate an independent share of the remaining AI budget."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        count = max(int(remaining_symbol_count or 1), 1)
+        remaining = max(float(remaining_round_seconds or 0.0), 0.0)
+        fair_share = remaining / count
+        reserve = min(0.75, max(0.1, fair_share * 0.05))
+        ceiling = max(
+            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+            min(MARKET_SYMBOL_ANALYSIS_MAX_SECONDS, interval * 0.45),
+        )
+        return round(max(0.0, min(ceiling, fair_share - reserve)), 3)
 
     def position_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent position-review rounds."""
@@ -2029,6 +2058,38 @@ class TradingService:
                         "remaining_seconds_at_start": round(remaining_seconds, 6),
                     }
                 )
+
+    async def _market_local_ml_context_value(
+        self,
+        feature: Any,
+        *,
+        lock_wait_seconds: float,
+        remaining_seconds_at_start: float,
+        timings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Load local ML context in parallel with independent memory context."""
+
+        started = asyncio.get_running_loop().time()
+        value = await self._local_ml_signal_context(
+            feature,
+            lock_wait_seconds=lock_wait_seconds,
+        )
+        timings.append(
+            {
+                "stage": "local_ml_context",
+                "status": str(value.get("status") or "ok"),
+                "duration_seconds": round(
+                    max(asyncio.get_running_loop().time() - started, 0.0),
+                    6,
+                ),
+                "allowed_lock_wait_seconds": round(lock_wait_seconds, 6),
+                "remaining_seconds_at_start": round(
+                    remaining_seconds_at_start,
+                    6,
+                ),
+            }
+        )
+        return value
 
     def _strategy_context_io_gate(self) -> asyncio.Semaphore:
         """Bound concurrent history queries shared by market and position loops."""
@@ -3967,6 +4028,71 @@ class TradingService:
         diagnostics["changes_trading_thresholds"] = False
         return diagnostics
 
+    def _queue_market_candidate_indicator_prewarm(
+        self,
+        symbols: list[str],
+    ) -> dict[str, Any]:
+        """Queue shortlist indicator work outside the latency-sensitive market round."""
+
+        requested = self.entry_symbol_universe.dedupe_symbols(symbols)
+        existing = list(getattr(self, "_market_indicator_prewarm_queue", []) or [])
+        queued = self.entry_symbol_universe.dedupe_symbols([*existing, *requested])[
+            :MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT
+        ]
+        self._market_indicator_prewarm_queue = queued
+        task = getattr(self, "_market_indicator_prewarm_task", None)
+        if queued and (task is None or task.done()):
+            self._market_indicator_prewarm_task = asyncio.create_task(
+                self._market_indicator_prewarm_worker()
+            )
+        last = self._safe_dict(
+            getattr(self, "_market_indicator_prewarm_last_diagnostics", None)
+        )
+        return {
+            "status": "queued" if requested else "skipped",
+            "requested_count": len(requested),
+            "queued_count": len(queued),
+            "worker_active": bool(
+                self._market_indicator_prewarm_task
+                and not self._market_indicator_prewarm_task.done()
+            ),
+            "last_completed_batch": last,
+            "is_entry_permission": False,
+            "changes_trading_thresholds": False,
+        }
+
+    async def _market_indicator_prewarm_worker(self) -> None:
+        """Drain rolling prewarm work in bounded batches without blocking analysis."""
+
+        try:
+            while self._market_indicator_prewarm_queue:
+                batch = self._market_indicator_prewarm_queue[
+                    :MARKET_BACKGROUND_PREWARM_BATCH_SIZE
+                ]
+                del self._market_indicator_prewarm_queue[: len(batch)]
+                diagnostics = await self._prewarm_market_candidate_indicators(batch)
+                diagnostics["background"] = True
+                diagnostics["remaining_queue_count"] = len(
+                    self._market_indicator_prewarm_queue
+                )
+                self._market_indicator_prewarm_last_diagnostics = diagnostics
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._market_indicator_prewarm_last_diagnostics = {
+                "status": "error",
+                "background": True,
+                "error": safe_error_text(exc),
+                "remaining_queue_count": len(
+                    getattr(self, "_market_indicator_prewarm_queue", []) or []
+                ),
+            }
+            logger.warning(
+                "background market indicator prewarm failed",
+                error=safe_error_text(exc),
+            )
+
     async def _hydrate_prewarmed_market_candidates(
         self,
         feature_vectors: dict[str, Any],
@@ -3990,7 +4116,16 @@ class TradingService:
         )
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def hydrate(symbol: str) -> tuple[str, Any | None, str]:
+        async def hydrate(symbol: str) -> tuple[str, Any | None, str, str]:
+            existing = feature_vectors.get(symbol)
+
+            def existing_full_snapshot() -> Any | None:
+                if self._is_valid_feature_vector(existing) and bool(
+                    getattr(existing, "indicator_snapshot_available", False)
+                ):
+                    return existing
+                return None
+
             async with semaphore:
                 try:
                     refreshed = await asyncio.wait_for(
@@ -4008,17 +4143,38 @@ class TradingService:
                         timeout=timeout_seconds,
                     )
                 except TimeoutError:
-                    return symbol, None, "prewarmed_feature_refresh_timeout"
+                    fallback = existing_full_snapshot()
+                    return (
+                        symbol,
+                        fallback,
+                        "" if fallback is not None else "prewarmed_feature_refresh_timeout",
+                        "existing_full_snapshot" if fallback is not None else "unavailable",
+                    )
                 except Exception as exc:
                     logger.warning(
                         "prewarmed market candidate hydration failed",
                         symbol=symbol,
                         error=safe_error_text(exc),
                     )
-                    return symbol, None, "prewarmed_feature_refresh_failed"
+                    fallback = existing_full_snapshot()
+                    return (
+                        symbol,
+                        fallback,
+                        "" if fallback is not None else "prewarmed_feature_refresh_failed",
+                        "existing_full_snapshot" if fallback is not None else "unavailable",
+                    )
                 if not self._is_valid_feature_vector(refreshed):
-                    return symbol, None, "prewarmed_feature_invalid"
+                    fallback = existing_full_snapshot()
+                    return (
+                        symbol,
+                        fallback,
+                        "" if fallback is not None else "prewarmed_feature_invalid",
+                        "existing_full_snapshot" if fallback is not None else "unavailable",
+                    )
                 if not bool(getattr(refreshed, "indicator_snapshot_available", False)):
+                    fallback = existing_full_snapshot()
+                    if fallback is not None:
+                        return symbol, fallback, "", "existing_full_snapshot"
                     return (
                         symbol,
                         None,
@@ -4026,18 +4182,21 @@ class TradingService:
                             getattr(refreshed, "indicator_snapshot_reason", "")
                             or "indicator_snapshot_unavailable"
                         ),
+                        "unavailable",
                     )
-                return symbol, refreshed, ""
+                return symbol, refreshed, "", "prewarmed_indicator_cache"
 
         rows = await asyncio.gather(
             *(hydrate(symbol) for symbol in feature_vectors),
         )
         hydrated = {
-            symbol: refreshed for symbol, refreshed, _reason in rows if refreshed is not None
+            symbol: refreshed
+            for symbol, refreshed, _reason, _source in rows
+            if refreshed is not None
         }
         unavailable = [
             {"symbol": symbol, "reason": reason}
-            for symbol, refreshed, reason in rows
+            for symbol, refreshed, reason, _source in rows
             if refreshed is None
         ]
         return hydrated, {
@@ -4046,6 +4205,10 @@ class TradingService:
             "hydrated_count": len(hydrated),
             "unavailable_count": len(unavailable),
             "unavailable_symbols": unavailable,
+            "reused_existing_full_snapshot_count": sum(
+                source == "existing_full_snapshot"
+                for _symbol, _refreshed, _reason, source in rows
+            ),
             "timeout_seconds": round(timeout_seconds, 3),
             "source": "prewarmed_indicator_cache",
             "is_entry_permission": False,
@@ -4118,6 +4281,16 @@ class TradingService:
             for symbol in market_symbols
             if self._normalize_position_symbol(symbol) in verified_symbols
         ]
+        deferred_keys = {
+            self._normalize_position_symbol(symbol)
+            for symbol in (getattr(self, "_market_budget_deferred_symbols", []) or [])
+            if self._normalize_position_symbol(symbol)
+        }
+        deferred_market_symbols = [
+            symbol
+            for symbol in market_symbols
+            if self._normalize_position_symbol(symbol) in deferred_keys
+        ]
         major_symbol_keys = {
             self._normalize_position_symbol(symbol) for symbol in ALT_LONG_ALLOWED_SYMBOLS
         }
@@ -4127,11 +4300,19 @@ class TradingService:
             if self._normalize_position_symbol(symbol) in major_symbol_keys
         ]
         priority_market_symbols = self.entry_symbol_universe.dedupe_symbols(
-            [*verified_market_symbols, *bootstrap_major_symbols]
+            [
+                *deferred_market_symbols,
+                *verified_market_symbols,
+                *bootstrap_major_symbols,
+            ]
         )
         priority_limit = min(
             market_budget,
-            max(int(configured_limit), len(bootstrap_major_symbols)),
+            max(
+                int(configured_limit),
+                len(deferred_market_symbols),
+                len(bootstrap_major_symbols),
+            ),
         )
         selected_verified = priority_market_symbols[:priority_limit]
         self._last_auto_feature_fetch_budget_diagnostics = {
@@ -4148,6 +4329,7 @@ class TradingService:
             "pool_min": int(AUTO_SCAN_FEATURE_FETCH_POOL_MIN),
             "pool_max": int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX),
             "verified_execution_symbol_count": len(verified_market_symbols),
+            "deferred_candidate_symbol_count": len(deferred_market_symbols),
             "bootstrap_major_symbol_count": len(bootstrap_major_symbols),
             "selected_priority_symbol_count": len(selected_verified),
             "execution_mode": model_mode,
@@ -5223,6 +5405,58 @@ class TradingService:
             raw["market_analysis_progress"] = self._safe_dict(progress)
         decision.raw_response = raw
 
+    @staticmethod
+    def _market_analysis_timeout_hold(
+        feature: Any,
+        *,
+        timeout_seconds: float,
+        market_context_timings: list[dict[str, Any]],
+    ) -> DecisionOutput:
+        """Persist a neutral record when one candidate exhausts its own model slot."""
+
+        reason = (
+            "本次候选的模型分析超过独立时间上限，已记录为观望并交给后续轮次重试；"
+            "本次不会开仓，也不会改变风控条件。"
+        )
+        symbol = str(getattr(feature, "symbol", "") or "")
+        return DecisionOutput(
+            model_name=ENSEMBLE_TRADER_NAME,
+            symbol=symbol,
+            action=Action.HOLD,
+            confidence=0.0,
+            reasoning=reason,
+            position_size_pct=0.0,
+            suggested_leverage=1.0,
+            stop_loss_pct=0.0,
+            take_profit_pct=0.0,
+            raw_response={
+                "analysis_type": "market",
+                "market_model_timeout": {
+                    "isolated_to_symbol": True,
+                    "timeout_seconds": round(max(float(timeout_seconds), 0.0), 3),
+                    "retry_later": True,
+                    "retry_after_seconds": MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS,
+                    "production_permission": False,
+                    "reason": reason,
+                },
+                "market_context_timings": list(market_context_timings),
+            },
+            feature_snapshot=(
+                feature.to_dict() if hasattr(feature, "to_dict") else {}
+            ),
+        )
+
+    @staticmethod
+    def _is_market_analysis_timeout_hold(decision: DecisionOutput) -> bool:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        timeout = raw.get("market_model_timeout")
+        return bool(
+            decision.is_hold
+            and isinstance(timeout, dict)
+            and timeout.get("isolated_to_symbol") is True
+            and timeout.get("production_permission") is False
+        )
+
     def _market_analysis_progress_snapshot(
         self,
         *,
@@ -5363,6 +5597,62 @@ class TradingService:
             normalized_seen.add(key)
             remembered.append(symbol)
         self._market_budget_deferred_symbols = remembered[:50]
+
+    def _mark_market_symbol_timeout_cooldown(
+        self,
+        symbol: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        key = self._normalize_position_symbol(symbol)
+        if not key:
+            return
+        store = getattr(self, "_market_timeout_retry_not_before", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._market_timeout_retry_not_before = store
+        current = now or datetime.now(UTC)
+        store[key] = current + timedelta(
+            seconds=MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS
+        )
+
+    def _filter_market_symbol_timeout_cooldowns(
+        self,
+        feature_vectors: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        current = now or datetime.now(UTC)
+        store = getattr(self, "_market_timeout_retry_not_before", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._market_timeout_retry_not_before = store
+        expired = [key for key, retry_at in store.items() if retry_at <= current]
+        for key in expired:
+            store.pop(key, None)
+        skipped = [
+            symbol
+            for symbol in feature_vectors
+            if self._normalize_position_symbol(symbol) in store
+        ]
+        available = {
+            symbol: feature
+            for symbol, feature in feature_vectors.items()
+            if self._normalize_position_symbol(symbol) not in store
+        }
+        return available, {
+            "read_only": True,
+            "is_entry_gate": False,
+            "cooldown_seconds": MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS,
+            "skipped_count": len(skipped),
+            "skipped_symbols": skipped[:50],
+            "active_cooldown_count": len(store),
+            "reason": (
+                "A symbol whose model call timed out yields its next model slot to other "
+                "ranked candidates until the retry cooldown expires. Rankings, entry "
+                "thresholds, sizing, leverage, and risk vetoes are unchanged."
+            ),
+        }
 
     async def _try_claim_analysis_symbol(self, symbol: str, scope: str) -> bool:
         normalized = self._normalize_position_symbol(symbol)
@@ -5945,7 +6235,7 @@ class TradingService:
                     }
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
             if run_market_analysis and market_feature_vectors:
-                market_indicator_prewarm = await self._prewarm_market_candidate_indicators(
+                market_indicator_prewarm = self._queue_market_candidate_indicator_prewarm(
                     list(market_feature_vectors)
                 )
             else:
@@ -6000,6 +6290,26 @@ class TradingService:
                     "changes_trading_thresholds": False,
                 }
             results["market_prewarmed_feature_hydration"] = hydration_diagnostics
+            if mode_manager.is_auto_scan and run_market_analysis and market_feature_vectors:
+                market_feature_vectors, timeout_cooldown_diagnostics = (
+                    self._filter_market_symbol_timeout_cooldowns(
+                        market_feature_vectors
+                    )
+                )
+                results["market_symbol_timeout_cooldowns"] = (
+                    timeout_cooldown_diagnostics
+                )
+            else:
+                results["market_symbol_timeout_cooldowns"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "cooldown_seconds": MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS,
+                    "skipped_count": 0,
+                    "skipped_symbols": [],
+                    "active_cooldown_count": len(
+                        getattr(self, "_market_timeout_retry_not_before", {}) or {}
+                    ),
+                }
             if mode_manager.is_auto_scan and run_market_analysis and market_feature_vectors:
                 await self._ensure_market_analysis_selection_history()
                 market_feature_vectors = self._select_market_analysis_candidates(
@@ -6115,6 +6425,7 @@ class TradingService:
             all_candidates: list[tuple[str, str, DecisionOutput, Any, int | None]] = []
             staged_entry_counts = self.entry_capacity.empty_staged_counts()
             market_round_skipped_by_budget: list[str] = []
+            market_timeout_retry_symbols: list[str] = []
 
             if new_pair_market_pause_applied:
                 self.market_decision_result_recorder.append_result(
@@ -6222,6 +6533,19 @@ class TradingService:
                     market_execution_cost_facts.get(model_mode),
                 )
                 feature_vectors[symbol] = fv
+                symbol_started_monotonic = asyncio.get_running_loop().time()
+                symbol_remaining_round_seconds = max(
+                    market_ai_deadline_monotonic - symbol_started_monotonic,
+                    0.0,
+                )
+                symbol_timeout_seconds = self.market_symbol_analysis_timeout_seconds(
+                    remaining_round_seconds=symbol_remaining_round_seconds,
+                    remaining_symbol_count=len(market_feature_items) - market_index,
+                )
+                symbol_deadline_monotonic = min(
+                    market_ai_deadline_monotonic,
+                    symbol_started_monotonic + max(symbol_timeout_seconds, 0.05),
+                )
                 market_analysis_progress = self._market_analysis_progress_snapshot(
                     symbol=symbol,
                     market_index=market_index,
@@ -6230,23 +6554,15 @@ class TradingService:
                     market_ai_started_at=market_ai_started_at,
                     strategy_context=strategy_mode_context,
                 )
-                market_context_timings: list[dict[str, Any]] = []
-                memory_context = await self._bounded_market_context_value(
-                    "memory_vector_context",
-                    self._memory_context_with_vector_feedback(symbol),
-                    {
-                        "memory_feedback": {
-                            "status": "analysis_budget_deferred",
-                            "production_permission": False,
-                        }
-                    },
-                    deadline_monotonic=market_ai_deadline_monotonic,
-                    timeout_seconds=MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
-                    timings=market_context_timings,
+                market_analysis_progress["symbol_analysis_timeout_seconds"] = round(
+                    symbol_timeout_seconds,
+                    3,
                 )
+                market_analysis_progress["symbol_timeout_isolated"] = True
+                market_context_timings: list[dict[str, Any]] = []
                 ml_started_monotonic = asyncio.get_running_loop().time()
                 ml_remaining_seconds = max(
-                    market_ai_deadline_monotonic - ml_started_monotonic,
+                    symbol_deadline_monotonic - ml_started_monotonic,
                     0.0,
                 )
                 ml_lock_wait_seconds = min(
@@ -6256,21 +6572,27 @@ class TradingService:
                         0.0,
                     ),
                 )
-                ml_signal_context = await self._local_ml_signal_context(
-                    fv,
-                    lock_wait_seconds=ml_lock_wait_seconds,
-                )
-                market_context_timings.append(
-                    {
-                        "stage": "local_ml_context",
-                        "status": str(ml_signal_context.get("status") or "ok"),
-                        "duration_seconds": round(
-                            max(asyncio.get_running_loop().time() - ml_started_monotonic, 0.0),
-                            6,
-                        ),
-                        "allowed_lock_wait_seconds": round(ml_lock_wait_seconds, 6),
-                        "remaining_seconds_at_start": round(ml_remaining_seconds, 6),
-                    }
+
+                memory_context, ml_signal_context = await asyncio.gather(
+                    self._bounded_market_context_value(
+                        "memory_vector_context",
+                        self._memory_context_with_vector_feedback(symbol),
+                        {
+                            "memory_feedback": {
+                                "status": "analysis_budget_deferred",
+                                "production_permission": False,
+                            }
+                        },
+                        deadline_monotonic=symbol_deadline_monotonic,
+                        timeout_seconds=MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
+                        timings=market_context_timings,
+                    ),
+                    self._market_local_ml_context_value(
+                        fv,
+                        lock_wait_seconds=ml_lock_wait_seconds,
+                        remaining_seconds_at_start=ml_remaining_seconds,
+                        timings=market_context_timings,
+                    ),
                 )
                 local_ai_tools_context = await self._bounded_market_context_value(
                     "local_ai_tools_context",
@@ -6285,7 +6607,7 @@ class TradingService:
                         "status": "analysis_budget_deferred",
                         "production_permission": False,
                     },
-                    deadline_monotonic=market_ai_deadline_monotonic,
+                    deadline_monotonic=symbol_deadline_monotonic,
                     timeout_seconds=float(settings.local_ai_tools_timeout_seconds or 0.0),
                     timings=market_context_timings,
                 )
@@ -6415,48 +6737,50 @@ class TradingService:
                             ),
                             "ml_signal_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
                             "local_ai_tools_prompt_enabled": LOCAL_QUANT_PROMPT_ENABLED,
-                            # The registry and final trader use this cooperative deadline to
-                            # bound batch fallbacks and arbitration to the current symbol's
-                            # remaining market-AI budget.  It is not a trading gate.
-                            "_analysis_deadline_monotonic": market_ai_deadline_monotonic,
-                            "_analysis_budget_scope": "market_ai",
-                            "_analysis_budget_seconds": market_ai_budget_seconds,
+                            # Each symbol gets an isolated model deadline inside the shared
+                            # round budget so one slow provider cannot consume later slots.
+                            "_analysis_deadline_monotonic": symbol_deadline_monotonic,
+                            "_analysis_budget_scope": "market_symbol_ai",
+                            "_analysis_budget_seconds": symbol_timeout_seconds,
                         },
                     ),
                     None,
-                    deadline_monotonic=market_ai_deadline_monotonic,
+                    deadline_monotonic=symbol_deadline_monotonic,
                     timeout_seconds=max(
-                        market_ai_deadline_monotonic - asyncio.get_running_loop().time(),
+                        symbol_deadline_monotonic - asyncio.get_running_loop().time(),
                         0.0,
                     ),
                     timings=market_context_timings,
                 )
                 if not isinstance(ensemble_result, tuple) or len(ensemble_result) != 2:
-                    remaining_symbols = [
-                        item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
-                    ]
-                    market_round_skipped_by_budget = remaining_symbols
-                    self._remember_market_budget_deferred_symbols(remaining_symbols)
+                    market_timeout_retry_symbols.append(symbol)
+                    self._mark_market_symbol_timeout_cooldown(symbol)
                     logger.warning(
-                        "market ensemble decision exceeded shared round deadline",
+                        "market ensemble decision exceeded isolated symbol deadline",
                         symbol=symbol,
-                        deferred_symbols=remaining_symbols[:10],
-                        budget_seconds=round(market_ai_budget_seconds, 3),
+                        timeout_seconds=round(symbol_timeout_seconds, 3),
                     )
                     results.setdefault("warnings", []).append(
                         {
                             "model": ENSEMBLE_TRADER_NAME,
                             "symbol": symbol,
                             "warning": (
-                                "市场模型调用未在本轮共享截止时间内完成，当前及剩余候选已顺延到后续轮次；"
-                                "该调度边界不改变开仓、收益或风控门槛。"
+                                "当前候选的模型分析超过独立时间上限，本次按观望记录并继续分析后续候选；"
+                                "本次不会开仓，也不会改变风控条件。"
                             ),
-                            "diagnostic_code": "market_ensemble_deadline_exceeded",
+                            "diagnostic_code": "market_symbol_model_timeout",
+                            "timeout_seconds": round(symbol_timeout_seconds, 3),
                             "market_context_timings": market_context_timings,
                         }
                     )
-                    break
-                decision, _opinions = ensemble_result
+                    decision = self._market_analysis_timeout_hold(
+                        fv,
+                        timeout_seconds=symbol_timeout_seconds,
+                        market_context_timings=market_context_timings,
+                    )
+                    _opinions = {}
+                else:
+                    decision, _opinions = ensemble_result
                 if isinstance(decision.raw_response, dict):
                     decision.raw_response.setdefault(
                         "entry_candidate_evidence", entry_candidate_evidence
@@ -6503,6 +6827,22 @@ class TradingService:
                     analysis_type="market",
                     local_ai_tools_context=local_ai_tools_context,
                 )
+
+                if decision.is_hold:
+                    timeout_hold = self._is_market_analysis_timeout_hold(decision)
+                    self.market_decision_result_recorder.append_result(
+                        results=results,
+                        model_name=model_name,
+                        symbol=symbol,
+                        decision_or_action=decision,
+                        model_mode=model_mode,
+                        approved=True,
+                        execution_status=(
+                            "model_timeout_hold" if timeout_hold else "hold"
+                        ),
+                        reason=decision.reasoning,
+                    )
+                    continue
 
                 decision_key = (model_name, self._normalize_position_symbol(symbol))
                 if decision_key in review_blocked_keys and not decision.is_hold:
@@ -6795,8 +7135,19 @@ class TradingService:
                     ),
                 }
 
-            if not market_round_skipped_by_budget and market_feature_items:
-                self._remember_market_budget_deferred_symbols([])
+            if market_feature_items:
+                self._remember_market_budget_deferred_symbols(
+                    market_round_skipped_by_budget
+                )
+            if market_timeout_retry_symbols:
+                results["market_symbol_timeouts"] = {
+                    "count": len(market_timeout_retry_symbols),
+                    "symbols": market_timeout_retry_symbols[:50],
+                    "isolated": True,
+                    "recorded_as_hold": True,
+                    "retry_later": True,
+                    "is_entry_gate": False,
+                }
 
             ranked_entry_candidates = self._entry_candidate_queue_policy().ranked(
                 all_candidates,
@@ -7078,6 +7429,7 @@ class TradingService:
             getattr(self, "_okx_position_settlement_sync_task", None),
             getattr(self, "_shadow_backtest_update_task", None),
             getattr(self, "_stale_entry_expire_task", None),
+            getattr(self, "_market_indicator_prewarm_task", None),
         ):
             if task and not task.done():
                 task.cancel()
@@ -7094,6 +7446,7 @@ class TradingService:
         self._okx_position_settlement_sync_task = None
         self._shadow_backtest_update_task = None
         self._stale_entry_expire_task = None
+        self._market_indicator_prewarm_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self._okx_paper, self._okx_live):

@@ -707,10 +707,10 @@ class DataService:
             )
         )
 
-        async def bounded_snapshot(name: str, coro) -> dict[str, Any]:
+        async def bounded_snapshot(name: str, provider) -> dict[str, Any]:
             timeout = max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5)
             try:
-                result = await asyncio.wait_for(coro, timeout=timeout)
+                result = await asyncio.wait_for(provider(), timeout=timeout)
                 return result if isinstance(result, dict) else {}
             except TimeoutError:
                 logger.warning(
@@ -732,16 +732,15 @@ class DataService:
         ticker_task = asyncio.create_task(
             bounded_snapshot(
                 "ticker",
-                self._get_feature_ticker_snapshot(
-                    symbol,
-                    block_on_remote=block_on_remote_ticker,
+                lambda: self._get_feature_ticker_snapshot(
+                    symbol, block_on_remote=block_on_remote_ticker
                 ),
             )
         )
         indicators_task = asyncio.create_task(
             bounded_snapshot(
                 "indicators",
-                self._get_feature_indicator_snapshot(
+                lambda: self._get_feature_indicator_snapshot(
                     symbol,
                     block_on_remote=block_on_remote_indicators,
                     allow_cached_build=allow_cached_indicator_build,
@@ -753,7 +752,7 @@ class DataService:
         derivatives_task = asyncio.create_task(
             bounded_snapshot(
                 "derivatives",
-                self._get_feature_derivatives_snapshot(
+                lambda: self._get_feature_derivatives_snapshot(
                     symbol,
                     block_on_remote=block_on_remote_derivatives,
                     allow_background_refresh=allow_derivatives_background_refresh,

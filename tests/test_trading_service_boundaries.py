@@ -896,6 +896,46 @@ async def test_market_candidate_prewarm_uses_bounded_priority_api() -> None:
 
 
 @pytest.mark.asyncio
+async def test_market_candidate_prewarm_runs_in_background_queue() -> None:
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    service._market_indicator_prewarm_queue = []
+    service._market_indicator_prewarm_task = None
+    service._market_indicator_prewarm_last_diagnostics = {}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prewarm(symbols: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        started.set()
+        await release.wait()
+        return {
+            "status": "ok",
+            "requested_count": len(symbols),
+            "available_count": len(symbols),
+            "unavailable_symbols": [],
+        }
+
+    service.data_service = SimpleNamespace(prewarm_indicator_snapshots=prewarm)
+
+    diagnostics = service._queue_market_candidate_indicator_prewarm(
+        ["BTC/USDT", "ETH/USDT", "BTC/USDT"]
+    )
+
+    assert diagnostics["status"] == "queued"
+    assert diagnostics["queued_count"] == 2
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    assert service._market_indicator_prewarm_task is not None
+    assert not service._market_indicator_prewarm_task.done()
+    release.set()
+    await service._market_indicator_prewarm_task
+    assert service._market_indicator_prewarm_last_diagnostics["background"] is True
+    assert service._market_indicator_prewarm_queue == []
+
+
+@pytest.mark.asyncio
 async def test_prewarmed_market_candidates_are_hydrated_from_full_indicators() -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[str, dict[str, Any]]] = []
@@ -938,6 +978,37 @@ async def test_prewarmed_market_candidates_are_hydrated_from_full_indicators() -
     ]
     assert all(kwargs["block_on_remote_indicators"] is False for _symbol, kwargs in calls)
     assert all(kwargs["prioritize_indicator_build"] is True for _symbol, kwargs in calls)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_hydration_reuses_existing_complete_snapshot() -> None:
+    service = TradingService.__new__(TradingService)
+    existing = SimpleNamespace(
+        symbol="BTC/USDT",
+        current_price=100.0,
+        close=100.0,
+        indicator_snapshot_available=True,
+    )
+    unavailable = SimpleNamespace(
+        symbol="BTC/USDT",
+        current_price=100.0,
+        close=100.0,
+        indicator_snapshot_available=False,
+        indicator_snapshot_reason="background_prewarm_pending",
+    )
+
+    async def feature_snapshot(_symbol: str, **_kwargs: Any) -> Any:
+        return unavailable
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    hydrated, diagnostics = await service._hydrate_prewarmed_market_candidates(
+        {"BTC/USDT": existing}
+    )
+
+    assert hydrated == {"BTC/USDT": existing}
+    assert diagnostics["status"] == "ok"
+    assert diagnostics["reused_existing_full_snapshot_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1413,7 @@ async def test_analysis_service_loop_uses_injected_lifecycle_boundary():
 
 
 @pytest.mark.asyncio
-async def test_analysis_service_loop_sleeps_interval_after_round_finishes(monkeypatch):
+async def test_analysis_service_loop_keeps_fixed_rate_after_short_round(monkeypatch):
     calls: list[str] = []
     running = True
     sleeps: list[float] = []
@@ -1370,7 +1441,46 @@ async def test_analysis_service_loop_sleeps_interval_after_round_finishes(monkey
     await service.loop(lambda: 10.0)
 
     assert calls == ["market"]
-    assert sleeps == [0.0, 10.0]
+    assert sleeps[0] == 0.0
+    assert sleeps[1] == pytest.approx(10.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_analysis_service_loop_does_not_add_delay_after_overrun(monkeypatch):
+    calls: list[str] = []
+    sleeps: list[float] = []
+    running = True
+    clock = 100.0
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal clock, running
+        sleeps.append(seconds)
+        clock += seconds
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(scope: str) -> dict[str, str]:
+        nonlocal clock
+        calls.append(scope)
+        clock += 12.0
+        return {"scope": scope}
+
+    service = MarketAnalysisService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(time=lambda: clock),
+    )
+
+    await service.loop(lambda: 10.0)
+
+    assert calls == ["market"]
+    assert sleeps == [0.0, 0.0]
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1515,8 @@ async def test_market_analysis_loop_keeps_stage_budget_separate_from_outer_watch
 
     assert calls == ["market"]
     assert completed == ["market"]
-    assert sleeps == [0.0, 30.0]
+    assert sleeps[0] == 0.0
+    assert sleeps[1] == pytest.approx(30.0, abs=0.1)
 
 
 @pytest.mark.asyncio
@@ -1413,10 +1524,12 @@ async def test_analysis_service_loop_continues_after_internal_round_cancellation
     calls: list[str] = []
     running = True
     sleeps: list[float] = []
+    clock = 100.0
 
     async def fake_sleep(seconds: float) -> None:
-        nonlocal running
+        nonlocal clock, running
         sleeps.append(seconds)
+        clock += seconds
         if len(calls) >= 2 and len(sleeps) > 2:
             running = False
 
@@ -1433,6 +1546,11 @@ async def test_analysis_service_loop_continues_after_internal_round_cancellation
     )
     service.initial_delay_seconds = 0.0
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(time=lambda: clock),
+    )
 
     await service.loop(lambda: 30.0)
 
@@ -1475,7 +1593,8 @@ async def test_position_review_loop_keeps_stage_timeout_separate_from_round_watc
 
     assert calls == ["position"]
     assert completed == ["position"]
-    assert sleeps == [0.0, 30.0]
+    assert sleeps[0] == 0.0
+    assert sleeps[1] == pytest.approx(30.0, abs=0.1)
 
 
 def test_position_review_batch_timeout_scales_with_selected_groups() -> None:
@@ -1517,7 +1636,8 @@ async def test_position_review_loop_without_round_watchdog_does_not_use_stage_ti
     await service.loop(lambda: 30.0)
 
     assert calls == ["position"]
-    assert sleeps == [0.0, 30.0]
+    assert sleeps[0] == 0.0
+    assert sleeps[1] == pytest.approx(30.0, abs=0.1)
 
 
 @pytest.mark.asyncio
@@ -3441,6 +3561,32 @@ def test_auto_scan_feature_budget_rotates_market_pool_and_keeps_positions(
     )
 
 
+def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._auto_scan_feature_cursor = 0
+    service._market_budget_deferred_symbols = ["S7/USDT"]
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 20)
+
+    selected = service._budget_auto_scan_feature_symbols(
+        [f"S{i}/USDT" for i in range(10)],
+        [],
+        configured_limit=2,
+    )
+
+    assert selected[0] == "S7/USDT"
+    assert service._last_auto_feature_fetch_budget_diagnostics[
+        "deferred_candidate_symbol_count"
+    ] == 1
+
+
 def test_auto_scan_feature_budget_expands_discovery_without_lowering_entry_gates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3826,6 +3972,79 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
 
     assert service.market_round_time_budget_seconds() == 27.0
     assert service.market_round_watchdog_seconds() >= 180.0
+
+
+def test_market_symbol_analysis_timeout_fairly_isolates_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    shared = service.market_symbol_analysis_timeout_seconds(
+        remaining_round_seconds=52.5,
+        remaining_symbol_count=5,
+    )
+    last = service.market_symbol_analysis_timeout_seconds(
+        remaining_round_seconds=30.0,
+        remaining_symbol_count=1,
+    )
+
+    assert trading_service.MARKET_SYMBOL_ANALYSIS_MIN_SECONDS <= shared < 10.5
+    assert last == pytest.approx(13.5)
+
+
+def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
+    feature = SimpleNamespace(
+        symbol="BTC/USDT",
+        to_dict=lambda: {"symbol": "BTC/USDT", "current_price": 100.0},
+    )
+
+    decision = TradingService._market_analysis_timeout_hold(
+        feature,
+        timeout_seconds=9.5,
+        market_context_timings=[{"stage": "ensemble_decision", "status": "timeout"}],
+    )
+
+    assert decision.action == Action.HOLD
+    assert decision.position_size_pct == 0.0
+    assert decision.raw_response["market_model_timeout"]["isolated_to_symbol"] is True
+    assert decision.raw_response["market_model_timeout"]["production_permission"] is False
+    assert TradingService._is_market_analysis_timeout_hold(decision) is True
+    assert TradingService._is_market_analysis_timeout_hold(_decision(Action.HOLD)) is False
+
+
+def test_market_symbol_timeout_cooldown_yields_to_other_candidates() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._market_timeout_retry_not_before = {}
+    now = datetime.now(UTC)
+    features = {
+        "ETH/USDT": SimpleNamespace(symbol="ETH/USDT"),
+        "SOL/USDT": SimpleNamespace(symbol="SOL/USDT"),
+    }
+
+    service._mark_market_symbol_timeout_cooldown("ETH/USDT", now=now)
+    available, diagnostics = service._filter_market_symbol_timeout_cooldowns(
+        features,
+        now=now + timedelta(seconds=30),
+    )
+
+    assert list(available) == ["SOL/USDT"]
+    assert diagnostics["skipped_symbols"] == ["ETH/USDT"]
+    assert diagnostics["is_entry_gate"] is False
+
+    available_after_retry, after_retry = service._filter_market_symbol_timeout_cooldowns(
+        features,
+        now=now
+        + timedelta(seconds=trading_service.MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS + 1),
+    )
+    assert list(available_after_retry) == ["ETH/USDT", "SOL/USDT"]
+    assert after_retry["skipped_count"] == 0
 
 
 def test_market_round_time_budget_expands_for_profit_first_quality_pressure(

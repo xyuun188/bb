@@ -78,10 +78,11 @@ class _ScopedAnalysisService:
 
     async def loop(self, interval_seconds: float | IntervalProvider) -> None:
         await asyncio.sleep(self.initial_delay_seconds)
+        loop = asyncio.get_running_loop()
+        next_round_at = loop.time()
         while self.is_running():
             try:
                 await self._run_loop_round()
-                await asyncio.sleep(self._resolve_interval(interval_seconds))
             except asyncio.CancelledError:
                 task = asyncio.current_task()
                 if not self.is_running() or (task is not None and task.cancelling()):
@@ -90,21 +91,26 @@ class _ScopedAnalysisService:
                     "analysis service round was cancelled while service remains running; continuing next loop",
                     scope=self.scope,
                 )
-                await asyncio.sleep(self._resolve_interval(interval_seconds))
             except TimeoutError:
                 logger.error(
                     "analysis service loop timed out",
                     scope=self.scope,
                     timeout_seconds=self._time_budget_seconds(),
                 )
-                await asyncio.sleep(self._resolve_interval(interval_seconds))
             except Exception as exc:
                 logger.error(
                     "analysis service loop error",
                     scope=self.scope,
                     error=safe_error_text(exc),
                 )
-                await asyncio.sleep(self._resolve_interval(interval_seconds))
+            if not self.is_running():
+                break
+            interval = self._resolve_interval(interval_seconds)
+            next_round_at += interval
+            now = loop.time()
+            if next_round_at <= now:
+                next_round_at = now
+            await asyncio.sleep(max(next_round_at - now, 0.0))
 
     async def _run_loop_round(self) -> None:
         time_budget = self._time_budget_seconds()
