@@ -88,6 +88,12 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
             "local_ml_readiness": {
                 "readiness_state": "degraded",
                 "allow_live_position_influence": False,
+                "strategy_blueprint": {
+                    "strategy_id": "trained-model-v1",
+                    "execution_scope": "paper_only",
+                    "paper_execution_eligible": False,
+                    "live_execution_permission": False,
+                },
             },
             "model_training_registry": {
                 "summary": {"trainable_count": 8},
@@ -131,6 +137,12 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
             },
             "strategy_learning": {
                 "optimization_target": "maximize_authoritative_fee_after_return_rate",
+                "paper_strategy_champion": {
+                    "active": False,
+                    "status": "base_strategy",
+                    "live_execution_permission": False,
+                    "reason": "no_validated_trained_model_strategy",
+                },
                 "feedback": {"generated_at": "2026-07-15T10:00:00+00:00"},
                 "schedule": {
                     "scheduler_mode": "shadow_validation",
@@ -174,6 +186,8 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
     assert summary["optimization_target"] == "realized_fee_after_return"
     assert summary["contract_summary"]["contract_violation_count"] == 2
     assert summary["ml_live_influence"] is False
+    assert summary["model_strategy_blueprint"]["execution_scope"] == "paper_only"
+    assert summary["model_strategy_blueprint"]["live_execution_permission"] is False
     assert summary["model_training_summary"]["trainable_count"] == 8
     assert summary["training_scheduler_state"]["heartbeat_stale"] is True
     assert summary["training_scheduler_state"]["models"][
@@ -184,6 +198,9 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
     assert closed_loop["shadow_maturity"]["completed_total"] == 14
     assert closed_loop["strategy_scheduler"]["candidate_count"] == 6
     assert closed_loop["strategy_scheduler"]["production_influence_enabled"] is False
+    assert closed_loop["strategy_scheduler"]["paper_strategy_champion"][
+        "active"
+    ] is False
     assert closed_loop["authoritative_settlement"]["outcome_contract"][
         "actual_outcome_overrides_shadow"
     ] is True

@@ -2408,12 +2408,41 @@ class TradingService:
             return existing
 
         async def _refresh() -> dict[str, Any]:
+            ml_signal_service = getattr(self, "ml_signal_service", None)
+            model_strategy_blueprint = (
+                ml_signal_service.strategy_blueprint()
+                if ml_signal_service is not None
+                else {}
+            )
             learned_context = await strategy_learning.apply_to_strategy_context(
                 mode=selected_mode,
                 strategy_context=dict(context),
                 open_positions=open_positions,
+                model_strategy_blueprint=model_strategy_blueprint,
                 limit=DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_row_limit,
             )
+            champion = self._safe_dict(
+                learned_context.get("paper_strategy_champion")
+            )
+            if (
+                selected_mode == "paper"
+                and champion.get("model_rollback_required") is True
+            ):
+                if ml_signal_service is not None:
+                    rollback_result = await asyncio.to_thread(
+                        ml_signal_service.rollback_to_strategy_model,
+                        champion.get("model_rollback_target_version"),
+                    )
+                else:
+                    rollback_result = {
+                        "rolled_back": False,
+                        "reason": "ml_signal_service_unavailable",
+                    }
+                champion["model_rollback"] = rollback_result
+                learned_context["paper_strategy_champion"] = champion
+                learning = self._safe_dict(learned_context.get("strategy_learning"))
+                learning["paper_strategy_champion"] = champion
+                learned_context["strategy_learning"] = learning
             learned_context["strategy_learning_cache_status"] = "fresh"
             learned_context["strategy_learning_runtime_timeout_seconds"] = (
                 self.strategy_learning_context_wait_timeout_seconds(analysis_scope)

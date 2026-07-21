@@ -22,6 +22,7 @@ from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     load_authoritative_trade_outcomes,
 )
+from services.paper_strategy_champion import PaperStrategyChampionService
 from services.shadow_backtest_service import shadow_fee_after_outcome
 from services.text_integrity import sanitize_runtime_text
 
@@ -668,11 +669,9 @@ class StrategyLearningEngine:
         self,
         feedback: StrategyFeedback,
         *,
-        extra_profiles: list[StrategyProfile] | None = None,
         current_context: dict[str, Any] | None = None,
         detail: str = "summary",
     ) -> dict[str, Any]:
-        del extra_profiles
         candidates: list[dict[str, Any]] = []
         backtest_rows: list[dict[str, Any]] = []
         shadow_rows: list[dict[str, Any]] = []
@@ -812,6 +811,8 @@ class StrategyLearningEngine:
         self,
         strategy_context: dict[str, Any],
         payload: dict[str, Any],
+        *,
+        paper_strategy_champion: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = dict(strategy_context or {})
         schedule = _safe_dict(payload.get("schedule"))
@@ -821,6 +822,7 @@ class StrategyLearningEngine:
         result["current_production_strategy"] = _safe_dict(
             schedule.get("current_production_strategy")
         )
+        champion = _safe_dict(paper_strategy_champion)
         result["strategy_learning"] = {
             "scheduler_mode": schedule.get("scheduler_mode"),
             "candidate_count": schedule.get("candidate_count"),
@@ -834,13 +836,22 @@ class StrategyLearningEngine:
             "current_production_strategy": _safe_dict(
                 schedule.get("current_production_strategy")
             ),
+            "paper_strategy_champion": champion,
         }
+        result["paper_strategy_champion"] = champion
         return result
 
 
 class StrategyLearningService:
-    def __init__(self, *, engine: StrategyLearningEngine | None = None, **_: Any) -> None:
+    def __init__(
+        self,
+        *,
+        engine: StrategyLearningEngine | None = None,
+        champion_service: PaperStrategyChampionService | None = None,
+        **_: Any,
+    ) -> None:
         self.engine = engine or StrategyLearningEngine()
+        self.champion_service = champion_service or PaperStrategyChampionService()
 
     async def dashboard_payload(
         self,
@@ -852,6 +863,7 @@ class StrategyLearningService:
     ) -> dict[str, Any]:
         feedback = await self._feedback(mode=mode, hours=hours, limit=limit)
         payload = self.engine.build_from_feedback(feedback, detail=detail)
+        champion = await self.champion_service.current(mode)
         payload.update(
             {
                 "mode": mode,
@@ -859,6 +871,7 @@ class StrategyLearningService:
                 "sample_limit": limit,
                 "optimization_target": "maximize_authoritative_fee_after_return_rate",
                 "production_permission": False,
+                "paper_strategy_champion": champion,
             }
         )
         return payload
@@ -869,6 +882,7 @@ class StrategyLearningService:
         mode: str,
         strategy_context: dict[str, Any],
         open_positions: list[dict[str, Any]] | None,
+        model_strategy_blueprint: dict[str, Any] | None = None,
         hours: int = DEFAULT_LOOKBACK_HOURS,
         limit: int = 500,
     ) -> dict[str, Any]:
@@ -880,7 +894,18 @@ class StrategyLearningService:
             current_context=strategy_context,
             detail="summary",
         )
-        return self.engine.apply_to_context(strategy_context, payload)
+        champion = await self.champion_service.reconcile(
+            mode=mode,
+            blueprint=model_strategy_blueprint,
+            candidates=list(_safe_dict(payload.get("schedule")).get("candidates") or []),
+        )
+        result = self.engine.apply_to_context(
+            strategy_context,
+            payload,
+            paper_strategy_champion=champion,
+        )
+        result["execution_mode"] = "live" if str(mode).lower() == "live" else "paper"
+        return result
 
     async def _feedback(self, *, mode: str, hours: int, limit: int) -> StrategyFeedback:
         selected_mode = "live" if str(mode).lower() == "live" else "paper"

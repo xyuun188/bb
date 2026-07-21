@@ -9,6 +9,13 @@ from services.paper_bootstrap_canary import (
 
 
 def complete_paper_canary_raw() -> dict[str, Any]:
+    sampling_stratum = {
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "volatility_bucket": "medium",
+        "market_regime": "trending",
+        "key": "BTC/USDT|long|medium|trending",
+    }
     canary_provenance = {
         "source": "governed_paper_model_distribution_for_normal_strategy_trading",
         "observation_window": "current_model_artifact_and_pre_order_market_snapshot",
@@ -50,7 +57,9 @@ def complete_paper_canary_raw() -> dict[str, Any]:
                 "horizon_minutes": 10,
                 "distribution_member_count": 128,
                 "source_authority": "extra_trees_empirical_distribution",
+                "sampling_stratum": sampling_stratum,
             },
+            "sampling_stratum": sampling_stratum,
             "direction_score_gap": 0.23,
             "confidence": 0.6969697,
             "artifact_version": "candidate-v1",

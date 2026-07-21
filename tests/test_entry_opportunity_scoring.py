@@ -355,6 +355,92 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
     assert opportunity["expected_gross_return_pct"] == pytest.approx(0.8)
 
 
+def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() -> None:
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {}
+    signal = decision.raw_response["ml_signal"]
+    signal.update(
+        {
+            "route_mode": "shadow_observation",
+            "live_influence": False,
+            "allow_live_position_influence": False,
+            "influence_enabled": False,
+            "artifact_lifecycle": "canary",
+            "model_version": "model-v1",
+            "paper_canary_authorized": True,
+            "paper_canary": {
+                "authorized": True,
+                "execution_scope": "paper_only",
+                "eligible_sides": ["long"],
+            },
+        }
+    )
+    strategy = {
+        "execution_mode": "paper",
+        "paper_strategy_champion": {
+            "active": True,
+            "execution_scope": "paper_only",
+            "paper_execution_permission": True,
+            "live_execution_permission": False,
+            "model_version": "model-v1",
+            "selector": {"side": "long"},
+        },
+    }
+
+    score = _scorer().score_candidate(decision, strategy)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    component = opportunity["expected_net_breakdown"]["components"][0]
+    assert score == pytest.approx(opportunity["return_lcb_pct"])
+    assert opportunity["production_eligible"] is True
+    assert component["production_eligible"] is True
+    assert component["execution_scope"] == "paper_only"
+    assert component["paper_strategy_authorization"]["eligible"] is True
+    assert "paper_bootstrap_canary" not in decision.raw_response
+
+
+def test_paper_strategy_cannot_authorize_same_model_in_live_mode() -> None:
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {}
+    signal = decision.raw_response["ml_signal"]
+    signal.update(
+        {
+            "route_mode": "shadow_observation",
+            "live_influence": False,
+            "allow_live_position_influence": False,
+            "influence_enabled": False,
+            "artifact_lifecycle": "canary",
+            "model_version": "model-v1",
+            "paper_canary_authorized": True,
+            "paper_canary": {
+                "authorized": True,
+                "execution_scope": "paper_only",
+                "eligible_sides": ["long"],
+            },
+        }
+    )
+    strategy = {
+        "execution_mode": "live",
+        "paper_strategy_champion": {
+            "active": True,
+            "execution_scope": "paper_only",
+            "paper_execution_permission": True,
+            "live_execution_permission": False,
+            "model_version": "model-v1",
+            "selector": {"side": "long"},
+        },
+    }
+
+    score = _scorer().score_candidate(decision, strategy)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    component = opportunity["expected_net_breakdown"]["components"][0]
+    assert isinf(score) and score < 0
+    assert opportunity["production_eligible"] is False
+    assert component["production_eligible"] is False
+    assert component["paper_strategy_authorization"]["eligible"] is False
+
+
 def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"].update(

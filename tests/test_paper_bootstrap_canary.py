@@ -14,7 +14,6 @@ from risk_manager.engine import RiskEngine
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.execution_service import _return_entry_contract_result
 from services.paper_bootstrap_canary import (
-    PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
     PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
     PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
@@ -25,8 +24,8 @@ from services.paper_bootstrap_canary import (
     annotate_paper_bootstrap_opportunity,
     assess_paper_canary_position_horizon,
     build_paper_canary_position_lifecycle,
-    select_paper_bootstrap_candidate,
 )
+from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
 def _context() -> dict[str, Any]:
@@ -86,10 +85,34 @@ def _context() -> dict[str, Any]:
 
 
 def _decision(context: dict[str, Any] | None = None) -> DecisionOutput:
-    canary = select_paper_bootstrap_candidate(context or _context())
+    canary = complete_paper_canary_raw()["paper_bootstrap_canary"]
+    selected_context = context or _context()
+    features = selected_context["sampling_features"]
+    symbol = str(selected_context.get("sampling_symbol") or "BTC/USDT")
+    volatility = float(features.get("volatility_20") or 0.0)
+    returns_20 = abs(float(features.get("returns_20") or 0.0))
+    volatility_bucket = (
+        "high" if volatility >= 0.03 else "medium" if volatility >= 0.01 else "low"
+    )
+    market_regime = (
+        "volatile"
+        if volatility >= 0.03
+        else "trending"
+        if returns_20 >= 0.01
+        else "ranging"
+    )
+    sampling_stratum = {
+        "symbol": symbol,
+        "side": "long",
+        "volatility_bucket": volatility_bucket,
+        "market_regime": market_regime,
+        "key": f"{symbol}|long|{volatility_bucket}|{market_regime}",
+    }
+    canary["sampling_stratum"] = sampling_stratum
+    canary["selected_observation"]["sampling_stratum"] = sampling_stratum
     return DecisionOutput(
         model_name="ensemble_trader",
-        symbol="BTC/USDT",
+        symbol=symbol,
         action=Action.LONG,
         confidence=float(canary["confidence"]),
         reasoning="paper canary test",
@@ -120,32 +143,6 @@ def _decision(context: dict[str, Any] | None = None) -> DecisionOutput:
     )
 
 
-def test_positive_fee_after_forecast_can_request_normal_paper_trade() -> None:
-    canary = select_paper_bootstrap_candidate(_context())
-
-    assert canary["authorized"] is True
-    assert canary["selected_side"] == "long"
-    assert canary["selected_observation"]["observed_net_return_pct"] > 0
-    assert canary["purpose"] == "execute_normal_paper_strategy_and_learn_after_settlement"
-    assert canary["trade_kind"] == "normal_strategy_trade"
-    assert canary["sample_target"] is None
-    assert canary["daily_sample_quota"] is None
-    assert canary["production_permission"] is False
-    assert canary["version"] == PAPER_BOOTSTRAP_CANARY_VERSION
-
-
-def test_non_positive_fee_after_forecast_stays_hold() -> None:
-    context = _context()
-    distributions = context["ml_signal"]["predictions"][0]["return_distribution_contract"]
-    for side in ("long", "short"):
-        distributions[side]["raw_expected_return_pct"] = 0.05
-
-    canary = select_paper_bootstrap_candidate(context)
-
-    assert canary["authorized"] is False
-    assert canary["reason"] == "paper_normal_expected_net_return_not_positive"
-
-
 def test_paper_normal_opportunity_annotation_is_finite_and_execution_eligible() -> None:
     decision = _decision()
 
@@ -164,16 +161,6 @@ def test_paper_normal_opportunity_annotation_is_finite_and_execution_eligible() 
     assert opportunity["execution_scope"] == "paper_only"
 
 
-def test_paper_canary_selection_is_forbidden_in_live_mode() -> None:
-    context = _context()
-    context["trading_mode"] = "live"
-
-    canary = select_paper_bootstrap_candidate(context)
-
-    assert canary["authorized"] is False
-    assert canary["reason"] == "paper_execution_mode_required"
-
-
 def test_executed_normal_paper_trade_does_not_build_expiring_position_lifecycle() -> None:
     executed_at = datetime.now(UTC) - timedelta(minutes=11)
     decision = SimpleNamespace(
@@ -183,7 +170,11 @@ def test_executed_normal_paper_trade_does_not_build_expiring_position_lifecycle(
         is_paper=True,
         was_executed=True,
         executed_at=executed_at,
-        raw_llm_response={"paper_bootstrap_canary": select_paper_bootstrap_candidate(_context())},
+        raw_llm_response={
+            "paper_bootstrap_canary": complete_paper_canary_raw()[
+                "paper_bootstrap_canary"
+            ]
+        },
     )
 
     lifecycle = build_paper_canary_position_lifecycle(decision)
@@ -192,7 +183,7 @@ def test_executed_normal_paper_trade_does_not_build_expiring_position_lifecycle(
 
 def test_legacy_sample_trade_still_builds_expiring_position_lifecycle() -> None:
     executed_at = datetime.now(UTC) - timedelta(minutes=11)
-    legacy = select_paper_bootstrap_candidate(_context())
+    legacy = complete_paper_canary_raw()["paper_bootstrap_canary"]
     legacy.update(
         {
             "version": "2026-07-19.paper-bootstrap-canary.v3",
@@ -271,7 +262,7 @@ def test_paper_canary_horizon_reads_persisted_management_lifecycle() -> None:
     assert assessment["elapsed"] is True
 
 
-def test_ensemble_emits_normal_paper_entry_when_live_source_is_absent() -> None:
+def test_ensemble_does_not_emit_special_sampling_entry_without_governed_source() -> None:
     coordinator = EnsembleCoordinator(SimpleNamespace(get=lambda _name: None))
 
     decision = coordinator.combine(
@@ -280,14 +271,8 @@ def test_ensemble_emits_normal_paper_entry_when_live_source_is_absent() -> None:
         opinions={},
     )
 
-    assert decision.action == Action.LONG
-    assert decision.raw_response["paper_bootstrap_canary"]["authorized"] is True
-    assert decision.raw_response["entry_permission_policy"]["execution_scope"] == "paper_only"
-    assert decision.raw_response["entry_permission_policy"]["source"] == (
-        "paper_normal_strategy"
-    )
-    assert decision.raw_response["entry_permission_policy"]["normal_strategy_trade"] is True
-    assert "采集" not in decision.reasoning
+    assert decision.action == Action.HOLD
+    assert "paper_bootstrap_canary" not in decision.raw_response
 
 
 @pytest.mark.asyncio
@@ -622,25 +607,6 @@ async def test_overrepresented_stratum_is_diagnostic_and_does_not_block_sampling
     }
     assert guard["sampling_balance_policy"]["mode"] == "diagnostic_only"
     assert guard["sampling_balance_policy"]["blocks_sampling"] is False
-
-
-def test_sampling_stratum_normalizes_observation_context_to_market_regime() -> None:
-    context = _context()
-    context["market_regime"] = {
-        "mode": "return_distribution_observation",
-        "avg_returns_20": 0.001,
-        "production_permission": False,
-    }
-    context["sampling_features"] = {
-        **context["sampling_features"],
-        "volatility_20": 0.005,
-        "returns_20": 0.002,
-    }
-
-    canary = select_paper_bootstrap_candidate(context)
-
-    assert canary["sampling_stratum"]["market_regime"] == "ranging"
-    assert canary["sampling_stratum"]["key"] == "BTC/USDT|long|low|ranging"
 
 
 @pytest.mark.asyncio

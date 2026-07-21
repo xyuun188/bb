@@ -1183,6 +1183,12 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     ]
     assert promotion_evidence[1]["paper_canary_authorized"] is True
     assert promotion_evidence[1]["production_influence_authorized"] is False
+    assert promotion_evidence[1]["strategy_blueprint"][
+        "paper_execution_eligible"
+    ] is True
+    assert promotion_evidence[1]["strategy_blueprint"][
+        "live_execution_permission"
+    ] is False
     assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_lcb_not_positive" in reason_codes

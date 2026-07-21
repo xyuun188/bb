@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from dataclasses import fields
 from datetime import UTC, datetime
@@ -11,7 +12,6 @@ from services.strategy_learning import (
     StrategyCandidateGenerator,
     StrategyFeedback,
     StrategyLearningEngine,
-    StrategyProfile,
     _json_safe,
     _runtime_prior_usage,
 )
@@ -310,24 +310,12 @@ def test_blocked_leading_candidate_is_not_attached_as_active_strategy() -> None:
     assert result["strategy_learning"]["production_permission"] is False
 
 
-def test_external_profile_cannot_reenter_scheduler() -> None:
-    candidate = StrategyProfile(
-        profile_id="external_execution_override",
-        version=1,
-        label="external override",
-        status="candidate",
-        source="external",
-        description="must be ignored",
-        params={"entry_threshold": -1, "position_fraction": 1, "leverage": 99},
-    )
-    payload = StrategyLearningEngine().build_from_feedback(
-        _feedback(),
-        extra_profiles=[candidate],
-    )
+def test_scheduler_has_no_external_profile_injection_interface() -> None:
+    parameters = inspect.signature(
+        StrategyLearningEngine.build_from_feedback
+    ).parameters
 
-    assert "external_execution_override" not in {
-        row["id"] for row in payload["schedule"]["candidates"]
-    }
+    assert "extra_profiles" not in parameters
 
 
 def test_strategy_learning_context_cannot_mutate_execution_fields() -> None:

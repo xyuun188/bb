@@ -34,7 +34,6 @@ from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
 from services.model_dynamic_routing import plan_dynamic_model_route
-from services.paper_bootstrap_canary import select_paper_bootstrap_candidate
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -822,67 +821,6 @@ class EnsembleCoordinator:
             "policy_provenance": policy_provenance,
         }
         if not production_eligible:
-            paper_canary = select_paper_bootstrap_candidate(
-                {
-                    **context,
-                    "sampling_symbol": features.symbol,
-                    "sampling_features": features.to_dict(),
-                }
-            )
-            if paper_canary.get("authorized") is True:
-                selected_side = str(paper_canary.get("selected_side") or "")
-                action = Action.LONG if selected_side == "long" else Action.SHORT
-                reason = self._reason(
-                    "模拟盘正常策略根据当前模型的扣费后正收益预测选择做多"
-                    if action == Action.LONG
-                    else "模拟盘正常策略根据当前模型的扣费后正收益预测选择做空",
-                    decision_score,
-                    disagreement,
-                    raw_opinions,
-                    resolution_brief,
-                )
-                canary_raw = self._raw(
-                    raw_opinions,
-                    decision_score,
-                    disagreement,
-                    cross_validations,
-                    consultation,
-                )
-                self._attach_expert_diversity_policy(canary_raw, context)
-                canary_raw["authoritative_return_candidate"] = raw[
-                    "authoritative_return_candidate"
-                ]
-                canary_raw["entry_candidate_evidence"] = candidate_evidence
-                canary_raw["paper_bootstrap_canary"] = paper_canary
-                canary_raw["base_weighted_score_observation"] = round(normalized_score, 4)
-                canary_raw["memory_feedback_observation"] = self._memory_feedback(context)
-                canary_raw["ml_signal"] = context.get("ml_signal") or {}
-                canary_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
-                canary_raw["direction_competition"] = (
-                    context.get("direction_competition") or {}
-                )
-                canary_raw["entry_permission_policy"] = {
-                    "source": "paper_normal_strategy",
-                    "execution_scope": "paper_only",
-                    "production_permission": False,
-                    "normal_strategy_trade": True,
-                    "continuous_training_after_settlement": True,
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    "strategy_version": paper_canary.get("version"),
-                }
-                return DecisionOutput(
-                    model_name=ENSEMBLE_TRADER_NAME,
-                    symbol=features.symbol,
-                    action=action,
-                    confidence=self._safe_float(paper_canary.get("confidence"), 0.0),
-                    reasoning=reason,
-                    position_size_pct=0.0,
-                    suggested_leverage=1.0,
-                    stop_loss_pct=0.0,
-                    take_profit_pct=0.0,
-                    raw_response=canary_raw,
-                    feature_snapshot=features.to_dict(),
-                )
             reason = self._reason(
                 "当前模型没有给出扣除交易成本后仍为正的模拟盘机会，本轮保持观望",
                 decision_score,

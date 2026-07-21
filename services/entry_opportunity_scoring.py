@@ -29,6 +29,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution_eligibility,
 )
 from services.execution_cost_model import execution_cost_estimate
+from services.model_strategy_blueprint import paper_strategy_authorization
 from services.paper_bootstrap_canary import annotate_paper_bootstrap_opportunity
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
@@ -86,17 +87,28 @@ class EntryOpportunityScoringPolicy:
         self,
         raw: dict[str, Any],
         side: str,
+        *,
+        strategy: dict[str, Any] | None,
+        symbol: str,
     ) -> dict[str, Any]:
         signal = safe_dict(raw.get("ml_signal"))
         predictions = safe_list(signal.get("predictions"))
         primary = safe_dict(predictions[0] if predictions else {})
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
-        production_claimed = bool(
+        live_claimed = bool(
             signal.get("allow_live_position_influence") is True
             and signal.get("influence_enabled") is True
             and side_policy.get("enabled") is True
         )
+        paper_authorization = paper_strategy_authorization(
+            strategy,
+            signal,
+            symbol=symbol,
+            side=side,
+        )
+        paper_claimed = paper_authorization.get("eligible") is True
+        production_claimed = bool(live_claimed or paper_claimed)
         governance = signal_production_eligibility(signal)
         distribution_eligibility = signal_return_distribution_eligibility(
             signal,
@@ -105,7 +117,7 @@ class EntryOpportunityScoringPolicy:
         contract = signal_return_distribution(signal, side)
         production_eligible = bool(
             production_claimed
-            and governance.get("eligible") is True
+            and (governance.get("eligible") is True or paper_claimed)
             and distribution_eligibility.get("eligible") is True
         )
         observation_only = bool(not production_eligible and primary and contract)
@@ -126,7 +138,9 @@ class EntryOpportunityScoringPolicy:
             "production_eligible": production_eligible,
             "observation_only": observation_only,
             "eligibility_reason": (
-                "standardized_distribution_and_side_readiness_confirmed"
+                "active_trained_model_paper_strategy"
+                if production_eligible and paper_claimed
+                else "standardized_distribution_and_side_readiness_confirmed"
                 if production_eligible
                 else str(
                     distribution_eligibility.get("reason")
@@ -135,6 +149,8 @@ class EntryOpportunityScoringPolicy:
                 )
             ),
             "side": side,
+            "execution_scope": "paper_only" if paper_claimed else "live",
+            "paper_strategy_authorization": paper_authorization,
             "return_distribution_contract": contract,
             "raw_market_return_pct": contract.get("raw_expected_return_pct"),
             "raw_return_pct": contract.get("raw_expected_return_pct"),
@@ -242,7 +258,12 @@ class EntryOpportunityScoringPolicy:
             decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
         )
         components = [
-            self._local_ml_component(raw, side),
+            self._local_ml_component(
+                raw,
+                side,
+                strategy=strategy,
+                symbol=decision.symbol,
+            ),
             self._server_component(
                 raw,
                 key="server_profit",

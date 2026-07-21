@@ -342,6 +342,10 @@ def _summarize_report(report: dict) -> dict:
     registry = registry if isinstance(registry, dict) else {}
     models = registry.get("models")
     models = models if isinstance(models, list) else []
+    strategy_blueprint = ml_status.get("strategy_blueprint")
+    strategy_blueprint = (
+        strategy_blueprint if isinstance(strategy_blueprint, dict) else {}
+    )
     return {
         "generated_at": report.get("generated_at"),
         "window_minutes": report.get("window_minutes"),
@@ -351,6 +355,24 @@ def _summarize_report(report: dict) -> dict:
         "contract_policy": contract.get("policy") or {},
         "ml_readiness_state": ml_status.get("readiness_state") or ml_status.get("state"),
         "ml_live_influence": bool(ml_status.get("allow_live_position_influence")),
+        "model_strategy_blueprint": {
+            key: strategy_blueprint.get(key)
+            for key in (
+                "strategy_id",
+                "model_version",
+                "artifact_stage",
+                "execution_scope",
+                "eligible_sides",
+                "paper_execution_eligible",
+                "live_execution_permission",
+                "blocking_reasons",
+                "model_quality",
+                "entry_policy",
+                "exit_policy",
+                "risk_policy",
+            )
+            if key in strategy_blueprint
+        },
         "model_training_summary": registry.get("summary") or {},
         "training_scheduler_state": _summarize_training_scheduler_state(
             registry.get("scheduler_state")
@@ -420,6 +442,8 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
     reflection_rows = reflection_rows if isinstance(reflection_rows, list) else []
     production_strategy = schedule.get("current_production_strategy")
     production_strategy = production_strategy if isinstance(production_strategy, dict) else {}
+    paper_champion = strategy.get("paper_strategy_champion")
+    paper_champion = paper_champion if isinstance(paper_champion, dict) else {}
     protection = positions.get("protection_inventory")
     protection = protection if isinstance(protection, dict) else {}
     return {
@@ -561,6 +585,28 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
                     "historical_prior_matching_enabled",
                 )
                 if key in production_strategy
+            },
+            "paper_strategy_champion": {
+                key: paper_champion.get(key)
+                for key in (
+                    "active",
+                    "profile_id",
+                    "profile_version",
+                    "status",
+                    "execution_scope",
+                    "paper_execution_permission",
+                    "live_execution_permission",
+                    "model_strategy_id",
+                    "model_version",
+                    "selector",
+                    "metrics",
+                    "transition",
+                    "reason",
+                    "rollback_reason",
+                    "model_rollback_required",
+                    "model_rollback_target_version",
+                )
+                if key in paper_champion
             },
             "production_influence_enabled": bool(
                 runtime.get("production_influence_enabled")
