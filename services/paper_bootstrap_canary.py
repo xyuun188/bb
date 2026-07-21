@@ -43,6 +43,7 @@ PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK = 0.0005
 PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK = 0.002
 PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK = 0.015
 PAPER_BOOTSTRAP_STRATUM_IMBALANCE_TOLERANCE = 2
+PAPER_BOOTSTRAP_SAMPLING_BALANCE_VERSION = "2026-07-21.soft-diagnostics.v1"
 PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
 PAPER_BOOTSTRAP_PREFLIGHT_TIMEOUT_SECONDS = 3.0
 PAPER_BOOTSTRAP_HISTORY_TIMEOUT_SECONDS = 2.5
@@ -183,6 +184,32 @@ def _as_utc(value: Any) -> datetime | None:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
+def _normalized_market_regime(value: Any) -> str:
+    if isinstance(value, dict):
+        candidates = (
+            value.get("regime"),
+            value.get("label"),
+            value.get("state"),
+            value.get("mode"),
+        )
+    else:
+        candidates = (value,)
+    aliases = {
+        "range": "ranging",
+        "ranging": "ranging",
+        "sideways": "ranging",
+        "trend": "trending",
+        "trending": "trending",
+        "volatile": "volatile",
+        "high_volatility": "volatile",
+    }
+    for candidate in candidates:
+        label = str(candidate or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if label in aliases:
+            return aliases[label]
+    return ""
+
+
 def _sampling_stratum(context: dict[str, Any], side: str) -> dict[str, str]:
     features = _safe_dict(context.get("sampling_features"))
     symbol = str(context.get("sampling_symbol") or features.get("symbol") or "unknown")
@@ -194,12 +221,10 @@ def _sampling_stratum(context: dict[str, Any], side: str) -> dict[str, str]:
         "high" if volatility >= 0.03 else "medium" if volatility >= 0.01 else "low"
     )
     strategy = _safe_dict(context.get("strategy_mode"))
-    explicit_regime = str(
-        context.get("market_regime")
-        or strategy.get("market_regime")
-        or strategy.get("regime")
-        or ""
-    ).strip().lower()
+    explicit_regime = _normalized_market_regime(context.get("market_regime")) or (
+        _normalized_market_regime(strategy.get("market_regime"))
+        or _normalized_market_regime(strategy.get("regime"))
+    )
     if explicit_regime:
         regime = explicit_regime
     else:
@@ -1062,9 +1087,6 @@ class PaperBootstrapCanaryPolicy:
                 >= PAPER_BOOTSTRAP_STRATUM_IMBALANCE_TOLERANCE
             ):
                 overrepresented_dimensions.append("symbol")
-        if overrepresented_dimensions:
-            reasons.append("paper_canary_stratum_quota_exhausted")
-
         daily_loss_fraction = 0.0
         for row in daily_rows:
             if str(_row_value(row, "outcome") or "").lower() != "loss":
@@ -1139,6 +1161,16 @@ class PaperBootstrapCanaryPolicy:
             "sampling_stratum_counts": stratum_counts,
             "sampling_symbol_counts": symbol_counts,
             "overrepresented_sampling_dimensions": overrepresented_dimensions,
+            "sampling_balance_policy": {
+                "version": PAPER_BOOTSTRAP_SAMPLING_BALANCE_VERSION,
+                "mode": "diagnostic_only",
+                "blocks_sampling": False,
+                "imbalance_tolerance": PAPER_BOOTSTRAP_STRATUM_IMBALANCE_TOLERANCE,
+                "reason": (
+                    "Preserve every risk-qualified paper sample; use observed stratum "
+                    "imbalance for downstream prioritization or weighting only."
+                ),
+            },
             "daily_loss_fraction": daily_loss_fraction,
             "daily_loss_budget_fraction": PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
             "daily_loss_budget_exhausted": daily_loss_budget_exhausted,

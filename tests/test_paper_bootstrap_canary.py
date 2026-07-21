@@ -525,7 +525,7 @@ async def test_recent_different_stratum_does_not_trigger_global_cooldown() -> No
 
 
 @pytest.mark.asyncio
-async def test_overrepresented_side_volatility_and_regime_are_stratum_limited() -> None:
+async def test_overrepresented_stratum_is_diagnostic_and_does_not_block_sampling() -> None:
     old = datetime.now(UTC) - timedelta(minutes=20)
 
     async def history() -> list[Any]:
@@ -553,14 +553,35 @@ async def test_overrepresented_side_volatility_and_regime_are_stratum_limited() 
 
     result = await policy.preflight(decision, "paper", [])
 
-    assert result.eligible is False
-    assert "paper_canary_stratum_quota_exhausted" in result.reason
+    assert result.eligible is True
+    assert "paper_canary_stratum_quota_exhausted" not in result.reason
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
     assert set(guard["overrepresented_sampling_dimensions"]) >= {
         "side",
         "volatility_bucket",
         "market_regime",
     }
+    assert guard["sampling_balance_policy"]["mode"] == "diagnostic_only"
+    assert guard["sampling_balance_policy"]["blocks_sampling"] is False
+
+
+def test_sampling_stratum_normalizes_observation_context_to_market_regime() -> None:
+    context = _context()
+    context["market_regime"] = {
+        "mode": "return_distribution_observation",
+        "avg_returns_20": 0.001,
+        "production_permission": False,
+    }
+    context["sampling_features"] = {
+        **context["sampling_features"],
+        "volatility_20": 0.005,
+        "returns_20": 0.002,
+    }
+
+    canary = select_paper_bootstrap_candidate(context)
+
+    assert canary["sampling_stratum"]["market_regime"] == "ranging"
+    assert canary["sampling_stratum"]["key"] == "BTC/USDT|long|low|ranging"
 
 
 @pytest.mark.asyncio
