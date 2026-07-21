@@ -833,9 +833,9 @@ class EnsembleCoordinator:
                 selected_side = str(paper_canary.get("selected_side") or "")
                 action = Action.LONG if selected_side == "long" else Action.SHORT
                 reason = self._reason(
-                    "正式生产收益源尚未恢复；本轮由仅限 OKX 模拟盘的 bootstrap canary 采集做多证据"
+                    "模拟盘正常策略根据当前模型的扣费后正收益预测选择做多"
                     if action == Action.LONG
-                    else "正式生产收益源尚未恢复；本轮由仅限 OKX 模拟盘的 bootstrap canary 采集做空证据",
+                    else "模拟盘正常策略根据当前模型的扣费后正收益预测选择做空",
                     decision_score,
                     disagreement,
                     raw_opinions,
@@ -862,9 +862,11 @@ class EnsembleCoordinator:
                     context.get("direction_competition") or {}
                 )
                 canary_raw["entry_permission_policy"] = {
-                    "source": "paper_bootstrap_canary",
+                    "source": "paper_normal_strategy",
                     "execution_scope": "paper_only",
                     "production_permission": False,
+                    "normal_strategy_trade": True,
+                    "continuous_training_after_settlement": True,
                     "generated_at": datetime.now(UTC).isoformat(),
                     "strategy_version": paper_canary.get("version"),
                 }
@@ -882,7 +884,7 @@ class EnsembleCoordinator:
                     feature_snapshot=features.to_dict(),
                 )
             reason = self._reason(
-                "权威费后收益分布没有给出正收益下界候选，本轮保持观望",
+                "当前模型没有给出扣除交易成本后仍为正的模拟盘机会，本轮保持观望",
                 decision_score,
                 disagreement,
                 raw_opinions,

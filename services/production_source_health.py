@@ -92,7 +92,16 @@ def summarize_production_source_health(
         for row in market_rows
         if _safe_dict(_raw(row).get("paper_bootstrap_canary")).get("requested") is True
     ]
+    normal_paper_rows = [
+        row
+        for row in canary_rows
+        if _safe_dict(_raw(row).get("paper_bootstrap_canary")).get("trade_kind")
+        == "normal_strategy_trade"
+    ]
     canary_executed = sum(bool(_row_value(row, "was_executed")) for row in canary_rows)
+    normal_paper_executed = sum(
+        bool(_row_value(row, "was_executed")) for row in normal_paper_rows
+    )
     latest_canary_at = (
         _as_utc(_row_value(canary_rows[0], "created_at")) if canary_rows else None
     )
@@ -141,6 +150,10 @@ def summarize_production_source_health(
         "critical_after_seconds": critical_after,
         "paper_bootstrap_candidate_count": len(canary_rows),
         "paper_bootstrap_executed_count": canary_executed,
+        "paper_normal_candidate_count": len(normal_paper_rows),
+        "paper_normal_executed_count": normal_paper_executed,
+        "continuous_training_after_settlement": bool(normal_paper_rows),
+        "sample_target": None if normal_paper_rows else "legacy",
         "sampling_plan_alert_active": sampling_plan_alert_active,
         "sampling_plan_alert_reason": sampling_plan_alert_reason,
         "sampling_plan_alert_observed_at": (
@@ -149,6 +162,8 @@ def summarize_production_source_health(
         "recovery_state": (
             "paper_bootstrap_plan_unreachable"
             if sampling_plan_alert_active
+            else "paper_normal_trading"
+            if normal_paper_rows
             else "paper_bootstrap_collecting"
             if canary_executed
             else "paper_bootstrap_waiting"

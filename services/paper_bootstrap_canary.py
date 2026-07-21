@@ -13,23 +13,26 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from math import ceil, isclose, isfinite
+from math import isclose, isfinite
 from typing import Any
 
 from sqlalchemy import select
 
 from ai_brain.base_model import Action, DecisionOutput
-from config.settings import settings
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
+from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.entry_profit_risk_sizing import (
     build_portfolio_risk_snapshot,
     select_okx_leverage_tier,
 )
 
-PAPER_BOOTSTRAP_CANARY_VERSION = "2026-07-19.paper-bootstrap-canary.v3"
-PAPER_BOOTSTRAP_SIZING_VERSION = "2026-07-19.paper-bootstrap-sizing.v3"
+PAPER_BOOTSTRAP_CANARY_VERSION = "2026-07-21.paper-normal-strategy.v1"
+PAPER_BOOTSTRAP_SIZING_VERSION = "2026-07-21.paper-normal-sizing.v1"
 PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION = "2026-07-19.paper-bootstrap-position-lifecycle.v2"
+PAPER_BOOTSTRAP_LEGACY_CANARY_VERSIONS = frozenset(
+    {"2026-07-19.paper-bootstrap-canary.v3"}
+)
 PAPER_BOOTSTRAP_CAMPAIGN_VERSION = "2026-07-19.authoritative-sample-sprint.v1"
 PAPER_BOOTSTRAP_CAMPAIGN_START = datetime(2026, 7, 19, 15, 10, tzinfo=UTC)
 PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES = 149
@@ -51,6 +54,8 @@ PAPER_BOOTSTRAP_PREPARE_TIMEOUT_SECONDS = 15.0
 PAPER_BOOTSTRAP_EXCHANGE_FACTS_TIMEOUT_SECONDS = 8.0
 PAPER_BOOTSTRAP_BALANCE_TIMEOUT_SECONDS = 3.0
 PAPER_BOOTSTRAP_DEADLINE_RESERVE_SECONDS = 0.05
+PAPER_NORMAL_TRADE_PURPOSE = "execute_normal_paper_strategy_and_learn_after_settlement"
+PAPER_NORMAL_POSITION_EXIT_POLICY = "dynamic_strategy_risk_and_position_review"
 
 BalanceProvider = Callable[[str, DecisionOutput], Awaitable[float | None]]
 ExchangeFactsProvider = Callable[
@@ -247,7 +252,7 @@ def _sampling_stratum(context: dict[str, Any], side: str) -> dict[str, str]:
 
 
 def build_paper_canary_position_lifecycle(decision: Any) -> dict[str, Any]:
-    """Build an expiry contract for an actually executed paper canary entry."""
+    """Build a legacy expiry contract only for pre-normal-trading sample entries."""
 
     raw = _row_raw(decision)
     contract = _safe_dict(raw.get("paper_bootstrap_canary"))
@@ -258,7 +263,10 @@ def build_paper_canary_position_lifecycle(decision: Any) -> dict[str, Any]:
     selected = _safe_dict(contract.get("selected_observation"))
     horizon_minutes = int(_positive(selected.get("horizon_minutes")) or 0)
     if (
-        contract.get("version") != PAPER_BOOTSTRAP_CANARY_VERSION
+        contract.get("version")
+        not in {PAPER_BOOTSTRAP_CANARY_VERSION, *PAPER_BOOTSTRAP_LEGACY_CANARY_VERSIONS}
+        or contract.get("purpose") == PAPER_NORMAL_TRADE_PURPOSE
+        or contract.get("position_exit_policy") == PAPER_NORMAL_POSITION_EXIT_POLICY
         or contract.get("authorized") is not True
         or contract.get("requested") is not True
         or contract.get("execution_scope") != "paper_only"
@@ -386,7 +394,7 @@ def _model_distribution(signal: dict[str, Any], side: str) -> dict[str, Any]:
 
 
 def select_paper_bootstrap_candidate(context: dict[str, Any] | None) -> dict[str, Any]:
-    """Select a paper sample by governed information value, not production PnL claims."""
+    """Select a normal paper strategy trade from a governed paper-ready model."""
 
     ctx = _safe_dict(context)
     blocked = {
@@ -444,35 +452,48 @@ def select_paper_bootstrap_candidate(context: dict[str, Any] | None) -> dict[str
                 "dispersion_pct": dispersion,
                 "current_execution_cost_pct": current_cost,
                 "observed_net_return_pct": raw_expected - current_cost,
+                "lower_quantile_net_return_pct": lower_quantile - current_cost,
                 "horizon_minutes": int(_positive(distribution.get("horizon_minutes")) or 10),
                 "distribution_member_count": int(
                     _positive(distribution.get("distribution_member_count"))
                 ),
                 "source_authority": distribution.get("source_authority"),
+                "tail_loss_probability": _positive(distribution.get("tail_loss_probability")),
+                "tail_loss_scale_pct": _positive(distribution.get("tail_loss_scale_pct")),
                 "sampling_stratum": sampling_stratum,
             }
         )
     if not observations:
         return {**blocked, "reason": "paper_canary_distribution_incomplete"}
 
-    observations.sort(
+    eligible_observations = [
+        item for item in observations if item["observed_net_return_pct"] > 0.0
+    ]
+    if not eligible_observations:
+        return {
+            **blocked,
+            "reason": "paper_normal_expected_net_return_not_positive",
+            "side_observations": observations,
+        }
+
+    eligible_observations.sort(
         key=lambda item: (
-            item["objective_expected_return_pct"],
             item["observed_net_return_pct"],
+            item["objective_expected_return_pct"],
             item["lower_quantile_return_pct"],
         ),
         reverse=True,
     )
-    selected = observations[0]
-    if len(observations) > 1:
+    selected = eligible_observations[0]
+    if len(eligible_observations) > 1:
         score_gap = (
-            selected["objective_expected_return_pct"]
-            - observations[1]["objective_expected_return_pct"]
+            selected["observed_net_return_pct"]
+            - eligible_observations[1]["observed_net_return_pct"]
         )
         if score_gap <= 0:
             return {**blocked, "reason": "paper_canary_direction_not_identifiable"}
     else:
-        score_gap = abs(selected["objective_expected_return_pct"])
+        score_gap = selected["observed_net_return_pct"]
     uncertainty = max(
         selected["dispersion_pct"],
         abs(selected["objective_expected_return_pct"] - selected["lower_quantile_return_pct"]),
@@ -485,7 +506,12 @@ def select_paper_bootstrap_candidate(context: dict[str, Any] | None) -> dict[str
         "requested": True,
         "execution_scope": "paper_only",
         "production_permission": False,
-        "purpose": "collect_version_bound_authoritative_cost_and_return_samples",
+        "purpose": PAPER_NORMAL_TRADE_PURPOSE,
+        "trade_kind": "normal_strategy_trade",
+        "position_exit_policy": PAPER_NORMAL_POSITION_EXIT_POLICY,
+        "continuous_training_after_settlement": True,
+        "sample_target": None,
+        "daily_sample_quota": None,
         "selected_side": selected["side"],
         "selected_observation": selected,
         "sampling_stratum": selected["sampling_stratum"],
@@ -501,7 +527,7 @@ def select_paper_bootstrap_candidate(context: dict[str, Any] | None) -> dict[str
         ),
         "generated_at": now.isoformat(),
         "policy_provenance": {
-            "source": "governed_shadow_market_distribution_for_paper_bootstrap",
+            "source": "governed_paper_model_distribution_for_normal_strategy_trading",
             "observation_window": "current_model_artifact_and_pre_order_market_snapshot",
             "sample_count": max(
                 int(signal.get("trained_sample_count") or 0),
@@ -515,7 +541,7 @@ def select_paper_bootstrap_candidate(context: dict[str, Any] | None) -> dict[str
 
 
 def annotate_paper_bootstrap_opportunity(decision: DecisionOutput) -> float | None:
-    """Persist the canary observation score without granting production eligibility."""
+    """Persist the normal paper opportunity without granting live permission."""
 
     raw = _safe_dict(decision.raw_response)
     contract = _safe_dict(raw.get("paper_bootstrap_canary"))
@@ -526,19 +552,23 @@ def annotate_paper_bootstrap_opportunity(decision: DecisionOutput) -> float | No
         return None
 
     selected = _safe_dict(contract.get("selected_observation"))
-    score = _finite(selected.get("objective_expected_return_pct"))
+    score = _finite(selected.get("observed_net_return_pct"))
     opportunity = dict(_safe_dict(raw.get("opportunity_score")))
     production_score = _finite(opportunity.get("score"))
     opportunity.update(
         {
             "contract_lifecycle": "paper_bootstrap_canary",
-            "score_kind": "paper_canary_objective_expected_return",
+            "score_kind": "paper_normal_expected_net_return",
             "score": round(score, 8) if score is not None else None,
             "production_score": production_score,
             "production_score_policy": opportunity.get("score_policy"),
             "production_eligible": False,
             "production_permission": False,
-            "observation_only": True,
+            "observation_only": False,
+            "paper_execution_eligible": bool(score is not None and score > 0.0),
+            "normal_strategy_trade": True,
+            "training_after_settlement": True,
+            "position_exit_policy": contract.get("position_exit_policy"),
             "execution_scope": "paper_only",
             "canary_objective_expected_return_pct": score,
             "canary_observed_net_return_pct": _finite(selected.get("observed_net_return_pct")),
@@ -645,9 +675,9 @@ class PaperBootstrapCanaryPolicy:
             "authorized": eligible,
             "blocking_reasons": reasons,
             "message_zh": (
-                "paper canary 运行时风控证据已在时限内完成。"
+                "模拟盘正常策略的运行时风控证据已在时限内完成。"
                 if history_status == "ok"
-                else "paper canary 运行时风控证据未在时限内完整取得，已按失败关闭处理。"
+                else "模拟盘正常策略的运行时风控证据未在时限内完整取得，已按失败关闭处理。"
             ),
         }
         previous_timings = [
@@ -726,8 +756,7 @@ class PaperBootstrapCanaryPolicy:
         decision.stop_loss_pct = 0.0
         decision.take_profit_pct = 0.0
         decision.reasoning = (
-            "paper canary \u8fd0\u884c\u65f6\u98ce\u63a7\u672a\u6388\u6743\u672c\u8f6e\u5f00\u4ed3\uff0c"
-            "\u5019\u9009\u65b9\u5411\u4ec5\u4fdd\u7559\u4e3a\u89c2\u5bdf\u8bc1\u636e\uff0c\u672c\u8f6e\u88c1\u51b3\u4e3a\u89c2\u671b\u3002"
+            "模拟盘正常策略未通过本轮账户与风险检查，候选方向保留为分析记录，本轮保持观望。"
         )
         decision.raw_response = raw
         return True
@@ -817,9 +846,9 @@ class PaperBootstrapCanaryPolicy:
             "blocking_reasons": list(dict.fromkeys(reasons)),
             "stages": prepare_timings,
             "message_zh": (
-                "paper canary 风险合同已在时限内完成。"
+                "模拟盘正常策略的风险合同已在时限内完成。"
                 if eligible
-                else "paper canary 风险合同证据不完整，已按失败关闭处理。"
+                else "模拟盘正常策略的风险合同证据不完整，已按失败关闭处理。"
             ),
         }
         contract["runtime_prepare_timing"] = prepare_timing
@@ -921,8 +950,17 @@ class PaperBootstrapCanaryPolicy:
             reasons.append("paper_canary_production_permission_invalid")
         if contract.get("artifact_lifecycle") != "canary":
             reasons.append("paper_canary_artifact_lifecycle_invalid")
+        if contract.get("purpose") != PAPER_NORMAL_TRADE_PURPOSE:
+            reasons.append("paper_normal_trade_purpose_invalid")
+        if contract.get("trade_kind") != "normal_strategy_trade":
+            reasons.append("paper_normal_trade_kind_invalid")
+        if contract.get("position_exit_policy") != PAPER_NORMAL_POSITION_EXIT_POLICY:
+            reasons.append("paper_normal_position_exit_policy_invalid")
         if contract.get("selected_side") != side:
             reasons.append("paper_canary_selected_side_mismatch")
+        selected = _safe_dict(contract.get("selected_observation"))
+        if (_finite(selected.get("observed_net_return_pct")) or 0.0) <= 0.0:
+            reasons.append("paper_normal_expected_net_return_not_positive")
         stratum = _safe_dict(contract.get("sampling_stratum"))
         if (
             stratum.get("side") != side
@@ -966,7 +1004,7 @@ class PaperBootstrapCanaryPolicy:
             timeout_reason="paper_canary_history_timeout",
             budget_reason="paper_canary_preflight_budget_exhausted",
             unavailable_reason_prefix="paper_canary_history_unavailable",
-            message_zh="读取已执行 paper canary 的仓位、日频、连亏和冷却风控证据。",
+            message_zh="读取模拟盘正常策略的持仓和当日亏损风控证据。",
         )
         history = list(history_value or [])
         if history_reason:
@@ -984,7 +1022,7 @@ class PaperBootstrapCanaryPolicy:
         open_canary_rows = [
             row for row in canary_rows if not str(_row_value(row, "outcome") or "").strip()
         ]
-        if len(open_canary_rows) >= PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS:
+        if max(len(open_canary_rows), len(account_open_positions)) >= PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS:
             reasons.append("paper_canary_open_position_limit_reached")
         now = datetime.now(UTC)
         today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
@@ -1000,53 +1038,7 @@ class PaperBootstrapCanaryPolicy:
         daily_entries = sum(
             1 for row in daily_rows
         )
-        completed = [row for row in canary_rows if _row_value(row, "outcome")]
-        campaign_completed_sample_count = len(completed)
-        completed_sample_count = (
-            PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-            + campaign_completed_sample_count
-        )
-        remaining_sample_count = max(
-            PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES - completed_sample_count,
-            0,
-        )
-        collection_started_at = PAPER_BOOTSTRAP_CAMPAIGN_START
-        collection_deadline = collection_started_at + timedelta(
-            days=PAPER_BOOTSTRAP_COLLECTION_HORIZON_DAYS
-        )
-        remaining_days = max(
-            ceil(max((collection_deadline - now).total_seconds(), 0.0) / 86400.0),
-            1,
-        )
-        required_daily_entries = (
-            ceil(
-                remaining_sample_count
-                / PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE
-                / remaining_days
-            )
-            if remaining_sample_count > 0
-            else 0
-        )
-        adaptive_daily_limit = min(
-            PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
-            max(
-                PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES,
-                required_daily_entries,
-            ),
-        )
-        remaining_capacity = int(
-            PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
-            * PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE
-            * remaining_days
-        )
-        sampling_plan_reachable = remaining_sample_count <= remaining_capacity
-        if remaining_sample_count <= 0:
-            reasons.append("paper_canary_target_sample_count_reached")
-        if daily_entries >= adaptive_daily_limit:
-            reasons.append("paper_canary_daily_entry_budget_exhausted")
-
         current_stratum = _safe_dict(contract.get("sampling_stratum"))
-        current_stratum_key = str(current_stratum.get("key") or "")
         dimension_values = {
             "side": ("long", "short"),
             "volatility_bucket": ("low", "medium", "high"),
@@ -1104,28 +1096,6 @@ class PaperBootstrapCanaryPolicy:
         if daily_loss_budget_exhausted:
             reasons.append("paper_canary_daily_loss_budget_exhausted")
 
-        last_executed = _as_utc(
-            next(
-                (
-                    _row_value(row, "executed_at") or _row_value(row, "created_at")
-                    for row in canary_rows
-                    if str(_row_value(row, "canary_sampling_stratum_key") or "")
-                    == current_stratum_key
-                    if _row_value(row, "executed_at") or _row_value(row, "created_at")
-                ),
-                None,
-            )
-        )
-        horizon_minutes = int(
-            _positive(_safe_dict(contract.get("selected_observation")).get("horizon_minutes")) or 10
-        )
-        cooldown_seconds = max(
-            horizon_minutes * 60,
-            max(int(settings.decision_interval_seconds or 60), 1) * 5,
-        )
-        if isinstance(last_executed, datetime):
-            if now - last_executed < timedelta(seconds=cooldown_seconds):
-                reasons.append("paper_canary_cooldown_active")
         return {
             "blocking_reasons": list(dict.fromkeys(reasons)),
             "status": "available" if history_reason is None else "failed_closed",
@@ -1135,28 +1105,28 @@ class PaperBootstrapCanaryPolicy:
             "account_open_position_count": len(account_open_positions),
             "open_position_source": "executed_canary_decisions_without_outcome",
             "daily_entry_count": daily_entries,
-            "max_daily_entries": adaptive_daily_limit,
-            "absolute_max_daily_entries": PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
-            "min_daily_entries": PAPER_BOOTSTRAP_MIN_DAILY_ENTRIES,
-            "campaign_version": PAPER_BOOTSTRAP_CAMPAIGN_VERSION,
-            "campaign_authoritative_baseline_sample_count": (
-                PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-            ),
-            "campaign_completed_sample_count": campaign_completed_sample_count,
-            "completed_authoritative_sample_count": completed_sample_count,
-            "target_authoritative_sample_count": PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
-            "remaining_authoritative_sample_count": remaining_sample_count,
-            "collection_started_at": collection_started_at.isoformat(),
-            "collection_deadline": collection_deadline.isoformat(),
-            "remaining_collection_days": remaining_days,
-            "required_daily_entries": required_daily_entries,
-            "remaining_collection_capacity": remaining_capacity,
-            "expected_completion_rate": PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE,
-            "sampling_plan_reachable": sampling_plan_reachable,
-            "sampling_plan_alert_active": not sampling_plan_reachable,
-            "daily_entry_limit_source": (
-                "remaining_sample_deficit_with_completion_reserve_over_remaining_collection_days"
-            ),
+            "max_daily_entries": None,
+            "absolute_max_daily_entries": None,
+            "min_daily_entries": None,
+            "campaign_version": None,
+            "campaign_authoritative_baseline_sample_count": None,
+            "campaign_completed_sample_count": None,
+            "completed_authoritative_sample_count": None,
+            "target_authoritative_sample_count": None,
+            "remaining_authoritative_sample_count": None,
+            "collection_started_at": None,
+            "collection_deadline": None,
+            "remaining_collection_days": None,
+            "required_daily_entries": None,
+            "remaining_collection_capacity": None,
+            "expected_completion_rate": None,
+            "sampling_plan_reachable": True,
+            "sampling_plan_alert_active": False,
+            "daily_entry_limit_source": "normal_risk_controls_only",
+            "normal_strategy_trading": True,
+            "continuous_training_after_settlement": True,
+            "sample_target": None,
+            "daily_sample_quota": None,
             "sampling_stratum": current_stratum,
             "sampling_stratum_counts": stratum_counts,
             "sampling_symbol_counts": symbol_counts,
@@ -1174,10 +1144,8 @@ class PaperBootstrapCanaryPolicy:
             "daily_loss_fraction": daily_loss_fraction,
             "daily_loss_budget_fraction": PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
             "daily_loss_budget_exhausted": daily_loss_budget_exhausted,
-            "cooldown_seconds": cooldown_seconds,
-            "last_executed_at": (
-                last_executed.isoformat() if isinstance(last_executed, datetime) else None
-            ),
+            "cooldown_seconds": 0,
+            "last_executed_at": None,
         }
 
     def _attach_risk_contract(
@@ -1239,26 +1207,30 @@ class PaperBootstrapCanaryPolicy:
             contract_specs=contract_specs,
         )
         account_portfolio["valuation_blockers"] = account_portfolio_blockers
-        canary_positions = [
-            position for position in open_positions if _is_open_paper_canary_position(position)
+        paper_positions = [
+            position
+            for position in open_positions
+            if position.get("is_open", True) is not False
+            and _positive(position.get("quantity", 1.0)) > 0
+            and str(position.get("execution_mode") or "paper").lower() == "paper"
         ]
-        canary_portfolio, canary_portfolio_blockers = build_portfolio_risk_snapshot(
-            canary_positions,
+        paper_portfolio, paper_portfolio_blockers = build_portfolio_risk_snapshot(
+            paper_positions,
             candidate_side=str(contract.get("selected_side") or ""),
             contract_specs=contract_specs,
         )
-        canary_portfolio["scope"] = "paper_bootstrap_canary_positions_only"
-        canary_portfolio["valuation_blockers"] = canary_portfolio_blockers
+        paper_portfolio["scope"] = "paper_account_positions"
+        paper_portfolio["valuation_blockers"] = paper_portfolio_blockers
         runtime_open_count = int(_positive(runtime_guard.get("open_position_count")))
-        conservative_open_count = max(runtime_open_count, len(canary_positions))
-        current_canary_stressed_loss = max(
-            _positive(canary_portfolio.get("current_stressed_loss_usdt")),
+        conservative_open_count = max(runtime_open_count, len(paper_positions))
+        current_paper_stressed_loss = max(
+            _positive(paper_portfolio.get("current_stressed_loss_usdt")),
             conservative_open_count * single_trade_budget,
         )
-        canary_portfolio["current_stressed_loss_usdt"] = current_canary_stressed_loss
-        canary_portfolio["conservative_open_position_count"] = conservative_open_count
+        paper_portfolio["current_stressed_loss_usdt"] = current_paper_stressed_loss
+        paper_portfolio["conservative_open_position_count"] = conservative_open_count
         remaining_portfolio_budget = max(
-            portfolio_budget - current_canary_stressed_loss,
+            portfolio_budget - current_paper_stressed_loss,
             0.0,
         )
         risk_budget = min(single_trade_budget, remaining_portfolio_budget)
@@ -1274,19 +1246,11 @@ class PaperBootstrapCanaryPolicy:
             if fill_notional_ceiling > 0
             else 0.0
         )
-        final_notional = min(target_notional, available_margin)
-        final_margin = final_notional
-        position_size = final_margin / available_margin if available_margin > 0 else 0.0
-        planned_loss = final_notional * stress
-        if final_notional <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
-            reasons.append("paper_canary_independent_risk_budget_zero")
-        if current_canary_stressed_loss + planned_loss > portfolio_budget + 1e-8:
-            reasons.append("paper_canary_portfolio_stressed_loss_exceeded")
         target_inst_id = str(facts.get("target_inst_id") or "").strip()
         target_contract_spec = _safe_dict(contract_specs.get(target_inst_id))
         leverage_tier_selection = select_okx_leverage_tier(
             facts.get("leverage_tiers"),
-            target_notional_usdt=final_notional,
+            target_notional_usdt=target_notional,
             mark_price=price,
             contract_spec=target_contract_spec,
         )
@@ -1299,6 +1263,63 @@ class PaperBootstrapCanaryPolicy:
         generated_at = datetime.now(UTC).isoformat()
         selected_observation = _safe_dict(contract.get("selected_observation"))
         expected_net_return = _finite(selected_observation.get("observed_net_return_pct"))
+        lower_quantile_net_return = _finite(
+            selected_observation.get("lower_quantile_net_return_pct")
+        )
+        expected_loss_pct = max(
+            _positive(selected_observation.get("dispersion_pct")),
+            abs(min(lower_quantile_net_return or 0.0, 0.0)),
+        )
+        profit_quality_ratio = (
+            max(expected_net_return or 0.0, 0.0)
+            / max(expected_loss_pct + cost_pct, 1e-12)
+        )
+        system_max_leverage = _positive(leverage_tier_selection.get("max_leverage"))
+        leverage_decision = DynamicLeverageAllocator().allocate(
+            DynamicLeverageInput(
+                symbol=decision.symbol,
+                requested_leverage=max(_positive(decision.suggested_leverage), 1.0),
+                system_max_leverage=system_max_leverage,
+                target_notional_usdt=target_notional,
+                available_margin_usdt=available_margin,
+                stressed_loss_fraction=stress,
+                expected_net_return_pct=max(expected_net_return or 0.0, 0.0),
+                return_lcb_pct=max(lower_quantile_net_return or 0.0, 0.0),
+                expected_loss_pct=expected_loss_pct,
+                profit_quality_ratio=profit_quality_ratio,
+                loss_probability=_positive(
+                    selected_observation.get("tail_loss_probability")
+                ),
+                tail_risk_score=min(
+                    _positive(selected_observation.get("tail_loss_scale_pct"))
+                    / max(stress * 100.0, 1e-12),
+                    1.0,
+                ),
+                aligned_source_count=max(int(contract.get("source_sample_count") or 0), 1),
+                atr_pct=atr_fraction,
+                execution_cost=execution_cost,
+                portfolio_capacity_fraction=(
+                    remaining_portfolio_budget / portfolio_budget
+                    if portfolio_budget > 0
+                    else 0.0
+                ),
+            )
+        )
+        if leverage_decision.policy_provenance.get("production_eligible") is not True:
+            reasons.extend(leverage_decision.reasons)
+        leverage = (
+            float(leverage_decision.final_integer_leverage)
+            if leverage_decision.policy_provenance.get("production_eligible") is True
+            else 1.0
+        )
+        final_notional = min(target_notional, available_margin * leverage)
+        final_margin = final_notional / leverage if leverage > 0 else 0.0
+        position_size = final_margin / available_margin if available_margin > 0 else 0.0
+        planned_loss = final_notional * stress
+        if final_notional <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
+            reasons.append("paper_canary_independent_risk_budget_zero")
+        if current_paper_stressed_loss + planned_loss > portfolio_budget + 1e-8:
+            reasons.append("paper_canary_portfolio_stressed_loss_exceeded")
         fingerprint_payload = {
             "artifact_version": contract.get("artifact_version"),
             "symbol": decision.symbol,
@@ -1308,11 +1329,12 @@ class PaperBootstrapCanaryPolicy:
             "stress": round(stress, 8),
             "risk_budget": round(risk_budget, 8),
             "final_notional": round(final_notional, 8),
+            "final_leverage": round(leverage, 8),
             "pre_order_fingerprint": pre_order.get("input_fingerprint"),
         }
         provenance = {
-            "source": "paper_bootstrap_canary_independent_risk_budget",
-            "observation_window": "current_okx_demo_account_market_and_canary_runtime_guard",
+            "source": "paper_normal_strategy_independent_risk_budget",
+            "observation_window": "current_okx_demo_account_market_and_normal_risk_guard",
             "sample_count": max(int(contract.get("source_sample_count") or 0), 1),
             "generated_at": generated_at,
             "strategy_version": PAPER_BOOTSTRAP_SIZING_VERSION,
@@ -1323,7 +1345,7 @@ class PaperBootstrapCanaryPolicy:
             "contract_version": PAPER_BOOTSTRAP_SIZING_VERSION,
             "production_eligible": not reasons,
             "reason": (
-                "paper_bootstrap_canary_independent_risk_budget_ready"
+                "paper_normal_strategy_independent_risk_budget_ready"
                 if not reasons
                 else ",".join(dict.fromkeys(reasons))
             ),
@@ -1336,7 +1358,7 @@ class PaperBootstrapCanaryPolicy:
             "single_trade_risk_budget_usdt": single_trade_budget,
             "portfolio_risk_budget_usdt": portfolio_budget,
             "remaining_portfolio_risk_budget_usdt": remaining_portfolio_budget,
-            "current_portfolio_stressed_loss_usdt": current_canary_stressed_loss,
+            "current_portfolio_stressed_loss_usdt": current_paper_stressed_loss,
             "planned_stressed_loss_usdt": planned_loss,
             "stressed_loss_fraction": stress,
             "target_notional_usdt": target_notional,
@@ -1351,12 +1373,13 @@ class PaperBootstrapCanaryPolicy:
                 if expected_net_return is not None
                 else None
             ),
-            "portfolio_risk_snapshot": canary_portfolio,
+            "portfolio_risk_snapshot": paper_portfolio,
             "account_portfolio_risk_snapshot": account_portfolio,
             "exchange_contract_specs": contract_specs,
             "exchange_risk_facts_provenance": facts.get("policy_provenance"),
             "entry_instrument_availability": facts.get("entry_instrument_availability"),
             "leverage_tier_selection": leverage_tier_selection,
+            "dynamic_leverage_decision": leverage_decision.to_dict(),
             "runtime_guard": runtime_guard,
             "reasons": reasons,
             "units": {
@@ -1369,6 +1392,7 @@ class PaperBootstrapCanaryPolicy:
             "policy_provenance": provenance,
         }
         raw["profit_risk_sizing"] = sizing
+        raw["dynamic_leverage_decision"] = leverage_decision.to_dict()
         raw["execution_cost_sizing_pass"] = {
             "order_size_complete": bool(not reasons and final_notional > 0),
             "impact_basis_notional_usdt": final_notional,
@@ -1377,7 +1401,7 @@ class PaperBootstrapCanaryPolicy:
         }
         decision.raw_response = raw
         decision.position_size_pct = position_size if not reasons else 0.0
-        decision.suggested_leverage = 1.0
+        decision.suggested_leverage = leverage if not reasons else 1.0
         if not reasons:
             decision.stop_loss_pct = stress
             decision.take_profit_pct = max(stress * 1.5, cost_pct * 2.0 / 100.0)
@@ -1420,7 +1444,12 @@ class PaperBootstrapCanaryPolicy:
                 AIDecision.was_executed.is_(True),
                 AIDecision.created_at >= PAPER_BOOTSTRAP_CAMPAIGN_START,
                 authorized.is_(True),
-                version == PAPER_BOOTSTRAP_CANARY_VERSION,
+                version.in_(
+                    [
+                        PAPER_BOOTSTRAP_CANARY_VERSION,
+                        *sorted(PAPER_BOOTSTRAP_LEGACY_CANARY_VERSIONS),
+                    ]
+                ),
             )
             .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
             .limit(200)

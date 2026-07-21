@@ -267,8 +267,8 @@ def test_scoring_path_persists_lifecycle_specific_paper_canary_score() -> None:
     score = _scorer().score_candidate(decision)
 
     opportunity = decision.raw_response["opportunity_score"]
-    assert score == pytest.approx(-0.32)
-    assert opportunity["score"] == pytest.approx(-0.32)
+    assert score == pytest.approx(0.27)
+    assert opportunity["score"] == pytest.approx(0.27)
     assert opportunity["production_score"] is None
     assert opportunity["contract_lifecycle"] == "paper_bootstrap_canary"
     assert opportunity["production_eligible"] is False

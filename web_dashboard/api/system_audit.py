@@ -2932,6 +2932,8 @@ async def _production_source_health_audit() -> dict[str, Any]:
             "Paper bootstrap canary sampling plan is unreachable; the alert is active "
             "while controlled collection continues."
         )
+    elif report.get("recovery_state") == "paper_normal_trading":
+        summary = "正式生产收益源仍为空；模拟盘正常策略交易与持续训练正在运行，实盘继续保持关闭。"
     elif report.get("recovery_state") == "paper_bootstrap_collecting":
         summary = "正式生产收益源仍为空，模拟盘 bootstrap canary 正在采集恢复证据。"
     else:
@@ -2949,17 +2951,21 @@ async def _production_source_health_audit() -> dict[str, Any]:
                 "value": int(report.get("production_source_decision_count") or 0),
             },
             {
-                "label": "canary 已执行",
-                "value": int(report.get("paper_bootstrap_executed_count") or 0),
+                "label": "模拟策略已执行",
+                "value": int(
+                    report.get("paper_normal_executed_count")
+                    or report.get("paper_bootstrap_executed_count")
+                    or 0
+                ),
             },
             {
-                "label": "采样计划告警",
-                "value": bool(report.get("sampling_plan_alert_active")),
+                "label": "固定样本目标",
+                "value": report.get("sample_target"),
             },
         ],
         next_actions=[
-            "检查 paper bootstrap canary 的运行时熔断、成交和版本归因。",
-            "采样计划不可达时按剩余样本、剩余天数和每日风险预算重新核算采样容量。",
+            "检查模拟盘正常策略的运行时风控、成交、费用结算和版本归因。",
+            "所有完整平仓继续进入训练，不再以固定样本数量控制开仓。",
             "只有 walk-forward、样本外和权威成交费后收益下界转正后才恢复正式生产源。",
         ],
         owner_path="services/production_source_health.py",

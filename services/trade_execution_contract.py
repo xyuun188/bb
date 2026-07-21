@@ -420,7 +420,8 @@ def validate_paper_canary_entry_contract(
 
     portfolio = _safe_dict(sizing.get("portfolio_risk_snapshot"))
     if (
-        portfolio.get("scope") != "paper_bootstrap_canary_positions_only"
+        portfolio.get("scope")
+        not in {"paper_bootstrap_canary_positions_only", "paper_account_positions"}
         or _safe_float(portfolio.get("current_stressed_loss_usdt")) < 0
     ):
         reasons.append("paper_canary_portfolio_snapshot_incomplete")
@@ -433,16 +434,27 @@ def validate_paper_canary_entry_contract(
 
     if opportunity.get("contract_lifecycle") == "paper_bootstrap_canary":
         annotated_score = _finite_value(opportunity.get("score"))
-        objective_score = _finite_value(observation.get("objective_expected_return_pct"))
+        normal_trade = canary.get("trade_kind") == "normal_strategy_trade"
+        expected_score = _finite_value(
+            observation.get(
+                "observed_net_return_pct"
+                if normal_trade
+                else "objective_expected_return_pct"
+            )
+        )
         if (
             opportunity.get("score_kind")
-            != "paper_canary_objective_expected_return"
+            != (
+                "paper_normal_expected_net_return"
+                if normal_trade
+                else "paper_canary_objective_expected_return"
+            )
             or annotated_score is None
-            or objective_score is None
-            or not isclose(annotated_score, objective_score, abs_tol=1e-8)
+            or expected_score is None
+            or not isclose(annotated_score, expected_score, abs_tol=1e-8)
             or opportunity.get("production_eligible") is not False
             or opportunity.get("production_permission") is not False
-            or opportunity.get("observation_only") is not True
+            or opportunity.get("observation_only") is not (not normal_trade)
             or opportunity.get("execution_scope") != "paper_only"
         ):
             reasons.append("paper_canary_opportunity_annotation_invalid")
@@ -464,11 +476,19 @@ def validate_paper_canary_entry_contract(
         "contract_complete": not reasons,
         "execution_scope": canary.get("execution_scope"),
         "production_permission": False,
-        "observation_only": True,
+        "observation_only": canary.get("trade_kind") != "normal_strategy_trade",
+        "normal_strategy_trade": canary.get("trade_kind") == "normal_strategy_trade",
+        "training_after_settlement": bool(
+            canary.get("continuous_training_after_settlement")
+        ),
         "artifact_version": canary.get("artifact_version"),
         "selected_side": canary.get("selected_side"),
         "opportunity_score": _finite_value(
-            observation.get("objective_expected_return_pct")
+            observation.get(
+                "observed_net_return_pct"
+                if canary.get("trade_kind") == "normal_strategy_trade"
+                else "objective_expected_return_pct"
+            )
         ),
         "observed_net_return_pct": _finite_value(
             observation.get("observed_net_return_pct")
@@ -633,6 +653,16 @@ def _paper_canary_observation_reasons(canary: dict[str, Any]) -> list[str]:
         reasons.append("paper_canary_production_permission_invalid")
     if canary.get("artifact_lifecycle") != "canary":
         reasons.append("paper_canary_artifact_lifecycle_invalid")
+    normal_trade = canary.get("trade_kind") == "normal_strategy_trade"
+    if normal_trade:
+        if canary.get("purpose") != (
+            "execute_normal_paper_strategy_and_learn_after_settlement"
+        ):
+            reasons.append("paper_normal_trade_purpose_invalid")
+        if canary.get("position_exit_policy") != (
+            "dynamic_strategy_risk_and_position_review"
+        ):
+            reasons.append("paper_normal_position_exit_policy_invalid")
 
     observation = _safe_dict(canary.get("selected_observation"))
     side = str(canary.get("selected_side") or "").lower()
@@ -653,6 +683,8 @@ def _paper_canary_observation_reasons(canary: dict[str, Any]) -> list[str]:
         or not str(observation.get("source_authority") or "").strip()
     ):
         reasons.append("paper_canary_selected_observation_incomplete")
+    if normal_trade and _safe_float(observation.get("observed_net_return_pct")) <= 0:
+        reasons.append("paper_normal_expected_net_return_not_positive")
     direction_gap = _finite_value(canary.get("direction_score_gap"))
     confidence = _finite_value(canary.get("confidence"))
     if (

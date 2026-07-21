@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from math import ceil
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,17 +14,13 @@ from risk_manager.engine import RiskEngine
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.execution_service import _return_entry_contract_result
 from services.paper_bootstrap_canary import (
-    PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES,
-    PAPER_BOOTSTRAP_CAMPAIGN_VERSION,
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
-    PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE,
     PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
     PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
     PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
     PAPER_BOOTSTRAP_SIZING_VERSION,
-    PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
     PaperBootstrapCanaryPolicy,
     annotate_paper_bootstrap_opportunity,
     assess_paper_canary_position_horizon,
@@ -81,8 +76,8 @@ def _context() -> dict[str, Any]:
             "predictions": [
                 {
                     "return_distribution_contract": {
-                        "long": distribution("long", -0.12),
-                        "short": distribution("short", -0.35),
+                        "long": distribution("long", 0.15),
+                        "short": distribution("short", 0.05),
                     }
                 }
             ],
@@ -104,6 +99,14 @@ def _decision(context: dict[str, Any] | None = None) -> DecisionOutput:
         take_profit_pct=0.0,
         raw_response={
             "paper_bootstrap_canary": canary,
+            "opportunity_score": {
+                "execution_cost": {
+                    "production_eligible": True,
+                    "total_pct": 0.08,
+                    "spread_pct": 0.02,
+                    "slippage_pct": 0.01,
+                }
+            },
             "pre_order_execution_facts": {
                 "production_eligible": True,
                 "input_fingerprint": "book-v1",
@@ -117,29 +120,47 @@ def _decision(context: dict[str, Any] | None = None) -> DecisionOutput:
     )
 
 
-def test_negative_shadow_objective_can_request_paper_sample_without_production_permission() -> None:
+def test_positive_fee_after_forecast_can_request_normal_paper_trade() -> None:
     canary = select_paper_bootstrap_candidate(_context())
 
     assert canary["authorized"] is True
     assert canary["selected_side"] == "long"
-    assert canary["selected_observation"]["objective_expected_return_pct"] < 0
+    assert canary["selected_observation"]["observed_net_return_pct"] > 0
+    assert canary["purpose"] == "execute_normal_paper_strategy_and_learn_after_settlement"
+    assert canary["trade_kind"] == "normal_strategy_trade"
+    assert canary["sample_target"] is None
+    assert canary["daily_sample_quota"] is None
     assert canary["production_permission"] is False
     assert canary["version"] == PAPER_BOOTSTRAP_CANARY_VERSION
 
 
-def test_paper_canary_opportunity_annotation_is_finite_and_observation_only() -> None:
+def test_non_positive_fee_after_forecast_stays_hold() -> None:
+    context = _context()
+    distributions = context["ml_signal"]["predictions"][0]["return_distribution_contract"]
+    for side in ("long", "short"):
+        distributions[side]["raw_expected_return_pct"] = 0.05
+
+    canary = select_paper_bootstrap_candidate(context)
+
+    assert canary["authorized"] is False
+    assert canary["reason"] == "paper_normal_expected_net_return_not_positive"
+
+
+def test_paper_normal_opportunity_annotation_is_finite_and_execution_eligible() -> None:
     decision = _decision()
 
     score = annotate_paper_bootstrap_opportunity(decision)
 
     opportunity = decision.raw_response["opportunity_score"]
-    assert score == pytest.approx(-0.12)
-    assert opportunity["score"] == pytest.approx(-0.12)
-    assert opportunity["score_kind"] == "paper_canary_objective_expected_return"
+    assert score == pytest.approx(0.27)
+    assert opportunity["score"] == pytest.approx(0.27)
+    assert opportunity["score_kind"] == "paper_normal_expected_net_return"
     assert opportunity["contract_lifecycle"] == "paper_bootstrap_canary"
     assert opportunity["production_eligible"] is False
     assert opportunity["production_permission"] is False
-    assert opportunity["observation_only"] is True
+    assert opportunity["observation_only"] is False
+    assert opportunity["paper_execution_eligible"] is True
+    assert opportunity["normal_strategy_trade"] is True
     assert opportunity["execution_scope"] == "paper_only"
 
 
@@ -153,7 +174,7 @@ def test_paper_canary_selection_is_forbidden_in_live_mode() -> None:
     assert canary["reason"] == "paper_execution_mode_required"
 
 
-def test_executed_paper_canary_builds_expiring_position_lifecycle() -> None:
+def test_executed_normal_paper_trade_does_not_build_expiring_position_lifecycle() -> None:
     executed_at = datetime.now(UTC) - timedelta(minutes=11)
     decision = SimpleNamespace(
         id=123,
@@ -163,6 +184,30 @@ def test_executed_paper_canary_builds_expiring_position_lifecycle() -> None:
         was_executed=True,
         executed_at=executed_at,
         raw_llm_response={"paper_bootstrap_canary": select_paper_bootstrap_candidate(_context())},
+    )
+
+    lifecycle = build_paper_canary_position_lifecycle(decision)
+    assert lifecycle == {}
+
+
+def test_legacy_sample_trade_still_builds_expiring_position_lifecycle() -> None:
+    executed_at = datetime.now(UTC) - timedelta(minutes=11)
+    legacy = select_paper_bootstrap_candidate(_context())
+    legacy.update(
+        {
+            "version": "2026-07-19.paper-bootstrap-canary.v3",
+            "purpose": "collect_version_bound_authoritative_cost_and_return_samples",
+            "position_exit_policy": "fixed_model_horizon",
+        }
+    )
+    decision = SimpleNamespace(
+        id=123,
+        symbol="BTC/USDT",
+        action="long",
+        is_paper=True,
+        was_executed=True,
+        executed_at=executed_at,
+        raw_llm_response={"paper_bootstrap_canary": legacy},
     )
 
     lifecycle = build_paper_canary_position_lifecycle(decision)
@@ -176,7 +221,6 @@ def test_executed_paper_canary_builds_expiring_position_lifecycle() -> None:
     )
 
     assert lifecycle["version"] == PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
-    assert lifecycle["horizon_minutes"] == 10
     assert assessment["authorized"] is True
     assert assessment["elapsed"] is True
 
@@ -227,7 +271,7 @@ def test_paper_canary_horizon_reads_persisted_management_lifecycle() -> None:
     assert assessment["elapsed"] is True
 
 
-def test_ensemble_emits_paper_canary_entry_when_production_source_is_absent() -> None:
+def test_ensemble_emits_normal_paper_entry_when_live_source_is_absent() -> None:
     coordinator = EnsembleCoordinator(SimpleNamespace(get=lambda _name: None))
 
     decision = coordinator.combine(
@@ -239,6 +283,11 @@ def test_ensemble_emits_paper_canary_entry_when_production_source_is_absent() ->
     assert decision.action == Action.LONG
     assert decision.raw_response["paper_bootstrap_canary"]["authorized"] is True
     assert decision.raw_response["entry_permission_policy"]["execution_scope"] == "paper_only"
+    assert decision.raw_response["entry_permission_policy"]["source"] == (
+        "paper_normal_strategy"
+    )
+    assert decision.raw_response["entry_permission_policy"]["normal_strategy_trade"] is True
+    assert "采集" not in decision.reasoning
 
 
 @pytest.mark.asyncio
@@ -266,7 +315,14 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
 
     decision = _decision()
     decision.feature_snapshot["atr_14"] = 2.443918123
-    decision.raw_response["opportunity_score"] = {"execution_cost": {"total_pct": 0.15}}
+    decision.raw_response["opportunity_score"] = {
+        "execution_cost": {
+            "production_eligible": True,
+            "total_pct": 0.15,
+            "spread_pct": 0.03,
+            "slippage_pct": 0.02,
+        }
+    }
     policy = PaperBootstrapCanaryPolicy(
         allocated_order_balance=balance,
         exchange_risk_facts=facts,
@@ -288,7 +344,7 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     assert sizing["leverage_tier_selection"]["contract_spec"]["ctVal"] == "0.01"
     assert sizing["contract_version"] == PAPER_BOOTSTRAP_SIZING_VERSION
     assert sizing["portfolio_risk_snapshot"]["gross_notional_usdt"] == 0.0
-    assert sizing["portfolio_risk_snapshot"]["scope"] == ("paper_bootstrap_canary_positions_only")
+    assert sizing["portfolio_risk_snapshot"]["scope"] == "paper_account_positions"
     assert sizing["entry_instrument_availability"]["available"] is True
     assert sizing["estimated_fill_drift_reserve_fraction"] == pytest.approx(
         PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION
@@ -297,7 +353,10 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     assert sizing["target_notional_usdt"] * (
         1.0 + sizing["estimated_fill_drift_reserve_fraction"]
     ) == pytest.approx(sizing["fill_notional_ceiling_usdt"])
-    assert decision.suggested_leverage == 1.0
+    assert sizing["dynamic_leverage_decision"]["final_integer_leverage"] >= 1
+    assert decision.suggested_leverage == pytest.approx(
+        sizing["dynamic_leverage_decision"]["final_integer_leverage"]
+    )
     assert decision.stop_loss_pct > 0
     assert decision.take_profit_pct > decision.stop_loss_pct
     assert _return_entry_contract_result(decision, "paper").passed is True
@@ -306,7 +365,7 @@ async def test_paper_canary_builds_bounded_contract_that_passes_hard_risk() -> N
     reconciled = reconcile_profit_risk_sizing(
         decision,
         final_notional_usdt=sizing["final_notional_usdt"],
-        final_leverage=1.0,
+        final_leverage=decision.suggested_leverage,
         source="test_exchange_precision",
     )
     assert reconciled["eligible"] is True
@@ -716,7 +775,7 @@ async def test_two_losses_do_not_open_a_fixed_six_hour_circuit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paper_canary_daily_budget_expands_while_sample_deficit_is_large() -> None:
+async def test_normal_paper_trading_has_no_daily_sample_quota() -> None:
     executed_at = datetime.now(UTC) - timedelta(minutes=20)
 
     async def history() -> list[Any]:
@@ -740,18 +799,17 @@ async def test_paper_canary_daily_budget_expands_while_sample_deficit_is_large()
 
     result = await policy.preflight(decision, "paper", [])
 
-    assert result.eligible is False
-    assert "paper_canary_daily_entry_budget_exhausted" in result.reason
+    assert result.eligible is True
+    assert "paper_canary_daily_entry_budget_exhausted" not in result.reason
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["max_daily_entries"] <= PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
-    assert guard["absolute_max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
-    assert guard["daily_entry_limit_source"] == (
-        "remaining_sample_deficit_with_completion_reserve_over_remaining_collection_days"
-    )
+    assert guard["max_daily_entries"] is None
+    assert guard["absolute_max_daily_entries"] is None
+    assert guard["daily_sample_quota"] is None
+    assert guard["daily_entry_limit_source"] == "normal_risk_controls_only"
 
 
 @pytest.mark.asyncio
-async def test_initial_sampling_plan_is_reachable_from_zero_samples() -> None:
+async def test_normal_paper_trading_has_no_sample_target() -> None:
     async def history() -> list[Any]:
         return []
 
@@ -766,41 +824,18 @@ async def test_initial_sampling_plan_is_reachable_from_zero_samples() -> None:
 
     assert result.eligible is True
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    expected_entries = ceil(
-        (
-            PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
-            - PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-        )
-        / PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE
-    )
-    assert guard["required_daily_entries"] == expected_entries
-    assert guard["max_daily_entries"] == expected_entries
-    assert guard["campaign_version"] == PAPER_BOOTSTRAP_CAMPAIGN_VERSION
-    assert (
-        guard["campaign_authoritative_baseline_sample_count"]
-        == PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-    )
-    assert guard["campaign_completed_sample_count"] == 0
-    assert (
-        guard["completed_authoritative_sample_count"]
-        == PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-    )
-    assert guard["remaining_authoritative_sample_count"] == (
-        PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
-        - PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-    )
+    assert guard["sample_target"] is None
+    assert guard["target_authoritative_sample_count"] is None
+    assert guard["remaining_authoritative_sample_count"] is None
+    assert guard["required_daily_entries"] is None
+    assert guard["normal_strategy_trading"] is True
+    assert guard["continuous_training_after_settlement"] is True
     assert guard["sampling_plan_reachable"] is True
     assert guard["sampling_plan_alert_active"] is False
 
 
 @pytest.mark.asyncio
-async def test_overdue_sampling_plan_emits_unreachable_alert_without_stopping_collection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "services.paper_bootstrap_canary.PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES",
-        0,
-    )
+async def test_old_trade_history_does_not_create_sample_plan_alert() -> None:
     old = datetime.now(UTC) - timedelta(days=15)
 
     async def history() -> list[Any]:
@@ -825,19 +860,16 @@ async def test_overdue_sampling_plan_emits_unreachable_alert_without_stopping_co
 
     assert result.eligible is True
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["remaining_collection_days"] == 1
-    assert guard["max_daily_entries"] == PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES
-    assert guard["sampling_plan_reachable"] is False
-    assert guard["sampling_plan_alert_active"] is True
+    assert guard["remaining_collection_days"] is None
+    assert guard["max_daily_entries"] is None
+    assert guard["sampling_plan_reachable"] is True
+    assert guard["sampling_plan_alert_active"] is False
 
 
 @pytest.mark.asyncio
-async def test_completed_campaign_blocks_additional_canary_entries() -> None:
+async def test_completed_trade_count_never_stops_normal_paper_trading() -> None:
     completed_at = datetime.now(UTC) - timedelta(minutes=20)
-    required = (
-        PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
-        - PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES
-    )
+    completed_count = 80
 
     async def history() -> list[Any]:
         return [
@@ -847,7 +879,7 @@ async def test_completed_campaign_blocks_additional_canary_entries() -> None:
                 executed_at=completed_at - timedelta(seconds=index),
                 created_at=completed_at - timedelta(seconds=index),
             )
-            for index in range(required)
+            for index in range(completed_count)
         ]
 
     decision = _decision()
@@ -859,15 +891,12 @@ async def test_completed_campaign_blocks_additional_canary_entries() -> None:
 
     result = await policy.preflight(decision, "paper", [])
 
-    assert result.eligible is False
-    assert "paper_canary_target_sample_count_reached" in result.reason
+    assert result.eligible is True
+    assert "paper_canary_target_sample_count_reached" not in result.reason
     guard = decision.raw_response["paper_bootstrap_canary"]["runtime_guard"]
-    assert guard["campaign_completed_sample_count"] == required
-    assert (
-        guard["completed_authoritative_sample_count"]
-        == PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES
-    )
-    assert guard["remaining_authoritative_sample_count"] == 0
+    assert guard["campaign_completed_sample_count"] is None
+    assert guard["completed_authoritative_sample_count"] is None
+    assert guard["remaining_authoritative_sample_count"] is None
 
 
 def test_canary_history_query_projects_only_runtime_guard_columns() -> None:

@@ -10,7 +10,7 @@ from services.paper_bootstrap_canary import (
 
 def complete_paper_canary_raw() -> dict[str, Any]:
     canary_provenance = {
-        "source": "governed_shadow_market_distribution_for_paper_bootstrap",
+        "source": "governed_paper_model_distribution_for_normal_strategy_trading",
         "observation_window": "current_model_artifact_and_pre_order_market_snapshot",
         "sample_count": 1200,
         "generated_at": "2026-07-17T08:00:00+00:00",
@@ -18,8 +18,8 @@ def complete_paper_canary_raw() -> dict[str, Any]:
         "fallback_reason": "",
     }
     sizing_provenance = {
-        "source": "paper_bootstrap_canary_independent_risk_budget",
-        "observation_window": "current_okx_demo_account_market_and_canary_runtime_guard",
+        "source": "paper_normal_strategy_independent_risk_budget",
+        "observation_window": "current_okx_demo_account_market_and_normal_risk_guard",
         "sample_count": 1200,
         "generated_at": "2026-07-17T08:01:00+00:00",
         "strategy_version": PAPER_BOOTSTRAP_SIZING_VERSION,
@@ -33,15 +33,20 @@ def complete_paper_canary_raw() -> dict[str, Any]:
             "requested": True,
             "execution_scope": "paper_only",
             "production_permission": False,
+            "purpose": "execute_normal_paper_strategy_and_learn_after_settlement",
+            "trade_kind": "normal_strategy_trade",
+            "position_exit_policy": "dynamic_strategy_risk_and_position_review",
+            "continuous_training_after_settlement": True,
             "selected_side": "long",
             "selected_observation": {
                 "side": "long",
-                "raw_expected_return_pct": -0.12,
-                "objective_expected_return_pct": -0.32,
-                "lower_quantile_return_pct": -0.42,
+                "raw_expected_return_pct": 0.35,
+                "objective_expected_return_pct": 0.15,
+                "lower_quantile_return_pct": 0.05,
                 "dispersion_pct": 0.1,
                 "current_execution_cost_pct": 0.08,
-                "observed_net_return_pct": -0.2,
+                "observed_net_return_pct": 0.27,
+                "lower_quantile_net_return_pct": -0.03,
                 "horizon_minutes": 10,
                 "distribution_member_count": 128,
                 "source_authority": "extra_trees_empirical_distribution",
@@ -83,7 +88,7 @@ def complete_paper_canary_raw() -> dict[str, Any]:
             "final_margin_usdt": 50.0,
             "position_size_pct": 0.1,
             "portfolio_risk_snapshot": {
-                "scope": "paper_bootstrap_canary_positions_only",
+                "scope": "paper_account_positions",
                 "current_stressed_loss_usdt": 0.0,
             },
             "entry_instrument_availability": {"available": True},
