@@ -545,7 +545,6 @@ def test_phase11_dashboard_exposes_profit_evidence_without_zero_fallbacks() -> N
     assert 'status["phase3_new_shadow_sample_count"] = None' in (
         ROOT / "web_dashboard/api/dashboard.py"
     ).read_text(encoding="utf-8")
-    assert "不能把缺失显示为 0" in SCRIPT
     assert "readinessDistributionAvailable" in SCRIPT
     assert "dirtySampleRatioLabel" in SCRIPT
     assert "splitEvidenceAvailable ? 'good' : 'warn'" in SCRIPT
@@ -554,7 +553,6 @@ def test_phase11_dashboard_exposes_profit_evidence_without_zero_fallbacks() -> N
     assert "authoritativePnl ?? fallbackPnl" not in SCRIPT
     assert "? mlOptionalNumber(authoritative.realized_pnl) : null;" in SCRIPT
     assert "positionProtectionInventoryWarnings(inventory)" in SCRIPT
-    assert "精确分片覆盖" in SCRIPT
     assert "multiple_active_okx_protection_orders" not in SCRIPT
     open_positions_block = SCRIPT[
         SCRIPT.index("function renderOpenPositionsTable") : SCRIPT.index(
@@ -563,7 +561,8 @@ def test_phase11_dashboard_exposes_profit_evidence_without_zero_fallbacks() -> N
     ]
     assert "positions.map((p, positionIndex) =>" in open_positions_block
     assert 'data-position-index="${positionIndex}"' in open_positions_block
-    assert 'id="positions-protection-status"' in HTML
+    assert 'id="positions-protection-status"' not in HTML
+    assert "renderPositionProtectionInventory" not in SCRIPT
     assert 'id="trade-reflection-authority"' in HTML
     assert "风险 / OCO / 操作" in HTML
 
@@ -573,11 +572,11 @@ def test_phase11_profit_evidence_layout_is_responsive_and_wrap_safe() -> None:
         ".ml-evidence-grid",
         ".ml-prediction-contract",
         ".position-evidence-grid",
-        ".positions-protection-status",
         ".trade-reflection-authority",
         ".trade-outcome-cell",
     ):
         assert selector in STYLE
+    assert ".positions-protection-status" not in STYLE
     assert "overflow-wrap: anywhere" in STYLE
     mobile = STYLE[STYLE.rindex("@media (max-width: 800px)") :]
     assert ".ml-evidence-grid" in mobile

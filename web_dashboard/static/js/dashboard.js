@@ -8185,7 +8185,6 @@ async function fetchPositions() {
     state.positionsTotal = data.total || 0;
     state.openPositions = data.positions || [];
     state.protectionInventory = data.protection_inventory || null;
-    renderPositionProtectionInventory();
     renderOpenPositionsTable(data.positions || [], state.positionsPage, data.total_pages || 1, data.total || 0);
     const badge = document.getElementById('position-badge');
     if (badge) {
@@ -8208,27 +8207,6 @@ function positionProtectionInventoryWarnings(inventory) {
         ...(invalidCount !== null && invalidCount > 0 ? [`无效保护单 ${invalidCount} 张`] : []),
         ...repairBlockers.map(item => `修复阻断：${dashboardReasonText(item)}`),
     ])];
-}
-
-function renderPositionProtectionInventory() {
-    const container = document.getElementById('positions-protection-status');
-    if (!container) return;
-    const inventory = state.protectionInventory || {};
-    if (inventory.available !== true) {
-        const blockers = Array.isArray(inventory.blockers) ? inventory.blockers : [];
-        container.className = 'positions-protection-status blocked';
-        container.innerHTML = `<strong>OKX OCO 证据不可用</strong><span>${blockers.length ? blockers.map(item => escHtml(dashboardReasonText(item))).join(' / ') : '保护快照尚未返回；不能把缺失显示为 0。'}</span>`;
-        return;
-    }
-    const warnings = positionProtectionInventoryWarnings(inventory);
-    const splitCoverage = Array.isArray(inventory.split_coverage_keys)
-        ? inventory.split_coverage_keys : [];
-    container.className = `positions-protection-status ${warnings.length ? 'warn' : 'ready'}`;
-    container.innerHTML = `
-        <strong>OKX OCO：持仓 ${mlSampleCountLabel(mlOptionalNumber(inventory.position_count))} · 保护单 ${mlSampleCountLabel(mlOptionalNumber(inventory.protection_order_count))}</strong>
-        <span>${warnings.length ? warnings.map(item => escHtml(item)).join(' / ') : '数量覆盖检查通过，未发现缺失、孤儿、无效或重复覆盖。'}</span>
-        ${splitCoverage.length ? `<span>精确分片覆盖：${splitCoverage.map(key => escHtml(Array.isArray(key) ? key.join(' ') : key)).join(' / ')}</span>` : ''}
-        <em>${escHtml(inventory.contract_version || '合同版本缺失')} · ${escHtml(inventory.inventory_fingerprint || '指纹缺失')}</em>`;
 }
 
 async function fetchPositionHistory() {
