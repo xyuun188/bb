@@ -13,8 +13,21 @@ from services.strategy_learning import (
     StrategyFeedback,
     StrategyLearningEngine,
     _json_safe,
+    _regime_label,
     _runtime_prior_usage,
 )
+
+
+def test_strategy_samples_use_feature_based_market_regime() -> None:
+    assert _regime_label(
+        {
+            "market_regime": {"mode": "return_distribution_observation"},
+            "adx_14": 30.0,
+            "returns_20": 0.005,
+            "price_vs_sma20": 0.004,
+            "price_vs_sma50": 0.002,
+        }
+    ) == "trend_up"
 
 
 def test_strategy_learning_json_payload_replaces_nested_non_finite_values() -> None:

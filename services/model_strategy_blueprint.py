@@ -160,9 +160,25 @@ def build_model_strategy_blueprint(
             "model_fit_rows_can_promote": False,
             "candidate_development_and_exam_must_be_disjoint": True,
             "cost_complete_shadow_required": True,
+            "replay_available_without_model_promotion": True,
             "live_execution_permission": False,
         },
     }
+
+
+def paper_strategy_replay_available(blueprint: dict[str, Any] | None) -> bool:
+    """Allow paper evaluation of a complete artifact without granting execution."""
+
+    strategy = _safe_dict(blueprint)
+    evidence = _safe_dict(strategy.get("training_evidence"))
+    return bool(
+        strategy.get("execution_scope") == "paper_only"
+        and strategy.get("live_execution_permission") is False
+        and str(strategy.get("model_version") or "")
+        and _safe_list(strategy.get("eligible_sides"))
+        and str(strategy.get("trained_at") or "")
+        and int(evidence.get("holdout_sample_count") or 0) > 0
+    )
 
 
 def _normalize_symbol(value: Any) -> str:

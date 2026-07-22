@@ -25,6 +25,12 @@ from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     load_authoritative_trade_outcomes,
 )
+from services.continuous_model_weight import market_regime_name
+from services.continuous_strategy_routing import (
+    ContinuousStrategyRoutingPolicy,
+    ContinuousStrategyRoutingStore,
+)
+from services.model_strategy_blueprint import paper_strategy_replay_available
 from services.paper_strategy_champion import PaperStrategyChampionService
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_backtest_service import shadow_fee_after_outcome
@@ -115,18 +121,8 @@ def _timestamp_text(value: Any) -> str:
 
 
 def _regime_label(value: Any) -> str:
-    if isinstance(value, str):
-        return value.strip().lower()
-    source = _safe_dict(value)
-    for key in ("mode", "regime", "market_regime", "state", "label"):
-        nested = source.get(key)
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip().lower()
-        if isinstance(nested, dict):
-            label = _regime_label(nested)
-            if label:
-                return label
-    return ""
+    label = market_regime_name(value)
+    return "" if label == "unknown" else label
 
 
 def _shadow_cost_evidence(
@@ -189,7 +185,7 @@ def _historical_replay_observation(row: Any) -> tuple[dict[str, Any] | None, lis
         "source_id": _safe_int(getattr(row, "id", None)),
         "decision_id": _safe_int(getattr(row, "decision_id", None)) or None,
         "symbol": str(getattr(row, "symbol", "") or "").upper(),
-        "market_regime": _regime_label(snapshot.get("market_regime")),
+        "market_regime": _regime_label(snapshot),
         "horizon_minutes": _safe_int(getattr(row, "horizon_minutes", None), 10),
         "created_at": _timestamp_text(created_at),
         "completed_at": _timestamp_text(getattr(row, "updated_at", None)),
@@ -622,6 +618,13 @@ class StrategyCandidateGenerator:
         for profile_id, (selector, samples) in sorted(partitions.items()):
             metrics = _return_metrics(samples)
             version = max(_safe_int(sample.get("source_row_id")) for sample in samples)
+            horizons = sorted(
+                {
+                    horizon
+                    for sample in samples
+                    if (horizon := _safe_int(sample.get("horizon_minutes"))) > 0
+                }
+            )
             provenance = {
                 "source": evidence_source,
                 "evidence_mode": evidence_mode,
@@ -652,6 +655,9 @@ class StrategyCandidateGenerator:
                     ),
                     params={
                         "selector": selector,
+                        "prediction_horizon_minutes": (
+                            horizons[0] if len(horizons) == 1 else None
+                        ),
                         "objective": "maximize_authoritative_fee_after_return_rate",
                         "historical_return_distribution": metrics,
                         "current_return_contract_required": True,
@@ -785,8 +791,14 @@ def _candidate_rank_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
 
 
 class StrategyLearningEngine:
-    def __init__(self, generator: StrategyCandidateGenerator | None = None, **_: Any) -> None:
+    def __init__(
+        self,
+        generator: StrategyCandidateGenerator | None = None,
+        routing_policy: ContinuousStrategyRoutingPolicy | None = None,
+        **_: Any,
+    ) -> None:
         self.generator = generator or StrategyCandidateGenerator()
+        self.routing_policy = routing_policy or ContinuousStrategyRoutingPolicy()
 
     def build_from_feedback(
         self,
@@ -796,17 +808,14 @@ class StrategyLearningEngine:
         detail: str = "summary",
         model_strategy_blueprint: dict[str, Any] | None = None,
         model_predictor: ModelPredictor | None = None,
+        update_strategy_state: bool = True,
     ) -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
         backtest_rows: list[dict[str, Any]] = []
         shadow_rows: list[dict[str, Any]] = []
         include_evidence_rows = detail == "full"
         blueprint = _safe_dict(model_strategy_blueprint)
-        model_replay_required = bool(
-            blueprint.get("paper_execution_eligible") is True
-            and blueprint.get("execution_scope") == "paper_only"
-            and blueprint.get("live_execution_permission") is False
-        )
+        model_replay_required = paper_strategy_replay_available(blueprint)
         replay = build_strategy_historical_replay(
             blueprint=blueprint,
             observations=feedback.shadow_replay_observations,
@@ -918,11 +927,25 @@ class StrategyLearningEngine:
         ]
         context = _safe_dict(current_context)
         current_regime = _regime_label(context.get("market_regime"))
+        continuous_routing = self.routing_policy.build(
+            execution_mode=feedback.mode,
+            market_regime=_safe_dict(context.get("market_regime")),
+            candidates=candidates,
+            update_state=update_strategy_state,
+        )
+        routed_side = str(
+            _safe_dict(continuous_routing.get("current_route")).get(
+                "recommended_side"
+            )
+            or ""
+        ).lower()
         leading = (candidates or [None])[0]
         influence_enabled = bool(governed)
         scheduler_mode = (
             "governed_dynamic_return"
             if influence_enabled
+            else "continuous_paper_strategy_routing"
+            if routed_side in {"long", "short"}
             else "model_replay_no_fee_after_entries"
             if model_replay_required
             and replay.get("status") == "complete"
@@ -940,6 +963,8 @@ class StrategyLearningEngine:
             else "Governed fee-after return candidates are available as matching historical priors; "
             "the current live return and dynamic risk contracts still own execution."
             if influence_enabled
+            else "Validated strategies remain continuously weighted for paper training; current return and risk contracts still own normal entries."
+            if routed_side in {"long", "short"}
             else "Exact trained-model historical replay found no fee-after-positive entries; no model strategy candidate was created."
             if model_replay_required
             and replay.get("status") == "complete"
@@ -983,6 +1008,7 @@ class StrategyLearningEngine:
                 "drawdown_pressure": context.get("drawdown_pressure"),
                 "position_exposure": context.get("position_exposure"),
             },
+            "continuous_strategy_routing": continuous_routing,
             "policy_provenance": {
                 "source": (
                     "exact_model_historical_replay_scheduler"
@@ -1021,6 +1047,7 @@ class StrategyLearningEngine:
                 for key, value in replay.items()
                 if key not in {"development_samples", "exam_samples"}
             },
+            "continuous_strategy_routing": continuous_routing,
             "scheduler_mode": scheduler_mode,
             "current_production_strategy": production_strategy,
         }
@@ -1060,8 +1087,14 @@ class StrategyLearningEngine:
                 schedule.get("current_production_strategy")
             ),
             "paper_strategy_champion": champion,
+            "continuous_strategy_routing": _safe_dict(
+                schedule.get("continuous_strategy_routing")
+            ),
         }
         result["paper_strategy_champion"] = champion
+        result["continuous_strategy_routing"] = _safe_dict(
+            schedule.get("continuous_strategy_routing")
+        )
         return result
 
 
@@ -1072,11 +1105,13 @@ class StrategyLearningService:
         engine: StrategyLearningEngine | None = None,
         champion_service: PaperStrategyChampionService | None = None,
         replay_model_service: Any | None = None,
+        routing_store: ContinuousStrategyRoutingStore | None = None,
         **_: Any,
     ) -> None:
         self.engine = engine or StrategyLearningEngine()
         self.champion_service = champion_service or PaperStrategyChampionService()
         self._replay_model_service = replay_model_service
+        self.routing_store = routing_store or ContinuousStrategyRoutingStore()
 
     def _default_model_replay_context(
         self,
@@ -1113,7 +1148,7 @@ class StrategyLearningService:
             hours=hours,
             limit=limit,
             include_historical_replay=bool(
-                blueprint.get("paper_execution_eligible") is True
+                paper_strategy_replay_available(blueprint)
                 and predictor is not None
             ),
         )
@@ -1123,6 +1158,7 @@ class StrategyLearningService:
             detail=detail,
             model_strategy_blueprint=blueprint,
             model_predictor=predictor,
+            update_strategy_state=False,
         )
         champion = await self.champion_service.current(mode)
         payload.update(
@@ -1153,10 +1189,9 @@ class StrategyLearningService:
             hours=hours,
             limit=limit,
             include_historical_replay=bool(
-                _safe_dict(model_strategy_blueprint).get(
-                    "paper_execution_eligible"
+                paper_strategy_replay_available(
+                    _safe_dict(model_strategy_blueprint)
                 )
-                is True
                 and model_predictor is not None
             ),
         )
@@ -1170,6 +1205,21 @@ class StrategyLearningService:
             model_strategy_blueprint=model_strategy_blueprint,
             model_predictor=model_predictor,
         )
+        schedule = _safe_dict(payload.get("schedule"))
+        routing = _safe_dict(schedule.get("continuous_strategy_routing"))
+        if routing.get("applied") is True:
+            async with get_session_ctx() as session:
+                routing["persistence"] = await self.routing_store.persist(
+                    mode=mode,
+                    candidates=list(schedule.get("candidates") or []),
+                    routing=routing,
+                    session=session,
+                )
+            schedule["continuous_strategy_routing"] = routing
+            runtime = _safe_dict(schedule.get("runtime"))
+            runtime["continuous_strategy_routing"] = routing
+            schedule["runtime"] = runtime
+            payload["schedule"] = schedule
         champion = await self.champion_service.reconcile(
             mode=mode,
             blueprint=model_strategy_blueprint,
@@ -1423,7 +1473,7 @@ class StrategyLearningService:
                         "source_id": _safe_int(getattr(row, "id", None)),
                         "symbol": str(getattr(row, "symbol", "") or "").upper(),
                         "side": side,
-                        "market_regime": _regime_label(snapshot.get("market_regime")),
+                        "market_regime": _regime_label(snapshot),
                         "net_return_after_cost_pct": (
                             round(net_return, 8) if net_return is not None else None
                         ),

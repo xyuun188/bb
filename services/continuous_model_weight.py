@@ -297,23 +297,45 @@ def _combined_multiplier(
     }
 
 
-def _regime_name(market_regime: dict[str, Any]) -> str:
-    for key in ("regime", "state", "label", "name"):
-        value = str(market_regime.get(key) or "").strip().lower()
-        if value:
-            return value
+_NON_REGIME_LABELS = {
+    "return_distribution_observation",
+    "observation_unavailable",
+    "unknown",
+}
+
+
+def market_regime_name(value: Any) -> str:
+    """Return one shared market-state label from cross-section or sample features."""
+
+    if isinstance(value, str):
+        label = value.strip().lower()
+        return "unknown" if not label or label in _NON_REGIME_LABELS else label
+    market_regime = _dict(value)
+    for key in ("regime", "state", "label", "name", "market_regime"):
+        nested = market_regime.get(key)
+        if isinstance(nested, dict):
+            label = market_regime_name(nested)
+        else:
+            label = str(nested or "").strip().lower()
+        if label and label not in _NON_REGIME_LABELS:
+            return label
     mode = str(market_regime.get("mode") or "").strip().lower()
-    if mode and mode not in {
-        "return_distribution_observation",
-        "observation_unavailable",
-    }:
+    if mode and mode not in _NON_REGIME_LABELS:
         return mode
     adx = _finite(market_regime.get("avg_adx_14"))
-    directional_inputs = [
-        value
-        for key in ("avg_returns_20", "avg_price_vs_sma20", "avg_price_vs_sma50")
-        if (value := _finite(market_regime.get(key))) is not None
-    ]
+    if adx is None:
+        adx = _finite(market_regime.get("adx_14"))
+    directional_inputs = []
+    for aggregate_key, sample_key in (
+        ("avg_returns_20", "returns_20"),
+        ("avg_price_vs_sma20", "price_vs_sma20"),
+        ("avg_price_vs_sma50", "price_vs_sma50"),
+    ):
+        directional = _finite(market_regime.get(aggregate_key))
+        if directional is None:
+            directional = _finite(market_regime.get(sample_key))
+        if directional is not None:
+            directional_inputs.append(directional)
     if adx is None or not directional_inputs:
         return "unknown"
     direction_score = sum(directional_inputs) / len(directional_inputs)
@@ -331,8 +353,7 @@ def continuous_model_weight_scenario(
     market_regime: dict[str, Any] | None,
 ) -> str:
     mode = "live" if str(execution_mode or "").lower() == "live" else "paper"
-    return f"{mode}:{_regime_name(_dict(market_regime))}"
-    return "unknown"
+    return f"{mode}:{market_regime_name(market_regime)}"
 
 
 class ContinuousModelWeightPolicy:

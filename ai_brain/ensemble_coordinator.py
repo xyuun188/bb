@@ -1299,6 +1299,31 @@ class EnsembleCoordinator:
             side: self._finite_or_none(row.get("horizon_minutes"))
             for side, row in training_rows.items()
         }
+        strategy_context = self._safe_dict(context.get("strategy_mode"))
+        strategy_routing = self._safe_dict(
+            context.get("continuous_strategy_routing")
+            or strategy_context.get("continuous_strategy_routing")
+        )
+        current_strategy_route = self._safe_dict(
+            strategy_routing.get("current_route")
+        )
+        routed_strategy = self._safe_dict(
+            current_strategy_route.get("primary")
+            or current_strategy_route.get("training_primary")
+        )
+        strategy_side = str(
+            current_strategy_route.get("recommended_side") or ""
+        ).lower()
+        strategy_strength = min(
+            max(
+                self._safe_float(
+                    routed_strategy.get("normalized_current_regime_weight"),
+                    0.0,
+                ),
+                0.0,
+            ),
+            0.5 if current_strategy_route.get("primary") else 0.25,
+        )
         if all(
             training_scores[side] is not None
             and training_horizons[side] is not None
@@ -1311,7 +1336,14 @@ class EnsembleCoordinator:
             quant_scale = max(abs(long_score) + abs(short_score), 1e-12)
             quant_signal = max(min(quant_gap / quant_scale, 1.0), -1.0)
             expert_signal = max(min(float(normalized_score), 1.0), -1.0)
-            combined_signal = quant_signal + expert_signal
+            strategy_signal = (
+                strategy_strength
+                if strategy_side == "long"
+                else -strategy_strength
+                if strategy_side == "short"
+                else 0.0
+            )
+            combined_signal = quant_signal + expert_signal + strategy_signal
             if abs(combined_signal) <= 1e-12:
                 combined_side = observed_side
             else:
@@ -1769,6 +1801,16 @@ class EnsembleCoordinator:
             raw["continuous_model_weights"] = weights
             if isinstance(allocations, dict):
                 raw["continuous_expert_weight_allocations"] = allocations
+        strategy = context.get("strategy_mode")
+        routing = context.get("continuous_strategy_routing")
+        if not isinstance(routing, dict) and isinstance(strategy, dict):
+            routing = strategy.get("continuous_strategy_routing")
+        if (
+            str(context.get("execution_mode") or "").lower() == "paper"
+            and isinstance(routing, dict)
+            and routing.get("applied") is True
+        ):
+            raw["continuous_strategy_routing"] = routing
 
     def _latency_summary(
         self,

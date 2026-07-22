@@ -11,6 +11,8 @@ from math import isfinite
 from threading import Lock
 from typing import Any
 
+from services.model_strategy_blueprint import paper_strategy_replay_available
+
 STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-07-21.model-selected-shadow-replay.v1"
 
 ModelPredictor = Callable[..., dict[str, Any]]
@@ -343,10 +345,6 @@ def _replay_entry(
         return None, "model_replay_fee_after_values_incomplete"
     expected_after_cost = float(expected) - float(execution_cost) + float(funding_return)
     lower_after_cost = float(lower) - float(execution_cost) + float(funding_return)
-    if expected_after_cost <= 0:
-        return None, "model_replay_expected_return_not_positive_after_cost"
-    if lower_after_cost <= 0:
-        return None, "model_replay_return_lcb_not_positive_after_cost"
     return (
         {
             "source": "trained_model_historical_shadow_replay",
@@ -363,6 +361,10 @@ def _replay_entry(
             "funding_return_pct": round(float(funding_return), 8),
             "model_expected_return_after_cost_pct": round(expected_after_cost, 8),
             "model_return_lcb_after_cost_pct": round(lower_after_cost, 8),
+            "paper_continuous_evaluation": True,
+            "normal_entry_return_gate_passed": bool(
+                expected_after_cost > 0.0 and lower_after_cost > 0.0
+            ),
             "timestamp": _timestamp_text(
                 observation.get("label_timestamp") or observation.get("timestamp")
             ),
@@ -544,11 +546,7 @@ def build_strategy_historical_replay(
         "excluded_reason_counts": {},
         "can_authorize_live": False,
     }
-    if (
-        strategy.get("paper_execution_eligible") is not True
-        or strategy.get("execution_scope") != "paper_only"
-        or strategy.get("live_execution_permission") is not False
-    ):
+    if not paper_strategy_replay_available(strategy):
         return {**base, "status": "trained_paper_strategy_unavailable"}
     if predictor is None:
         return {**base, "status": "model_replay_predictor_unavailable"}

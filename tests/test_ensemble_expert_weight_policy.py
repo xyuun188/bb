@@ -503,3 +503,64 @@ def test_paper_bootstrap_combines_weighted_quant_and_expert_direction() -> None:
     assert decision.raw_response["paper_training"]["signal_source"] == (
         "continuous_weighted_quant_and_expert_observations"
     )
+
+
+def test_continuous_strategy_route_influences_bootstrap_and_is_persisted() -> None:
+    context = _return_context(
+        execution_mode="paper",
+        paper_training_mode="bootstrap",
+        paper_strategy_champion={"active": False, "paper_execution_permission": False},
+        strategy_mode={
+            "continuous_strategy_routing": {
+                "applied": True,
+                "execution_scope": "paper_only",
+                "current_route": {
+                    "recommended_side": "long",
+                    "primary": {
+                        "profile_id": "trend_up_long",
+                        "side": "long",
+                        "normalized_current_regime_weight": 1.0,
+                    },
+                },
+                "order_creation_permission": False,
+                "risk_override_permission": False,
+            }
+        },
+        direction_competition={
+            "preferred_side": "neutral",
+            "training_preferred_side": "short",
+            "training_long": {
+                "score": 0.1,
+                "raw_expected_return_pct": 0.1,
+                "objective_expected_return_pct": 0.1,
+                "horizon_minutes": 10,
+                "observation_count": 2,
+            },
+            "training_short": {
+                "score": 0.2,
+                "raw_expected_return_pct": 0.2,
+                "objective_expected_return_pct": 0.2,
+                "horizon_minutes": 10,
+                "observation_count": 2,
+            },
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+    hold_opinions = {
+        name: _decision(name, Action.HOLD, confidence=0.5)
+        for name in (
+            "trend_expert",
+            "momentum_expert",
+            "sentiment_expert",
+            "position_expert",
+            "risk_expert",
+        )
+    }
+
+    decision = _coordinator().combine(_features(), context, hold_opinions)
+
+    assert decision.action == Action.LONG
+    assert decision.raw_response["continuous_strategy_routing"]["current_route"][
+        "primary"
+    ]["profile_id"] == "trend_up_long"

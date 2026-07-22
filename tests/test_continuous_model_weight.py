@@ -8,6 +8,7 @@ from services.continuous_model_weight import (
     COLD_START_MULTIPLIER,
     ContinuousModelWeightEvidenceService,
     ContinuousModelWeightPolicy,
+    market_regime_name,
 )
 
 
@@ -199,6 +200,18 @@ def test_cross_section_metrics_produce_recomputable_market_regime() -> None:
 
     assert trend["scenario"] == "paper:trend_up"
     assert ranging["scenario"] == "paper:range_bound"
+
+
+def test_individual_sample_metrics_replace_observation_placeholder() -> None:
+    assert market_regime_name(
+        {
+            "market_regime": {"mode": "return_distribution_observation"},
+            "adx_14": 32.0,
+            "returns_20": -0.007,
+            "price_vs_sma20": -0.004,
+            "price_vs_sma50": -0.003,
+        }
+    ) == "trend_down"
 
 
 def test_live_mode_always_keeps_original_weights() -> None:

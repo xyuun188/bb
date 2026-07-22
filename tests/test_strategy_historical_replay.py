@@ -193,7 +193,7 @@ def test_replay_uses_model_selected_side_instead_of_scoring_both_directions() ->
     assert report["excluded_reason_counts"]["model_replay_side_not_governed"] == 5
 
 
-def test_replay_rejects_prediction_that_is_not_profitable_after_captured_cost() -> None:
+def test_replay_keeps_unprofitable_prediction_for_continuous_paper_evaluation() -> None:
     observations = _observations()
     for row in observations:
         row["execution_cost_pct"] = 1.0
@@ -204,13 +204,30 @@ def test_replay_rejects_prediction_that_is_not_profitable_after_captured_cost() 
         predictor=_predictor,
     )
 
-    assert report["selected_entry_count"] == 0
-    assert (
-        report["excluded_reason_counts"][
-            "model_replay_return_lcb_not_positive_after_cost"
+    assert report["selected_entry_count"] == 5
+    assert all(
+        row["paper_continuous_evaluation"] is True
+        and row["normal_entry_return_gate_passed"] is False
+        for row in [
+            *report["development_samples"],
+            *report["exam_samples"],
         ]
-        == 5
     )
+
+
+def test_replay_does_not_wait_for_model_promotion() -> None:
+    blueprint = _blueprint()
+    blueprint["paper_execution_eligible"] = False
+
+    report = build_strategy_historical_replay(
+        blueprint=blueprint,
+        observations=_observations(),
+        predictor=_predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert report["selected_entry_count"] == 5
+    assert report["can_authorize_live"] is False
 
 
 def test_replay_fails_closed_when_artifact_holdout_cannot_be_reconstructed() -> None:
