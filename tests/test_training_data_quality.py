@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from core.market_facts import MARKET_FACT_CONTRACT_VERSION
 from core.training_contracts import (
     SHADOW_LABEL_VERSION,
@@ -389,6 +391,33 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     assert "local_ai_tools" in governance["refresh_targets"]
 
 
+def test_shadow_training_payload_exposes_fee_after_labels_not_only_gross_returns() -> None:
+    payload = annotate_training_payload(
+        shadow_samples=[
+            _shadow_sample(
+                long_return_pct=0.05,
+                short_return_pct=-0.05,
+                best_action="hold",
+            )
+        ],
+        trade_samples=[],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    sample = payload["shadow_samples"][0]
+    assert sample["gross_long_return_pct"] == 0.05
+    assert sample["long_net_return_after_cost_pct"] < 0.0
+    assert sample["short_net_return_after_cost_pct"] < 0.0
+    assert sample["best_action_after_cost"] == "hold"
+    assert sample["fee_after_label_complete"] is True
+    contract_label = sample["training_sample_contract"]["label"]
+    assert contract_label["long_net_return_after_cost_pct"] == sample[
+        "long_net_return_after_cost_pct"
+    ]
+    assert "long_return_pct" not in contract_label
+
+
 def test_training_payload_enriches_trade_profit_learning_labels() -> None:
     payload = annotate_training_payload(
         shadow_samples=[],
@@ -549,6 +578,9 @@ def test_training_payload_reports_specialist_shadow_model_quality() -> None:
                     "symbol": "BTC/USDT",
                     "current_price": 100.0,
                     "spread_pct": 0.03,
+                    "round_trip_fee_pct": 0.08,
+                    "funding_rate": 0.0,
+                    "funding_interval_minutes": 480.0,
                     "local_ai_tools_shadow": {
                         "time_series_prediction": {
                             "timesfm_shadow_side": "long",
@@ -599,8 +631,10 @@ def test_training_payload_reports_specialist_shadow_model_quality() -> None:
     assert chronos["direction_hit_count"] == 1
     assert chronos["direction_hit_rate"] == 1.0
     assert chronos["avg_shadow_expected_return_pct"] == 0.21
-    assert chronos["avg_realized_return_pct"] == 0.42
-    assert chronos["return_lower_hinge_pct"] == 0.42
+    assert chronos["avg_realized_return_pct"] < 0.42
+    assert chronos["return_lower_hinge_pct"] == pytest.approx(
+        chronos["avg_realized_return_pct"]
+    )
     assert chronos["observation_policy"]["promotion_authority"] is False
     assert timesfm["tool"] == "time_series_prediction"
     assert timesfm["model"] == "timesfm-2.5-shadow-challenger"
@@ -610,8 +644,10 @@ def test_training_payload_reports_specialist_shadow_model_quality() -> None:
     assert timesfm["direction_hit_count"] == 1
     assert timesfm["direction_hit_rate"] == 1.0
     assert timesfm["avg_shadow_expected_return_pct"] == 0.42
-    assert timesfm["avg_realized_return_pct"] == 0.42
-    assert timesfm["return_lower_hinge_pct"] == 0.42
+    assert timesfm["avg_realized_return_pct"] < 0.42
+    assert timesfm["return_lower_hinge_pct"] == pytest.approx(
+        timesfm["avg_realized_return_pct"]
+    )
     assert sentiment["direction_hit_count"] == 0
 
 
@@ -627,6 +663,9 @@ def test_training_payload_reports_specialist_tail_loss_quality() -> None:
                     "symbol": "ACT/USDT",
                     "current_price": 100.0,
                     "spread_pct": 0.03,
+                    "round_trip_fee_pct": 0.08,
+                    "funding_rate": 0.0,
+                    "funding_interval_minutes": 480.0,
                     "local_ai_tools_shadow": {
                         "time_series_prediction": {
                             "specialist_inference_active": True,
@@ -659,9 +698,9 @@ def test_training_payload_reports_specialist_tail_loss_quality() -> None:
     assert model["direction_count"] == 34
     assert model["direction_hit_rate"] == 0.0
     assert model["false_signal_count"] == 34
-    assert model["avg_realized_return_pct"] == -0.25
-    assert model["worst_realized_return_pct"] == -0.25
-    assert model["return_lower_hinge_pct"] == -0.25
+    assert model["avg_realized_return_pct"] < -0.25
+    assert model["worst_realized_return_pct"] == model["avg_realized_return_pct"]
+    assert model["return_lower_hinge_pct"] == model["avg_realized_return_pct"]
     assert model["return_distribution_provenance"]["sample_count"] == 34
     assert model["worst_samples"][0]["predicted_side"] == "long"
     assert model["worst_samples"][0]["actual_best_side"] == "short"

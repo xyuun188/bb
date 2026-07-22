@@ -17,7 +17,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from core.symbols import normalize_trading_symbol
-from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
+from core.training_contracts import (
+    AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
+    SHADOW_FEE_AFTER_LABEL_VERSION,
+)
 from services.execution_cost_model import execution_cost_estimate
 
 PROFIT_SUPERVISION_VERSION = "2026-07-14.separated-profit-supervision.v1"
@@ -156,6 +159,44 @@ def _shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def shadow_fee_after_return_labels(sample: dict[str, Any]) -> dict[str, Any]:
+    """Build the only two-sided shadow labels allowed to supervise net returns."""
+
+    long_gross = _safe_float(sample.get("long_return_pct"))
+    short_gross = _safe_float(sample.get("short_return_pct"))
+    costs = _shadow_cost_labels(sample)
+    long_cost = _safe_float(costs.get("long_total_cost_pct"))
+    short_cost = _safe_float(costs.get("short_total_cost_pct"))
+    complete = bool(
+        costs.get("eligible") is True
+        and long_gross is not None
+        and short_gross is not None
+        and long_cost is not None
+        and short_cost is not None
+    )
+    long_net = long_gross - long_cost if complete else None
+    short_net = short_gross - short_cost if complete else None
+    best_action = "hold"
+    if complete and long_net is not None and short_net is not None:
+        if long_net > 0.0 and long_net >= short_net:
+            best_action = "long"
+        elif short_net > 0.0 and short_net > long_net:
+            best_action = "short"
+    return {
+        "version": SHADOW_FEE_AFTER_LABEL_VERSION,
+        "complete": complete,
+        "source_authority": "shadow_native_market_path_plus_locked_cost_evidence",
+        "long_gross_return_pct": long_gross,
+        "short_gross_return_pct": short_gross,
+        "long_total_cost_pct": long_cost,
+        "short_total_cost_pct": short_cost,
+        "long_net_return_after_cost_pct": long_net,
+        "short_net_return_after_cost_pct": short_net,
+        "best_action_after_cost": best_action,
+        "reason": "" if complete else "fee_after_shadow_label_incomplete",
+    }
+
+
 def _trade_cost_labels(
     labels: dict[str, Any],
     sample: dict[str, Any],
@@ -202,6 +243,7 @@ def build_profit_supervision_contract(
     decision_id = _safe_int(sample.get("decision_id")) or None
     horizon = _safe_int(sample.get("horizon_minutes")) or None
     labels = _safe_dict(sample.get("profit_learning_labels"))
+    fee_after_labels: dict[str, Any] = {}
 
     if kind == "shadow":
         long_return = _safe_float(sample.get("long_return_pct"))
@@ -224,6 +266,12 @@ def build_profit_supervision_contract(
         }
         cost_task = _shadow_cost_labels(sample)
         cost_task["eligible"] = bool(quality_eligible and cost_task.get("eligible"))
+        fee_after_labels = shadow_fee_after_return_labels(sample)
+        fee_after_labels["complete"] = bool(
+            quality_eligible and fee_after_labels.get("complete")
+        )
+        if not fee_after_labels["complete"] and not fee_after_labels.get("reason"):
+            fee_after_labels["reason"] = "training_quality_excluded"
         realized_task = {
             "eligible": False,
             "source_authority": "none",
@@ -303,6 +351,7 @@ def build_profit_supervision_contract(
         "sample_weight": weight,
         "correlation_weight": _safe_dict(sample.get("correlation_weight")),
         "tasks": tasks,
+        "fee_after_return_labels": fee_after_labels,
         "authority_invariant": {
             "shadow_realized_trade_weight": 0.0,
             "trade_market_counterfactual_weight": 0.0,

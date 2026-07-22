@@ -84,6 +84,7 @@ DEFAULT_MAX_ORDER_GAP_QUERIES = 20
 CORE_OKX_STAGE_TIMEOUT_SECONDS = 6.0
 TARGET_ORDER_PULL_TIMEOUT_SECONDS = 12.0
 ACCOUNT_HISTORY_MAX_TIMEOUT_SECONDS = 30.0
+ACCOUNT_HISTORY_MAX_PAGES = 10
 CURRENT_POSITION_ENTRY_LINK_WINDOW_SECONDS = 10 * 60
 CURRENT_POSITION_ENTRY_PRICE_TOLERANCE_RATIO = 0.002
 CURRENT_POSITION_ENTRY_QUANTITY_TOLERANCE_RATIO = 0.02
@@ -598,7 +599,7 @@ class OkxOrderFactSyncService:
         account_bills: list[OkxNativeAccountBill] = []
         account_bill_error: str | None = None
         optional_stage_errors: list[str] = []
-        history_page_count = max(3, min(10, (self.limit // 100) + 2))
+        history_page_count = ACCOUNT_HISTORY_MAX_PAGES
         history_timeout_seconds = min(
             ACCOUNT_HISTORY_MAX_TIMEOUT_SECONDS,
             max(self.timeout_seconds, history_page_count * 3.0),
@@ -666,7 +667,7 @@ class OkxOrderFactSyncService:
                             order_ids=priority_target_order_ids,
                             since=since,
                             limit=100,
-                            max_pages=1,
+                            max_pages=history_page_count,
                             target_orders_only=True,
                             target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
                             strict=True,
@@ -848,7 +849,11 @@ class OkxOrderFactSyncService:
             algo_rows=protection_algo_rows,
         )
         async with get_session_ctx() as session:
-            writable_orders = await self._load_writable_refresh_orders(session, since_naive)
+            writable_orders = await self._load_writable_refresh_orders(
+                session,
+                since_naive,
+                authoritative_fill_order_ids=set(fills_by_order_id),
+            )
             if okx_pull_available:
                 # The native positions-history endpoint is optional and can
                 # be rate-limited.  Load the already verified local mirror
@@ -1236,7 +1241,14 @@ class OkxOrderFactSyncService:
         self,
         session: Any,
         since_naive: datetime,
+        *,
+        authoritative_fill_order_ids: set[str] | None = None,
     ) -> list[Order]:
+        fill_order_ids = {
+            str(order_id or "").strip()
+            for order_id in (authoritative_fill_order_ids or set())
+            if str(order_id or "").strip()
+        }
         linked_ids = await _load_open_position_entry_order_ids(session, mode=self.mode)
         rows = await session.execute(
             select(Order)
@@ -1257,10 +1269,23 @@ class OkxOrderFactSyncService:
                 )
             )
             linked = list(linked_rows.scalars().all())
+        matched_fills: list[Order] = []
+        if fill_order_ids:
+            matched_fill_rows = await session.execute(
+                select(Order).where(
+                    Order.execution_mode == self.mode,
+                    Order.exchange_order_id.in_(sorted(fill_order_ids)),
+                )
+            )
+            matched_fills = list(matched_fill_rows.scalars().all())
         return [
             order
-            for order in _merge_local_order_rows(recent, linked)
+            for order in _merge_local_order_rows(recent, linked, matched_fills)
             if _order_needs_okx_fact_refresh(order)
+            or bool(
+                _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+                & fill_order_ids
+            )
         ]
 
     async def _load_account_contract_size_repair_orders(
@@ -1475,6 +1500,13 @@ class OkxOrderFactSyncService:
                 fill,
                 contract_sizes,
             )
+            if _stored_order_matches_native_fill(
+                order,
+                fill,
+                contract_size=contract_size,
+                contract_size_source=contract_size_source,
+            ):
+                continue
             self._apply_fill_to_order(
                 order,
                 fill,
@@ -3944,6 +3976,76 @@ def _order_has_authoritative_stored_okx_fill_fact(order: Order) -> bool:
     return True
 
 
+def _stored_order_matches_native_fill(
+    order: Order,
+    fill: OkxNativeFillGroup,
+    *,
+    contract_size: float,
+    contract_size_source: str,
+) -> bool:
+    """Return whether the stored order already reflects the latest cumulative fill."""
+
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    expected_quantity = _fill_base_quantity(fill, contract_size)
+    if (
+        raw.get("fills_history_confirmed") is not True
+        or fill.order_id
+        not in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+        or str(raw.get("order_id") or "").strip() != fill.order_id
+        or str(raw.get("inst_id") or "").strip().upper()
+        != str(fill.inst_id or "").strip().upper()
+        or str(getattr(order, "side", "") or "").strip().lower()
+        != str(fill.side or "").strip().lower()
+        or expected_quantity <= 0
+        or not _relative_close_enough(
+            _safe_float(getattr(order, "quantity", None), 0.0),
+            expected_quantity,
+            0.001,
+        )
+        or not _relative_close_enough(
+            _safe_float(getattr(order, "okx_fill_contracts", None), 0.0),
+            float(fill.contracts),
+            0.001,
+        )
+        or not _relative_close_enough(
+            _safe_float(getattr(order, "price", None), 0.0),
+            float(fill.avg_price),
+            0.001,
+        )
+        or not _relative_close_enough(
+            _safe_float(getattr(order, "fee", None), 0.0),
+            float(fill.fee_abs),
+            0.001,
+        )
+        or not _relative_close_enough(
+            _safe_float(getattr(order, "okx_fill_pnl", None), 0.0),
+            float(fill.fill_pnl),
+            0.001,
+        )
+        or not _relative_close_enough(
+            _safe_float(raw.get("contract_size"), 0.0),
+            float(contract_size),
+            0.000001,
+        )
+        or not _relative_close_enough(
+            _stored_fill_base_quantity(raw),
+            expected_quantity,
+            0.001,
+        )
+        or str(raw.get("contract_size_source") or "").strip()
+        != str(contract_size_source or "").strip()
+    ):
+        return False
+    return _trade_id_set(raw.get("trade_ids")) == set(fill.trade_ids)
+
+
+def _trade_id_set(value: Any) -> set[str]:
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {str(item or "").strip() for item in value if str(item or "").strip()}
+    return _split_exchange_order_ids(value)
+
+
 def _stored_fill_contract_size_needs_public_reverification(order: Order) -> bool:
     raw = getattr(order, "okx_raw_fills", None)
     raw = raw if isinstance(raw, dict) else {}
@@ -5887,15 +5989,29 @@ def _matching_position_history_fills(
 
 
 def _dedupe_fills_by_order_id(fills: list[OkxNativeFillGroup]) -> list[OkxNativeFillGroup]:
-    result: list[OkxNativeFillGroup] = []
-    seen: set[str] = set()
-    for fill in sorted(fills, key=lambda item: item.timestamp or datetime.min.replace(tzinfo=UTC)):
+    by_order_id: dict[str, OkxNativeFillGroup] = {}
+    for fill in fills:
         order_id = str(fill.order_id or "").strip()
-        if not order_id or order_id in seen:
+        if not order_id:
             continue
-        seen.add(order_id)
-        result.append(fill)
-    return result
+        existing = by_order_id.get(order_id)
+        if existing is None or _fill_completeness_key(fill) > _fill_completeness_key(existing):
+            by_order_id[order_id] = fill
+    return sorted(
+        by_order_id.values(),
+        key=lambda item: item.timestamp or datetime.min.replace(tzinfo=UTC),
+    )
+
+
+def _fill_completeness_key(fill: OkxNativeFillGroup) -> tuple[float, int, int, float]:
+    """Prefer cumulative order facts over a truncated first-page result."""
+
+    return (
+        max(float(fill.contracts or 0.0), 0.0),
+        len(set(fill.trade_ids)),
+        max(int(fill.raw_count or 0), 0),
+        max(float(fill.timestamp_ms or 0.0), 0.0),
+    )
 
 
 def _ordered_exchange_ids(values: Any) -> list[str]:

@@ -119,6 +119,45 @@ def test_verified_order_contract_size_wins_over_stale_public_contract_size() -> 
     assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
 
+def test_account_verified_order_contract_size_does_not_require_fill_history_flag() -> None:
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=6200.0,
+        price=0.04122,
+        status="filled",
+        exchange_order_id="3765187269268054016",
+        okx_inst_id="ZAMA-USDT-SWAP",
+        okx_fill_contracts=62.0,
+        okx_raw_fills={
+            "order_id": "3765187269268054016",
+            "inst_id": "ZAMA-USDT-SWAP",
+            "contracts": 62.0,
+            "contract_size": 100.0,
+            "base_quantity": 6200.0,
+            "contract_size_verified": True,
+            "contract_size_source": (
+                "okx_account_position_history_pnl_fill_crosscheck"
+            ),
+            "fills_history_confirmed": False,
+        },
+    )
+
+    assert _local_order_verified_okx_raw_contract_size(order) == pytest.approx(100.0)
+
+    order.okx_raw_fills["contract_size_source"] = "okx_public_instruments"
+    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
+
+    order.okx_raw_fills["contract_size_source"] = (
+        "okx_account_position_history_pnl_fill_crosscheck"
+    )
+    order.okx_raw_fills["base_quantity"] = 620.0
+    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
+
+
 class _AgedUnlinkedFillExecutor(_FakeExecutor):
     async def _get_ccxt(self) -> _FakeCcxt:
         timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=10)).timestamp() * 1000)

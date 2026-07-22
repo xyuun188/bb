@@ -373,6 +373,99 @@ async def test_order_okx_raw_fills_win_over_stale_decision_execution_price(
 
 
 @pytest.mark.asyncio
+async def test_verified_pepe_order_fact_wins_over_stale_decision_contract_size(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=25)
+        exchange_order_id = "pepe-account-verified-fill"
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="PEPE/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="PEPE-USDT-SWAP",
+                    contracts=40.9,
+                    contract_size=1.0,
+                    avg_price=0.00000288,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PEPE/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=409_000_000.0,
+                        price=0.00000288,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id=exchange_order_id,
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                        okx_inst_id="PEPE-USDT-SWAP",
+                        okx_fill_contracts=40.9,
+                        okx_sync_status="okx_confirmed",
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "order_id": exchange_order_id,
+                            "trade_ids": ["pepe-trade-1"],
+                            "inst_id": "PEPE-USDT-SWAP",
+                            "contracts": 40.9,
+                            "contract_size": 10_000_000.0,
+                            "contract_size_verified": True,
+                            "contract_size_source": (
+                                "okx_account_position_margin_notional_crosscheck"
+                            ),
+                            "base_quantity": 409_000_000.0,
+                            "avg_price": 0.00000288,
+                            "rows": [
+                                {
+                                    "instId": "PEPE-USDT-SWAP",
+                                    "ordId": exchange_order_id,
+                                    "tradeId": "pepe-trade-1",
+                                    "fillSz": "40.9",
+                                    "fillPx": "0.00000288",
+                                }
+                            ],
+                        },
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="PEPE/USDT",
+                        side="long",
+                        quantity=409_000_000.0,
+                        entry_price=0.00000288,
+                        current_price=0.00000288,
+                        leverage=1.0,
+                        is_open=True,
+                        okx_inst_id="PEPE-USDT-SWAP",
+                        entry_exchange_order_id=exchange_order_id,
+                        created_at=filled_at + timedelta(seconds=10),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+        assert report["checked_orders"] == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_position_order_direct_link_wins_over_time_window(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

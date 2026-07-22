@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import posixpath
 import re
 import subprocess
@@ -1249,17 +1250,32 @@ def _trade_response(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _required_shadow_fee_after_returns(sample: dict[str, Any]) -> tuple[float, float]:
+    values: list[float] = []
+    for key in (
+        "long_net_return_after_cost_pct",
+        "short_net_return_after_cost_pct",
+    ):
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"shadow training sample is missing {key}") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"shadow training sample has invalid {key}")
+        values.append(value)
+    return values[0], values[1]
+
+
 def _shadow_response(sample: dict[str, Any]) -> dict[str, Any]:
-    long_return = _safe_float(sample.get("long_return_pct"))
-    short_return = _safe_float(sample.get("short_return_pct"))
+    long_return, short_return = _required_shadow_fee_after_returns(sample)
     best_side = "long" if long_return >= short_return else "short"
     return {
         "verdict": (
             "missed_opportunity" if sample.get("missed_opportunity") else "shadow_observation"
         ),
         "best_side": best_side,
-        "long_return_pct": round(long_return, 6),
-        "short_return_pct": round(short_return, 6),
+        "long_net_return_after_cost_pct": round(long_return, 6),
+        "short_net_return_after_cost_pct": round(short_return, 6),
         "lesson": "Rank future candidates by after-cost payoff and avoid suppressing high-quality opportunities without explicit counter-evidence.",
         "risk_guidance": {
             "do_not_trade_without_confirmation": True,
@@ -1342,8 +1358,7 @@ def _shadow_rejected_response(
     sample: dict[str, Any],
     response: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    long_return = _safe_float(sample.get("long_return_pct"))
-    short_return = _safe_float(sample.get("short_return_pct"))
+    long_return, short_return = _required_shadow_fee_after_returns(sample)
     chosen_side = str(response.get("best_side") or "long")
     rejected_side = "short" if chosen_side == "long" else "long"
     rejected = dict(response)
@@ -1566,9 +1581,11 @@ async def build_dataset() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "decision_confidence",
                 "horizon_minutes",
                 "features",
-                "long_return_pct",
-                "short_return_pct",
-                "best_action",
+                "gross_long_return_pct",
+                "gross_short_return_pct",
+                "long_net_return_after_cost_pct",
+                "short_net_return_after_cost_pct",
+                "best_action_after_cost",
                 "missed_opportunity",
             )
             if key in sample

@@ -75,6 +75,28 @@ def test_online_report_parser_ignores_runtime_logs_before_json() -> None:
     assert report == {"status": "warning", "mutates_database": False}
 
 
+@pytest.mark.asyncio
+async def test_daily_reconciliation_uses_unbounded_read_only_close_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int | None] = []
+
+    async def fake_audit(*, max_close_orders: int | None = 300) -> dict[str, object]:
+        calls.append(max_close_orders)
+        return {"key": "okx_reconciliation", "status": "ok"}
+
+    monkeypatch.setattr(
+        report_script.system_audit,
+        "_okx_reconciliation_audit",
+        fake_audit,
+    )
+
+    result = await report_script._full_okx_reconciliation_audit()
+
+    assert result["status"] == "ok"
+    assert calls == [None]
+
+
 def _card(key: str, status: str) -> dict[str, object]:
     return {
         "key": key,

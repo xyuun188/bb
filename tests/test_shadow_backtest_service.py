@@ -9,8 +9,16 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.market_facts import build_market_fact, verify_market_fact_path
-from core.training_contracts import SHADOW_LABEL_VERSION, shadow_label_contract_reasons
-from services.shadow_backtest_service import ShadowBacktestService, side_label
+from core.training_contracts import (
+    SHADOW_FEE_AFTER_LABEL_VERSION,
+    SHADOW_LABEL_VERSION,
+    shadow_label_contract_reasons,
+)
+from services.shadow_backtest_service import (
+    ShadowBacktestService,
+    shadow_fee_after_outcome,
+    side_label,
+)
 
 
 class _SessionCtx:
@@ -172,6 +180,32 @@ def _decision() -> DecisionOutput:
         },
         raw_response={"reason": "test"},
     )
+
+
+def test_shadow_fee_after_label_uses_funding_when_it_changes_the_best_side() -> None:
+    row = SimpleNamespace(
+        horizon_minutes=480,
+        feature_snapshot={
+            "bid": 99.99,
+            "ask": 100.01,
+            "orderbook_bid_depth": 100_000.0,
+            "orderbook_ask_depth": 100_000.0,
+            "taker_fee_rate": 0.0004,
+            "funding_rate": 0.002,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+        },
+    )
+
+    outcome = shadow_fee_after_outcome(
+        row,
+        long_return=0.001,
+        short_return=-0.001,
+    )
+
+    assert outcome["cost_complete"] is True
+    assert outcome["long_net_return_after_cost_pct"] < 0.0
+    assert outcome["short_net_return_after_cost_pct"] > 0.0
 
 
 @pytest.mark.asyncio
@@ -375,6 +409,11 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     assert label_contract["version"] == SHADOW_LABEL_VERSION
     assert label_contract["decision_id"] == 123
     assert label_contract["horizon_minutes"] == 10
+    assert label_contract["fee_after_label_version"] == SHADOW_FEE_AFTER_LABEL_VERSION
+    assert label_contract["fee_after_complete"] is True
+    assert label_contract["long_net_return_after_cost_pct"] < label_contract[
+        "long_return_pct"
+    ]
     assert shadow_label_contract_reasons(
         label_contract,
         decision_id=123,

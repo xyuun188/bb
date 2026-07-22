@@ -1478,21 +1478,30 @@ async def _trade_loop_audit() -> dict[str, Any]:
     )
 
 
-async def _okx_reconciliation_audit() -> dict[str, Any]:
-    cached = _cached_okx_reconciliation_card()
-    if cached is not None:
-        return cached
+async def _okx_reconciliation_audit(
+    *,
+    max_close_orders: int | None = OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS,
+) -> dict[str, Any]:
+    use_dashboard_cache = max_close_orders == OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS
+    if use_dashboard_cache:
+        cached = _cached_okx_reconciliation_card()
+        if cached is not None:
+            return cached
+
+    def finalize(card: dict[str, Any]) -> dict[str, Any]:
+        return _store_okx_reconciliation_card(card) if use_dashboard_cache else card
+
     try:
         report = await asyncio.wait_for(
             _okx_reconciliation_light_scan(
                 days=14,
-                max_close_orders=OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS,
+                max_close_orders=max_close_orders,
             ),
             timeout=5.0,
         )
     except Exception as exc:
         timeout = isinstance(exc, TimeoutError)
-        return _store_okx_reconciliation_card(
+        return finalize(
             _audit_card(
                 "okx_reconciliation",
                 "OKX 历史对账",
@@ -1545,7 +1554,7 @@ async def _okx_reconciliation_audit() -> dict[str, Any]:
             else "14 天历史仓位 dry-run 无缺失。"
         )
     )
-    return _store_okx_reconciliation_card(
+    return finalize(
         _audit_card(
             "okx_reconciliation",
             "OKX 历史对账",

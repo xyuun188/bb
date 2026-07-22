@@ -176,6 +176,26 @@ def test_finquant_preference_counterexample_prefers_low_win_positive_expectancy(
     assert json.loads(preference["chosen"])["best_side"] == "candidate_a"
 
 
+def test_shadow_response_chooses_fee_after_side_even_when_gross_points_elsewhere() -> None:
+    response = training._shadow_response(
+        {
+            "gross_long_return_pct": 2.0,
+            "gross_short_return_pct": -2.0,
+            "long_net_return_after_cost_pct": -0.2,
+            "short_net_return_after_cost_pct": 0.3,
+            "missed_opportunity": True,
+        }
+    )
+
+    assert response["best_side"] == "short"
+    assert response["long_net_return_after_cost_pct"] == -0.2
+    assert response["short_net_return_after_cost_pct"] == 0.3
+    assert "long_return_pct" not in response
+
+    with pytest.raises(ValueError, match="missing long_net_return_after_cost_pct"):
+        training._shadow_response({"long_return_pct": 9.0, "short_return_pct": -9.0})
+
+
 def test_remote_json_parser_returns_root_object_instead_of_last_nested_object() -> None:
     raw = 'remote-prefix\n{"verified":true,"adapter_path":"/adapter","manifest":{"training_config":{"rank":8}}}'
 

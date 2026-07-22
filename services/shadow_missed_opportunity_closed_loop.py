@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from services.dynamic_policy_values import empirical_policy_value
+from services.profit_supervision import shadow_fee_after_return_labels
 from services.trade_execution_contract import validate_entry_execution_contract
 
 DEFAULT_REPORT_WINDOW_HOURS = 24
@@ -126,13 +127,20 @@ def _executed_return_contract_gaps(decisions: Sequence[Any]) -> list[dict[str, A
 
 
 def _side_return(row: Any, side: str) -> float | None:
-    key = "long_return_pct" if side == "long" else "short_return_pct" if side == "short" else ""
-    if not key:
+    if side not in {"long", "short"}:
         return None
-    try:
-        return float(_row_get(row, key))
-    except (TypeError, ValueError):
-        return None
+    fee_after = shadow_fee_after_return_labels(
+        {
+            "horizon_minutes": _row_get(row, "horizon_minutes"),
+            "long_return_pct": _row_get(row, "long_return_pct"),
+            "short_return_pct": _row_get(row, "short_return_pct"),
+            "features": _row_get(row, "feature_snapshot") or {},
+        }
+    )
+    return _safe_float(
+        fee_after.get(f"{side}_net_return_after_cost_pct"),
+        None,
+    )
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:

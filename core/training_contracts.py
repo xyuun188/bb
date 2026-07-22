@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 SHADOW_LABEL_VERSION = "2026-07-14.native-shadow-label.v1"
+SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"
 AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-19.authoritative-trade-outcome.v2"
 AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-07-19.realized-fee-after-return.v1"
 AUTHORITATIVE_TRADE_OUTCOME_SOURCES = frozenset(
@@ -78,6 +79,31 @@ def build_shadow_label_contract(
 ) -> dict[str, Any]:
     market_contract = _dict(market_fact_contract)
     market_provenance = _dict(market_contract.get("provenance"))
+    costs = _dict(cost_facts)
+    long_net_return = _float(costs.get("long_net_return_after_cost_pct"))
+    short_net_return = _float(costs.get("short_net_return_after_cost_pct"))
+    fee_after_complete = bool(
+        costs.get("cost_complete") is True
+        and long_net_return is not None
+        and short_net_return is not None
+    )
+    labels = {
+        "long_return_pct": float(long_return_pct),
+        "short_return_pct": float(short_return_pct),
+        "best_action": _text(best_action).lower(),
+        "label_timestamp": _iso(label_timestamp),
+    }
+    if fee_after_complete:
+        labels.update(
+            {
+                "fee_after_label_version": SHADOW_FEE_AFTER_LABEL_VERSION,
+                "fee_after_complete": True,
+                "long_gross_return_pct": float(long_return_pct),
+                "short_gross_return_pct": float(short_return_pct),
+                "long_net_return_after_cost_pct": long_net_return,
+                "short_net_return_after_cost_pct": short_net_return,
+            }
+        )
     payload = {
         "version": version,
         "immutable": True,
@@ -86,12 +112,7 @@ def build_shadow_label_contract(
             "decision_id": int(decision_id or 0),
             "horizon_minutes": int(horizon_minutes or 0),
         },
-        "labels": {
-            "long_return_pct": float(long_return_pct),
-            "short_return_pct": float(short_return_pct),
-            "best_action": _text(best_action).lower(),
-            "label_timestamp": _iso(label_timestamp),
-        },
+        "labels": labels,
         "market_fact_lineage": {
             "contract_version": market_contract.get("version"),
             "data_fingerprint": market_provenance.get("data_fingerprint")
@@ -100,7 +121,7 @@ def build_shadow_label_contract(
             "result_fact_id": market_contract.get("result_fact_id"),
             "path_fingerprint": market_contract.get("path_fingerprint"),
         },
-        "cost_facts": _dict(cost_facts),
+        "cost_facts": costs,
     }
     contract = {
         **payload,
@@ -151,8 +172,46 @@ def compact_shadow_label_contract(
         "strategy_version": provenance.get("strategy_version"),
         "fallback_reason": provenance.get("fallback_reason"),
     }
+    if labels.get("fee_after_complete") is True:
+        compact.update(
+            {
+                "fee_after_label_version": labels.get("fee_after_label_version"),
+                "fee_after_complete": True,
+                "long_gross_return_pct": labels.get("long_gross_return_pct"),
+                "short_gross_return_pct": labels.get("short_gross_return_pct"),
+                "long_net_return_after_cost_pct": labels.get(
+                    "long_net_return_after_cost_pct"
+                ),
+                "short_net_return_after_cost_pct": labels.get(
+                    "short_net_return_after_cost_pct"
+                ),
+            }
+        )
     compact["compact_fingerprint"] = _fingerprint(compact)
     return compact
+
+
+def shadow_fee_after_label_values(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return explicit fee-after labels without treating gross returns as net."""
+
+    value = _dict(contract)
+    labels = _dict(value.get("labels")) or value
+    long_net = _float(labels.get("long_net_return_after_cost_pct"))
+    short_net = _float(labels.get("short_net_return_after_cost_pct"))
+    complete = bool(
+        labels.get("fee_after_complete") is True
+        and labels.get("fee_after_label_version") == SHADOW_FEE_AFTER_LABEL_VERSION
+        and long_net is not None
+        and short_net is not None
+    )
+    return {
+        "version": labels.get("fee_after_label_version"),
+        "complete": complete,
+        "long_net_return_after_cost_pct": long_net if complete else None,
+        "short_net_return_after_cost_pct": short_net if complete else None,
+    }
 
 
 def shadow_label_contract_reasons(
@@ -198,6 +257,32 @@ def shadow_label_contract_reasons(
         reasons.append("shadow_best_action_label_invalid")
     if not _iso(labels.get("label_timestamp")):
         reasons.append("shadow_label_timestamp_missing")
+
+    fee_after_declared = any(
+        key in labels
+        for key in (
+            "fee_after_label_version",
+            "fee_after_complete",
+            "long_net_return_after_cost_pct",
+            "short_net_return_after_cost_pct",
+        )
+    )
+    if fee_after_declared:
+        fee_after = shadow_fee_after_label_values(value)
+        if fee_after.get("complete") is not True:
+            reasons.append("shadow_fee_after_label_incomplete")
+        else:
+            long_net = float(fee_after["long_net_return_after_cost_pct"])
+            short_net = float(fee_after["short_net_return_after_cost_pct"])
+            expected_best = (
+                "long"
+                if long_net > 0.0 and long_net >= short_net
+                else "short"
+                if short_net > 0.0 and short_net > long_net
+                else "hold"
+            )
+            if _text(labels.get("best_action")).lower() != expected_best:
+                reasons.append("shadow_best_action_not_fee_after_optimal")
 
     if compact:
         for key in (

@@ -34,8 +34,14 @@ from core.safe_output import safe_error_text  # noqa: E402
 from web_dashboard.api import system_audit  # noqa: E402
 
 DEFAULT_REPORT_DIR = "okx_daily_reconciliation_reports"
+
+
+async def _full_okx_reconciliation_audit() -> dict[str, Any]:
+    return await system_audit._okx_reconciliation_audit(max_close_orders=None)
+
+
 OKX_REPORT_CARD_FACTORIES = (
-    ("okx_reconciliation", system_audit._okx_reconciliation_audit),
+    ("okx_reconciliation", _full_okx_reconciliation_audit),
     ("okx_trade_fact_integrity", system_audit._okx_trade_fact_integrity_audit),
     ("position_price_integrity", system_audit._position_price_integrity_audit),
     ("trade_execution_contract", system_audit._trade_execution_contract_audit),

@@ -7,6 +7,7 @@ from math import sqrt
 from typing import Any
 
 from services.execution_cost_model import execution_cost_estimate
+from services.profit_supervision import shadow_fee_after_return_labels
 
 DEFAULT_WINDOW_HOURS = 168
 MAX_WORST_SAMPLE_COUNT = 8
@@ -175,15 +176,29 @@ def _authoritative_market_regime(sample: Any) -> str:
 
 def _actual_best_side(row: Any) -> str:
     best = _safe_str(_row_get(row, "best_action")).lower()
-    if best in {"long", "short"}:
+    if best in {"long", "short", "hold"}:
         return best
-    long_return = _safe_float(_row_get(row, "long_return_pct"), None)
-    short_return = _safe_float(_row_get(row, "short_return_pct"), None)
+    fee_after = shadow_fee_after_return_labels(_shadow_quality_payload(row))
+    long_return = _safe_float(
+        fee_after.get("long_net_return_after_cost_pct"), None
+    )
+    short_return = _safe_float(
+        fee_after.get("short_net_return_after_cost_pct"), None
+    )
     if long_return is None or short_return is None:
         return ""
-    if long_return == short_return:
-        return "flat"
-    return "long" if long_return > short_return else "short"
+    if max(long_return, short_return) <= 0.0:
+        return "hold"
+    return "long" if long_return >= short_return else "short"
+
+
+def _shadow_quality_payload(row: Any) -> dict[str, Any]:
+    return {
+        "horizon_minutes": _row_get(row, "horizon_minutes"),
+        "long_return_pct": _row_get(row, "long_return_pct"),
+        "short_return_pct": _row_get(row, "short_return_pct"),
+        "features": _features(row),
+    }
 
 
 def _tool_direction(tool: dict[str, Any]) -> str:
@@ -468,8 +483,12 @@ def _compact_worst_sample(
         "actual_best_side": actual_side,
         "actual_return_pct": round(float(actual_return), 6),
         "expected_return_pct": None if expected_return is None else round(float(expected_return), 6),
-        "long_return_pct": _safe_float(_row_get(row, "long_return_pct"), None),
-        "short_return_pct": _safe_float(_row_get(row, "short_return_pct"), None),
+        "long_net_return_after_cost_pct": shadow_fee_after_return_labels(
+            _shadow_quality_payload(row)
+        ).get("long_net_return_after_cost_pct"),
+        "short_net_return_after_cost_pct": shadow_fee_after_return_labels(
+            _shadow_quality_payload(row)
+        ).get("short_net_return_after_cost_pct"),
         "created_at": _iso_row_datetime(row, "created_at"),
         "due_at": _iso_row_datetime(row, "due_at"),
         "sequence_length": sequence_length,

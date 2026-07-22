@@ -1690,9 +1690,45 @@ def _local_order_verified_okx_raw_contract_size(order: Order) -> float:
     raw = _safe_dict(getattr(order, "okx_raw_fills", None))
     if raw.get("contract_size_verified") is not True:
         return 0.0
-    if raw.get("fills_history_confirmed") is not True:
+    contract_size = _local_order_okx_raw_contract_size(order)
+    if contract_size <= 0:
         return 0.0
-    return _local_order_okx_raw_contract_size(order)
+    if raw.get("fills_history_confirmed") is True:
+        return contract_size
+
+    source = str(raw.get("contract_size_source") or "").strip()
+    exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    raw_order_id = str(raw.get("order_id") or "").strip()
+    contracts = _first_positive(
+        raw.get("contracts"),
+        getattr(order, "okx_fill_contracts", None),
+        default=0.0,
+    )
+    base_quantity = _first_positive(
+        raw.get("base_quantity"),
+        raw.get("filled_base_quantity"),
+        getattr(order, "quantity", None),
+        default=0.0,
+    )
+    expected_base_quantity = contracts * contract_size
+    account_verified = source.startswith("okx_account_position_")
+    order_identity_matches = bool(
+        exchange_order_id and raw_order_id and exchange_order_id == raw_order_id
+    )
+    quantity_matches = bool(
+        expected_base_quantity > 0
+        and base_quantity > 0
+        and _relative_close_enough(
+            base_quantity,
+            expected_base_quantity,
+            QUANTITY_TOLERANCE_RATIO,
+        )
+    )
+    return (
+        contract_size
+        if account_verified and order_identity_matches and quantity_matches
+        else 0.0
+    )
 
 
 def _local_order_execution_payloads(decision: AIDecision | None) -> list[dict[str, Any]]:

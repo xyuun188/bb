@@ -12,6 +12,17 @@ def test_missed_opportunities_are_return_observations_only() -> None:
             symbol="BTC/USDT",
             best_action="long",
             long_return_pct=value,
+            short_return_pct=-value,
+            horizon_minutes=30,
+            feature_snapshot={
+                "bid": 99.99,
+                "ask": 100.01,
+                "orderbook_bid_depth": 100_000.0,
+                "orderbook_ask_depth": 100_000.0,
+                "taker_fee_rate": 0.0004,
+                "funding_rate": 0.0,
+                "funding_interval_minutes": 480.0,
+            },
         )
         for value in (0.4, 0.8, -0.1)
     ]

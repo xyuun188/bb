@@ -4336,6 +4336,8 @@ def train(req: TrainRequest) -> dict[str, Any]:
             for value in (long_return, short_return, long_cost, short_cost)
         ):
             continue
+        long_net_return = long_return - long_cost
+        short_net_return = short_return - short_cost
         sample_weight = max(0.0, f(sample, "sample_weight", 1.0))
         if sample_weight <= 0.0:
             continue
@@ -4359,11 +4361,18 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "raw_short_return": short_return,
             "long_return": long_return,
             "short_return": short_return,
+            "long_net_return": long_net_return,
+            "short_net_return": short_net_return,
             "long_execution_cost": long_cost,
             "short_execution_cost": short_cost,
-            "long_net_return": long_return - long_cost,
-            "short_net_return": short_return - short_cost,
-            "best_side": "long" if long_return >= short_return else "short",
+            "best_side": (
+                "long"
+                if long_net_return > 0.0 and long_net_return >= short_net_return
+                else "short"
+                if short_net_return > 0.0 and short_net_return > long_net_return
+                else "hold"
+            ),
+            "best_net_return": max(long_net_return, short_net_return),
             "execution_cost": cost_task,
             "features": features,
             "sample_weight": sample_weight,

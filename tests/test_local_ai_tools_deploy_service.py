@@ -2186,6 +2186,34 @@ def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
     assert not module.CURRENT_POINTER_PATH.exists()
 
 
+def test_local_ai_tools_training_marks_positive_gross_but_negative_net_as_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _training_shadow_samples(count=2)
+    captured: list[dict[str, object]] = []
+
+    def chronological_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        captured.extend(rows)
+        return rows
+
+    monkeypatch.setattr(module, "_chronological_rows", chronological_rows)
+    for sample in samples:
+        tasks = sample["profit_supervision"]["tasks"]
+        tasks[module.MARKET_OPPORTUNITY_TASK]["long_gross_market_return_pct"] = 0.05
+        tasks[module.MARKET_OPPORTUNITY_TASK]["short_gross_market_return_pct"] = -0.05
+        tasks[module.EXECUTION_COST_TASK]["long_total_cost_pct"] = 0.12
+        tasks[module.EXECUTION_COST_TASK]["short_total_cost_pct"] = 0.08
+
+    module.train(module.TrainRequest(shadow_samples=samples))
+
+    assert captured
+    assert all(row["long_net_return"] < 0.0 for row in captured)
+    assert all(row["short_net_return"] < 0.0 for row in captured)
+    assert all(row["best_side"] == "hold" for row in captured)
+
+
 def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
     tmp_path: Path,
 ) -> None:

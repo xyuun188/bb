@@ -32,6 +32,7 @@ from services.okx_order_fact_sync import (
     _build_contract_size_catalog,
     _current_position_entry_fee_evidence,
     _db_naive_since,
+    _dedupe_fills_by_order_id,
     _matching_current_position_entry_orders,
     _matching_native_full_close_pending_fill,
     _order_needs_account_contract_size_repair,
@@ -46,6 +47,42 @@ from services.paper_training import (
     build_paper_training_contract,
 )
 from web_dashboard.api.trades import get_trade_detail, get_trades
+
+
+def test_fill_deduplication_keeps_complete_cumulative_order_fact() -> None:
+    partial = OkxNativeFillGroup(
+        order_id="fil-cumulative-order",
+        trade_ids=("fill-1",),
+        inst_id="FIL-USDT-SWAP",
+        symbol="FIL/USDT",
+        side="sell",
+        pos_side="net",
+        contracts=120.0,
+        avg_price=0.7673,
+        fee_abs=0.04,
+        fill_pnl=0.0,
+        timestamp_ms=1_000.0,
+        timestamp=datetime.fromtimestamp(1, tz=UTC),
+        raw_count=1,
+    )
+    complete = OkxNativeFillGroup(
+        order_id="fil-cumulative-order",
+        trade_ids=("fill-1", "fill-2"),
+        inst_id="FIL-USDT-SWAP",
+        symbol="FIL/USDT",
+        side="sell",
+        pos_side="net",
+        contracts=158.0,
+        avg_price=0.76737215,
+        fee_abs=0.053,
+        fill_pnl=-0.0094,
+        timestamp_ms=2_000.0,
+        timestamp=datetime.fromtimestamp(2, tz=UTC),
+        raw_count=2,
+    )
+
+    assert _dedupe_fills_by_order_id([partial, complete]) == [complete]
+    assert _dedupe_fills_by_order_id([complete, partial]) == [complete]
 
 
 def test_paper_catalog_overrides_public_contract_size_with_account_evidence() -> None:
@@ -874,6 +911,54 @@ class _StaleVerifiedContractSizeExecutor(_Executor):
         self.ccxt = _StaleVerifiedContractSizeCcxt()
 
     async def _get_ccxt(self) -> _StaleVerifiedContractSizeCcxt:
+        return self.ccxt
+
+
+class _LateCumulativeFillCcxt(_FillCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        start_ms = int(
+            (PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=12)).timestamp()
+            * 1000
+        )
+        self.rows.extend(
+            [
+                {
+                    "ordId": "fil-late-cumulative-order",
+                    "tradeId": "fil-fill-1",
+                    "instId": "FIL-USDT-SWAP",
+                    "side": "sell",
+                    "fillSz": "120",
+                    "fillPx": "0.7673",
+                    "fee": "-0.04",
+                    "fillPnl": "0",
+                    "ts": str(start_ms),
+                },
+                {
+                    "ordId": "fil-late-cumulative-order",
+                    "tradeId": "fil-fill-2",
+                    "instId": "FIL-USDT-SWAP",
+                    "side": "sell",
+                    "fillSz": "38",
+                    "fillPx": "0.7676",
+                    "fee": "-0.013",
+                    "fillPnl": "-0.0094",
+                    "ts": str(start_ms + 2_000),
+                },
+            ]
+        )
+
+    async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        payload = await super().publicGetPublicInstruments(params)
+        payload["data"].append({"instId": "FIL-USDT-SWAP", "ctVal": "0.1"})
+        return payload
+
+
+class _LateCumulativeFillExecutor(_Executor):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ccxt = _LateCumulativeFillCcxt()
+
+    async def _get_ccxt(self) -> _LateCumulativeFillCcxt:
         return self.ccxt
 
 
@@ -2030,6 +2115,91 @@ async def test_order_fact_sync_rechecks_ambiguous_verified_contract_size_from_in
         assert raw["base_quantity"] == pytest.approx(1780.0)
         assert raw["contract_size_verified"] is True
         assert raw["contract_size_source"] == "okx_public_instruments"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_refreshes_late_cumulative_fill_for_confirmed_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-late-cumulative-fill.db').as_posix()}",
+    )
+    await init_db()
+    phase3_time = (
+        PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(minutes=12)
+    ).astimezone(UTC).replace(tzinfo=None)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="FIL/USDT",
+                    side="sell",
+                    order_type="market",
+                    quantity=12.0,
+                    price=0.7673,
+                    status="filled",
+                    fee=0.04,
+                    exchange_order_id="fil-late-cumulative-order",
+                    filled_at=phase3_time,
+                    created_at=phase3_time,
+                    okx_inst_id="FIL-USDT-SWAP",
+                    okx_trade_ids="fil-fill-1",
+                    okx_fill_contracts=120.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_CONFIRMED,
+                    okx_raw_fills={
+                        "fills_history_confirmed": True,
+                        "order_id": "fil-late-cumulative-order",
+                        "trade_ids": ["fil-fill-1"],
+                        "inst_id": "FIL-USDT-SWAP",
+                        "contracts": 120.0,
+                        "contract_size": 0.1,
+                        "contract_size_verified": True,
+                        "contract_size_source": "okx_public_instruments",
+                        "base_quantity": 12.0,
+                        "avg_price": 0.7673,
+                        "fee_abs": 0.04,
+                        "fill_pnl": 0.0,
+                        "timestamp": phase3_time.isoformat(),
+                    },
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            lookback_hours=72,
+            executor_factory=_LateCumulativeFillExecutor,
+            cold_start_marker_path=None,
+        ).sync()
+
+        async with get_session_ctx() as session:
+            row = (
+                await session.execute(
+                    Order.__table__.select().where(
+                        Order.__table__.c.exchange_order_id
+                        == "fil-late-cumulative-order"
+                    )
+                )
+            ).one()._mapping
+
+        raw = row["okx_raw_fills"]
+        assert report["okx_pull_available"] is True
+        assert report["confirmed_count"] >= 1
+        assert row["quantity"] == pytest.approx(15.8)
+        assert row["okx_fill_contracts"] == pytest.approx(158.0)
+        assert row["price"] == pytest.approx((120 * 0.7673 + 38 * 0.7676) / 158)
+        assert row["fee"] == pytest.approx(0.053)
+        assert row["okx_fill_pnl"] == pytest.approx(-0.0094)
+        assert set(raw["trade_ids"]) == {"fil-fill-1", "fil-fill-2"}
+        assert raw["base_quantity"] == pytest.approx(15.8)
     finally:
         await close_db()
 
@@ -3968,7 +4138,7 @@ async def test_order_fact_sync_uses_full_account_history_page_budget(
         await close_db()
 
     assert report["okx_pull_available"] is True
-    assert calls == {"fills": [7], "orders": [7], "positions": [7]}
+    assert calls == {"fills": [10], "orders": [10], "positions": [10]}
 
 
 @pytest.mark.asyncio

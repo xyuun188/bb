@@ -29,6 +29,7 @@ from services.profit_supervision import (
     apply_correlation_group_weights,
     build_profit_supervision_contract,
     profit_supervision_report,
+    shadow_fee_after_return_labels,
 )
 from services.return_loss_attribution import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
@@ -965,8 +966,12 @@ def _shadow_profit_learning_labels(
     sample: dict[str, Any],
     assessment: SampleQualityAssessment,
 ) -> dict[str, Any]:
-    best_action = _sample_best_direction(sample)
-    best_return = _actual_return_for_side(sample, best_action) if best_action else None
+    fee_after = shadow_fee_after_return_labels(sample)
+    best_action = _safe_str(fee_after.get("best_action_after_cost")).lower()
+    best_return = _safe_float(
+        fee_after.get(f"{best_action}_net_return_after_cost_pct"),
+        None,
+    )
     missed = bool(sample.get("missed_opportunity")) and best_action in {"long", "short"}
     if missed and (best_return or 0.0) > 0:
         missed_label = "missed_positive_entry"
@@ -989,6 +994,13 @@ def _shadow_profit_learning_labels(
         "missed_opportunity_label": missed_label,
         "shadow_outcome_label": outcome_label,
         "opportunity_side": best_action,
+        "long_net_return_after_cost_pct": fee_after.get(
+            "long_net_return_after_cost_pct"
+        ),
+        "short_net_return_after_cost_pct": fee_after.get(
+            "short_net_return_after_cost_pct"
+        ),
+        "fee_after_label_version": fee_after.get("version"),
     }
 
 
@@ -1032,6 +1044,27 @@ def annotate_sample(sample: dict[str, Any], kind: SampleKind) -> dict[str, Any]:
     assessment = ASSESSORS[kind](sample)
     annotated = dict(sample)
     annotated.update(assessment.as_dict())
+    if kind == "shadow":
+        fee_after = shadow_fee_after_return_labels(annotated)
+        annotated.update(
+            {
+                "gross_long_return_pct": _safe_float(
+                    annotated.get("long_return_pct"), None
+                ),
+                "gross_short_return_pct": _safe_float(
+                    annotated.get("short_return_pct"), None
+                ),
+                "long_net_return_after_cost_pct": fee_after.get(
+                    "long_net_return_after_cost_pct"
+                ),
+                "short_net_return_after_cost_pct": fee_after.get(
+                    "short_net_return_after_cost_pct"
+                ),
+                "best_action_after_cost": fee_after.get("best_action_after_cost"),
+                "fee_after_label_version": fee_after.get("version"),
+                "fee_after_label_complete": bool(fee_after.get("complete")),
+            }
+        )
     labels = _profit_learning_labels(annotated, kind, assessment)
     if labels:
         annotated["profit_learning_labels"] = labels
@@ -1107,11 +1140,22 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
         "label_timestamp": sample.get("label_timestamp"),
     }
     label = {
-        "long_return_pct": _safe_float(sample.get("long_return_pct"), None),
-        "short_return_pct": _safe_float(sample.get("short_return_pct"), None),
+        "gross_long_return_pct": _safe_float(sample.get("long_return_pct"), None),
+        "gross_short_return_pct": _safe_float(sample.get("short_return_pct"), None),
+        "long_net_return_after_cost_pct": _safe_float(
+            sample.get("long_net_return_after_cost_pct"), None
+        ),
+        "short_net_return_after_cost_pct": _safe_float(
+            sample.get("short_net_return_after_cost_pct"), None
+        ),
         "realized_pnl": _safe_float(sample.get("realized_pnl"), None),
         "outcome": _safe_str(sample.get("outcome")),
-        "best_action": _safe_str(sample.get("best_action")),
+        "best_action": _safe_str(
+            sample.get("best_action_after_cost") or sample.get("best_action")
+        ),
+        "fee_after_label_version": _safe_str(
+            sample.get("fee_after_label_version")
+        ),
         "label_fingerprint": _safe_dict(
             features.get("training_label_contract")
         ).get("label_fingerprint"),
@@ -1494,16 +1538,23 @@ def _sample_source(sample: dict[str, Any], kind: str) -> str:
 
 
 def _sample_best_direction(sample: dict[str, Any]) -> str:
-    best = _safe_str(sample.get("best_action")).lower()
-    if best in {"long", "short"}:
+    best = _safe_str(
+        sample.get("best_action_after_cost") or sample.get("best_action")
+    ).lower()
+    if best in {"long", "short", "hold"}:
         return best
-    long_return = _safe_float(sample.get("long_return_pct"), None)
-    short_return = _safe_float(sample.get("short_return_pct"), None)
+    fee_after = shadow_fee_after_return_labels(sample)
+    long_return = _safe_float(
+        fee_after.get("long_net_return_after_cost_pct"), None
+    )
+    short_return = _safe_float(
+        fee_after.get("short_net_return_after_cost_pct"), None
+    )
     if long_return is None or short_return is None:
         return ""
-    if long_return == short_return:
-        return "flat"
-    return "long" if long_return > short_return else "short"
+    if max(long_return, short_return) <= 0.0:
+        return "hold"
+    return "long" if long_return >= short_return else "short"
 
 
 def _sample_symbol(sample: dict[str, Any]) -> str:
@@ -1511,10 +1562,11 @@ def _sample_symbol(sample: dict[str, Any]) -> str:
 
 
 def _actual_return_for_side(sample: dict[str, Any], side: str) -> float | None:
+    fee_after = shadow_fee_after_return_labels(sample)
     if side == "long":
-        return _safe_float(sample.get("long_return_pct"), None)
+        return _safe_float(fee_after.get("long_net_return_after_cost_pct"), None)
     if side == "short":
-        return _safe_float(sample.get("short_return_pct"), None)
+        return _safe_float(fee_after.get("short_net_return_after_cost_pct"), None)
     return None
 
 
@@ -1757,8 +1809,12 @@ def _compact_worst_shadow_sample(
         "actual_best_side": actual_side,
         "actual_return_pct": round(float(actual_return), 6),
         "expected_return_pct": None if expected_return is None else round(float(expected_return), 6),
-        "long_return_pct": _safe_float(sample.get("long_return_pct"), None),
-        "short_return_pct": _safe_float(sample.get("short_return_pct"), None),
+        "long_net_return_after_cost_pct": _safe_float(
+            sample.get("long_net_return_after_cost_pct"), None
+        ),
+        "short_net_return_after_cost_pct": _safe_float(
+            sample.get("short_net_return_after_cost_pct"), None
+        ),
         "sequence_length": sequence_length,
         "legacy_mixed_shadow": bool(legacy_mixed_shadow),
     }
@@ -1897,13 +1953,19 @@ def _shadow_training_view_diagnostics(samples: list[dict[str, Any]]) -> dict[str
     trainable = [sample for sample in samples if not sample.get("exclude_from_training")]
     projected: list[dict[str, Any]] = []
     for sample in trainable:
-        long_return = _safe_float(sample.get("long_return_pct"), None)
-        short_return = _safe_float(sample.get("short_return_pct"), None)
+        long_return = _safe_float(
+            sample.get("long_net_return_after_cost_pct"), None
+        )
+        short_return = _safe_float(
+            sample.get("short_net_return_after_cost_pct"), None
+        )
         if long_return is None or short_return is None:
             continue
         projected.append(
             {
                 **sample,
+                "long_return_pct": long_return,
+                "short_return_pct": short_return,
                 "best_return_pct": max(long_return, short_return),
             }
         )
