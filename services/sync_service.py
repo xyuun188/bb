@@ -35,6 +35,7 @@ from services.current_position_management import (
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
+from services.paper_training import build_paper_training_position_lifecycle
 from services.position_open_time import parse_position_time, serialize_position_time
 from services.position_settlement import (
     SETTLEMENT_STATUS_SETTLING,
@@ -214,6 +215,10 @@ def _merge_local_position_candidates(
             )
         if not _dict_value(merged.get("paper_canary_lifecycle")):
             merged["paper_canary_lifecycle"] = _dict_value(candidate.get("paper_canary_lifecycle"))
+        if not _dict_value(merged.get("paper_training_lifecycle")):
+            merged["paper_training_lifecycle"] = _dict_value(
+                candidate.get("paper_training_lifecycle")
+            )
         if _float_value(merged.get("entry_fee"), 0.0) <= 0:
             merged["entry_fee"] = candidate.get("entry_fee")
 
@@ -723,6 +728,9 @@ def normalized_open_position_context(
             "exit_fee_rate": exit_fee_rate,
             "current_management_contract": current_management_contract,
             "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
+            "paper_training_lifecycle": _dict_value(
+                position_payload.get("paper_training_lifecycle")
+            ),
             "execution_mode": position_payload.get("execution_mode"),
             "info": info,
         }
@@ -831,6 +839,9 @@ def normalized_open_position_context(
         "exit_fee_rate": exit_fee_rate,
         "current_management_contract": current_management_contract,
         "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
+        "paper_training_lifecycle": _dict_value(
+            position_payload.get("paper_training_lifecycle")
+        ),
         "execution_mode": position_payload.get("execution_mode"),
         "info": info,
     }
@@ -2897,6 +2908,33 @@ class OkxSyncService:
                     limit=1000,
                     is_open=True,
                 )
+                entry_order_ids_by_position = {
+                    int(getattr(position, "id", 0) or 0): _split_exchange_order_ids(
+                        getattr(position, "entry_exchange_order_id", None)
+                    )
+                    for position in db_positions
+                }
+                entry_order_ids = {
+                    order_id
+                    for order_ids in entry_order_ids_by_position.values()
+                    for order_id in order_ids
+                }
+                decision_ids_by_entry_order: dict[str, int] = {}
+                if entry_order_ids:
+                    entry_order_rows = (
+                        await session.execute(
+                            select(Order.exchange_order_id, Order.decision_id).where(
+                                Order.exchange_order_id.in_(entry_order_ids),
+                                Order.decision_id.is_not(None),
+                            )
+                        )
+                    ).all()
+                    decision_ids_by_entry_order = {
+                        str(exchange_order_id): int(decision_id)
+                        for exchange_order_id, decision_id in entry_order_rows
+                        if str(exchange_order_id or "").strip()
+                        and int(decision_id or 0) > 0
+                    }
                 decision_ids = {
                     int(decision_id)
                     for position in db_positions
@@ -2905,6 +2943,7 @@ class OkxSyncService:
                     ).get("original_entry_decision_ids", [])
                     if str(decision_id or "").isdigit() and int(decision_id) > 0
                 }
+                decision_ids.update(decision_ids_by_entry_order.values())
                 decisions_by_id: dict[int, Any] = {}
                 if decision_ids:
                     decisions_result = await session.execute(
@@ -2920,10 +2959,23 @@ class OkxSyncService:
                     canary_lifecycle = _dict_value(
                         management_contract.get("paper_canary_lifecycle")
                     )
+                    training_lifecycle = _dict_value(
+                        management_contract.get("paper_training_lifecycle")
+                    )
+                    lineage_decision_ids = list(
+                        management_contract.get("original_entry_decision_ids", [])
+                    )
+                    lineage_decision_ids.extend(
+                        decision_ids_by_entry_order[order_id]
+                        for order_id in entry_order_ids_by_position.get(
+                            int(getattr(p, "id", 0) or 0),
+                            [],
+                        )
+                        if order_id in decision_ids_by_entry_order
+                    )
+                    lineage_decision_ids = list(dict.fromkeys(lineage_decision_ids))
                     if not canary_lifecycle:
-                        for decision_id in management_contract.get(
-                            "original_entry_decision_ids", []
-                        ):
+                        for decision_id in lineage_decision_ids:
                             decision = decisions_by_id.get(
                                 int(decision_id)
                                 if str(decision_id or "").isdigit()
@@ -2932,6 +2984,17 @@ class OkxSyncService:
                             lifecycle = build_paper_canary_position_lifecycle(decision)
                             if lifecycle:
                                 canary_lifecycle = lifecycle
+                                break
+                    if not training_lifecycle:
+                        for decision_id in lineage_decision_ids:
+                            decision = decisions_by_id.get(
+                                int(decision_id)
+                                if str(decision_id or "").isdigit()
+                                else -1
+                            )
+                            lifecycle = build_paper_training_position_lifecycle(decision)
+                            if lifecycle:
+                                training_lifecycle = lifecycle
                                 break
                     local_positions.append(
                         {
@@ -2953,6 +3016,7 @@ class OkxSyncService:
                             "entry_fee": getattr(p, "entry_fee", None),
                             "current_management_contract": management_contract,
                             "paper_canary_lifecycle": canary_lifecycle,
+                            "paper_training_lifecycle": training_lifecycle,
                             "execution_mode": getattr(p, "execution_mode", None),
                         }
                     )
@@ -3036,6 +3100,7 @@ class OkxSyncService:
                 ("entry_fee", "entry_fee"),
                 ("current_management_contract", "current_management_contract"),
                 ("paper_canary_lifecycle", "paper_canary_lifecycle"),
+                ("paper_training_lifecycle", "paper_training_lifecycle"),
                 ("execution_mode", "execution_mode"),
             ):
                 value = local_position.get(source_key)

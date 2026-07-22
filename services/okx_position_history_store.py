@@ -297,6 +297,23 @@ def _apply_payload(record: OkxPositionHistory, payload: dict[str, Any]) -> None:
         elif key == "raw_row":
             existing_raw = dict(getattr(record, "raw_row", None) or {})
             incoming_raw = dict(value or {})
+            existing_spec_source = str(
+                existing_raw.get("_bb_contract_spec_source") or ""
+            ).strip()
+            incoming_spec_source = str(
+                incoming_raw.get("_bb_contract_spec_source") or ""
+            ).strip()
+            if (
+                existing_spec_source.startswith("okx_account_position_")
+                and not incoming_spec_source.startswith("okx_account_position_")
+            ):
+                for contract_key in (
+                    "_bb_contract_spec",
+                    "_bb_contract_spec_source",
+                    "_bb_contract_size_evidence",
+                ):
+                    if contract_key in existing_raw:
+                        incoming_raw[contract_key] = existing_raw[contract_key]
             for raw_key, raw_value in existing_raw.items():
                 if raw_key.startswith("_bb_") and raw_key not in incoming_raw:
                     incoming_raw[raw_key] = raw_value

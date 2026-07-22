@@ -16,6 +16,7 @@ from services.current_position_management import (
 )
 from services.dynamic_policy_values import continuous_budget_fraction
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
+from services.paper_training import assess_paper_training_position_horizon
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -68,6 +69,9 @@ class DynamicExitAssessment:
     paper_canary_horizon_elapsed: bool
     paper_canary_horizon_minutes: int
     paper_canary_expires_at: str | None
+    paper_training_horizon_elapsed: bool
+    paper_training_horizon_minutes: float
+    paper_training_expires_at: str | None
     current_management_contract_versions: tuple[str, ...]
     policy_provenance: dict[str, Any]
 
@@ -110,6 +114,7 @@ def assess_dynamic_exit(
     management_contracts: list[dict[str, Any]] = []
     management_pressure_values: list[float] = []
     canary_horizon_assessments: list[dict[str, Any]] = []
+    training_horizon_assessments: list[dict[str, Any]] = []
     for position in matches:
         qty = abs(
             _safe_float(
@@ -201,6 +206,9 @@ def assess_dynamic_exit(
         management = _safe_dict(position.get("current_management_contract"))
         management_contracts.append(management)
         canary_horizon_assessments.append(assess_paper_canary_position_horizon(position))
+        training_horizon_assessments.append(
+            assess_paper_training_position_horizon(position)
+        )
         if management.get("management_eligible") is True and not management.get("blockers"):
             management_pressure_values.append(
                 _clamp(_safe_float(management.get("portfolio_concentration_pressure"), 0.0))
@@ -224,6 +232,15 @@ def assess_dynamic_exit(
         if item.get("authorized") is True and item.get("elapsed") is True
     ]
     paper_canary_horizon_elapsed = bool(elapsed_canary_horizons)
+    elapsed_training_horizons = [
+        item
+        for item in training_horizon_assessments
+        if item.get("authorized") is True and item.get("elapsed") is True
+    ]
+    paper_training_horizon_elapsed = bool(elapsed_training_horizons)
+    model_horizon_elapsed = bool(
+        paper_canary_horizon_elapsed or paper_training_horizon_elapsed
+    )
     stop_usage = (
         _clamp(max(-net_pnl, 0.0) / planned_risk)
         if planned_risk > 0
@@ -273,7 +290,7 @@ def assess_dynamic_exit(
     )
     close_fraction = (
         1.0
-        if hard_risk or paper_canary_horizon_elapsed
+        if hard_risk or model_horizon_elapsed
         else continuous_budget_fraction(
             retrace,
             stop_usage,
@@ -287,23 +304,23 @@ def assess_dynamic_exit(
         reasons.append("position_economics_missing")
     if (
         not hard_risk
-        and not paper_canary_horizon_elapsed
+        and not model_horizon_elapsed
         and matches
         and not current_management_contract_complete
     ):
         reasons.append("current_position_management_contract_incomplete")
-    if not hard_risk and not paper_canary_horizon_elapsed and close_fraction <= 0:
+    if not hard_risk and not model_horizon_elapsed and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
     if (
         not hard_risk
-        and not paper_canary_horizon_elapsed
+        and not model_horizon_elapsed
         and gross_pnl > 0
         and net_pnl <= 0
         and stop_usage <= 0
         and continuation <= 0
     ):
         reasons.append("fee_after_profit_not_positive")
-    if not hard_risk and not paper_canary_horizon_elapsed and not execution_cost_complete:
+    if not hard_risk and not model_horizon_elapsed and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
     eligible = not reasons
     provenance = {
@@ -341,6 +358,22 @@ def assess_dynamic_exit(
             (
                 str(item.get("expires_at"))
                 for item in elapsed_canary_horizons
+                if item.get("expires_at")
+            ),
+            None,
+        ),
+        paper_training_horizon_elapsed=paper_training_horizon_elapsed,
+        paper_training_horizon_minutes=max(
+            (
+                _safe_float(item.get("horizon_minutes"), 0.0)
+                for item in elapsed_training_horizons
+            ),
+            default=0.0,
+        ),
+        paper_training_expires_at=next(
+            (
+                str(item.get("expires_at"))
+                for item in elapsed_training_horizons
                 if item.get("expires_at")
             ),
             None,

@@ -7,6 +7,15 @@ from math import isclose
 from typing import Any
 
 
+def _within_limit(value: float, limit: float) -> bool:
+    return value <= limit or isclose(
+        value,
+        limit,
+        rel_tol=1e-9,
+        abs_tol=1e-12,
+    )
+
+
 @dataclass
 class LimitCheckResult:
     passed: bool
@@ -37,9 +46,9 @@ class ContractExposureSnapshot:
     def has_entry_capacity(self) -> bool:
         return (
             self.contract_algebra_valid
-            and self.margin_after_pct <= self.margin_limit_pct + 1e-12
-            and self.stop_risk_after_pct <= self.stop_risk_limit_pct + 1e-12
-            and self.notional_after_pct <= self.notional_limit_pct + 1e-12
+            and _within_limit(self.margin_after_pct, self.margin_limit_pct)
+            and _within_limit(self.stop_risk_after_pct, self.stop_risk_limit_pct)
+            and _within_limit(self.notional_after_pct, self.notional_limit_pct)
         )
 
 
@@ -69,12 +78,18 @@ class PositionLimitChecker:
                 passed=False,
                 reason=f"{symbol} authoritative margin exceeds current OKX available margin.",
             )
-        if snapshot.stop_risk_after_pct > snapshot.stop_risk_limit_pct + 1e-12:
+        if not _within_limit(
+            snapshot.stop_risk_after_pct,
+            snapshot.stop_risk_limit_pct,
+        ):
             return LimitCheckResult(
                 passed=False,
                 reason=f"{symbol} would exceed the dynamic portfolio stressed-loss budget.",
             )
-        if snapshot.notional_after_pct > snapshot.notional_limit_pct + 1e-12:
+        if not _within_limit(
+            snapshot.notional_after_pct,
+            snapshot.notional_limit_pct,
+        ):
             return LimitCheckResult(
                 passed=False,
                 reason=f"{symbol} would exceed notional capacity implied by stressed loss.",

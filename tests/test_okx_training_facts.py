@@ -8,6 +8,7 @@ import pytest
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.okx_training_facts import build_okx_history_training_sample
 from services.paper_exploration import build_paper_exploration_contract
+from services.paper_training import build_paper_training_contract
 from services.training_data_quality import annotate_training_payload
 
 
@@ -125,6 +126,24 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert label["realized_net_pnl_usdt"] == 8.5
 
 
+def test_paper_training_prefers_verified_account_contract_size_over_public_spec() -> None:
+    history = _history(pnl=100.0, realized_pnl=98.5)
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills = {
+        "contract_size": 0.1,
+        "contract_size_verified": True,
+        "contract_size_source": "okx_account_position_margin_notional_crosscheck",
+    }
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["contract_ct_val"] == pytest.approx(0.1)
+    assert sample["contract_ct_val_source"].startswith("okx_account_position_")
+    assert sample["contract_ct_val_corrected"] is True
+    assert sample["notional_usdt"] == pytest.approx(20_000.0)
+    assert "account_contract_size_evidence_conflict" not in sample["training_evidence_gaps"]
+    assert sample["trade_fact_trusted"] is True
+
+
 def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reason() -> None:
     provenance = {
         "source": "test_cost_complete_return_distribution",
@@ -172,6 +191,73 @@ def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reas
     )
     assert sample["paper_exploration_evidence"]["sample_target"] is None
     assert sample["paper_exploration_evidence"]["daily_sample_quota"] is None
+
+
+def test_paper_training_loss_is_a_normal_authoritative_training_sample() -> None:
+    lineage = _complete_lineage()
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "paper_training": build_paper_training_contract(
+            symbol="BTC/USDT",
+            selected_side="long",
+            signal_source="local_ml_observation",
+            expected_net_return_pct=-0.5,
+            return_lcb_pct=-0.8,
+            horizon_minutes=10.0,
+        ),
+        "paper_training_mode": "bootstrap",
+    }
+    history = _history(
+        close_avg_px=99_650.0,
+        realized_pnl=-8.5,
+        pnl=-7.0,
+        pnl_ratio=-0.0085,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "realizedPnl": "-8.5",
+        "pnl": "-7",
+        "pnlRatio": "-0.0085",
+    }
+
+    sample = _outcome(build_okx_history_training_sample(history, **lineage))
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[sample],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert sample["strategy_entry_supervision_eligible"] is True
+    assert sample["strategy_training_role"] == "entry_strategy"
+    assert sample["strategy_entry_kind"] == "loss_tolerant_paper_training"
+    assert sample["paper_training_evidence"]["loss_tolerant_for_training"] is True
+    assert sample["paper_training_evidence"]["sample_target"] is None
+    assert sample["paper_training_evidence"]["daily_sample_quota"] is None
+    assert len(payload["trade_samples"]) == 1
+    assert payload["trade_samples"][0]["profit_learning_labels"][
+        "realized_net_pnl_usdt"
+    ] == -8.5
+
+
+def test_paper_training_contract_is_never_trainable_as_a_live_trade() -> None:
+    lineage = _complete_lineage()
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "paper_training": build_paper_training_contract(
+            symbol="BTC/USDT",
+            selected_side="long",
+            signal_source="local_ml_observation",
+            horizon_minutes=10.0,
+        )
+    }
+
+    sample = build_okx_history_training_sample(
+        _history(mode="live"),
+        **lineage,
+    )
+
+    assert sample["strategy_entry_supervision_eligible"] is False
+    assert sample["strategy_training_role"] == "invalid_paper_training_research_only"
+    assert "invalid_paper_training_contract" in sample["training_evidence_gaps"]
 
 
 def test_stale_contract_multiplier_uses_authoritative_gross_pnl_price_path() -> None:

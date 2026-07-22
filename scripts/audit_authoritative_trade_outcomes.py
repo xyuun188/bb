@@ -65,6 +65,12 @@ def _outcome_summary(outcome: dict[str, Any]) -> dict[str, Any]:
         "lifecycle_key": outcome.get("lifecycle_key"),
         "position_ids": sorted(_position_ids(outcome)),
         "decision_id": outcome.get("decision_id"),
+        "execution_mode": outcome.get("execution_mode"),
+        "strategy_entry_kind": outcome.get("strategy_entry_kind"),
+        "strategy_training_role": outcome.get("strategy_training_role"),
+        "strategy_selection_reason": outcome.get("strategy_selection_reason"),
+        "paper_training_evidence": outcome.get("paper_training_evidence"),
+        "paper_exploration_evidence": outcome.get("paper_exploration_evidence"),
         "entry_order_ids": outcome.get("entry_order_ids"),
         "close_order_ids": outcome.get("close_order_ids"),
         "symbol": outcome.get("symbol"),
@@ -83,6 +89,15 @@ def _outcome_summary(outcome: dict[str, Any]) -> dict[str, Any]:
         "consumer_provenance": outcome.get("consumer_provenance"),
         "learning_summary": outcome.get("learning_summary"),
     }
+
+
+def _strategy_entry_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(
+        str(row.get("strategy_entry_kind") or "unclassified").strip()
+        or "unclassified"
+        for row in rows
+    )
+    return dict(counts.most_common())
 
 
 def _gap_summary(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -205,6 +220,20 @@ async def audit(
         "incomplete_count": sum(item.get("outcome_complete") is not True for item in outcomes),
         "training_integrity": {
             "trainable_count": len(trainable),
+            "all_outcome_entry_kind_counts": _strategy_entry_kind_counts(outcomes),
+            "trainable_entry_kind_counts": _strategy_entry_kind_counts(trainable),
+            "loss_tolerant_paper_training_count": sum(
+                item.get("strategy_entry_kind") == "loss_tolerant_paper_training"
+                for item in trainable
+            ),
+            "bounded_paper_exploration_count": sum(
+                item.get("strategy_entry_kind") == "bounded_risk_paper_exploration"
+                for item in trainable
+            ),
+            "normal_strategy_trade_count": sum(
+                item.get("strategy_entry_kind") == "normal_strategy_trade"
+                for item in trainable
+            ),
             "contract_notional_corrected_count": sum(
                 item.get("contract_notional_corrected") is True for item in trainable
             ),

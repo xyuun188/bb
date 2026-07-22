@@ -38,10 +38,13 @@ from services.current_position_management import (
     current_position_management_contract_complete,
 )
 from services.okx_native_facts import (
+    OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO,
     OkxNativeAccountBill,
     OkxNativeFactsClient,
     OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
+    derive_okx_account_contract_size_evidence,
+    derive_okx_account_history_contract_size_evidence,
 )
 from services.okx_position_confirmation import (
     OkxCurrentPositionEntryConfirmation,
@@ -53,6 +56,11 @@ from services.okx_position_history_store import (
     upsert_okx_position_history_row,
 )
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
+from services.paper_training import (
+    build_paper_training_position_lifecycle,
+    paper_training_contract_reasons,
+    paper_training_decision_id_from_client_order_id,
+)
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
 from services.position_settlement import (
     apply_position_settlement_snapshot,
@@ -94,6 +102,7 @@ OKX_SYNC_EXECUTION_RESULT_CONFIRMED = "okx_execution_result_confirmed"
 OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING = "okx_native_full_close_pending_backfill"
 OKX_POSITION_SYNC_SUPPRESSION_EVENT_TYPE = "okx_position_sync_suppression"
 NATIVE_FULL_CLOSE_BACKFILL_WINDOW_SECONDS = 20 * 60
+ACCOUNT_CONTRACT_SIZE_SOURCE_PREFIX = "okx_account_position_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +121,66 @@ class OkxPositionFactSyncSummary:
             "skipped_count": self.skipped_count,
             "samples": list(self.samples),
         }
+
+
+class OkxContractSizeCatalog(dict[str, float]):
+    """Contract sizes plus account authority and quarantine metadata."""
+
+    def __init__(self, public_sizes: dict[str, float] | None = None) -> None:
+        normalized = {
+            str(inst_id or "").strip().upper(): float(size)
+            for inst_id, size in dict(public_sizes or {}).items()
+            if str(inst_id or "").strip() and _safe_float(size, 0.0) > 0
+        }
+        super().__init__(normalized)
+        self.sources: dict[str, str] = {
+            inst_id: "okx_public_instruments" for inst_id in normalized
+        }
+        self.invalid_reasons: dict[str, str] = {}
+        self.evidence: dict[str, dict[str, Any]] = {}
+
+    def set_verified(
+        self,
+        inst_id: str,
+        contract_size: float,
+        *,
+        source: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        key = str(inst_id or "").strip().upper()
+        size = _safe_float(contract_size, 0.0)
+        if not key or size <= 0:
+            return
+        self[key] = size
+        self.sources[key] = str(source or "").strip() or "verified_contract_size"
+        self.invalid_reasons.pop(key, None)
+        if evidence:
+            self.evidence[key] = dict(evidence)
+
+    def quarantine(
+        self,
+        inst_id: str,
+        reason: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        key = str(inst_id or "").strip().upper()
+        if not key:
+            return
+        self.pop(key, None)
+        self.sources.pop(key, None)
+        self.invalid_reasons[key] = str(reason or "contract_size_evidence_incomplete")
+        if evidence:
+            self.evidence[key] = dict(evidence)
+
+    def is_quarantined(self, inst_id: str) -> bool:
+        return str(inst_id or "").strip().upper() in self.invalid_reasons
+
+    def source_for(self, inst_id: str) -> str:
+        return self.sources.get(str(inst_id or "").strip().upper(), "")
+
+    def reason_for(self, inst_id: str) -> str:
+        return self.invalid_reasons.get(str(inst_id or "").strip().upper(), "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +285,222 @@ class OkxOrderFactSyncSummary:
             "error": self.error,
             "samples": list(self.samples),
         }
+
+
+def _build_contract_size_catalog(
+    *,
+    mode: str,
+    public_sizes: dict[str, float],
+    exchange_positions: list[dict[str, Any]],
+    position_history_rows: Iterable[dict[str, Any]] = (),
+    fills: Iterable[OkxNativeFillGroup] = (),
+    local_orders: Iterable[Order] = (),
+) -> OkxContractSizeCatalog:
+    """Use private demo-account evidence without changing live resolution."""
+
+    catalog = OkxContractSizeCatalog(public_sizes)
+    if str(mode or "").strip().lower() != "paper":
+        return catalog
+
+    current_evidence: dict[str, list[Any]] = {}
+    for row in exchange_positions:
+        evidence = derive_okx_account_contract_size_evidence(row)
+        if evidence.inst_id:
+            current_evidence.setdefault(evidence.inst_id, []).append(evidence)
+
+    history_evidence: dict[str, tuple[float, Any]] = {}
+    fill_rows = tuple(fills)
+    for row in position_history_rows:
+        evidence = derive_okx_account_history_contract_size_evidence(
+            row,
+            fills=fill_rows,
+        )
+        if not evidence.inst_id:
+            continue
+        if not evidence.verified and not evidence.source.endswith("evidence_conflict"):
+            continue
+        timestamp = _safe_float(
+            row.get("uTime") or row.get("updatedTime") or row.get("closeTime"),
+            0.0,
+        )
+        existing = history_evidence.get(evidence.inst_id)
+        if existing is None or timestamp > existing[0]:
+            history_evidence[evidence.inst_id] = (timestamp, evidence)
+
+    persisted_sizes: dict[str, list[tuple[float, str, dict[str, Any]]]] = {}
+    for order in local_orders:
+        raw = getattr(order, "okx_raw_fills", None)
+        raw = raw if isinstance(raw, dict) else {}
+        source = str(raw.get("contract_size_source") or "").strip()
+        if not source.startswith(ACCOUNT_CONTRACT_SIZE_SOURCE_PREFIX):
+            continue
+        if raw.get("contract_size_verified") is not True:
+            continue
+        inst_id = str(raw.get("inst_id") or _order_inst_id(order)).strip().upper()
+        size = _safe_float(raw.get("contract_size") or raw.get("contractSize"), 0.0)
+        if inst_id and size > 0:
+            persisted_sizes.setdefault(inst_id, []).append((size, source, dict(raw)))
+
+    for inst_id in sorted(
+        set(current_evidence) | set(history_evidence) | set(persisted_sizes)
+    ):
+        rows = current_evidence.get(inst_id, [])
+        latest_history = history_evidence.get(inst_id)
+        history = latest_history[1] if latest_history is not None else None
+        persisted = persisted_sizes.get(inst_id, [])
+        incomplete = [evidence for evidence in rows if not evidence.verified]
+        current_sizes = [float(evidence.contract_size) for evidence in rows if evidence.verified]
+        history_sizes = (
+            [float(history.contract_size)]
+            if history is not None and history.verified
+            else []
+        )
+        persisted_values = [size for size, _source, _raw in persisted]
+        evidence_payload = {
+            "account_position_evidence": [evidence.as_dict() for evidence in rows],
+            "account_position_history_evidence": (
+                history.as_dict() if history is not None else {}
+            ),
+            "persisted_account_contract_sizes": persisted_values,
+            "public_contract_size": _safe_float(public_sizes.get(inst_id), 0.0),
+        }
+        if incomplete:
+            catalog.quarantine(
+                inst_id,
+                incomplete[0].reason,
+                evidence=evidence_payload,
+            )
+            continue
+        history_conflict = bool(
+            history is not None
+            and not history.verified
+            and history.source.endswith("evidence_conflict")
+        )
+        if not current_sizes and history_conflict:
+            catalog.quarantine(
+                inst_id,
+                history.reason,
+                evidence=evidence_payload,
+            )
+            continue
+        authoritative_sizes = current_sizes or history_sizes
+        all_account_sizes = [*authoritative_sizes, *persisted_values]
+        if not all_account_sizes:
+            continue
+        reference = all_account_sizes[0]
+        if any(
+            not _relative_close_enough(
+                reference,
+                size,
+                OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO,
+            )
+            for size in all_account_sizes[1:]
+        ):
+            catalog.quarantine(
+                inst_id,
+                "current_and_persisted_account_contract_sizes_disagree",
+                evidence=evidence_payload,
+            )
+            continue
+        if current_sizes:
+            source = rows[0].source
+            size = sum(current_sizes) / len(current_sizes)
+        elif history_sizes:
+            source = history.source
+            size = sum(history_sizes) / len(history_sizes)
+        else:
+            source = "okx_account_position_persisted_verified_contract_size"
+            size = sum(persisted_values) / len(persisted_values)
+        public_size = _safe_float(public_sizes.get(inst_id), 0.0)
+        if public_size > 0 and _relative_close_enough(
+            size,
+            public_size,
+            OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO,
+        ):
+            # Private margin/notional values can carry small mark-price and
+            # margin rounding noise.  When they confirm the public tick size,
+            # keep the exact exchange catalogue value; only material demo/live
+            # differences (for example 100 versus 10) override it.
+            size = public_size
+        catalog.set_verified(
+            inst_id,
+            size,
+            source=source,
+            evidence=evidence_payload,
+        )
+    return catalog
+
+
+def _contract_size_catalog_is_quarantined(
+    contract_sizes: dict[str, float],
+    inst_id: str,
+) -> bool:
+    return isinstance(contract_sizes, OkxContractSizeCatalog) and contract_sizes.is_quarantined(
+        inst_id
+    )
+
+
+def _contract_size_catalog_reason(
+    contract_sizes: dict[str, float],
+    inst_id: str,
+) -> str:
+    if isinstance(contract_sizes, OkxContractSizeCatalog):
+        return contract_sizes.reason_for(inst_id)
+    return ""
+
+
+def _contract_size_catalog_source(
+    contract_sizes: dict[str, float],
+    inst_id: str,
+) -> str:
+    if isinstance(contract_sizes, OkxContractSizeCatalog):
+        return contract_sizes.source_for(inst_id)
+    return "okx_public_instruments"
+
+
+def _position_history_row_with_contract_size_evidence(
+    row: dict[str, Any],
+    contract_sizes: dict[str, float],
+) -> dict[str, Any]:
+    inst_id = _position_history_inst_id(row)
+    source = _contract_size_catalog_source(contract_sizes, inst_id)
+    size = _safe_float(contract_sizes.get(inst_id), 0.0)
+    if not source.startswith(ACCOUNT_CONTRACT_SIZE_SOURCE_PREFIX) or size <= 0:
+        return row
+    enriched = dict(row)
+    spec = enriched.get("_bb_contract_spec")
+    spec = dict(spec) if isinstance(spec, dict) else {}
+    spec["ctVal"] = str(size)
+    enriched["_bb_contract_spec"] = spec
+    enriched["_bb_contract_spec_source"] = source
+    if isinstance(contract_sizes, OkxContractSizeCatalog):
+        enriched["_bb_contract_size_evidence"] = dict(
+            contract_sizes.evidence.get(inst_id, {})
+        )
+    return enriched
+
+
+def _quarantine_order_contract_size(
+    order: Order,
+    *,
+    contract_sizes: dict[str, float],
+    now: datetime,
+) -> bool:
+    inst_id = _order_inst_id(order)
+    if not _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+        return False
+    reason = _contract_size_catalog_reason(contract_sizes, inst_id)
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = dict(raw) if isinstance(raw, dict) else {}
+    raw["contract_size_verified"] = False
+    raw["contract_size_source"] = "okx_account_position_evidence_quarantined"
+    raw["contract_size_evidence_gap"] = reason
+    order.okx_raw_fills = raw
+    order.okx_sync_status = OKX_SYNC_UNVERIFIED
+    order.okx_state = "contract_size_evidence_quarantined"
+    order.okx_synced_at = now
+    order.okx_last_error = f"OKX account contract-size evidence incomplete: {reason}"
+    return True
 
 
 class OkxOrderFactSyncService:
@@ -564,6 +849,24 @@ class OkxOrderFactSyncService:
         )
         async with get_session_ctx() as session:
             writable_orders = await self._load_writable_refresh_orders(session, since_naive)
+            if okx_pull_available:
+                # The native positions-history endpoint is optional and can
+                # be rate-limited.  Load the already verified local mirror
+                # before resolving contract units so a recent closed demo
+                # lifecycle (such as ZAMA) is still eligible for account-level
+                # PnL/fill cross-check recovery.
+                mirrored_position_history = await load_okx_position_history_records(
+                    session,
+                    mode=self.mode,
+                    limit=min(self.limit * 4, 5000),
+                )
+                mirrored_position_history_rows = okx_position_history_records_to_rows(
+                    mirrored_position_history
+                )
+                if mirrored_position_history_rows:
+                    position_history_rows = _dedupe_position_history_rows(
+                        [*position_history_rows, *mirrored_position_history_rows]
+                    )
             stored_repair_orders = (
                 writable_orders
                 if okx_pull_available
@@ -578,6 +881,27 @@ class OkxOrderFactSyncService:
                 for order in (writable_orders if okx_pull_available else stored_repair_orders)
                 if (decision_id := getattr(order, "decision_id", None))
             }
+            decision_ids.update(
+                decision_id
+                for row in order_rows
+                if (
+                    decision_id := paper_training_decision_id_from_client_order_id(
+                        _order_row_client_order_id(row)
+                    )
+                )
+            )
+            decision_ids.update(
+                decision_id
+                for fill in fills
+                if (
+                    decision_id := paper_training_decision_id_from_client_order_id(
+                        _fill_client_order_id(
+                            fill,
+                            order_rows_by_id.get(str(fill.order_id or "").strip()),
+                        )
+                    )
+                )
+            )
             decisions_by_id: dict[int, AIDecision] = {}
             if decision_ids:
                 decision_rows = await session.execute(
@@ -591,6 +915,66 @@ class OkxOrderFactSyncService:
             unverified_count = 0
             skipped_old_count = 0
             samples: list[dict[str, Any]] = []
+            contract_sizes = _build_contract_size_catalog(
+                mode=self.mode,
+                public_sizes=contract_sizes,
+                exchange_positions=exchange_positions,
+                position_history_rows=position_history_rows,
+                fills=fills,
+                local_orders=writable_orders,
+            )
+            if okx_pull_available:
+                contract_repair_orders = await self._load_account_contract_size_repair_orders(
+                    session,
+                    contract_sizes=contract_sizes,
+                    since_naive=since_naive,
+                )
+                if contract_repair_orders:
+                    writable_orders = _merge_local_order_rows(
+                        writable_orders,
+                        contract_repair_orders,
+                    )
+                    missing_decision_ids = {
+                        int(decision_id)
+                        for order in contract_repair_orders
+                        if (decision_id := getattr(order, "decision_id", None))
+                        and int(decision_id) not in decisions_by_id
+                    }
+                    if missing_decision_ids:
+                        repair_decision_rows = await session.execute(
+                            select(AIDecision).where(
+                                AIDecision.id.in_(sorted(missing_decision_ids))
+                            )
+                        )
+                        decisions_by_id.update(
+                            {
+                                int(decision.id): decision
+                                for decision in repair_decision_rows.scalars().all()
+                            }
+                        )
+            if isinstance(contract_sizes, OkxContractSizeCatalog):
+                for inst_id, source in sorted(contract_sizes.sources.items()):
+                    if source.startswith(ACCOUNT_CONTRACT_SIZE_SOURCE_PREFIX):
+                        samples.append(
+                            {
+                                "kind": "okx_account_contract_size_verified",
+                                "inst_id": inst_id,
+                                "contract_size": contract_sizes.get(inst_id),
+                                "source": source,
+                                "public_contract_size": _safe_mapping(
+                                    contract_sizes.evidence.get(inst_id)
+                                ).get("public_contract_size"),
+                            }
+                        )
+                for inst_id, reason in sorted(contract_sizes.invalid_reasons.items()):
+                    samples.append(
+                        {
+                            "kind": "okx_account_contract_size_quarantined",
+                            "inst_id": inst_id,
+                            "reason": reason,
+                        }
+                    )
+            contract_size_samples = list(samples)
             backfilled_count = 0
             order_history_backfilled_count = 0
             position_history_result = OkxPositionFactSyncSummary()
@@ -617,10 +1001,12 @@ class OkxOrderFactSyncService:
                     now=datetime.now(UTC),
                     since=since,
                 )
+                samples[:0] = contract_size_samples
                 backfilled_count, order_history_backfilled_count = await self._backfill_okx_only_orders(
                     session,
                     fills=fills,
                     order_rows=order_rows,
+                    decisions_by_id=decisions_by_id,
                     protection_execution_by_order_id=protection_execution_by_order_id,
                     contract_sizes=contract_sizes,
                     since=since,
@@ -628,26 +1014,6 @@ class OkxOrderFactSyncService:
                     samples=samples,
                 )
                 await session.flush()
-                mirrored_position_history = await load_okx_position_history_records(
-                    session,
-                    mode=self.mode,
-                    limit=min(self.limit * 4, 5000),
-                )
-                mirrored_position_history_rows = okx_position_history_records_to_rows(
-                    mirrored_position_history
-                )
-                if mirrored_position_history_rows:
-                    live_position_history_count = len(position_history_rows)
-                    position_history_rows = _dedupe_position_history_rows(
-                        [*position_history_rows, *mirrored_position_history_rows]
-                    )
-                    samples.append(
-                        {
-                            "kind": "okx_position_history_mirror_reused",
-                            "record_count": len(mirrored_position_history_rows),
-                            "live_record_count": live_position_history_count,
-                        }
-                    )
                 position_history_result = await self._sync_position_history_rows(
                     session,
                     position_history_rows=position_history_rows,
@@ -897,6 +1263,42 @@ class OkxOrderFactSyncService:
             if _order_needs_okx_fact_refresh(order)
         ]
 
+    async def _load_account_contract_size_repair_orders(
+        self,
+        session: Any,
+        *,
+        contract_sizes: dict[str, float],
+        since_naive: datetime,
+    ) -> list[Order]:
+        if self.mode != "paper" or not isinstance(contract_sizes, OkxContractSizeCatalog):
+            return []
+        account_inst_ids = sorted(
+            inst_id
+            for inst_id, source in contract_sizes.sources.items()
+            if source.startswith(ACCOUNT_CONTRACT_SIZE_SOURCE_PREFIX)
+        )
+        if not account_inst_ids:
+            return []
+        rows = await session.execute(
+            select(Order)
+            .where(
+                Order.execution_mode == self.mode,
+                Order.okx_inst_id.in_(account_inst_ids),
+                or_(
+                    Order.created_at >= since_naive,
+                    Order.filled_at >= since_naive,
+                    Order.okx_synced_at >= since_naive,
+                ),
+            )
+            .order_by(Order.filled_at.desc().nullslast(), Order.id.desc())
+            .limit(self.limit * 4)
+        )
+        return [
+            order
+            for order in rows.scalars().all()
+            if _order_needs_account_contract_size_repair(order, contract_sizes)
+        ]
+
     def _apply_local_order_facts(
         self,
         orders: list[Order],
@@ -921,6 +1323,14 @@ class OkxOrderFactSyncService:
             order_time = _order_time(order)
             if order_time is not None and order_time < since:
                 skipped_old_count += 1
+                continue
+            if _quarantine_order_contract_size(
+                order,
+                contract_sizes=contract_sizes,
+                now=now,
+            ):
+                unverified_count += 1
+                samples.append(_sample(order, kind="local_order_contract_size_quarantined"))
                 continue
             exchange_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
             fill = next(
@@ -1123,6 +1533,7 @@ class OkxOrderFactSyncService:
         *,
         fills: list[OkxNativeFillGroup],
         order_rows: list[dict[str, Any]],
+        decisions_by_id: dict[int, AIDecision],
         protection_execution_by_order_id: dict[str, dict[str, Any]],
         contract_sizes: dict[str, float],
         since: datetime,
@@ -1148,12 +1559,35 @@ class OkxOrderFactSyncService:
                 continue
             if fill.timestamp is not None and _aware_utc(fill.timestamp) < since:
                 continue
+            if _contract_size_catalog_is_quarantined(contract_sizes, fill.inst_id):
+                samples.append(
+                    {
+                        "kind": "okx_only_fill_contract_size_quarantined",
+                        "inst_id": fill.inst_id,
+                        "exchange_order_id": fill.order_id,
+                        "reason": _contract_size_catalog_reason(
+                            contract_sizes,
+                            fill.inst_id,
+                        ),
+                    }
+                )
+                continue
             contract_size, contract_size_source = _contract_size_for_fill_with_source(
                 fill,
                 contract_sizes,
             )
+            order_row = order_rows_by_id.get(fill.order_id)
+            decision = _paper_training_decision_for_order_fact(
+                fill=fill,
+                order_row=order_row,
+                decisions_by_id=decisions_by_id,
+            )
             order = Order(
-                model_name="okx_authoritative_sync",
+                model_name=(
+                    str(getattr(decision, "model_name", "") or "okx_authoritative_sync")
+                    if decision is not None
+                    else "okx_authoritative_sync"
+                ),
                 execution_mode=self.mode,
                 symbol=fill.symbol,
                 side=fill.side,
@@ -1162,7 +1596,7 @@ class OkxOrderFactSyncService:
                 price=fill.avg_price,
                 status="filled",
                 fee=fill.fee_abs,
-                decision_id=None,
+                decision_id=(int(decision.id) if decision is not None else None),
                 exchange_order_id=fill.order_id,
                 filled_at=fill.timestamp or now,
                 created_at=fill.timestamp or now,
@@ -1174,13 +1608,29 @@ class OkxOrderFactSyncService:
                 sync_status=OKX_SYNC_OKX_ONLY,
                 contract_size=contract_size,
                 contract_size_source=contract_size_source,
-                order_row=order_rows_by_id.get(fill.order_id),
+                order_row=order_row,
                 protection_execution=protection_execution_by_order_id.get(fill.order_id),
             )
+            if decision is not None:
+                _apply_paper_training_exchange_recovery_to_decision(
+                    decision,
+                    fill=fill,
+                    client_order_id=_fill_client_order_id(fill, order_row),
+                    now=now,
+                )
             session.add(order)
             existing_exchange_ids.add(fill.order_id)
             backfilled += 1
-            samples.append(_sample(order, kind="okx_only_backfilled"))
+            samples.append(
+                _sample(
+                    order,
+                    kind=(
+                        "okx_only_backfilled_with_paper_training_decision"
+                        if decision is not None
+                        else "okx_only_backfilled"
+                    ),
+                )
+            )
         for row in order_rows:
             order_id = _order_row_id(row)
             if not order_id or order_id in existing_exchange_ids:
@@ -1189,6 +1639,20 @@ class OkxOrderFactSyncService:
             if order_time is not None and _aware_utc(order_time) < since:
                 continue
             if _order_row_state(row) == "filled":
+                continue
+            inst_id = str(row.get("instId") or "").strip().upper()
+            if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+                samples.append(
+                    {
+                        "kind": "okx_order_history_contract_size_quarantined",
+                        "inst_id": inst_id,
+                        "exchange_order_id": order_id,
+                        "reason": _contract_size_catalog_reason(
+                            contract_sizes,
+                            inst_id,
+                        ),
+                    }
+                )
                 continue
             order = _order_from_order_history_row(
                 row,
@@ -1229,6 +1693,21 @@ class OkxOrderFactSyncService:
                 skipped += 1
                 continue
             checked += 1
+            if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+                skipped += 1
+                samples.append(
+                    {
+                        "kind": "okx_position_history_contract_size_quarantined",
+                        "inst_id": inst_id,
+                        "okx_pos_id": _position_history_pos_id(row),
+                        "reason": _contract_size_catalog_reason(
+                            contract_sizes,
+                            inst_id,
+                        ),
+                    }
+                )
+                continue
+            row = _position_history_row_with_contract_size_evidence(row, contract_sizes)
             pos_id = _position_history_pos_id(row)
             side = _position_history_side(row)
             created_at = _position_history_opened_at(row) or position_time or now
@@ -1462,6 +1941,24 @@ class OkxOrderFactSyncService:
         skipped = 0
         for entry_fill, close_fill, side in _closed_position_fill_pair_candidates(unlinked_fills):
             checked += 1
+            if _contract_size_catalog_is_quarantined(
+                contract_sizes,
+                entry_fill.inst_id,
+            ):
+                skipped += 1
+                samples.append(
+                    {
+                        "kind": "okx_fill_pair_contract_size_quarantined",
+                        "inst_id": entry_fill.inst_id,
+                        "entry_exchange_order_id": entry_fill.order_id,
+                        "close_exchange_order_id": close_fill.order_id,
+                        "reason": _contract_size_catalog_reason(
+                            contract_sizes,
+                            entry_fill.inst_id,
+                        ),
+                    }
+                )
+                continue
             if entry_fill.order_id in linked_order_ids or close_fill.order_id in linked_order_ids:
                 skipped += 1
                 continue
@@ -1829,6 +2326,20 @@ class OkxOrderFactSyncService:
                 skipped += 1
                 continue
             checked += 1
+            if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+                skipped += 1
+                samples.append(
+                    {
+                        "kind": "okx_current_position_contract_size_quarantined",
+                        "inst_id": inst_id,
+                        "okx_pos_id": _current_position_pos_id(row),
+                        "reason": _contract_size_catalog_reason(
+                            contract_sizes,
+                            inst_id,
+                        ),
+                    }
+                )
+                continue
             payload = _position_from_current_row(
                 row,
                 mode=self.mode,
@@ -1893,12 +2404,20 @@ class OkxOrderFactSyncService:
                 decisions_by_id=entry_decisions_by_id,
             )
             paper_canary_lifecycle: dict[str, Any] = {}
+            paper_training_lifecycle: dict[str, Any] = {}
             for decision_id in original_entry["decision_ids"]:
                 lifecycle = build_paper_canary_position_lifecycle(
                     entry_decisions_by_id.get(int(decision_id))
                 )
                 if lifecycle:
                     paper_canary_lifecycle = lifecycle
+                    break
+            for decision_id in original_entry["decision_ids"]:
+                lifecycle = build_paper_training_position_lifecycle(
+                    entry_decisions_by_id.get(int(decision_id))
+                )
+                if lifecycle:
+                    paper_training_lifecycle = lifecycle
                     break
             management_facts = {
                 **position_portfolio,
@@ -1925,6 +2444,7 @@ class OkxOrderFactSyncService:
                 "account_equity_usdt": portfolio_snapshot.get("account_equity_usdt"),
                 "open_position_count": portfolio_snapshot.get("open_position_count"),
                 "paper_canary_lifecycle": paper_canary_lifecycle,
+                "paper_training_lifecycle": paper_training_lifecycle,
             }
             previous_management_contract = _safe_mapping(
                 getattr(existing, "current_management_contract", None)
@@ -2905,6 +3425,12 @@ def _repair_stored_fill_contract_size_from_instruments(
     inst_id = str(raw.get("inst_id") or _order_inst_id(order)).strip().upper()
     if not inst_id:
         return False
+    if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+        return _quarantine_order_contract_size(
+            order,
+            contract_sizes=contract_sizes,
+            now=now,
+        )
     contract_size = _safe_float(contract_sizes.get(inst_id), 0.0)
     if contract_size <= 0:
         return False
@@ -2924,13 +3450,14 @@ def _repair_stored_fill_contract_size_from_instruments(
         and _relative_close_enough(existing_base_quantity, base_quantity, 0.000001)
         and _relative_close_enough(local_quantity, base_quantity, 0.000001)
     )
+    contract_size_source = _contract_size_catalog_source(contract_sizes, inst_id)
     if already_verified:
-        if str(raw.get("contract_size_source") or "").strip() != "okx_public_instruments":
+        if str(raw.get("contract_size_source") or "").strip() != contract_size_source:
             order.okx_inst_id = inst_id
             order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
             order.okx_synced_at = now
             order.okx_last_error = None
-            raw["contract_size_source"] = "okx_public_instruments"
+            raw["contract_size_source"] = contract_size_source
             raw["contract_size_verified"] = True
             raw["fills_history_confirmed"] = True
             order.okx_raw_fills = raw
@@ -2953,7 +3480,7 @@ def _repair_stored_fill_contract_size_from_instruments(
     raw["contracts"] = contracts
     raw["contract_size"] = contract_size
     raw["contract_size_verified"] = True
-    raw["contract_size_source"] = "okx_public_instruments"
+    raw["contract_size_source"] = contract_size_source
     raw["base_quantity"] = base_quantity
     raw["fills_history_confirmed"] = True
     order.okx_raw_fills = raw
@@ -2972,6 +3499,12 @@ def _repair_execution_result_contract_size_from_instruments(
     inst_id = str(raw.get("inst_id") or _order_inst_id(order)).strip().upper()
     if not inst_id:
         return False
+    if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+        return _quarantine_order_contract_size(
+            order,
+            contract_sizes=contract_sizes,
+            now=now,
+        )
     contract_size = _safe_float(contract_sizes.get(inst_id), 0.0)
     if contract_size <= 0:
         return False
@@ -2991,13 +3524,14 @@ def _repair_execution_result_contract_size_from_instruments(
         and _relative_close_enough(existing_base_quantity, base_quantity, 0.000001)
         and _relative_close_enough(local_quantity, base_quantity, 0.000001)
     )
+    contract_size_source = _contract_size_catalog_source(contract_sizes, inst_id)
     if already_verified:
-        if str(raw.get("contract_size_source") or "").strip() != "okx_public_instruments":
+        if str(raw.get("contract_size_source") or "").strip() != contract_size_source:
             order.okx_inst_id = inst_id
             order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
             order.okx_synced_at = now
             order.okx_last_error = None
-            raw["contract_size_source"] = "okx_public_instruments"
+            raw["contract_size_source"] = contract_size_source
             raw["contract_size_verified"] = True
             raw["execution_result_confirmed"] = True
             order.okx_raw_fills = raw
@@ -3016,7 +3550,7 @@ def _repair_execution_result_contract_size_from_instruments(
     raw["contracts"] = contracts
     raw["contract_size"] = contract_size
     raw["contract_size_verified"] = True
-    raw["contract_size_source"] = "okx_public_instruments"
+    raw["contract_size_source"] = contract_size_source
     raw["base_quantity"] = base_quantity
     raw["execution_result_confirmed"] = True
     raw.setdefault("fills_history_confirmed", False)
@@ -3175,6 +3709,49 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
     }:
         return False
     return refreshable_status
+
+
+def _order_needs_account_contract_size_repair(
+    order: Order,
+    contract_sizes: dict[str, float],
+) -> bool:
+    if not _order_has_authoritative_stored_okx_fill_fact(order):
+        return False
+    inst_id = _order_inst_id(order)
+    if not inst_id or _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+        return False
+    source = _contract_size_catalog_source(contract_sizes, inst_id)
+    if not source.startswith(ACCOUNT_CONTRACT_SIZE_SOURCE_PREFIX):
+        return False
+    expected_size = _safe_float(contract_sizes.get(inst_id), 0.0)
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    contracts = _safe_float(
+        raw.get("contracts") or getattr(order, "okx_fill_contracts", None),
+        0.0,
+    )
+    if expected_size <= 0 or contracts <= 0:
+        return False
+    expected_quantity = contracts * expected_size
+    return bool(
+        raw.get("contract_size_verified") is not True
+        or str(raw.get("contract_size_source") or "").strip() != source
+        or not _relative_close_enough(
+            _safe_float(raw.get("contract_size") or raw.get("contractSize"), 0.0),
+            expected_size,
+            0.000001,
+        )
+        or not _relative_close_enough(
+            _stored_fill_base_quantity(raw),
+            expected_quantity,
+            0.000001,
+        )
+        or not _relative_close_enough(
+            _safe_float(getattr(order, "quantity", None), 0.0),
+            expected_quantity,
+            0.000001,
+        )
+    )
 
 
 def _order_needs_local_stored_fact_recovery(order: Order) -> bool:
@@ -3450,6 +4027,96 @@ def _order_row_id(row: dict[str, Any] | None) -> str:
     return str(row.get("ordId") or row.get("order") or row.get("id") or "").strip()
 
 
+def _order_row_client_order_id(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("clOrdId") or row.get("clientOrderId") or "").strip()
+
+
+def _fill_client_order_id(
+    fill: OkxNativeFillGroup,
+    order_row: dict[str, Any] | None,
+) -> str:
+    client_order_id = _order_row_client_order_id(order_row)
+    if client_order_id:
+        return client_order_id
+    for row in fill.rows:
+        client_order_id = _order_row_client_order_id(row)
+        if client_order_id:
+            return client_order_id
+    return ""
+
+
+def _paper_training_decision_for_order_fact(
+    *,
+    fill: OkxNativeFillGroup,
+    order_row: dict[str, Any] | None,
+    decisions_by_id: dict[int, AIDecision],
+) -> AIDecision | None:
+    client_order_id = _fill_client_order_id(fill, order_row)
+    decision_id = paper_training_decision_id_from_client_order_id(client_order_id)
+    decision = decisions_by_id.get(int(decision_id or 0))
+    if decision is None or getattr(decision, "is_paper", None) is not True:
+        return None
+    raw = getattr(decision, "raw_llm_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    contract = raw.get("paper_training")
+    contract = contract if isinstance(contract, dict) else {}
+    identity = raw.get("paper_training_order_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    try:
+        identity_decision_id = int(identity.get("decision_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    expected_side = {
+        "long": "buy",
+        "short": "sell",
+    }.get(str(getattr(decision, "action", "") or "").strip().lower())
+    if (
+        paper_training_contract_reasons(contract)
+        or identity.get("execution_scope") != "paper_only"
+        or identity.get("production_permission") is not False
+        or identity_decision_id != int(decision.id or 0)
+        or str(identity.get("client_order_id") or "").strip() != client_order_id
+        or normalize_trading_symbol(getattr(decision, "symbol", None))
+        != normalize_trading_symbol(fill.symbol)
+        or expected_side != str(fill.side or "").strip().lower()
+    ):
+        return None
+    return decision
+
+
+def _apply_paper_training_exchange_recovery_to_decision(
+    decision: AIDecision,
+    *,
+    fill: OkxNativeFillGroup,
+    client_order_id: str,
+    now: datetime,
+) -> None:
+    decision.was_executed = True
+    decision.executed_at = fill.timestamp or now
+    decision.execution_price = fill.avg_price
+    decision.execution_reason = (
+        "OKX 已确认该模拟训练订单成交；系统已按客户端订单身份恢复精确决策关联。"
+    )
+    raw = getattr(decision, "raw_llm_response", None)
+    raw = dict(raw) if isinstance(raw, dict) else {}
+    raw["paper_training_exchange_recovery"] = {
+        "version": "2026-07-22.paper-training-exchange-recovery.v1",
+        "source_authority": "okx_native_fills_and_client_order_identity",
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "client_order_id": client_order_id,
+        "exchange_order_id": fill.order_id,
+        "decision_id": int(decision.id or 0),
+        "contracts": fill.contracts,
+        "average_price": fill.avg_price,
+        "fee_usdt": fill.fee_abs,
+        "recovered_at": now.isoformat(),
+    }
+    decision.raw_llm_response = raw
+
+
 def _order_row_state(row: dict[str, Any] | None) -> str:
     if not isinstance(row, dict):
         return ""
@@ -3527,6 +4194,8 @@ def _contract_size_for_order_row(
     contract_sizes: dict[str, float],
 ) -> float:
     inst_id = str(row.get("instId") or "").strip().upper()
+    if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+        return 0.0
     size = _safe_float(contract_sizes.get(inst_id), 0.0)
     if size > 0:
         return size
@@ -4475,6 +5144,8 @@ def _current_portfolio_management_snapshot(
         contracts = _current_position_contracts(row)
         if not inst_id or side not in {"long", "short"} or contracts <= 0:
             continue
+        if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+            continue
         contract_size = _current_position_contract_size(row, contract_sizes)
         payload = _position_from_current_row(
             row,
@@ -4520,7 +5191,7 @@ def _position_from_current_row(
 ) -> dict[str, Any]:
     inst_id = _current_position_inst_id(row)
     contracts = _current_position_contracts(row)
-    quantity = contracts * (contract_size if contract_size > 0 else 1.0)
+    quantity = contracts * contract_size if contract_size > 0 else 0.0
     entry_price = _current_position_entry_price(row)
     mark_price = _current_position_mark_price(row)
     timestamp = _current_position_time(row) or now
@@ -4874,6 +5545,8 @@ def _current_position_contract_size(
     contract_sizes: dict[str, float],
 ) -> float:
     inst_id = _current_position_inst_id(row)
+    if _contract_size_catalog_is_quarantined(contract_sizes, inst_id):
+        return 0.0
     size = _contract_size_for_inst_id(inst_id, contract_sizes)
     if size > 0 and size != 1.0:
         return size
@@ -5316,7 +5989,10 @@ def _okx_numeric_exchange_order_ids(value: Any) -> str | None:
 
 
 def _contract_size_for_inst_id(inst_id: str, contract_sizes: dict[str, float]) -> float:
-    size = _safe_float(contract_sizes.get(str(inst_id or "").strip().upper()), 0.0)
+    key = str(inst_id or "").strip().upper()
+    if _contract_size_catalog_is_quarantined(contract_sizes, key):
+        return 0.0
+    size = _safe_float(contract_sizes.get(key), 0.0)
     return size if size > 0 else 1.0
 
 
@@ -5365,9 +6041,11 @@ def _contract_size_for_fill_with_source(
     contract_sizes: dict[str, float],
 ) -> tuple[float, str]:
     for key in (fill.inst_id, okx_inst_id_from_symbol(fill.symbol) or ""):
+        if _contract_size_catalog_is_quarantined(contract_sizes, key):
+            return 0.0, "okx_account_position_evidence_quarantined"
         size = _safe_float(contract_sizes.get(key), 0.0)
         if size > 0:
-            return size, "okx_public_instruments"
+            return size, _contract_size_catalog_source(contract_sizes, key)
     for row in fill.rows:
         size = _safe_float(row.get("ctVal") or row.get("contractSize"), 0.0)
         if size > 0:
@@ -5377,7 +6055,7 @@ def _contract_size_for_fill_with_source(
 
 def _fill_base_quantity(fill: OkxNativeFillGroup, contract_size: float) -> float:
     size = _safe_float(contract_size, 0.0)
-    return float(fill.contracts) * (size if size > 0 else 1.0)
+    return float(fill.contracts) * size if size > 0 else 0.0
 
 
 def _split_exchange_order_ids(value: Any) -> set[str]:

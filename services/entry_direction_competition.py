@@ -61,6 +61,41 @@ def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize directional observations without requiring promotion permission."""
+
+    objective_values = [
+        float(item["objective_expected_return_pct"])
+        for item in values
+        if _safe_float(item.get("objective_expected_return_pct")) is not None
+    ]
+    raw_values = [
+        float(item["raw_expected_return_pct"])
+        for item in values
+        if _safe_float(item.get("raw_expected_return_pct")) is not None
+    ]
+    horizon_values = [
+        float(item["horizon_minutes"])
+        for item in values
+        if (_safe_float(item.get("horizon_minutes")) or 0.0) > 0
+    ]
+    selected = objective_values or raw_values
+    return {
+        "score": sum(selected) / len(selected) if selected else None,
+        "objective_expected_return_pct": (
+            sum(objective_values) / len(objective_values)
+            if objective_values
+            else None
+        ),
+        "raw_expected_return_pct": (
+            sum(raw_values) / len(raw_values) if raw_values else None
+        ),
+        "horizon_minutes": min(horizon_values) if horizon_values else None,
+        "horizon_source_count": len(horizon_values),
+        "observation_count": len(selected),
+    }
+
+
 def _enforce_aggregate_contract_consistency(
     evidence: dict[str, list[dict[str, Any]]],
 ) -> list[str]:
@@ -142,6 +177,8 @@ class EntryDirectionCompetitionPolicy:
         aggregate_blockers = _enforce_aggregate_contract_consistency(evidence)
         long_side = _side_summary(evidence["long"])
         short_side = _side_summary(evidence["short"])
+        long_training = _training_side_summary(evidence["long"])
+        short_training = _training_side_summary(evidence["short"])
         long_score = float(long_side["score"])
         short_score = float(short_side["score"])
         source_count = int(long_side["production_source_count"]) + int(
@@ -154,12 +191,41 @@ class EntryDirectionCompetitionPolicy:
             if long_score > short_score
             else "short"
         )
+        training_scores = {
+            "long": long_training.get("score"),
+            "short": short_training.get("score"),
+        }
+        available_training_scores = {
+            side: score
+            for side, score in training_scores.items()
+            if _safe_float(score) is not None
+            and (_safe_float(
+                (long_training if side == "long" else short_training).get(
+                    "horizon_minutes"
+                )
+            ) or 0.0)
+            > 0
+        }
+        training_preferred_side = "neutral"
+        if available_training_scores:
+            training_preferred_side = max(
+                available_training_scores,
+                key=lambda side: float(available_training_scores[side]),
+            )
+            if len(available_training_scores) == 2 and (
+                available_training_scores["long"] == available_training_scores["short"]
+            ):
+                training_preferred_side = "neutral"
         return {
             "enabled": bool(source_count),
             "preferred_side": preferred_side,
             "score_gap": abs(long_score - short_score),
             "long": long_side,
             "short": short_side,
+            "training_preferred_side": training_preferred_side,
+            "training_long": long_training,
+            "training_short": short_training,
+            "training_permission": False,
             "production_source_count": source_count,
             "production_permission": False,
             "policy": "governed_gross_market_observation_only_no_fixed_gap",

@@ -68,6 +68,23 @@ def raise_if_okx_error(
 
     if not isinstance(result, Mapping):
         raise ExchangeAPIError(f"{fallback}: unexpected response type {type(result).__name__}")
+    rows = result.get("data")
+    if check_data_code and isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            item_code = str(row.get("sCode") or row.get("code") or "")
+            if item_code in {"", "0"}:
+                continue
+            message = safe_error_text(
+                row.get("sMsg") or row.get("msg") or fallback,
+                limit=240,
+            )
+            raise ExchangeAPIError(
+                f"OKX API error [{safe_error_text(item_code, limit=40)}]: {message}",
+                code=item_code,
+                payload={"response": dict(result), "item": dict(row)},
+            )
     code = str(result.get("code") or "")
     if code not in {"", "0"}:
         message = safe_error_text(result.get("msg") or fallback, limit=240)
@@ -75,23 +92,6 @@ def raise_if_okx_error(
             f"OKX API error [{safe_error_text(code, limit=40)}]: {message}",
             code=code,
             payload=dict(result),
-        )
-    if not check_data_code:
-        return
-    rows = result.get("data")
-    if not isinstance(rows, list):
-        return
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        item_code = str(row.get("sCode") or row.get("code") or "")
-        if item_code in {"", "0"}:
-            continue
-        message = safe_error_text(row.get("sMsg") or row.get("msg") or fallback, limit=240)
-        raise ExchangeAPIError(
-            f"OKX API error [{safe_error_text(item_code, limit=40)}]: {message}",
-            code=item_code,
-            payload={"response": dict(result), "item": dict(row)},
         )
 
 
@@ -895,6 +895,10 @@ class OkxPerpetualSdkExchange:
             payload["reduceOnly"] = _normalize_bool_text(params.get("reduceOnly"))
         if params.get("attachAlgoOrds") is not None:
             payload["attachAlgoOrds"] = params.get("attachAlgoOrds")
+        if params.get("clOrdId"):
+            payload["clOrdId"] = str(params.get("clOrdId"))
+        if params.get("tag"):
+            payload["tag"] = str(params.get("tag"))
         response = await self.privatePostTradeOrder(payload)
         return self._order_submit_to_ccxt_shape(response, payload)
 

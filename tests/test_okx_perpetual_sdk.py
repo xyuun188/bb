@@ -30,6 +30,17 @@ def test_sdk_error_preserves_order_item_code_and_payload() -> None:
     assert captured.value.payload == {"response": payload, "item": item}
 
 
+def test_sdk_error_prefers_specific_order_item_over_batch_failure() -> None:
+    item = {"ordId": "", "sCode": "51008", "sMsg": "Insufficient USDT margin"}
+    payload = {"code": "1", "msg": "All operations failed", "data": [item]}
+
+    with pytest.raises(ExchangeAPIError) as captured:
+        okx_perpetual_sdk.raise_if_okx_error(payload, check_data_code=True)
+
+    assert captured.value.code == "51008"
+    assert captured.value.payload == {"response": payload, "item": item}
+
+
 class _PublicApi:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -224,7 +235,7 @@ async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
         "buy",
         2,
         None,
-        {"tdMode": "cross", "reduceOnly": False},
+        {"tdMode": "cross", "reduceOnly": False, "clOrdId": "BBPT104208"},
     )
 
     assert order["id"] == "okx-1"
@@ -238,7 +249,7 @@ async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
                 "ordType": "market",
                 "sz": "2",
                 "ccy": "",
-                "clOrdId": "",
+                "clOrdId": "BBPT104208",
                 "tag": "",
                 "posSide": "",
                 "px": "",

@@ -198,6 +198,60 @@ def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
     assert "paper_exploration" not in decision.raw_response
 
 
+def test_no_champion_uses_loss_tolerant_paper_training_direction() -> None:
+    context = _return_context(
+        execution_mode="paper",
+        paper_training_mode="bootstrap",
+        paper_strategy_champion={
+            "active": False,
+            "paper_execution_permission": False,
+        },
+        direction_competition={
+            "preferred_side": "neutral",
+            "training_preferred_side": "short",
+            "training_short": {
+                "score": -0.4,
+                "raw_expected_return_pct": -0.1,
+                "objective_expected_return_pct": -0.4,
+                "horizon_minutes": 10,
+                "observation_count": 1,
+            },
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+
+    decision = _coordinator().combine(
+        _features(),
+        context,
+        _strong_long_opinions(),
+    )
+
+    assert decision.action == Action.SHORT
+    assert decision.raw_response["paper_training"]["loss_tolerant_for_training"] is True
+    assert decision.raw_response["paper_training"]["production_permission"] is False
+    assert decision.raw_response["paper_training"]["expected_net_return_pct"] == -0.4
+    assert decision.raw_response["paper_training"]["valid_for_seconds"] == 600.0
+
+
+def test_paper_training_route_is_never_created_for_live_execution() -> None:
+    context = _return_context(
+        execution_mode="live",
+        paper_training_mode="bootstrap",
+        direction_competition={
+            "training_preferred_side": "long",
+            "training_long": {"score": -1.0, "observation_count": 1},
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+
+    decision = _coordinator().combine(_features(), context, _strong_long_opinions())
+
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
+
+
 def test_expert_diversity_policy_is_carried_into_ensemble_raw() -> None:
     context = _return_context(
         _expert_diversity_policy={

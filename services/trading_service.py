@@ -144,6 +144,7 @@ from services.paper_bootstrap_canary import (
     PaperBootstrapCanaryPolicy,
     assess_paper_canary_position_horizon,
 )
+from services.paper_training import assess_paper_training_position_horizon
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -4730,6 +4731,8 @@ class TradingService:
             account_equity=account_equity,
             account_config=settings.get_execution_account_config(selected_mode),
         )
+        context["execution_mode"] = selected_mode
+        context["paper_training_mode"] = "bootstrap" if selected_mode == "paper" else "disabled"
         context["account_equity"] = account_equity
         context["strategy_context_performance"] = performance_snapshot
         if _analysis_scope_context.get() == "market":
@@ -4904,7 +4907,25 @@ class TradingService:
         if (datetime.now(UTC) - created_at).total_seconds() > max_age:
             return None
         context = entry.get("context")
-        return dict(context) if isinstance(context, dict) else None
+        if not isinstance(context, dict):
+            return None
+        result = dict(context)
+        result["execution_mode"] = selected_mode
+        champion = self._safe_dict(result.get("paper_strategy_champion"))
+        learning = self._safe_dict(result.get("strategy_learning"))
+        if not champion:
+            champion = self._safe_dict(learning.get("paper_strategy_champion"))
+        paper_training_mode = (
+            "disabled"
+            if selected_mode == "live"
+            else "normal"
+            if champion.get("active") is True
+            else "bootstrap"
+        )
+        result["paper_training_mode"] = paper_training_mode
+        learning["paper_training_mode"] = paper_training_mode
+        result["strategy_learning"] = learning
+        return result
 
     def _attach_strategy_learning_context(
         self,
@@ -9235,6 +9256,7 @@ class TradingService:
                 peak_state.get("peak_unrealized_pnl"), current_unrealized
             )
             canary_horizon = assess_paper_canary_position_horizon(position_snapshot)
+            training_horizon = assess_paper_training_position_horizon(position_snapshot)
 
             close_action = Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT
             trigger = (
@@ -9244,7 +9266,9 @@ class TradingService:
                     "take_profit"
                     if target_crossed
                     else (
-                        "paper_canary_horizon"
+                        "paper_training_horizon"
+                        if training_horizon.get("elapsed") is True
+                        else "paper_canary_horizon"
                         if canary_horizon.get("elapsed") is True
                         else "dynamic_position_scan"
                     )
@@ -9263,11 +9287,15 @@ class TradingService:
                 raw_response={
                     "fast_risk_trigger": trigger,
                     "forced_exit": bool(
-                        stop_crossed or target_crossed or canary_horizon.get("elapsed") is True
+                        stop_crossed
+                        or target_crossed
+                        or canary_horizon.get("elapsed") is True
+                        or training_horizon.get("elapsed") is True
                     ),
                     "close_evidence": {
                         "hard_risk": stop_crossed,
                         "paper_canary_horizon": canary_horizon,
+                        "paper_training_horizon": training_horizon,
                         "continuation_deteriorated": bool(adverse_returns),
                         "peak_unrealized_pnl_usdt": position_snapshot["peak_unrealized_pnl"],
                     },

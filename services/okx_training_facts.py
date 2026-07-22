@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from services.paper_exploration import paper_exploration_contract_reasons
+from services.paper_training import paper_training_contract_reasons
 
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
@@ -78,6 +79,55 @@ def _entry_fill_contracts(entry_orders: Iterable[Any]) -> float | None:
     ]
     valid = [value for value in values if value is not None and value > 0]
     return sum(valid) if valid else None
+
+
+def _account_contract_size_from_orders(orders: Iterable[Any]) -> dict[str, Any]:
+    values: list[tuple[float, str]] = []
+    quarantined_reasons: list[str] = []
+    for order in orders:
+        raw = _dict(_value(order, "okx_raw_fills", {}))
+        source = _text(raw.get("contract_size_source"))
+        if source == "okx_account_position_evidence_quarantined":
+            quarantined_reasons.append(
+                _text(raw.get("contract_size_evidence_gap"))
+                or "account_contract_size_evidence_quarantined"
+            )
+            continue
+        if (
+            raw.get("contract_size_verified") is True
+            and source.startswith("okx_account_position_")
+        ):
+            size = _safe_float(raw.get("contract_size") or raw.get("contractSize"), None)
+            if size is not None and size > 0:
+                values.append((size, source))
+    if quarantined_reasons:
+        return {
+            "contract_size": None,
+            "source": "okx_account_position_evidence_quarantined",
+            "conflict": True,
+            "reason": quarantined_reasons[0],
+            "values": [value for value, _source in values],
+        }
+    if not values:
+        return {
+            "contract_size": None,
+            "source": "",
+            "conflict": False,
+            "reason": "",
+            "values": [],
+        }
+    reference = values[0][0]
+    conflict = any(
+        not math.isclose(value, reference, rel_tol=0.02, abs_tol=1e-12)
+        for value, _source in values[1:]
+    )
+    return {
+        "contract_size": None if conflict else sum(value for value, _source in values) / len(values),
+        "source": values[0][1] if not conflict else "okx_account_position_evidence_conflict",
+        "conflict": conflict,
+        "reason": "linked_order_account_contract_sizes_disagree" if conflict else "",
+        "values": [value for value, _source in values],
+    }
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -304,14 +354,9 @@ def build_okx_history_training_sample(
     fill_contracts = _entry_fill_contracts(entry_orders)
     contracts = fill_contracts or open_contracts
     spec = _raw_contract_spec(raw)
-    ct_val = _safe_float(spec.get("ctVal"), None)
+    public_or_stored_ct_val = _safe_float(spec.get("ctVal"), None)
     ct_mult = _safe_float(spec.get("ctMult"), None)
     lot_size = _safe_float(spec.get("lotSz"), None)
-    contract_notional = (
-        abs(contracts * ct_val * ct_mult * entry_price)
-        if contracts > 0 and ct_val and ct_mult and entry_price > 0
-        else None
-    )
 
     realized_pnl = _safe_float(_value(history, "realized_pnl"), 0.0) or 0.0
     gross_pnl = _safe_float(_value(history, "pnl"), 0.0) or 0.0
@@ -320,6 +365,113 @@ def build_okx_history_training_sample(
     liquidation_penalty = _safe_float(
         raw.get("liqPenalty") or raw.get("liquidationPenalty"), 0.0
     ) or 0.0
+    source_execution_mode = _text(_value(history, "mode")).lower()
+    execution_mode = _canonical_execution_mode(source_execution_mode)
+    account_contract_size = _account_contract_size_from_orders(entry_orders)
+    history_contract_source = _text(raw.get("_bb_contract_spec_source"))
+    history_account_ct_val = (
+        public_or_stored_ct_val
+        if history_contract_source.startswith("okx_account_position_")
+        else None
+    )
+    linked_account_ct_val = _safe_float(
+        account_contract_size.get("contract_size"),
+        None,
+    )
+    account_values = [
+        value
+        for value in (history_account_ct_val, linked_account_ct_val)
+        if value is not None and value > 0
+    ]
+    account_contract_conflict = bool(account_contract_size.get("conflict"))
+    if len(account_values) > 1 and not math.isclose(
+        account_values[0],
+        account_values[1],
+        rel_tol=0.02,
+        abs_tol=1e-12,
+    ):
+        account_contract_conflict = True
+    verified_account_ct_val = (
+        sum(account_values) / len(account_values)
+        if account_values and not account_contract_conflict
+        else None
+    )
+    pnl_implied_ct_val = None
+    price_delta = abs(exit_price - entry_price)
+    if (
+        contracts > 0
+        and ct_mult is not None
+        and ct_mult > 0
+        and price_delta > 1e-12
+        and abs(gross_pnl) > 1e-12
+        and _text(_value(history, "inst_id")).upper().endswith("-USDT-SWAP")
+    ):
+        pnl_implied_ct_val = abs(gross_pnl) / contracts / price_delta / ct_mult
+    if (
+        verified_account_ct_val is not None
+        and pnl_implied_ct_val is not None
+        and not math.isclose(
+            verified_account_ct_val,
+            pnl_implied_ct_val,
+            rel_tol=0.02,
+            abs_tol=1e-12,
+        )
+    ):
+        account_contract_conflict = True
+
+    ct_val = public_or_stored_ct_val
+    contract_ct_val_source = "okx_contract_spec"
+    contract_ct_val_corrected = False
+    if verified_account_ct_val is not None:
+        ct_val = verified_account_ct_val
+        contract_ct_val_source = (
+            history_contract_source
+            or _text(account_contract_size.get("source"))
+            or "okx_account_position_verified"
+        )
+        contract_ct_val_corrected = bool(
+            public_or_stored_ct_val is not None
+            and not math.isclose(
+                public_or_stored_ct_val,
+                verified_account_ct_val,
+                rel_tol=0.02,
+                abs_tol=1e-12,
+            )
+        )
+    elif (
+        execution_mode == "paper"
+        and pnl_implied_ct_val is not None
+        and (
+            public_or_stored_ct_val is None
+            or not math.isclose(
+                public_or_stored_ct_val,
+                pnl_implied_ct_val,
+                rel_tol=0.05,
+                abs_tol=1e-12,
+            )
+        )
+    ):
+        ct_val = pnl_implied_ct_val
+        contract_ct_val_source = "okx_gross_pnl_contract_size_crosscheck"
+        contract_ct_val_corrected = True
+    public_contract_notional = (
+        abs(contracts * public_or_stored_ct_val * ct_mult * entry_price)
+        if contracts > 0
+        and public_or_stored_ct_val
+        and ct_mult
+        and entry_price > 0
+        else None
+    )
+    effective_contract_notional = (
+        abs(contracts * ct_val * ct_mult * entry_price)
+        if contracts > 0 and ct_val and ct_mult and entry_price > 0
+        else None
+    )
+    contract_notional = (
+        effective_contract_notional
+        if verified_account_ct_val is not None
+        else public_contract_notional
+    )
     notional_facts = _authoritative_notional_facts(
         inst_id=_text(_value(history, "inst_id")),
         side=side,
@@ -331,9 +483,6 @@ def build_okx_history_training_sample(
     notional = _safe_float(notional_facts.get("notional_usdt"), None)
     settlement_expected = gross_pnl + fee_signed + funding_fee + liquidation_penalty
     settlement_tolerance = max(1e-6, abs(realized_pnl) * 1e-5)
-    source_execution_mode = _text(_value(history, "mode")).lower()
-    execution_mode = _canonical_execution_mode(source_execution_mode)
-
     gaps: list[str] = []
     if not execution_mode:
         gaps.append("missing_or_invalid_execution_mode")
@@ -363,6 +512,8 @@ def build_okx_history_training_sample(
         gaps.append("missing_contract_lot_size")
     if contracts <= 0:
         gaps.append("missing_fill_or_open_contracts")
+    if account_contract_conflict:
+        gaps.append("account_contract_size_evidence_conflict")
     if notional is None or notional <= 0:
         gaps.append("missing_authoritative_notional")
     if notional_facts.get("gross_return_price_consistent") is not True:
@@ -504,11 +655,25 @@ def build_okx_history_training_sample(
         if paper_exploration
         else []
     )
+    paper_training = _dict(raw_llm_response.get("paper_training"))
+    paper_training_gaps = (
+        paper_training_contract_reasons(paper_training)
+        if paper_training
+        else []
+    )
+    if paper_training and execution_mode != "paper":
+        paper_training_gaps.append("paper_training_non_paper_execution_mode")
+    if paper_training and (paper_exploration or paper_canary):
+        paper_training_gaps.append("paper_training_conflicting_entry_contract")
+    paper_training_gaps = list(dict.fromkeys(paper_training_gaps))
     valid_paper_exploration = bool(
         paper_exploration and not paper_exploration_gaps
     )
+    valid_paper_training = bool(paper_training and not paper_training_gaps)
     if paper_exploration_gaps:
         lineage_gaps.append("invalid_paper_exploration_contract")
+    if paper_training_gaps:
+        lineage_gaps.append("invalid_paper_training_contract")
     lineage_gaps = list(dict.fromkeys(lineage_gaps))
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
     official_ratio_pct = _official_ratio_pct(raw, _value(history, "pnl_ratio"))
@@ -546,6 +711,11 @@ def build_okx_history_training_sample(
         "quantity_unit": "contracts",
         "fill_contracts": fill_contracts,
         "contract_ct_val": ct_val,
+        "contract_ct_val_source": contract_ct_val_source,
+        "contract_ct_val_corrected": contract_ct_val_corrected,
+        "public_or_stored_contract_ct_val": public_or_stored_ct_val,
+        "pnl_implied_contract_ct_val": pnl_implied_ct_val,
+        "account_contract_size_evidence": account_contract_size,
         "contract_ct_mult": ct_mult,
         "contract_lot_size": lot_size,
         "notional_usdt": notional,
@@ -638,12 +808,16 @@ def build_okx_history_training_sample(
             "actual_over_budget_loss_usdt"
         ],
         "strategy_entry_kind": (
-            "bounded_risk_paper_exploration"
+            "loss_tolerant_paper_training"
+            if valid_paper_training
+            else "bounded_risk_paper_exploration"
             if valid_paper_exploration
             else "normal_strategy_trade"
         ),
         "strategy_selection_reason": (
-            _text(paper_exploration.get("selection_reason"))
+            _text(paper_training.get("selection_reason"))
+            if valid_paper_training
+            else _text(paper_exploration.get("selection_reason"))
             if valid_paper_exploration
             else _text(
                 _dict(raw_llm_response.get("entry_permission_policy")).get("source")
@@ -671,6 +845,28 @@ def build_okx_history_training_sample(
                 "daily_sample_quota": paper_exploration.get("daily_sample_quota"),
             }
             if valid_paper_exploration
+            else {}
+        ),
+        "paper_training_evidence": (
+            {
+                "version": paper_training.get("version"),
+                "trade_kind": paper_training.get("trade_kind"),
+                "selected_side": paper_training.get("selected_side"),
+                "signal_source": paper_training.get("signal_source"),
+                "expected_net_return_pct": paper_training.get(
+                    "expected_net_return_pct"
+                ),
+                "return_lcb_pct": paper_training.get("return_lcb_pct"),
+                "loss_tolerant_for_training": paper_training.get(
+                    "loss_tolerant_for_training"
+                ),
+                "continuous_training_after_settlement": paper_training.get(
+                    "continuous_training_after_settlement"
+                ),
+                "sample_target": paper_training.get("sample_target"),
+                "daily_sample_quota": paper_training.get("daily_sample_quota"),
+            }
+            if valid_paper_training
             else {}
         ),
         "close_order_types": sorted(
@@ -710,6 +906,7 @@ def build_okx_history_training_sample(
             len(entry_decision_ids) <= 1
             and not obsolete_sampling_entry
             and not paper_exploration_gaps
+            and not paper_training_gaps
         ),
         "strategy_training_role": (
             "aggregate_position_research_only"
@@ -718,6 +915,8 @@ def build_okx_history_training_sample(
             if obsolete_sampling_entry
             else "invalid_exploration_research_only"
             if paper_exploration_gaps
+            else "invalid_paper_training_research_only"
+            if paper_training_gaps
             else "entry_strategy"
         ),
         "training_evidence_gaps": list(dict.fromkeys([*gaps, *lineage_gaps])),

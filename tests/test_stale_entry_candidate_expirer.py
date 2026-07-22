@@ -12,6 +12,7 @@ from services.decision_state import (
     append_decision_stage,
     decision_state_from_raw,
 )
+from services.paper_training import build_paper_training_contract
 from services.stale_entry_candidate_expirer import (
     STALE_ENTRY_MAINTENANCE_BATCH_LIMIT,
     STALE_ENTRY_MAINTENANCE_LOOKBACK,
@@ -257,6 +258,86 @@ async def test_stale_entry_projection_expires_paper_canary_by_model_horizon() ->
     assert expired == 1
     assert "600-second model-bound validity horizon" in row.execution_reason
     assert "0.0000%" not in row.execution_reason
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_projection_preserves_fresh_paper_training_horizon() -> None:
+    training = build_paper_training_contract(
+        symbol="BTC/USDT",
+        selected_side="long",
+        signal_source="direction_competition_observation",
+        expected_net_return_pct=-1.0,
+        horizon_minutes=10.0,
+    )
+    generated_at = datetime.fromisoformat(
+        training["policy_provenance"]["generated_at"]
+    ).replace(tzinfo=None)
+    row = _stale_entry_row_from_mapping(
+        {
+            "id": 43,
+            "symbol": "BTC/USDT",
+            "action": "long",
+            "execution_reason": "waiting",
+            "created_at": generated_at,
+            "updated_at": generated_at,
+            "stale_entry_raw__expected_net_return_pct": -1.0,
+            "stale_entry_raw__paper_training": training,
+        }
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        [row],
+        [],
+        now=generated_at + timedelta(minutes=9),
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 0
+    assert row.raw_llm_response["paper_training"] == training
+    assert row.execution_reason == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_projection_expires_paper_training_only_at_model_horizon() -> None:
+    training = build_paper_training_contract(
+        symbol="BTC/USDT",
+        selected_side="long",
+        signal_source="direction_competition_observation",
+        expected_net_return_pct=-1.0,
+        horizon_minutes=10.0,
+    )
+    generated_at = datetime.fromisoformat(
+        training["policy_provenance"]["generated_at"]
+    ).replace(tzinfo=None)
+    row = _stale_entry_row_from_mapping(
+        {
+            "id": 44,
+            "symbol": "BTC/USDT",
+            "action": "long",
+            "execution_reason": "waiting",
+            "created_at": generated_at,
+            "updated_at": generated_at,
+            "stale_entry_raw__expected_net_return_pct": -1.0,
+            "stale_entry_raw__paper_training": training,
+        }
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expired = await StaleEntryCandidateExpirer(_float).expire_rows(
+        [row],
+        [],
+        now=generated_at + timedelta(minutes=11),
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    assert "600-second model-bound validity horizon" in row.execution_reason
+    assert "-1.0000%" not in row.execution_reason
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,10 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.paper_training import (
+    PAPER_TRAINING_VERSION,
+    paper_training_contract_reasons,
+)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -41,6 +45,17 @@ def parse_utc_datetime(value: Any) -> datetime | None:
 
 def entry_validity_seconds_from_raw(raw_response: Any) -> float:
     raw = _safe_dict(raw_response)
+    paper_training = _safe_dict(raw.get("paper_training"))
+    if (
+        paper_training.get("version") == PAPER_TRAINING_VERSION
+        and not paper_training_contract_reasons(paper_training)
+    ):
+        valid_for_seconds = _safe_float(
+            paper_training.get("valid_for_seconds"),
+            0.0,
+        )
+        if valid_for_seconds > 0:
+            return valid_for_seconds
     paper_canary = _safe_dict(raw.get("paper_bootstrap_canary"))
     if (
         paper_canary.get("authorized") is True
@@ -60,6 +75,15 @@ def entry_validity_seconds_from_raw(raw_response: Any) -> float:
 
 def entry_reference_time_from_raw(raw_response: Any) -> datetime | None:
     raw = _safe_dict(raw_response)
+    paper_training = _safe_dict(raw.get("paper_training"))
+    if (
+        paper_training.get("version") == PAPER_TRAINING_VERSION
+        and not paper_training_contract_reasons(paper_training)
+    ):
+        provenance = _safe_dict(paper_training.get("policy_provenance"))
+        generated_at = parse_utc_datetime(provenance.get("generated_at"))
+        if generated_at is not None:
+            return generated_at
     paper_canary = _safe_dict(raw.get("paper_bootstrap_canary"))
     if (
         paper_canary.get("authorized") is True

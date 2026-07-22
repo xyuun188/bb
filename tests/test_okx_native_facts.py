@@ -7,9 +7,102 @@ import pytest
 
 from services.okx_native_facts import (
     OkxNativeFactsClient,
+    OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
+    derive_okx_account_contract_size_evidence,
+    derive_okx_account_history_contract_size_evidence,
     group_okx_native_fill_rows,
 )
+
+
+def test_account_contract_size_uses_private_margin_and_notional_crosscheck() -> None:
+    evidence = derive_okx_account_contract_size_evidence(
+        {
+            "instId": "ZAMA-USDT-SWAP",
+            "pos": "24",
+            "avgPx": "0.04122",
+            "markPx": "0.04112",
+            "lever": "1",
+            "imr": "98.688",
+            "notionalUsd": "98.688",
+        }
+    )
+
+    assert evidence.verified is True
+    assert evidence.contract_size == pytest.approx(100.0, rel=0.001)
+    assert evidence.source == "okx_account_position_margin_notional_crosscheck"
+
+
+def test_account_contract_size_conflict_is_quarantined() -> None:
+    evidence = derive_okx_account_contract_size_evidence(
+        {
+            "instId": "ZAMA-USDT-SWAP",
+            "pos": "24",
+            "avgPx": "0.04122",
+            "markPx": "0.04112",
+            "lever": "1",
+            "imr": "98.688",
+            "notionalUsd": "9.8688",
+        }
+    )
+
+    assert evidence.verified is False
+    assert evidence.contract_size == 0
+    assert evidence.source == "okx_account_position_evidence_conflict"
+
+
+def test_closed_account_history_recovers_contract_size_from_two_official_paths() -> None:
+    opened = datetime(2026, 7, 22, 9, 48, 44, tzinfo=UTC)
+    fills = (
+        OkxNativeFillGroup(
+            order_id="close-1",
+            trade_ids=("trade-1",),
+            inst_id="ZAMA-USDT-SWAP",
+            symbol="ZAMA/USDT",
+            side="sell",
+            pos_side="net",
+            contracts=38.0,
+            avg_price=0.04115,
+            fee_abs=0.078185,
+            fill_pnl=-0.266,
+            timestamp_ms=(opened + timedelta(minutes=2)).timestamp() * 1000,
+            timestamp=opened + timedelta(minutes=2),
+            raw_count=1,
+        ),
+        OkxNativeFillGroup(
+            order_id="close-2",
+            trade_ids=("trade-2",),
+            inst_id="ZAMA-USDT-SWAP",
+            symbol="ZAMA/USDT",
+            side="sell",
+            pos_side="net",
+            contracts=24.0,
+            avg_price=0.04119,
+            fee_abs=0.049428,
+            fill_pnl=-0.072,
+            timestamp_ms=(opened + timedelta(minutes=11)).timestamp() * 1000,
+            timestamp=opened + timedelta(minutes=11),
+            raw_count=1,
+        ),
+    )
+    evidence = derive_okx_account_history_contract_size_evidence(
+        {
+            "instId": "ZAMA-USDT-SWAP",
+            "direction": "long",
+            "openMaxPos": "62",
+            "closeTotalPos": "62",
+            "openAvgPx": "0.04122",
+            "closeAvgPx": "0.0411654838709677",
+            "pnl": "-0.338",
+            "cTime": str(int(opened.timestamp() * 1000)),
+            "uTime": str(int((opened + timedelta(minutes=11)).timestamp() * 1000)),
+        },
+        fills=fills,
+    )
+
+    assert evidence.verified is True
+    assert evidence.contract_size == pytest.approx(100.0)
+    assert evidence.source == "okx_account_position_history_pnl_fill_crosscheck"
 
 
 class _FakeCcxt:

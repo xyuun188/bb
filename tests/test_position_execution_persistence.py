@@ -10,6 +10,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import OrderStatus
 from services.entry_fee_provider import proportional_fee
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
+from services.paper_training import build_paper_training_contract
 from services.position_execution_persistence import PositionExecutionPersistenceService
 
 
@@ -208,6 +209,38 @@ async def test_persist_entry_stores_immutable_paper_canary_lifecycle() -> None:
     assert lifecycle["symbol"] == "BTC/USDT"
     assert lifecycle["side"] == "long"
     assert lifecycle["horizon_minutes"] == 10
+
+
+@pytest.mark.asyncio
+async def test_persist_entry_stores_paper_training_horizon_lifecycle() -> None:
+    session = FakeSession()
+    repo = FakeTradeRepo()
+    decision = _decision(Action.SHORT)
+    decision.raw_response = {
+        "paper_training": build_paper_training_contract(
+            symbol=decision.symbol,
+            selected_side="short",
+            signal_source="test_model_direction",
+            expected_net_return_pct=-0.5,
+            horizon_minutes=10.0,
+        )
+    }
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=decision,
+        result=_result(price=100.0, quantity=1.5, exchange_order_id="training-entry"),
+        execution_mode="paper",
+    )
+
+    lifecycle = repo.opened[0]["current_management_contract"][
+        "paper_training_lifecycle"
+    ]
+    assert lifecycle["kind"] == "normal_paper_training_position"
+    assert lifecycle["symbol"] == "BTC/USDT"
+    assert lifecycle["side"] == "short"
+    assert lifecycle["horizon_minutes"] == 10.0
+    assert lifecycle["loss_tolerant_for_training"] is True
 
 
 @pytest.mark.asyncio

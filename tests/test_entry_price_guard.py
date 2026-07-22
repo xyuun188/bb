@@ -7,6 +7,7 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_price_guard import EntryPriceGuardPolicy
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
+from services.paper_training import build_paper_training_contract
 
 
 def _decision(*, return_lcb: float = 0.6, expected_net: float = 0.8) -> DecisionOutput:
@@ -162,12 +163,48 @@ async def test_paper_canary_rejects_drift_beyond_empirical_uncertainty_band() ->
 
 
 @pytest.mark.asyncio
+async def test_paper_training_checks_fresh_market_without_profit_drift_gate() -> None:
+    decision = _decision(return_lcb=-2.0, expected_net=-3.0)
+    decision.raw_response["paper_training"] = build_paper_training_contract(
+        symbol=decision.symbol,
+        selected_side="long",
+        signal_source="test_model_direction",
+        expected_net_return_pct=-3.0,
+        return_lcb_pct=-4.0,
+        horizon_minutes=10.0,
+    )
+    decision.raw_response["paper_training_mode"] = "bootstrap"
+
+    assert await _policy(latest=150.0).guard_reason(decision, "paper") is None
+    price_check = decision.raw_response["pre_execution_price_check"]
+    assert price_check["contract_lifecycle"] == "paper_training"
+    assert price_check["production_permission"] is False
+    assert price_check["profitability_gate_applied"] is False
+    assert price_check["safety_scope"] == "market_integrity_only"
+    assert price_check["allowed_adverse_move_fraction"] is None
+    assert decision.feature_snapshot["current_price"] == 150.0
+
+
+@pytest.mark.asyncio
+async def test_paper_training_still_fails_closed_without_fresh_market_fact() -> None:
+    decision = _decision(return_lcb=-2.0, expected_net=-3.0)
+    decision.raw_response["paper_training"] = build_paper_training_contract(
+        symbol=decision.symbol,
+        selected_side="long",
+        signal_source="test_model_direction",
+        horizon_minutes=10.0,
+    )
+    decision.raw_response["paper_training_mode"] = "bootstrap"
+
+    reason = await _policy(latest=0.0).guard_reason(decision, "paper")
+
+    assert "fails closed" in reason
+
+
+@pytest.mark.asyncio
 async def test_pre_order_execution_facts_replace_market_and_fee_snapshot() -> None:
     async def fresh_feature(_symbol: str) -> dict[str, Any]:
-        return {
-            "current_price": 100.1,
-            "market_fact": {"native_identity": {"inst_id": "BTC-USDT-SWAP"}},
-        }
+        raise AssertionError("authoritative execution facts must avoid a duplicate feature refresh")
 
     async def execution_facts(mode: str, decision: DecisionOutput) -> dict[str, Any]:
         assert mode == "paper"
@@ -205,6 +242,9 @@ async def test_pre_order_execution_facts_replace_market_and_fee_snapshot() -> No
     contract = decision.raw_response["pre_order_execution_facts"]
     assert contract["production_eligible"] is True
     assert contract["input_fingerprint"]
+    proof = decision.raw_response["pre_execution_price_check"]["native_market_fact_proof"]
+    assert proof["fresh_inst_id"] == "BTC-USDT-SWAP"
+    assert proof["fresh_source_interface"] == "test_okx_native"
 
 
 @pytest.mark.asyncio

@@ -79,6 +79,17 @@ def build_current_position_management_contract(
                 refreshed_value = refreshed_canary_lifecycle.get(key)
                 if refreshed_value not in (None, ""):
                     paper_canary_lifecycle[key] = refreshed_value
+    previous_training_lifecycle = _safe_dict(previous.get("paper_training_lifecycle"))
+    refreshed_training_lifecycle = _safe_dict(facts.get("paper_training_lifecycle"))
+    paper_training_lifecycle = dict(
+        previous_training_lifecycle or refreshed_training_lifecycle
+    )
+    if paper_training_lifecycle and refreshed_training_lifecycle:
+        for key in ("decision_id", "executed_at"):
+            if paper_training_lifecycle.get(key) in (None, ""):
+                refreshed_value = refreshed_training_lifecycle.get(key)
+                if refreshed_value not in (None, ""):
+                    paper_training_lifecycle[key] = refreshed_value
     symbol = normalize_trading_symbol(facts.get("symbol"))
     side = str(facts.get("side") or "").lower().strip()
     quantity = abs(_safe_float(facts.get("quantity")))
@@ -216,6 +227,7 @@ def build_current_position_management_contract(
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "paper_canary_lifecycle": paper_canary_lifecycle,
+        "paper_training_lifecycle": paper_training_lifecycle,
     }
     provenance = {
         "source": "okx_current_position_fills_protection_account_and_portfolio_facts",
@@ -278,6 +290,8 @@ def build_current_position_management_contract(
     }
     if paper_canary_lifecycle:
         contract["paper_canary_lifecycle"] = paper_canary_lifecycle
+    if paper_training_lifecycle:
+        contract["paper_training_lifecycle"] = paper_training_lifecycle
     contract["policy_provenance"]["contract_fingerprint"] = _fingerprint(contract)
     return contract
 

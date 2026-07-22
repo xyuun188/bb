@@ -1,4 +1,7 @@
-from scripts.audit_authoritative_trade_outcomes import _gap_summary
+from scripts.audit_authoritative_trade_outcomes import (
+    _gap_summary,
+    _strategy_entry_kind_counts,
+)
 
 
 def test_gap_summary_classifies_complete_and_recovery_candidates() -> None:
@@ -53,3 +56,18 @@ def test_gap_summary_deduplicates_repeated_gaps_per_outcome() -> None:
     assert summary["gap_set_counts"] == [
         {"evidence_gaps": ["missing_position_history_entry_orders"], "count": 1}
     ]
+
+
+def test_trade_audit_distinguishes_normal_exploration_and_fast_training() -> None:
+    assert _strategy_entry_kind_counts(
+        [
+            {"strategy_entry_kind": "normal_strategy_trade"},
+            {"strategy_entry_kind": "bounded_risk_paper_exploration"},
+            {"strategy_entry_kind": "loss_tolerant_paper_training"},
+            {"strategy_entry_kind": "loss_tolerant_paper_training"},
+        ]
+    ) == {
+        "loss_tolerant_paper_training": 2,
+        "normal_strategy_trade": 1,
+        "bounded_risk_paper_exploration": 1,
+    }

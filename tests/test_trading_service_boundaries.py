@@ -38,6 +38,10 @@ from services.expert_memory_service import ExpertMemoryService
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
+from services.paper_training import (
+    PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
+    paper_training_mode_enabled,
+)
 from services.position_margin import PositionMarginCalculator
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
@@ -2897,6 +2901,86 @@ async def test_expired_canary_forces_full_exit_with_incomplete_takeover_contract
     ]
 
 
+@pytest.mark.asyncio
+async def test_expired_paper_training_horizon_forces_full_exit() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[Any, ...]] = []
+
+    class FakePositionTime:
+        def position_age_minutes(self, _created_at):
+            return 30.0
+
+    class FakeProfitPeaks:
+        def update(self, **_kwargs):
+            return {"peak_unrealized_pnl": 0.0}
+
+    class FakeProcessor:
+        async def execute(self, **kwargs):
+            calls.append(
+                (
+                    kwargs["symbol"],
+                    kwargs["trigger"],
+                    kwargs["close_fraction"],
+                )
+            )
+            return SimpleNamespace(
+                skipped=False,
+                auto_close={
+                    "model_name": kwargs["model_name"],
+                    "symbol": kwargs["symbol"],
+                    "trigger": kwargs["trigger"],
+                },
+            )
+
+    lifecycle = {
+        "version": PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
+        "kind": "normal_paper_training_position",
+        "authorized": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "symbol": "PEPE/USDT",
+        "side": "short",
+        "horizon_minutes": 10.0,
+        "expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        "continuous_training_after_settlement": True,
+        "loss_tolerant_for_training": True,
+    }
+    open_positions = [
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "PEPE/USDT",
+            "side": "short",
+            "execution_mode": "paper",
+            "is_open": True,
+            "entry_price": 0.00000284,
+            "current_price": 0.00000285,
+            "quantity": 1_717_000_000.0,
+            "leverage": 1.0,
+            "unrealized_pnl": -17.17,
+            "created_at": datetime.now(UTC) - timedelta(minutes=11),
+            "current_management_contract": {
+                "management_eligible": False,
+                "blockers": ["okx_protection_evidence_incomplete"],
+                "paper_training_lifecycle": lifecycle,
+            },
+        }
+    ]
+    service.position_time = FakePositionTime()
+    service.position_profit_peaks = FakeProfitPeaks()
+    service.fast_risk_exit_execution_processor = FakeProcessor()
+
+    auto_closes = await service._enforce_sl_tp({}, open_positions=open_positions)
+
+    assert calls == [("PEPE/USDT", "paper_training_horizon", 1.0)]
+    assert auto_closes == [
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "PEPE/USDT",
+            "trigger": "paper_training_horizon",
+        }
+    ]
+
+
 def test_entry_policy_uses_injected_decision_freshness_boundary():
     calls: list[str] = []
 
@@ -4259,6 +4343,9 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
 
     assert result["current_production_strategy"]["id"] == "cached_production_strategy"
     assert result["strategy_learning_cache_status"] == "stale_background_refresh"
+    assert result["execution_mode"] == "paper"
+    assert result["paper_training_mode"] == "bootstrap"
+    assert paper_training_mode_enabled(result) is True
     task = service._strategy_learning_context_refresh_tasks.get("paper")
     assert task is not None and not task.done()
     await asyncio.sleep(0)
@@ -4433,6 +4520,34 @@ async def test_strategy_mode_reuses_authoritative_empty_position_snapshot() -> N
     )
 
     assert context["account_equity"] == 100.0
+    assert context["execution_mode"] == "paper"
+    assert context["paper_training_mode"] == "bootstrap"
+    assert paper_training_mode_enabled(context) is True
+
+
+def test_cached_promoted_champion_keeps_fast_training_disabled() -> None:
+    service = TradingService.__new__(TradingService)
+    service._strategy_learning_context_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC),
+            "context": {
+                "paper_training_mode": "bootstrap",
+                "paper_strategy_champion": {
+                    "active": True,
+                    "paper_execution_permission": True,
+                },
+            },
+        }
+    }
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+
+    context = service._recent_strategy_learning_context("paper")
+
+    assert context is not None
+    assert context["execution_mode"] == "paper"
+    assert context["paper_training_mode"] == "normal"
+    assert context["strategy_learning"]["paper_training_mode"] == "normal"
+    assert paper_training_mode_enabled(context) is False
 
 
 @pytest.mark.asyncio
@@ -7505,7 +7620,7 @@ async def test_local_open_positions_context_returns_db_positions_without_okx(
     assert position["okx_inst_id"] == "BTC-USDT-SWAP"
     assert position["okx_pos_id"] == "pos-1"
     assert position["entry_exchange_order_id"] == "entry-1"
-    assert execute_calls == []
+    assert execute_calls == ["execute"]
 
 
 @pytest.mark.asyncio

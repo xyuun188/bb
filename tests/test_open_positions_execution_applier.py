@@ -7,6 +7,7 @@ from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
 )
+from services.paper_training import build_paper_training_contract
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -74,6 +75,34 @@ def test_open_positions_applier_adds_filled_entry() -> None:
             }
         ],
     }
+
+
+def test_open_positions_applier_attaches_paper_training_horizon() -> None:
+    open_positions: list[dict] = []
+    decision = _decision(Action.SHORT)
+    decision.raw_response = {
+        "paper_training": build_paper_training_contract(
+            symbol=decision.symbol,
+            selected_side="short",
+            signal_source="test_model_direction",
+            horizon_minutes=10.0,
+        )
+    }
+
+    _applier().apply(
+        open_positions,
+        "ensemble_trader",
+        decision,
+        _result(OrderStatus.FILLED),
+    )
+
+    lifecycle = open_positions[0]["paper_training_lifecycle"]
+    assert lifecycle["kind"] == "normal_paper_training_position"
+    assert lifecycle["side"] == "short"
+    assert lifecycle["horizon_minutes"] == 10.0
+    assert open_positions[0]["current_management_contract"][
+        "paper_training_lifecycle"
+    ] == lifecycle
 
 
 def test_open_positions_applier_merges_same_symbol_side_okx_net_entries() -> None:

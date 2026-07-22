@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.account import OkxAccountBill
@@ -24,17 +25,219 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_POSITION_CONFIRMED,
     OKX_SYNC_UNVERIFIED,
     PHASE3_DEFAULT_ORDER_SYNC_START,
+    OkxContractSizeCatalog,
     OkxOrderFactSyncService,
+    _apply_paper_training_exchange_recovery_to_decision,
     _apply_position_history_payload,
+    _build_contract_size_catalog,
     _current_position_entry_fee_evidence,
     _db_naive_since,
     _matching_current_position_entry_orders,
     _matching_native_full_close_pending_fill,
+    _order_needs_account_contract_size_repair,
     _order_needs_okx_fact_refresh,
     _order_needs_okx_pull,
+    _paper_training_decision_for_order_fact,
+    _repair_stored_fill_contract_size_from_instruments,
     _stored_fill_base_quantity,
 )
+from services.paper_training import (
+    attach_paper_training_order_identity,
+    build_paper_training_contract,
+)
 from web_dashboard.api.trades import get_trade_detail, get_trades
+
+
+def test_paper_catalog_overrides_public_contract_size_with_account_evidence() -> None:
+    catalog = _build_contract_size_catalog(
+        mode="paper",
+        public_sizes={"ZAMA-USDT-SWAP": 10.0},
+        exchange_positions=[
+            {
+                "instId": "ZAMA-USDT-SWAP",
+                "pos": "24",
+                "avgPx": "0.04122",
+                "markPx": "0.04112",
+                "lever": "1",
+                "imr": "98.688",
+                "notionalUsd": "98.688",
+            }
+        ],
+    )
+
+    assert isinstance(catalog, OkxContractSizeCatalog)
+    assert catalog["ZAMA-USDT-SWAP"] == pytest.approx(100.0, rel=0.001)
+    assert catalog.source_for("ZAMA-USDT-SWAP").startswith("okx_account_position_")
+
+
+def test_live_catalog_keeps_public_contract_size_unchanged() -> None:
+    catalog = _build_contract_size_catalog(
+        mode="live",
+        public_sizes={"ZAMA-USDT-SWAP": 10.0},
+        exchange_positions=[
+            {
+                "instId": "ZAMA-USDT-SWAP",
+                "pos": "24",
+                "avgPx": "0.04122",
+                "markPx": "0.04112",
+                "lever": "1",
+                "imr": "98.688",
+                "notionalUsd": "98.688",
+            }
+        ],
+    )
+
+    assert catalog["ZAMA-USDT-SWAP"] == 10.0
+    assert catalog.source_for("ZAMA-USDT-SWAP") == "okx_public_instruments"
+
+
+def test_paper_catalog_snaps_account_rounding_noise_to_public_tick_size() -> None:
+    catalog = _build_contract_size_catalog(
+        mode="paper",
+        public_sizes={"CFX-USDT-SWAP": 10.0},
+        exchange_positions=[
+            {
+                "instId": "CFX-USDT-SWAP",
+                "pos": "100",
+                "avgPx": "0.10",
+                "markPx": "0.10",
+                "lever": "1",
+                "imr": "99.918",
+                "notionalUsd": "100",
+            }
+        ],
+    )
+
+    assert catalog["CFX-USDT-SWAP"] == 10.0
+    assert catalog.source_for("CFX-USDT-SWAP").startswith("okx_account_position_")
+
+
+def test_paper_catalog_recovers_closed_demo_multiplier_from_history_and_fills() -> None:
+    opened = datetime(2026, 7, 22, 9, 48, 44, tzinfo=UTC)
+    fills = [
+        OkxNativeFillGroup(
+            order_id="close-1",
+            trade_ids=("trade-1",),
+            inst_id="ZAMA-USDT-SWAP",
+            symbol="ZAMA/USDT",
+            side="sell",
+            pos_side="net",
+            contracts=38.0,
+            avg_price=0.04115,
+            fee_abs=0.078185,
+            fill_pnl=-0.266,
+            timestamp_ms=(opened + timedelta(minutes=2)).timestamp() * 1000,
+            timestamp=opened + timedelta(minutes=2),
+            raw_count=1,
+        ),
+        OkxNativeFillGroup(
+            order_id="close-2",
+            trade_ids=("trade-2",),
+            inst_id="ZAMA-USDT-SWAP",
+            symbol="ZAMA/USDT",
+            side="sell",
+            pos_side="net",
+            contracts=24.0,
+            avg_price=0.04119,
+            fee_abs=0.049428,
+            fill_pnl=-0.072,
+            timestamp_ms=(opened + timedelta(minutes=11)).timestamp() * 1000,
+            timestamp=opened + timedelta(minutes=11),
+            raw_count=1,
+        ),
+    ]
+    catalog = _build_contract_size_catalog(
+        mode="paper",
+        public_sizes={"ZAMA-USDT-SWAP": 10.0},
+        exchange_positions=[],
+        position_history_rows=[
+            {
+                "instId": "ZAMA-USDT-SWAP",
+                "direction": "long",
+                "openMaxPos": "62",
+                "closeTotalPos": "62",
+                "openAvgPx": "0.04122",
+                "closeAvgPx": "0.0411654838709677",
+                "pnl": "-0.338",
+                "cTime": str(int(opened.timestamp() * 1000)),
+                "uTime": str(int((opened + timedelta(minutes=11)).timestamp() * 1000)),
+            }
+        ],
+        fills=fills,
+    )
+
+    assert catalog["ZAMA-USDT-SWAP"] == pytest.approx(100.0)
+    assert catalog.source_for("ZAMA-USDT-SWAP") == (
+        "okx_account_position_history_pnl_fill_crosscheck"
+    )
+
+
+def test_paper_catalog_quarantines_conflicting_account_evidence() -> None:
+    catalog = _build_contract_size_catalog(
+        mode="paper",
+        public_sizes={"ZAMA-USDT-SWAP": 10.0},
+        exchange_positions=[
+            {
+                "instId": "ZAMA-USDT-SWAP",
+                "pos": "24",
+                "avgPx": "0.04122",
+                "markPx": "0.04112",
+                "lever": "1",
+                "imr": "98.688",
+                "notionalUsd": "9.8688",
+            }
+        ],
+    )
+
+    assert "ZAMA-USDT-SWAP" not in catalog
+    assert catalog.is_quarantined("ZAMA-USDT-SWAP") is True
+
+
+def test_confirmed_order_is_repaired_when_account_contract_size_disagrees() -> None:
+    catalog = OkxContractSizeCatalog({"ZAMA-USDT-SWAP": 10.0})
+    catalog.set_verified(
+        "ZAMA-USDT-SWAP",
+        100.0,
+        source="okx_account_position_history_pnl_fill_crosscheck",
+    )
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=620.0,
+        price=0.04122,
+        status="filled",
+        fee=0.127782,
+        exchange_order_id="3765187269268054016",
+    )
+    order.okx_inst_id = "ZAMA-USDT-SWAP"
+    order.okx_fill_contracts = 62.0
+    order.okx_sync_status = OKX_SYNC_CONFIRMED
+    order.okx_raw_fills = {
+        "fills_history_confirmed": True,
+        "order_id": "3765187269268054016",
+        "inst_id": "ZAMA-USDT-SWAP",
+        "contracts": 62.0,
+        "contract_size": 10.0,
+        "contract_size_verified": True,
+        "contract_size_source": "okx_public_instruments",
+        "base_quantity": 620.0,
+    }
+
+    assert _order_needs_account_contract_size_repair(order, catalog) is True
+    assert _repair_stored_fill_contract_size_from_instruments(
+        order,
+        contract_sizes=catalog,
+        now=datetime.now(UTC),
+    ) is True
+    assert order.quantity == pytest.approx(6200.0)
+    assert order.okx_raw_fills["contract_size"] == pytest.approx(100.0)
+    assert order.okx_raw_fills["contract_size_source"] == (
+        "okx_account_position_history_pnl_fill_crosscheck"
+    )
+    assert _order_needs_account_contract_size_repair(order, catalog) is False
 
 
 def test_stored_fill_base_quantity_prefers_okx_contract_size_over_stale_base_quantity() -> None:
@@ -45,6 +248,83 @@ def test_stored_fill_base_quantity_prefers_okx_contract_size_over_stale_base_qua
             "base_quantity": 15.265700483091791,
         }
     ) == pytest.approx(16.0)
+
+
+def test_okx_fill_client_identity_restores_exact_paper_training_decision() -> None:
+    decision_output = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ENA/USDT",
+        action=Action.SHORT,
+        confidence=0.2,
+        reasoning="paper training",
+        raw_response={
+            "paper_training": build_paper_training_contract(
+                symbol="ENA/USDT",
+                selected_side="short",
+                signal_source="direction_competition_observation",
+                expected_net_return_pct=-0.2,
+                return_lcb_pct=-0.3,
+                feature_opportunity_score=6.2,
+                horizon_minutes=10.0,
+            ),
+            "paper_training_mode": "bootstrap",
+        },
+    )
+    attach_paper_training_order_identity(decision_output, 104208, "paper")
+    decision = AIDecision(
+        id=104208,
+        model_name="ensemble_trader",
+        symbol="ENA/USDT",
+        action="short",
+        confidence=0.2,
+        is_paper=True,
+        was_executed=False,
+        raw_llm_response=decision_output.raw_response,
+    )
+    filled_at = datetime(2026, 7, 22, 8, 0, 57, tzinfo=UTC)
+    fill = OkxNativeFillGroup(
+        order_id="okx-entry-1",
+        trade_ids=("trade-1",),
+        inst_id="ENA-USDT-SWAP",
+        symbol="ENA/USDT",
+        side="sell",
+        pos_side="net",
+        contracts=1858.0,
+        avg_price=0.0865,
+        fee_abs=0.8,
+        fill_pnl=0.0,
+        timestamp_ms=filled_at.timestamp() * 1000,
+        timestamp=filled_at,
+        raw_count=1,
+        rows=(
+            {
+                "ordId": "okx-entry-1",
+                "clOrdId": "BBPT104208",
+                "instId": "ENA-USDT-SWAP",
+                "side": "sell",
+            },
+        ),
+    )
+
+    recovered = _paper_training_decision_for_order_fact(
+        fill=fill,
+        order_row=None,
+        decisions_by_id={104208: decision},
+    )
+    assert recovered is decision
+
+    _apply_paper_training_exchange_recovery_to_decision(
+        decision,
+        fill=fill,
+        client_order_id="BBPT104208",
+        now=filled_at + timedelta(seconds=1),
+    )
+
+    assert decision.was_executed is True
+    assert decision.execution_price == pytest.approx(0.0865)
+    recovery = decision.raw_llm_response["paper_training_exchange_recovery"]
+    assert recovery["source_authority"] == "okx_native_fills_and_client_order_identity"
+    assert recovery["exchange_order_id"] == "okx-entry-1"
 
 
 def test_current_position_fee_accepts_verified_okx_execution_result() -> None:

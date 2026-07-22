@@ -145,6 +145,29 @@ def test_shadow_model_cannot_enter_direction_scores() -> None:
     assert context["production_source_count"] == 0
 
 
+def test_shadow_model_still_exposes_direction_for_paper_training() -> None:
+    payload = _governed_ml(-0.4, -0.1)
+    payload.update(
+        {
+            "route_mode": "shadow_observation",
+            "live_influence": False,
+            "allow_live_position_influence": False,
+            "influence_enabled": False,
+            "promotion_ready": False,
+        }
+    )
+
+    context = _context(ml=payload)
+
+    assert context["preferred_side"] == "neutral"
+    assert context["production_source_count"] == 0
+    assert context["training_preferred_side"] == "short"
+    assert context["training_short"]["observation_count"] == 1
+    assert context["training_short"]["horizon_minutes"] == 30
+    assert context["training_short"]["horizon_source_count"] == 1
+    assert context["training_permission"] is False
+
+
 def test_diagnostic_win_rate_cannot_change_direction_scores() -> None:
     first_ml = _governed_ml(0.5, 0.2)
     second_ml = deepcopy(first_ml)

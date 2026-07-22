@@ -101,6 +101,36 @@ def test_normalized_open_position_context_does_not_copy_obsolete_policy_metadata
     assert "profit_first_exit_plan" not in context
 
 
+def test_normalized_context_preserves_paper_training_horizon_lifecycle() -> None:
+    lifecycle = {
+        "version": "2026-07-22.paper-training-position-lifecycle.v1",
+        "kind": "normal_paper_training_position",
+        "symbol": "PEPE/USDT",
+        "side": "short",
+        "horizon_minutes": 10.0,
+    }
+    context = normalized_open_position_context(
+        {
+            "symbol": "PEPE/USDT:USDT",
+            "side": "short",
+            "contracts": 171.7,
+            "entry_price": 0.00000284,
+            "current_price": 0.00000285,
+            "execution_mode": "paper",
+            "paper_training_lifecycle": lifecycle,
+            "info": {
+                "ctVal": "10000000",
+                "instId": "PEPE-USDT-SWAP",
+                "posId": "pepe-pos",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=_float,
+    )
+
+    assert context["paper_training_lifecycle"] == lifecycle
+
+
 def _management_contract(*, contracts: float = 109.0, quantity: float = 109.0) -> dict:
     return {
         "contract_version": CURRENT_POSITION_MANAGEMENT_VERSION,

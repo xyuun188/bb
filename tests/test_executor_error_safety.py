@@ -11,6 +11,7 @@ from core.exceptions import ExchangeAPIError, OrderPlacementError
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
+from services.paper_training import build_paper_training_contract
 
 
 class _FakeLogger:
@@ -184,6 +185,43 @@ class _SystemErrorOnceCcxt:
                 code="50026",
             )
         return {"data": []}
+
+
+class _AmbiguousPaperTrainingSubmitCcxt:
+    def __init__(self) -> None:
+        self.submit_calls = 0
+        self.recovery_calls = 0
+
+    async def create_order(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        self.submit_calls += 1
+        raise ExchangeAPIError(
+            "OKX API error [50013]: Systems are busy. Please try again later.",
+            code="50013",
+        )
+
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.recovery_calls += 1
+        assert params == {
+            "instId": "ENA-USDT-SWAP",
+            "clOrdId": "BBPT104208",
+        }
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "ENA-USDT-SWAP",
+                    "ordId": "okx-entry-1",
+                    "clOrdId": "BBPT104208",
+                    "side": "sell",
+                    "ordType": "market",
+                    "state": "filled",
+                    "sz": "1858",
+                    "accFillSz": "1858",
+                    "avgPx": "0.0865",
+                    "fee": "-0.8",
+                }
+            ],
+        }
 
 
 def _native_position_row(
@@ -1554,6 +1592,39 @@ def test_okx_attached_protection_uses_market_price_precision() -> None:
     assert result["take_profit_price"] == "0.000009001"
 
 
+def test_paper_training_reserves_modeled_execution_cost_before_submit() -> None:
+    executor = _executor(_PrecisionEntryCcxt())
+    decision = _entry_decision()
+    decision.raw_response["paper_training"] = build_paper_training_contract(
+        symbol=decision.symbol,
+        selected_side="long",
+        signal_source="test_model_direction",
+        horizon_minutes=10.0,
+    )
+    decision.raw_response["opportunity_score"] = {
+        "execution_cost": {
+            "fee_pct": 0.1,
+            "slippage_pct": 0.02,
+            "total_pct": 0.12,
+            "order_size_complete": True,
+        }
+    }
+
+    reserve = executor._paper_training_margin_execution_reserve(
+        decision,
+        available_balance_usdt=1000.0,
+        leverage=1.0,
+        planned_notional_usdt=1000.0,
+    )
+
+    assert reserve["risk_cap_applied"] is False
+    assert reserve["applied"] is True
+    assert reserve["execution_cost_pct"] == pytest.approx(0.12)
+    assert reserve["executable_notional_usdt"] == pytest.approx(
+        1000.0 / 1.0012
+    )
+
+
 def test_okx_attached_protection_rejects_invalid_direction_after_precision() -> None:
     class RoundedToReferenceCcxt(_PrecisionEntryCcxt):
         def price_to_precision(self, _symbol: str, _price: float) -> str:
@@ -1941,3 +2012,23 @@ async def test_okx_exit_full_close_falls_back_to_split_when_native_close_fails()
     assert [call[3] for call in exchange.create_calls] == [10.0] * 10
     assert result.raw_response["split_exit_order"] is True
     assert result.raw_response["position_contracts_after"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_paper_training_submit_recovers_without_second_logical_order() -> None:
+    exchange = _AmbiguousPaperTrainingSubmitCcxt()
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+
+    order = await executor._create_order_with_client_recovery(
+        exchange,
+        "ENA/USDT:USDT",
+        "sell",
+        1858.0,
+        {"tdMode": "cross", "clOrdId": "BBPT104208"},
+    )
+
+    assert order["id"] == "okx-entry-1"
+    assert order["status"] == "filled"
+    assert order["filled"] == pytest.approx(1858.0)
+    assert exchange.submit_calls == 1
+    assert exchange.recovery_calls == 1

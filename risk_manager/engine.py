@@ -17,6 +17,7 @@ from services.paper_exploration import (
     PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
     PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
 )
+from services.paper_training import PAPER_TRAINING_SIZING_VERSION, PAPER_TRAINING_VERSION
 
 logger = structlog.get_logger(__name__)
 
@@ -176,6 +177,19 @@ class RiskEngine:
         leverage = RiskEngine._safe_positive_float(decision.suggested_leverage)
         if sizing.get("production_eligible") is not True:
             return "Dynamic account risk budget is not production eligible."
+        if sizing.get("contract_lifecycle") == "paper_training":
+            training = raw.get("paper_training")
+            training = training if isinstance(training, dict) else {}
+            if (
+                sizing.get("contract_version") != PAPER_TRAINING_SIZING_VERSION
+                or training.get("version") != PAPER_TRAINING_VERSION
+                or sizing.get("execution_scope") != "paper_only"
+                or sizing.get("production_permission") is not False
+                or training.get("execution_scope") != "paper_only"
+                or training.get("production_permission") is not False
+                or training.get("loss_tolerant_for_training") is not True
+            ):
+                return "Paper training risk contract is not paper-only."
         if sizing.get("contract_lifecycle") == "paper_exploration":
             exploration = raw.get("paper_exploration")
             exploration = exploration if isinstance(exploration, dict) else {}

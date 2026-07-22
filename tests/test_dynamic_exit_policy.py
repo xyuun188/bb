@@ -6,6 +6,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.current_position_management import build_current_position_management_contract
 from services.dynamic_exit_policy import apply_dynamic_exit
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
+from services.paper_training import PAPER_TRAINING_POSITION_LIFECYCLE_VERSION
 
 
 def _decision(raw: dict | None = None) -> DecisionOutput:
@@ -237,6 +238,38 @@ def test_expired_paper_canary_horizon_closes_full_position() -> None:
     assert result.eligible is True
     assert result.paper_canary_horizon_elapsed is True
     assert result.close_fraction == 1.0
+
+
+def test_expired_paper_training_horizon_closes_full_position() -> None:
+    position = _position(
+        execution_mode="paper",
+        current_management_contract={
+            "kind": "current_position_takeover",
+            "management_eligible": False,
+            "blockers": ["okx_protection_evidence_incomplete"],
+        },
+        paper_training_lifecycle={
+            "version": PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
+            "kind": "normal_paper_training_position",
+            "authorized": True,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "horizon_minutes": 10.0,
+            "expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+            "continuous_training_after_settlement": True,
+            "loss_tolerant_for_training": True,
+        },
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.eligible is True
+    assert result.paper_training_horizon_elapsed is True
+    assert result.paper_training_horizon_minutes == 10.0
+    assert result.close_fraction == 1.0
+    assert "current_position_management_contract_incomplete" not in result.reason
 
 
 def test_expired_paper_canary_horizon_closes_even_when_takeover_contract_is_incomplete() -> None:

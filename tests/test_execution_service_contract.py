@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -8,10 +9,16 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
+from risk_manager.engine import RiskEngine
+from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
+from services.okx_training_facts import build_okx_history_training_sample
+from services.paper_training import build_paper_training_contract
+from services.trade_execution_contract import validate_entry_execution_contract
 from services.trading_policies import PolicyGateResult
+from services.training_data_quality import annotate_training_payload
 
 
 async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
@@ -171,10 +178,245 @@ def _dynamic_return_ready_decision() -> DecisionOutput:
     return decision
 
 
+def _paper_training_ready_decision() -> DecisionOutput:
+    provenance = {
+        "source": "paper_training_test",
+        "observation_window": "current_test_entry",
+        "sample_count": 1,
+        "generated_at": "2026-07-22T00:00:00+00:00",
+        "strategy_version": "paper-training-test.v1",
+        "fallback_reason": "",
+        "contract_fingerprint": "paper-training-sizing-fingerprint",
+    }
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.2,
+        reasoning="loss-tolerant paper training",
+        position_size_pct=0.1,
+        suggested_leverage=1.0,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        feature_snapshot={"current_price": 100.0, "close": 100.0},
+        raw_response={},
+    )
+    decision.raw_response = {
+        "paper_training": build_paper_training_contract(
+            symbol=decision.symbol,
+            selected_side="long",
+            signal_source="local_ml_observation",
+            expected_net_return_pct=-0.5,
+            return_lcb_pct=-0.8,
+            horizon_minutes=10.0,
+        ),
+        "paper_training_mode": "bootstrap",
+        "opportunity_score": {
+            "execution_cost": {
+                "production_eligible": True,
+                "order_size_complete": True,
+                "order_notional_usdt": 100.0,
+            }
+        },
+        "pre_order_execution_facts": {
+            "production_eligible": True,
+            "input_fingerprint": "paper-training-pre-order",
+        },
+        "execution_cost_sizing_pass": {
+            "order_size_complete": True,
+            "impact_basis_notional_usdt": 100.0,
+            "final_notional_usdt": 100.0,
+        },
+        "profit_risk_sizing": {
+            "contract_version": "2026-07-22.paper-training-sizing.v1",
+            "contract_lifecycle": "paper_training",
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "production_eligible": True,
+            "account_equity_usdt": 1000.0,
+            "available_margin_usdt": 1000.0,
+            "position_size_pct": 0.1,
+            "risk_budget_usdt": 2.0,
+            "portfolio_risk_budget_usdt": 2.0,
+            "current_portfolio_stressed_loss_usdt": 0.0,
+            "planned_stressed_loss_usdt": 2.0,
+            "stressed_loss_fraction": 0.02,
+            "target_notional_usdt": 100.0,
+            "final_notional_usdt": 100.0,
+            "final_margin_usdt": 100.0,
+            "final_leverage": 1.0,
+            "policy_provenance": provenance,
+        },
+    }
+    return decision
+
+
 def test_dynamic_return_contract_accepts_complete_governed_entry() -> None:
     result = _return_entry_contract_result(_dynamic_return_ready_decision())
     assert result.passed is True
     assert result.data["return_execution_contract"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_paper_training_entry_close_and_loss_reach_authoritative_training() -> None:
+    decision = _paper_training_ready_decision()
+    contract, reasons = validate_entry_execution_contract(decision.raw_response)
+    assert reasons == []
+    assert contract["contract_lifecycle"] == "paper_training"
+    assert RiskEngine._dynamic_risk_contract_reason(decision) is None
+    assert _return_entry_contract_result(decision, "paper").passed is True
+
+    class FilledExecutor:
+        async def place_order(
+            self,
+            current: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            del account_id, override_balance
+            is_entry = current.action == Action.LONG
+            return ExecutionResult(
+                order_id="local-entry" if is_entry else "local-close",
+                exchange_order_id="okx-entry" if is_entry else "okx-close",
+                symbol=current.symbol,
+                side="buy" if is_entry else "sell",
+                order_type="market",
+                quantity=1.0,
+                price=100.0 if is_entry else 95.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    executor = FilledExecutor()
+
+    async def executor_provider(_mode: str) -> FilledExecutor:
+        return executor
+
+    service = _test_execution_service(okx_executor_provider=executor_provider)
+    entry_result = await service.execute_candidate(
+        decision.symbol,
+        decision.model_name,
+        decision,
+        SimpleNamespace(warnings=[]),
+        321,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+    assert entry_result is not None and entry_result.status == OrderStatus.FILLED
+    assert decision.raw_response["paper_training_order_identity"]["client_order_id"] == (
+        "BBPT321"
+    )
+
+    close_decision = DecisionOutput(
+        model_name=decision.model_name,
+        symbol=decision.symbol,
+        action=Action.CLOSE_LONG,
+        confidence=0.0,
+        reasoning="authoritative paper close",
+        position_size_pct=1.0,
+        suggested_leverage=1.0,
+        raw_response={},
+    )
+    close_result = await service.execute_candidate(
+        close_decision.symbol,
+        close_decision.model_name,
+        close_decision,
+        SimpleNamespace(warnings=[]),
+        322,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[
+            {
+                "symbol": decision.symbol,
+                "side": "long",
+                "quantity": 1.0,
+                "is_open": True,
+            }
+        ],
+    )
+    assert close_result is not None and close_result.status == OrderStatus.FILLED
+
+    opened_at = datetime(2026, 7, 22, 1, tzinfo=UTC)
+    history = SimpleNamespace(
+        id=1,
+        mode="paper",
+        row_identity="paper|BTC-USDT-SWAP|paper-training-pos|long|1",
+        inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT",
+        pos_id="paper-training-pos",
+        side="long",
+        close_status="full",
+        opened_at=opened_at,
+        updated_at_okx=opened_at + timedelta(minutes=30),
+        open_avg_px=entry_result.price,
+        close_avg_px=close_result.price,
+        open_max_pos=entry_result.quantity,
+        leverage=1.0,
+        realized_pnl=-5.1,
+        pnl=-5.0,
+        pnl_ratio=-0.051,
+        funding_fee=0.0,
+        fee=-0.1,
+        entry_order_ids=[entry_result.exchange_order_id],
+        close_order_ids=[close_result.exchange_order_id],
+        linked_order_ids=[
+            entry_result.exchange_order_id,
+            close_result.exchange_order_id,
+        ],
+        position_ids=[7],
+        evidence_gaps=[],
+        raw_row={
+            "instId": "BTC-USDT-SWAP",
+            "posId": "paper-training-pos",
+            "posSide": "long",
+            "realizedPnl": "-5.1",
+            "pnl": "-5.0",
+            "fee": "-0.1",
+            "fundingFee": "0",
+            "pnlRatio": "-0.051",
+            "_bb_contract_spec": {"ctVal": "1", "ctMult": "1", "lotSz": "1"},
+        },
+        sync_status="synced",
+    )
+    orders = {
+        entry_result.exchange_order_id: SimpleNamespace(
+            okx_fill_contracts=entry_result.quantity,
+            okx_trade_ids="trade-entry",
+            decision_id=321,
+        ),
+        close_result.exchange_order_id: SimpleNamespace(
+            okx_fill_contracts=close_result.quantity,
+            okx_trade_ids="trade-close",
+            decision_id=322,
+        ),
+    }
+    sample = build_okx_history_training_sample(
+        history,
+        positions_by_id={
+            7: SimpleNamespace(
+                model_name=decision.model_name,
+                stop_loss_price=98.0,
+                take_profit_price=104.0,
+            )
+        },
+        orders_by_exchange_id=orders,
+        decision_raw_by_order_id={
+            entry_result.exchange_order_id: decision.raw_response
+        },
+    )
+    outcome = build_authoritative_trade_outcome(sample)
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[outcome],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert outcome["outcome_complete"] is True
+    assert outcome["strategy_entry_kind"] == "loss_tolerant_paper_training"
+    assert len(payload["trade_samples"]) == 1
+    labels = payload["trade_samples"][0]["profit_learning_labels"]
+    assert labels["training_supervision_ready"] is True
+    assert labels["realized_net_pnl_usdt"] == -5.1
 
 
 def test_dynamic_return_contract_ignores_legacy_probe_fields_and_fails_closed() -> None:

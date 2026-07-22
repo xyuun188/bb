@@ -22,6 +22,11 @@ from services.paper_exploration import (
     PAPER_EXPLORATION_VERSION,
     paper_exploration_contract_reasons,
 )
+from services.paper_training import (
+    PAPER_TRAINING_SIZING_VERSION,
+    PAPER_TRAINING_VERSION,
+    paper_training_contract_reasons,
+)
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
@@ -256,9 +261,15 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     """Classify an entry contract before validating lifecycle-specific invariants."""
 
     exploration = _safe_dict(raw.get("paper_exploration"))
+    training = _safe_dict(raw.get("paper_training"))
     canary = _safe_dict(raw.get("paper_bootstrap_canary"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
+    if (
+        training
+        or sizing.get("contract_lifecycle") == "paper_training"
+    ):
+        return "paper_training"
     if (
         exploration
         or sizing.get("contract_lifecycle") == "paper_exploration"
@@ -312,6 +323,13 @@ def validate_entry_execution_contract(
     lifecycle = entry_contract_lifecycle(raw)
     if lifecycle == "paper_bootstrap_canary":
         return validate_paper_canary_entry_contract(
+            raw,
+            filled_notional_usdt=filled_notional_usdt,
+            executed=executed,
+            filled_order_present=filled_order_present,
+        )
+    if lifecycle == "paper_training":
+        return validate_paper_training_entry_contract(
             raw,
             filled_notional_usdt=filled_notional_usdt,
             executed=executed,
@@ -671,6 +689,94 @@ def _bounded_canary_fill_drift(
             else "legacy_cost_bound_and_okx_reconciliations"
         ),
     }
+
+
+def validate_paper_training_entry_contract(
+    raw: dict[str, Any],
+    *,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate a loss-tolerant paper bootstrap entry without profit gates."""
+
+    training = _safe_dict(raw.get("paper_training"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
+    sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
+    reasons = paper_training_contract_reasons(training)
+    if training.get("version") != PAPER_TRAINING_VERSION:
+        reasons.append("paper_training_version_invalid")
+    if sizing.get("contract_version") != PAPER_TRAINING_SIZING_VERSION:
+        reasons.append("paper_training_sizing_version_invalid")
+    if sizing.get("contract_lifecycle") != "paper_training":
+        reasons.append("paper_training_sizing_lifecycle_invalid")
+    if sizing.get("execution_scope") != "paper_only":
+        reasons.append("paper_training_sizing_scope_invalid")
+    if sizing.get("production_permission") is not False:
+        reasons.append("paper_training_sizing_production_permission_invalid")
+    if sizing.get("production_eligible") is not True:
+        reasons.append("paper_training_sizing_ineligible")
+    if not _provenance_complete(sizing.get("policy_provenance")):
+        reasons.append("paper_training_sizing_provenance_incomplete")
+    if not str(_safe_dict(sizing.get("policy_provenance")).get("contract_fingerprint") or ""):
+        reasons.append("paper_training_sizing_fingerprint_missing")
+
+    stress = _safe_float(sizing.get("stressed_loss_fraction"))
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"))
+    target_notional = _safe_float(sizing.get("target_notional_usdt"))
+    final_notional = _safe_float(sizing.get("final_notional_usdt"))
+    final_leverage = _safe_float(sizing.get("final_leverage"))
+    if stress <= 0 or not isclose(
+        planned_loss,
+        final_notional * stress,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("paper_training_stressed_loss_algebra_mismatch")
+    if final_notional <= 0 or target_notional <= 0 or final_notional > target_notional + 1e-8:
+        reasons.append("paper_training_notional_invalid")
+    if final_leverage < 1:
+        reasons.append("paper_training_leverage_invalid")
+    if execution_cost.get("production_eligible") is not True:
+        reasons.append("paper_training_execution_cost_incomplete")
+    if execution_cost.get("order_size_complete") is not True:
+        reasons.append("paper_training_order_size_cost_incomplete")
+    if _safe_float(execution_cost.get("order_notional_usdt")) + 1e-8 < final_notional:
+        reasons.append("paper_training_execution_cost_notional_too_small")
+    if pre_order.get("production_eligible") is not True or not str(
+        pre_order.get("input_fingerprint") or ""
+    ).strip():
+        reasons.append("paper_training_pre_order_facts_incomplete")
+    if sizing_pass.get("order_size_complete") is not True:
+        reasons.append("paper_training_size_aware_cost_incomplete")
+    filled_notional = max(_safe_float(filled_notional_usdt), 0.0)
+    if executed and filled_notional > target_notional + 1e-8:
+        reasons.append("paper_training_filled_notional_exceeds_target")
+    if executed and filled_order_present is False:
+        reasons.append("executed_entry_without_filled_order")
+    reasons = list(dict.fromkeys(reasons))
+    return (
+        {
+            "contract_lifecycle": "paper_training",
+            "contract_complete": not reasons,
+            "execution_scope": training.get("execution_scope"),
+            "production_permission": training.get("production_permission"),
+            "trade_is_normal": training.get("trade_is_normal"),
+            "loss_tolerant_for_training": training.get("loss_tolerant_for_training"),
+            "expected_net_return_pct": _safe_float(
+                training.get("expected_net_return_pct")
+            ),
+            "return_lcb_pct": _safe_float(training.get("return_lcb_pct")),
+            "planned_stressed_loss_usdt": planned_loss,
+            "final_notional_usdt": final_notional,
+            "final_leverage": final_leverage,
+            "filled_notional_usdt": filled_notional,
+        },
+        reasons,
+    )
 
 
 def validate_paper_exploration_entry_contract(

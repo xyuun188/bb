@@ -27,6 +27,11 @@ from services.paper_exploration import (
     assess_paper_exploration_entry,
     is_paper_exploration_decision,
 )
+from services.paper_training import (
+    assess_paper_training_entry,
+    attach_paper_training_order_identity,
+    is_paper_training_decision,
+)
 from services.strategy_arbitration import arbitrate_decision
 from services.trading_policies import PolicyGateResult
 
@@ -105,6 +110,25 @@ def _return_entry_contract_result(
             {
                 "stage_status": "blocked",
                 "paper_exploration": assessment.to_dict(),
+            },
+        )
+
+    if is_paper_training_decision(decision):
+        assessment = assess_paper_training_entry(decision, model_mode)
+        if assessment.eligible:
+            return PolicyGateResult.allow(
+                {
+                    "return_execution_contract": "paper_training",
+                    "production_permission": False,
+                    "paper_training": assessment.to_dict(),
+                }
+            )
+        return PolicyGateResult.block(
+            "paper_training_contract_incomplete",
+            assessment.reason,
+            {
+                "stage_status": "blocked",
+                "paper_training": assessment.to_dict(),
             },
         )
 
@@ -1067,6 +1091,13 @@ class ExecutionService:
             arbitration.data,
         )
         if decision.is_entry or decision.is_exit:
+            paper_training_order_identity = attach_paper_training_order_identity(
+                decision,
+                decision_db_id,
+                model_mode,
+            )
+            if paper_training_order_identity and decision_db_id is not None:
+                await mark_decision_raw_response(decision_db_id, decision.raw_response)
             await mark_stage(
                 DecisionStage.RISK_CHECK,
                 DecisionStageStatus.PENDING,

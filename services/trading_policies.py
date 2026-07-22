@@ -18,6 +18,10 @@ from services.paper_exploration import (
     assess_paper_exploration_entry,
     is_paper_exploration_decision,
 )
+from services.paper_training import (
+    assess_paper_training_entry,
+    is_paper_training_decision,
+)
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.return_execution_policy import apply_production_entry_policy
 
@@ -171,6 +175,25 @@ class EntryPolicy:
             return
         raise RuntimeError("EntryPolicy requires entry_profit_risk_sizing dependency")
 
+    @staticmethod
+    def _record_execution_cost_sizing_pass(
+        decision: DecisionOutput,
+        impact_basis_notional: float,
+    ) -> None:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing")
+        sizing = sizing if isinstance(sizing, dict) else {}
+        opportunity = raw.get("opportunity_score")
+        opportunity = opportunity if isinstance(opportunity, dict) else {}
+        execution_cost = opportunity.get("execution_cost")
+        execution_cost = execution_cost if isinstance(execution_cost, dict) else {}
+        raw["execution_cost_sizing_pass"] = {
+            "impact_basis_notional_usdt": impact_basis_notional,
+            "final_notional_usdt": sizing.get("final_notional_usdt", 0.0),
+            "order_size_complete": execution_cost.get("order_size_complete") is True,
+        }
+        decision.raw_response = raw
+
     async def prepare_dynamic_risk_contract(
         self,
         decision: DecisionOutput,
@@ -190,6 +213,42 @@ class EntryPolicy:
                 model_mode,
                 open_positions or [],
             )
+            return
+        if is_paper_training_decision(decision) and str(model_mode).lower() == "paper":
+            self.ensure_opportunity_score(
+                decision,
+                self.strategy_context_from_decision(decision),
+            )
+            await self.apply_profit_risk_sizing(
+                decision,
+                model_mode,
+                open_positions=open_positions or [],
+            )
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            sizing = raw.get("profit_risk_sizing")
+            sizing = sizing if isinstance(sizing, dict) else {}
+            planned_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+            if planned_notional > 0:
+                snapshot = (
+                    dict(decision.feature_snapshot)
+                    if isinstance(decision.feature_snapshot, dict)
+                    else {}
+                )
+                snapshot["planned_order_notional_usdt"] = planned_notional
+                snapshot["planned_order_side"] = (
+                    "long" if decision.action == Action.LONG else "short"
+                )
+                decision.feature_snapshot = snapshot
+                self.score_candidate(
+                    decision,
+                    self.strategy_context_from_decision(decision),
+                )
+                await self.apply_profit_risk_sizing(
+                    decision,
+                    model_mode,
+                    open_positions=open_positions or [],
+                )
+            self._record_execution_cost_sizing_pass(decision, planned_notional)
             return
         self.ensure_opportunity_score(
             decision,
@@ -260,24 +319,7 @@ class EntryPolicy:
                     "calculated_final_notional_usdt": final_notional,
                 },
             )
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        raw["execution_cost_sizing_pass"] = {
-            "impact_basis_notional_usdt": impact_basis_notional,
-            "final_notional_usdt": (
-                (raw.get("profit_risk_sizing") or {}).get("final_notional_usdt")
-                if isinstance(raw.get("profit_risk_sizing"), dict)
-                else 0.0
-            ),
-            "order_size_complete": (
-                ((raw.get("opportunity_score") or {}).get("execution_cost") or {}).get(
-                    "order_size_complete"
-                )
-                if isinstance(raw.get("opportunity_score"), dict)
-                and isinstance((raw.get("opportunity_score") or {}).get("execution_cost"), dict)
-                else False
-            ),
-        }
-        decision.raw_response = raw
+        self._record_execution_cost_sizing_pass(decision, impact_basis_notional)
 
     async def high_risk_review_gate(
         self,
@@ -400,6 +442,30 @@ class EntryPolicy:
                     "intent": "paper_exploration_entry",
                     "pipeline_context": context.public_data(),
                     "paper_exploration": exploration_assessment.to_dict(),
+                    "production_permission": False,
+                }
+            )
+        if is_paper_training_decision(decision):
+            assessment = assess_paper_training_entry(decision, model_mode)
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw["paper_training_assessment"] = assessment.to_dict()
+            decision.raw_response = raw
+            if not assessment.eligible:
+                return PolicyGateResult.block(
+                    "paper_training_policy",
+                    assessment.reason,
+                    {
+                        "pipeline_context": context.public_data(),
+                        "stage_status": "skipped",
+                        "skip_kind": "paper_training_policy",
+                        "paper_training": assessment.to_dict(),
+                    },
+                )
+            return PolicyGateResult.allow(
+                {
+                    "intent": "paper_training_entry",
+                    "pipeline_context": context.public_data(),
+                    "paper_training": assessment.to_dict(),
                     "production_permission": False,
                 }
             )

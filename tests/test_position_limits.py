@@ -28,6 +28,44 @@ def test_position_limit_checker_uses_dynamic_margin_and_stress_budgets():
     assert result.passed is True
 
 
+def test_position_limit_checker_accepts_money_rounding_at_exact_training_capacity():
+    checker = PositionLimitChecker()
+    result = checker.check_contract_entry_limits(
+        risk_contract=_contract(
+            account_equity_usdt=4829.84527538,
+            available_margin_usdt=4829.84527538,
+            final_margin_usdt=4829.84527538,
+            final_notional_usdt=4829.84527538,
+            planned_stressed_loss_usdt=48.29845275,
+            stressed_loss_fraction=0.01,
+            portfolio_risk_budget_usdt=48.29845275,
+        ),
+        current_positions=[],
+        account_balance=4829.84527538,
+        symbol="ADA/USDT",
+    )
+
+    assert result.passed is True
+
+
+def test_position_limit_checker_still_rejects_real_capacity_breach():
+    checker = PositionLimitChecker()
+    result = checker.check_contract_entry_limits(
+        risk_contract=_contract(
+            available_margin_usdt=500.0,
+            final_margin_usdt=260.0,
+            final_notional_usdt=260.0,
+            planned_stressed_loss_usdt=5.2,
+            portfolio_risk_budget_usdt=5.0,
+        ),
+        current_positions=[],
+        account_balance=1000.0,
+        symbol="BTC/USDT",
+    )
+
+    assert result.passed is False
+
+
 def test_missing_dynamic_stress_does_not_restore_fixed_notional_capacity():
     checker = PositionLimitChecker()
 

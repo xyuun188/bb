@@ -105,6 +105,21 @@ def test_takeover_refresh_preserves_persisted_paper_canary_lifecycle() -> None:
     assert contract["paper_canary_lifecycle"] == lifecycle
 
 
+def test_takeover_refresh_preserves_paper_training_lifecycle() -> None:
+    lifecycle = {
+        "version": "2026-07-22.paper-training-position-lifecycle.v1",
+        "kind": "normal_paper_training_position",
+        "decision_id": 104168,
+    }
+
+    contract = build_current_position_management_contract(
+        _facts(current_price=104.0),
+        previous_contract={"paper_training_lifecycle": lifecycle},
+    )
+
+    assert contract["paper_training_lifecycle"] == lifecycle
+
+
 def test_zero_actual_fee_is_complete_when_okx_fee_evidence_is_explicit() -> None:
     contract = build_current_position_management_contract(
         _facts(entry_fee_usdt=0.0, full_entry_fee_usdt=0.0)

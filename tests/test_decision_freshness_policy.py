@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_freshness import DecisionFreshnessPolicy
+from services.paper_training import build_paper_training_contract
 
 
 def _decision(
@@ -116,6 +117,30 @@ def test_paper_canary_freshness_uses_version_bound_prediction_horizon() -> None:
     decision.raw_response["paper_bootstrap_canary"]["policy_provenance"][
         "generated_at"
     ] = "2026-07-17T09:49:00+00:00"
+    assert policy.stale_decision_reason(decision) is not None
+
+
+def test_paper_training_freshness_uses_observed_model_horizon() -> None:
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)
+    decision = _decision(
+        now=now,
+        generated_at=now - timedelta(days=1),
+        valid_for_seconds=0,
+    )
+    decision.raw_response["paper_training"] = build_paper_training_contract(
+        symbol=decision.symbol,
+        selected_side="long",
+        signal_source="direction_competition_observation",
+        horizon_minutes=10.0,
+    )
+    policy = DecisionFreshnessPolicy(clock=lambda: now)
+    generated_at = policy.decision_reference_time(decision)
+    policy.clock = lambda: generated_at + timedelta(seconds=599)
+
+    assert policy.max_age_seconds(decision) == 600.0
+    assert policy.stale_decision_reason(decision) is None
+
+    policy.clock = lambda: generated_at + timedelta(seconds=601)
     assert policy.stale_decision_reason(decision) is not None
 
 

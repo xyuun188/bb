@@ -6,13 +6,16 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.symbols import okx_inst_id_from_symbol
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PaperBootstrapCanaryPolicy,
 )
+from services.paper_training import is_paper_training_decision
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -21,9 +24,10 @@ def _safe_dict(value: Any) -> dict[str, Any]:
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value) if value is not None else default
+        number = float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+    return number if isfinite(number) else default
 
 
 def _feature_snapshot(value: Any) -> dict[str, Any]:
@@ -62,10 +66,6 @@ class EntryPriceGuardPolicy:
         if quality_reason:
             return f"Pre-order analysis market fact is invalid; entry fails closed: {quality_reason}"
 
-        fresh = await self._fresh_valid_snapshot(decision.symbol)
-        if not fresh:
-            return "Fresh pre-order native market fact is incomplete; entry fails closed."
-
         execution_facts: dict[str, Any] = {}
         if self.pre_order_execution_facts_provider is not None:
             try:
@@ -83,16 +83,19 @@ class EntryPriceGuardPolicy:
             execution_snapshot = _safe_dict(execution_facts.get("feature_snapshot"))
             if not execution_snapshot:
                 return "Authoritative pre-order execution snapshot is missing; entry fails closed."
-            fresh_inst_id = str(
-                _safe_dict(_safe_dict(fresh.get("market_fact")).get("native_identity")).get(
-                    "inst_id"
-                )
-                or ""
-            ).upper()
             execution_inst_id = str(execution_facts.get("inst_id") or "").upper()
-            if fresh_inst_id and execution_inst_id and fresh_inst_id != execution_inst_id:
+            expected_inst_id = okx_inst_id_from_symbol(decision.symbol).upper()
+            if (
+                not execution_inst_id
+                or not expected_inst_id
+                or execution_inst_id != expected_inst_id
+            ):
                 return "Pre-order market fact and execution fact instrument mismatch; entry fails closed."
-            fresh = {**fresh, **execution_snapshot}
+            fresh = execution_snapshot
+        else:
+            fresh = await self._fresh_valid_snapshot(decision.symbol)
+            if not fresh:
+                return "Fresh pre-order native market fact is incomplete; entry fails closed."
 
         snapshot_price = _safe_float(snapshot.get("current_price") or snapshot.get("close"))
         if snapshot_price <= 0:
@@ -105,13 +108,16 @@ class EntryPriceGuardPolicy:
             str(model_mode or "").lower() == "paper"
             and PaperBootstrapCanaryPolicy.is_claimed(decision)
         )
-        return_budget = (
+        paper_training = bool(
+            str(model_mode or "").lower() == "paper"
+            and is_paper_training_decision(decision)
+        )
+        return_budget = None if paper_training else (
             self._paper_canary_price_budget_fraction(decision)
             if paper_canary
             else self._return_budget_fraction(decision)
         )
-        allowed = return_budget
-        if allowed <= 0:
+        if not paper_training and (return_budget is None or return_budget <= 0):
             return (
                 "Authoritative paper bootstrap distribution drift budget is missing; "
                 "entry fails closed."
@@ -121,6 +127,7 @@ class EntryPriceGuardPolicy:
 
         move = (latest_price - snapshot_price) / snapshot_price
         adverse = self._adverse_move(decision.action, move)
+        allowed = None if paper_training else return_budget
         raw = _safe_dict(decision.raw_response)
         analysis_fact = _safe_dict(snapshot.get("market_fact"))
         fresh_fact = _safe_dict(fresh.get("market_fact"))
@@ -128,22 +135,41 @@ class EntryPriceGuardPolicy:
             "snapshot_price": snapshot_price,
             "latest_price": latest_price,
             "adverse_move_fraction": round(adverse, 8),
-            "return_budget_fraction": round(return_budget, 8),
-            "allowed_adverse_move_fraction": round(allowed, 8),
+            "return_budget_fraction": (
+                round(return_budget, 8) if return_budget is not None else None
+            ),
+            "allowed_adverse_move_fraction": (
+                round(allowed, 8) if allowed is not None else None
+            ),
             "decision_age_seconds": round(self.decision_age_seconds_provider(decision), 3),
             "contract_lifecycle": (
-                "paper_bootstrap_canary" if paper_canary else "production_return"
+                "paper_training"
+                if paper_training
+                else "paper_bootstrap_canary"
+                if paper_canary
+                else "production_return"
             ),
-            "production_permission": False if paper_canary else True,
+            "production_permission": False if paper_canary or paper_training else True,
+            "profitability_gate_applied": not paper_training,
+            "safety_scope": (
+                "market_integrity_only"
+                if paper_training
+                else "market_integrity_and_return_budget"
+            ),
             "policy_provenance": {
                 "source": (
+                    "paper_training_market_integrity_only"
+                    if paper_training
+                    else
                     "paper_bootstrap_empirical_distribution_uncertainty"
                     if paper_canary
                     else "authoritative_fee_after_return_lcb"
                 ),
                 "observation_window": "current_pre_order_refresh",
                 "sample_count": (
-                    self._paper_canary_sample_count(decision)
+                    self._paper_training_sample_count(decision)
+                    if paper_training
+                    else self._paper_canary_sample_count(decision)
                     if paper_canary
                     else self._return_sample_count(decision)
                 ),
@@ -159,12 +185,15 @@ class EntryPriceGuardPolicy:
                 ).get("inst_id"),
                 "fresh_inst_id": _safe_dict(fresh_fact.get("native_identity")).get(
                     "inst_id"
-                ),
-                "fresh_source_timestamp_ms": fresh_fact.get("source_timestamp_ms"),
-                "fresh_source_interface": fresh_fact.get("source_interface"),
+                )
+                or execution_facts.get("inst_id"),
+                "fresh_source_timestamp_ms": fresh_fact.get("source_timestamp_ms")
+                or execution_facts.get("ticker_source_timestamp_ms"),
+                "fresh_source_interface": fresh_fact.get("source_interface")
+                or _safe_dict(execution_facts.get("policy_provenance")).get("source"),
             },
         }
-        if adverse <= allowed:
+        if paper_training or (allowed is not None and adverse <= allowed):
             public_execution_facts = {
                 key: value
                 for key, value in execution_facts.items()
@@ -268,3 +297,10 @@ class EntryPriceGuardPolicy:
 
     def _return_sample_count(self, decision: DecisionOutput) -> int:
         return max(int(_safe_float(self._side_evidence(decision).get("production_source_count"))), 0)
+
+    @staticmethod
+    def _paper_training_sample_count(decision: DecisionOutput) -> int:
+        raw = _safe_dict(decision.raw_response)
+        contract = _safe_dict(raw.get("paper_training"))
+        provenance = _safe_dict(contract.get("policy_provenance"))
+        return max(int(_safe_float(provenance.get("sample_count"))), 0)

@@ -226,6 +226,10 @@ class OkxPositionHistoryMirrorSyncService:
                 if not spec:
                     continue
                 raw = dict(record.raw_row or {})
+                if str(raw.get("_bb_contract_spec_source") or "").startswith(
+                    "okx_account_position_"
+                ):
+                    continue
                 if raw.get("_bb_contract_spec") == spec:
                     continue
                 raw["_bb_contract_spec"] = dict(spec)
