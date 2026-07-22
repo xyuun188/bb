@@ -540,19 +540,14 @@ def build_batch_experts_user_prompt(
         ),
     }
     role_contracts = "\n".join(
-        f"- {name}: {role_contract_by_expert[name]}"
-        for name in requested_experts
+        f"- {name}: {role_contract_by_expert[name]}" for name in requested_experts
     )
     if isinstance(feature_context, dict):
         market_by_expert = {
-            name: _short_text(feature_context.get(name, ""), 640)
-            for name in requested_experts
+            name: _short_text(feature_context.get(name, ""), 640) for name in requested_experts
         }
     else:
-        market_by_expert = {
-            name: _short_text(feature_context, 420)
-            for name in requested_experts
-        }
+        market_by_expert = {name: _short_text(feature_context, 420) for name in requested_experts}
 
     strategy_mode = (
         context.get("strategy_mode") if isinstance(context.get("strategy_mode"), dict) else {}
@@ -657,19 +652,40 @@ def build_batch_experts_user_prompt(
         payload["local_ai_tools"] = {}
         payload["portfolio"] = {}
         payload["market_by_expert"] = {
-            name: _short_text(value, 220)
-            for name, value in market_by_expert.items()
+            name: _short_text(value, 220) for name, value in market_by_expert.items()
         }
         text = json.dumps(payload, ensure_ascii=False, default=str)
-    return f"""BATCH_EXPERT_JSON_V11
+    paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
+    expert_schema = (
+        '{"action":"long|short|close_long|close_short|hold","confidence":0-1,'
+        '"reasoning":"简体中文12-28字，写方向/收益/风险要点",'
+        '"position_size_pct":0-1,"suggested_leverage":"number >=1",'
+        '"stop_loss_pct":0-1,"take_profit_pct":0-1,'
+        '"suggested_holding_minutes":"positive number",'
+        '"maximum_holding_minutes":"number >= suggested_holding_minutes",'
+        '"suggested_close_fraction":0-1,"cross_check_for":null}'
+        if paper_multidimensional
+        else '{"action":"long|short|close_long|close_short|hold","confidence":0-1,'
+        '"reasoning":"简体中文12-28字，写方向/收益/风险要点",'
+        '"cross_check_for":null}'
+    )
+    expert_rule = (
+        "For paper mode every expert must provide a complete diagnostic trade plan: "
+        "size, leverage, stop, target, expected holding time, maximum holding time, "
+        "and close fraction. These are recommendations only; unified risk remains "
+        "authoritative and may reduce or reject them."
+        if paper_multidimensional
+        else "Experts are diagnostic and cannot set size, leverage, stop loss, or take profit."
+    )
+    return f"""BATCH_EXPERT_JSON_V12
 Return one minified JSON object only. No markdown, no prose, no <think>. Keep it short enough to finish in one response.
 Schema: {{"experts":{{{requested_schema}}}}}
 Required experts: {requested_list}. {omitted_rule.rstrip()}
 Role contracts; do not copy or merge them:
 {role_contracts}
 Each expert value must contain exactly:
-{{"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-28字，写方向/收益/风险要点","cross_check_for":null}}
-Rules: Experts are diagnostic and cannot set size, leverage, stop loss, or take profit. Follow only each role contract; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
+{expert_schema}
+Rules: {expert_rule} Follow only each role contract; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
 Payload JSON (complete and valid):
 {text}
 JSON:"""

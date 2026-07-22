@@ -190,6 +190,52 @@ def test_authoritative_return_candidate_does_not_depend_on_expert_availability()
     assert decision.raw_response["authoritative_return_candidate"]["production_eligible"] is True
 
 
+def test_paper_entry_aggregates_matching_model_trade_plan() -> None:
+    opinions = _strong_long_opinions()
+    for index, opinion in enumerate(opinions.values(), start=1):
+        opinion.position_size_pct = 0.02 * index
+        opinion.suggested_leverage = float(index + 1)
+        opinion.stop_loss_pct = 0.005 * index
+        opinion.take_profit_pct = 0.01 * index
+        opinion.suggested_holding_minutes = 10.0 * index
+        opinion.maximum_holding_minutes = 20.0 * index
+        opinion.suggested_close_fraction = 0.1 * index
+
+    decision = _coordinator().combine(
+        _features(),
+        _return_context(execution_mode="paper"),
+        opinions,
+    )
+
+    assert decision.action == Action.LONG
+    assert 0.02 <= decision.position_size_pct <= 0.10
+    assert 2.0 <= decision.suggested_leverage <= 6.0
+    assert decision.stop_loss_pct > 0.0
+    assert decision.take_profit_pct > decision.stop_loss_pct
+    assert decision.suggested_holding_minutes > 0.0
+    assert decision.maximum_holding_minutes >= decision.suggested_holding_minutes
+    plan = decision.raw_response["multidimensional_recommendation"]
+    assert plan["matching_side_model_count"] == 5
+    assert plan["fallback_fields"] == []
+    assert plan["single_order_authority"] is True
+
+
+def test_live_entry_keeps_legacy_execution_values() -> None:
+    decision = _coordinator().combine(
+        _features(),
+        _return_context(execution_mode="live"),
+        _strong_long_opinions(),
+    )
+
+    assert decision.action == Action.LONG
+    assert decision.position_size_pct == 0.0
+    assert decision.suggested_leverage == 1.0
+    assert decision.stop_loss_pct == 0.0
+    assert decision.take_profit_pct == 0.0
+    assert decision.suggested_holding_minutes == 0.0
+    assert "multidimensional_recommendation" not in decision.raw_response
+
+
 def test_positive_mean_uncertain_candidate_can_only_create_bounded_paper_entry() -> None:
     decision = _coordinator().combine(
         _features(),
@@ -198,7 +244,10 @@ def test_positive_mean_uncertain_candidate_can_only_create_bounded_paper_entry()
     )
 
     assert decision.action == Action.LONG
-    assert decision.suggested_leverage == 1.0
+    assert decision.suggested_leverage == 3.0
+    assert (
+        decision.raw_response["multidimensional_recommendation"]["execution_scope"] == "paper_only"
+    )
     contract = decision.raw_response["paper_exploration"]
     assert contract["execution_scope"] == "paper_only"
     assert contract["production_permission"] is False
@@ -436,9 +485,9 @@ def test_many_low_quality_roles_cannot_outvote_one_high_quality_model() -> None:
     decision = _coordinator().combine(_features(), context, opinions)
 
     assert decision.raw_response["weighted_score"] > 0.0
-    weak = decision.raw_response["continuous_expert_weight_allocations"][
-        "source_groups"
-    ]["llm:shared-weak-model"]
+    weak = decision.raw_response["continuous_expert_weight_allocations"]["source_groups"][
+        "llm:shared-weak-model"
+    ]
     assert weak["effective_weight_total"] == weak["source_budget"]
 
 
@@ -462,9 +511,7 @@ def test_continuous_weights_are_ignored_by_live_ensemble_path() -> None:
     )
 
     assert with_report.action == baseline.action
-    assert with_report.raw_response["weighted_score"] == baseline.raw_response[
-        "weighted_score"
-    ]
+    assert with_report.raw_response["weighted_score"] == baseline.raw_response["weighted_score"]
     assert with_report.raw_response["opinions"] == baseline.raw_response["opinions"]
     assert "continuous_model_weights" not in with_report.raw_response
 
@@ -562,6 +609,9 @@ def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> 
 
     assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    assert decision.raw_response["continuous_strategy_routing"]["current_route"][
-        "primary"
-    ]["profile_id"] == "trend_up_long"
+    assert (
+        decision.raw_response["continuous_strategy_routing"]["current_route"]["primary"][
+            "profile_id"
+        ]
+        == "trend_up_long"
+    )

@@ -109,7 +109,7 @@ def _decision() -> DecisionOutput:
                         }
                     ]
                 },
-            }
+            },
         },
     )
 
@@ -181,7 +181,6 @@ def test_multiple_okx_leverage_tiers_without_bounds_fail_closed() -> None:
 async def test_legacy_probe_and_evidence_payload_cannot_change_dynamic_sizing() -> None:
     first = _decision()
     second = deepcopy(first)
-    second.position_size_pct = 0.9
     first.raw_response.update(
         {
             "quant_profit_probe": {"triggered": True, "strong_probe": True},
@@ -206,9 +205,15 @@ async def test_legacy_probe_and_evidence_payload_cannot_change_dynamic_sizing() 
     sizing = first.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is True
     assert sizing["risk_budget_usdt"] > 0
-    assert sizing["target_notional_usdt"] == pytest.approx(
+    assert sizing["risk_limited_target_notional_usdt"] == pytest.approx(
         sizing["risk_budget_usdt"] / sizing["stressed_loss_fraction"],
         rel=1e-7,
+    )
+    assert sizing["target_notional_usdt"] == pytest.approx(
+        min(
+            sizing["risk_limited_target_notional_usdt"],
+            sizing["model_requested_notional_cap_usdt"],
+        )
     )
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assert "final_position_size" not in sizing["audit_inputs"]
@@ -226,11 +231,31 @@ async def test_legacy_probe_and_evidence_payload_cannot_change_dynamic_sizing() 
 
 
 @pytest.mark.asyncio
+async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
+    small = _decision()
+    large = deepcopy(small)
+    small.position_size_pct = 0.01
+    small.suggested_leverage = 2.0
+    large.position_size_pct = 0.9
+    large.suggested_leverage = 12.0
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(small, "paper", [])
+    await policy.apply(large, "paper", [])
+
+    small_sizing = small.raw_response["profit_risk_sizing"]
+    assert small.position_size_pct <= 0.01
+    assert small.suggested_leverage <= 2.0
+    assert large.position_size_pct <= 0.9
+    assert large.suggested_leverage <= 12.0
+    assert small_sizing["model_position_cap_applied"] is True
+    assert small_sizing["final_notional_usdt"] <= small_sizing["model_final_notional_cap_usdt"]
+
+
+@pytest.mark.asyncio
 async def test_missing_production_cost_fails_closed_without_fixed_fallback() -> None:
     decision = _decision()
-    decision.raw_response["opportunity_score"]["execution_cost"][
-        "production_eligible"
-    ] = False
+    decision.raw_response["opportunity_score"]["execution_cost"]["production_eligible"] = False
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
@@ -272,12 +297,14 @@ async def test_risk_increase_cannot_increase_position() -> None:
     await policy.apply(wider_stop, "paper", [])
     await policy.apply(worse_tail, "paper", [])
 
-    assert wider_stop.raw_response["profit_risk_sizing"]["final_notional_usdt"] <= baseline.raw_response[
-        "profit_risk_sizing"
-    ]["final_notional_usdt"]
-    assert worse_tail.raw_response["profit_risk_sizing"]["risk_budget_usdt"] <= baseline.raw_response[
-        "profit_risk_sizing"
-    ]["risk_budget_usdt"]
+    assert (
+        wider_stop.raw_response["profit_risk_sizing"]["final_notional_usdt"]
+        <= baseline.raw_response["profit_risk_sizing"]["final_notional_usdt"]
+    )
+    assert (
+        worse_tail.raw_response["profit_risk_sizing"]["risk_budget_usdt"]
+        <= baseline.raw_response["profit_risk_sizing"]["risk_budget_usdt"]
+    )
 
 
 @pytest.mark.asyncio
@@ -292,9 +319,10 @@ async def test_lower_return_lcb_cannot_increase_risk_budget() -> None:
     await policy.apply(baseline, "paper", [])
     await policy.apply(lower_lcb, "paper", [])
 
-    assert lower_lcb.raw_response["profit_risk_sizing"]["risk_budget_usdt"] <= baseline.raw_response[
-        "profit_risk_sizing"
-    ]["risk_budget_usdt"]
+    assert (
+        lower_lcb.raw_response["profit_risk_sizing"]["risk_budget_usdt"]
+        <= baseline.raw_response["profit_risk_sizing"]["risk_budget_usdt"]
+    )
 
 
 @pytest.mark.asyncio
@@ -325,7 +353,7 @@ async def test_portfolio_dependency_cannot_increase_risk_budget() -> None:
     }
     pressured.raw_response["exchange_risk_facts"]["contract_specs"] = {
         "BTC-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
-        "ETH-USDT-SWAP": {"ctVal": "1", "ctMult": "1"}
+        "ETH-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
     }
     open_positions = [
         {
@@ -444,7 +472,8 @@ async def test_confirmed_fill_can_use_reserved_ceiling_but_other_enlargement_can
     await policy.apply(decision, "paper", [])
     sizing = decision.raw_response["profit_risk_sizing"]
     risk_ceiling = sizing["risk_budget_usdt"] / sizing["stressed_loss_fraction"]
-    reserved_target = risk_ceiling / 1.002
+    model_ceiling = sizing["model_requested_notional_cap_usdt"]
+    reserved_target = min(risk_ceiling, model_ceiling) / 1.002
     sizing["target_notional_usdt"] = reserved_target
     sizing["fill_notional_ceiling_usdt"] = risk_ceiling
     sizing["final_notional_usdt"] = reserved_target

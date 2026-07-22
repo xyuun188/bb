@@ -15,6 +15,7 @@ COMPLETION_TOKEN_CAPS = {
     # prompts use about 3200 input tokens, so 560 leaves explicit transport and
     # tokenizer headroom while still fitting five compact expert JSON objects.
     "batch_expert": 560,
+    "paper_batch_expert": 900,
     "consultation": 700,
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 700,
@@ -28,6 +29,7 @@ THINKING_COMPLETION_TOKEN_CAPS = {
     "expert": 640,
     "decision_maker": 560,
     "batch_expert": 1100,
+    "paper_batch_expert": 1100,
     "consultation": 1100,
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 1100,

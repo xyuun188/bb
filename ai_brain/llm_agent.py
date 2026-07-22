@@ -83,6 +83,21 @@ def _snapshot_float(snapshot: dict[str, Any], key: str, default: float = 0.0) ->
         return default
 
 
+def _bounded_number(
+    value: Any,
+    *,
+    default: float = 0.0,
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or abs(number) == float("inf"):
+        return default
+    number = max(number, minimum)
+    return min(number, maximum) if maximum is not None else number
 
 
 def _format_local_ai_tools(tools: dict[str, Any]) -> str:
@@ -161,8 +176,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         urgency = exit_advice.get("urgency")
         reason = exit_advice.get("reason") or ""
         parts.append(
-            "Exit model: "
-            f"action={action}, urgency={_fmt_num(urgency, 3)}, reason={reason[:180]}."
+            f"Exit model: action={action}, urgency={_fmt_num(urgency, 3)}, reason={reason[:180]}."
         )
 
     parts.append(
@@ -227,8 +241,6 @@ def _format_portfolio_profit_protection(context: dict[str, Any]) -> str:
         "For this position review, explicitly choose continue_hold, partial_lock_profit, or full_close. "
         "Hold is valid only if continuation edge is still better than locking realized profit now."
     )
-
-
 
 
 def _strip_trailing_json_commas(text: str) -> str:
@@ -551,8 +563,8 @@ def _build_compact_feature_context(features: FeatureVector, role: str) -> str:
         headlines = " | ".join((features.recent_headlines or [])[:3])
         news_items = getattr(features, "recent_news_items", None) or []
         news_detail = " | ".join(
-            f"{item.get('source','-')}:{item.get('event_type','news')}:impact{item.get('impact_level',1)}:"
-            f"sent{_fmt_num(item.get('sentiment_score', 0), 2)}:{item.get('title','')[:80]}"
+            f"{item.get('source', '-')}:{item.get('event_type', 'news')}:impact{item.get('impact_level', 1)}:"
+            f"sent{_fmt_num(item.get('sentiment_score', 0), 2)}:{item.get('title', '')[:80]}"
             for item in news_items[:4]
             if isinstance(item, dict)
         )
@@ -647,6 +659,13 @@ _FAST_EXPERT_SYSTEM_PROMPT = """FAST_EXPERT_JSON_V1. Return only one compact JSO
 Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":"positive number, account-capped later","stop_loss_pct":"0-1, derived from current market risk","take_profit_pct":"0-1, derived from current expected move","cross_check_for":null}
 Confidence is diagnostic only. Incomplete fee-after return or provenance => hold."""
 
+_PAPER_MULTIDIMENSIONAL_PLAN_PROMPT = """PAPER_MULTIDIMENSIONAL_PLAN_V1.
+For simulated trading, the earlier exact JSON schema is extended: also return
+suggested_holding_minutes, maximum_holding_minutes, and suggested_close_fraction.
+Every numeric recommendation must be based on the current
+symbol, fee-after return, volatility, liquidity, and loss range. The unified risk system
+may reduce or reject the recommendation and is the only execution authority."""
+
 
 def _fast_feature_text(feature_text: str, *, limit: int = 900) -> str:
     """Return the highest-signal prefix of an expert feature context."""
@@ -727,6 +746,7 @@ class LLMAgent(AbstractAIModel):
         *,
         json_response: bool = False,
         fast_expert: bool = False,
+        completion_stage: str | None = None,
     ) -> ChatOpenAI:
         reasoning_model = _is_reasoning_model(model)
         configured_timeout = (
@@ -751,7 +771,7 @@ class LLMAgent(AbstractAIModel):
             if self._role == "final_decision"
             else settings.ai_expert_max_completion_tokens
         )
-        token_stage = (
+        token_stage = completion_stage or (
             "batch_expert"
             if max_completion_tokens_override is not None
             else ("decision_maker" if self._role == "final_decision" else "expert")
@@ -925,6 +945,8 @@ class LLMAgent(AbstractAIModel):
                 )
             )
         )
+        if str(context.get("execution_mode") or "").lower() == "paper":
+            system_prompt = f"{system_prompt}\n{_PAPER_MULTIDIMENSIONAL_PLAN_PROMPT}"
 
         # Retry configured model first. In expert mode, try provider-compatible
         # backup AI models before falling back to conservative local rules.
@@ -1027,8 +1049,17 @@ class LLMAgent(AbstractAIModel):
                     await asyncio.sleep(_LLM_CALL_DELAY)
                 batch_llm = self._create_llm(
                     self._model_name,
-                    max_completion_tokens_override=settings.ai_batch_expert_max_completion_tokens,
+                    max_completion_tokens_override=(
+                        max(settings.ai_batch_expert_max_completion_tokens, 900)
+                        if str(context.get("execution_mode") or "").lower() == "paper"
+                        else settings.ai_batch_expert_max_completion_tokens
+                    ),
                     json_response=True,
+                    completion_stage=(
+                        "paper_batch_expert"
+                        if str(context.get("execution_mode") or "").lower() == "paper"
+                        else "batch_expert"
+                    ),
                 )
                 response = await batch_llm.ainvoke(messages)
             parsed = _extract_json(_message_content_text(response))
@@ -1115,11 +1146,11 @@ class LLMAgent(AbstractAIModel):
         if missing_after_repair:
             missing_text = ", ".join(missing_after_repair)
             raise LLMResponseParseError(
-                "batch experts response incomplete after repair; "
-                f"missing experts: {missing_text}"
+                f"batch experts response incomplete after repair; missing experts: {missing_text}"
             )
 
         decisions: dict[str, DecisionOutput] = {}
+        paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
         for name in expert_names:
             payload = experts_payload.get(name)
             if not isinstance(payload, dict):  # pragma: no cover - guarded above.
@@ -1138,14 +1169,55 @@ class LLMAgent(AbstractAIModel):
                 action=Action.from_string(str(payload.get("action", "hold"))),
                 confidence=min(max(float(payload.get("confidence", 0.5) or 0.5), 0.0), 1.0),
                 reasoning=str(payload.get("reasoning") or "暂无分析内容。")[:150],
-                position_size_pct=0.0,
-                suggested_leverage=1.0,
-                stop_loss_pct=0.0,
-                take_profit_pct=0.0,
+                position_size_pct=(
+                    _bounded_number(payload.get("position_size_pct"), maximum=1.0)
+                    if paper_multidimensional
+                    else 0.0
+                ),
+                suggested_leverage=(
+                    _bounded_number(
+                        payload.get("suggested_leverage"),
+                        default=1.0,
+                        minimum=1.0,
+                    )
+                    if paper_multidimensional
+                    else 1.0
+                ),
+                stop_loss_pct=(
+                    _bounded_number(payload.get("stop_loss_pct"), maximum=1.0)
+                    if paper_multidimensional
+                    else 0.0
+                ),
+                take_profit_pct=(
+                    _bounded_number(payload.get("take_profit_pct"), maximum=1.0)
+                    if paper_multidimensional
+                    else 0.0
+                ),
+                suggested_holding_minutes=(
+                    _bounded_number(payload.get("suggested_holding_minutes"))
+                    if paper_multidimensional
+                    else 0.0
+                ),
+                maximum_holding_minutes=(
+                    _bounded_number(payload.get("maximum_holding_minutes"))
+                    if paper_multidimensional
+                    else 0.0
+                ),
+                suggested_close_fraction=(
+                    _bounded_number(payload.get("suggested_close_fraction"), maximum=1.0)
+                    if paper_multidimensional
+                    else 0.0
+                ),
                 cross_check_for=payload.get("cross_check_for"),
                 raw_response=payload,
                 feature_snapshot=features.to_dict(),
             )
+            if (
+                paper_multidimensional
+                and decision.suggested_holding_minutes > 0
+                and decision.maximum_holding_minutes < decision.suggested_holding_minutes
+            ):
+                decision.maximum_holding_minutes = decision.suggested_holding_minutes
             decision = _calibrate_sentiment_decision(features, decision)
             decisions[name] = decision
         return decisions
@@ -1196,6 +1268,7 @@ class LLMAgent(AbstractAIModel):
             self._role,
         )
         parsed["cross_check_for"] = cross_check_for
+        paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
 
         decision = DecisionOutput(
             model_name=self.name,
@@ -1211,13 +1284,32 @@ class LLMAgent(AbstractAIModel):
                 1.0,
             ),
             stop_loss_pct=min(max(float(parsed.get("stop_loss_pct", 0.0) or 0.0), 0.0), 1.0),
-            take_profit_pct=min(
-                max(float(parsed.get("take_profit_pct", 0.0) or 0.0), 0.0), 1.0
+            take_profit_pct=min(max(float(parsed.get("take_profit_pct", 0.0) or 0.0), 0.0), 1.0),
+            suggested_holding_minutes=(
+                _bounded_number(parsed.get("suggested_holding_minutes"))
+                if paper_multidimensional
+                else 0.0
+            ),
+            maximum_holding_minutes=(
+                _bounded_number(parsed.get("maximum_holding_minutes"))
+                if paper_multidimensional
+                else 0.0
+            ),
+            suggested_close_fraction=(
+                _bounded_number(parsed.get("suggested_close_fraction"), maximum=1.0)
+                if paper_multidimensional
+                else 0.0
             ),
             cross_check_for=cross_check_for,
             raw_response=parsed,
             feature_snapshot=features.to_dict(),
         )
+        if (
+            paper_multidimensional
+            and decision.suggested_holding_minutes > 0
+            and decision.maximum_holding_minutes < decision.suggested_holding_minutes
+        ):
+            decision.maximum_holding_minutes = decision.suggested_holding_minutes
 
         return decision
 

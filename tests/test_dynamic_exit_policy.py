@@ -106,6 +106,20 @@ def test_profit_retrace_generates_continuous_fraction_and_overrides_legacy_size(
     assert result.current_management_contract_complete is True
 
 
+def test_explicit_model_close_recommendation_enters_risk_comparison() -> None:
+    decision = _decision()
+    decision.suggested_close_fraction = 0.25
+    position = _position(peak_unrealized_pnl=10.0)
+
+    result = apply_dynamic_exit(decision, [position])
+
+    assert result.eligible is True
+    assert result.model_requested_close_fraction == pytest.approx(0.25)
+    assert result.model_exit_confidence == pytest.approx(0.8)
+    assert result.model_exit_pressure == pytest.approx(0.2)
+    assert result.close_fraction == pytest.approx(0.2)
+
+
 def test_profitable_exit_without_execution_cost_fails_closed() -> None:
     result = apply_dynamic_exit(
         _decision(),

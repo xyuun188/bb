@@ -68,7 +68,7 @@ class DynamicLeverageDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": "dynamic_leverage_allocator_v2",
+            "version": "dynamic_leverage_allocator_v3",
             "requested_leverage": round(self.requested_leverage, 6),
             "theoretical_leverage": round(self.theoretical_leverage, 6),
             "final_integer_leverage": self.final_integer_leverage,
@@ -132,7 +132,7 @@ class DynamicLeverageAllocator:
                     "observation_window": "current_decision_with_active_account_state",
                     "sample_count": max(int(data.aligned_source_count), 0),
                     "generated_at": datetime.now(UTC).isoformat(),
-                    "strategy_version": "2026-07-15.independent-risk-leverage.v3",
+                    "strategy_version": "2026-07-22.model-capped-risk-leverage.v4",
                     "fallback_reason": fallback_reason,
                     "production_eligible": False,
                 },
@@ -145,6 +145,7 @@ class DynamicLeverageAllocator:
         portfolio = self._portfolio_leverage(data, float(system_max), adjustments)
 
         candidates = {
+            "model_request": requested,
             "system_max": float(system_max),
             "volatility": volatility,
             "liquidity": liquidity,
@@ -156,7 +157,9 @@ class DynamicLeverageAllocator:
 
         theoretical = min(signal_quality, candidate_limit)
         theoretical = _clamp(theoretical, 1.0, float(system_max))
-        if candidate_limit < requested:
+        if limiting_factor == "model_request":
+            reasons.append("limited_by_model_request")
+        elif candidate_limit < requested:
             reasons.append(f"limited_by_{limiting_factor}")
         else:
             reasons.append("derived_from_return_quality_and_risk_budget")
@@ -164,7 +167,7 @@ class DynamicLeverageAllocator:
         rounding_policy = self._rounding_policy(data)
         final_integer = floor(theoretical)
 
-        integer_cap = max(1, floor(min(candidate_limit, float(system_max))))
+        integer_cap = max(1, floor(min(candidate_limit, requested, float(system_max))))
         final_integer = max(1, min(final_integer, integer_cap, system_max))
 
         required_margin_leverage = data.target_notional_usdt / max(
@@ -200,7 +203,7 @@ class DynamicLeverageAllocator:
                 "observation_window": "current_decision_with_active_account_state",
                 "sample_count": max(int(data.aligned_source_count), 0),
                 "generated_at": datetime.now(UTC).isoformat(),
-                "strategy_version": "2026-07-15.independent-risk-leverage.v3",
+                "strategy_version": "2026-07-22.model-capped-risk-leverage.v4",
                 "fallback_reason": "",
                 "production_eligible": True,
             },

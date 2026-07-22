@@ -28,12 +28,13 @@ def _input(**overrides):
     return DynamicLeverageInput(**base)
 
 
-def test_dynamic_leverage_lifts_exploration_signal_without_fixed_three_x_cap():
+def test_dynamic_leverage_never_exceeds_model_request():
     decision = DynamicLeverageAllocator().allocate(_input())
 
-    assert decision.final_integer_leverage > 3
+    assert decision.final_integer_leverage == 3
     assert decision.final_integer_leverage == int(decision.final_integer_leverage)
     assert decision.limiting_factor in {
+        "model_request",
         "volatility",
         "signal_quality",
         "risk_budget",
@@ -75,12 +76,14 @@ def test_dynamic_leverage_observes_required_margin_without_using_size_to_set_bud
     assert decision.final_integer_leverage <= decision.system_max_leverage
 
 
-def test_requested_leverage_is_not_the_exchange_system_maximum() -> None:
+def test_requested_leverage_is_an_upper_bound_below_exchange_maximum() -> None:
     low_request = DynamicLeverageAllocator().allocate(_input(requested_leverage=2.0))
     high_request = DynamicLeverageAllocator().allocate(_input(requested_leverage=12.0))
 
     assert low_request.system_max_leverage == high_request.system_max_leverage == 20.0
-    assert low_request.final_integer_leverage == high_request.final_integer_leverage
+    assert low_request.final_integer_leverage <= 2
+    assert high_request.final_integer_leverage <= 12
+    assert low_request.final_integer_leverage < high_request.final_integer_leverage
 
 
 def test_dynamic_leverage_missing_cost_distribution_falls_back_to_one_x() -> None:

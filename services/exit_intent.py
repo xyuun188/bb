@@ -45,11 +45,10 @@ def _dynamic_exit_contract(raw: dict[str, Any]) -> dict[str, Any]:
     if not policy:
         policy = _safe_dict(_safe_dict(raw.get("close_evidence")).get("dynamic_exit_policy"))
     provenance = _safe_dict(policy.get("policy_provenance"))
-    if (
-        policy.get("eligible") is not True
-        or provenance.get("source")
-        != "current_position_fee_after_pnl_peak_planned_stop_and_market_returns"
-    ):
+    if policy.get("eligible") is not True or provenance.get("source") not in {
+        "current_position_fee_after_pnl_peak_planned_stop_and_market_returns",
+        "current_position_takeover_fee_after_pnl_peak_planned_stop_market_and_portfolio_facts",
+    }:
         return {}
     return policy
 

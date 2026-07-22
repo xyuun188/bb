@@ -65,6 +65,9 @@ class DynamicExitAssessment:
     continuation_deterioration: float
     opposite_pressure: float
     portfolio_exposure_pressure: float
+    model_requested_close_fraction: float
+    model_exit_confidence: float
+    model_exit_pressure: float
     planned_stop_crossed: bool
     paper_canary_horizon_elapsed: bool
     paper_canary_horizon_minutes: int
@@ -102,6 +105,15 @@ def assess_dynamic_exit(
     positions: list[dict[str, Any]],
 ) -> DynamicExitAssessment:
     raw = _safe_dict(decision.raw_response)
+    model_exit = _safe_dict(raw.get("model_exit_recommendation"))
+    model_requested_close_fraction = _clamp(
+        max(
+            _safe_float(model_exit.get("requested_close_fraction"), 0.0),
+            _safe_float(decision.suggested_close_fraction, 0.0),
+        )
+    )
+    model_exit_confidence = _clamp(_safe_float(model_exit.get("confidence"), decision.confidence))
+    model_exit_pressure = model_requested_close_fraction * model_exit_confidence
     matches = _matching_positions(decision, positions)
 
     gross_pnl = 0.0
@@ -206,9 +218,7 @@ def assess_dynamic_exit(
         management = _safe_dict(position.get("current_management_contract"))
         management_contracts.append(management)
         canary_horizon_assessments.append(assess_paper_canary_position_horizon(position))
-        training_horizon_assessments.append(
-            assess_paper_training_position_horizon(position)
-        )
+        training_horizon_assessments.append(assess_paper_training_position_horizon(position))
         if management.get("management_eligible") is True and not management.get("blockers"):
             management_pressure_values.append(
                 _clamp(_safe_float(management.get("portfolio_concentration_pressure"), 0.0))
@@ -241,7 +251,9 @@ def assess_dynamic_exit(
     stop_usage = (
         _clamp(max(-net_pnl, 0.0) / planned_risk)
         if planned_risk > 0
-        else _clamp(max(-net_pnl, 0.0) / notional) if notional > 0 else 0.0
+        else _clamp(max(-net_pnl, 0.0) / notional)
+        if notional > 0
+        else 0.0
     )
     target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
     feature_snapshot = _safe_dict(decision.feature_snapshot)
@@ -294,26 +306,17 @@ def assess_dynamic_exit(
             continuation,
             opposite,
             portfolio_pressure,
+            model_exit_pressure,
         )
     )
     reasons: list[str] = []
     if not matches:
         reasons.append("position_economics_missing")
-    if (
-        not hard_risk
-        and matches
-        and not current_management_contract_complete
-    ):
+    if not hard_risk and matches and not current_management_contract_complete:
         reasons.append("current_position_management_contract_incomplete")
     if not hard_risk and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
-    if (
-        not hard_risk
-        and gross_pnl > 0
-        and net_pnl <= 0
-        and stop_usage <= 0
-        and continuation <= 0
-    ):
+    if not hard_risk and gross_pnl > 0 and net_pnl <= 0 and stop_usage <= 0 and continuation <= 0:
         reasons.append("fee_after_profit_not_positive")
     if not hard_risk and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
@@ -325,7 +328,7 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-07-15.dynamic-exit-authoritative-facts.v3",
+        "strategy_version": "2026-07-22.dynamic-exit-model-risk-comparison.v4",
         "fallback_reason": ",".join(reasons),
     }
     return DynamicExitAssessment(
@@ -343,6 +346,9 @@ def assess_dynamic_exit(
         continuation_deterioration=round(continuation, 8),
         opposite_pressure=round(opposite, 8),
         portfolio_exposure_pressure=round(portfolio_pressure, 8),
+        model_requested_close_fraction=round(model_requested_close_fraction, 8),
+        model_exit_confidence=round(model_exit_confidence, 8),
+        model_exit_pressure=round(model_exit_pressure, 8),
         planned_stop_crossed=planned_stop_crossed,
         paper_canary_horizon_elapsed=paper_canary_horizon_elapsed,
         paper_canary_horizon_minutes=max(
@@ -359,10 +365,7 @@ def assess_dynamic_exit(
         ),
         paper_training_horizon_elapsed=paper_training_horizon_elapsed,
         paper_training_horizon_minutes=max(
-            (
-                _safe_float(item.get("horizon_minutes"), 0.0)
-                for item in elapsed_training_horizons
-            ),
+            (_safe_float(item.get("horizon_minutes"), 0.0) for item in elapsed_training_horizons),
             default=0.0,
         ),
         paper_training_expires_at=next(
@@ -397,7 +400,9 @@ def apply_dynamic_exit(
     raw["action_plan"] = (
         "close"
         if assessment.close_fraction >= 1.0
-        else "reduce" if assessment.close_fraction > 0.0 else "hold"
+        else "reduce"
+        if assessment.close_fraction > 0.0
+        else "hold"
     )
     decision.raw_response = raw
     decision.position_size_pct = assessment.close_fraction

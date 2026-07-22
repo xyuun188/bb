@@ -9,7 +9,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 
-TRADE_RECOMMENDATION_CONTRACT_VERSION = "2026-07-22.complete-trade-recommendation.v1"
+TRADE_RECOMMENDATION_CONTRACT_VERSION = "2026-07-22.multidimensional-paper-plan.v2"
 ENTRY_ACTIONS = {Action.LONG, Action.SHORT}
 
 
@@ -110,9 +110,7 @@ def _return_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
     )
     upper = _first_number(
         distribution.get("upper_quantile_return_pct"),
-        expected + abs(uncertainty)
-        if expected is not None and uncertainty is not None
-        else None,
+        expected + abs(uncertainty) if expected is not None and uncertainty is not None else None,
         expected,
     )
     return {
@@ -137,13 +135,18 @@ def _return_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
     }
 
 
-def _holding_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
+def _holding_plan(
+    raw: dict[str, Any],
+    side: str,
+    decision: DecisionOutput | None = None,
+) -> dict[str, Any]:
     opportunity, side_candidate, training, canary, exploration = _opportunity_sources(
         raw,
         side,
     )
     distribution = _dict(opportunity.get("return_distribution_contract"))
     target = _positive(
+        getattr(decision, "suggested_holding_minutes", None),
         distribution.get("horizon_minutes"),
         side_candidate.get("horizon_minutes"),
         training.get("prediction_horizon_minutes"),
@@ -153,6 +156,7 @@ def _holding_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
         exploration.get("horizon_minutes"),
     )
     max_minutes = _positive(
+        getattr(decision, "maximum_holding_minutes", None),
         raw.get("max_holding_minutes"),
         _dict(raw.get("dynamic_exit_policy")).get("max_holding_minutes"),
         target,
@@ -168,7 +172,9 @@ def _holding_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
         "maximum_minutes": max_minutes,
         "entry_valid_for_seconds": valid_for_seconds,
         "source": (
-            "model_return_horizon"
+            "unified_model_recommendation"
+            if _positive(getattr(decision, "suggested_holding_minutes", None)) is not None
+            else "model_return_horizon"
             if target is not None
             else "missing"
         ),
@@ -242,11 +248,12 @@ def _loss_plan(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _exit_plan(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, Any]:
-    holding = _holding_plan(raw, _side(decision))
+    holding = _holding_plan(raw, _side(decision), decision)
     stop = _positive(decision.stop_loss_pct)
     take = _positive(decision.take_profit_pct)
     close_evidence = _dict(raw.get("close_evidence"))
     close_fraction = _positive(
+        decision.suggested_close_fraction,
         close_evidence.get("close_fraction"),
         close_evidence.get("position_size_pct"),
     )
@@ -289,6 +296,9 @@ def _model_recommendations(raw: dict[str, Any]) -> list[dict[str, Any]]:
                 "suggested_leverage": _finite(item.get("suggested_leverage")),
                 "stop_loss_fraction": _finite(item.get("stop_loss_pct")),
                 "take_profit_fraction": _finite(item.get("take_profit_pct")),
+                "suggested_holding_minutes": _finite(item.get("suggested_holding_minutes")),
+                "maximum_holding_minutes": _finite(item.get("maximum_holding_minutes")),
+                "suggested_close_fraction": _finite(item.get("suggested_close_fraction")),
                 "effective_weight": _finite(item.get("effective_weight")),
                 "trade_plan": copy.deepcopy(_dict(item.get("trade_plan"))),
                 "reasoning": str(item.get("reasoning") or "")[:500],
@@ -321,7 +331,7 @@ def _recommendation(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, 
     action = decision.action.value
     recommendations = _model_recommendations(raw)
     support, oppose = _evidence_summary(recommendations, action)
-    holding = _holding_plan(raw, side)
+    holding = _holding_plan(raw, side, decision)
     return {
         "symbol": decision.symbol,
         "decision": _decision_kind(decision),
@@ -353,9 +363,10 @@ def _entry_plan_reasons(plan: dict[str, Any]) -> list[str]:
     entry = _dict(plan.get("entry"))
     if _positive(entry.get("price_reference")) is None:
         reasons.append("trade_plan_entry_price_missing")
-    if _positive(entry.get("minimum_price")) is None or _positive(
-        entry.get("maximum_price")
-    ) is None:
+    if (
+        _positive(entry.get("minimum_price")) is None
+        or _positive(entry.get("maximum_price")) is None
+    ):
         reasons.append("trade_plan_entry_range_missing")
     if _positive(entry.get("valid_for_seconds")) is None:
         reasons.append("trade_plan_validity_missing")
@@ -384,9 +395,7 @@ def _entry_plan_reasons(plan: dict[str, Any]) -> list[str]:
         reasons.append("trade_plan_stop_loss_missing")
     if _positive(exit_plan.get("take_profit_fraction")) is None:
         reasons.append("trade_plan_take_profit_missing")
-    if not _dict(exit_plan.get("invalidation")) or not _dict(
-        exit_plan.get("full_close")
-    ):
+    if not _dict(exit_plan.get("invalidation")) or not _dict(exit_plan.get("full_close")):
         reasons.append("trade_plan_exit_conditions_missing")
     return reasons
 
@@ -401,11 +410,7 @@ def attach_initial_trade_recommendation(
     raw = _dict(decision.raw_response)
     existing = _dict(raw.get("trade_recommendation_contract"))
     recommendation = _recommendation(decision, raw)
-    reasons = (
-        _entry_plan_reasons(recommendation)
-        if decision.action in ENTRY_ACTIONS
-        else []
-    )
+    reasons = _entry_plan_reasons(recommendation) if decision.action in ENTRY_ACTIONS else []
     contract = {
         **existing,
         "version": TRADE_RECOMMENDATION_CONTRACT_VERSION,
@@ -419,12 +424,14 @@ def attach_initial_trade_recommendation(
         "current_recommendation": recommendation,
         "current_recommendation_complete": not reasons,
         "current_recommendation_reasons": reasons,
-        "risk_adjustment": _dict(existing.get("risk_adjustment")) or {
+        "risk_adjustment": _dict(existing.get("risk_adjustment"))
+        or {
             "status": "pending",
             "complete": False,
             "reasons": ["risk_adjustment_pending"],
         },
-        "execution": _dict(existing.get("execution")) or {
+        "execution": _dict(existing.get("execution"))
+        or {
             "status": "pending",
             "exchange_confirmed": False,
         },
@@ -463,6 +470,11 @@ def attach_risk_adjusted_trade_recommendation(
                     "field": field,
                     "before": before.get(field),
                     "after": after.get(field),
+                    "reason": (
+                        "账户、交易所、波动、流动性和最大亏损共同限制杠杆"
+                        if field == "suggested_leverage"
+                        else "账户与组合最大亏损预算限制仓位"
+                    ),
                 }
             )
     for field in ("stop_loss_fraction", "take_profit_fraction"):
@@ -474,8 +486,36 @@ def attach_risk_adjusted_trade_recommendation(
                     "field": field,
                     "before": before_value,
                     "after": after_value,
+                    "reason": (
+                        "硬止损和压力损失取更严格结果"
+                        if field == "stop_loss_fraction"
+                        else "按扣费后预期收益与交易成本调整止盈"
+                    ),
                 }
             )
+    for field in ("target_minutes", "maximum_minutes"):
+        before_value = _dict(before.get("holding")).get(field)
+        after_value = _dict(after.get("holding")).get(field)
+        if before_value != after_value:
+            adjustments.append(
+                {
+                    "field": f"holding_{field}",
+                    "before": before_value,
+                    "after": after_value,
+                    "reason": "按当前收益预测周期和最长风险暴露时间调整",
+                }
+            )
+    before_close = _dict(_dict(before.get("exit")).get("partial_close")).get("close_fraction")
+    after_close = _dict(_dict(after.get("exit")).get("partial_close")).get("close_fraction")
+    if before_close != after_close:
+        adjustments.append(
+            {
+                "field": "suggested_close_fraction",
+                "before": before_close,
+                "after": after_close,
+                "reason": "按持仓复评中的继续持有、减仓和全部退出比较调整",
+            }
+        )
     existing["risk_adjustment"] = {
         "status": str(status or "unknown"),
         "complete": not reasons,

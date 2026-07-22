@@ -23,7 +23,7 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
         {"review_positions": True, "open_positions": [{"symbol": "BTC/USDT"}]},
     )
 
-    assert "BATCH_EXPERT_JSON_V11" in prompt
+    assert "BATCH_EXPERT_JSON_V12" in prompt
     assert (
         "Required experts: trend_expert, momentum_expert, sentiment_expert, position_expert, risk_expert"
         in prompt
@@ -45,6 +45,26 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
     assert "STRICT_COMPACT_BATCH_JSON_V3" not in prompt
     assert "Payload JSON (complete and valid)" in prompt
     assert len(prompt) < 8_000
+
+
+def test_paper_batch_expert_prompt_requires_complete_trade_plan() -> None:
+    prompt = build_batch_experts_user_prompt(
+        "symbol=BTC/USDT price=100",
+        {"execution_mode": "paper", "review_positions": False},
+        ["trend_expert"],
+    )
+
+    for field in (
+        "position_size_pct",
+        "suggested_leverage",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "suggested_holding_minutes",
+        "maximum_holding_minutes",
+        "suggested_close_fraction",
+    ):
+        assert field in prompt
+    assert "unified risk remains authoritative" in prompt
 
 
 def test_batch_expert_prompt_keeps_role_scoped_market_contexts() -> None:
@@ -250,6 +270,56 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     assert decisions["risk_expert"].position_size_pct == 0.0
     assert decisions["risk_expert"].suggested_leverage == 1.0
     assert all(kwargs["max_tokens"] == 560 for kwargs in json_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_paper_batch_parser_preserves_complete_model_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def ainvoke(self, messages: list[Any]) -> SimpleNamespace:
+            return SimpleNamespace(
+                content=(
+                    '{"experts":{"trend_expert":{"action":"long",'
+                    '"confidence":0.8,"reasoning":"趋势和收益支持开多",'
+                    '"position_size_pct":0.12,"suggested_leverage":4,'
+                    '"stop_loss_pct":0.02,"take_profit_pct":0.06,'
+                    '"suggested_holding_minutes":30,'
+                    '"maximum_holding_minutes":90,'
+                    '"suggested_close_fraction":0.4,'
+                    '"cross_check_for":null}}}'
+                )
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": LOCAL_QWEN_TEST_BASE,
+            "api_key": "test-key",
+            "model": "qwen3-14b-trade",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    decisions = await agent.decide_batch_experts(
+        FeatureVector(symbol="BTC/USDT"),
+        {"execution_mode": "paper"},
+        ["trend_expert"],
+    )
+
+    decision = decisions["trend_expert"]
+    assert decision.position_size_pct == 0.12
+    assert decision.suggested_leverage == 4.0
+    assert decision.stop_loss_pct == 0.02
+    assert decision.take_profit_pct == 0.06
+    assert decision.suggested_holding_minutes == 30.0
+    assert decision.maximum_holding_minutes == 90.0
+    assert decision.suggested_close_fraction == 0.4
 
 
 @pytest.mark.asyncio
@@ -739,9 +809,7 @@ async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch
     }
     assert _BatchTimeoutExpert.batch_calls == 1
     assert _BatchTimeoutExpert.individual_calls == 0
-    assert {row["status"] for row in context["_model_timings"]} == {
-        "analysis_budget_deferred"
-    }
+    assert {row["status"] for row in context["_model_timings"]} == {"analysis_budget_deferred"}
     assert all(row["analysis_budget"]["scope"] == "market_ai" for row in context["_model_timings"])
 
 

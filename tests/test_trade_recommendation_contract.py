@@ -28,6 +28,9 @@ def _raw() -> dict:
                 "suggested_leverage": 2.0,
                 "stop_loss_pct": 0.01,
                 "take_profit_pct": 0.02,
+                "suggested_holding_minutes": 20.0,
+                "maximum_holding_minutes": 60.0,
+                "suggested_close_fraction": 0.5,
                 "effective_weight": 1.0,
                 "reasoning": "趋势和量价支持做多。",
             },
@@ -67,6 +70,9 @@ def _decision(*, action: Action = Action.LONG, raw: dict | None = None) -> Decis
         suggested_leverage=2.0,
         stop_loss_pct=0.01 if action.is_entry() else 0.0,
         take_profit_pct=0.02 if action.is_entry() else 0.0,
+        suggested_holding_minutes=20.0,
+        maximum_holding_minutes=60.0,
+        suggested_close_fraction=0.5,
         raw_response=deepcopy(raw if raw is not None else _raw()),
         feature_snapshot={"bid": 99.0, "ask": 101.0, "current_price": 100.0},
     )
@@ -117,6 +123,8 @@ def test_missing_required_plan_sections_block_entry(
         decision.feature_snapshot = {}
     elif mutation == "holding":
         decision.raw_response["opportunity_score"]["return_distribution_contract"] = {}
+        decision.suggested_holding_minutes = 0.0
+        decision.maximum_holding_minutes = 0.0
     elif mutation == "return":
         decision.raw_response["opportunity_score"].update(
             {
@@ -167,6 +175,9 @@ def test_risk_adjustment_keeps_before_and_after_plans_separate() -> None:
     decision.suggested_leverage = 1.0
     decision.stop_loss_pct = 0.015
     decision.take_profit_pct = 0.025
+    decision.suggested_holding_minutes = 15.0
+    decision.maximum_holding_minutes = 45.0
+    decision.suggested_close_fraction = 0.25
 
     contract = attach_risk_adjusted_trade_recommendation(decision, status="approved")
 
@@ -183,6 +194,9 @@ def test_risk_adjustment_keeps_before_and_after_plans_separate() -> None:
         "suggested_position_fraction",
         "stop_loss_fraction",
         "take_profit_fraction",
+        "holding_target_minutes",
+        "holding_maximum_minutes",
+        "suggested_close_fraction",
     }
 
 
@@ -220,13 +234,13 @@ def test_exit_plan_has_hold_partial_and_full_exit_paths() -> None:
     _prepare(decision)
     plan = trade_recommendation_snapshot(decision.raw_response)["unified_recommendation"]
 
-    assert plan["exit"]["continue_holding"]["maximum_minutes"] == 30.0
+    assert plan["exit"]["continue_holding"]["maximum_minutes"] == 60.0
     assert plan["exit"]["partial_close"] == {
         "type": "dynamic_profit_or_risk_reduction",
         "close_fraction": 0.5,
         "enabled": True,
     }
-    assert plan["exit"]["full_close"]["maximum_minutes"] == 30.0
+    assert plan["exit"]["full_close"]["maximum_minutes"] == 60.0
 
 
 @pytest.mark.asyncio

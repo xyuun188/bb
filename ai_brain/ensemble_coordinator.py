@@ -71,6 +71,7 @@ ACTION_SCORE = {
     Action.HOLD: 0.0,
 }
 
+
 class EnsembleCoordinator:
     """Combines fixed expert model reports into one executable decision."""
 
@@ -268,15 +269,6 @@ class EnsembleCoordinator:
                 result.append(text)
                 seen.add(text)
         return result
-
-
-
-
-
-
-
-
-
 
     def _decision_payload(self, name: str, decision: DecisionOutput) -> dict[str, Any]:
         meta = self._slot_meta.get(name, {})
@@ -489,7 +481,9 @@ class EnsembleCoordinator:
             "mode": (
                 "no_position_entry_overlay"
                 if "no_position_entry_overlay" in modes
-                else "position_review" if "position_review" in modes else "market_entry"
+                else "position_review"
+                if "position_review" in modes
+                else "market_entry"
             ),
             "policies": policies,
             "entry_support_excluded_experts": [],
@@ -535,10 +529,7 @@ class EnsembleCoordinator:
         for name, decision in decisions.items():
             if eligible_names is not None and name not in eligible_names:
                 continue
-            if (
-                not isinstance(decision, DecisionOutput)
-                or decision.action != action
-            ):
+            if not isinstance(decision, DecisionOutput) or decision.action != action:
                 continue
             group = self._expert_source_group(name, decision)
             current = groups.get(group)
@@ -634,9 +625,7 @@ class EnsembleCoordinator:
             )
         return payload
 
-    def _expert_source_policy_from_opinions(
-        self, opinions: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    def _expert_source_policy_from_opinions(self, opinions: list[dict[str, Any]]) -> dict[str, Any]:
         groups: dict[str, dict[str, Any]] = {}
         for opinion in opinions:
             if not isinstance(opinion, dict):
@@ -676,7 +665,6 @@ class EnsembleCoordinator:
                 return dict(opinion["risk_expert_policy"])
         return {"active": False, "reason": "risk_expert opinion missing"}
 
-
     def combine(
         self,
         features: FeatureVector,
@@ -698,10 +686,6 @@ class EnsembleCoordinator:
 
         weighted_score = 0.0
         total_weight = 0.0
-        entry_size = 0.0
-        leverage_votes: list[float] = []
-        stop_votes: list[float] = []
-        profit_votes: list[float] = []
         raw_opinions: list[dict[str, Any]] = []
         raw_opinions_by_name: dict[str, dict[str, Any]] = {}
         exit_votes: list[DecisionOutput] = []
@@ -751,13 +735,6 @@ class EnsembleCoordinator:
             if effective_weight > 0:
                 score_participants[name] = decision
 
-            if decision.is_entry and effective_weight > 0:
-                entry_size += (
-                    effective_weight * decision.position_size_pct * max(decision.confidence, 0.1)
-                )
-                leverage_votes.append(decision.suggested_leverage)
-                stop_votes.append(decision.stop_loss_pct)
-                profit_votes.append(decision.take_profit_pct)
             if decision.is_exit and effective_weight > 0:
                 exit_votes.append(decision)
             if name == "risk_expert" and effective_weight > 0:
@@ -774,6 +751,9 @@ class EnsembleCoordinator:
                     "suggested_leverage": decision.suggested_leverage,
                     "stop_loss_pct": decision.stop_loss_pct,
                     "take_profit_pct": decision.take_profit_pct,
+                    "suggested_holding_minutes": decision.suggested_holding_minutes,
+                    "maximum_holding_minutes": decision.maximum_holding_minutes,
+                    "suggested_close_fraction": decision.suggested_close_fraction,
                     "base_weight": base_weight,
                     "weight": weight,
                     "effective_weight": effective_weight,
@@ -877,6 +857,10 @@ class EnsembleCoordinator:
                     suggested_leverage=1.0,
                     stop_loss_pct=0.0,
                     take_profit_pct=0.0,
+                    suggested_close_fraction=self._safe_float(
+                        evidence.get("position_size_pct"),
+                        0.0,
+                    ),
                     raw_response=close_raw,
                     feature_snapshot=features.to_dict(),
                 )
@@ -932,13 +916,9 @@ class EnsembleCoordinator:
             "policy_provenance": policy_provenance,
         }
         if not production_eligible:
-            if (
-                paper_training_mode_enabled(context)
-                and str(
-                    candidate_evidence.get("preferred_exploration_side") or ""
-                ).lower()
-                not in {"long", "short"}
-            ):
+            if paper_training_mode_enabled(context) and str(
+                candidate_evidence.get("preferred_exploration_side") or ""
+            ).lower() not in {"long", "short"}:
                 (
                     training_side,
                     training_source,
@@ -978,9 +958,7 @@ class EnsembleCoordinator:
                         normalized_score,
                         4,
                     )
-                    training_raw["memory_feedback_observation"] = self._memory_feedback(
-                        context
-                    )
+                    training_raw["memory_feedback_observation"] = self._memory_feedback(context)
                     training_raw["ml_signal"] = context.get("ml_signal") or {}
                     training_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
                     training_raw["direction_competition"] = (
@@ -992,9 +970,7 @@ class EnsembleCoordinator:
                         "production_permission": False,
                         "sample_target": None,
                         "daily_sample_quota": None,
-                        "valid_for_seconds": training_contract.get(
-                            "valid_for_seconds"
-                        ),
+                        "valid_for_seconds": training_contract.get("valid_for_seconds"),
                         "prediction_horizon_minutes": training_contract.get(
                             "prediction_horizon_minutes"
                         ),
@@ -1002,9 +978,9 @@ class EnsembleCoordinator:
                         "strategy_version": training_contract.get("version"),
                     }
                     action = Action.LONG if training_side == "long" else Action.SHORT
-                    return DecisionOutput(
-                        model_name=ENSEMBLE_TRADER_NAME,
-                        symbol=features.symbol,
+                    return self._entry_decision(
+                        features=features,
+                        context=context,
                         action=action,
                         confidence=min(max(abs(normalized_score), 0.05), 1.0),
                         reasoning=(
@@ -1012,12 +988,8 @@ class EnsembleCoordinator:
                             if action == Action.LONG
                             else "模拟盘快速训练期按模型方向正常开空，暂不以预期盈亏拦截"
                         ),
-                        position_size_pct=0.0,
-                        suggested_leverage=1.0,
-                        stop_loss_pct=0.0,
-                        take_profit_pct=0.0,
                         raw_response=training_raw,
-                        feature_snapshot=features.to_dict(),
+                        raw_opinions=raw_opinions,
                     )
             exploration_side = str(
                 candidate_evidence.get("preferred_exploration_side") or ""
@@ -1028,15 +1000,12 @@ class EnsembleCoordinator:
                     candidate_evidence,
                     symbol=features.symbol,
                 )
-                if execution_mode == "paper"
-                and exploration_side in {"long", "short"}
+                if execution_mode == "paper" and exploration_side in {"long", "short"}
                 else {}
             )
             if exploration_contract:
                 action = Action.LONG if exploration_side == "long" else Action.SHORT
-                exploration = self._safe_dict(
-                    candidate_evidence.get("paper_exploration")
-                )
+                exploration = self._safe_dict(candidate_evidence.get("paper_exploration"))
                 selected_exploration = self._safe_dict(exploration.get("selected"))
                 information_value = self._safe_float(
                     selected_exploration.get("information_value_score"),
@@ -1072,9 +1041,7 @@ class EnsembleCoordinator:
                     normalized_score,
                     4,
                 )
-                exploration_raw["memory_feedback_observation"] = self._memory_feedback(
-                    context
-                )
+                exploration_raw["memory_feedback_observation"] = self._memory_feedback(context)
                 exploration_raw["ml_signal"] = context.get("ml_signal") or {}
                 exploration_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
                 exploration_raw["direction_competition"] = (
@@ -1089,18 +1056,14 @@ class EnsembleCoordinator:
                     "generated_at": datetime.now(UTC).isoformat(),
                     "strategy_version": exploration_contract.get("version"),
                 }
-                return DecisionOutput(
-                    model_name=ENSEMBLE_TRADER_NAME,
-                    symbol=features.symbol,
+                return self._entry_decision(
+                    features=features,
+                    context=context,
                     action=action,
                     confidence=min(max(information_value, 0.0), 1.0),
                     reasoning=reason,
-                    position_size_pct=0.0,
-                    suggested_leverage=1.0,
-                    stop_loss_pct=0.0,
-                    take_profit_pct=0.0,
                     raw_response=exploration_raw,
-                    feature_snapshot=features.to_dict(),
+                    raw_opinions=raw_opinions,
                 )
             reason = self._reason(
                 "当前模型没有给出扣除交易成本后仍为正的模拟盘机会，本轮保持观望",
@@ -1157,20 +1120,199 @@ class EnsembleCoordinator:
             "strategy_version": "2026-07-12.ensemble-return-candidate.v1",
             "fallback_reason": "",
         }
+        return self._entry_decision(
+            features=features,
+            context=context,
+            action=action,
+            confidence=confidence,
+            reasoning=reason,
+            raw_response=raw_response,
+            raw_opinions=raw_opinions,
+        )
+
+    def _paper_multidimensional_recommendation(
+        self,
+        *,
+        action: Action,
+        confidence: float,
+        features: FeatureVector,
+        context: dict[str, Any],
+        raw_opinions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        matching = [
+            item
+            for item in raw_opinions
+            if item.get("action") == action.value
+            and self._safe_float(item.get("effective_weight"), 0.0) > 0.0
+            and item.get("trace_only_fallback") is not True
+        ]
+
+        def weighted(field: str, *, minimum: float = 0.0, maximum: float | None = None):
+            numerator = 0.0
+            denominator = 0.0
+            contributors: list[str] = []
+            for item in matching:
+                value = self._finite_or_none(item.get(field))
+                if value is None or value <= minimum:
+                    continue
+                if maximum is not None:
+                    value = min(value, maximum)
+                weight = self._safe_float(item.get("effective_weight"), 0.0) * max(
+                    self._safe_float(item.get("confidence"), 0.0),
+                    0.05,
+                )
+                if weight <= 0.0:
+                    continue
+                numerator += value * weight
+                denominator += weight
+                contributors.append(str(item.get("model_name") or ""))
+            return (
+                numerator / denominator if denominator > 0.0 else None,
+                contributors,
+            )
+
+        side = "long" if action == Action.LONG else "short"
+        candidate_evidence = self._safe_dict(context.get("entry_candidate_evidence"))
+        side_evidence = self._safe_dict(candidate_evidence.get(side))
+        exploration = self._safe_dict(candidate_evidence.get("paper_exploration"))
+        exploration_selected = self._safe_dict(exploration.get("selected"))
+        direction = self._safe_dict(context.get("direction_competition"))
+        direction_side = self._safe_dict(direction.get(f"training_{side}"))
+        horizon_candidates = (
+            side_evidence.get("horizon_minutes"),
+            exploration_selected.get("horizon_minutes"),
+            direction_side.get("horizon_minutes"),
+        )
+        evidence_horizon = next(
+            (
+                value
+                for candidate in horizon_candidates
+                if (value := self._finite_or_none(candidate)) is not None and value > 0.0
+            ),
+            30.0,
+        )
+        expected_return_pct = max(
+            self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0),
+            self._safe_float(exploration_selected.get("expected_net_return_pct"), 0.0),
+            self._safe_float(direction_side.get("objective_expected_return_pct"), 0.0),
+            0.0,
+        )
+        volatility = self._safe_float(getattr(features, "volatility_20", 0.0), 0.0)
+        volatility = volatility / 100.0 if volatility > 1.0 else volatility
+        fallback_stop = min(max(volatility, 0.005), 0.10)
+
+        position, position_models = weighted("position_size_pct", maximum=1.0)
+        leverage, leverage_models = weighted("suggested_leverage", minimum=0.999)
+        stop, stop_models = weighted("stop_loss_pct", maximum=1.0)
+        take_profit, take_models = weighted("take_profit_pct", maximum=1.0)
+        holding, holding_models = weighted("suggested_holding_minutes")
+        maximum_holding, maximum_models = weighted("maximum_holding_minutes")
+        close_fraction, close_models = weighted("suggested_close_fraction", maximum=1.0)
+
+        fallback_fields: list[str] = []
+        if position is None:
+            position = min(max(confidence * 0.05, 0.005), 0.05)
+            fallback_fields.append("position_size_pct")
+        if leverage is None:
+            leverage = 1.0
+            fallback_fields.append("suggested_leverage")
+        if stop is None:
+            stop = fallback_stop
+            fallback_fields.append("stop_loss_pct")
+        if take_profit is None:
+            take_profit = min(max(stop * 1.5, expected_return_pct / 100.0, 0.01), 0.30)
+            fallback_fields.append("take_profit_pct")
+        if holding is None:
+            holding = evidence_horizon
+            fallback_fields.append("suggested_holding_minutes")
+        if maximum_holding is None:
+            maximum_holding = max(holding, evidence_horizon * 2.0)
+            fallback_fields.append("maximum_holding_minutes")
+        maximum_holding = max(maximum_holding, holding)
+        if close_fraction is None:
+            close_fraction = 0.5
+            fallback_fields.append("suggested_close_fraction")
+
+        return {
+            "version": "paper_multidimensional_recommendation_v1",
+            "execution_scope": "paper_only",
+            "side": side,
+            "position_size_pct": round(min(max(position, 0.0), 1.0), 8),
+            "suggested_leverage": round(max(leverage, 1.0), 8),
+            "stop_loss_pct": round(min(max(stop, 0.0), 1.0), 8),
+            "take_profit_pct": round(min(max(take_profit, 0.0), 1.0), 8),
+            "suggested_holding_minutes": round(max(holding, 0.0), 8),
+            "maximum_holding_minutes": round(max(maximum_holding, 0.0), 8),
+            "suggested_close_fraction": round(min(max(close_fraction, 0.0), 1.0), 8),
+            "matching_side_model_count": len(matching),
+            "contributors": {
+                "position_size_pct": position_models,
+                "suggested_leverage": leverage_models,
+                "stop_loss_pct": stop_models,
+                "take_profit_pct": take_models,
+                "suggested_holding_minutes": holding_models,
+                "maximum_holding_minutes": maximum_models,
+                "suggested_close_fraction": close_models,
+            },
+            "fallback_fields": fallback_fields,
+            "fallback_source": (
+                "current_fee_after_candidate_and_market_risk"
+                if fallback_fields
+                else "matching_side_weighted_model_recommendations"
+            ),
+            "single_order_authority": True,
+            "risk_may_reduce_or_reject": True,
+        }
+
+    def _entry_decision(
+        self,
+        *,
+        features: FeatureVector,
+        context: dict[str, Any],
+        action: Action,
+        confidence: float,
+        reasoning: str,
+        raw_response: dict[str, Any],
+        raw_opinions: list[dict[str, Any]],
+    ) -> DecisionOutput:
+        if str(context.get("execution_mode") or "").lower() != "paper":
+            return DecisionOutput(
+                model_name=ENSEMBLE_TRADER_NAME,
+                symbol=features.symbol,
+                action=action,
+                confidence=confidence,
+                reasoning=reasoning,
+                position_size_pct=0.0,
+                suggested_leverage=1.0,
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
+                raw_response=raw_response,
+                feature_snapshot=features.to_dict(),
+            )
+        plan = self._paper_multidimensional_recommendation(
+            action=action,
+            confidence=confidence,
+            features=features,
+            context=context,
+            raw_opinions=raw_opinions,
+        )
+        raw_response["multidimensional_recommendation"] = plan
         return DecisionOutput(
             model_name=ENSEMBLE_TRADER_NAME,
             symbol=features.symbol,
             action=action,
             confidence=confidence,
-            reasoning=reason,
-            position_size_pct=0.0,
-            suggested_leverage=1.0,
-            stop_loss_pct=0.0,
-            take_profit_pct=0.0,
+            reasoning=reasoning,
+            position_size_pct=plan["position_size_pct"],
+            suggested_leverage=plan["suggested_leverage"],
+            stop_loss_pct=plan["stop_loss_pct"],
+            take_profit_pct=plan["take_profit_pct"],
+            suggested_holding_minutes=plan["suggested_holding_minutes"],
+            maximum_holding_minutes=plan["maximum_holding_minutes"],
+            suggested_close_fraction=plan["suggested_close_fraction"],
             raw_response=raw_response,
             feature_snapshot=features.to_dict(),
         )
-
 
     def _local_tool_signal(
         self,
@@ -1225,11 +1367,6 @@ class EnsembleCoordinator:
             0.0,
         )
 
-
-
-
-
-
     def _local_profit_aligned(self, context: dict[str, Any] | None, side: str) -> bool:
         side = str(side or "").lower()
         if side not in {"long", "short"}:
@@ -1251,15 +1388,6 @@ class EnsembleCoordinator:
         best_side = signal_payload_side(prediction)
         expected = self._local_expected_return(prediction, side)
         return best_side == side and expected > 0
-
-
-
-
-
-
-
-
-
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1283,17 +1411,14 @@ class EnsembleCoordinator:
 
         competition = self._safe_dict(context.get("direction_competition"))
         observed_side = str(
-            competition.get("training_preferred_side")
-            or competition.get("preferred_side")
-            or ""
+            competition.get("training_preferred_side") or competition.get("preferred_side") or ""
         ).lower()
         training_rows = {
             "long": self._safe_dict(competition.get("training_long")),
             "short": self._safe_dict(competition.get("training_short")),
         }
         training_scores = {
-            side: self._finite_or_none(row.get("score"))
-            for side, row in training_rows.items()
+            side: self._finite_or_none(row.get("score")) for side, row in training_rows.items()
         }
         training_horizons = {
             side: self._finite_or_none(row.get("horizon_minutes"))
@@ -1304,16 +1429,11 @@ class EnsembleCoordinator:
             context.get("continuous_strategy_routing")
             or strategy_context.get("continuous_strategy_routing")
         )
-        current_strategy_route = self._safe_dict(
-            strategy_routing.get("current_route")
-        )
+        current_strategy_route = self._safe_dict(strategy_routing.get("current_route"))
         routed_strategy = self._safe_dict(
-            current_strategy_route.get("primary")
-            or current_strategy_route.get("training_primary")
+            current_strategy_route.get("primary") or current_strategy_route.get("training_primary")
         )
-        strategy_side = str(
-            current_strategy_route.get("recommended_side") or ""
-        ).lower()
+        strategy_side = str(current_strategy_route.get("recommended_side") or "").lower()
         strategy_strength = min(
             max(
                 self._safe_float(
@@ -1375,13 +1495,10 @@ class EnsembleCoordinator:
         primary = self._safe_dict(predictions[0] if predictions else {})
         distribution = self._safe_dict(primary.get("return_distribution_contract"))
         rows: dict[str, dict[str, Any]] = {
-            side: self._safe_dict(distribution.get(side))
-            for side in ("long", "short")
+            side: self._safe_dict(distribution.get(side)) for side in ("long", "short")
         }
         scores = {
-            side: self._finite_or_none(
-                row.get("objective_expected_return_pct")
-            )
+            side: self._finite_or_none(row.get("objective_expected_return_pct"))
             for side, row in rows.items()
         }
         if all(value is None for value in scores.values()):
@@ -1398,9 +1515,7 @@ class EnsembleCoordinator:
         available = {
             side: value
             for side, value in scores.items()
-            if value is not None
-            and horizons.get(side) is not None
-            and float(horizons[side]) > 0
+            if value is not None and horizons.get(side) is not None and float(horizons[side]) > 0
         }
         if available:
             side = max(available, key=lambda item: float(available[item]))
@@ -1431,11 +1546,6 @@ class EnsembleCoordinator:
             return None
         return number if number == number and abs(number) != float("inf") else None
 
-
-
-
-
-
     def _position_close_evidence(
         self,
         current_side: str | None,
@@ -1452,31 +1562,106 @@ class EnsembleCoordinator:
         if not current_side:
             return {"should_close": False, "block_reason": "当前没有持仓。"}
 
-        del exit_votes, risk_vetoes, score, raw_opinions
-        del context
+        matching_model_rows = [
+            item
+            for item in raw_opinions
+            if item.get("action") == close_action.value
+            and self._safe_float(item.get("effective_weight"), 0.0) > 0.0
+            and item.get("trace_only_fallback") is not True
+        ]
+        model_numerator = 0.0
+        model_denominator = 0.0
+        for item in matching_model_rows:
+            requested = max(
+                self._safe_float(item.get("suggested_close_fraction"), 0.0),
+                self._safe_float(item.get("position_size_pct"), 0.0),
+            )
+            if requested <= 0.0:
+                continue
+            weight = self._safe_float(item.get("effective_weight"), 0.0) * max(
+                self._safe_float(item.get("confidence"), 0.0),
+                0.05,
+            )
+            model_numerator += min(requested, 1.0) * weight
+            model_denominator += weight
+        model_close_fraction = (
+            model_numerator / model_denominator if model_denominator > 0.0 else 0.0
+        )
+        model_exit_confidence = (
+            sum(self._safe_float(item.get("confidence"), 0.0) for item in matching_model_rows)
+            / len(matching_model_rows)
+            if matching_model_rows
+            else 0.0
+        )
+        stronger_opportunity = self._safe_dict(self._safe_dict(context).get("stronger_opportunity"))
+        rotation_available = bool(
+            stronger_opportunity.get("production_eligible") is True
+            and self._safe_float(
+                stronger_opportunity.get("expected_net_return_pct"),
+                0.0,
+            )
+            > 0.0
+        )
         dynamic_decision = DecisionOutput(
             model_name=ENSEMBLE_TRADER_NAME,
             symbol=features.symbol if features is not None else "",
             action=close_action,
             confidence=0.0,
             reasoning="dynamic fee-after exit evidence",
-            position_size_pct=0.0,
+            position_size_pct=model_close_fraction,
             suggested_leverage=1.0,
             stop_loss_pct=0.0,
             take_profit_pct=0.0,
-            raw_response={},
+            suggested_close_fraction=model_close_fraction,
+            raw_response={
+                "model_exit_recommendation": {
+                    "requested_close_fraction": model_close_fraction,
+                    "confidence": model_exit_confidence,
+                    "matching_model_count": len(matching_model_rows),
+                    "raw_exit_vote_count": len(exit_votes),
+                    "hard_risk_vote_count": len(risk_vetoes),
+                    "weighted_direction_score": score,
+                },
+                "stronger_opportunity": stronger_opportunity,
+            },
             feature_snapshot=features.to_dict() if features is not None else {},
         )
         assessment = assess_dynamic_exit(dynamic_decision, symbol_positions or [])
+        action_plan = (
+            "full_close"
+            if assessment.close_fraction >= 1.0
+            else "reduce"
+            if assessment.close_fraction > 0.0
+            else "hold"
+        )
+        decision_comparison = {
+            "version": "position_action_comparison_v1",
+            "selected": action_plan,
+            "continue_holding": {
+                "eligible": not assessment.eligible,
+                "fee_after_pnl_usdt": assessment.fee_after_unrealized_pnl_usdt,
+                "continuation_deterioration": assessment.continuation_deterioration,
+            },
+            "partial_close": {
+                "eligible": assessment.eligible and 0.0 < assessment.close_fraction < 1.0,
+                "close_fraction": assessment.close_fraction,
+            },
+            "full_close": {
+                "eligible": assessment.eligible and assessment.close_fraction >= 1.0,
+                "hard_risk": assessment.hard_risk,
+            },
+            "rotate_to_stronger_opportunity": {
+                "evidence_available": bool(stronger_opportunity),
+                "eligible": rotation_available and assessment.eligible,
+                "candidate": stronger_opportunity if rotation_available else {},
+                "creates_order": False,
+            },
+            "model_requested_close_fraction": model_close_fraction,
+            "risk_authorized_close_fraction": assessment.close_fraction,
+        }
         return {
             "should_close": assessment.eligible,
-            "action_plan": (
-                "full_close"
-                if assessment.close_fraction >= 1.0
-                else "reduce"
-                if assessment.close_fraction > 0.0
-                else "hold"
-            ),
+            "action_plan": action_plan,
             "position_size_pct": assessment.close_fraction,
             "suggested_confidence": assessment.close_fraction,
             "reason": assessment.reason,
@@ -1485,6 +1670,11 @@ class EnsembleCoordinator:
             "planned_stop_crossed": assessment.planned_stop_crossed,
             "position_loss": assessment.fee_after_unrealized_pnl_usdt < 0.0,
             "dynamic_loss_reduce_fraction": assessment.stop_risk_usage,
+            "model_exit_recommendation": dynamic_decision.raw_response.get(
+                "model_exit_recommendation",
+                {},
+            ),
+            "decision_comparison": decision_comparison,
         }
 
     def _position_quantity(self, pos: dict[str, Any]) -> float:
@@ -1788,9 +1978,7 @@ class EnsembleCoordinator:
         if not isinstance(weights, dict):
             strategy = context.get("strategy_mode")
             weights = (
-                strategy.get("continuous_model_weights")
-                if isinstance(strategy, dict)
-                else None
+                strategy.get("continuous_model_weights") if isinstance(strategy, dict) else None
             )
         allocations = context.get("_continuous_expert_weight_allocations")
         if (
@@ -2009,8 +2197,6 @@ class EnsembleCoordinator:
     def _avg(self, values: list[float], default: float) -> float:
         clean = [float(v) for v in values if v is not None]
         return sum(clean) / len(clean) if clean else default
-
-
 
     def _action_label(self, action: Any) -> str:
         labels = {

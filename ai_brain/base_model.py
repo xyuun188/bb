@@ -64,6 +64,9 @@ class DecisionOutput:
     suggested_leverage: float = 1.0
     stop_loss_pct: float = 0.0
     take_profit_pct: float = 0.0
+    suggested_holding_minutes: float = 0.0
+    maximum_holding_minutes: float = 0.0
+    suggested_close_fraction: float = 0.0
     cross_check_for: dict[str, Any] | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     raw_response: dict | None = None  # for debugging LLM models
@@ -92,6 +95,9 @@ class DecisionOutput:
             "suggested_leverage": self.suggested_leverage,
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
+            "suggested_holding_minutes": self.suggested_holding_minutes,
+            "maximum_holding_minutes": self.maximum_holding_minutes,
+            "suggested_close_fraction": self.suggested_close_fraction,
             "cross_check_for": self.cross_check_for,
         }
 

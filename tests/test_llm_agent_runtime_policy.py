@@ -10,6 +10,66 @@ from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
 
 
+def test_paper_parser_preserves_multidimensional_recommendation() -> None:
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={"role": "trend_direction", "label": "trend"},
+    )
+    features = FeatureVector(symbol="BTC/USDT", current_price=100.0)
+    parsed = {
+        "action": "long",
+        "confidence": 0.8,
+        "reasoning": "趋势、收益和风险支持模拟开仓",
+        "position_size_pct": 0.12,
+        "suggested_leverage": 4.0,
+        "stop_loss_pct": 0.02,
+        "take_profit_pct": 0.06,
+        "suggested_holding_minutes": 30.0,
+        "maximum_holding_minutes": 90.0,
+        "suggested_close_fraction": 0.4,
+        "cross_check_for": None,
+    }
+
+    decision = agent._decision_from_parsed(
+        dict(parsed),
+        features,
+        {"execution_mode": "paper"},
+    )
+
+    assert decision.position_size_pct == 0.12
+    assert decision.suggested_leverage == 4.0
+    assert decision.stop_loss_pct == 0.02
+    assert decision.take_profit_pct == 0.06
+    assert decision.suggested_holding_minutes == 30.0
+    assert decision.maximum_holding_minutes == 90.0
+    assert decision.suggested_close_fraction == 0.4
+
+
+def test_live_parser_does_not_add_paper_holding_fields() -> None:
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={"role": "trend_direction", "label": "trend"},
+    )
+    features = FeatureVector(symbol="BTC/USDT", current_price=100.0)
+
+    decision = agent._decision_from_parsed(
+        {
+            "action": "long",
+            "confidence": 0.8,
+            "reasoning": "live compatibility",
+            "suggested_holding_minutes": 30.0,
+            "maximum_holding_minutes": 90.0,
+            "suggested_close_fraction": 0.4,
+        },
+        features,
+        {"execution_mode": "live"},
+    )
+
+    assert decision.suggested_holding_minutes == 0.0
+    assert decision.maximum_holding_minutes == 0.0
+    assert decision.suggested_close_fraction == 0.0
+
+
 @pytest.mark.asyncio
 async def test_keyless_loopback_model_uses_process_local_client_placeholder(
     monkeypatch: pytest.MonkeyPatch,
