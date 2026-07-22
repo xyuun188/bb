@@ -44,6 +44,7 @@ def _side(
         "return_lcb_pct": return_lcb,
         "return_uncertainty_pct": 0.20,
         "expected_loss_pct": 0.20,
+        "horizon_minutes": 30.0,
         "loss_probability": loss_probability,
         "tail_risk_score": tail_risk,
         "production_source_count": 3,

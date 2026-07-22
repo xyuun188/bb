@@ -33,6 +33,7 @@ from services.paper_training import (
     is_paper_training_decision,
 )
 from services.strategy_arbitration import arbitrate_decision
+from services.trade_recommendation_contract import attach_trade_execution_result
 from services.trading_policies import PolicyGateResult
 
 logger = structlog.get_logger(__name__)
@@ -798,6 +799,14 @@ class ExecutionService:
                 "raw_response": compact_execution_value(execution_raw),
             }
             decision.raw_response = raw_response
+            if model_mode == "paper":
+                attach_trade_execution_result(
+                    decision,
+                    execution_result,
+                    source=source,
+                    exchange_confirmed=exchange_confirmed,
+                    exit_progress=exit_progress,
+                )
 
         async def await_exchange_place_order(
             executor: Any,
@@ -968,7 +977,16 @@ class ExecutionService:
                 }
             )
             result = rejected_execution_result(decision, reason)
-            result.raw_response = raw_response
+            if model_mode == "paper":
+                attach_trade_execution_result(
+                    decision,
+                    result,
+                    source=blocker,
+                    exchange_confirmed=False,
+                )
+                if decision_db_id is not None:
+                    await mark_decision_raw_response(decision_db_id, decision.raw_response)
+            result.raw_response = decision.raw_response
             return result
 
         async def policy_evaluation_failed_result(
@@ -1060,6 +1078,15 @@ class ExecutionService:
                 }
             )
             result = rejected_execution_result(decision, reason)
+            if model_mode == "paper":
+                attach_trade_execution_result(
+                    decision,
+                    result,
+                    source=blocker,
+                    exchange_confirmed=False,
+                )
+                if decision_db_id is not None:
+                    await mark_decision_raw_response(decision_db_id, decision.raw_response)
             result.raw_response = decision.raw_response
             return result
 
@@ -1720,6 +1747,13 @@ class ExecutionService:
             if decision_db_id is not None:
                 await mark_decision_reason(decision_db_id, missing_result_reason)
                 attach_execution_parameters("missing_execution_result")
+                if model_mode == "paper":
+                    attach_trade_execution_result(
+                        decision,
+                        None,
+                        source="missing_execution_result",
+                        exchange_confirmed=False,
+                    )
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
             if position_review_alert_context(decision):
                 await log_position_review_risk_result(

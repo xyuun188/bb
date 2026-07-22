@@ -46,6 +46,9 @@ class PositionReviewResultRecorder:
                 ),
             )
         if decision_db_id is not None:
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            if raw:
+                await self.decision_raw_response_marker(decision_db_id, raw)
             await self.decision_reason_marker(
                 decision_db_id,
                 self.outcome_policy.hold_reason(
@@ -91,6 +94,9 @@ class PositionReviewResultRecorder:
         append_result: bool = False,
     ) -> None:
         if decision_db_id is not None:
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            if raw:
+                await self.decision_raw_response_marker(decision_db_id, raw)
             await self.decision_reason_marker(decision_db_id, reason)
         if risk_alert:
             await self.risk_result_logger(

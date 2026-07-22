@@ -192,6 +192,10 @@ from services.strategy_learning import StrategyLearningService
 from services.symbol_side_performance import SymbolSidePerformanceService
 from services.sync_service import OkxSyncService
 from services.trade_order_log_service import TradeOrderLogService
+from services.trade_recommendation_contract import (
+    attach_initial_trade_recommendation,
+    attach_risk_adjusted_trade_recommendation,
+)
 from services.trading_agent_skills import TradingAgentSkillBook
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
@@ -5144,6 +5148,18 @@ class TradingService:
             model_mode,
             open_positions=open_positions or [],
         )
+        if str(model_mode or "").lower() == "paper":
+            raw = self._safe_dict(decision.raw_response)
+            contract = self._safe_dict(raw.get("trade_recommendation_contract"))
+            risk = self._safe_dict(contract.get("risk_adjustment"))
+            status = str(risk.get("status") or "")
+            if status not in {"approved", "passed"}:
+                status = "prepared"
+            attach_risk_adjusted_trade_recommendation(
+                decision,
+                status=status,
+                reason="模拟盘动态仓位、杠杆和退出风险方案已生成。",
+            )
         if decision_db_id is not None:
             await self._mark_decision_raw_response(
                 decision_db_id,
@@ -7135,6 +7151,12 @@ class TradingService:
                         reason=assessment.rejection_reason,
                     )
                     reason = assessment.rejection_reason or "风控引擎拒绝该决策。"
+                    if model_mode == "paper":
+                        attach_risk_adjusted_trade_recommendation(
+                            decision,
+                            status="rejected",
+                            reason=reason,
+                        )
                     if decision_db_id is not None:
                         await self._mark_decision_reason(decision_db_id, reason)
                     self.market_decision_result_recorder.append_result(
@@ -7174,6 +7196,21 @@ class TradingService:
                     executed.feature_snapshot = (
                         executed.feature_snapshot or decision.feature_snapshot
                     )
+                if model_mode == "paper":
+                    attach_risk_adjusted_trade_recommendation(
+                        executed,
+                        status=("adjusted_to_hold" if executed.is_hold else "approved"),
+                        reason=(
+                            "硬风控调整后改为观望。"
+                            if executed.is_hold
+                            else "硬风控已确认模拟盘最终交易方案。"
+                        ),
+                    )
+                    if decision_db_id is not None:
+                        await self._mark_decision_raw_response(
+                            decision_db_id,
+                            executed.raw_response,
+                        )
                 if executed.is_hold:
                     executed_raw = (
                         executed.raw_response if isinstance(executed.raw_response, dict) else {}
@@ -10752,6 +10789,13 @@ class TradingService:
         return self.execution_result_factory.rejected(decision, error)
 
     async def _log_decision(self, decision: DecisionOutput, is_paper: bool) -> int | None:
+        if is_paper:
+            raw = self._safe_dict(decision.raw_response)
+            attach_initial_trade_recommendation(
+                decision,
+                analysis_type=self.decision_persistence.analysis_type(decision, raw),
+                execution_mode="paper",
+            )
         decision_id = await self.decision_persistence.log_decision(decision, is_paper)
         if decision_id is not None:
             await self._record_strategy_learning_event(

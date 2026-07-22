@@ -16,7 +16,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 
-PAPER_EXPLORATION_VERSION = "2026-07-21.bounded-paper-exploration.v1"
+PAPER_EXPLORATION_VERSION = "2026-07-22.complete-paper-exploration.v2"
 PAPER_EXPLORATION_SIZING_VERSION = "2026-07-21.bounded-paper-risk.v1"
 PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0001
 PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION = 0.0003
@@ -86,6 +86,8 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "return_source_count",
             "feature_opportunity_score",
             "information_value_score",
+            "prediction_horizon_minutes",
+            "valid_for_seconds",
             "single_trade_risk_fraction_cap",
             "portfolio_risk_fraction_cap",
             "leverage_cap",
@@ -109,6 +111,7 @@ def evaluate_paper_exploration_side(
     loss_probability = _float(evidence.get("loss_probability"), 1.0) or 0.0
     tail_risk = _float(evidence.get("tail_risk_score"), 1.0) or 0.0
     source_count = _int(evidence.get("production_source_count"))
+    horizon_minutes = max(_float(evidence.get("horizon_minutes"), 0.0) or 0.0, 0.0)
     feature_score = max(float(feature_opportunity_score), 0.0)
     cost = _dict(evidence.get("execution_cost"))
     reasons: list[str] = []
@@ -135,6 +138,8 @@ def evaluate_paper_exploration_side(
         reasons.append("paper_exploration_tail_risk_too_high")
     if source_count < PAPER_EXPLORATION_MIN_RETURN_SOURCE_COUNT:
         reasons.append("paper_exploration_return_sources_incomplete")
+    if horizon_minutes <= 0:
+        reasons.append("paper_exploration_prediction_horizon_missing")
     if feature_score <= 0:
         reasons.append("paper_exploration_feature_value_not_positive")
     if cost.get("production_eligible") is not True or (_float(cost.get("total_pct"), 0.0) or 0.0) <= 0:
@@ -159,6 +164,8 @@ def evaluate_paper_exploration_side(
         "loss_probability": round(loss_probability, 8),
         "tail_risk_score": round(tail_risk, 8),
         "return_source_count": source_count,
+        "prediction_horizon_minutes": round(horizon_minutes, 8),
+        "valid_for_seconds": round(horizon_minutes * 60.0, 8),
         "feature_opportunity_score": round(feature_score, 8),
         "information_value_score": round(information_value, 8),
         "policy_provenance": _dict(evidence.get("policy_provenance")),
@@ -242,6 +249,8 @@ def build_paper_exploration_contract(
         "return_source_count": selected.get("return_source_count"),
         "feature_opportunity_score": selected.get("feature_opportunity_score"),
         "information_value_score": selected.get("information_value_score"),
+        "prediction_horizon_minutes": selected.get("prediction_horizon_minutes"),
+        "valid_for_seconds": selected.get("valid_for_seconds"),
         "single_trade_risk_fraction_cap": (
             PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION
         ),
@@ -309,6 +318,17 @@ def paper_exploration_contract_reasons(contract_value: Any) -> list[str]:
         reasons.append("paper_exploration_tail_risk_too_high")
     if _int(contract.get("return_source_count")) < PAPER_EXPLORATION_MIN_RETURN_SOURCE_COUNT:
         reasons.append("paper_exploration_return_sources_incomplete")
+    horizon_minutes = _float(contract.get("prediction_horizon_minutes"), 0.0) or 0.0
+    valid_for_seconds = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
+    if horizon_minutes <= 0:
+        reasons.append("paper_exploration_prediction_horizon_missing")
+    if valid_for_seconds <= 0 or not isclose(
+        valid_for_seconds,
+        horizon_minutes * 60.0,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("paper_exploration_validity_contract_invalid")
     if (_float(contract.get("feature_opportunity_score"), 0.0) or 0.0) <= 0:
         reasons.append("paper_exploration_feature_value_not_positive")
     if (_float(contract.get("information_value_score"), 0.0) or 0.0) <= 0:

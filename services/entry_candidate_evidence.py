@@ -212,6 +212,7 @@ class EntryCandidateEvidencePolicy:
         score = self.score_candidate(decision, strategy)
         finite_score = _optional_float(score)
         opportunity = _safe_dict(_safe_dict(decision.raw_response).get("opportunity_score"))
+        return_distribution = _safe_dict(opportunity.get("return_distribution_contract"))
         expected_net = _safe_float(opportunity.get("expected_net_return_pct"), 0.0)
         return_lcb = _safe_float(opportunity.get("return_lcb_pct"), 0.0)
         source_count = int(
@@ -237,6 +238,10 @@ class EntryCandidateEvidencePolicy:
             ),
             "expected_loss_pct": round(
                 _safe_float(opportunity.get("expected_loss_pct"), 0.0),
+                8,
+            ),
+            "horizon_minutes": round(
+                _safe_float(return_distribution.get("horizon_minutes"), 0.0),
                 8,
             ),
             "profit_quality_ratio": round(

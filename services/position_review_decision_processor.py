@@ -15,6 +15,7 @@ from services.entry_capacity import EntryCapacityPolicy
 from services.position_review_entry_guard import PositionReviewEntryGuardPolicy
 from services.position_review_result_recorder import PositionReviewResultRecorder
 from services.position_review_risk_assessment import PositionReviewRiskAssessmentPolicy
+from services.trade_recommendation_contract import attach_risk_adjusted_trade_recommendation
 
 logger = structlog.get_logger(__name__)
 
@@ -135,6 +136,12 @@ class PositionReviewDecisionProcessor:
 
         if not assessment.approved:
             rejection_reason = assessment.rejection_reason or "风控引擎拒绝本次持仓复盘决策"
+            if model_mode == "paper":
+                attach_risk_adjusted_trade_recommendation(
+                    decision,
+                    status="rejected",
+                    reason=rejection_reason,
+                )
             logger.info(
                 "risk blocked close",
                 model=model_name,
@@ -157,6 +164,17 @@ class PositionReviewDecisionProcessor:
         if executed is not decision and decision.raw_response and not executed.raw_response:
             executed.raw_response = decision.raw_response
             executed.feature_snapshot = executed.feature_snapshot or decision.feature_snapshot
+
+        if model_mode == "paper":
+            attach_risk_adjusted_trade_recommendation(
+                executed,
+                status=("adjusted_to_hold" if executed.is_hold else "approved"),
+                reason=(
+                    "持仓复评风控调整后改为观望。"
+                    if executed.is_hold
+                    else "持仓复评硬风控已确认最终方案。"
+                ),
+            )
 
         if executed.is_hold:
             await self.result_recorder.record_hold(

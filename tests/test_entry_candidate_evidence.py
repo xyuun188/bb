@@ -241,6 +241,7 @@ def test_positive_mean_near_threshold_candidate_is_exposed_for_bounded_paper_exp
             "server_profit_loss_probability": 0.30,
             "tail_risk_score": 0.20,
             "production_eligible": True,
+            "return_distribution_contract": {"horizon_minutes": 30.0},
             "execution_cost": {"production_eligible": True, "total_pct": 0.08},
             "policy_provenance": {
                 "source": "test_return_distribution",

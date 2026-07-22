@@ -510,6 +510,12 @@ async def test_execution_service_blocks_symbol_mismatch_before_okx_submit() -> N
     assert result.raw_response["normalized_decision_symbol"] == "SPK/USDT"
     assert reasons and "执行链交易对不一致" in reasons[-1]
     assert raw_updates[-1]["policy_blocker"] == "execution_symbol_mismatch"
+    assert raw_updates[-1]["trade_recommendation_contract"]["execution"]["source"] == (
+        "execution_symbol_mismatch"
+    )
+    assert raw_updates[-1]["trade_recommendation_contract"]["execution"][
+        "exchange_confirmed"
+    ] is False
     assert results["decisions"][0]["execution_status"] == "skipped"
 
 
@@ -565,6 +571,9 @@ async def test_execution_service_marks_entry_policy_cancellation_terminal_before
     assert final_raw["stage_status"] == DecisionStageStatus.FAILED
     assert final_raw["high_risk_review"]["status"] == "cancelled_blocked"
     assert final_raw["high_risk_review"]["approved"] is False
+    assert final_raw["trade_recommendation_contract"]["execution"]["source"] == (
+        "entry_policy_cancelled"
+    )
     assert any(
         stage == DecisionStage.RISK_CHECK and status == DecisionStageStatus.FAILED
         for stage, status, _reason in stages

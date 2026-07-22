@@ -24,6 +24,11 @@ from services.paper_training import (
 )
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.return_execution_policy import apply_production_entry_policy
+from services.trade_recommendation_contract import (
+    attach_risk_adjusted_trade_recommendation,
+    paper_trade_recommendation_reason_text,
+    paper_trade_recommendation_reasons,
+)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -335,6 +340,40 @@ class EntryPolicy:
             open_positions or [],
         )
 
+    @staticmethod
+    def _paper_trade_plan_gate(
+        decision: DecisionOutput,
+        model_mode: str,
+        context: EntryPipelineContext,
+    ) -> PolicyGateResult | None:
+        if str(model_mode or "").lower() != "paper" or not decision.is_entry:
+            return None
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        contract = raw.get("trade_recommendation_contract")
+        contract = contract if isinstance(contract, dict) else {}
+        risk = contract.get("risk_adjustment")
+        risk = risk if isinstance(risk, dict) else {}
+        status = str(risk.get("status") or "")
+        if status not in {"approved", "passed"}:
+            status = "prepared"
+        attach_risk_adjusted_trade_recommendation(
+            decision,
+            status=status,
+            reason="模拟盘执行前已重新核对完整交易方案。",
+        )
+        reasons = paper_trade_recommendation_reasons(decision)
+        if not reasons:
+            return None
+        return PolicyGateResult.block(
+            "paper_trade_recommendation_incomplete",
+            paper_trade_recommendation_reason_text(reasons),
+            {
+                "pipeline_context": context.public_data(),
+                "stage_status": "blocked",
+                "block_reasons": reasons,
+            },
+        )
+
     async def evaluate(
         self,
         decision: DecisionOutput,
@@ -392,6 +431,9 @@ class EntryPolicy:
                 model_mode,
                 open_positions or [],
             )
+            paper_plan_gate = self._paper_trade_plan_gate(decision, model_mode, context)
+            if paper_plan_gate is not None:
+                return paper_plan_gate
             paper_assessment = self.paper_bootstrap_canary.assess(decision, model_mode)
             if not paper_assessment.eligible:
                 return PolicyGateResult.block(
@@ -418,6 +460,9 @@ class EntryPolicy:
             model_mode,
             open_positions=open_positions or [],
         )
+        paper_plan_gate = self._paper_trade_plan_gate(decision, model_mode, context)
+        if paper_plan_gate is not None:
+            return paper_plan_gate
         if is_paper_exploration_decision(decision):
             exploration_assessment = assess_paper_exploration_entry(
                 decision,

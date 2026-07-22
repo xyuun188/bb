@@ -162,6 +162,8 @@ def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reas
         "loss_probability": 0.3,
         "tail_risk_score": 0.2,
         "return_source_count": 3,
+        "prediction_horizon_minutes": 30.0,
+        "valid_for_seconds": 1800.0,
         "feature_opportunity_score": 8.0,
         "information_value_score": 0.04,
         "policy_provenance": provenance,
