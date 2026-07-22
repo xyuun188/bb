@@ -42,6 +42,10 @@ def test_auto_scan_snapshot_is_operational_not_entry_permission() -> None:
     assert "BTC/USDT" in params.major_symbols
     selection = DEFAULT_TRADING_PARAMS.market_analysis_selection
     assert selection.candidate_pool_multiplier >= 2
-    assert selection.discovery_slots == 1
-    assert selection.cooldown_seconds > 0
-    assert 0 < selection.unchanged_repeat_penalty_ratio < 1
+    assert selection.coverage_slots == 1
+    assert selection.single_slot_coverage_interval == 3
+    assert selection.coverage_target_seconds == 30 * 60
+    assert selection.coverage_history_seconds == 24 * 60 * 60
+    assert selection.cooldown_seconds == 10 * 60
+    assert selection.unchanged_repeat_penalty_ratio == 0.65
+    assert selection.material_change_repeat_penalty_ratio == 0.25

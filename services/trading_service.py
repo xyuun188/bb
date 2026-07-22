@@ -5305,7 +5305,11 @@ class TradingService:
         if policy.history_loaded:
             return
         cutoff = datetime.now(UTC) - timedelta(
-            seconds=max(int(MARKET_ANALYSIS_SELECTION_PARAMS.cooldown_seconds), 1)
+            seconds=max(
+                int(MARKET_ANALYSIS_SELECTION_PARAMS.coverage_history_seconds),
+                int(MARKET_ANALYSIS_SELECTION_PARAMS.cooldown_seconds),
+                1,
+            )
         )
         try:
             async with get_read_session_ctx() as session:
@@ -5367,8 +5371,10 @@ class TradingService:
             recent_unchanged_candidate_count=diagnostics.get(
                 "recent_unchanged_candidate_count"
             ),
+            coverage_due_candidate_count=diagnostics.get("coverage_due_candidate_count"),
+            coverage_selected_symbols=diagnostics.get("coverage_selected_symbols"),
             skipped_symbols=diagnostics.get("skipped_symbols"),
-            material_change_bypass_count=diagnostics.get("material_change_bypass_count"),
+            recent_material_change_count=diagnostics.get("recent_material_change_count"),
         )
         return result.selected
 

@@ -73,10 +73,14 @@ class MarketAnalysisSelectionParams:
     """Expert-analysis allocation controls that do not grant trade permission."""
 
     candidate_pool_multiplier: int = 3
-    discovery_slots: int = 1
-    cooldown_seconds: int = 5 * 60
-    unchanged_repeat_penalty_ratio: float = 0.35
-    history_limit: int = 120
+    coverage_slots: int = 1
+    single_slot_coverage_interval: int = 3
+    coverage_target_seconds: int = 30 * 60
+    coverage_history_seconds: int = 24 * 60 * 60
+    cooldown_seconds: int = 10 * 60
+    unchanged_repeat_penalty_ratio: float = 0.65
+    material_change_repeat_penalty_ratio: float = 0.25
+    history_limit: int = 3_000
     material_price_change_ratio: float = 0.003
     material_volume_ratio_change_ratio: float = 0.35
     material_adx_change: float = 3.0

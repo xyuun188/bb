@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-07-21.marginal-market-analysis-value.v1"
+    VERSION = "2026-07-22.advantage-coverage-market-analysis.v2"
 
     def __init__(
         self,
@@ -68,10 +68,12 @@ class MarketAnalysisSelectionPolicy:
         self.advantage_scorer = advantage_scorer
         self.params = params
         self._recent: dict[str, MarketAnalysisObservation] = {}
+        self._selection_round = 0
         self.history_loaded = False
 
     def clear(self) -> None:
         self._recent.clear()
+        self._selection_round = 0
         self.history_loaded = False
 
     def remember(
@@ -126,44 +128,60 @@ class MarketAnalysisSelectionPolicy:
             reverse=True,
         )
 
-        discovery_slots = min(
-            max(int(self.params.discovery_slots), 0),
-            max(final_limit - 1, 0),
+        self._selection_round += 1
+        coverage_candidates = [row for row in ranked if bool(row["coverage_due"])]
+        coverage_slots = self._coverage_slot_count(
+            final_limit,
+            has_coverage_candidates=bool(coverage_candidates),
         )
-        exploitation_slots = final_limit - discovery_slots
-        selected_rows = ranked[:exploitation_slots]
+        advantage_slots = final_limit - coverage_slots
+        selected_rows = ranked[:advantage_slots]
         for row in selected_rows:
             row["selection_role"] = "advantage"
         selected_keys = {str(row["symbol_key"]) for row in selected_rows}
 
-        discovery_candidates = [
-            row
-            for row in ranked
-            if str(row["symbol_key"]) not in selected_keys
-            and not bool(row["recent_unchanged"])
-        ]
-        for row in discovery_candidates[:discovery_slots]:
-            row["selection_role"] = "discovery"
+        coverage_ranked = sorted(
+            (
+                row
+                for row in coverage_candidates
+                if str(row["symbol_key"]) not in selected_keys
+            ),
+            key=lambda row: (
+                bool(row["never_analyzed"]),
+                _safe_float(row["recent_age_seconds"], float("inf")),
+                _safe_float(row["evaluation_score"]),
+            ),
+            reverse=True,
+        )
+        for row in coverage_ranked[:coverage_slots]:
+            row["selection_role"] = "coverage"
             selected_rows.append(row)
             selected_keys.add(str(row["symbol_key"]))
 
-        discovery_assigned = sum(
-            row.get("selection_role") == "discovery" for row in selected_rows
+        coverage_assigned = sum(
+            row.get("selection_role") == "coverage" for row in selected_rows
         )
-        if discovery_assigned < discovery_slots:
+        if coverage_assigned < coverage_slots:
             for row in reversed(selected_rows):
-                if bool(row["recent_unchanged"]):
+                if not bool(row["coverage_due"]):
                     continue
-                row["selection_role"] = "discovery"
-                discovery_assigned += 1
-                if discovery_assigned >= discovery_slots:
+                row["selection_role"] = "coverage"
+                coverage_assigned += 1
+                if coverage_assigned >= coverage_slots:
                     break
 
         if len(selected_rows) < final_limit:
+            advantage_assigned = sum(
+                row.get("selection_role") == "advantage" for row in selected_rows
+            )
             for row in ranked:
                 if str(row["symbol_key"]) in selected_keys:
                     continue
-                row["selection_role"] = "fallback_fill"
+                if advantage_assigned < advantage_slots:
+                    row["selection_role"] = "advantage"
+                    advantage_assigned += 1
+                else:
+                    row["selection_role"] = "fallback_fill"
                 selected_rows.append(row)
                 selected_keys.add(str(row["symbol_key"]))
                 if len(selected_rows) >= final_limit:
@@ -175,6 +193,22 @@ class MarketAnalysisSelectionPolicy:
         }
         diagnostics = self._diagnostics(rows, selected_rows, final_limit, selected_at)
         return MarketAnalysisSelectionResult(selected=selected, diagnostics=diagnostics)
+
+    def _coverage_slot_count(
+        self,
+        final_limit: int,
+        *,
+        has_coverage_candidates: bool,
+    ) -> int:
+        if not has_coverage_candidates or final_limit <= 0:
+            return 0
+        configured = max(int(self.params.coverage_slots), 0)
+        if configured <= 0:
+            return 0
+        if final_limit > 1:
+            return min(configured, final_limit - 1)
+        interval = max(int(self.params.single_slot_coverage_interval), 1)
+        return 1 if self._selection_round % interval == 0 else 0
 
     def _candidate_row(
         self,
@@ -200,18 +234,29 @@ class MarketAnalysisSelectionPolicy:
             and age_seconds < float(self.params.cooldown_seconds)
         )
         recent_unchanged = bool(recent and not material_change)
-        penalty = (
-            base_score * min(max(float(self.params.unchanged_repeat_penalty_ratio), 0.0), 1.0)
-            if recent_unchanged
-            else 0.0
-        )
+        repeat_penalty_ratio = 0.0
+        if recent:
+            repeat_penalty_ratio = (
+                self.params.material_change_repeat_penalty_ratio
+                if material_change
+                else self.params.unchanged_repeat_penalty_ratio
+            )
+        repeat_penalty_ratio = min(max(float(repeat_penalty_ratio), 0.0), 1.0)
+        penalty = base_score * repeat_penalty_ratio
         evaluation_score = max(base_score - penalty, 0.0)
+        coverage_due = bool(
+            observation is None
+            or age_seconds is None
+            or age_seconds >= float(self.params.coverage_target_seconds)
+        )
         if observation is None:
             status = "not_recently_analyzed"
-        elif material_change:
-            status = "material_change_bypass"
+        elif recent and material_change:
+            status = "recent_material_change_penalty"
         elif recent_unchanged:
             status = "recent_unchanged_penalty"
+        elif material_change:
+            status = "material_change_after_cooldown"
         else:
             status = "cooldown_expired"
         return {
@@ -221,9 +266,12 @@ class MarketAnalysisSelectionPolicy:
             "rank_before_selection": rank,
             "base_advantage_score": round(base_score, 6),
             "repeat_penalty": round(penalty, 6),
+            "repeat_penalty_ratio": round(repeat_penalty_ratio, 6),
             "evaluation_score": round(evaluation_score, 6),
             "recent_age_seconds": None if age_seconds is None else round(age_seconds, 3),
             "recent_unchanged": recent_unchanged,
+            "never_analyzed": observation is None,
+            "coverage_due": coverage_due,
             "material_change": material_change,
             "material_change_reasons": changes,
             "selection_status": status,
@@ -297,6 +345,16 @@ class MarketAnalysisSelectionPolicy:
             row for row in rows if row["recent_unchanged"] and row["symbol_key"] not in selected_keys
         ]
         selected_details = [self._public_row(row) for row in selected_rows]
+        coverage_selected = [
+            str(row["symbol"])
+            for row in selected_rows
+            if row.get("selection_role") == "coverage"
+        ]
+        advantage_selected = [
+            str(row["symbol"])
+            for row in selected_rows
+            if row.get("selection_role") == "advantage"
+        ]
         return {
             "version": self.VERSION,
             "read_only": True,
@@ -310,16 +368,25 @@ class MarketAnalysisSelectionPolicy:
             "unchanged_repeat_penalty_ratio": round(
                 float(self.params.unchanged_repeat_penalty_ratio), 6
             ),
-            "discovery_slots": min(
-                max(int(self.params.discovery_slots), 0),
-                max(int(final_limit) - 1, 0),
+            "material_change_repeat_penalty_ratio": round(
+                float(self.params.material_change_repeat_penalty_ratio), 6
             ),
-            "discovery_selected_symbols": [
-                str(row["symbol"])
-                for row in selected_rows
-                if row.get("selection_role") == "discovery"
-            ],
-            "material_change_bypass_count": sum(bool(row["material_change"]) for row in rows),
+            "coverage_target_seconds": int(self.params.coverage_target_seconds),
+            "coverage_configured_slots": int(self.params.coverage_slots),
+            "single_slot_coverage_interval": int(
+                self.params.single_slot_coverage_interval
+            ),
+            "selection_round": int(self._selection_round),
+            "coverage_due_candidate_count": sum(bool(row["coverage_due"]) for row in rows),
+            "coverage_selected_count": len(coverage_selected),
+            "coverage_selected_symbols": coverage_selected,
+            "advantage_selected_count": len(advantage_selected),
+            "advantage_selected_symbols": advantage_selected,
+            "recent_material_change_count": sum(
+                bool(row["material_change"])
+                and row.get("selection_status") == "recent_material_change_penalty"
+                for row in rows
+            ),
             "recent_unchanged_candidate_count": sum(
                 bool(row["recent_unchanged"]) for row in rows
             ),
@@ -328,9 +395,10 @@ class MarketAnalysisSelectionPolicy:
             "candidate_sample": [self._public_row(row) for row in rows[:12]],
             "generated_at": selected_at.isoformat(),
             "reason": (
-                "Rank by current market advantage, penalize only unchanged recent analyses, "
-                "reserve discovery capacity when available, and allow material market changes "
-                "to bypass the cooldown. This controls expert-analysis allocation only."
+                "Allocate expert analysis between current advantage and overdue coverage. "
+                "Recent repeats remain penalized even after material market changes, while "
+                "single-slot rounds periodically cover overdue candidates. This controls "
+                "expert-analysis allocation only."
             ),
             "diagnostic_boundary": (
                 "Analysis scheduling only; it cannot authorize entry, change rank eligibility, "
@@ -348,9 +416,12 @@ class MarketAnalysisSelectionPolicy:
                 "rank_before_selection",
                 "base_advantage_score",
                 "repeat_penalty",
+                "repeat_penalty_ratio",
                 "evaluation_score",
                 "recent_age_seconds",
                 "recent_unchanged",
+                "never_analyzed",
+                "coverage_due",
                 "material_change",
                 "material_change_reasons",
                 "selection_status",

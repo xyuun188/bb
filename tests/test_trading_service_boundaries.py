@@ -3803,7 +3803,7 @@ def test_market_analysis_value_selection_populates_runtime_budget_diagnostics() 
     assert list(selected) == ["BTC/USDT", "ETH/USDT"]
     diagnostics = analysis_budget["market_analysis_selection"]
     assert diagnostics["selected_symbols"] == ["BTC/USDT", "ETH/USDT"]
-    assert diagnostics["discovery_selected_symbols"] == ["ETH/USDT"]
+    assert diagnostics["coverage_selected_symbols"] == ["ETH/USDT"]
     assert diagnostics["is_entry_gate"] is False
     assert analysis_budget["recent_market_analysis_dedupe"]["skipped_count"] == 0
 
