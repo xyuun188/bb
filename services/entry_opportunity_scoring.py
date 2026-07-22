@@ -76,6 +76,22 @@ def _unique_distribution_rows(
     return unique
 
 
+def _paper_quant_multipliers(strategy: dict[str, Any] | None) -> dict[str, float]:
+    context = safe_dict(strategy)
+    if str(context.get("execution_mode") or "").lower() != "paper":
+        return {}
+    report = safe_dict(context.get("continuous_model_weights"))
+    if report.get("applied") is not True:
+        return {}
+    rows = safe_dict(report.get("quant_source_weights"))
+    weights: dict[str, float] = {}
+    for name in ("local_ml", "server_profit", "timeseries"):
+        value = _finite(safe_dict(rows.get(name)).get("effective_multiplier"))
+        if value is not None and value > 0.0:
+            weights[name] = value
+    return weights
+
+
 @dataclass(slots=True)
 class EntryOpportunityScoringPolicy:
     """Build and rank the current production return distribution."""
@@ -300,6 +316,16 @@ class EntryOpportunityScoringPolicy:
             for component in claimed_components
             if safe_dict(component.get("return_distribution_contract"))
         ]
+        quant_multipliers = _paper_quant_multipliers(strategy)
+        claimed_model_weights = (
+            [
+                quant_multipliers.get(str(component.get("key") or ""), 1.0)
+                for component in claimed_components
+                if safe_dict(component.get("return_distribution_contract"))
+            ]
+            if quant_multipliers
+            else None
+        )
         input_blockers = []
         if len(claimed_contracts) != len(claimed_components):
             input_blockers.append("claimed_production_return_distribution_missing")
@@ -462,20 +488,30 @@ class EntryOpportunityScoringPolicy:
                 "governed_model_contracts_live_orderbook_and_okx_position_history"
             ),
             input_blockers=input_blockers,
+            model_weights=claimed_model_weights,
         )
         combination_ready = production_distribution.get("production_eligible") is True
         distribution_mode = (
             "governed_market_opportunity" if combination_ready else "unavailable"
         )
-        production_weight = (
-            1.0 / len(selected_components)
-            if combination_ready and selected_components
-            else 0.0
+        selected_weight_total = sum(
+            quant_multipliers.get(str(component.get("key") or ""), 1.0)
+            for component in selected_components
         )
         for component in components:
             included = bool(combination_ready and component in selected_components)
             component["included_in_return_distribution"] = included
-            component["production_weight"] = production_weight if included else 0.0
+            component_weight = quant_multipliers.get(
+                str(component.get("key") or ""),
+                1.0,
+            )
+            component["production_weight"] = (
+                component_weight / selected_weight_total
+                if included and selected_weight_total > 0.0
+                else 0.0
+            )
+            if quant_multipliers:
+                component["continuous_weight_multiplier"] = component_weight
             if component in selected_components and not combination_ready:
                 component["production_eligible"] = False
                 component["observation_only"] = True
@@ -586,7 +622,10 @@ class EntryOpportunityScoringPolicy:
             "execution_cost": execution_cost.to_dict(),
             "expected_net_breakdown": {
                 "formula": (
-                    "mean(governed_gross_market_returns)-live_execution_cost-"
+                    "weighted_mean(governed_gross_market_returns)-live_execution_cost-"
+                    if quant_multipliers
+                    else "mean(governed_gross_market_returns)-live_execution_cost-"
+                ) + (
                     "authoritative_slippage_tail_excess"
                 ),
                 "unit": "pct",

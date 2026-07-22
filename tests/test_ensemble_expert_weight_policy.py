@@ -149,6 +149,26 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
     }
 
 
+def _continuous_weights(**overrides: float) -> dict[str, object]:
+    values = {
+        name: {"effective_multiplier": overrides.get(name, 1.0)}
+        for name in (
+            "trend_expert",
+            "momentum_expert",
+            "sentiment_expert",
+            "position_expert",
+            "risk_expert",
+        )
+    }
+    return {
+        "applied": True,
+        "execution_scope": "paper_only",
+        "expert_weights": values,
+        "quant_source_weights": {},
+        "rollback": {"mode": "base_weights"},
+    }
+
+
 def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote() -> None:
     decision = _coordinator().combine(_features(), _return_context(), _strong_long_opinions())
 
@@ -349,3 +369,137 @@ def test_local_fallback_risk_opinion_cannot_veto_authoritative_return_entry() ->
     assert decision.action == Action.LONG
     assert risk["effective_weight"] == 0.0
     assert decision.raw_response["risk_expert_policy"]["hard_veto"] is False
+
+
+def test_same_provider_roles_share_one_total_weight_budget() -> None:
+    opinions = _strong_long_opinions()
+    for decision in opinions.values():
+        decision.raw_response = {"provider_model": "shared-provider-model"}
+    context = _return_context(
+        execution_mode="paper",
+        strategy_mode={"continuous_model_weights": _continuous_weights()},
+    )
+
+    decision = _coordinator().combine(_features(), context, opinions)
+
+    allocations = decision.raw_response["continuous_expert_weight_allocations"]
+    group = allocations["source_groups"]["llm:shared-provider-model"]
+    assert group["effective_weight_total"] == group["source_budget"]
+    assert group["effective_weight_total"] < group["raw_weight_total"]
+    assert group["same_provider_roles_share_one_budget"] is True
+
+
+def test_many_low_quality_roles_cannot_outvote_one_high_quality_model() -> None:
+    opinions = {
+        "trend_expert": _decision(
+            "trend_expert",
+            Action.LONG,
+            confidence=0.9,
+            provider_model="independent-good-model",
+        ),
+        "momentum_expert": _decision(
+            "momentum_expert",
+            Action.SHORT,
+            confidence=0.9,
+            provider_model="shared-weak-model",
+        ),
+        "sentiment_expert": _decision(
+            "sentiment_expert",
+            Action.SHORT,
+            confidence=0.9,
+            provider_model="shared-weak-model",
+        ),
+        "position_expert": _decision(
+            "position_expert",
+            Action.SHORT,
+            confidence=0.9,
+            provider_model="shared-weak-model",
+        ),
+        "risk_expert": _decision(
+            "risk_expert",
+            Action.HOLD,
+            confidence=0.7,
+            provider_model="risk-model",
+        ),
+    }
+    context = _return_context(
+        execution_mode="paper",
+        continuous_model_weights=_continuous_weights(
+            trend_expert=1.4,
+            momentum_expert=0.1,
+            sentiment_expert=0.1,
+            position_expert=0.1,
+            risk_expert=0.1,
+        ),
+    )
+
+    decision = _coordinator().combine(_features(), context, opinions)
+
+    assert decision.raw_response["weighted_score"] > 0.0
+    weak = decision.raw_response["continuous_expert_weight_allocations"][
+        "source_groups"
+    ]["llm:shared-weak-model"]
+    assert weak["effective_weight_total"] == weak["source_budget"]
+
+
+def test_continuous_weights_are_ignored_by_live_ensemble_path() -> None:
+    opinions = _strong_long_opinions()
+    baseline = _coordinator().combine(
+        _features(),
+        _return_context(execution_mode="live"),
+        opinions,
+    )
+    with_report = _coordinator().combine(
+        _features(),
+        _return_context(
+            execution_mode="live",
+            continuous_model_weights=_continuous_weights(
+                trend_expert=0.1,
+                momentum_expert=1.4,
+            ),
+        ),
+        opinions,
+    )
+
+    assert with_report.action == baseline.action
+    assert with_report.raw_response["weighted_score"] == baseline.raw_response[
+        "weighted_score"
+    ]
+    assert with_report.raw_response["opinions"] == baseline.raw_response["opinions"]
+    assert "continuous_model_weights" not in with_report.raw_response
+
+
+def test_paper_bootstrap_combines_weighted_quant_and_expert_direction() -> None:
+    context = _return_context(
+        execution_mode="paper",
+        paper_training_mode="bootstrap",
+        paper_strategy_champion={"active": False, "paper_execution_permission": False},
+        continuous_model_weights=_continuous_weights(),
+        direction_competition={
+            "preferred_side": "neutral",
+            "training_preferred_side": "short",
+            "training_long": {
+                "score": 0.1,
+                "raw_expected_return_pct": 0.1,
+                "objective_expected_return_pct": 0.1,
+                "horizon_minutes": 10,
+                "observation_count": 2,
+            },
+            "training_short": {
+                "score": 0.2,
+                "raw_expected_return_pct": 0.2,
+                "objective_expected_return_pct": 0.2,
+                "horizon_minutes": 10,
+                "observation_count": 2,
+            },
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+
+    decision = _coordinator().combine(_features(), context, _strong_long_opinions())
+
+    assert decision.action == Action.LONG
+    assert decision.raw_response["paper_training"]["signal_source"] == (
+        "continuous_weighted_quant_and_expert_observations"
+    )

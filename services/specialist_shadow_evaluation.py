@@ -1139,6 +1139,7 @@ class SpecialistShadowEvaluationService:
         *,
         hours: int = DEFAULT_WINDOW_HOURS,
         authoritative_trade_samples: Sequence[Any] | None = None,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         from sqlalchemy import select
         from sqlalchemy.orm import load_only
@@ -1149,16 +1150,22 @@ class SpecialistShadowEvaluationService:
         capped_hours = max(1, min(int(hours or DEFAULT_WINDOW_HOURS), 24 * 90))
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         since_naive = since.replace(tzinfo=None)
+        selected_mode = (
+            "live" if str(mode or "").lower() == "live" else "paper" if mode else None
+        )
+        filters = [
+            ShadowBacktest.created_at >= since_naive,
+            ShadowBacktest.status == "completed",
+            ShadowBacktest.long_return_pct.is_not(None),
+            ShadowBacktest.short_return_pct.is_not(None),
+        ]
+        if selected_mode is not None:
+            filters.append(ShadowBacktest.execution_mode == selected_mode)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
             result = await session.execute(
                 select(ShadowBacktest)
-                .where(
-                    ShadowBacktest.created_at >= since_naive,
-                    ShadowBacktest.status == "completed",
-                    ShadowBacktest.long_return_pct.is_not(None),
-                    ShadowBacktest.short_return_pct.is_not(None),
-                )
+                .where(*filters)
                 .options(
                     load_only(
                         ShadowBacktest.id,
@@ -1183,6 +1190,8 @@ class SpecialistShadowEvaluationService:
             authoritative_trade_samples=authoritative_trade_samples,
         )
         report["window_hours"] = capped_hours
+        report["execution_mode"] = selected_mode or "all"
+        report["mode_filter_applied"] = selected_mode is not None
         report["query_policy"] = {
             "read_only": True,
             "ordered_by_primary_key": True,

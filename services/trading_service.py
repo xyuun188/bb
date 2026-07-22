@@ -49,6 +49,11 @@ from services.account_accounting_service import (
 )
 from services.analysis_budget import POSITION_REVIEW_MAX_GROUPS_PER_ROUND, AnalysisBudgetPolicy
 from services.analysis_services import MarketAnalysisService, PositionReviewService
+from services.continuous_model_weight import (
+    ContinuousModelWeightEvidenceService,
+    ContinuousModelWeightPolicy,
+    continuous_model_weight_scenario,
+)
 from services.daily_performance_service import DailyPerformanceService
 from services.daily_side_performance import DailySidePerformanceService
 from services.data_service import DataService
@@ -656,6 +661,11 @@ class TradingService:
         self.model_contribution_performance_service = ModelContributionPerformanceService(
             lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
         )
+        self.continuous_model_weight_evidence_service = (
+            ContinuousModelWeightEvidenceService()
+        )
+        self.continuous_model_weight_policy = ContinuousModelWeightPolicy()
+        self._continuous_model_weight_snapshot_cache: dict[str, dict[str, Any]] = {}
         self.entry_opportunity_score = EntryOpportunityScoringPolicy(
             normalize_symbol=self._normalize_position_symbol,
             annotate_decision_source=self._annotate_decision_source,
@@ -2283,6 +2293,14 @@ class TradingService:
                     selected_mode
                 ),
             }
+            if (
+                selected_mode == "paper"
+                and getattr(self, "continuous_model_weight_evidence_service", None)
+                is not None
+            ):
+                loaders["continuous_model_weight_evidence"] = (
+                    lambda: self._continuous_model_weight_evidence("paper")
+                )
             rows = await asyncio.gather(
                 *[
                     self._refresh_strategy_context_performance_value(label, loader)
@@ -4739,6 +4757,15 @@ class TradingService:
         side_perf_multiday = self._safe_dict(performance_values.get("multiday_side_perf"))
         symbol_side_perf = self._safe_dict(performance_values.get("symbol_side_perf"))
         model_contribution_perf = self._safe_dict(performance_values.get("model_contribution_perf"))
+        continuous_weight_report = self._continuous_model_weight_report(
+            mode=selected_mode,
+            market_regime=market_regime,
+            evidence=self._safe_dict(
+                performance_values.get("continuous_model_weight_evidence")
+            ),
+            contribution=model_contribution_perf,
+            snapshot_version=int(performance_snapshot.get("version") or 0),
+        )
         account_equity = await self._bounded_strategy_context_value(
             "account_equity",
             self._strategy_context_account_equity(selected_mode),
@@ -4762,6 +4789,8 @@ class TradingService:
         context["paper_training_mode"] = "bootstrap" if selected_mode == "paper" else "disabled"
         context["account_equity"] = account_equity
         context["strategy_context_performance"] = performance_snapshot
+        if continuous_weight_report:
+            context["continuous_model_weights"] = continuous_weight_report
         if _analysis_scope_context.get() == "market":
             context["account_equity_source"] = getattr(
                 self,
@@ -4798,6 +4827,14 @@ class TradingService:
                 if cached_context:
                     cached_context.update(
                         {
+                            **(
+                                {
+                                    "continuous_model_weights": continuous_weight_report,
+                                    "strategy_context_performance": performance_snapshot,
+                                }
+                                if continuous_weight_report
+                                else {}
+                            ),
                             "strategy_learning_cache_status": "stale_background_refresh",
                             "strategy_learning_error": (
                                 "市场扫描轮使用最近一次策略学习上下文，后台刷新学习结果，"
@@ -4874,6 +4911,14 @@ class TradingService:
             if cached_context:
                 cached_context.update(
                     {
+                        **(
+                            {
+                                "continuous_model_weights": continuous_weight_report,
+                                "strategy_context_performance": performance_snapshot,
+                            }
+                            if continuous_weight_report
+                            else {}
+                        ),
                         "strategy_learning_cache_status": "stale_timeout",
                         "strategy_learning_error": (
                             "策略学习上下文超过交易轮次预算，已使用最近一次可用学习上下文，"
@@ -5301,6 +5346,59 @@ class TradingService:
             )
             self.model_contribution_performance_service = service
         return await service.recent(mode)
+
+    async def _continuous_model_weight_evidence(self, mode: str) -> dict[str, Any]:
+        service = getattr(self, "continuous_model_weight_evidence_service", None)
+        if service is None:
+            service = ContinuousModelWeightEvidenceService()
+            self.continuous_model_weight_evidence_service = service
+        return await service.report(mode)
+
+    def _continuous_model_weight_report(
+        self,
+        *,
+        mode: str,
+        market_regime: dict[str, Any],
+        evidence: dict[str, Any],
+        contribution: dict[str, Any],
+        snapshot_version: int,
+    ) -> dict[str, Any]:
+        if mode != "paper":
+            return {}
+        scenario = continuous_model_weight_scenario(mode, market_regime)
+        evidence_version = str(evidence.get("generated_at") or "cold_start")
+        cache_key = f"{scenario}:{snapshot_version}:{evidence_version}"
+        cache = getattr(self, "_continuous_model_weight_snapshot_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._continuous_model_weight_snapshot_cache = cache
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        policy = getattr(self, "continuous_model_weight_policy", None)
+        if policy is None:
+            policy = ContinuousModelWeightPolicy()
+            self.continuous_model_weight_policy = policy
+        report = policy.build(
+            execution_mode="paper",
+            market_regime=market_regime,
+            health_report=self._safe_dict(evidence.get("health")),
+            specialist_report=self._safe_dict(evidence.get("specialist_shadow")),
+            contribution_performance=contribution,
+        )
+        report["performance_snapshot_version"] = snapshot_version
+        report["evidence_snapshot"] = {
+            "available": evidence.get("available") is True,
+            "generated_at": evidence.get("generated_at"),
+            "expires_at": evidence.get("expires_at"),
+            "fallback": (
+                "none" if evidence.get("available") is True else "cold_start_weights"
+            ),
+        }
+        if len(cache) >= 16:
+            cache.pop(next(iter(cache)))
+        cache[cache_key] = report
+        return report
 
     def _market_analysis_selector_policy(self) -> MarketAnalysisSelectionPolicy:
         policy = getattr(self, "market_analysis_selector", None)

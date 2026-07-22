@@ -36,6 +36,13 @@ DEFAULT_POSITION_LIMIT = 800
 DEFAULT_ORDER_LIMIT = 3000
 MANUAL_CLOSE_LOOKUP_GRACE_SECONDS = 15.0
 OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
+EXPERT_CONTRIBUTION_NAMES = (
+    "trend_expert",
+    "momentum_expert",
+    "sentiment_expert",
+    "position_expert",
+    "risk_expert",
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -87,6 +94,9 @@ def _empty_bucket(label: str) -> dict[str, Any]:
         "win_rate": 0.0,
         "profit_factor": None,
         "pnl_lcb_usdt": 0.0,
+        "worst_pnl_usdt": None,
+        "tail_loss_p10_usdt": None,
+        "max_drawdown_usdt": 0.0,
         "production_permission": False,
         "state": "not_observed",
         "reason": "尚无可归因的权威平仓结果。",
@@ -95,7 +105,7 @@ def _empty_bucket(label: str) -> dict[str, Any]:
 
 
 def _default_stats() -> dict[str, dict[str, Any]]:
-    return {
+    stats = {
         "decision_llm": _empty_bucket("决策大模型"),
         "ml_profit_model": _empty_bucket("本地 ML 盈利模型"),
         "server_profit_model": _empty_bucket("服务器盈利模型"),
@@ -106,6 +116,13 @@ def _default_stats() -> dict[str, dict[str, Any]]:
         "high_risk_review": _empty_bucket("高风险复核模型"),
         "ai_only_without_quant": _empty_bucket("AI 单独支持但量化未同向"),
     }
+    stats.update(
+        {
+            f"expert:{name}": _empty_bucket(name)
+            for name in EXPERT_CONTRIBUTION_NAMES
+        }
+    )
+    return stats
 
 
 class ModelContributionPerformanceService:
@@ -282,6 +299,7 @@ class ModelContributionPerformanceService:
                             AIDecision.raw_llm_response["opportunity_score"].label(
                                 "opportunity_score"
                             ),
+                            AIDecision.model_health_opinions.label("opinions"),
                         )
                         .where(AIDecision.id.in_(decision_ids))
                     )
@@ -290,7 +308,8 @@ class ModelContributionPerformanceService:
                             id=int(row.id),
                             action=row.action,
                             raw_llm_response={
-                                "opportunity_score": _safe_dict(row.opportunity_score)
+                                "opportunity_score": _safe_dict(row.opportunity_score),
+                                "opinions": _safe_list(row.opinions),
                             },
                         )
                         for row in decisions_result.all()
@@ -319,7 +338,15 @@ class ModelContributionPerformanceService:
 
         stats = _default_stats()
         order_list = list(orders)
-        for pos in positions:
+        ordered_positions = sorted(
+            positions,
+            key=lambda pos: (
+                _aware(getattr(pos, "closed_at", None))
+                or _aware(getattr(pos, "created_at", None))
+                or datetime.min.replace(tzinfo=UTC)
+            ),
+        )
+        for pos in ordered_positions:
             if not closed_position_trade_fact_trusted(pos):
                 continue
             matched_decision = self._match_entry_decision(pos, order_list, decisions)
@@ -392,22 +419,38 @@ class ModelContributionPerformanceService:
     ) -> list[str]:
         """Infer which evidence sources supported an entry decision."""
 
-        del raw, side
         breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
         source_map = {
             "local_ml": "ml_profit_model",
             "server_profit": "server_profit_model",
             "timeseries": "timeseries_model",
+            "sentiment": "sentiment_model",
         }
-        return list(
-            dict.fromkeys(
-                source_map[str(item.get("key"))]
-                for item in _safe_list(breakdown.get("components"))
-                if isinstance(item, dict)
-                and item.get("production_eligible") is True
-                and str(item.get("key")) in source_map
+        sources = [
+            source_map[str(item.get("key"))]
+            for item in _safe_list(breakdown.get("components"))
+            if isinstance(item, dict)
+            and item.get("production_eligible") is True
+            and str(item.get("key")) in source_map
+        ]
+        normalized_side = "short" if str(side or "").lower() == "short" else "long"
+        for opinion in _safe_list(raw.get("opinions")):
+            row = _safe_dict(opinion)
+            name = str(row.get("model_name") or "").strip()
+            action = str(row.get("action") or "").strip().lower()
+            effective_weight = _safe_float(
+                row.get("effective_weight", row.get("weight")),
+                0.0,
             )
-        )
+            if (
+                name in EXPERT_CONTRIBUTION_NAMES
+                and action == normalized_side
+                and effective_weight > 0.0
+                and row.get("trace_only_fallback") is not True
+                and row.get("timeout_fallback") is not True
+            ):
+                sources.append(f"expert:{name}")
+        return list(dict.fromkeys(sources))
 
     def score_adjustment(
         self,
@@ -492,6 +535,15 @@ class ModelContributionPerformanceService:
             else avg_pnl**2
         )
         lcb = avg_pnl - sqrt(max(variance, 0.0) / count)
+        ordered_samples = sorted(samples)
+        tail_index = min(max(int(len(ordered_samples) * 0.10), 0), count - 1)
+        cumulative = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for sample in samples:
+            cumulative += sample
+            peak = max(peak, cumulative)
+            max_drawdown = max(max_drawdown, peak - cumulative)
         state = (
             "positive_return_observation"
             if lcb > 0 and profit_factor is not None and profit_factor > 1
@@ -504,6 +556,9 @@ class ModelContributionPerformanceService:
                 "loss": round(loss, 6),
                 "avg_pnl": round(avg_pnl, 6),
                 "pnl_lcb_usdt": round(lcb, 6),
+                "worst_pnl_usdt": round(min(samples), 6),
+                "tail_loss_p10_usdt": round(ordered_samples[tail_index], 6),
+                "max_drawdown_usdt": round(max_drawdown, 6),
                 "win_rate": round(win_rate, 6),
                 "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
                 "state": state,

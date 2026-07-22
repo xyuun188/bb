@@ -156,3 +156,39 @@ def test_model_contribution_cannot_adjust_production_score_or_size() -> None:
     assert "score_multiplier" not in adjustment
     assert "size_multiplier" not in adjustment
     assert adjustment["production_permission"] is False
+
+
+def test_realized_fee_after_pnl_is_attributed_to_each_aligned_expert() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    raw = _current_raw()
+    raw["opinions"] = [
+        {
+            "model_name": "trend_expert",
+            "action": "long",
+            "effective_weight": 0.8,
+            "trace_only_fallback": False,
+        },
+        {
+            "model_name": "momentum_expert",
+            "action": "short",
+            "effective_weight": 0.6,
+            "trace_only_fallback": False,
+        },
+        {
+            "model_name": "sentiment_expert",
+            "action": "long",
+            "effective_weight": 0.0,
+            "trace_only_fallback": True,
+        },
+    ]
+
+    stats = ModelContributionPerformanceService().build_stats(
+        [_position(1, -2.5, created_at=now)],
+        [_order(1, 1, created_at=now)],
+        {1: _decision(1, raw)},
+    )
+
+    assert stats["expert:trend_expert"]["count"] == 1
+    assert stats["expert:trend_expert"]["pnl"] == pytest.approx(-2.5)
+    assert stats["expert:momentum_expert"]["count"] == 0
+    assert stats["expert:sentiment_expert"]["count"] == 0

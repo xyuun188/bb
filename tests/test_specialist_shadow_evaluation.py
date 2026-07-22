@@ -4,13 +4,26 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from config.settings import settings
+from db.session import close_db, get_session_ctx, init_db
+from models.learning import ShadowBacktest
 from scripts import run_specialist_shadow_evaluation as runner
 from services.specialist_shadow_evaluation import (
+    SpecialistShadowEvaluationService,
     _regime_stability_report,
     _rolling_distribution_report,
     _walk_forward_report,
     summarize_specialist_shadow_evaluation,
 )
+
+
+async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    await close_db()
+    db_path = tmp_path / "specialist-shadow.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
 
 
 def test_specialist_shadow_evaluation_script_imports_online_runtime_bootstrap() -> None:
@@ -490,3 +503,54 @@ def test_authoritative_return_is_not_assigned_to_opposite_prediction() -> None:
         for evidence in model["authoritative_evidence"]
     )
     assert model["promotion_ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_specialist_report_mode_filter_uses_only_selected_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    now = datetime.now(UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    status="completed",
+                    due_at=now,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.2,
+                    created_at=now,
+                ),
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="live",
+                    symbol="ETH/USDT",
+                    status="completed",
+                    due_at=now,
+                    long_return_pct=-0.3,
+                    short_return_pct=0.3,
+                    created_at=now,
+                ),
+            ]
+        )
+
+    try:
+        paper = await SpecialistShadowEvaluationService().report(
+            hours=24,
+            mode="paper",
+        )
+        live = await SpecialistShadowEvaluationService().report(
+            hours=24,
+            mode="live",
+        )
+    finally:
+        await close_db()
+
+    assert paper["execution_mode"] == "paper"
+    assert live["execution_mode"] == "live"
+    assert paper["completed_count"] == 1
+    assert live["completed_count"] == 1

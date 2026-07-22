@@ -249,10 +249,24 @@ def combine_production_return_distribution(
     profit_supervision_version: str,
     source_authority: str,
     input_blockers: Iterable[str] = (),
+    model_weights: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Build the sole fee-after production distribution and transformation audit."""
 
     contracts = [item for item in model_contracts if isinstance(item, dict)]
+    requested_weights = list(model_weights) if model_weights is not None else None
+    resolved_weights: list[float] = []
+    weight_fallback_count = 0
+    for index in range(len(contracts)):
+        candidate = (
+            safe_float(requested_weights[index], None)
+            if requested_weights is not None and index < len(requested_weights)
+            else 1.0
+        )
+        if candidate is None or candidate <= 0.0:
+            candidate = 1.0
+            weight_fallback_count += 1
+        resolved_weights.append(float(candidate))
     cost_rows = [item for item in counterfactual_cost_distributions if isinstance(item, dict)]
     calibration_rows = [item for item in actual_trade_calibrations if isinstance(item, dict)]
     blockers = [str(item) for item in input_blockers if item]
@@ -270,6 +284,24 @@ def combine_production_return_distribution(
     ]
     for validation in validations:
         blockers.extend(validation.get("blockers") or [])
+
+    eligible_weights = [
+        resolved_weights[index]
+        for index, validation in enumerate(validations)
+        if validation.get("eligible") is True
+    ]
+
+    def weighted_mean(values: list[float]) -> float | None:
+        if not values:
+            return None
+        weights = eligible_weights[: len(values)]
+        total = sum(weights)
+        return (
+            sum(value * weight for value, weight in zip(values, weights, strict=False))
+            / total
+            if total > 0.0
+            else sum(values) / len(values)
+        )
 
     signatures = {
         (
@@ -335,21 +367,21 @@ def combine_production_return_distribution(
         if validation.get("eligible") is True
     ]
 
-    gross_expected = (
-        sum(gross_expected_values) / len(gross_expected_values)
-        if gross_expected_values
-        else None
-    )
-    gross_median = (
-        sum(gross_median_values) / len(gross_median_values)
-        if gross_median_values
-        else None
-    )
+    gross_expected = weighted_mean(gross_expected_values)
+    gross_median = weighted_mean(gross_median_values)
     between_model_dispersion = None
     if gross_expected_values and gross_expected is not None:
+        dispersion_weight_total = sum(eligible_weights[: len(gross_expected_values)])
         between_model_dispersion = math.sqrt(
-            sum((value - gross_expected) ** 2 for value in gross_expected_values)
-            / len(gross_expected_values)
+            sum(
+                weight * (value - gross_expected) ** 2
+                for value, weight in zip(
+                    gross_expected_values,
+                    eligible_weights,
+                    strict=False,
+                )
+            )
+            / max(dispersion_weight_total, 1e-12)
         )
     market_dispersion = (
         max([between_model_dispersion or 0.0, *model_dispersion_values])
@@ -465,7 +497,7 @@ def combine_production_return_distribution(
     )
     net_upper = (
         max(
-            sum(gross_upper_values) / len(gross_upper_values)
+            float(weighted_mean(gross_upper_values))
             - live_cost
             - slippage_tail_excess,
             net_median if net_median is not None else float("-inf"),
@@ -547,6 +579,21 @@ def combine_production_return_distribution(
             else 0
         ),
     }
+    if requested_weights is not None:
+        total_weight = sum(eligible_weights)
+        contract["model_weighting"] = {
+            "applied": bool(eligible_weights),
+            "execution_scope": "caller_controlled",
+            "resolved_weights": resolved_weights,
+            "eligible_weights": eligible_weights,
+            "normalized_eligible_weights": (
+                [round(value / total_weight, 8) for value in eligible_weights]
+                if total_weight > 0.0
+                else []
+            ),
+            "fallback_count": weight_fallback_count,
+            "rollback": "omit_model_weights_for_equal_weighting",
+        }
     return contract
 
 

@@ -196,3 +196,57 @@ def test_production_distribution_blocks_mismatched_model_contract_versions() -> 
     assert "model_distribution_cost_model_version_mismatch" in contract[
         "blockers"
     ]
+
+
+def test_paper_model_weights_change_central_return_without_weakening_tail_guard() -> None:
+    contract = combine_production_return_distribution(
+        side="long",
+        model_contracts=[
+            _distribution(raw_expected_return_pct=1.0),
+            _distribution(
+                raw_expected_return_pct=-0.2,
+                median_return_pct=-0.2,
+                lower_quantile_return_pct=-0.4,
+                upper_quantile_return_pct=0.0,
+            ),
+        ],
+        model_weights=[1.4, 0.1],
+        live_execution_cost_pct=0.1,
+        live_slippage_pct=0.01,
+        counterfactual_cost_distributions=[
+            {
+                "expected_pct": 0.08,
+                "upper_tail_pct": 0.11,
+                "uncertainty_pct": 0.02,
+                "distribution_ready": True,
+                "source_authority": "shadow_counterfactual_live_microstructure",
+            }
+        ],
+        actual_trade_calibrations=[
+            {
+                "source_authority": "okx_position_history",
+                "side": "long",
+                "net_return_after_cost_pct": {
+                    "count": 12,
+                    "expected": 0.5,
+                    "lower_hinge": 0.4,
+                },
+                "slippage_pct": {
+                    "count": 12,
+                    "expected": 0.02,
+                    "upper_hinge": 0.03,
+                },
+            }
+        ],
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+        source_authority="test_paper_weighted_combiner",
+    )
+
+    expected = (1.0 * 1.4 - 0.2 * 0.1) / 1.5
+    assert contract["gross_market_distribution"]["raw_expected_return_pct"] == (
+        pytest.approx(expected)
+    )
+    assert contract["gross_market_distribution"]["lower_quantile_return_pct"] == -0.4
+    assert contract["model_weighting"]["normalized_eligible_weights"] == pytest.approx(
+        [1.4 / 1.5, 0.1 / 1.5]
+    )

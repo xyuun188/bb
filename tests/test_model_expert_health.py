@@ -303,3 +303,65 @@ async def test_model_health_report_projects_required_raw_fragments_only(
     trend = report["components"]["trend_expert"]
     assert trend["windows"]["24h"]["participation_count"] == 1
     assert trend["memory"]["evidence_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_model_health_mode_filter_keeps_paper_and_live_evidence_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    now = datetime.now(UTC)
+    timing = [{"name": "trend_expert", "status": "completed", "action": "long"}]
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="BTC/USDT",
+                    action="long",
+                    confidence=0.7,
+                    is_paper=True,
+                    raw_llm_response={"model_timings": timing},
+                    created_at=now,
+                ),
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="ETH/USDT",
+                    action="short",
+                    confidence=0.7,
+                    is_paper=False,
+                    raw_llm_response={"model_timings": timing},
+                    created_at=now,
+                ),
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    status="completed",
+                    due_at=now,
+                    created_at=now,
+                ),
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="live",
+                    symbol="ETH/USDT",
+                    status="completed",
+                    due_at=now,
+                    created_at=now,
+                ),
+            ]
+        )
+
+    try:
+        paper = await ModelExpertHealthService().report(hours=24, limit=20, mode="paper")
+        live = await ModelExpertHealthService().report(hours=24, limit=20, mode="live")
+    finally:
+        await close_db()
+
+    assert paper["execution_mode"] == "paper"
+    assert live["execution_mode"] == "live"
+    assert paper["summary"]["decisions"] == 1
+    assert live["summary"]["decisions"] == 1
+    assert paper["summary"]["shadows"] == 1
+    assert live["summary"]["shadows"] == 1

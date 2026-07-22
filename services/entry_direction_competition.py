@@ -29,33 +29,56 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def _weight(value: Any) -> float:
+    parsed = _safe_float(value, 1.0)
+    return parsed if parsed is not None and parsed > 0.0 else 1.0
+
+
+def _weighted_mean(values: list[tuple[float, float]]) -> float | None:
+    total_weight = sum(weight for _, weight in values)
+    if total_weight <= 0.0:
+        return None
+    return sum(value * weight for value, weight in values) / total_weight
+
+
+def _paper_quant_weights(strategy_mode: dict[str, Any] | None) -> dict[str, float]:
+    strategy = _safe_dict(strategy_mode)
+    if str(strategy.get("execution_mode") or "").lower() != "paper":
+        return {}
+    report = _safe_dict(strategy.get("continuous_model_weights"))
+    if report.get("applied") is not True:
+        return {}
+    rows = _safe_dict(report.get("quant_source_weights"))
+    return {
+        name: _weight(_safe_dict(row).get("effective_multiplier"))
+        for name, row in rows.items()
+        if name in {"local_ml", "server_profit", "timeseries", "sentiment"}
+    }
+
+
 def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     eligible_objective = [
-        float(item["objective_expected_return_pct"])
+        (
+            float(item["objective_expected_return_pct"]),
+            _weight(item.get("continuous_weight_multiplier")),
+        )
         for item in values
         if item.get("production_eligible") is True
         and _safe_float(item.get("objective_expected_return_pct")) is not None
     ]
     eligible_raw = [
-        float(item["raw_expected_return_pct"])
+        (
+            float(item["raw_expected_return_pct"]),
+            _weight(item.get("continuous_weight_multiplier")),
+        )
         for item in values
         if item.get("production_eligible") is True
         and _safe_float(item.get("raw_expected_return_pct")) is not None
     ]
     return {
-        "score": (
-            sum(eligible_objective) / len(eligible_objective)
-            if eligible_objective
-            else 0.0
-        ),
-        "raw_expected_return_pct": (
-            sum(eligible_raw) / len(eligible_raw) if eligible_raw else None
-        ),
-        "objective_expected_return_pct": (
-            sum(eligible_objective) / len(eligible_objective)
-            if eligible_objective
-            else None
-        ),
+        "score": _weighted_mean(eligible_objective) or 0.0,
+        "raw_expected_return_pct": _weighted_mean(eligible_raw),
+        "objective_expected_return_pct": _weighted_mean(eligible_objective),
         "production_source_count": len(eligible_objective),
         "evidence": values,
     }
@@ -65,12 +88,18 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize directional observations without requiring promotion permission."""
 
     objective_values = [
-        float(item["objective_expected_return_pct"])
+        (
+            float(item["objective_expected_return_pct"]),
+            _weight(item.get("continuous_weight_multiplier")),
+        )
         for item in values
         if _safe_float(item.get("objective_expected_return_pct")) is not None
     ]
     raw_values = [
-        float(item["raw_expected_return_pct"])
+        (
+            float(item["raw_expected_return_pct"]),
+            _weight(item.get("continuous_weight_multiplier")),
+        )
         for item in values
         if _safe_float(item.get("raw_expected_return_pct")) is not None
     ]
@@ -81,15 +110,9 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     selected = objective_values or raw_values
     return {
-        "score": sum(selected) / len(selected) if selected else None,
-        "objective_expected_return_pct": (
-            sum(objective_values) / len(objective_values)
-            if objective_values
-            else None
-        ),
-        "raw_expected_return_pct": (
-            sum(raw_values) / len(raw_values) if raw_values else None
-        ),
+        "score": _weighted_mean(selected),
+        "objective_expected_return_pct": _weighted_mean(objective_values),
+        "raw_expected_return_pct": _weighted_mean(raw_values),
         "horizon_minutes": min(horizon_values) if horizon_values else None,
         "horizon_source_count": len(horizon_values),
         "observation_count": len(selected),
@@ -153,7 +176,7 @@ class EntryDirectionCompetitionPolicy:
         market_regime: dict[str, Any] | None,
         strategy_mode: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        del feature_vector, market_regime, strategy_mode
+        del feature_vector, market_regime
         evidence = {"long": [], "short": []}
         self._append_local_ml(evidence, ml_signal_context)
         self._append_server_tool(
@@ -174,6 +197,12 @@ class EntryDirectionCompetitionPolicy:
                 "time_series",
             ),
         )
+        quant_weights = _paper_quant_weights(strategy_mode)
+        if quant_weights:
+            for side in ("long", "short"):
+                for item in evidence[side]:
+                    source = str(item.get("source") or "")
+                    item["continuous_weight_multiplier"] = quant_weights.get(source, 1.0)
         aggregate_blockers = _enforce_aggregate_contract_consistency(evidence)
         long_side = _side_summary(evidence["long"])
         short_side = _side_summary(evidence["short"])
@@ -216,7 +245,7 @@ class EntryDirectionCompetitionPolicy:
                 available_training_scores["long"] == available_training_scores["short"]
             ):
                 training_preferred_side = "neutral"
-        return {
+        result = {
             "enabled": bool(source_count),
             "preferred_side": preferred_side,
             "score_gap": abs(long_score - short_score),
@@ -238,6 +267,14 @@ class EntryDirectionCompetitionPolicy:
                 "fallback_reason": "" if source_count else "governed_return_models_unavailable",
             },
         }
+        if quant_weights:
+            result["continuous_model_weighting"] = {
+                "applied": True,
+                "execution_scope": "paper_only",
+                "weights": quant_weights,
+                "fallback": "none",
+            }
+        return result
 
     @staticmethod
     def _append_local_ml(

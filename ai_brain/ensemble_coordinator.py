@@ -344,6 +344,7 @@ class EnsembleCoordinator:
         name: str,
         base_weight: float,
         dynamic_multiplier: float,
+        source_group_multiplier: float,
         review_positions: bool,
         current_side: str | None,
         trace_only_fallback: bool,
@@ -351,6 +352,7 @@ class EnsembleCoordinator:
         """Weight expert observations without granting production permission."""
 
         raw_weight = base_weight * dynamic_multiplier
+        grouped_weight = raw_weight * source_group_multiplier
         policy: dict[str, Any] = {
             "mode": "observation_only",
             "base_weight": round(base_weight, 6),
@@ -360,6 +362,8 @@ class EnsembleCoordinator:
             "production_permission": False,
             "excluded_reason": "expert output is observation-only",
         }
+        if source_group_multiplier != 1.0:
+            policy["source_group_multiplier"] = round(source_group_multiplier, 8)
         if trace_only_fallback:
             policy.update(
                 {
@@ -370,8 +374,85 @@ class EnsembleCoordinator:
             )
             return 0.0, policy
         del name, review_positions, current_side
-        policy["effective_weight"] = round(raw_weight, 6)
-        return raw_weight, policy
+        policy["effective_weight"] = round(grouped_weight, 6)
+        return grouped_weight, policy
+
+    def _paper_expert_weight_allocations(
+        self,
+        context: dict[str, Any],
+        decisions: dict[str, DecisionOutput],
+    ) -> dict[str, Any]:
+        if str(context.get("execution_mode") or "").lower() != "paper":
+            return {}
+        report = self._continuous_model_weight_report(context)
+        if report.get("applied") is not True:
+            return {}
+        report_rows = self._safe_dict(report.get("expert_weights"))
+        candidates: dict[str, dict[str, Any]] = {}
+        groups: dict[str, list[str]] = {}
+        for name, decision in decisions.items():
+            meta = self._slot_meta.get(name, {})
+            base_weight = float(
+                meta.get("weight", getattr(self.registry.get(name), "weight", 1.0)) or 1.0
+            )
+            multiplier = self._safe_float(
+                self._safe_dict(report_rows.get(name)).get("effective_multiplier"),
+                1.0,
+            )
+            multiplier = min(max(multiplier, 0.0), 2.0)
+            raw_decision = self._safe_dict(decision.raw_response)
+            trace_only = bool(
+                raw_decision.get("timeout_fallback")
+                or raw_decision.get("local_fallback")
+                or raw_decision.get("batch_expert_fallback")
+                or raw_decision.get("production_eligible") is False
+            )
+            group = self._expert_source_group(name, decision)
+            candidates[name] = {
+                "dynamic_multiplier": multiplier,
+                "raw_weight": 0.0 if trace_only else base_weight * multiplier,
+                "source_group": group,
+                "trace_only": trace_only,
+            }
+            groups.setdefault(group, []).append(name)
+
+        group_rows: dict[str, Any] = {}
+        for group, names in groups.items():
+            raw_total = sum(float(candidates[name]["raw_weight"]) for name in names)
+            budget = max(
+                (float(candidates[name]["raw_weight"]) for name in names),
+                default=0.0,
+            )
+            group_multiplier = budget / raw_total if raw_total > 0.0 else 0.0
+            for name in names:
+                candidates[name]["source_group_multiplier"] = group_multiplier
+                candidates[name]["effective_weight"] = (
+                    float(candidates[name]["raw_weight"]) * group_multiplier
+                )
+            group_rows[group] = {
+                "experts": names,
+                "raw_weight_total": round(raw_total, 8),
+                "source_budget": round(budget, 8),
+                "effective_weight_total": round(raw_total * group_multiplier, 8),
+                "same_provider_roles_share_one_budget": True,
+            }
+        return {
+            "execution_scope": "paper_only",
+            "applied": True,
+            "experts": candidates,
+            "source_groups": group_rows,
+            "rollback": "base_weights_without_group_budget",
+        }
+
+    def _continuous_model_weight_report(
+        self,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        direct = self._safe_dict(context.get("continuous_model_weights"))
+        if direct:
+            return direct
+        strategy = self._safe_dict(context.get("strategy_mode"))
+        return self._safe_dict(strategy.get("continuous_model_weights"))
 
     def _risk_expert_entry_policy(
         self,
@@ -627,12 +708,25 @@ class EnsembleCoordinator:
         risk_vetoes: list[DecisionOutput] = []
         risk_opinion: DecisionOutput | None = None
         score_participants: dict[str, DecisionOutput] = {}
+        continuous_allocations = self._paper_expert_weight_allocations(context, valid)
+        if continuous_allocations:
+            context["_continuous_expert_weight_allocations"] = continuous_allocations
         for name, decision in valid.items():
             meta = self._slot_meta.get(name, {})
             base_weight = float(
                 meta.get("weight", getattr(self.registry.get(name), "weight", 1.0)) or 1.0
             )
-            dynamic_multiplier = 1.0
+            allocation = self._safe_dict(
+                self._safe_dict(continuous_allocations.get("experts")).get(name)
+            )
+            dynamic_multiplier = self._safe_float(
+                allocation.get("dynamic_multiplier"),
+                1.0,
+            )
+            source_group_multiplier = self._safe_float(
+                allocation.get("source_group_multiplier"),
+                1.0,
+            )
             raw_decision = self._safe_dict(decision.raw_response)
             timeout_fallback = bool(raw_decision.get("timeout_fallback"))
             trace_only_fallback = bool(
@@ -645,6 +739,7 @@ class EnsembleCoordinator:
                 name=name,
                 base_weight=base_weight,
                 dynamic_multiplier=dynamic_multiplier,
+                source_group_multiplier=source_group_multiplier,
                 review_positions=review_positions,
                 current_side=str(current_side) if current_side else None,
                 trace_only_fallback=trace_only_fallback,
@@ -683,6 +778,17 @@ class EnsembleCoordinator:
                     "weight": weight,
                     "effective_weight": effective_weight,
                     "weight_policy": weight_policy,
+                    **(
+                        {
+                            "source_group": allocation.get("source_group"),
+                            "provider_model": self._decision_provider_model(
+                                name,
+                                decision,
+                            ),
+                        }
+                        if allocation
+                        else {}
+                    ),
                     "entry_support_eligible": weight_policy.get("entry_support_eligible"),
                     "excluded_reason": weight_policy.get("excluded_reason"),
                     "reasoning": decision.reasoning,
@@ -1175,8 +1281,6 @@ class EnsembleCoordinator:
     ) -> tuple[str, str, float | None, float | None, float | None]:
         """Choose the best available observed direction without a profit gate."""
 
-        del normalized_score
-
         competition = self._safe_dict(context.get("direction_competition"))
         observed_side = str(
             competition.get("training_preferred_side")
@@ -1187,6 +1291,40 @@ class EnsembleCoordinator:
             "long": self._safe_dict(competition.get("training_long")),
             "short": self._safe_dict(competition.get("training_short")),
         }
+        training_scores = {
+            side: self._finite_or_none(row.get("score"))
+            for side, row in training_rows.items()
+        }
+        training_horizons = {
+            side: self._finite_or_none(row.get("horizon_minutes"))
+            for side, row in training_rows.items()
+        }
+        if all(
+            training_scores[side] is not None
+            and training_horizons[side] is not None
+            and float(training_horizons[side]) > 0.0
+            for side in ("long", "short")
+        ):
+            long_score = float(training_scores["long"])
+            short_score = float(training_scores["short"])
+            quant_gap = long_score - short_score
+            quant_scale = max(abs(long_score) + abs(short_score), 1e-12)
+            quant_signal = max(min(quant_gap / quant_scale, 1.0), -1.0)
+            expert_signal = max(min(float(normalized_score), 1.0), -1.0)
+            combined_signal = quant_signal + expert_signal
+            if abs(combined_signal) <= 1e-12:
+                combined_side = observed_side
+            else:
+                combined_side = "long" if combined_signal > 0.0 else "short"
+            if combined_side in {"long", "short"}:
+                row = training_rows[combined_side]
+                return (
+                    combined_side,
+                    "continuous_weighted_quant_and_expert_observations",
+                    self._finite_or_none(row.get("raw_expected_return_pct")),
+                    self._finite_or_none(row.get("objective_expected_return_pct")),
+                    training_horizons[combined_side],
+                )
         if observed_side in {"long", "short"}:
             row = training_rows.get(observed_side, {})
             horizon = self._finite_or_none(row.get("horizon_minutes"))
@@ -1614,6 +1752,23 @@ class EnsembleCoordinator:
         policy = context.get("_expert_diversity_policy")
         if isinstance(policy, dict):
             raw["expert_diversity_policy"] = policy
+        weights = context.get("continuous_model_weights")
+        if not isinstance(weights, dict):
+            strategy = context.get("strategy_mode")
+            weights = (
+                strategy.get("continuous_model_weights")
+                if isinstance(strategy, dict)
+                else None
+            )
+        allocations = context.get("_continuous_expert_weight_allocations")
+        if (
+            str(context.get("execution_mode") or "").lower() == "paper"
+            and isinstance(weights, dict)
+            and weights.get("applied") is True
+        ):
+            raw["continuous_model_weights"] = weights
+            if isinstance(allocations, dict):
+                raw["continuous_expert_weight_allocations"] = allocations
 
     def _latency_summary(
         self,

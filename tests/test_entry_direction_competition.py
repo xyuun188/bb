@@ -201,6 +201,45 @@ def test_features_regime_and_strategy_weights_are_observation_excluded() -> None
     assert first["short"]["score"] == second["short"]["score"]
 
 
+def test_paper_continuous_weights_can_change_direction_without_affecting_live() -> None:
+    ml = _governed_ml(0.6, 0.0)
+    tools = {"profit_prediction": _governed_payload(0.0, 0.5)}
+    equal = _context(ml=ml, tools=tools)
+    weighted = _context(
+        ml=ml,
+        tools=tools,
+        strategy={
+            "execution_mode": "paper",
+            "continuous_model_weights": {
+                "applied": True,
+                "quant_source_weights": {
+                    "local_ml": {"effective_multiplier": 0.1},
+                    "server_profit": {"effective_multiplier": 1.4},
+                },
+            },
+        },
+    )
+    live = _context(
+        ml=ml,
+        tools=tools,
+        strategy={
+            "execution_mode": "live",
+            "continuous_model_weights": {
+                "applied": True,
+                "quant_source_weights": {
+                    "local_ml": {"effective_multiplier": 0.1},
+                    "server_profit": {"effective_multiplier": 1.4},
+                },
+            },
+        },
+    )
+
+    assert equal["preferred_side"] == "long"
+    assert weighted["preferred_side"] == "short"
+    assert weighted["continuous_model_weighting"]["applied"] is True
+    assert live == equal
+
+
 def test_mismatched_horizons_cannot_enter_direction_aggregation() -> None:
     payload = _governed_payload(0.6, -0.1)
     for side in ("long", "short"):

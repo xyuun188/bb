@@ -477,12 +477,31 @@ class ModelExpertHealthService:
     def __init__(self, session_context_factory: Any = get_read_session_ctx) -> None:
         self._session_context_factory = session_context_factory
 
-    async def report(self, *, hours: int = 72, limit: int = 1000) -> dict[str, Any]:
+    async def report(
+        self,
+        *,
+        hours: int = 72,
+        limit: int = 1000,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
         from sqlalchemy import select
 
         capped_hours = max(1, min(int(hours or 72), 168))
         capped_limit = max(50, min(int(limit or 1000), 5000))
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
+        selected_mode = (
+            "live" if str(mode or "").lower() == "live" else "paper" if mode else None
+        )
+        decision_filters = [
+            AIDecision.created_at >= since,
+            AIDecision.model_health_snapshot_version >= 1,
+        ]
+        shadow_filters = [ShadowBacktest.created_at >= since]
+        event_filters = [StrategyLearningEvent.created_at >= since]
+        if selected_mode is not None:
+            decision_filters.append(AIDecision.is_paper.is_(selected_mode == "paper"))
+            shadow_filters.append(ShadowBacktest.execution_mode == selected_mode)
+            event_filters.append(StrategyLearningEvent.execution_mode == selected_mode)
         async with self._session_context_factory() as session:
             decisions_result = await session.execute(
                 select(
@@ -513,10 +532,7 @@ class ModelExpertHealthService:
                         f"{_MODEL_HEALTH_RAW_COLUMN_PREFIX}has_local_ai_tools"
                     ),
                 )
-                .where(
-                    AIDecision.created_at >= since,
-                    AIDecision.model_health_snapshot_version >= 1,
-                )
+                .where(*decision_filters)
                 .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
                 .limit(capped_limit)
             )
@@ -527,34 +543,44 @@ class ModelExpertHealthService:
                     ShadowBacktest.best_action,
                     ShadowBacktest.created_at,
                 )
-                .where(ShadowBacktest.created_at >= since)
+                .where(*shadow_filters)
                 .order_by(ShadowBacktest.created_at.desc())
                 .limit(capped_limit)
             )
-            memories_result = await session.execute(
-                select(
-                    ExpertMemory.expert_name,
-                    ExpertMemory.evidence_count,
-                    ExpertMemory.success_count,
-                    ExpertMemory.failure_count,
+            memories_result = None
+            if selected_mode is None:
+                memories_result = await session.execute(
+                    select(
+                        ExpertMemory.expert_name,
+                        ExpertMemory.evidence_count,
+                        ExpertMemory.success_count,
+                        ExpertMemory.failure_count,
+                    )
+                    .order_by(
+                        ExpertMemory.updated_at.desc().nullslast(),
+                        ExpertMemory.created_at.desc(),
+                    )
+                    .limit(500)
                 )
-                .order_by(
-                    ExpertMemory.updated_at.desc().nullslast(), ExpertMemory.created_at.desc()
-                )
-                .limit(500)
-            )
             events_result = await session.execute(
                 select(StrategyLearningEvent.attribution)
-                .where(StrategyLearningEvent.created_at >= since)
+                .where(*event_filters)
                 .order_by(StrategyLearningEvent.created_at.desc())
                 .limit(capped_limit)
             )
-        return summarize_model_expert_health(
+        report = summarize_model_expert_health(
             [
                 _model_health_decision_from_mapping(row)
                 for row in decisions_result.mappings().all()
             ],
             [SimpleNamespace(**dict(row)) for row in shadows_result.mappings().all()],
-            [SimpleNamespace(**dict(row)) for row in memories_result.mappings().all()],
+            (
+                [SimpleNamespace(**dict(row)) for row in memories_result.mappings().all()]
+                if memories_result is not None
+                else []
+            ),
             [SimpleNamespace(**dict(row)) for row in events_result.mappings().all()],
         )
+        report["execution_mode"] = selected_mode or "all"
+        report["mode_filter_applied"] = selected_mode is not None
+        return report
