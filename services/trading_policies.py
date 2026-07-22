@@ -14,6 +14,7 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.dynamic_exit_policy import apply_dynamic_exit
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
+from services.normal_paper_trade import ensure_normal_paper_trade_contract
 from services.paper_exploration import (
     assess_paper_exploration_entry,
     is_paper_exploration_decision,
@@ -209,6 +210,7 @@ class EntryPolicy:
 
         if not decision.is_entry:
             return
+        ensure_normal_paper_trade_contract(decision, model_mode)
         if (
             self.paper_bootstrap_canary is not None
             and self.paper_bootstrap_canary.is_claimed(decision)

@@ -238,9 +238,6 @@ def assess_dynamic_exit(
         if item.get("authorized") is True and item.get("elapsed") is True
     ]
     paper_training_horizon_elapsed = bool(elapsed_training_horizons)
-    model_horizon_elapsed = bool(
-        paper_canary_horizon_elapsed or paper_training_horizon_elapsed
-    )
     stop_usage = (
         _clamp(max(-net_pnl, 0.0) / planned_risk)
         if planned_risk > 0
@@ -290,7 +287,7 @@ def assess_dynamic_exit(
     )
     close_fraction = (
         1.0
-        if hard_risk or model_horizon_elapsed
+        if hard_risk
         else continuous_budget_fraction(
             retrace,
             stop_usage,
@@ -304,23 +301,21 @@ def assess_dynamic_exit(
         reasons.append("position_economics_missing")
     if (
         not hard_risk
-        and not model_horizon_elapsed
         and matches
         and not current_management_contract_complete
     ):
         reasons.append("current_position_management_contract_incomplete")
-    if not hard_risk and not model_horizon_elapsed and close_fraction <= 0:
+    if not hard_risk and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
     if (
         not hard_risk
-        and not model_horizon_elapsed
         and gross_pnl > 0
         and net_pnl <= 0
         and stop_usage <= 0
         and continuation <= 0
     ):
         reasons.append("fee_after_profit_not_positive")
-    if not hard_risk and not model_horizon_elapsed and not execution_cost_complete:
+    if not hard_risk and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
     eligible = not reasons
     provenance = {

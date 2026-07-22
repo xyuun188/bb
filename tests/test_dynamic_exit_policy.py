@@ -216,7 +216,7 @@ def test_non_hard_exit_fails_closed_when_position_changed_after_contract_refresh
     assert "current_position_management_contract_incomplete" in result.reason
 
 
-def test_expired_paper_canary_horizon_closes_full_position() -> None:
+def test_expired_paper_canary_horizon_does_not_force_full_close() -> None:
     position = _position(
         execution_mode="paper",
         peak_unrealized_pnl=10.0,
@@ -235,12 +235,13 @@ def test_expired_paper_canary_horizon_closes_full_position() -> None:
 
     result = apply_dynamic_exit(_decision(), [position])
 
-    assert result.eligible is True
+    assert result.eligible is False
     assert result.paper_canary_horizon_elapsed is True
-    assert result.close_fraction == 1.0
+    assert result.close_fraction == 0.0
+    assert "dynamic_exit_pressure_zero" in result.reason
 
 
-def test_expired_paper_training_horizon_closes_full_position() -> None:
+def test_expired_paper_training_horizon_does_not_bypass_normal_exit_evidence() -> None:
     position = _position(
         execution_mode="paper",
         current_management_contract={
@@ -265,14 +266,14 @@ def test_expired_paper_training_horizon_closes_full_position() -> None:
 
     result = apply_dynamic_exit(_decision(), [position])
 
-    assert result.eligible is True
+    assert result.eligible is False
     assert result.paper_training_horizon_elapsed is True
     assert result.paper_training_horizon_minutes == 10.0
-    assert result.close_fraction == 1.0
-    assert "current_position_management_contract_incomplete" not in result.reason
+    assert result.close_fraction == 0.0
+    assert "current_position_management_contract_incomplete" in result.reason
 
 
-def test_expired_paper_canary_horizon_closes_even_when_takeover_contract_is_incomplete() -> None:
+def test_expired_paper_canary_horizon_cannot_bypass_incomplete_takeover_contract() -> None:
     position = _position(
         execution_mode="paper",
         current_management_contract={
@@ -295,11 +296,11 @@ def test_expired_paper_canary_horizon_closes_even_when_takeover_contract_is_inco
 
     result = apply_dynamic_exit(_decision(), [position])
 
-    assert result.eligible is True
+    assert result.eligible is False
     assert result.paper_canary_horizon_elapsed is True
     assert result.current_management_contract_complete is False
-    assert result.close_fraction == 1.0
-    assert "current_position_management_contract_incomplete" not in result.reason
+    assert result.close_fraction == 0.0
+    assert "current_position_management_contract_incomplete" in result.reason
 
 
 def test_ordinary_position_is_not_closed_only_because_it_is_old() -> None:

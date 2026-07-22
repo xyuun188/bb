@@ -4987,11 +4987,18 @@ class TradingService:
         learning = self._safe_dict(result.get("strategy_learning"))
         if not champion:
             champion = self._safe_dict(learning.get("paper_strategy_champion"))
+        routing = self._safe_dict(
+            result.get("continuous_strategy_routing")
+            or learning.get("continuous_strategy_routing")
+        )
+        continuous_primary_ready = bool(
+            self._safe_dict(routing.get("current_route")).get("primary")
+        )
         paper_training_mode = (
             "disabled"
             if selected_mode == "live"
             else "normal"
-            if champion.get("active") is True
+            if champion.get("active") is True or continuous_primary_ready
             else "bootstrap"
         )
         result["paper_training_mode"] = paper_training_mode
@@ -9426,17 +9433,9 @@ class TradingService:
             trigger = (
                 "stop_loss"
                 if stop_crossed
-                else (
-                    "take_profit"
-                    if target_crossed
-                    else (
-                        "paper_training_horizon"
-                        if training_horizon.get("elapsed") is True
-                        else "paper_canary_horizon"
-                        if canary_horizon.get("elapsed") is True
-                        else "dynamic_position_scan"
-                    )
-                )
+                else "take_profit"
+                if target_crossed
+                else "dynamic_position_scan"
             )
             close_decision = DecisionOutput(
                 model_name=model_name,
@@ -9453,8 +9452,6 @@ class TradingService:
                     "forced_exit": bool(
                         stop_crossed
                         or target_crossed
-                        or canary_horizon.get("elapsed") is True
-                        or training_horizon.get("elapsed") is True
                     ),
                     "close_evidence": {
                         "hard_risk": stop_crossed,

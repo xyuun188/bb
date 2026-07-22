@@ -17,7 +17,12 @@ from services.paper_exploration import (
     PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
     PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
 )
-from services.paper_training import PAPER_TRAINING_SIZING_VERSION, PAPER_TRAINING_VERSION
+from services.paper_training import (
+    PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
+    PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_TRAINING_SIZING_VERSION,
+    PAPER_TRAINING_VERSION,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -180,6 +185,7 @@ class RiskEngine:
         if sizing.get("contract_lifecycle") == "paper_training":
             training = raw.get("paper_training")
             training = training if isinstance(training, dict) else {}
+            equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
             if (
                 sizing.get("contract_version") != PAPER_TRAINING_SIZING_VERSION
                 or training.get("version") != PAPER_TRAINING_VERSION
@@ -190,10 +196,24 @@ class RiskEngine:
                 or training.get("loss_tolerant_for_training") is not True
             ):
                 return "Paper training risk contract is not paper-only."
+            if equity <= 0 or risk_budget > (
+                equity * PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8
+            ):
+                return "Paper cold-start exploration exceeds its single-trade risk cap."
+            if portfolio_budget > (
+                equity * PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
+            ):
+                return "Paper cold-start exploration exceeds its portfolio risk cap."
         if sizing.get("contract_lifecycle") == "paper_exploration":
             exploration = raw.get("paper_exploration")
             exploration = exploration if isinstance(exploration, dict) else {}
             equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
+            single_cap = RiskEngine._safe_positive_float(
+                exploration.get("single_trade_risk_fraction_cap")
+            )
+            portfolio_cap = RiskEngine._safe_positive_float(
+                exploration.get("portfolio_risk_fraction_cap")
+            )
             if (
                 sizing.get("execution_scope") != "paper_only"
                 or sizing.get("production_permission") is not False
@@ -203,12 +223,17 @@ class RiskEngine:
                 return "Paper exploration risk contract is not paper-only."
             if not isclose(leverage, 1.0, abs_tol=1e-8):
                 return "Paper exploration leverage must remain at one."
-            if equity <= 0 or risk_budget > (
-                equity * PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8
+            if (
+                single_cap <= 0
+                or single_cap > PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION
+                or equity <= 0
+                or risk_budget > equity * single_cap + 1e-8
             ):
                 return "Paper exploration exceeds its single-trade equity risk cap."
-            if portfolio_budget > (
-                equity * PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
+            if (
+                portfolio_cap <= 0
+                or portfolio_cap > PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION
+                or portfolio_budget > equity * portfolio_cap + 1e-8
             ):
                 return "Paper exploration exceeds its portfolio equity risk cap."
         if not provenance_complete:

@@ -505,7 +505,7 @@ def test_paper_bootstrap_combines_weighted_quant_and_expert_direction() -> None:
     )
 
 
-def test_continuous_strategy_route_influences_bootstrap_and_is_persisted() -> None:
+def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -560,7 +560,8 @@ def test_continuous_strategy_route_influences_bootstrap_and_is_persisted() -> No
 
     decision = _coordinator().combine(_features(), context, hold_opinions)
 
-    assert decision.action == Action.LONG
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
     assert decision.raw_response["continuous_strategy_routing"]["current_route"][
         "primary"
     ]["profile_id"] == "trend_up_long"

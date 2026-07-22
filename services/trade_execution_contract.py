@@ -23,6 +23,8 @@ from services.paper_exploration import (
     paper_exploration_contract_reasons,
 )
 from services.paper_training import (
+    PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
+    PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
     PAPER_TRAINING_SIZING_VERSION,
     PAPER_TRAINING_VERSION,
     paper_training_contract_reasons,
@@ -729,6 +731,9 @@ def validate_paper_training_entry_contract(
     target_notional = _safe_float(sizing.get("target_notional_usdt"))
     final_notional = _safe_float(sizing.get("final_notional_usdt"))
     final_leverage = _safe_float(sizing.get("final_leverage"))
+    equity = _safe_float(sizing.get("account_equity_usdt"))
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
+    portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"))
     if stress <= 0 or not isclose(
         planned_loss,
         final_notional * stress,
@@ -740,6 +745,14 @@ def validate_paper_training_entry_contract(
         reasons.append("paper_training_notional_invalid")
     if final_leverage < 1:
         reasons.append("paper_training_leverage_invalid")
+    if equity <= 0 or risk_budget > (
+        equity * PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8
+    ):
+        reasons.append("paper_training_single_trade_risk_cap_exceeded")
+    if portfolio_budget > (
+        equity * PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
+    ):
+        reasons.append("paper_training_portfolio_risk_cap_exceeded")
     if execution_cost.get("production_eligible") is not True:
         reasons.append("paper_training_execution_cost_incomplete")
     if execution_cost.get("order_size_complete") is not True:
@@ -803,6 +816,14 @@ def validate_paper_exploration_entry_contract(
     target_notional = _safe_float(sizing.get("target_notional_usdt"), 0.0)
     equity = _safe_float(sizing.get("account_equity_usdt"), 0.0)
     final_leverage = _safe_float(sizing.get("final_leverage"), 0.0)
+    single_cap = _safe_float(
+        exploration.get("single_trade_risk_fraction_cap"),
+        0.0,
+    )
+    portfolio_cap = _safe_float(
+        exploration.get("portfolio_risk_fraction_cap"),
+        0.0,
+    )
 
     if exploration.get("version") != PAPER_EXPLORATION_VERSION:
         reasons.append("paper_exploration_version_invalid")
@@ -824,9 +845,17 @@ def validate_paper_exploration_entry_contract(
         reasons.append("paper_exploration_account_risk_budget_incomplete")
     if planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
         reasons.append("paper_exploration_planned_loss_invalid")
-    if risk_budget > equity * PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8:
+    if (
+        single_cap <= 0
+        or single_cap > PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION
+        or risk_budget > equity * single_cap + 1e-8
+    ):
         reasons.append("paper_exploration_single_trade_risk_cap_exceeded")
-    if portfolio_budget > equity * PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION + 1e-8:
+    if (
+        portfolio_cap <= 0
+        or portfolio_cap > PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION
+        or portfolio_budget > equity * portfolio_cap + 1e-8
+    ):
         reasons.append("paper_exploration_portfolio_risk_cap_exceeded")
     if stress <= 0 or not isclose(
         planned_loss,

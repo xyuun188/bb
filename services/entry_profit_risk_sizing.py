@@ -28,6 +28,8 @@ from services.paper_exploration import (
     paper_exploration_selection_reasons,
 )
 from services.paper_training import (
+    PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
+    PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
     PAPER_TRAINING_SIZING_VERSION,
     is_paper_training_decision,
 )
@@ -614,6 +616,7 @@ class EntryProfitRiskSizingPolicy:
 
         raw = _safe_dict(decision.raw_response)
         paper_exploration = is_paper_exploration_decision(decision)
+        paper_exploration_contract = _safe_dict(raw.get("paper_exploration"))
         exploration_selection_reasons = (
             paper_exploration_selection_reasons(decision, model_mode)
             if paper_exploration
@@ -737,11 +740,17 @@ class EntryProfitRiskSizingPolicy:
         if paper_exploration:
             single_trade_budget_fraction = min(
                 single_trade_budget_fraction,
-                PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
+                _safe_float(
+                    paper_exploration_contract.get("single_trade_risk_fraction_cap"),
+                    PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
+                ),
             )
             portfolio_budget_fraction = min(
                 portfolio_budget_fraction,
-                PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+                _safe_float(
+                    paper_exploration_contract.get("portfolio_risk_fraction_cap"),
+                    PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+                ),
             )
         single_trade_budget = account_equity * single_trade_budget_fraction
         portfolio_risk_budget = account_equity * portfolio_budget_fraction
@@ -1052,9 +1061,41 @@ class EntryProfitRiskSizingPolicy:
             ),
             0.0,
         )
+        declared_stop = _normalized_ratio(decision.stop_loss_pct)
+        declared_take_profit = _normalized_ratio(decision.take_profit_pct)
+        volatility = _normalized_ratio(snapshot.get("volatility_20"))
+        stress_fraction = max(declared_stop, volatility, 0.01)
+        single_trade_risk_fraction = min(
+            max(
+                _safe_float(training.get("single_trade_risk_fraction_cap"), 0.0),
+                0.0,
+            ),
+            PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
+        )
+        portfolio_risk_fraction = min(
+            max(
+                _safe_float(training.get("portfolio_risk_fraction_cap"), 0.0),
+                0.0,
+            ),
+            PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
+        )
+        single_trade_risk_budget = account_equity * single_trade_risk_fraction
+        portfolio_risk_budget = account_equity * portfolio_risk_fraction
+        remaining_portfolio_risk_budget = max(
+            portfolio_risk_budget - current_portfolio_risk,
+            0.0,
+        )
+        risk_budget = min(
+            single_trade_risk_budget,
+            remaining_portfolio_risk_budget,
+        )
+        risk_limited_notional = (
+            risk_budget / stress_fraction if stress_fraction > 0 else 0.0
+        )
         target_notional = min(
             available_margin * requested_leverage,
             side_depth,
+            risk_limited_notional,
         )
         leverage_tier_selection = select_okx_leverage_tier(
             facts.get("leverage_tiers"),
@@ -1074,10 +1115,6 @@ class EntryProfitRiskSizingPolicy:
             available_margin * final_leverage,
             side_depth,
         )
-        declared_stop = _normalized_ratio(decision.stop_loss_pct)
-        declared_take_profit = _normalized_ratio(decision.take_profit_pct)
-        volatility = _normalized_ratio(snapshot.get("volatility_20"))
-        stress_fraction = max(declared_stop, volatility, 0.01)
         planned_loss = final_notional * stress_fraction
         expected_net = _safe_float(
             distribution.get("raw_expected_return_pct"),
@@ -1139,6 +1176,11 @@ class EntryProfitRiskSizingPolicy:
             "expected_net_return_pct": expected_net,
             "return_lcb_pct": return_lcb,
             "dynamic_take_profit_fraction": dynamic_take_profit,
+            "single_trade_risk_fraction_cap": single_trade_risk_fraction,
+            "portfolio_risk_fraction_cap": portfolio_risk_fraction,
+            "single_trade_risk_budget_usdt": single_trade_risk_budget,
+            "portfolio_risk_budget_usdt": portfolio_risk_budget,
+            "remaining_portfolio_risk_budget_usdt": remaining_portfolio_risk_budget,
             "leverage_tier_input_fingerprint": _safe_dict(
                 leverage_tier_selection.get("policy_provenance")
             ).get("input_fingerprint"),
@@ -1167,13 +1209,13 @@ class EntryProfitRiskSizingPolicy:
             )
             if eligible
             else 0.0,
-            "risk_budget_usdt": round(planned_loss, 8),
-            "single_trade_risk_budget_usdt": round(planned_loss, 8),
-            "portfolio_risk_budget_usdt": round(
-                current_portfolio_risk + planned_loss,
+            "risk_budget_usdt": round(risk_budget, 8),
+            "single_trade_risk_budget_usdt": round(single_trade_risk_budget, 8),
+            "portfolio_risk_budget_usdt": round(portfolio_risk_budget, 8),
+            "remaining_portfolio_risk_budget_usdt": round(
+                remaining_portfolio_risk_budget,
                 8,
             ),
-            "remaining_portfolio_risk_budget_usdt": round(planned_loss, 8),
             "current_portfolio_stressed_loss_usdt": round(current_portfolio_risk, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
             "target_notional_usdt": round(target_notional, 8),
@@ -1193,7 +1235,9 @@ class EntryProfitRiskSizingPolicy:
             ),
             "dynamic_take_profit_fraction": round(dynamic_take_profit, 8),
             "paper_training_no_profit_gate": True,
-            "paper_training_no_virtual_risk_cap": True,
+            "paper_training_bounded_exploration_risk": True,
+            "single_trade_risk_fraction_cap": round(single_trade_risk_fraction, 8),
+            "portfolio_risk_fraction_cap": round(portfolio_risk_fraction, 8),
             "return_lcb_pct": round(return_lcb, 8),
             "execution_cost": execution_cost,
             "portfolio_risk_snapshot": portfolio_snapshot,
@@ -1215,7 +1259,7 @@ class EntryProfitRiskSizingPolicy:
         raw["paper_training_sizing"] = {
             "version": PAPER_TRAINING_SIZING_VERSION,
             "no_profit_gate": True,
-            "no_virtual_risk_cap": True,
+            "bounded_exploration_risk": True,
         }
         decision.raw_response = raw
         decision.position_size_pct = sizing["position_size_pct"] if eligible else 0.0

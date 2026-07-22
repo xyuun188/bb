@@ -37,6 +37,7 @@ def _side(
     return_lcb: float = -0.10,
     loss_probability: float = 0.30,
     tail_risk: float = 0.20,
+    historical_sample_count: int = 0,
 ) -> dict:
     return {
         "side": "long",
@@ -52,7 +53,31 @@ def _side(
         "production_eligible": False,
         "execution_cost": {"production_eligible": True, "total_pct": 0.08},
         "policy_provenance": _provenance(),
+        "scheduled_return_prior": {
+            "historical_return_distribution": {
+                "sample_count": historical_sample_count,
+            }
+        },
     }
+
+
+def test_exploration_allocation_decreases_as_historical_evidence_grows() -> None:
+    cold = evaluate_paper_exploration_side(
+        _side(historical_sample_count=0),
+        feature_opportunity_score=8.0,
+    )
+    mature = evaluate_paper_exploration_side(
+        _side(historical_sample_count=400),
+        feature_opportunity_score=8.0,
+    )
+
+    assert cold["eligible"] is True
+    assert mature["eligible"] is True
+    assert mature["historical_evidence_count"] == 400
+    assert (
+        mature["exploration_allocation_multiplier"]
+        < cold["exploration_allocation_multiplier"]
+    )
 
 
 def _candidate_evidence() -> dict:

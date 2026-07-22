@@ -181,6 +181,17 @@ def test_paper_training_mode_only_runs_without_paper_champion() -> None:
     assert not paper_training_mode_enabled(
         {"execution_mode": "live", "paper_training_mode": "bootstrap"}
     )
+    assert not paper_training_mode_enabled(
+        {
+            "execution_mode": "paper",
+            "paper_training_mode": "bootstrap",
+            "paper_strategy_champion": {"active": False},
+            "continuous_strategy_routing": {
+                "applied": True,
+                "current_route": {"primary": {"profile_id": "stable-route"}},
+            },
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -237,7 +248,7 @@ async def test_promoted_paper_champion_immediately_disables_fast_training() -> N
 
 
 @pytest.mark.asyncio
-async def test_paper_training_sizing_has_no_profit_or_virtual_risk_cap() -> None:
+async def test_paper_training_sizing_has_no_profit_gate_but_bounded_risk() -> None:
     decision = _decision(expected_net=-2.5)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
@@ -247,11 +258,26 @@ async def test_paper_training_sizing_has_no_profit_or_virtual_risk_cap() -> None
     assert sizing["production_eligible"] is True
     assert sizing["contract_lifecycle"] == "paper_training"
     assert sizing["paper_training_no_profit_gate"] is True
-    assert sizing["paper_training_no_virtual_risk_cap"] is True
+    assert sizing["paper_training_bounded_exploration_risk"] is True
     assert sizing["expected_net_return_pct"] == -2.5
-    assert sizing["final_notional_usdt"] == pytest.approx(800.0)
-    assert sizing["risk_budget_usdt"] == pytest.approx(16.0)
-    assert decision.position_size_pct == pytest.approx(0.8)
+    assert sizing["final_notional_usdt"] == pytest.approx(5.0)
+    assert sizing["risk_budget_usdt"] == pytest.approx(0.1)
+    assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(0.3)
+    assert decision.position_size_pct == pytest.approx(0.005)
+
+
+@pytest.mark.asyncio
+async def test_training_marker_does_not_force_leverage_to_one() -> None:
+    decision = _decision(expected_net=-1.0)
+    decision.suggested_leverage = 3.0
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["final_leverage"] == 3.0
+    assert sizing["planned_stressed_loss_usdt"] <= 0.1
+    assert decision.suggested_leverage == 3.0
 
     final_notional = sizing["final_notional_usdt"]
     decision.raw_response["opportunity_score"]["execution_cost"].update(
@@ -326,7 +352,7 @@ async def test_paper_training_records_final_size_aware_cost_pass() -> None:
 
     sizing = decision.raw_response["profit_risk_sizing"]
     sizing_pass = decision.raw_response["execution_cost_sizing_pass"]
-    assert sizing_pass["impact_basis_notional_usdt"] == pytest.approx(800.0)
+    assert sizing_pass["impact_basis_notional_usdt"] == pytest.approx(5.0)
     assert sizing_pass["final_notional_usdt"] == sizing["final_notional_usdt"]
     assert sizing_pass["order_size_complete"] is True
 

@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import isclose, isfinite
+from math import isclose, isfinite, sqrt
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -84,6 +84,8 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "loss_probability",
             "tail_risk_score",
             "return_source_count",
+            "historical_evidence_count",
+            "exploration_allocation_multiplier",
             "feature_opportunity_score",
             "information_value_score",
             "prediction_horizon_minutes",
@@ -111,6 +113,16 @@ def evaluate_paper_exploration_side(
     loss_probability = _float(evidence.get("loss_probability"), 1.0) or 0.0
     tail_risk = _float(evidence.get("tail_risk_score"), 1.0) or 0.0
     source_count = _int(evidence.get("production_source_count"))
+    historical = _dict(
+        _dict(evidence.get("scheduled_return_prior")).get(
+            "historical_return_distribution"
+        )
+    )
+    historical_evidence_count = _int(historical.get("sample_count"))
+    exploration_allocation_multiplier = max(
+        0.10,
+        1.0 / sqrt(1.0 + historical_evidence_count / 20.0),
+    )
     horizon_minutes = max(_float(evidence.get("horizon_minutes"), 0.0) or 0.0, 0.0)
     feature_score = max(float(feature_opportunity_score), 0.0)
     cost = _dict(evidence.get("execution_cost"))
@@ -164,6 +176,11 @@ def evaluate_paper_exploration_side(
         "loss_probability": round(loss_probability, 8),
         "tail_risk_score": round(tail_risk, 8),
         "return_source_count": source_count,
+        "historical_evidence_count": historical_evidence_count,
+        "exploration_allocation_multiplier": round(
+            exploration_allocation_multiplier,
+            8,
+        ),
         "prediction_horizon_minutes": round(horizon_minutes, 8),
         "valid_for_seconds": round(horizon_minutes * 60.0, 8),
         "feature_opportunity_score": round(feature_score, 8),
@@ -247,14 +264,22 @@ def build_paper_exploration_contract(
         "loss_probability": selected.get("loss_probability"),
         "tail_risk_score": selected.get("tail_risk_score"),
         "return_source_count": selected.get("return_source_count"),
+        "historical_evidence_count": selected.get("historical_evidence_count"),
+        "exploration_allocation_multiplier": selected.get(
+            "exploration_allocation_multiplier"
+        ),
         "feature_opportunity_score": selected.get("feature_opportunity_score"),
         "information_value_score": selected.get("information_value_score"),
         "prediction_horizon_minutes": selected.get("prediction_horizon_minutes"),
         "valid_for_seconds": selected.get("valid_for_seconds"),
         "single_trade_risk_fraction_cap": (
             PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION
+            * (_float(selected.get("exploration_allocation_multiplier"), 1.0) or 1.0)
         ),
-        "portfolio_risk_fraction_cap": PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
+        "portfolio_risk_fraction_cap": (
+            PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION
+            * (_float(selected.get("exploration_allocation_multiplier"), 1.0) or 1.0)
+        ),
         "leverage_cap": 1,
         "sample_target": None,
         "daily_sample_quota": None,
@@ -333,6 +358,23 @@ def paper_exploration_contract_reasons(contract_value: Any) -> list[str]:
         reasons.append("paper_exploration_feature_value_not_positive")
     if (_float(contract.get("information_value_score"), 0.0) or 0.0) <= 0:
         reasons.append("paper_exploration_information_value_zero")
+    allocation = _float(contract.get("exploration_allocation_multiplier"), 0.0) or 0.0
+    single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
+    portfolio_cap = _float(contract.get("portfolio_risk_fraction_cap"), 0.0) or 0.0
+    if allocation < 0.10 or allocation > 1.0:
+        reasons.append("paper_exploration_allocation_multiplier_invalid")
+    if not isclose(
+        single_cap,
+        PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION * allocation,
+        abs_tol=1e-12,
+    ):
+        reasons.append("paper_exploration_single_trade_risk_cap_invalid")
+    if not isclose(
+        portfolio_cap,
+        PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION * allocation,
+        abs_tol=1e-12,
+    ):
+        reasons.append("paper_exploration_portfolio_risk_cap_invalid")
     if contract.get("sample_target") is not None or contract.get("daily_sample_quota") is not None:
         reasons.append("paper_exploration_sample_quota_forbidden")
     if not _governance_complete(contract.get("policy_provenance")):
@@ -431,9 +473,11 @@ def assess_paper_exploration_entry(
         reasons.append("paper_exploration_risk_budget_incomplete")
     if planned_loss > risk_budget + 1e-8:
         reasons.append("paper_exploration_planned_loss_exceeds_budget")
-    if risk_budget > equity * PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8:
+    single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
+    portfolio_cap = _float(contract.get("portfolio_risk_fraction_cap"), 0.0) or 0.0
+    if risk_budget > equity * single_cap + 1e-8:
         reasons.append("paper_exploration_single_trade_risk_cap_exceeded")
-    if portfolio_budget > equity * PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION + 1e-8:
+    if portfolio_budget > equity * portfolio_cap + 1e-8:
         reasons.append("paper_exploration_portfolio_risk_cap_exceeded")
     if not isclose(float(decision.suggested_leverage), 1.0, abs_tol=1e-8):
         reasons.append("paper_exploration_leverage_must_be_one")

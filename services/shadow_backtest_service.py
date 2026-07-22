@@ -32,6 +32,8 @@ from services.shadow_training_quarantine import quarantine_completed_shadow_row
 logger = structlog.get_logger(__name__)
 
 SHADOW_BACKTEST_HORIZONS_MINUTES = (10, 30, 60)
+SHADOW_LEVERAGE_SCENARIOS = (1, 2, 3, 5, 10)
+SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION = "2026-07-22.shadow-leverage-counterfactual.v1"
 
 LatestPriceProvider = Callable[[str], Awaitable[float]]
 LatestMarketFactProvider = Callable[[str], Awaitable[dict[str, Any]]]
@@ -256,6 +258,26 @@ def shadow_fee_after_outcome(
         if cost_complete
         else None
     )
+    leverage_counterfactuals = [
+        {
+            "leverage": leverage,
+            "long_fee_after_margin_return_pct": (
+                round(float(long_net_pct) * leverage, 8)
+                if long_net_pct is not None
+                else None
+            ),
+            "short_fee_after_margin_return_pct": (
+                round(float(short_net_pct) * leverage, 8)
+                if short_net_pct is not None
+                else None
+            ),
+            "long_gross_margin_return_pct": round(gross_long_pct * leverage, 8),
+            "short_gross_margin_return_pct": round(gross_short_pct * leverage, 8),
+            "approximate_full_margin_loss_move_pct": round(100.0 / leverage, 8),
+            "creates_order": False,
+        }
+        for leverage in SHADOW_LEVERAGE_SCENARIOS
+    ]
     return {
         "objective": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
@@ -281,8 +303,42 @@ def shadow_fee_after_outcome(
         "funding_interval_minutes": funding_interval_minutes,
         "long_net_return_after_cost_pct": long_net_pct,
         "short_net_return_after_cost_pct": short_net_pct,
+        "leverage_counterfactuals": leverage_counterfactuals,
+        "leverage_counterfactual_policy": {
+            "source": "one_cost_complete_shadow_path_without_duplicate_orders",
+            "scenario_count": len(leverage_counterfactuals),
+            "creates_order": False,
+            "notional_return_is_shared_before_margin_leverage": True,
+        },
         "execution_cost": execution_cost.to_dict(),
     }
+
+
+def compact_shadow_leverage_counterfactuals(
+    outcome: dict[str, Any] | None,
+) -> dict[str, Any]:
+    source = outcome if isinstance(outcome, dict) else {}
+    rows = source.get("leverage_counterfactuals")
+    rows = rows if isinstance(rows, list) else []
+    compact: dict[str, Any] = {
+        "version": SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION,
+        "source": "one_cost_complete_shadow_path_without_duplicate_orders",
+        "creates_order": False,
+        "scenario_count": len(rows),
+    }
+    for row in rows:
+        item = row if isinstance(row, dict) else {}
+        leverage = int(_safe_shadow_number(item.get("leverage")) or 0)
+        if leverage not in SHADOW_LEVERAGE_SCENARIOS:
+            continue
+        prefix = f"leverage_{leverage}x"
+        for target, source_key in (
+            ("long_fee_after_margin_return_pct", "long_fee_after_margin_return_pct"),
+            ("short_fee_after_margin_return_pct", "short_fee_after_margin_return_pct"),
+            ("approximate_full_margin_loss_move_pct", "approximate_full_margin_loss_move_pct"),
+        ):
+            compact[f"{prefix}_{target}"] = _safe_shadow_number(item.get(source_key))
+    return compact
 
 
 @dataclass(slots=True)
@@ -516,6 +572,9 @@ class ShadowBacktestService:
                     row,
                     long_return=long_return,
                     short_return=short_return,
+                )
+                feature_snapshot["training_leverage_counterfactuals"] = (
+                    compact_shadow_leverage_counterfactuals(fee_after_outcome)
                 )
                 long_net = fee_after_outcome.get("long_net_return_after_cost_pct")
                 short_net = fee_after_outcome.get("short_net_return_after_cost_pct")

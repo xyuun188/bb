@@ -2824,7 +2824,7 @@ async def test_fixed_take_profit_crossing_cannot_authorize_dynamic_exit():
 
 
 @pytest.mark.asyncio
-async def test_expired_canary_forces_full_exit_with_incomplete_takeover_contract() -> None:
+async def test_expired_canary_does_not_force_exit_with_incomplete_takeover_contract() -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []
 
@@ -2891,18 +2891,12 @@ async def test_expired_canary_forces_full_exit_with_incomplete_takeover_contract
 
     auto_closes = await service._enforce_sl_tp({}, open_positions=open_positions)
 
-    assert calls == [("MAGIC/USDT", "paper_canary_horizon", 1.0)]
-    assert auto_closes == [
-        {
-            "model_name": "ensemble_trader",
-            "symbol": "MAGIC/USDT",
-            "trigger": "paper_canary_horizon",
-        }
-    ]
+    assert calls == []
+    assert auto_closes == []
 
 
 @pytest.mark.asyncio
-async def test_expired_paper_training_horizon_forces_full_exit() -> None:
+async def test_expired_paper_training_horizon_does_not_force_full_exit() -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []
 
@@ -2971,14 +2965,8 @@ async def test_expired_paper_training_horizon_forces_full_exit() -> None:
 
     auto_closes = await service._enforce_sl_tp({}, open_positions=open_positions)
 
-    assert calls == [("PEPE/USDT", "paper_training_horizon", 1.0)]
-    assert auto_closes == [
-        {
-            "model_name": "ensemble_trader",
-            "symbol": "PEPE/USDT",
-            "trigger": "paper_training_horizon",
-        }
-    ]
+    assert calls == []
+    assert auto_closes == []
 
 
 def test_entry_policy_uses_injected_decision_freshness_boundary():
@@ -4547,6 +4535,32 @@ def test_cached_promoted_champion_keeps_fast_training_disabled() -> None:
     assert context["execution_mode"] == "paper"
     assert context["paper_training_mode"] == "normal"
     assert context["strategy_learning"]["paper_training_mode"] == "normal"
+    assert paper_training_mode_enabled(context) is False
+
+
+def test_cached_continuous_primary_disables_fast_training_without_promotion() -> None:
+    service = TradingService.__new__(TradingService)
+    service._strategy_learning_context_cache = {
+        "paper": {
+            "created_at": datetime.now(UTC),
+            "context": {
+                "paper_training_mode": "bootstrap",
+                "paper_strategy_champion": {"active": False},
+                "continuous_strategy_routing": {
+                    "applied": True,
+                    "current_route": {
+                        "primary": {"profile_id": "future-stable-primary"}
+                    },
+                },
+            },
+        }
+    }
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+
+    context = service._recent_strategy_learning_context("paper")
+
+    assert context is not None
+    assert context["paper_training_mode"] == "normal"
     assert paper_training_mode_enabled(context) is False
 
 

@@ -206,6 +206,13 @@ def test_shadow_fee_after_label_uses_funding_when_it_changes_the_best_side() -> 
     assert outcome["cost_complete"] is True
     assert outcome["long_net_return_after_cost_pct"] < 0.0
     assert outcome["short_net_return_after_cost_pct"] > 0.0
+    scenarios = outcome["leverage_counterfactuals"]
+    assert [item["leverage"] for item in scenarios] == [1, 2, 3, 5, 10]
+    assert scenarios[-1]["short_fee_after_margin_return_pct"] == pytest.approx(
+        outcome["short_net_return_after_cost_pct"] * 10
+    )
+    assert all(item["creates_order"] is False for item in scenarios)
+    assert outcome["leverage_counterfactual_policy"]["creates_order"] is False
 
 
 @pytest.mark.asyncio
@@ -406,6 +413,7 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     await _service(repo, latest_price=101.0).update_due()
 
     label_contract = row.feature_snapshot["training_label_contract"]
+    leverage_evidence = row.feature_snapshot["training_leverage_counterfactuals"]
     assert label_contract["version"] == SHADOW_LABEL_VERSION
     assert label_contract["decision_id"] == 123
     assert label_contract["horizon_minutes"] == 10
@@ -419,6 +427,11 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
         decision_id=123,
         horizon_minutes=10,
     ) == []
+    assert leverage_evidence["scenario_count"] == 5
+    assert leverage_evidence["creates_order"] is False
+    assert leverage_evidence["leverage_10x_long_fee_after_margin_return_pct"] == (
+        pytest.approx(label_contract["long_net_return_after_cost_pct"] * 10)
+    )
     assert len(repo.memories) == 4
     assert {item["expert_name"] for item in repo.memories} == {
         "trend_expert",

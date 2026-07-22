@@ -1231,9 +1231,15 @@ class StrategyLearningService:
             paper_strategy_champion=champion,
         )
         result["execution_mode"] = "live" if str(mode).lower() == "live" else "paper"
+        current_route = _safe_dict(
+            _safe_dict(result.get("continuous_strategy_routing")).get("current_route")
+        )
+        continuous_primary_ready = bool(current_route.get("primary"))
         result["paper_training_mode"] = (
             "bootstrap"
-            if str(mode).lower() != "live" and champion.get("active") is not True
+            if str(mode).lower() != "live"
+            and champion.get("active") is not True
+            and not continuous_primary_ready
             else "normal"
             if str(mode).lower() != "live"
             else "disabled"

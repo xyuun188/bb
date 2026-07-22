@@ -24,6 +24,8 @@ PAPER_TRAINING_POSITION_LIFECYCLE_VERSION = (
 )
 PAPER_TRAINING_ORDER_IDENTITY_VERSION = "2026-07-22.paper-training-order-identity.v1"
 PAPER_TRAINING_CLIENT_ORDER_ID_PREFIX = "BBPT"
+PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0001
+PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION = 0.0003
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -61,6 +63,10 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "trade_is_normal",
             "continuous_training_after_settlement",
             "loss_tolerant_for_training",
+            "risk_profile",
+            "single_trade_risk_fraction_cap",
+            "portfolio_risk_fraction_cap",
+            "separate_sampling_order",
             "purpose",
             "symbol",
             "selected_side",
@@ -79,7 +85,7 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
 
 
 def paper_training_mode_enabled(context: dict[str, Any] | None) -> bool:
-    """Return whether the current paper context has no validated champion."""
+    """Return whether paper trading still lacks a future-stable strategy route."""
 
     payload = _dict(context)
     if str(payload.get("execution_mode") or "").lower() != "paper":
@@ -89,6 +95,13 @@ def paper_training_mode_enabled(context: dict[str, Any] | None) -> bool:
     nested_champion = _dict(learning.get("paper_strategy_champion"))
     champion = champion or nested_champion
     if champion.get("active") is True:
+        return False
+    routing = _dict(
+        payload.get("continuous_strategy_routing")
+        or _dict(payload.get("strategy_mode")).get("continuous_strategy_routing")
+        or learning.get("continuous_strategy_routing")
+    )
+    if _dict(routing.get("current_route")).get("primary"):
         return False
     explicit = str(payload.get("paper_training_mode") or "").lower()
     if explicit:
@@ -175,7 +188,13 @@ def build_paper_training_contract(
         "trade_is_normal": True,
         "continuous_training_after_settlement": True,
         "loss_tolerant_for_training": True,
-        "purpose": "collect_complete_directional_paper_outcomes_until_strategy_promotion",
+        "risk_profile": "cold_start_exploration",
+        "single_trade_risk_fraction_cap": (
+            PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION
+        ),
+        "portfolio_risk_fraction_cap": PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
+        "separate_sampling_order": False,
+        "purpose": "execute_one_normal_bounded_paper_trade_and_learn_after_settlement",
         "symbol": str(symbol or ""),
         "selected_side": side,
         "signal_source": str(signal_source or "unknown"),
@@ -233,6 +252,22 @@ def paper_training_contract_reasons(value: Any) -> list[str]:
         reasons.append("paper_training_continuous_training_missing")
     if contract.get("loss_tolerant_for_training") is not True:
         reasons.append("paper_training_loss_tolerance_missing")
+    if contract.get("risk_profile") != "cold_start_exploration":
+        reasons.append("paper_training_risk_profile_invalid")
+    if not isclose(
+        _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0,
+        PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
+        abs_tol=1e-12,
+    ):
+        reasons.append("paper_training_single_trade_risk_cap_invalid")
+    if not isclose(
+        _float(contract.get("portfolio_risk_fraction_cap"), 0.0) or 0.0,
+        PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
+        abs_tol=1e-12,
+    ):
+        reasons.append("paper_training_portfolio_risk_cap_invalid")
+    if contract.get("separate_sampling_order") is not False:
+        reasons.append("paper_training_separate_sampling_order_forbidden")
     if str(contract.get("selected_side") or "").lower() not in {"long", "short"}:
         reasons.append("paper_training_side_missing")
     if not str(contract.get("symbol") or "").strip():
