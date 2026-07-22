@@ -207,10 +207,15 @@ async def test_position_history_mirror_sync_updates_existing_rows(
         ccxt.rows[0]["uTime"] = _ms(now - timedelta(minutes=1))
         ccxt.rows[0]["closeTotalPos"] = "90"
         second = await service.sync_once()
+        third = await service.sync_once()
 
         assert first["inserted_count"] == 1
         assert second["inserted_count"] == 0
         assert second["updated_count"] == 1
+        assert second["unchanged_count"] == 0
+        assert third["inserted_count"] == 0
+        assert third["updated_count"] == 0
+        assert third["unchanged_count"] == 1
         async with get_session_ctx() as session:
             result = await session.execute(select(OkxPositionHistory))
             records = list(result.scalars().all())

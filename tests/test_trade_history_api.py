@@ -3112,6 +3112,167 @@ def test_trade_detail_does_not_use_numeric_order_id_as_reason() -> None:
     assert "策略纪律触发" in reason
 
 
+@pytest.mark.asyncio
+async def test_xrp_final_close_cannot_be_downgraded_by_stale_local_order_links(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'xrp-final-close-links.db').as_posix()}",
+    )
+    await init_db()
+    dashboard_api._clear_dashboard_heavy_cache("closed-position-ledger")
+    opened_at = datetime(2026, 7, 22, 11, 9, 44, 608000, tzinfo=UTC)
+    first_close_at = datetime(2026, 7, 22, 11, 13, 53, 949000, tzinfo=UTC)
+    final_close_at = datetime(2026, 7, 22, 11, 20, 49, 921000, tzinfo=UTC)
+    pos_id = "3765222187788378112"
+    entry_id = "3765350335720955904"
+    first_close_id = "3765358702216585216"
+    final_close_id = "3765372659920773120"
+    official_row = {
+        "instId": "XRP-USDT-SWAP",
+        "posId": pos_id,
+        "posSide": "net",
+        "direction": "short",
+        "type": "2",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(final_close_at.timestamp() * 1000)),
+        "openAvgPx": "1.1372",
+        "closeAvgPx": "1.137525",
+        "openMaxPos": "0.04",
+        "closeTotalPos": "0.04",
+        "realizedPnl": "-0.00584945",
+        "pnl": "-0.0013",
+        "fee": "-0.00454945",
+        "fundingFee": "0",
+        "_bb_contract_spec": {"ctVal": "100.0"},
+        "_bb_contract_spec_source": "okx_account_position_margin_notional_crosscheck",
+    }
+
+    async def add_order(
+        repo: TradeRepository,
+        *,
+        order_id: str,
+        side: str,
+        base_quantity: float,
+        contracts: float,
+        price: float,
+        fee: float,
+        pnl: float,
+        filled_at: datetime,
+    ) -> None:
+        await repo.create_order(
+            {
+                "model_name": "ensemble_trader",
+                "execution_mode": "paper",
+                "symbol": "XRP/USDT",
+                "side": side,
+                "order_type": "market",
+                "quantity": base_quantity,
+                "price": price,
+                "status": "filled",
+                "fee": fee,
+                "exchange_order_id": order_id,
+                "filled_at": filled_at,
+                "created_at": filled_at,
+                "okx_inst_id": "XRP-USDT-SWAP",
+                "okx_trade_ids": f"trade-{order_id}",
+                "okx_fill_contracts": contracts,
+                "okx_fill_pnl": pnl,
+                "okx_sync_status": OKX_SYNC_CONFIRMED,
+                "okx_raw_fills": {
+                    "order_id": order_id,
+                    "trade_ids": [f"trade-{order_id}"],
+                    "inst_id": "XRP-USDT-SWAP",
+                    "contracts": contracts,
+                    "contract_size": 100.0,
+                    "base_quantity": base_quantity,
+                    "avg_price": price,
+                    "fee_abs": fee,
+                    "fill_pnl": pnl,
+                    "timestamp": filled_at.isoformat(),
+                    "fills_history_confirmed": True,
+                },
+            }
+        )
+
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await add_order(
+                repo,
+                order_id=entry_id,
+                side="sell",
+                base_quantity=4.0,
+                contracts=0.04,
+                price=1.1372,
+                fee=0.0022744,
+                pnl=0.0,
+                filled_at=opened_at,
+            )
+            await add_order(
+                repo,
+                order_id=first_close_id,
+                side="buy",
+                base_quantity=3.0,
+                contracts=0.03,
+                price=1.1375,
+                fee=0.00170625,
+                pnl=-0.0009,
+                filled_at=first_close_at,
+            )
+        await _seed_okx_position_history_rows(
+            [official_row],
+            entry_order_ids={pos_id: [entry_id]},
+            close_order_ids={pos_id: [first_close_id]},
+        )
+
+        before_final_link = await get_dashboard_positions(mode="paper", closed_only=True)
+        stale_link_row = before_final_link["positions"][0]
+        assert stale_link_row["close_status"] == "full"
+        assert stale_link_row["closed_at"] == final_close_at.isoformat()
+        assert stale_link_row["quantity"] == pytest.approx(4.0)
+        assert stale_link_row["max_position_quantity"] == pytest.approx(4.0)
+        assert stale_link_row["close_order_ids"] == [first_close_id]
+        assert stale_link_row["evidence_complete"] is False
+        assert stale_link_row["trainable"] is False
+        assert "position_history_close_quantity_not_matched_to_orders" in stale_link_row[
+            "evidence_gaps"
+        ]
+
+        async with get_session_ctx() as session:
+            await add_order(
+                TradeRepository(session),
+                order_id=final_close_id,
+                side="buy",
+                base_quantity=1.0,
+                contracts=0.01,
+                price=1.1376,
+                fee=0.0005688,
+                pnl=-0.0004,
+                filled_at=final_close_at,
+            )
+
+        after_final_link = await get_dashboard_positions(mode="paper", closed_only=True)
+        repaired_row = after_final_link["positions"][0]
+        assert repaired_row["close_status"] == "full"
+        assert repaired_row["quantity"] == pytest.approx(4.0)
+        assert repaired_row["max_position_quantity"] == pytest.approx(4.0)
+        assert repaired_row["entry_order_ids"] == [entry_id]
+        assert repaired_row["close_order_ids"] == [first_close_id, final_close_id]
+        assert repaired_row["linked_order_count"] == 3
+        assert repaired_row["evidence_complete"] is True
+        assert repaired_row["trainable"] is True
+    finally:
+        dashboard_api._clear_dashboard_heavy_cache("closed-position-ledger")
+        await close_db()
+
+
 def test_trade_detail_numeric_only_reason_falls_back_to_readable_success() -> None:
     reason = _readable_execution_reason(
         execution_reason="3670054929945042944",

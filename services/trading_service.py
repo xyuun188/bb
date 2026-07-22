@@ -1073,7 +1073,7 @@ class TradingService:
     def okx_position_history_mirror_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""
 
-        return max(60.0, self.okx_authoritative_sync_interval_seconds() * 2.0)
+        return max(30.0, self.okx_authoritative_sync_interval_seconds())
 
     def okx_position_settlement_sync_interval_seconds(self) -> float:
         """Return the retry cadence for official closed-position settlement."""
@@ -1652,9 +1652,32 @@ class TradingService:
                         row.get("updated_count") or 0
                     )
                     if changed_count > 0:
-                        row["authoritative_outcome_feedback"] = (
-                            await self.expert_memory_service.backfill_trade_reflections(mode)
-                        )
+                        try:
+                            row["authoritative_outcome_feedback"] = await asyncio.wait_for(
+                                self.expert_memory_service.backfill_trade_reflections(mode),
+                                timeout=5.0,
+                            )
+                        except TimeoutError:
+                            row["authoritative_outcome_feedback"] = {
+                                "status": "deferred",
+                                "reason": "feedback_timeout",
+                            }
+                            logger.warning(
+                                "authoritative outcome feedback timed out; history mirror continues",
+                                mode=mode,
+                                changed_count=changed_count,
+                            )
+                        except Exception as exc:
+                            row["authoritative_outcome_feedback"] = {
+                                "status": "degraded",
+                                "error": safe_error_text(exc, limit=180),
+                            }
+                            logger.warning(
+                                "authoritative outcome feedback failed; history mirror continues",
+                                mode=mode,
+                                changed_count=changed_count,
+                                error=safe_error_text(exc, limit=180),
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

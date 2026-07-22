@@ -2936,12 +2936,19 @@ async def _dashboard_closed_ledger_watermark(
             select(
                 select(func.count(Position.id)).where(*position_filters).scalar_subquery(),
                 select(func.max(Position.id)).where(*position_filters).scalar_subquery(),
+                select(func.max(Position.updated_at))
+                .where(*position_filters)
+                .scalar_subquery(),
                 select(func.count(Order.id)).where(*order_filters).scalar_subquery(),
                 select(func.max(Order.id)).where(*order_filters).scalar_subquery(),
+                select(func.max(Order.updated_at)).where(*order_filters).scalar_subquery(),
                 select(func.count(OkxPositionHistory.id))
                 .where(*history_filters)
                 .scalar_subquery(),
                 select(func.max(OkxPositionHistory.id))
+                .where(*history_filters)
+                .scalar_subquery(),
+                select(func.max(OkxPositionHistory.synced_at))
                 .where(*history_filters)
                 .scalar_subquery(),
                 select(func.count(OkxAccountBill.id))
@@ -3247,6 +3254,17 @@ def _dashboard_position_history_close_status(row: dict[str, Any]) -> tuple[str, 
     if max_qty > 0 and closed_qty > 0 and closed_qty < max_qty:
         return "partial", "部分平仓"
     return "full", "全部平仓"
+
+
+def _dashboard_position_history_is_authoritative_full(row: dict[str, Any]) -> bool:
+    close_type = str(row.get("type") or row.get("closeType") or "").strip()
+    if close_type == "2":
+        return True
+    if close_type == "1":
+        return False
+    closed_qty = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
+    max_qty = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
+    return bool(max_qty > 0 and closed_qty >= max_qty * 0.999)
 
 
 def _dashboard_position_history_group_id(row: dict[str, Any], mode: str | None) -> str:
@@ -3732,11 +3750,18 @@ def _dashboard_position_history_matching_position_ids(
         position_side = str(getattr(position, "side", "") or "").lower().strip()
         if side and position_side and position_side != side:
             continue
-        if pos_id and str(getattr(position, "okx_pos_id", "") or "").strip() == pos_id:
-            result.append(int(row_id))
-            continue
         position_opened = _as_utc_datetime(getattr(position, "created_at", None))
         position_closed = _as_utc_datetime(getattr(position, "closed_at", None))
+        if pos_id and str(getattr(position, "okx_pos_id", "") or "").strip() == pos_id:
+            if opened_at and position_opened and abs(position_opened - opened_at) > window:
+                continue
+            if opened_at and position_opened:
+                result.append(int(row_id))
+                continue
+            if updated_at and position_closed and abs(position_closed - updated_at) > window:
+                continue
+            result.append(int(row_id))
+            continue
         if opened_at and position_opened and abs(position_opened - opened_at) > window:
             continue
         if updated_at and position_closed and abs(position_closed - updated_at) > window:
@@ -3769,6 +3794,20 @@ def _dashboard_position_history_order_payload(
             updated_at=updated_at,
         )
     ]
+    entry_candidates = [
+        order
+        for order in candidates
+        if not entry_side or str(getattr(order, "side", "") or "").lower() == entry_side
+    ]
+    close_candidates = [
+        order
+        for order in candidates
+        if (
+            not close_side
+            or str(getattr(order, "side", "") or "").lower() == close_side
+        )
+        and (_dashboard_order_fill_pnl(order) is not None or _dashboard_order_raw_fills(order))
+    ]
     hinted_entry_ids = _dashboard_split_exchange_order_ids(
         row.get("_dashboard_entry_order_ids")
     )
@@ -3795,6 +3834,16 @@ def _dashboard_position_history_order_payload(
                 for order in hinted_orders
                 if not close_side or str(getattr(order, "side", "") or "").lower() == close_side
             ]
+        selected_entries, entry_augmented = _dashboard_augment_orders_to_official_quantity(
+            selected_entries,
+            entry_candidates,
+            raw_max_quantity,
+        )
+        selected_closes, close_augmented = _dashboard_augment_orders_to_official_quantity(
+            selected_closes,
+            close_candidates,
+            raw_close_quantity,
+        )
         return _dashboard_position_history_order_payload_from_selected(
             row,
             selected_entries=selected_entries,
@@ -3802,26 +3851,20 @@ def _dashboard_position_history_order_payload(
             raw_close_quantity=raw_close_quantity,
             raw_max_quantity=raw_max_quantity,
             entry_match_source=(
-                "persisted_order_ids" if selected_entries else "persisted_order_ids_missing"
+                "persisted_order_ids_plus_confirmed_fills"
+                if entry_augmented
+                else "persisted_order_ids"
+                if selected_entries
+                else "persisted_order_ids_missing"
             ),
             close_match_source=(
-                "persisted_order_ids" if selected_closes else "persisted_order_ids_missing"
+                "persisted_order_ids_plus_confirmed_fills"
+                if close_augmented
+                else "persisted_order_ids"
+                if selected_closes
+                else "persisted_order_ids_missing"
             ),
         )
-    entry_candidates = [
-        order
-        for order in candidates
-        if not entry_side or str(getattr(order, "side", "") or "").lower() == entry_side
-    ]
-    close_candidates = [
-        order
-        for order in candidates
-        if (
-            not close_side
-            or str(getattr(order, "side", "") or "").lower() == close_side
-        )
-        and (_dashboard_order_fill_pnl(order) is not None or _dashboard_order_raw_fills(order))
-    ]
     selected_closes, close_match_source = _dashboard_select_orders_by_official_quantity(
         close_candidates,
         raw_close_quantity,
@@ -3846,29 +3889,12 @@ def _dashboard_position_history_order_payload(
                 and order_time <= first_close_at
             )
         ]
-    close_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_closes)
-    close_contracts = sum(_dashboard_order_contracts(order) for order in selected_closes)
-    entry_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_entries)
-    entry_contracts = sum(_dashboard_order_contracts(order) for order in selected_entries)
-    close_quantity = raw_close_quantity
-    if close_base_quantity > 0 and _dashboard_quantities_match(close_base_quantity, raw_close_quantity):
-        close_quantity = close_base_quantity
-    elif close_contracts > 0 and _dashboard_quantities_match(close_contracts, raw_close_quantity):
-        close_quantity = close_base_quantity or raw_close_quantity
-    max_quantity = raw_max_quantity or entry_base_quantity or close_quantity
-    if raw_max_quantity > 0:
-        if entry_base_quantity > 0 and _dashboard_quantities_match(entry_base_quantity, raw_max_quantity):
-            max_quantity = entry_base_quantity
-        elif entry_contracts > 0 and _dashboard_quantities_match(entry_contracts, raw_max_quantity):
-            max_quantity = entry_base_quantity or raw_max_quantity
-    elif entry_base_quantity > 0:
-        max_quantity = max(entry_base_quantity, close_quantity)
     return _dashboard_position_history_order_payload_from_selected(
         row,
         selected_entries=selected_entries,
         selected_closes=selected_closes,
-        raw_close_quantity=close_quantity,
-        raw_max_quantity=max_quantity,
+        raw_close_quantity=raw_close_quantity,
+        raw_max_quantity=raw_max_quantity,
         entry_match_source=entry_match_source,
         close_match_source=close_match_source,
     )
@@ -3888,6 +3914,51 @@ def _dashboard_orders_by_exchange_ids(order_rows: list[Any], order_ids: set[str]
     )
 
 
+def _dashboard_augment_orders_to_official_quantity(
+    selected_orders: list[Any],
+    candidates: list[Any],
+    official_quantity: float,
+) -> tuple[list[Any], bool]:
+    """Fill missing persisted links with confirmed orders from the same lifecycle window."""
+
+    selected = list(selected_orders)
+    if official_quantity <= 0:
+        return selected, False
+    selected_ids = {
+        str(getattr(order, "exchange_order_id", "") or "").strip() for order in selected
+    }
+    extras = [
+        order
+        for order in candidates
+        if str(getattr(order, "exchange_order_id", "") or "").strip() not in selected_ids
+    ]
+    for quantity_getter in (_dashboard_order_contracts, _dashboard_order_base_quantity):
+        selected_quantity = sum(quantity_getter(order) for order in selected)
+        if _dashboard_quantities_match(selected_quantity, official_quantity):
+            return selected, False
+        remaining = official_quantity - selected_quantity
+        if remaining <= 0:
+            continue
+        supplement, matched = _dashboard_best_quantity_subset(
+            extras,
+            remaining,
+            quantity_getter,
+        )
+        if not matched:
+            continue
+        combined = sorted(
+            [*selected, *supplement],
+            key=lambda order: _dashboard_order_time(order)
+            or datetime.max.replace(tzinfo=UTC),
+        )
+        if _dashboard_quantities_match(
+            sum(quantity_getter(order) for order in combined),
+            official_quantity,
+        ):
+            return combined, True
+    return selected, False
+
+
 def _dashboard_position_history_order_payload_from_selected(
     row: dict[str, Any],
     *,
@@ -3902,17 +3973,36 @@ def _dashboard_position_history_order_payload_from_selected(
     close_contracts = sum(_dashboard_order_contracts(order) for order in selected_closes)
     entry_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_entries)
     entry_contracts = sum(_dashboard_order_contracts(order) for order in selected_entries)
-    close_quantity = raw_close_quantity
-    if close_base_quantity > 0 and _dashboard_quantities_match(close_base_quantity, raw_close_quantity):
+    contract_size = _dashboard_position_history_contract_size(row)
+    raw_close_base_quantity = raw_close_quantity * contract_size
+    raw_max_base_quantity = raw_max_quantity * contract_size
+    close_base_matches = bool(
+        close_base_quantity > 0
+        and _dashboard_quantities_match(close_base_quantity, raw_close_base_quantity)
+    )
+    close_contracts_match = bool(
+        close_contracts > 0
+        and _dashboard_quantities_match(close_contracts, raw_close_quantity)
+    )
+    entry_base_matches = bool(
+        entry_base_quantity > 0
+        and _dashboard_quantities_match(entry_base_quantity, raw_max_base_quantity)
+    )
+    entry_contracts_match = bool(
+        entry_contracts > 0
+        and _dashboard_quantities_match(entry_contracts, raw_max_quantity)
+    )
+    close_quantity = raw_close_base_quantity
+    if close_base_matches:
         close_quantity = close_base_quantity
-    elif close_contracts > 0 and _dashboard_quantities_match(close_contracts, raw_close_quantity):
-        close_quantity = close_base_quantity or raw_close_quantity
-    max_quantity = raw_max_quantity or entry_base_quantity or close_quantity
+    elif close_contracts_match:
+        close_quantity = close_base_quantity or raw_close_base_quantity
+    max_quantity = raw_max_base_quantity or entry_base_quantity or close_quantity
     if raw_max_quantity > 0:
-        if entry_base_quantity > 0 and _dashboard_quantities_match(entry_base_quantity, raw_max_quantity):
+        if entry_base_matches:
             max_quantity = entry_base_quantity
-        elif entry_contracts > 0 and _dashboard_quantities_match(entry_contracts, raw_max_quantity):
-            max_quantity = entry_base_quantity or raw_max_quantity
+        elif entry_contracts_match:
+            max_quantity = entry_base_quantity or raw_max_base_quantity
     elif entry_base_quantity > 0:
         max_quantity = max(entry_base_quantity, close_quantity)
     linked_orders = sorted(
@@ -3932,7 +4022,23 @@ def _dashboard_position_history_order_payload_from_selected(
         ),
         "entry_match_source": entry_match_source,
         "close_match_source": close_match_source,
+        "entry_quantity_matched": bool(
+            raw_max_quantity <= 0 or entry_base_matches or entry_contracts_match
+        ),
+        "close_quantity_matched": bool(
+            raw_close_quantity <= 0 or close_base_matches or close_contracts_match
+        ),
     }
+
+
+def _dashboard_position_history_contract_size(row: dict[str, Any]) -> float:
+    spec = row.get("_bb_contract_spec")
+    if not isinstance(spec, dict):
+        return 1.0
+    contract_value = _safe_float(spec.get("ctVal") or spec.get("contract_size"), 0.0) or 0.0
+    contract_multiplier = _safe_float(spec.get("ctMult"), 1.0) or 1.0
+    contract_size = abs(contract_value * contract_multiplier)
+    return contract_size if contract_size > 0 else 1.0
 
 
 def _dashboard_position_history_official_rows_as_groups_legacy(
@@ -4068,12 +4174,21 @@ def _dashboard_position_history_official_rows_as_groups(
             order_rows=order_rows,
         )
         status, status_label = _dashboard_position_history_close_status(row)
+        authoritative_full = _dashboard_position_history_is_authoritative_full(row)
         opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
         updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
         close_quantity = order_payload["close_quantity"]
         max_quantity = order_payload["max_quantity"]
-        if max_quantity > 0 and close_quantity > 0 and close_quantity < max_quantity * 0.999:
+        if (
+            not authoritative_full
+            and max_quantity > 0
+            and close_quantity > 0
+            and close_quantity < max_quantity * 0.999
+        ):
             status = "partial"
+            status_label = _dashboard_position_history_status_label(status)
+        elif authoritative_full:
+            status = "full"
             status_label = _dashboard_position_history_status_label(status)
         closed_at = None if status == "partial" else updated_at
         realized_pnl = _safe_float(row.get("realizedPnl"), 0.0) or 0.0
@@ -4091,7 +4206,9 @@ def _dashboard_position_history_official_rows_as_groups(
             evidence_gaps.append("missing_position_history_entry_orders")
         if not order_payload["close_order_ids"]:
             evidence_gaps.append("missing_position_history_close_orders")
-        if order_payload["close_match_source"] == "unmatched":
+        if not order_payload["entry_quantity_matched"]:
+            evidence_gaps.append("position_history_entry_quantity_not_matched_to_orders")
+        if not order_payload["close_quantity_matched"]:
             evidence_gaps.append("position_history_close_quantity_not_matched_to_orders")
         official_groups.append(
             {

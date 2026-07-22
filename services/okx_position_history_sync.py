@@ -49,6 +49,7 @@ class OkxPositionHistoryMirrorSyncSummary:
     upserted_count: int = 0
     inserted_count: int = 0
     updated_count: int = 0
+    unchanged_count: int = 0
     skipped_count: int = 0
     latest_u_time_ms: float = 0.0
     latest_inst_id: str = ""
@@ -68,6 +69,7 @@ class OkxPositionHistoryMirrorSyncSummary:
             "upserted_count": self.upserted_count,
             "inserted_count": self.inserted_count,
             "updated_count": self.updated_count,
+            "unchanged_count": self.unchanged_count,
             "skipped_count": self.skipped_count,
             "latest_u_time_ms": self.latest_u_time_ms,
             "latest_inst_id": self.latest_inst_id,
@@ -251,19 +253,23 @@ class OkxPositionHistoryMirrorSyncService:
             for row in rows
             if (identity := okx_position_history_row_identity(row, mode=self.mode)).strip("|")
         ]
-        existing_identities: set[str] = set()
+        existing_fingerprints: dict[str, tuple[Any, ...]] = {}
         if identities:
             async with self.session_context_factory() as session:
                 result = await session.execute(
-                    select(OkxPositionHistory.row_identity).where(
+                    select(OkxPositionHistory).where(
                         OkxPositionHistory.mode == self.mode,
                         OkxPositionHistory.row_identity.in_(identities),
                     )
                 )
-                existing_identities = {str(value) for value in result.scalars().all()}
+                existing_fingerprints = {
+                    str(record.row_identity): _history_record_fact_fingerprint(record)
+                    for record in result.scalars().all()
+                }
 
         inserted = 0
         updated = 0
+        unchanged = 0
         upserted = 0
         skipped = 0
         samples: list[dict[str, Any]] = []
@@ -286,14 +292,20 @@ class OkxPositionHistoryMirrorSyncService:
                     skipped += 1
                     continue
                 upserted += 1
-                was_existing = identity in existing_identities
-                if was_existing:
+                previous_fingerprint = existing_fingerprints.get(identity)
+                was_existing = previous_fingerprint is not None
+                operation = "inserted"
+                if was_existing and previous_fingerprint != _history_record_fact_fingerprint(record):
                     updated += 1
+                    operation = "updated"
+                elif was_existing:
+                    unchanged += 1
+                    operation = "unchanged"
                 else:
                     inserted += 1
-                    existing_identities.add(identity)
+                existing_fingerprints[identity] = _history_record_fact_fingerprint(record)
                 if len(samples) < 10:
-                    samples.append(_sample_from_row(row, inserted=not was_existing))
+                    samples.append(_sample_from_row(row, operation=operation))
 
         return OkxPositionHistoryMirrorSyncSummary(
             status="ok",
@@ -306,6 +318,7 @@ class OkxPositionHistoryMirrorSyncService:
             upserted_count=upserted,
             inserted_count=inserted,
             updated_count=updated,
+            unchanged_count=unchanged,
             skipped_count=skipped,
             latest_u_time_ms=_row_u_time_ms(latest_row),
             latest_inst_id=str((latest_row or {}).get("instId") or ""),
@@ -329,7 +342,40 @@ def _row_u_time_ms(row: dict[str, Any] | None) -> float:
         return 0.0
 
 
-def _sample_from_row(row: dict[str, Any], *, inserted: bool) -> dict[str, Any]:
+def _history_record_fact_fingerprint(record: OkxPositionHistory) -> tuple[Any, ...]:
+    """Return only exchange facts whose change should trigger downstream work."""
+
+    return (
+        str(record.inst_id or ""),
+        str(record.pos_id or ""),
+        str(record.pos_side or ""),
+        str(record.side or ""),
+        str(record.close_type or ""),
+        str(record.close_status or ""),
+        _history_datetime_fingerprint(record.opened_at),
+        _history_datetime_fingerprint(record.updated_at_okx),
+        float(record.open_avg_px or 0.0),
+        float(record.close_avg_px or 0.0),
+        float(record.open_max_pos or 0.0),
+        float(record.close_total_pos or 0.0),
+        float(record.leverage or 0.0),
+        float(record.realized_pnl or 0.0),
+        float(record.pnl or 0.0),
+        record.pnl_ratio,
+        float(record.funding_fee or 0.0),
+        float(record.fee or 0.0),
+    )
+
+
+def _history_datetime_fingerprint(value: datetime | None) -> float | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return round(value.astimezone(UTC).timestamp(), 6)
+
+
+def _sample_from_row(row: dict[str, Any], *, operation: str) -> dict[str, Any]:
     return {
         "inst_id": str(row.get("instId") or ""),
         "pos_id": str(row.get("posId") or ""),
@@ -337,5 +383,5 @@ def _sample_from_row(row: dict[str, Any], *, inserted: bool) -> dict[str, Any]:
         "type": str(row.get("type") or ""),
         "u_time": str(row.get("uTime") or ""),
         "realized_pnl": str(row.get("realizedPnl") or ""),
-        "operation": "inserted" if inserted else "updated",
+        "operation": operation,
     }

@@ -4,11 +4,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
-from models.trade import Position
+from models.trade import OkxPositionHistory, Position
 from web_dashboard.api import dashboard
 
 
@@ -60,6 +61,69 @@ async def test_closed_ledger_read_model_reuses_same_watermark(
 
     assert refreshed[0][0]["build"] == 2
     assert builds["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_closed_ledger_watermark_changes_when_history_row_updates_in_place(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'closed-ledger-watermark.db').as_posix()}",
+    )
+    await init_db()
+    now = datetime.now(UTC)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                OkxPositionHistory(
+                    mode="paper",
+                    row_identity="paper|XRP-USDT-SWAP|xrp-pos|net|1",
+                    inst_id="XRP-USDT-SWAP",
+                    symbol="XRP/USDT",
+                    pos_id="xrp-pos",
+                    pos_side="net",
+                    side="short",
+                    close_type="1",
+                    close_status="partial",
+                    raw_row={"instId": "XRP-USDT-SWAP", "type": "1"},
+                    sync_status="synced",
+                    synced_at=now - timedelta(minutes=1),
+                )
+            )
+
+        async with get_session_ctx() as session:
+            before = await dashboard._dashboard_closed_ledger_watermark(
+                session,
+                mode="paper",
+                model_names=None,
+            )
+
+        async with get_session_ctx() as session:
+            record = (
+                await session.execute(
+                    select(OkxPositionHistory).where(
+                        OkxPositionHistory.mode == "paper"
+                    )
+                )
+            ).scalars().one()
+            record.close_type = "2"
+            record.close_status = "full"
+            record.synced_at = now
+
+        async with get_session_ctx() as session:
+            after = await dashboard._dashboard_closed_ledger_watermark(
+                session,
+                mode="paper",
+                model_names=None,
+            )
+
+        assert after != before
+    finally:
+        await close_db()
 
 
 def test_analysis_payload_bounds_transcripts_and_nested_collections() -> None:
