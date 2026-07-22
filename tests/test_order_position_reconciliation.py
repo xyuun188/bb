@@ -8,7 +8,7 @@ from sqlalchemy import select
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
-from models.trade import Order, Position
+from models.trade import OkxPositionHistory, Order, Position
 from scripts.repair_missing_closed_positions_from_orders import (
     collect_missing_closed_position_scan,
 )
@@ -138,6 +138,101 @@ async def test_missing_closed_position_scan_only_scans_close_orders(
         assert report.repairable_count == 1
         assert report.manual_review_count == 0
         assert report.plan_classifications[0]["status"] == "repairable"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_official_okx_history_prevents_duplicate_closed_position_repair(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'official-history.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        opened_at = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)
+        closed_at = opened_at + timedelta(minutes=12)
+        async with get_session_ctx() as session:
+            entry_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="ZRO/USDT",
+                action="long",
+                confidence=0.8,
+                reasoning="entry",
+                is_paper=True,
+                was_executed=True,
+            )
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="ZRO/USDT",
+                action="close_long",
+                confidence=0.8,
+                reasoning="close",
+                is_paper=True,
+                was_executed=True,
+            )
+            session.add_all([entry_decision, close_decision])
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ZRO/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=34.0,
+                        price=1.8,
+                        status="filled",
+                        decision_id=entry_decision.id,
+                        exchange_order_id="zro-entry",
+                        filled_at=opened_at,
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ZRO/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=34.0,
+                        price=1.83,
+                        status="filled",
+                        decision_id=close_decision.id,
+                        exchange_order_id="zro-close",
+                        filled_at=closed_at,
+                    ),
+                    OkxPositionHistory(
+                        mode="paper",
+                        row_identity="paper|ZRO-USDT-SWAP|zro-pos|net|1",
+                        inst_id="ZRO-USDT-SWAP",
+                        symbol="ZRO/USDT",
+                        close_status="full",
+                        realized_pnl=1.0,
+                        pnl=1.02,
+                        close_order_ids=["zro-close"],
+                        entry_order_ids=["zro-entry"],
+                        linked_order_ids=["zro-entry", "zro-close"],
+                    ),
+                ]
+            )
+
+        report = await collect_missing_closed_position_scan(days=14)
+
+        assert report.candidate_order_count == 1
+        assert report.scanned_order_count == 1
+        assert report.plans == []
+        assert report.repairable_count == 0
+        assert report.official_history_covered_count == 1
+        assert report.classification_counts == {
+            "repairable": 0,
+            "manual_review": 0,
+            "skipped_or_not_repairable": 0,
+            "unscanned": 0,
+        }
     finally:
         await close_db()
 

@@ -14,6 +14,7 @@ from services.okx_authoritative_sync import (
     MAX_AUTHORITATIVE_FILL_PAGES,
     OkxAuthoritativeSyncService,
     OkxFillGroup,
+    _local_order_verified_okx_raw_contract_size,
 )
 
 
@@ -85,6 +86,37 @@ class _FakeExecutor:
 
     async def shutdown(self) -> None:
         self.shutdown_called = True
+
+
+def test_verified_order_contract_size_wins_over_stale_public_contract_size() -> None:
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=6200.0,
+        price=0.04122,
+        status="filled",
+        exchange_order_id="3765187269268054016",
+        okx_inst_id="ZAMA-USDT-SWAP",
+        okx_fill_contracts=62.0,
+        okx_raw_fills={
+            "order_id": "3765187269268054016",
+            "inst_id": "ZAMA-USDT-SWAP",
+            "contracts": 62.0,
+            "contract_size": 100.0,
+            "base_quantity": 6200.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_account_position_history_pnl_fill_crosscheck",
+            "fills_history_confirmed": True,
+        },
+    )
+
+    assert _local_order_verified_okx_raw_contract_size(order) == pytest.approx(100.0)
+
+    order.okx_raw_fills["contract_size_verified"] = False
+    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
 
 class _AgedUnlinkedFillExecutor(_FakeExecutor):

@@ -16,6 +16,65 @@ def test_okx_daily_reconciliation_report_uses_online_runtime_bootstrap() -> None
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
 
 
+def test_online_report_command_forces_read_only_online_runtime() -> None:
+    args = report_script._parse_args(["--online", "--json-indent", "0"])
+
+    command = report_script._online_report_command(args)
+
+    assert "cd /data/bb/app" in command
+    assert "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql" in command
+    assert "--stdout-only" in command
+    assert "--online" not in command
+    assert "--output-dir" not in command
+
+
+def test_run_online_report_relays_status_without_writing_or_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeSsh:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    ssh = FakeSsh()
+
+    def fake_run_remote_text(_ssh, command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return json.dumps(
+            {
+                "status": "ok",
+                "issue_ledger": {"summary": {"unresolved": 0}},
+                "summary": {"critical": 0},
+                "mutates_database": False,
+                "live_order_mutation": False,
+            }
+        )
+
+    monkeypatch.setattr(report_script, "connect_remote_ssh", lambda *_args, **_kwargs: ssh)
+    monkeypatch.setattr(report_script, "run_remote_text", fake_run_remote_text)
+    args = report_script._parse_args(["--online", "--stdout-only"])
+
+    assert report_script.run_online_report(args) == 0
+    assert ssh.closed is True
+    assert calls[0]["check"] is False
+    assert "--stdout-only" in str(calls[0]["command"])
+    assert json.loads(capsys.readouterr().out)["mutates_database"] is False
+
+
+def test_online_report_parser_ignores_runtime_logs_before_json() -> None:
+    report = report_script._last_json_object(
+        "2026-07-22 [info] executor initialized\n"
+        "2026-07-22 [info] executor closed\n"
+        '{"status":"warning","mutates_database":false}'
+    )
+
+    assert report == {"status": "warning", "mutates_database": False}
+
+
 def _card(key: str, status: str) -> dict[str, object]:
     return {
         "key": key,

@@ -22,7 +22,7 @@ from core.symbols import normalize_trading_symbol, trading_symbol_variants  # no
 from db.session import get_session_ctx  # noqa: E402
 from models.decision import AIDecision  # noqa: E402
 from models.learning import TradeReflection  # noqa: E402
-from models.trade import Order  # noqa: E402
+from models.trade import OkxPositionHistory, Order  # noqa: E402
 from services.order_position_reconciliation import (  # noqa: E402
     apply_missing_closed_position_plan,
     plan_missing_closed_position,
@@ -58,6 +58,7 @@ class ReconciliationScanReport:
     manual_review_count: int
     skipped_candidate_count: int
     unscanned_candidate_count: int
+    official_history_covered_count: int
 
 
 async def collect_missing_closed_position_plans(
@@ -104,14 +105,25 @@ async def collect_missing_closed_position_scan(
             stmt = stmt.limit(max_orders)
         result = await session.execute(stmt)
         orders = list(result.scalars().all())
+        official_history_links = await _official_history_close_order_index(
+            session,
+            execution_modes={str(order.execution_mode or "") for order in orders},
+        )
+        official_history_covered_count = 0
         for order in orders:
+            if _order_has_official_history_coverage(order, official_history_links):
+                official_history_covered_count += 1
+                continue
             plan = await plan_missing_closed_position(session, order)
             if plan is not None and _matches_filters(plan, active_filters):
                 plans.append(plan)
     classifications = [_classify_plan(plan) for plan in plans]
     classification_counts = _classification_counts(
         classifications,
-        skipped_candidate_count=max(len(orders) - len(plans), 0),
+        skipped_candidate_count=max(
+            len(orders) - len(plans) - official_history_covered_count,
+            0,
+        ),
         unscanned_candidate_count=max(candidate_count - len(orders), 0),
     )
     return ReconciliationScanReport(
@@ -128,7 +140,40 @@ async def collect_missing_closed_position_scan(
         manual_review_count=int(classification_counts.get("manual_review", 0)),
         skipped_candidate_count=int(classification_counts.get("skipped_or_not_repairable", 0)),
         unscanned_candidate_count=int(classification_counts.get("unscanned", 0)),
+        official_history_covered_count=official_history_covered_count,
     )
+
+
+async def _official_history_close_order_index(
+    session: Any,
+    *,
+    execution_modes: set[str],
+) -> set[tuple[str, str]]:
+    modes = {str(mode or "").strip().lower() for mode in execution_modes if str(mode or "").strip()}
+    if not modes:
+        return set()
+    rows = list(
+        (
+            await session.execute(
+                select(OkxPositionHistory).where(OkxPositionHistory.mode.in_(sorted(modes)))
+            )
+        ).scalars().all()
+    )
+    return {
+        (str(row.mode or "").strip().lower(), str(order_id or "").strip())
+        for row in rows
+        for order_id in (row.close_order_ids or [])
+        if str(order_id or "").strip()
+    }
+
+
+def _order_has_official_history_coverage(
+    order: Order,
+    official_history_links: set[tuple[str, str]],
+) -> bool:
+    mode = str(getattr(order, "execution_mode", "") or "").strip().lower()
+    exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    return bool(mode and exchange_order_id and (mode, exchange_order_id) in official_history_links)
 
 
 def _close_order_candidate_conditions(
@@ -171,6 +216,12 @@ async def apply_plans(
         for original_plan in plans:
             close_order = await session.get(Order, int(original_plan.close_order_id))
             if close_order is None:
+                continue
+            official_history_links = await _official_history_close_order_index(
+                session,
+                execution_modes={str(close_order.execution_mode or "")},
+            )
+            if _order_has_official_history_coverage(close_order, official_history_links):
                 continue
             plan = await plan_missing_closed_position(session, close_order)
             if plan is None or not _matches_filters(plan, active_filters):
@@ -368,6 +419,7 @@ async def main() -> int:
             "manual_review_count": report.manual_review_count,
             "skipped_candidate_count": report.skipped_candidate_count,
             "unscanned_candidate_count": report.unscanned_candidate_count,
+            "official_history_covered_count": report.official_history_covered_count,
         }
     )
     classifications_by_close_order_id = {

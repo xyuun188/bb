@@ -1008,7 +1008,9 @@ class OkxAuthoritativeSyncService:
                     )
                     continue
                 decision = local_decisions.get(int(order.decision_id or 0))
-                contract_size = instrument_contract_sizes.get(fill.inst_id, 0.0)
+                contract_size = _local_order_verified_okx_raw_contract_size(order)
+                if contract_size <= 0:
+                    contract_size = instrument_contract_sizes.get(fill.inst_id, 0.0)
                 if contract_size <= 0:
                     fill_inst_id = okx_inst_id_from_symbol(fill.symbol)
                     contract_size = instrument_contract_sizes.get(fill_inst_id, 0.0)
@@ -1680,6 +1682,17 @@ def _local_order_okx_raw_contract_size(order: Order) -> float:
     if contracts > 0 and base_quantity > 0:
         return base_quantity / contracts
     return 0.0
+
+
+def _local_order_verified_okx_raw_contract_size(order: Order) -> float:
+    """Return the order-specific contract size only when sync verified it."""
+
+    raw = _safe_dict(getattr(order, "okx_raw_fills", None))
+    if raw.get("contract_size_verified") is not True:
+        return 0.0
+    if raw.get("fills_history_confirmed") is not True:
+        return 0.0
+    return _local_order_okx_raw_contract_size(order)
 
 
 def _local_order_execution_payloads(decision: AIDecision | None) -> list[dict[str, Any]]:

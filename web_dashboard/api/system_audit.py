@@ -25,7 +25,7 @@ from core.symbols import normalize_trading_symbol
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.market_data import Kline, Ticker
-from models.trade import Order, Position
+from models.trade import OkxPositionHistory, Order, Position
 from scripts.audit_runtime_text_integrity import collect_runtime_text_integrity_report
 from scripts.repair_okx_position_fact_links import (
     collect_scan_report as collect_position_fact_link_scan_report,
@@ -1674,12 +1674,28 @@ async def _okx_reconciliation_light_scan(
                 if str(order.exchange_order_id or "").strip()
             },
         )
+        official_history_link_index = await _load_official_history_close_link_index(
+            session,
+            execution_modes={str(order.execution_mode or "") for order, _action in rows},
+            exchange_order_ids={
+                str(order.exchange_order_id or "").strip()
+                for order, _action in rows
+                if str(order.exchange_order_id or "").strip()
+            },
+        )
+        official_history_covered_count = 0
         for order, action in rows:
             exchange_order_id = str(order.exchange_order_id or "").strip()
             if not exchange_order_id:
                 continue
             if (str(order.execution_mode or ""), exchange_order_id) in close_link_index:
                 linked_count += 1
+                continue
+            if (
+                str(order.execution_mode or "").strip().lower(),
+                exchange_order_id,
+            ) in official_history_link_index:
+                official_history_covered_count += 1
                 continue
             close_order_id = int(order.id)
             classification = {
@@ -1704,6 +1720,7 @@ async def _okx_reconciliation_light_scan(
     unscanned_count = max(candidate_order_count - len(rows), 0)
     classification_counts = {
         "linked": linked_count,
+        "official_history_covered": official_history_covered_count,
         "manual_review": len(plans),
         "unscanned": unscanned_count,
     }
@@ -1721,6 +1738,7 @@ async def _okx_reconciliation_light_scan(
         manual_review_count=len(plans),
         skipped_candidate_count=0,
         unscanned_candidate_count=unscanned_count,
+        official_history_covered_count=official_history_covered_count,
         scan_mode="light_close_order_link_summary",
     )
 
@@ -1754,6 +1772,34 @@ async def _load_position_close_link_index(
             if exchange_order_id in tokens or exchange_order_id == raw_text:
                 linked.add((mode_text, exchange_order_id))
     return linked
+
+
+async def _load_official_history_close_link_index(
+    session: Any,
+    *,
+    execution_modes: set[str],
+    exchange_order_ids: set[str],
+) -> set[tuple[str, str]]:
+    modes = {
+        str(mode or "").strip().lower()
+        for mode in execution_modes
+        if str(mode or "").strip()
+    }
+    if not modes or not exchange_order_ids:
+        return set()
+    rows = list(
+        (
+            await session.execute(
+                select(OkxPositionHistory).where(OkxPositionHistory.mode.in_(sorted(modes)))
+            )
+        ).scalars().all()
+    )
+    return {
+        (str(row.mode or "").strip().lower(), str(order_id or "").strip())
+        for row in rows
+        for order_id in (row.close_order_ids or [])
+        if str(order_id or "").strip() in exchange_order_ids
+    }
 
 
 def _exchange_order_link_tokens(value: str) -> set[str]:

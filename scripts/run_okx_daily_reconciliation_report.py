@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shlex
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from config.settings import settings  # noqa: E402
+from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text  # noqa: E402
 from web_dashboard.api import system_audit  # noqa: E402
 
@@ -83,7 +85,69 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow the short OKX reconciliation audit cache. Default clears it for a fresh dry-run.",
     )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help=(
+            "Run this read-only report inside the online BB runtime and print its JSON. "
+            "This prevents a local empty database from being mistaken for online state."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _online_report_command(args: argparse.Namespace) -> str:
+    remote_args = [
+        ".venv/bin/python",
+        "scripts/run_okx_daily_reconciliation_report.py",
+        "--stdout-only",
+        "--json-indent",
+        str(int(args.json_indent or 0)),
+    ]
+    if args.allow_cache:
+        remote_args.append("--allow-cache")
+    app_script = "\n".join(
+        (
+            "cd /data/bb/app",
+            "export DATABASE_URL='postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql'",
+            "exec " + " ".join(shlex.quote(value) for value in remote_args),
+        )
+    )
+    return "runuser -u bb -- /bin/bash -lc " + shlex.quote(app_script)
+
+
+def run_online_report(args: argparse.Namespace) -> int:
+    ssh = connect_remote_ssh(ROOT, timeout=20)
+    try:
+        output = run_remote_text(
+            ssh,
+            _online_report_command(args),
+            timeout=240,
+            check=False,
+            max_output_chars=200_000,
+        )
+    finally:
+        ssh.close()
+    print(output)
+    try:
+        report = _last_json_object(output)
+    except json.JSONDecodeError:
+        return 2
+    return exit_code_for_report(report)
+
+
+def _last_json_object(output: str) -> dict[str, Any]:
+    """Parse the report after optional runtime log lines from the remote process."""
+
+    lines = str(output or "").splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        candidate = "\n".join(lines[index:]).strip()
+        if not candidate.startswith("{"):
+            continue
+        value = json.loads(candidate)
+        if isinstance(value, dict):
+            return value
+    raise json.JSONDecodeError("online report JSON object not found", str(output or ""), 0)
 
 
 async def _collect_card(key: str, factory: Any) -> dict[str, Any]:
@@ -429,6 +493,8 @@ def exit_code_for_report(report: dict[str, Any]) -> int:
 
 async def async_main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.online:
+        return run_online_report(args)
     indent = None if int(args.json_indent or 0) <= 0 else int(args.json_indent)
     report = await collect_report(allow_cache=bool(args.allow_cache))
     if not args.stdout_only:
