@@ -60,6 +60,17 @@ def _aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
     }
 
 
+def _training_data_version(metadata: dict[str, Any] | None) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    quality = _dict(metadata.get("quality_report"))
+    return str(
+        metadata.get("training_data_version")
+        or quality.get("data_quality_version")
+        or ""
+    ).strip()
+
+
 def _stable_both_sides(metadata: dict[str, Any]) -> bool:
     walk_report = _dict(metadata.get("walk_forward_report"))
     walk_sides = _dict(walk_report.get("sides"))
@@ -124,9 +135,25 @@ def compare_candidate_to_champion(
         report["blocking_reasons"] = ["champion_stage_invalid"]
         return report
 
+    candidate_training_data_version = _training_data_version(candidate)
+    champion_training_data_version = _training_data_version(champion)
+    report["candidate_training_data_version"] = candidate_training_data_version or None
+    report["champion_training_data_version"] = champion_training_data_version or None
+    training_contract_refresh = bool(
+        candidate_training_data_version
+        and champion_training_data_version
+        and candidate_training_data_version != champion_training_data_version
+    )
+
     candidate_rank = _STAGE_RANK[candidate_stage]
     champion_rank = _STAGE_RANK[champion_stage]
     if candidate_rank < champion_rank:
+        if training_contract_refresh and champion_stage != "active":
+            return {
+                **report,
+                "accepted": True,
+                "reason": "training_data_contract_refresh",
+            }
         report["blocking_reasons"] = ["candidate_lifecycle_regression"]
         return report
     if candidate_rank > champion_rank:
@@ -137,6 +164,13 @@ def compare_candidate_to_champion(
             **report,
             "accepted": True,
             "reason": "governed_lifecycle_upgrade",
+        }
+
+    if training_contract_refresh:
+        return {
+            **report,
+            "accepted": True,
+            "reason": "training_data_contract_refresh",
         }
 
     candidate_aggregate = _aggregate(candidate)

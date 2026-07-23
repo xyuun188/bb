@@ -8,6 +8,7 @@ def _metadata(
     profit_factor: float = 1.40,
     cvar: float = -0.20,
     drawdown: float = 0.40,
+    training_data_version: str = "2026-07-21.authoritative-trade-integrity.v5",
 ) -> dict:
     side = {
         "avg_return_pct": avg,
@@ -18,6 +19,8 @@ def _metadata(
         "promotion_math_ready": True,
     }
     return {
+        "training_data_version": training_data_version,
+        "quality_report": {"data_quality_version": training_data_version},
         "training_data_sha256": "a" * 64,
         "walk_forward_report": {
             "sides": {
@@ -138,6 +141,36 @@ def test_same_stage_challenger_must_improve_primary_metrics() -> None:
 
     assert rejected["accepted"] is False
     assert accepted["accepted"] is True
+
+
+def test_same_stage_challenger_replaces_stale_training_data_contract() -> None:
+    report = compare_candidate_to_champion(
+        _metadata(avg=-0.10, lcb=-0.20, profit_factor=0.70),
+        _metadata(training_data_version="2026-07-14.separated-profit-supervision.v4"),
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is True
+    assert report["reason"] == "training_data_contract_refresh"
+    assert report["candidate_training_data_version"] == (
+        "2026-07-21.authoritative-trade-integrity.v5"
+    )
+    assert report["champion_training_data_version"] == (
+        "2026-07-14.separated-profit-supervision.v4"
+    )
+
+
+def test_shadow_challenger_can_replace_stale_non_active_champion() -> None:
+    report = compare_candidate_to_champion(
+        _metadata(avg=-0.10, lcb=-0.20, profit_factor=0.70),
+        _metadata(training_data_version="2026-07-14.separated-profit-supervision.v4"),
+        candidate_stage="shadow",
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is True
+    assert report["reason"] == "training_data_contract_refresh"
 
 
 def test_active_candidate_requires_multiple_profitable_walk_forward_windows() -> None:

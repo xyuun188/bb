@@ -699,6 +699,8 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
     )
     assert metadata["artifact_registry_version"] == ARTIFACT_REGISTRY_VERSION
     assert metadata["artifact_sha256"]
+    assert metadata["metrics"]["long_accuracy"] is not None
+    assert metadata["metrics"]["short_accuracy"] is not None
     assert registry.candidate_path.exists()
     assert not registry.current_path.exists()
 

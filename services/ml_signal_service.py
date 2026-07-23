@@ -397,6 +397,19 @@ def _safe_pr_auc(y_true: pd.Series, y_score: np.ndarray) -> float | None:
         return None
 
 
+def _safe_accuracy(y_true: pd.Series, y_score: np.ndarray) -> float | None:
+    try:
+        truth = pd.Series(y_true).astype(int)
+        if not len(truth):
+            return None
+        predictions = (np.asarray(y_score, dtype=float) >= 0.5).astype(int)
+        if len(predictions) != len(truth):
+            return None
+        return float((truth.to_numpy() == predictions).mean())
+    except (TypeError, ValueError):
+        return None
+
+
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(min(float(value), high), low)
 
@@ -1980,6 +1993,8 @@ def train_from_frame(
             "short_auc": _safe_auc(test["short_win"], short_scores),
             "long_pr_auc": _safe_pr_auc(test["long_win"], long_scores),
             "short_pr_auc": _safe_pr_auc(test["short_win"], short_scores),
+            "long_accuracy": _safe_accuracy(test["long_win"], long_scores),
+            "short_accuracy": _safe_accuracy(test["short_win"], short_scores),
             "top_long_avg_return_pct": return_buckets["long"]["top"]["avg_return_pct"],
             "bottom_long_avg_return_pct": return_buckets["long"]["bottom"]["avg_return_pct"],
             "top_long_median_return_pct": return_buckets["long"]["top"]["median_return_pct"],

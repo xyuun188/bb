@@ -802,6 +802,8 @@ def build_ml_readiness_report(
             "short_auc": _safe_float(metrics.get("short_auc"), None),
             "long_pr_auc": _safe_float(metrics.get("long_pr_auc"), None),
             "short_pr_auc": _safe_float(metrics.get("short_pr_auc"), None),
+            "long_accuracy": _safe_float(metrics.get("long_accuracy"), None),
+            "short_accuracy": _safe_float(metrics.get("short_accuracy"), None),
             "top_long_avg_return_pct": _safe_float(metrics.get("top_long_avg_return_pct"), None),
             "top_long_return_lcb_pct": _safe_float(
                 metrics.get("top_long_return_lcb_pct"), None
