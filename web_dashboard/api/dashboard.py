@@ -754,12 +754,22 @@ def _display_opportunity_score(
 def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
     """Expose the persisted distribution and cost contract without recalculating it."""
 
+    gate = _safe_dict(raw.get("production_trade_gate"))
+    gate_mode = str(gate.get("mode") or "").lower()
     opportunity = _safe_dict(raw.get("opportunity_score"))
     distribution = _safe_dict(opportunity.get("return_distribution_contract"))
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
     breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
     policy = _safe_dict(raw.get("production_return_policy"))
     if not opportunity:
+        if gate_mode == "live_rules_canary":
+            return {
+                "available": False,
+                "production_trade_gate": gate,
+                "execution_mode": "live_rules_canary",
+                "blockers": [],
+                "model_live_blockers": ["production_return_distribution_missing"],
+            }
         return {
             "available": False,
             "blockers": ["production_return_distribution_missing"],
@@ -779,9 +789,24 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
             if value
         )
     )
+    model_live_blockers: list[str] = []
+    if gate_mode == "live_rules_canary":
+        model_live_blockers = blockers
+        blockers = []
+    elif gate and gate.get("can_trade") is not True:
+        blockers = list(
+            dict.fromkeys(
+                [
+                    str(gate.get("reason") or "production_trade_gate_blocked"),
+                    *blockers,
+                ]
+            )
+        )
     return {
         "available": bool(distribution and execution_cost and breakdown and policy),
         "production_eligible": opportunity.get("production_eligible") is True,
+        "production_trade_gate": gate,
+        "execution_mode": gate_mode or None,
         "side": opportunity.get("side"),
         "return_distribution_contract": distribution,
         "execution_cost": {
@@ -835,6 +860,7 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
             )
         },
         "blockers": blockers,
+        "model_live_blockers": model_live_blockers,
     }
 
 

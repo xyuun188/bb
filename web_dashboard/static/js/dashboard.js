@@ -4699,11 +4699,14 @@ function mlDecisionAlignment(record, prediction) {
 
 function mlPredictionEconomicsHtml(record, prediction) {
     const economics = record?.prediction_economics || {};
+    const tradeGate = economics.production_trade_gate || {};
+    const gateMode = String(economics.execution_mode || tradeGate.mode || '').trim();
     const distribution = standardizedReturnDistribution(prediction, prediction?.best_side);
     const productionDistribution = economics.return_distribution_contract || {};
     const cost = economics.execution_cost || {};
     const breakdown = economics.cost_and_return_breakdown || {};
     const blockers = Array.isArray(economics.blockers) ? economics.blockers : [];
+    const modelLiveBlockers = Array.isArray(economics.model_live_blockers) ? economics.model_live_blockers : [];
     const metric = (label, value) => `
         <div class="ml-prediction-metric">
             <span>${escHtml(label)}</span>
@@ -4732,11 +4735,15 @@ function mlPredictionEconomicsHtml(record, prediction) {
     const contractReady = economics.available === true
         && distribution?.production_eligible === true
         && economics.production_eligible === true;
+    const rulesCanary = gateMode === 'live_rules_canary';
+    const headlineStatus = contractReady
+        ? '生产合同完整'
+        : (rulesCanary ? '规则小仓采样' : '仅观察 / 已阻断');
     return `
-        <div class="ml-prediction-contract ${contractReady ? 'ready' : 'blocked'}">
+        <div class="ml-prediction-contract ${contractReady || rulesCanary ? 'ready' : 'blocked'}">
             <div class="ml-prediction-contract-head">
                 <strong>收益分布与逐项成本</strong>
-                <span>${contractReady ? '生产合同完整' : '仅观察 / 已阻断'}</span>
+                <span>${headlineStatus}</span>
             </div>
             <div class="ml-prediction-distribution">${distributionMetrics.join('')}</div>
             <div class="ml-prediction-costs">
@@ -4748,6 +4755,7 @@ function mlPredictionEconomicsHtml(record, prediction) {
                 <span>成本扣除次数 ${mlSampleCountLabel(mlOptionalNumber(breakdown.cost_deduction_count))}</span>
             </div>
             ${blockers.length ? `<div class="ml-prediction-blockers">阻断：${blockers.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>` : ''}
+            ${rulesCanary && modelLiveBlockers.length ? `<div class="ml-prediction-blockers">模型接管未达标：${modelLiveBlockers.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>` : ''}
         </div>`;
 }
 
