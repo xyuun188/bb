@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAuditService
 from services.trade_execution_contract import build_live_rules_canary_entry_contract
 from tests.paper_canary_fixtures import complete_paper_canary_raw
@@ -104,7 +105,7 @@ def _live_rules_canary_decision() -> SimpleNamespace:
     provenance = _provenance()
     raw = {
         "production_trade_gate": {
-            "version": "test-gate",
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "mode": "live_rules_canary",
             "can_trade": True,
             "decision_authority": "rules",

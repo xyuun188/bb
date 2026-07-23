@@ -32,6 +32,7 @@ from services.paper_training import (
     attach_paper_training_order_identity,
     is_paper_training_decision,
 )
+from services.production_trade_gate import validate_production_trade_gate
 from services.strategy_arbitration import arbitrate_decision
 from services.trade_execution_contract import build_live_rules_canary_entry_contract
 from services.trade_recommendation_contract import attach_trade_execution_result
@@ -68,44 +69,6 @@ def _governance_complete(value: dict[str, Any]) -> bool:
     )
 
 
-def _rules_canary_entry_contract_result(
-    decision: DecisionOutput,
-    model_mode: str = "",
-) -> PolicyGateResult | None:
-    """Allow bounded live rules-canary entries before model promotion."""
-
-    if str(model_mode or "").lower() == "paper":
-        return None
-    raw = _safe_dict(decision.raw_response)
-    gate = _safe_dict(raw.get("production_trade_gate"))
-    if gate.get("mode") != "live_rules_canary":
-        return None
-
-    contract, blockers = build_live_rules_canary_entry_contract(
-        raw,
-        entry_action=decision.action,
-    )
-    if blockers:
-        return PolicyGateResult.block(
-            "live_rules_canary_contract_incomplete",
-            "Live rules canary contract is incomplete; entry fails closed.",
-            {
-                "stage_status": "blocked",
-                "block_reasons": blockers,
-                "production_trade_gate": gate,
-                "live_rules_canary_contract": contract,
-            },
-        )
-    return PolicyGateResult.allow(
-        {
-            "return_execution_contract": "live_rules_canary",
-            "production_permission": True,
-            "production_trade_gate": gate,
-            "live_rules_canary_contract": contract,
-        }
-    )
-
-
 def _return_entry_contract_result(
     decision: DecisionOutput,
     model_mode: str = "",
@@ -114,10 +77,6 @@ def _return_entry_contract_result(
 
     if not decision.is_entry:
         return PolicyGateResult.allow({"return_execution_contract": "not_entry"})
-
-    rules_canary_result = _rules_canary_entry_contract_result(decision, model_mode)
-    if rules_canary_result is not None:
-        return rules_canary_result
 
     if PaperBootstrapCanaryPolicy.is_claimed(decision):
         assessment = PaperBootstrapCanaryPolicy.assess(decision, model_mode)
@@ -177,6 +136,47 @@ def _return_entry_contract_result(
         )
 
     raw = _safe_dict(decision.raw_response)
+    production_gate: dict[str, Any] | None = None
+    if str(model_mode or "").lower() != "paper":
+        gate_validation = validate_production_trade_gate(
+            raw.get("production_trade_gate")
+        )
+        if not gate_validation.valid:
+            return PolicyGateResult.block(
+                "production_trade_gate",
+                f"生产交易门禁无效：{gate_validation.reason}",
+                {
+                    "stage_status": "blocked",
+                    "gate_validation_reason": gate_validation.reason,
+                    "production_trade_gate": gate_validation.gate,
+                },
+            )
+        production_gate = gate_validation.gate
+        if gate_validation.mode == "live_rules_canary":
+            contract, blockers = build_live_rules_canary_entry_contract(
+                raw,
+                entry_action=decision.action,
+            )
+            if blockers:
+                return PolicyGateResult.block(
+                    "live_rules_canary_contract_incomplete",
+                    "Live rules canary contract is incomplete; entry fails closed.",
+                    {
+                        "stage_status": "blocked",
+                        "block_reasons": blockers,
+                        "production_trade_gate": production_gate,
+                        "live_rules_canary_contract": contract,
+                    },
+                )
+            return PolicyGateResult.allow(
+                {
+                    "return_execution_contract": "live_rules_canary",
+                    "production_permission": True,
+                    "production_trade_gate": production_gate,
+                    "live_rules_canary_contract": contract,
+                }
+            )
+
     candidate = _safe_dict(raw.get("authoritative_return_candidate"))
     side_evidence = _safe_dict(candidate.get("side_evidence"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
@@ -261,6 +261,8 @@ def _return_entry_contract_result(
             "expected_net_return_pct": expected_net,
             "return_lcb_pct": return_lcb,
             "production_source_count": source_count,
+            "production_permission": production_gate is not None,
+            "production_trade_gate": production_gate,
         }
     )
 
@@ -1224,36 +1226,66 @@ class ExecutionService:
                 return await block_before_submit(exit_policy_result)
 
         if decision.is_entry:
-            try:
-                if self.production_trade_gate_provider is not None:
+            raw = dict(_safe_dict(decision.raw_response))
+            raw.pop("production_trade_gate", None)
+            decision.raw_response = raw
+
+            if str(model_mode or "").lower() != "paper":
+                if self.production_trade_gate_provider is None:
+                    return await block_before_submit(
+                        PolicyGateResult.block(
+                            "production_trade_gate",
+                            "生产开仓缺少权威交易门禁，系统已拒绝提交订单。",
+                            {
+                                "stage_status": "blocked",
+                                "skip_kind": "production_trade_gate",
+                                "gate_validation_reason": (
+                                    "production_trade_gate_provider_missing"
+                                ),
+                            },
+                        )
+                    )
+                try:
                     gate_payload = await self.production_trade_gate_provider(
                         decision,
                         model_name,
                         model_mode,
                         open_positions,
                     )
-                    if isinstance(gate_payload, dict) and gate_payload:
-                        raw = _safe_dict(decision.raw_response)
-                        raw = dict(raw)
-                        raw["production_trade_gate"] = gate_payload
-                        decision.raw_response = raw
-                        if str(model_mode or "").lower() != "paper" and gate_payload.get(
-                            "can_trade"
-                        ) is not True:
-                            return await block_before_submit(
-                                PolicyGateResult.block(
-                                    "production_trade_gate",
-                                    (
-                                        "生产交易闸门未放行："
-                                        f"{gate_payload.get('reason') or gate_payload.get('mode') or 'unknown'}"
-                                    ),
-                                    {
-                                        "stage_status": "blocked",
-                                        "skip_kind": "production_trade_gate",
-                                        "production_trade_gate": gate_payload,
-                                    },
-                                )
-                            )
+                except asyncio.CancelledError:
+                    return await policy_evaluation_failed_result(
+                        blocker="production_trade_gate_cancelled",
+                        reason="生产交易门禁检查被取消，系统未提交 OKX 订单。",
+                        error_type="cancelled",
+                    )
+                except Exception as exc:
+                    error_text = safe_error_text(exc, limit=180)
+                    return await policy_evaluation_failed_result(
+                        blocker="production_trade_gate_error",
+                        reason=f"生产交易门禁检查异常：{error_text}。系统未提交 OKX 订单。",
+                        error_type="exception",
+                        error=error_text,
+                    )
+
+                gate_validation = validate_production_trade_gate(gate_payload)
+                if not gate_validation.valid:
+                    return await block_before_submit(
+                        PolicyGateResult.block(
+                            "production_trade_gate",
+                            f"生产交易门禁无效：{gate_validation.reason}",
+                            {
+                                "stage_status": "blocked",
+                                "skip_kind": "production_trade_gate",
+                                "gate_validation_reason": gate_validation.reason,
+                                "production_trade_gate": gate_validation.gate,
+                            },
+                        )
+                    )
+                raw = dict(_safe_dict(decision.raw_response))
+                raw["production_trade_gate"] = gate_validation.gate
+                decision.raw_response = raw
+
+            try:
                 entry_policy_result = await evaluate_entry_policy(
                     decision,
                     model_name,

@@ -269,3 +269,14 @@
 - 单次预测能否参与当前决策使用 `prediction_eligible` / `ml_prediction_eligible` 表示，但它不能授予生产权限；生产权限仍只来自 `production_trade_gate`。
 - 盈亏归因不再接受默认 ML 影响开关。只有当 `production_trade_gate` 同时满足 `can_trade=true`、`mode=live_ml`、`decision_authority=model`、`model_can_influence=true` 时，交易才标记为模型生产责任；无闸门和规则小仓交易一律不归责给模型。
 - 本地量化 API 没有当前 epoch artifact 时必须显式返回 `trained=false`、`live_ml_ready=false`、`production_permission=false`、`production_eligible=false`，不得伪造 `loss_probability` 或收益预测；部署 smoke 同时验证无 artifact 的观察态和有 artifact 的晋升态。
+
+## 18. 生产交易授权单一路径
+
+- `production_trade_gate` 已升级为 `2026-07-24.profit-loop-trade-gate.v2`；生产开仓只接受当前版本，不兼容旧版本、不接受缺字段字典。
+- 唯一合法生产模式只有 `live_rules_canary + rules + model_can_influence=false` 和 `live_ml + model + model_can_influence=true`；模式、权责或版本不一致时统一失败关闭。
+- `ExecutionService` 对非模拟开仓强制要求权威门禁提供器；缺少提供器、返回空值、返回关闭门禁或返回旧门禁时，必须在获取 OKX 执行器前拒绝。
+- `EntryPolicy` 和最终执行合同只复核同一个门禁结果；`live_ml_profit_contract` 只提供收益安全证据，不能单独授予生产权限。
+- 仓位计算、价格保护、候选排序、规则信号、成交合同和训练责任归因全部调用同一个门禁校验器；删除各模块手写的规则/模型授权判断和旧阻断码。
+- 模拟交易不读取生产门禁；进入执行服务时会清除裁决载荷中夹带的生产门禁，避免模拟样本被错误标记为模型实盘责任。
+- 策略学习只提供历史先验上下文，不提供生产授权。`production_influence_enabled` / `production_influence_eligible` 已删除并替换为 `historical_prior_context_enabled` / `historical_prior_context_eligible`，旧键不迁移、不双读。
+- Dashboard、持续策略路由、纸面冠军和线上健康检查统一使用“历史先验上下文”命名，并继续显式声明 `can_authorize_entry=false`、`production_permission=false`。

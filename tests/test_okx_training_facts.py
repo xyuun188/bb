@@ -9,6 +9,7 @@ from services.authoritative_trade_outcome import build_authoritative_trade_outco
 from services.okx_training_facts import build_okx_history_training_sample
 from services.paper_exploration import build_paper_exploration_contract
 from services.paper_training import build_paper_training_contract
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
 
@@ -135,7 +136,13 @@ def _complete_lineage() -> dict:
         },
         "decision_raw_by_order_id": {
             "entry-1": {
-                "production_trade_gate": {"decision_authority": "model"},
+                "production_trade_gate": {
+                    "version": PRODUCTION_TRADE_GATE_VERSION,
+                    "can_trade": True,
+                    "mode": "live_ml",
+                    "decision_authority": "model",
+                    "model_can_influence": True,
+                },
                 "opportunity_score": {"expected_net_return_pct": 0.8},
             }
         },
@@ -214,6 +221,8 @@ def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> Non
     _set_close_fill_price(lineage, 99_650.0)
     lineage["decision_raw_by_order_id"]["entry-1"] = {
         "production_trade_gate": {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
+            "can_trade": True,
             "mode": "live_rules_canary",
             "decision_authority": "rules",
             "model_can_influence": False,

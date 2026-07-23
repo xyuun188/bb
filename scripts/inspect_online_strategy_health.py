@@ -638,8 +638,8 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
                 if key in paper_champion
             },
             "historical_model_replay": historical_replay,
-            "production_influence_enabled": bool(
-                runtime.get("production_influence_enabled")
+            "historical_prior_context_enabled": bool(
+                runtime.get("historical_prior_context_enabled")
             ),
             "can_authorize_entry": runtime.get("can_authorize_entry"),
             "policy_provenance": runtime.get("policy_provenance") or {},

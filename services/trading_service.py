@@ -5205,7 +5205,9 @@ class TradingService:
             ),
             "scheduler_reason": strategy_mode_context.get("scheduler_reason"),
             "market_regime": strategy_mode_context.get("market_regime"),
-            "production_influence_enabled": runtime.get("production_influence_enabled") is True,
+            "historical_prior_context_enabled": (
+                runtime.get("historical_prior_context_enabled") is True
+            ),
             "strategy_learning": learning,
         }
         decision.raw_response = raw
@@ -5395,15 +5397,13 @@ class TradingService:
             return
         if str(model_mode or "").lower() != "paper":
             raw = dict(self._safe_dict(decision.raw_response))
-            gate = self._safe_dict(raw.get("production_trade_gate"))
-            if not gate:
-                gate = await self.production_trade_gate_snapshot(
-                    decision,
-                    str(decision.model_name or ENSEMBLE_TRADER_NAME),
-                    model_mode,
-                    open_positions or [],
-                )
-                raw["production_trade_gate"] = gate
+            gate = await self.production_trade_gate_snapshot(
+                decision,
+                str(decision.model_name or ENSEMBLE_TRADER_NAME),
+                model_mode,
+                open_positions or [],
+            )
+            raw["production_trade_gate"] = gate
             decision.raw_response = raw
         await self.entry_policy.prepare_dynamic_risk_contract(
             decision,

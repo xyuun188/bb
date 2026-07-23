@@ -6,6 +6,7 @@ from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from models.trade import Order, Position
 from services.entry_signal_extraction import extract_entry_signal_sides
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.profit_attribution import (
     build_profit_attribution,
     extract_signal_sides,
@@ -225,6 +226,7 @@ def test_extract_signal_sides_uses_only_production_trade_gate_for_model_authorit
         {
             "ml_signal": _ml_payload("long", 0.81),
             "production_trade_gate": {
+                "version": PRODUCTION_TRADE_GATE_VERSION,
                 "can_trade": True,
                 "mode": "live_ml",
                 "decision_authority": "model",

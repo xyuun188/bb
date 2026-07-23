@@ -16,6 +16,7 @@ from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
 from services.okx_training_facts import build_okx_history_training_sample
 from services.paper_training import build_paper_training_contract
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import validate_entry_execution_contract
 from services.trading_policies import PolicyGateResult
 from services.training_data_quality import annotate_training_payload
@@ -138,6 +139,13 @@ def _dynamic_return_ready_decision() -> DecisionOutput:
     }
     decision.position_size_pct = 0.03
     decision.raw_response = {
+        "production_trade_gate": {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
+            "can_trade": True,
+            "mode": "live_ml",
+            "decision_authority": "model",
+            "model_can_influence": True,
+        },
         "authoritative_return_candidate": {
             "production_eligible": True,
             "side_evidence": {
@@ -186,7 +194,7 @@ def _live_rules_canary_ready_decision(*, max_notional: float = 100.0) -> Decisio
     provenance = raw["profit_risk_sizing"]["policy_provenance"]
     final_notional = float(raw["profit_risk_sizing"]["final_notional_usdt"])
     raw["production_trade_gate"] = {
-        "version": "test",
+        "version": PRODUCTION_TRADE_GATE_VERSION,
         "mode": "live_rules_canary",
         "can_trade": True,
         "decision_authority": "rules",
@@ -332,6 +340,18 @@ def test_dynamic_return_contract_accepts_complete_governed_entry() -> None:
     result = _return_entry_contract_result(_dynamic_return_ready_decision())
     assert result.passed is True
     assert result.data["return_execution_contract"] == "complete"
+    assert result.data["production_permission"] is True
+
+
+def test_live_ml_profit_contract_cannot_authorize_entry_without_trade_gate() -> None:
+    decision = _dynamic_return_ready_decision()
+    decision.raw_response.pop("production_trade_gate")
+
+    result = _return_entry_contract_result(decision, "live")
+
+    assert result.passed is False
+    assert result.blocker == "production_trade_gate"
+    assert result.data["gate_validation_reason"] == "production_trade_gate_missing"
 
 
 def test_live_rules_canary_bypasses_model_promotion_return_distribution() -> None:
@@ -357,6 +377,72 @@ def test_live_rules_canary_respects_gate_notional_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_entry_without_trade_gate_provider_never_calls_okx() -> None:
+    calls = 0
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("missing production gate must stop before OKX submit")
+
+    service = _test_execution_service(okx_executor_provider=okx_executor_provider)
+    service.model_execution_mode_provider = lambda _model: "live"
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        _dynamic_return_ready_decision(),
+        SimpleNamespace(warnings=[]),
+        2600,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert calls == 0
+    assert result is not None and result.status == OrderStatus.REJECTED
+    assert result.raw_response["policy_blocker"] == "production_trade_gate"
+    assert result.raw_response["gate_validation_reason"] == (
+        "production_trade_gate_provider_missing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_entry_with_empty_trade_gate_never_calls_okx() -> None:
+    calls = 0
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid production gate must stop before OKX submit")
+
+    async def gate_provider(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        production_trade_gate_provider=gate_provider,
+    )
+    service.model_execution_mode_provider = lambda _model: "live"
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        _dynamic_return_ready_decision(),
+        SimpleNamespace(warnings=[]),
+        2601,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert calls == 0
+    assert result is not None and result.status == OrderStatus.REJECTED
+    assert result.raw_response["policy_blocker"] == "production_trade_gate"
+    assert result.raw_response["gate_validation_reason"] == (
+        "production_trade_gate_missing"
+    )
+
+
+@pytest.mark.asyncio
 async def test_execution_service_attaches_trade_gate_before_entry_policy() -> None:
     raw_updates: list[dict[str, Any] | None] = []
     calls: list[str] = []
@@ -368,6 +454,7 @@ async def test_execution_service_attaches_trade_gate_before_entry_policy() -> No
     async def gate_provider(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         calls.append("gate")
         return {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "can_trade": True,
             "mode": "live_rules_canary",
             "decision_authority": "rules",
@@ -396,6 +483,7 @@ async def test_execution_service_attaches_trade_gate_before_entry_policy() -> No
         production_trade_gate_provider=gate_provider,
         raw_updates=raw_updates,
     )
+    service.model_execution_mode_provider = lambda _model: "live"
     results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
 
     result = await service.execute_candidate(
@@ -417,6 +505,7 @@ async def test_execution_service_attaches_trade_gate_before_entry_policy() -> No
 @pytest.mark.asyncio
 async def test_execution_service_persists_live_rules_canary_contract_before_submit() -> None:
     decision = _live_rules_canary_ready_decision()
+    trade_gate = dict(decision.raw_response["production_trade_gate"])
     raw_updates: list[dict[str, Any] | None] = []
 
     class FilledExecutor:
@@ -445,7 +534,7 @@ async def test_execution_service_persists_live_rules_canary_contract_before_subm
         return executor
 
     async def gate_provider(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return dict(decision.raw_response["production_trade_gate"])
+        return dict(trade_gate)
 
     service = _test_execution_service(
         okx_executor_provider=executor_provider,

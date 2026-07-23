@@ -165,7 +165,7 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
                     "rejected_candidate_count": 6,
                     "current_production_strategy": {"id": "dynamic-return-contract"},
                     "runtime": {
-                        "production_influence_enabled": False,
+                        "historical_prior_context_enabled": False,
                         "can_authorize_entry": False,
                     },
                 },
@@ -211,7 +211,7 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
     closed_loop = summary["profit_closed_loop"]
     assert closed_loop["shadow_maturity"]["completed_total"] == 14
     assert closed_loop["strategy_scheduler"]["candidate_count"] == 6
-    assert closed_loop["strategy_scheduler"]["production_influence_enabled"] is False
+    assert closed_loop["strategy_scheduler"]["historical_prior_context_enabled"] is False
     assert closed_loop["strategy_scheduler"]["paper_strategy_champion"][
         "active"
     ] is False

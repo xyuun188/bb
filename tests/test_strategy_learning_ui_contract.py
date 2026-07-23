@@ -17,7 +17,8 @@ def test_strategy_learning_ui_shows_dynamic_return_governance() -> None:
     assert "return_lcb_pct" in VIEW
     assert "realized_net_pnl_usdt" in VIEW
     assert "profit_factor" in VIEW
-    assert "production_influence_eligible" in VIEW
+    assert "historical_prior_context_eligible" in VIEW
+    assert "production_influence" not in VIEW
     assert "rejection_reasons" in VIEW
     assert "滚动收益率下界" in VIEW
     assert "影子收益率下界" in VIEW

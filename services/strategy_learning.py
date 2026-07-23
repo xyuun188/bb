@@ -375,7 +375,7 @@ def _current_production_strategy(
             },
         },
         "historical_prior_matching_enabled": bool(
-            runtime.get("production_influence_enabled")
+            runtime.get("historical_prior_context_enabled")
         ),
     }
 
@@ -785,7 +785,11 @@ def _candidate_rank_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     backtest_metrics = _safe_dict(backtest.get("metrics"))
     shadow_metrics = _safe_dict(shadow.get("metrics"))
     return (
-        bool(_safe_dict(candidate.get("promotion")).get("production_influence_eligible")),
+        bool(
+            _safe_dict(candidate.get("promotion")).get(
+                "historical_prior_context_eligible"
+            )
+        ),
         _rank_value(backtest_metrics.get("return_lcb_pct")),
         _rank_value(shadow_metrics.get("return_lcb_pct")),
         _rank_value(historical.get("realized_net_pnl_usdt")),
@@ -899,13 +903,23 @@ class StrategyLearningEngine:
             ):
                 rejection_reasons.append("exact_model_replay_evidence_missing")
             rejection_reasons = list(dict.fromkeys(rejection_reasons))
-            influence_eligible = not rejection_reasons
+            historical_prior_context_eligible = not rejection_reasons
             profile_payload = profile.to_dict()
-            profile_payload["status"] = "governed" if influence_eligible else "shadow_validation"
+            profile_payload["status"] = (
+                "governed"
+                if historical_prior_context_eligible
+                else "shadow_validation"
+            )
             profile_payload["promotion"] = {
                 **_safe_dict(profile_payload.get("promotion")),
-                "evaluation_state": "governed" if influence_eligible else "blocked",
-                "production_influence_eligible": influence_eligible,
+                "evaluation_state": (
+                    "governed"
+                    if historical_prior_context_eligible
+                    else "blocked"
+                ),
+                "historical_prior_context_eligible": (
+                    historical_prior_context_eligible
+                ),
                 "rejection_reasons": rejection_reasons,
                 "can_authorize_entry": False,
                 "can_change_size_or_leverage": False,
@@ -927,7 +941,9 @@ class StrategyLearningEngine:
         governed = [
             candidate
             for candidate in candidates
-            if _safe_dict(candidate.get("promotion")).get("production_influence_eligible")
+            if _safe_dict(candidate.get("promotion")).get(
+                "historical_prior_context_eligible"
+            )
             is True
         ]
         context = _safe_dict(current_context)
@@ -945,10 +961,10 @@ class StrategyLearningEngine:
             or ""
         ).lower()
         leading = (candidates or [None])[0]
-        influence_enabled = bool(governed)
+        historical_prior_context_enabled = bool(governed)
         scheduler_mode = (
             "governed_dynamic_return"
-            if influence_enabled
+            if historical_prior_context_enabled
             else "continuous_paper_strategy_routing"
             if routed_side in {"long", "short"}
             else "model_replay_no_fee_after_entries"
@@ -964,10 +980,10 @@ class StrategyLearningEngine:
         reason = (
             "Governed fee-after return candidates are available from exact model replay; "
             "the current live return and dynamic risk contracts still own execution."
-            if influence_enabled and exact_replay
+            if historical_prior_context_enabled and exact_replay
             else "Governed fee-after return candidates are available as matching historical priors; "
             "the current live return and dynamic risk contracts still own execution."
-            if influence_enabled
+            if historical_prior_context_enabled
             else "Validated strategies remain continuously weighted for paper training; current return and risk contracts still own normal entries."
             if routed_side in {"long", "short"}
             else "Exact trained-model historical replay found no fee-after-positive entries; no model strategy candidate was created."
@@ -1001,7 +1017,7 @@ class StrategyLearningEngine:
         ]
         runtime = {
             "optimization_target": "maximize_authoritative_fee_after_return_rate",
-            "production_influence_enabled": influence_enabled,
+            "historical_prior_context_enabled": historical_prior_context_enabled,
             "can_authorize_entry": False,
             "can_change_size_or_leverage": False,
             "current_return_contract_required": True,
@@ -1028,7 +1044,9 @@ class StrategyLearningEngine:
                 ),
                 "generated_at": feedback.generated_at,
                 "strategy_version": STRATEGY_SCHEDULER_VERSION,
-                "fallback_reason": "" if influence_enabled else scheduler_mode,
+                "fallback_reason": (
+                    "" if historical_prior_context_enabled else scheduler_mode
+                ),
             },
         }
         production_strategy = _current_production_strategy(feedback, runtime)

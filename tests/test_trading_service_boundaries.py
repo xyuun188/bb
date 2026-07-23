@@ -47,6 +47,7 @@ from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
@@ -3182,6 +3183,7 @@ async def test_entry_policy_allows_live_rules_canary_without_live_ml_profit_cont
     decision = _decision(Action.LONG)
     decision.raw_response = {
         "production_trade_gate": {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "can_trade": True,
             "mode": "live_rules_canary",
             "decision_authority": "rules",
@@ -3373,6 +3375,7 @@ async def test_live_trade_gate_is_attached_before_dynamic_sizing() -> None:
     async def gate_snapshot(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         events.append("gate")
         return {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "mode": "live_rules_canary",
             "can_trade": True,
             "decision_authority": "rules",
@@ -3416,6 +3419,7 @@ async def test_live_market_signal_uses_rules_instead_of_model_direction() -> Non
 
     async def gate_snapshot(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "mode": "live_rules_canary",
             "can_trade": True,
             "decision_authority": "rules",
@@ -4614,7 +4618,7 @@ def test_decision_snapshot_keeps_governed_strategy_attribution_without_permissio
         },
         "strategy_learning": {
             "scheduler_mode": "governed_dynamic_return",
-            "runtime": {"production_influence_enabled": True},
+            "runtime": {"historical_prior_context_enabled": True},
         },
     }
 
@@ -4625,7 +4629,7 @@ def test_decision_snapshot_keeps_governed_strategy_attribution_without_permissio
     assert "strategy_profile_id" not in snapshot
     assert "strategy_profile_version" not in snapshot
     assert snapshot["scheduler_reason"] == "highest governed fee-after return LCB"
-    assert snapshot["production_influence_enabled"] is True
+    assert snapshot["historical_prior_context_enabled"] is True
     assert snapshot["production_permission"] is False
     assert snapshot["advisory_prior_only"] is True
 

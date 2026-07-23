@@ -25,6 +25,7 @@ from services.paper_training import (
     is_paper_training_decision,
 )
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
+from services.production_trade_gate import validate_production_trade_gate
 from services.trade_recommendation_contract import (
     attach_risk_adjusted_trade_recommendation,
     paper_trade_recommendation_reason_text,
@@ -180,21 +181,6 @@ class EntryPolicy:
             )
             return
         raise RuntimeError("EntryPolicy requires entry_profit_risk_sizing dependency")
-
-    @staticmethod
-    def _live_rules_canary_gate(decision: DecisionOutput) -> dict[str, Any]:
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        gate = raw.get("production_trade_gate")
-        if not isinstance(gate, dict):
-            return {}
-        if (
-            gate.get("mode") == "live_rules_canary"
-            and gate.get("can_trade") is True
-            and gate.get("decision_authority") == "rules"
-            and gate.get("model_can_influence") is False
-        ):
-            return gate
-        return {}
 
     @staticmethod
     def _record_execution_cost_sizing_pass(
@@ -531,16 +517,35 @@ class EntryPolicy:
                     "production_permission": False,
                 }
             )
-        rules_canary_gate = self._live_rules_canary_gate(decision)
-        if rules_canary_gate and str(model_mode or "").lower() != "paper":
-            return PolicyGateResult.allow(
-                {
-                    "intent": "live_rules_canary_entry",
-                    "pipeline_context": context.public_data(),
-                    "production_permission": True,
-                    "production_trade_gate": rules_canary_gate,
-                }
+        production_gate = None
+        if str(model_mode or "").lower() != "paper":
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            gate_validation = validate_production_trade_gate(
+                raw.get("production_trade_gate")
             )
+            if not gate_validation.valid:
+                return PolicyGateResult.block(
+                    "production_trade_gate",
+                    f"生产交易门禁无效：{gate_validation.reason}",
+                    {
+                        "pipeline_context": context.public_data(),
+                        "stage_status": "blocked",
+                        "skip_kind": "production_trade_gate",
+                        "gate_validation_reason": gate_validation.reason,
+                        "production_trade_gate": gate_validation.gate,
+                    },
+                )
+            production_gate = gate_validation.gate
+            if gate_validation.mode == "live_rules_canary":
+                return PolicyGateResult.allow(
+                    {
+                        "intent": "live_rules_canary_entry",
+                        "pipeline_context": context.public_data(),
+                        "production_permission": True,
+                        "production_trade_gate": production_gate,
+                    }
+                )
+
         live_ml_assessment = apply_live_ml_profit_contract(decision)
         if not live_ml_assessment.eligible:
             return PolicyGateResult.block(
@@ -556,9 +561,11 @@ class EntryPolicy:
 
         return PolicyGateResult.allow(
             {
-                "intent": "entry",
+                "intent": "live_ml_entry" if production_gate is not None else "entry",
                 "pipeline_context": context.public_data(),
                 "live_ml_profit_contract": live_ml_assessment.to_dict(),
+                "production_permission": production_gate is not None,
+                "production_trade_gate": production_gate,
             }
         )
 

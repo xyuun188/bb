@@ -15,8 +15,9 @@ from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 TradeGateMode = Literal["observe", "live_rules_canary", "live_ml", "blocked"]
 DecisionAuthority = Literal["none", "rules", "model"]
+AuthorizedTradeGateMode = Literal["live_rules_canary", "live_ml"]
 
-PRODUCTION_TRADE_GATE_VERSION = "2026-07-23.profit-loop-trade-gate.v1"
+PRODUCTION_TRADE_GATE_VERSION = "2026-07-24.profit-loop-trade-gate.v2"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -72,6 +73,65 @@ class ProductionTradeGateResult:
         payload = asdict(self)
         payload["risk"] = self.risk.to_dict()
         return payload
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionTradeGateValidation:
+    valid: bool
+    reason: str
+    gate: dict[str, Any] = field(default_factory=dict)
+    mode: AuthorizedTradeGateMode | None = None
+
+
+def validate_production_trade_gate(
+    value: Any,
+    *,
+    required_mode: AuthorizedTradeGateMode | None = None,
+) -> ProductionTradeGateValidation:
+    """Validate the only contract allowed to authorize a production entry."""
+
+    if not isinstance(value, dict) or not value:
+        return ProductionTradeGateValidation(False, "production_trade_gate_missing")
+    gate = dict(value)
+    if gate.get("version") != PRODUCTION_TRADE_GATE_VERSION:
+        return ProductionTradeGateValidation(
+            False,
+            "production_trade_gate_version_invalid",
+            gate,
+        )
+    if gate.get("can_trade") is not True:
+        return ProductionTradeGateValidation(
+            False,
+            str(gate.get("reason") or "production_trade_gate_closed"),
+            gate,
+        )
+
+    mode = gate.get("mode")
+    if mode not in {"live_rules_canary", "live_ml"}:
+        return ProductionTradeGateValidation(
+            False,
+            "production_trade_gate_mode_invalid",
+            gate,
+        )
+    if required_mode is not None and mode != required_mode:
+        return ProductionTradeGateValidation(
+            False,
+            "production_trade_gate_mode_mismatch",
+            gate,
+        )
+
+    expected_authority = "rules" if mode == "live_rules_canary" else "model"
+    expected_model_influence = mode == "live_ml"
+    if (
+        gate.get("decision_authority") != expected_authority
+        or gate.get("model_can_influence") is not expected_model_influence
+    ):
+        return ProductionTradeGateValidation(
+            False,
+            "production_trade_gate_authority_invalid",
+            gate,
+        )
+    return ProductionTradeGateValidation(True, "ok", gate, mode)
 
 
 def _risk_limits(settings: dict[str, Any], risk: dict[str, Any]) -> TradeGateRiskLimits:
@@ -159,7 +219,7 @@ def _model_live_ml_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
     influence_allowed = model.get("live_ml_ready") is True
     blockers: list[str] = []
     if not influence_allowed:
-        blockers.append("model_live_influence_not_authorized")
+        blockers.append("model_live_ml_ready_false")
     profit_ready, profit_blockers = _model_profit_ready(model)
     if not profit_ready:
         blockers.extend(profit_blockers)

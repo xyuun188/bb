@@ -9,6 +9,7 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.production_trade_gate import validate_production_trade_gate
 
 LIVE_RULES_CANARY_SIGNAL_VERSION = "2026-07-23.live-rules-canary-signal.v1"
 _DIRECTION_FIELDS = (
@@ -161,14 +162,13 @@ def apply_live_rules_canary_signal(
 ) -> dict[str, Any] | None:
     """Replace model execution fields when the authoritative gate selects rules."""
 
-    trade_gate = _safe_dict(gate)
-    if (
-        trade_gate.get("mode") != "live_rules_canary"
-        or trade_gate.get("can_trade") is not True
-        or trade_gate.get("decision_authority") != "rules"
-        or trade_gate.get("model_can_influence") is not False
-    ):
+    gate_validation = validate_production_trade_gate(
+        gate,
+        required_mode="live_rules_canary",
+    )
+    if not gate_validation.valid:
         return None
+    trade_gate = gate_validation.gate
 
     raw = dict(_safe_dict(decision.raw_response))
     raw["production_trade_gate"] = trade_gate

@@ -16,6 +16,7 @@ from services.paper_bootstrap_canary import (
     PaperBootstrapCanaryPolicy,
 )
 from services.paper_training import is_paper_training_decision
+from services.production_trade_gate import validate_production_trade_gate
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -112,10 +113,12 @@ class EntryPriceGuardPolicy:
             str(model_mode or "").lower() == "paper"
             and is_paper_training_decision(decision)
         )
-        trade_gate = _safe_dict(_safe_dict(decision.raw_response).get("production_trade_gate"))
-        live_rules_canary = (
-            str(model_mode or "").lower() != "paper"
-            and trade_gate.get("mode") == "live_rules_canary"
+        gate_validation = validate_production_trade_gate(
+            _safe_dict(decision.raw_response).get("production_trade_gate"),
+            required_mode="live_rules_canary",
+        )
+        live_rules_canary = bool(
+            str(model_mode or "").lower() != "paper" and gate_validation.valid
         )
         return_budget = None if paper_training or live_rules_canary else (
             self._paper_canary_price_budget_fraction(decision)

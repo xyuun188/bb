@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.production_trade_gate import validate_production_trade_gate
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     RETURN_LABEL_NAME,
@@ -539,13 +540,10 @@ def extract_entry_signal_sides(
     profit = payloads["server_profit"]
     timeseries = payloads["timeseries"]
     sentiment = payloads["sentiment"]
-    trade_gate = safe_dict(raw.get("production_trade_gate"))
-    ml_production_eligible = bool(
-        trade_gate.get("can_trade") is True
-        and trade_gate.get("mode") == "live_ml"
-        and trade_gate.get("decision_authority") == "model"
-        and trade_gate.get("model_can_influence") is True
-    )
+    ml_production_eligible = validate_production_trade_gate(
+        raw.get("production_trade_gate"),
+        required_mode="live_ml",
+    ).valid
     ml_side = payload_side(primary_ml)
     profit_side = payload_side(profit)
     timeseries_side = payload_side(timeseries)

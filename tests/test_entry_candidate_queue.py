@@ -4,6 +4,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_candidate_queue import EntryCandidate, EntryCandidateQueuePolicy
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trading_service import TradingService
 
 
@@ -92,6 +93,8 @@ def test_rules_canary_queue_uses_rule_score_without_calling_profit_scorer() -> N
         decision.raw_response.update(
             {
                 "production_trade_gate": {
+                    "version": PRODUCTION_TRADE_GATE_VERSION,
+                    "can_trade": True,
                     "mode": "live_rules_canary",
                     "decision_authority": "rules",
                     "model_can_influence": False,

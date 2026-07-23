@@ -4,10 +4,12 @@ from copy import deepcopy
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.live_rules_canary_signal import apply_live_rules_canary_signal
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 
 
 def _gate() -> dict[str, object]:
     return {
+        "version": PRODUCTION_TRADE_GATE_VERSION,
         "mode": "live_rules_canary",
         "can_trade": True,
         "decision_authority": "rules",

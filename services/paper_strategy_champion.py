@@ -95,7 +95,7 @@ def build_trained_model_strategy_candidates(
         shadow_validation = _dict(candidate.get("shadow_validation"))
         side = str(selector.get("side") or "").lower()
         if (
-            promotion.get("production_influence_eligible") is not True
+            promotion.get("historical_prior_context_eligible") is not True
             or side not in eligible_sides
             or provenance.get("evidence_mode")
             != "exact_trained_model_historical_replay"

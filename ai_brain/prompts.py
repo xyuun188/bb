@@ -586,8 +586,8 @@ def build_batch_experts_user_prompt(
             "mode": strategy_learning.get("scheduler_mode"),
             "candidate_count": strategy_learning.get("candidate_count"),
             "governed_candidate_count": strategy_learning.get("governed_candidate_count"),
-            "production_influence_enabled": strategy_learning_runtime.get(
-                "production_influence_enabled"
+            "historical_prior_context_enabled": strategy_learning_runtime.get(
+                "historical_prior_context_enabled"
             ),
             "can_authorize_entry": False,
         },

@@ -34,6 +34,7 @@ from services.paper_training import (
     PAPER_TRAINING_SIZING_VERSION,
     is_paper_training_decision,
 )
+from services.production_trade_gate import validate_production_trade_gate
 
 RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
 LIVE_RULES_CANARY_SIZING_VERSION = "2026-07-23.live-rules-canary-sizing.v2"
@@ -78,16 +79,6 @@ def _normalized_ratio(value: Any) -> float:
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
-
-
-def _live_rules_canary_gate(
-    raw: dict[str, Any],
-    model_mode: str,
-) -> dict[str, Any]:
-    if str(model_mode or "").lower() == "paper":
-        return {}
-    gate = _safe_dict(raw.get("production_trade_gate"))
-    return gate if gate.get("mode") == "live_rules_canary" else {}
 
 
 def _tier_value(tier: dict[str, Any], *keys: str) -> float:
@@ -654,13 +645,19 @@ class EntryProfitRiskSizingPolicy:
             return
 
         raw = _safe_dict(decision.raw_response)
-        rules_canary_gate = _live_rules_canary_gate(raw, model_mode)
-        if rules_canary_gate:
+        gate_validation = validate_production_trade_gate(
+            raw.get("production_trade_gate")
+        )
+        if (
+            str(model_mode or "").lower() != "paper"
+            and gate_validation.valid
+            and gate_validation.mode == "live_rules_canary"
+        ):
             await self._apply_live_rules_canary_sizing(
                 decision,
                 model_mode,
                 open_positions or [],
-                rules_canary_gate,
+                gate_validation.gate,
             )
             return
         paper_exploration = is_paper_exploration_decision(decision)
@@ -850,6 +847,11 @@ class EntryProfitRiskSizingPolicy:
 
         reasons: list[str] = []
         reasons.extend(exploration_selection_reasons)
+        if (
+            str(model_mode or "").lower() != "paper"
+            and not gate_validation.valid
+        ):
+            reasons.append(gate_validation.reason)
         if facts.get("production_eligible") is not True:
             reasons.append("exchange_risk_facts_ineligible")
         if leverage_tier_selection.get("production_eligible") is not True:
@@ -1223,12 +1225,6 @@ class EntryProfitRiskSizingPolicy:
         )
 
         reasons: list[str] = []
-        if gate.get("can_trade") is not True:
-            reasons.append("production_trade_gate_not_open")
-        if gate.get("decision_authority") != "rules":
-            reasons.append("rules_canary_authority_not_rules")
-        if gate.get("model_can_influence") is not False:
-            reasons.append("rules_canary_model_influence_not_disabled")
         if max_notional <= 0:
             reasons.append("rules_canary_max_notional_missing")
         if max_daily_loss <= 0 or remaining_daily_loss <= 0:

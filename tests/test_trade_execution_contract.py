@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from models.decision import _compact_decision_learning_snapshot
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import summarize_trade_execution_contract
 from tests.paper_canary_fixtures import (
     bounded_legacy_fill_drift_raw,
@@ -98,7 +99,7 @@ def _rules_canary_raw(
             "decision_authority": "rules",
             "model_can_influence": False,
             "reason": "collecting_authoritative_profit_samples",
-            "version": "test-gate",
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "risk": {
                 "max_notional_usdt": max_notional,
                 "max_open_positions": 1,
@@ -128,7 +129,7 @@ def _rules_canary_raw(
             "order_notional_usdt": final_notional,
             "max_notional_usdt": max_notional,
             "exchange_min_notional_usdt": 1.0,
-            "gate_version": "test-gate",
+            "gate_version": PRODUCTION_TRADE_GATE_VERSION,
             "gate_reason": "collecting_authoritative_profit_samples",
             "blockers": [],
         },

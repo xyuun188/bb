@@ -139,9 +139,9 @@ function strategyLearningProductionOverview(data) {
     const production = data?.current_production_strategy || schedule.current_production_strategy || {};
     const leading = schedule.leading_candidate || candidates[0] || null;
     const governedCount = Number(schedule.governed_candidate_count || 0);
-    const influenceEnabled = runtime.production_influence_enabled === true && governedCount > 0;
+    const historicalPriorContextEnabled = runtime.historical_prior_context_enabled === true && governedCount > 0;
     const rejectedCount = Number(schedule.rejected_candidate_count || 0);
-    const governedProfiles = candidates.filter(profile => profile?.promotion?.production_influence_eligible === true);
+    const governedProfiles = candidates.filter(profile => profile?.promotion?.historical_prior_context_eligible === true);
     const eligible = governedProfiles[0] || null;
     const eligibleIdentity = eligible
         ? `${strategyLearningProfileTitle(eligible)} · ${eligible.id || '-'} · v${Number(eligible.version || 0)}`
@@ -159,10 +159,10 @@ function strategyLearningProductionOverview(data) {
         'dynamic_position_capacity',
         'dynamic_exit_policy',
     ];
-    const stateTitle = influenceEnabled
+    const stateTitle = historicalPriorContextEnabled
         ? `${governedCount} 条治理通过的历史先验可动态匹配`
         : '当前没有历史先验参与生产决策';
-    const stateReason = influenceEnabled
+    const stateReason = historicalPriorContextEnabled
         ? matchedDecisionCount
             ? `当前窗口已有 ${matchedDecisionCount} 条市场决策实际匹配历史先验；它们仍不能绕过实时收益、成本和风险合同。`
             : '已有治理通过的历史先验，但当前窗口尚无市场决策实际命中对应币种、方向或行情状态。'
@@ -203,17 +203,17 @@ function strategyLearningProductionOverview(data) {
                     <span class="done"><b>费后</b><em>最终收益合同与执行</em></span>
                 </div>
             </section>
-            <section class="strategy-learning-command-main ${influenceEnabled ? 'production-active' : 'production-idle'}" aria-label="当前候选策略生产状态">
+            <section class="strategy-learning-command-main ${historicalPriorContextEnabled ? 'prior-context-active' : 'prior-context-inactive'}" aria-label="当前历史先验上下文状态">
                 <span class="strategy-learning-command-eyebrow">历史收益先验状态 · 不能授权开仓</span>
                 <div class="strategy-learning-command-title">
                     <strong>${strategyLearningEsc(stateTitle)}</strong>
                     <span class="strategy-learning-status-pill ${matchedDecisionCount ? 'good' : 'warn'}">最近匹配 ${matchedDecisionCount}</span>
                 </div>
                 <p>${strategyLearningEsc(stateReason)}</p>
-                <div class="strategy-learning-inline-alert ${influenceEnabled ? '' : 'warn'}">
-                    <strong>${influenceEnabled ? '可匹配的治理先验示例' : '排名首位不等于正在使用'}</strong>
-                    <span>${strategyLearningEsc(influenceEnabled ? eligibleIdentity : leadingIdentity)}</span>
-                    <em>${influenceEnabled ? '实际是否使用以最近决策匹配记录为准' : '未治理分区只参与排名和继续验证'}</em>
+                <div class="strategy-learning-inline-alert ${historicalPriorContextEnabled ? '' : 'warn'}">
+                    <strong>${historicalPriorContextEnabled ? '可匹配的治理先验示例' : '排名首位不等于正在使用'}</strong>
+                    <span>${strategyLearningEsc(historicalPriorContextEnabled ? eligibleIdentity : leadingIdentity)}</span>
+                    <em>${historicalPriorContextEnabled ? '实际是否使用以最近决策匹配记录为准' : '未治理分区只参与排名和继续验证'}</em>
                 </div>
                 <div class="strategy-learning-command-meta">
                     <span class="strategy-learning-meta"><b>调度状态</b>${strategyLearningEsc(strategyLearningSchedulerModeLabel(schedule.scheduler_mode))}</span>
@@ -279,7 +279,7 @@ function strategyLearningSideRows(sidePerformance) {
 
 function strategyLearningCandidateState(profile, matchedProfileIds, leadingId) {
     const promotion = profile?.promotion || {};
-    const governed = promotion.production_influence_eligible === true;
+    const governed = promotion.historical_prior_context_eligible === true;
     const matchedRecently = governed && matchedProfileIds.has(profile?.id);
     const leading = profile?.id === leadingId;
     if (matchedRecently) return { css: 'recently-matched', tone: 'good', label: '最近决策已匹配 · 只读' };
@@ -354,7 +354,7 @@ function strategyLearningCandidateGroups(candidates, matchedProfileIds, leadingI
 
 function strategyLearningCandidateIndex(candidates, leading, usage) {
     const leadingText = leading ? `#${Number(leading.rank || 0)} ${strategyLearningProfileTitle(leading)}` : '无可排名候选';
-    const governedCount = candidates.filter(profile => profile?.promotion?.production_influence_eligible === true).length;
+    const governedCount = candidates.filter(profile => profile?.promotion?.historical_prior_context_eligible === true).length;
     const matchedCount = Number(usage?.matched_decision_count || 0);
     return `
         <div class="strategy-learning-compact-head"><strong>运行</strong><span>所有币种共同使用动态费后收益执行链</span><em>逐币逐方向评估</em></div>
@@ -388,7 +388,7 @@ function renderStrategyLearning(data) {
     const shadow = feedback.shadow_feedback || {};
     const eventFeedback = feedback.event_feedback || {};
     const problems = Array.isArray(feedback.problems) ? feedback.problems : [];
-    const influenceEnabled = runtime.production_influence_enabled === true && governedCount > 0;
+    const historicalPriorContextEnabled = runtime.historical_prior_context_enabled === true && governedCount > 0;
 
     const updated = document.getElementById('strategy-learning-updated');
     if (updated) updated.textContent = feedback.generated_at ? toBeijingTime(feedback.generated_at) : '暂无生成时间';
@@ -419,6 +419,6 @@ function renderStrategyLearning(data) {
         <div class="strategy-learning-compact-head"><strong>${Number(eventFeedback.linked_event_count || 0)}</strong><span>已关联策略事件</span><em>${Number(eventFeedback.regime_linked_position_count || 0)} 个持仓带行情分区</em></div>
         <div class="strategy-learning-compact-head"><strong>${Number(shadow.cost_complete_direction_sample_count || 0)}</strong><span>成本完整影子方向样本</span><em>${Number(shadow.completed_row_count || 0)} 条完成记录</em></div>`);
     strategyLearningSetHtml('strategy-learning-guard', `
-        <div class="strategy-learning-guard-state ${influenceEnabled ? 'ok' : 'warn'}"><strong>${strategyLearningEsc(strategyLearningSchedulerModeLabel(schedule.scheduler_mode))}</strong><span>${influenceEnabled ? '治理历史先验可按决策上下文匹配' : '当前没有历史先验参与决策'}</span><em>历史先验不能授权下单</em></div>`);
+        <div class="strategy-learning-guard-state ${historicalPriorContextEnabled ? 'ok' : 'warn'}"><strong>${strategyLearningEsc(strategyLearningSchedulerModeLabel(schedule.scheduler_mode))}</strong><span>${historicalPriorContextEnabled ? '治理历史先验可按决策上下文匹配' : '当前没有历史先验参与决策'}</span><em>历史先验不能授权下单</em></div>`);
     strategyLearningSetHtml('strategy-learning-recent-events', strategyLearningCandidateIndex(candidates, leading, usage));
 }

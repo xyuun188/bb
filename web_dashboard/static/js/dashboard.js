@@ -4301,7 +4301,6 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     walk_forward_required: '缺少按时间滚动验证',
     model_stage_not_live: '模型仍处于影子或候选阶段',
     model_stage_not_canary_eligible: '模型证据尚不满足灰度阶段要求',
-    live_mutation_not_enabled: '生产影响权限未开启',
     ml_readiness_blocks_live_route: '本地 ML 收益证据未达标，禁止切换生产路由',
     competition_not_live_applicable: '模型竞赛结果仍为观察数据，不能应用到生产',
     competition_baseline_missing: '缺少可比较的生产基线样本',

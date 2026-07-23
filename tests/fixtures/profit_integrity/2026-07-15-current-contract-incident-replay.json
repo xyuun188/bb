@@ -39,7 +39,7 @@
       "before": {
         "expected_return_pct": 0.4603,
         "lower_quantile_return_pct": 0.496,
-        "production_influence": true
+      "live_ml_ready": true
       },
       "decision_id": 79318,
       "symbol": "ICP/USDT"

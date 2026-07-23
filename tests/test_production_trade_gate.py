@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from services.production_trade_gate import evaluate_production_trade_gate
+from services.production_trade_gate import (
+    PRODUCTION_TRADE_GATE_VERSION,
+    evaluate_production_trade_gate,
+    validate_production_trade_gate,
+)
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
@@ -21,6 +25,30 @@ def test_gate_allows_rules_canary_before_model_promotion() -> None:
     assert gate.decision_authority == "rules"
     assert gate.model_can_influence is False
     assert gate.reason == "collecting_authoritative_profit_samples"
+    assert validate_production_trade_gate(gate.to_dict()).valid is True
+
+
+def test_validator_rejects_old_or_incomplete_trade_gate_contracts() -> None:
+    old_gate = {
+        "version": "2026-07-23.profit-loop-trade-gate.v1",
+        "can_trade": True,
+        "mode": "live_ml",
+        "decision_authority": "model",
+        "model_can_influence": True,
+    }
+    incomplete_gate = {
+        "version": PRODUCTION_TRADE_GATE_VERSION,
+        "can_trade": True,
+        "mode": "live_ml",
+        "decision_authority": "model",
+    }
+
+    assert validate_production_trade_gate(old_gate).reason == (
+        "production_trade_gate_version_invalid"
+    )
+    assert validate_production_trade_gate(incomplete_gate).reason == (
+        "production_trade_gate_authority_invalid"
+    )
 
 
 def test_gate_allows_live_ml_only_after_profit_and_authorization() -> None:

@@ -162,12 +162,12 @@
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
 }
 
-.strategy-learning-command-main.production-active {
+.strategy-learning-command-main.prior-context-active {
     border-color: rgba(34,197,94,0.45);
     background: var(--green-dim);
 }
 
-.strategy-learning-command-main.production-idle {
+.strategy-learning-command-main.prior-context-inactive {
     border-color: rgba(245,158,11,0.36);
 }
 

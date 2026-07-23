@@ -10,6 +10,7 @@ from typing import Any
 from services.okx_order_fact_sync import authoritative_order_fee_fact_source
 from services.paper_exploration import paper_exploration_contract_reasons
 from services.paper_training import paper_training_contract_reasons
+from services.production_trade_gate import validate_production_trade_gate
 from services.profit_training_contract import validate_profit_training_sample
 
 
@@ -308,10 +309,11 @@ def _decision_authority(
     valid_paper_training: bool,
     strategy_training_role: str,
  ) -> str:
-    gate = _dict(raw_llm_response.get("production_trade_gate"))
-    authority = _text(gate.get("decision_authority")).lower()
-    if authority in {"rules", "model", "manual", "system"}:
-        return authority
+    gate_validation = validate_production_trade_gate(
+        raw_llm_response.get("production_trade_gate")
+    )
+    if gate_validation.valid:
+        return _text(gate_validation.gate.get("decision_authority")).lower()
     if execution_mode == "paper" and (valid_paper_exploration or valid_paper_training):
         return "system"
     if strategy_training_role != "entry_strategy":
@@ -326,13 +328,14 @@ def _model_shadow_prediction(
 ) -> dict[str, Any]:
     if decision_authority != "rules":
         return {}
-    gate = _dict(raw_llm_response.get("production_trade_gate"))
+    gate_validation = validate_production_trade_gate(
+        raw_llm_response.get("production_trade_gate"),
+        required_mode="live_rules_canary",
+    )
     signal = _dict(raw_llm_response.get("live_rules_canary_signal"))
     shadow = _dict(raw_llm_response.get("model_shadow_decision"))
     if (
-        gate.get("mode") != "live_rules_canary"
-        or gate.get("decision_authority") != "rules"
-        or gate.get("model_can_influence") is not False
+        not gate_validation.valid
         or signal.get("production_eligible") is not True
         or signal.get("decision_authority") != "rules"
         or signal.get("model_can_influence") is not False

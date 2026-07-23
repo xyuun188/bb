@@ -206,7 +206,7 @@ def test_scheduler_uses_walk_forward_and_cost_complete_shadow_governance() -> No
     assert schedule["scheduler_mode"] == "governed_dynamic_return"
     assert schedule["candidate_count"] == len(schedule["candidates"])
     assert schedule["governed_candidate_count"] > 0
-    assert schedule["runtime"]["production_influence_enabled"] is True
+    assert schedule["runtime"]["historical_prior_context_enabled"] is True
     assert schedule["runtime"]["can_authorize_entry"] is False
     assert schedule["runtime"]["can_change_size_or_leverage"] is False
     production = schedule["current_production_strategy"]
@@ -255,8 +255,8 @@ def test_low_win_high_return_policy_outranks_high_win_negative_return_policy() -
     }
 
     assert side_candidates["long"]["rank"] < side_candidates["short"]["rank"]
-    assert side_candidates["long"]["promotion"]["production_influence_eligible"] is True
-    assert side_candidates["short"]["promotion"]["production_influence_eligible"] is False
+    assert side_candidates["long"]["promotion"]["historical_prior_context_eligible"] is True
+    assert side_candidates["short"]["promotion"]["historical_prior_context_eligible"] is False
 
 
 def test_strategy_candidate_cannot_promote_with_undefined_profit_factor() -> None:
@@ -272,7 +272,7 @@ def test_strategy_candidate_cannot_promote_with_undefined_profit_factor() -> Non
 
     assert long_candidate["backtest"]["metrics"]["profit_factor"] is None
     assert long_candidate["shadow_validation"]["metrics"]["profit_factor"] is None
-    assert long_candidate["promotion"]["production_influence_eligible"] is False
+    assert long_candidate["promotion"]["historical_prior_context_eligible"] is False
     assert "walk_forward_profit_factor_undefined" in long_candidate["promotion"][
         "rejection_reasons"
     ]
@@ -288,7 +288,7 @@ def test_missing_shadow_evidence_fails_closed_without_numeric_fallback() -> None
 
     assert payload["schedule"]["scheduler_mode"] == "shadow_validation"
     assert payload["schedule"]["governed_candidate_count"] == 0
-    assert payload["schedule"]["runtime"]["production_influence_enabled"] is False
+    assert payload["schedule"]["runtime"]["historical_prior_context_enabled"] is False
     assert "active_profile" not in payload["schedule"]
     assert payload["schedule"]["current_production_strategy"]["status"] == "running"
     assert payload["schedule"]["leading_candidate"] == payload["schedule"]["candidates"][0]

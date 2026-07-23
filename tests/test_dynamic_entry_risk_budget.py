@@ -9,6 +9,7 @@ from services.entry_profit_risk_sizing import (
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
 )
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 
 
 def _decision() -> DecisionOutput:
@@ -266,7 +267,7 @@ async def test_live_rules_canary_sizes_without_profit_distribution_or_model_cont
     opportunity["return_distribution_contract"] = {}
     opportunity["expected_net_breakdown"] = {"components": []}
     decision.raw_response["production_trade_gate"] = {
-        "version": "test-rules-canary",
+        "version": PRODUCTION_TRADE_GATE_VERSION,
         "mode": "live_rules_canary",
         "can_trade": True,
         "decision_authority": "rules",
@@ -317,7 +318,7 @@ async def test_live_rules_canary_blocks_before_submit_when_exchange_minimum_exce
         }
     }
     decision.raw_response["production_trade_gate"] = {
-        "version": "test-rules-canary",
+        "version": PRODUCTION_TRADE_GATE_VERSION,
         "mode": "live_rules_canary",
         "can_trade": True,
         "decision_authority": "rules",
@@ -345,7 +346,7 @@ async def test_live_rules_canary_blocks_before_submit_when_exchange_minimum_exce
 async def test_live_rules_canary_fails_closed_when_notional_limit_is_zero() -> None:
     decision = _decision()
     decision.raw_response["production_trade_gate"] = {
-        "version": "test-rules-canary",
+        "version": PRODUCTION_TRADE_GATE_VERSION,
         "mode": "live_rules_canary",
         "can_trade": False,
         "decision_authority": "none",
@@ -363,8 +364,8 @@ async def test_live_rules_canary_fails_closed_when_notional_limit_is_zero() -> N
 
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is False
-    assert "production_trade_gate_not_open" in sizing["reason"]
-    assert "rules_canary_max_notional_missing" in sizing["reason"]
+    assert "production_trade_gate_closed" in sizing["reason"]
+    assert sizing["contract_lifecycle"] != "live_rules_canary"
     assert decision.position_size_pct == 0.0
     assert sizing["final_notional_usdt"] == 0.0
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.production_trade_gate import validate_production_trade_gate
 
 EntryCandidate = tuple[str, str, DecisionOutput, Any, int | None]
 ScoreCandidate = Callable[[DecisionOutput, dict[str, Any] | None], float]
@@ -35,14 +36,14 @@ class EntryCandidateQueuePolicy:
         strategy_context: dict[str, Any] | None,
     ) -> tuple[float, str]:
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        gate = raw.get("production_trade_gate")
-        gate = gate if isinstance(gate, dict) else {}
+        gate_validation = validate_production_trade_gate(
+            raw.get("production_trade_gate"),
+            required_mode="live_rules_canary",
+        )
         rules_signal = raw.get("live_rules_canary_signal")
         rules_signal = rules_signal if isinstance(rules_signal, dict) else {}
         if (
-            gate.get("mode") == "live_rules_canary"
-            and gate.get("decision_authority") == "rules"
-            and gate.get("model_can_influence") is False
+            gate_validation.valid
             and rules_signal.get("production_eligible") is True
         ):
             return (

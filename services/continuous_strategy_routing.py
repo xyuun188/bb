@@ -239,9 +239,9 @@ class ContinuousStrategyRoutingPolicy:
                     "validated": validated,
                     "future_stable": stable,
                     "primary_eligible": primary_eligible,
-                    "production_influence_eligible": _dict(
+                    "historical_prior_context_eligible": _dict(
                         candidate.get("promotion")
-                    ).get("production_influence_eligible")
+                    ).get("historical_prior_context_eligible")
                     is True,
                     "development_metrics": _compact_metrics(development),
                     "exam_metrics": _compact_metrics(exam),

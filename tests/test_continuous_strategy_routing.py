@@ -79,7 +79,7 @@ def _candidate(
             "historical_return_distribution": development,
         },
         "promotion": {
-            "production_influence_eligible": production_eligible,
+            "historical_prior_context_eligible": production_eligible,
         },
         "backtest": {
             "status": "complete",

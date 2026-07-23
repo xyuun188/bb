@@ -32,6 +32,7 @@ from services.paper_training import (
     PAPER_TRAINING_VERSION,
     paper_training_contract_reasons,
 )
+from services.production_trade_gate import validate_production_trade_gate
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_epoch import load_training_epoch_start
 
@@ -279,7 +280,10 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     exploration = _safe_dict(raw.get("paper_exploration"))
     training = _safe_dict(raw.get("paper_training"))
     canary = _safe_dict(raw.get("paper_bootstrap_canary"))
-    trade_gate = _safe_dict(raw.get("production_trade_gate"))
+    rules_gate_validation = validate_production_trade_gate(
+        raw.get("production_trade_gate"),
+        required_mode="live_rules_canary",
+    )
     rules_canary_contract = _safe_dict(raw.get("live_rules_canary_contract"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
@@ -308,7 +312,7 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     ):
         return "paper_bootstrap_canary"
     if (
-        trade_gate.get("mode") == "live_rules_canary"
+        rules_gate_validation.valid
         or rules_canary_contract.get("execution_scope") == "live_rules_canary"
         or sizing.get("execution_scope") == "live_rules_canary"
     ):
@@ -1013,7 +1017,11 @@ def build_live_rules_canary_entry_contract(
 ) -> tuple[dict[str, Any], list[str]]:
     """Build the one pre-submit contract for bounded rules-led live entries."""
 
-    gate = _safe_dict(raw.get("production_trade_gate"))
+    gate_validation = validate_production_trade_gate(
+        raw.get("production_trade_gate"),
+        required_mode="live_rules_canary",
+    )
+    gate = gate_validation.gate
     signal = _safe_dict(raw.get("live_rules_canary_signal"))
     model_shadow = _safe_dict(raw.get("model_shadow_decision"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
@@ -1042,14 +1050,8 @@ def build_live_rules_canary_entry_contract(
         exchange_minimum.get("minimum_notional_usdt")
     )
 
-    if gate.get("mode") != "live_rules_canary":
-        reasons.append("live_rules_canary_gate_mode_invalid")
-    if gate.get("can_trade") is not True:
-        reasons.append("production_trade_gate_not_open")
-    if gate.get("decision_authority") != "rules":
-        reasons.append("rules_canary_authority_not_rules")
-    if gate.get("model_can_influence") is not False:
-        reasons.append("rules_canary_model_influence_not_disabled")
+    if not gate_validation.valid:
+        reasons.append(gate_validation.reason)
     if (
         signal.get("production_eligible") is not True
         or signal.get("action") not in {"long", "short"}

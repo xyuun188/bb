@@ -8,6 +8,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.entry_price_guard import EntryPriceGuardPolicy
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
 from services.paper_training import build_paper_training_contract
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 
 
 def _decision(*, return_lcb: float = 0.6, expected_net: float = 0.8) -> DecisionOutput:
@@ -90,6 +91,7 @@ async def test_live_rules_canary_does_not_require_model_return_budget() -> None:
     decision = _decision()
     decision.raw_response = {
         "production_trade_gate": {
+            "version": PRODUCTION_TRADE_GATE_VERSION,
             "mode": "live_rules_canary",
             "can_trade": True,
             "decision_authority": "rules",

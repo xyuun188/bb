@@ -68,7 +68,7 @@ def _candidate(
                 "evidence_mode": "exact_trained_model_historical_replay",
             },
         },
-        "promotion": {"production_influence_eligible": True},
+        "promotion": {"historical_prior_context_eligible": True},
         "backtest": {
             "status": "complete",
             "metrics": metrics,
