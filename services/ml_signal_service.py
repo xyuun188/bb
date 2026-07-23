@@ -2424,6 +2424,17 @@ class MLSignalService:
                         "ML model metadata is not available.",
                     )
                 )
+                readiness_metrics = _safe_dict(readiness.get("metrics"))
+                training_data_version = str(
+                    readiness_metrics.get("training_data_version") or ""
+                ).strip()
+                required_training_data_version = str(
+                    readiness_metrics.get("required_training_data_version") or ""
+                ).strip()
+                training_data_contract_stale = bool(
+                    required_training_data_version
+                    and training_data_version != required_training_data_version
+                )
                 learning_only = not bool(readiness.get("allow_live_position_influence"))
                 new_samples = max(completed_count - last_completed_count, 0)
                 new_trade_samples = max(
@@ -2434,7 +2445,14 @@ class MLSignalService:
                     "learning_only": learning_only,
                     "readiness_state": readiness.get("state"),
                     "readiness_blocking_reasons": readiness.get("blocking_reasons") or [],
-                    "trigger": "new_cost_complete_authoritative_sample_or_forced_rebuild",
+                    "trigger": (
+                        "training_data_contract_changed"
+                        if training_data_contract_stale
+                        else "new_cost_complete_authoritative_sample_or_forced_rebuild"
+                    ),
+                    "training_data_contract_stale": training_data_contract_stale,
+                    "training_data_version": training_data_version or None,
+                    "required_training_data_version": required_training_data_version or None,
                     "cursor_source": "phase3_clean_training_view",
                     "promotion_requires_readiness": True,
                     "candidate_artifact_persisted": False,
@@ -2460,6 +2478,7 @@ class MLSignalService:
                 should_train = (
                     force
                     or not metadata
+                    or training_data_contract_stale
                     or new_samples > 0
                     or new_trade_samples > 0
                 )
@@ -2486,7 +2505,15 @@ class MLSignalService:
                         scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
                         model_ids=LOCAL_ML_MODEL_IDS,
                         run_id=self._active_training_run_id,
-                        trigger_reason="forced" if force else "training_due",
+                        trigger_reason=(
+                            "forced"
+                            if force
+                            else (
+                                "training_data_contract_changed"
+                                if training_data_contract_stale
+                                else "training_due"
+                            )
+                        ),
                         sample_cursor={
                             "shadow": completed_count,
                             "trade": completed_trade_count,

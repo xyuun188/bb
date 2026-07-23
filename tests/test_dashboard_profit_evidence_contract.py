@@ -70,7 +70,6 @@ def test_position_risk_evidence_preserves_authoritative_contract_values() -> Non
     assert contract["portfolio_risk_snapshot"]["gross_notional_usdt"] == 340.0
     assert contract["adjustment_reasons"] == [
         "final_notional_reduced_from_dynamic_target",
-        "okx_exchange_precision",
     ]
     assert contract["policy_provenance"]["contract_fingerprint"] == "abc123"
 
@@ -90,6 +89,53 @@ def test_position_risk_evidence_preserves_authoritative_contract_values() -> Non
     assert "independent_risk_budget_missing" in incomplete["evidence_gaps"]
     assert "planned_stressed_loss_missing" in incomplete["evidence_gaps"]
     assert "risk_contract_fingerprint_missing" in incomplete["evidence_gaps"]
+
+
+def test_position_risk_evidence_keeps_real_reconciliation_failures_not_stage_names() -> None:
+    decision = SimpleNamespace(
+        id=734,
+        raw_llm_response={
+            "profit_risk_sizing": {
+                "contract_version": "dynamic-risk-v1",
+                "production_eligible": False,
+                "reason": "execution_stressed_loss_exceeds_risk_budget",
+                "risk_budget_usdt": 4.2,
+                "planned_stressed_loss_usdt": 4.4,
+                "stressed_loss_fraction": 0.04,
+                "target_notional_usdt": 100.0,
+                "final_notional_usdt": 110.0,
+                "portfolio_risk_snapshot": {
+                    "gross_notional_usdt": 340.0,
+                    "current_stressed_loss_usdt": 3.5,
+                },
+                "execution_reconciliations": [
+                    {
+                        "source": "okx_pre_submit_order_shape",
+                        "eligible": True,
+                        "reasons": [],
+                    },
+                    {
+                        "source": "okx_confirmed_entry_fill",
+                        "eligible": False,
+                        "reasons": [
+                            "execution_notional_exceeds_authoritative_target",
+                            "execution_stressed_loss_exceeds_risk_budget",
+                        ],
+                    },
+                ],
+                "policy_provenance": {"contract_fingerprint": "def456"},
+            }
+        },
+    )
+
+    contract = dashboard._dashboard_position_risk_contract(decision)
+
+    assert "okx_pre_submit_order_shape" not in contract["adjustment_reasons"]
+    assert "okx_confirmed_entry_fill" not in contract["adjustment_reasons"]
+    assert contract["adjustment_reasons"] == [
+        "execution_notional_exceeds_authoritative_target",
+        "execution_stressed_loss_exceeds_risk_budget",
+    ]
 
 
 def test_missing_position_risk_contract_is_not_rendered_as_zero() -> None:
@@ -599,13 +645,20 @@ def test_strategy_scheduler_page_separates_production_prior_matches_and_rejectio
     assert "币种方向候选" not in view
 
 
-def test_undefined_profit_factor_and_auc_are_not_rendered_as_zero() -> None:
+def test_undefined_profit_factor_auc_and_accuracy_are_not_rendered_as_zero() -> None:
     assert "function profitFactorLabel" in SCRIPT
     assert "function metricNumberLabel" in SCRIPT
+    assert "function pctLabel" in SCRIPT
+    pct_label_block = SCRIPT[
+        SCRIPT.index("function pctLabel") : SCRIPT.index("function signedPctValueLabel")
+    ]
+    assert "value === null || value === undefined || value === ''" in pct_label_block
     assert "Number(metrics.top_long_profit_factor || 0)" not in SCRIPT
     assert "Number(metrics.top_short_profit_factor || 0)" not in SCRIPT
     assert "Number(row.profit_factor || 0)" not in SCRIPT
     assert "Number(summary.profit_factor || 0)" not in SCRIPT
     assert "Number(metrics.long_auc || 0)" not in SCRIPT
     assert "Number(metrics.short_auc || 0)" not in SCRIPT
+    assert "pctLabel(metrics.long_accuracy, 1)" in SCRIPT
+    assert "pctLabel(metrics.short_accuracy, 1)" in SCRIPT
     assert "profitFactorLabel(summary.profit_factor)" in SCRIPT

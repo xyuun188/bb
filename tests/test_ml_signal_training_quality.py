@@ -1196,6 +1196,79 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
 
 
 @pytest.mark.asyncio
+async def test_ml_signal_retrains_when_data_quality_contract_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MLSignalService()
+    calls: list[bool] = []
+
+    async def completed_shadow_sample_count() -> int:
+        return 1300
+
+    async def quarantine_dirty_training_samples(**_kwargs: object) -> dict[str, object]:
+        return {"scanned": 1300, "quarantined": 0}
+
+    async def load_rows() -> list[object]:
+        return [object()]
+
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
+
+    def quality_report(_rows: list[object]) -> dict[str, object]:
+        return {"quality_report": {"totals": {"total": 1}}}
+
+    def build_frame(_rows: list[object]) -> pd.DataFrame:
+        return _training_frame()
+
+    def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
+        persist_artifact = bool(kwargs["persist_artifact"])
+        calls.append(persist_artifact)
+        return _ml_training_metadata(
+            artifact_persisted=persist_artifact,
+            ready=False,
+        )
+
+    stale_metadata = _ml_training_metadata(
+        artifact_persisted=True,
+        ready=False,
+    )
+    stale_metadata["quality_report"] = {
+        **stale_metadata["quality_report"],
+        "data_quality_version": "2026-07-14.separated-profit-supervision.v4",
+    }
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: stale_metadata  # type: ignore[method-assign]
+    service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
+    service._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    promotion_evidence: list[dict[str, object]] = []
+
+    def promote_candidate(evidence: dict[str, object]) -> SimpleNamespace:
+        promotion_evidence.append(evidence)
+        return SimpleNamespace(version="candidate-v1")
+
+    service.artifact_registry = SimpleNamespace(
+        promote_candidate=promote_candidate,
+        transition_current=promote_candidate,
+    )
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
+    monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
+    monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
+
+    result = await service.maybe_auto_train()
+
+    assert calls == [False, True]
+    assert result["trained"] is True
+    assert result["training_policy"]["trigger"] == "training_data_contract_changed"
+    assert result["training_policy"]["training_data_contract_stale"] is True
+    assert len(promotion_evidence) == 2
+
+
+@pytest.mark.asyncio
 async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

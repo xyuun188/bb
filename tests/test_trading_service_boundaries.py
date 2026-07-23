@@ -4813,6 +4813,7 @@ async def test_ml_signal_auto_train_skips_when_authoritative_cursor_has_no_new_s
             "last_trained_completed_shadow_sample_count": 1050,
             "trained_at": datetime.now(UTC).isoformat(),
             "test_count": 250,
+            "quality_report": {"data_quality_version": DATA_QUALITY_VERSION},
             "metrics": {
                 "long_auc": 0.40,
                 "short_auc": 0.41,

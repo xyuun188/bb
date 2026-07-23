@@ -2312,9 +2312,6 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
     ):
         adjustment_reasons.append("final_notional_reduced_from_dynamic_target")
     for item in reconciliations:
-        source = str(item.get("source") or "").strip()
-        if source:
-            adjustment_reasons.append(source)
         adjustment_reasons.extend(str(value) for value in item.get("reasons") or [] if value)
 
     return {

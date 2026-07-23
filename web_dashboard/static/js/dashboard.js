@@ -2610,6 +2610,7 @@ function analysisExpertStatusLine(record, missingCount) {
 }
 
 function pctLabel(value, digits = 0) {
+    if (value === null || value === undefined || value === '') return '-';
     const num = Number(value);
     if (!Number.isFinite(num)) return '-';
     return `${(num * 100).toFixed(digits)}%`;
@@ -4334,7 +4335,13 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     risk_contract_fingerprint_missing: '历史入场记录未保存风险合同指纹',
     local_position_lineage_missing: '本地仓位缺少可追溯的入场链路',
     entry_decision_risk_contract_missing: '入场决策缺少可追溯的风险合同',
-    final_notional_reduced_from_dynamic_target: '最终仓位已按下游风险约束缩减',
+    final_notional_reduced_from_dynamic_target: '最终仓位已缩减到可执行且不超风险预算的数量；调整已经完成，不是待处理异常',
+    upstream_sizing_ineligible: '上游风险定仓未通过，系统已禁止提交订单',
+    execution_reconciliation_inputs_incomplete: '成交校验所需的仓位、杠杆、止损或保证金数据不完整，系统已阻止继续执行',
+    execution_leverage_tier_contract_missing: '缺少 OKX 杠杆档位合同，系统已阻止继续执行',
+    execution_leverage_exceeds_selected_okx_tier: '计划杠杆超过 OKX 当前档位上限，系统已阻止继续执行',
+    execution_notional_exceeds_authoritative_target: '实际成交名义价值超过风险合同上限，该成交已标记为风险合同违规，不能作为合格执行证据',
+    execution_stressed_loss_exceeds_risk_budget: '实际成交后的压力损失超过风险预算，该成交已标记为风险合同违规，不能作为合格执行证据',
     production_return_distribution_missing: '缺少生产收益分布证据',
     live_execution_cost_missing: '缺少实时执行成本证据',
     expected_net_breakdown_missing: '缺少费后预期收益拆分',
@@ -4391,6 +4398,7 @@ function dashboardReasonText(value) {
             top_profit_factor_not_above_one: '高分组盈亏比没有高于自然盈亏平衡线 1',
             top_tail_loss_not_improved: '高分组尾部亏损没有改善',
             walk_forward_return_stability_failed: '费后收益在时间滚动验证中不稳定',
+            market_regime_stability_failed: '费后收益未能在至少两种市场状态下稳定为正',
             walk_forward_return_evidence_not_ready: '时间滚动费后收益证据尚未就绪',
             walk_forward_fold_not_ready: '时间滚动验证分折证据尚未就绪',
             leave_one_symbol_out_stability_failed: '收益过度依赖单一币种',
@@ -8435,7 +8443,7 @@ function openPositionEvidenceModal(positionIndex) {
                         <div><span>同方向 notional</span><strong>${positionEvidenceValue(portfolio.same_side_notional_usdt, ' U')}</strong></div>
                         <div><span>方向集中度</span><strong>${distributionProbabilityLabel(portfolio.direction_concentration)}</strong></div>
                     </div>
-                    <div class="position-evidence-reasons"><b>调整原因</b><span>${adjustments.length ? adjustments.map(item => escHtml(dashboardReasonText(item))).join(' / ') : '目标与最终仓位一致，无下游缩减记录'}</span></div>
+                    <div class="position-evidence-reasons"><b>仓位调整结果</b><span>${adjustments.length ? adjustments.map(item => escHtml(dashboardReasonText(item))).join(' / ') : '目标与最终仓位一致，无需调整'}</span></div>
                     <div class="position-evidence-provenance"><span>版本 ${escHtml(contract.contract_version || '缺失')}</span><span>指纹 ${escHtml(contract.policy_provenance?.contract_fingerprint || '缺失')}</span></div>
                     ${positionEvidenceBlockers(contract.blockers)}
                 </article>`;
