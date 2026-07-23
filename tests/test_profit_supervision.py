@@ -127,7 +127,7 @@ def test_authoritative_return_prefers_profit_training_contract_target() -> None:
 
     assert task["return_target"] == PROFIT_TRAINING_TARGET
     assert task[PROFIT_TRAINING_TARGET] == -2.4
-    assert task["realized_net_return_pct"] == -2.4
+    assert "realized_net_return_pct" not in task
 
 
 def test_multi_horizon_rows_share_one_decision_weight_budget() -> None:
@@ -158,7 +158,7 @@ def test_reports_keep_shadow_market_cost_and_actual_returns_separate() -> None:
     assert report["actual_execution_cost_sample_count"] == 1
     assert report["actual_realized_return_sample_count"] == 1
     assert report["shadow_samples_are_actual_returns"] is False
-    assert report["authoritative_realized_trade"]["net_return_after_cost_pct"][
+    assert report["authoritative_realized_trade"][PROFIT_TRAINING_TARGET][
         "expected"
     ] == pytest.approx(0.6)
 
@@ -180,8 +180,27 @@ def test_trade_calibration_selects_symbol_side_then_global_side() -> None:
 
     assert exact["profile_source"] == "symbol_side"
     assert global_side["profile_source"] == "global_side"
-    assert exact["net_return_after_cost_pct"]["count"] == 1
+    assert exact[PROFIT_TRAINING_TARGET]["count"] == 1
+    assert "net_return_after_cost_pct" not in exact
     assert exact["slippage_pct"]["count"] == 1
+
+
+def test_authoritative_return_rejects_old_net_return_label_without_contract() -> None:
+    trade = _trade_sample()
+    trade["profit_training_contract"] = {
+        "eligible": False,
+        "target": PROFIT_TRAINING_TARGET,
+        "target_value": None,
+        "reason": "missing_contract",
+    }
+    trade["profit_learning_labels"]["net_return_after_cost_pct"] = 99.0
+
+    contract = build_profit_supervision_contract(trade, kind="trade")
+    task = contract["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
+
+    assert task["eligible"] is False
+    assert task[PROFIT_TRAINING_TARGET] is None
+    assert task["return_target"] == PROFIT_TRAINING_TARGET
 
 
 def test_confirmed_stop_fill_slippage_can_supervise_actual_execution_cost() -> None:

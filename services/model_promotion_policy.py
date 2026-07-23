@@ -187,7 +187,7 @@ def build_return_objective_report(
     if not actual_slippage_pairs:
         blockers.append("authoritative_slippage_distribution_missing")
     if avg_return is None or avg_return <= 0:
-        blockers.append("average_fee_after_return_not_positive")
+        blockers.append("average_net_return_after_all_cost_not_positive")
     if lower_hinge is None or lower_hinge <= 0:
         blockers.append("empirical_return_lower_hinge_not_positive")
     if profit_factor is None:
@@ -224,10 +224,7 @@ def build_return_objective_report(
             },
             "authoritative_realized_trade": {
                 "source_authority": "okx_position_history",
-                "net_return_after_all_cost_pct": weighted_distribution(
-                    actual_return_pairs
-                ),
-                "net_return_after_cost_pct": weighted_distribution(actual_return_pairs),
+                PROFIT_TRAINING_TARGET: weighted_distribution(actual_return_pairs),
                 "execution_cost_pct": weighted_distribution(actual_cost_pairs),
                 "slippage_pct": weighted_distribution(actual_slippage_pairs),
             },
@@ -242,10 +239,10 @@ def build_return_objective_report(
                 reason.endswith("distribution_missing") for reason in blockers
             ),
         },
-        "average_net_return_after_cost_pct": (
+        "average_net_return_after_all_cost_pct": (
             round(avg_return, 8) if avg_return is not None else None
         ),
-        "median_net_return_after_cost_pct": (
+        "median_net_return_after_all_cost_pct": (
             round(float(_median(returns)), 8) if returns else None
         ),
         "empirical_return_lower_hinge_pct": (

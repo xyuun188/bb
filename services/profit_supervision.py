@@ -295,11 +295,7 @@ def build_profit_supervision_contract(
             and profit_contract.get("target") == PROFIT_TRAINING_TARGET
             else None
         )
-        net_return = (
-            contract_target
-            if contract_target is not None
-            else _safe_float(labels.get("net_return_after_cost_pct"))
-        )
+        net_return = contract_target
         source = _safe_text(sample.get("source"))
         trusted = bool(
             quality_eligible
@@ -314,14 +310,9 @@ def build_profit_supervision_contract(
             "actual_execution": True,
             "lifecycle_key": _safe_text(sample.get("lifecycle_key")),
             "side": _safe_text(sample.get("side")).lower(),
-            "return_target": (
-                PROFIT_TRAINING_TARGET
-                if contract_target is not None
-                else "net_return_after_cost_pct"
-            ),
-            "net_return_after_all_cost_pct": net_return,
+            "return_target": PROFIT_TRAINING_TARGET,
+            PROFIT_TRAINING_TARGET: net_return,
             "profit_training_contract": profit_contract,
-            "realized_net_return_pct": net_return,
             "realized_net_pnl_usdt": _safe_float(labels.get("realized_net_pnl_usdt")),
             "gross_market_return_pct": _safe_float(
                 labels.get("gross_return_on_notional_pct")
@@ -551,14 +542,7 @@ def profit_supervision_report(
             ),
         },
         "authoritative_realized_trade": {
-            "net_return_after_all_cost_pct": weighted_distribution(
-                _task_pairs(
-                    trade_samples,
-                    AUTHORITATIVE_REALIZED_RETURN_TASK,
-                    PROFIT_TRAINING_TARGET,
-                )
-            ),
-            "net_return_after_cost_pct": weighted_distribution(
+            PROFIT_TRAINING_TARGET: weighted_distribution(
                 _task_pairs(
                     trade_samples,
                     AUTHORITATIVE_REALIZED_RETURN_TASK,
@@ -666,8 +650,7 @@ def authoritative_trade_calibration(
             "source_authority": "okx_position_history",
             "symbol": key.rsplit("|", 1)[0],
             "side": side,
-            "net_return_after_all_cost_pct": weighted_distribution(net_pairs),
-            "net_return_after_cost_pct": weighted_distribution(net_pairs),
+            PROFIT_TRAINING_TARGET: weighted_distribution(net_pairs),
             "execution_cost_pct": weighted_distribution(cost_pairs),
             "slippage_pct": weighted_distribution(slippage_pairs),
             "stop_loss_slippage_pct": weighted_distribution(stop_pairs),

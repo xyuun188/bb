@@ -510,9 +510,7 @@ def _standardized_model_return_distribution(
 
 
 def _actual_calibration_ready(profile: dict[str, Any]) -> bool:
-    realized = _safe_dict(
-        profile.get(PROFIT_TRAINING_TARGET) or profile.get("net_return_after_cost_pct")
-    )
+    realized = _safe_dict(profile.get(PROFIT_TRAINING_TARGET))
     slippage = _safe_dict(profile.get("slippage_pct"))
     required_values = (
         realized.get("expected"),
@@ -609,10 +607,7 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     calibration = _safe_dict(metadata.get("actual_trade_calibration"))
     profiles = _safe_dict(calibration.get("profiles"))
     global_profile = _safe_dict(profiles.get(f"*|{side}"))
-    actual_return_distribution = _safe_dict(
-        global_profile.get(PROFIT_TRAINING_TARGET)
-        or global_profile.get("net_return_after_cost_pct")
-    )
+    actual_return_distribution = _safe_dict(global_profile.get(PROFIT_TRAINING_TARGET))
     slippage_distribution = _safe_dict(global_profile.get("slippage_pct"))
     if int(actual_return_distribution.get("count") or 0) <= 0:
         hard_reasons.append("authoritative realized return calibration is missing")
@@ -1334,12 +1329,7 @@ def _authoritative_trade_return_evidence(
         )
         realized = _safe_dict(tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK))
         side = str(realized.get("side") or sample.get("side") or "").lower()
-        value = _safe_float(
-            realized.get(PROFIT_TRAINING_TARGET)
-            if realized.get(PROFIT_TRAINING_TARGET) is not None
-            else realized.get("realized_net_return_pct"),
-            float("nan"),
-        )
+        value = _safe_float(realized.get(PROFIT_TRAINING_TARGET), float("nan"))
         if (
             realized.get("eligible") is not True
             or side not in side_rows

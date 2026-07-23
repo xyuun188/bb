@@ -105,11 +105,6 @@ def _with_return_objective(metadata: dict) -> dict:
                         "expected": 0.4,
                         "lower_hinge": 0.2,
                     },
-                    "net_return_after_cost_pct": {
-                        "count": 2,
-                        "expected": 0.4,
-                        "lower_hinge": 0.2,
-                    },
                     "slippage_pct": {
                         "count": 2,
                         "expected": 0.02,
@@ -576,7 +571,6 @@ def _authoritative_trade_sample() -> dict[str, object]:
                     "eligible": True,
                     "side": "long",
                     PROFIT_TRAINING_TARGET: 0.4,
-                    "realized_net_return_pct": 0.4,
                     "hold_minutes": 30.0,
                 },
             },
@@ -678,8 +672,12 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
         "actual_realized_return_sample_count"
     ] == 1
     assert metadata["profit_supervision_report"]["authoritative_realized_trade"][
-        "net_return_after_cost_pct"
+        PROFIT_TRAINING_TARGET
     ]["count"] == 1
+    assert (
+        "net_return_after_cost_pct"
+        not in metadata["profit_supervision_report"]["authoritative_realized_trade"]
+    )
     assert metadata["quality_report"]["profit_supervision"][
         "actual_realized_return_sample_count"
     ] == 1
@@ -1281,11 +1279,21 @@ def test_authoritative_trade_return_evidence_prefers_profit_training_target() ->
     sample = _authoritative_trade_sample()
     task = sample["profit_supervision"]["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
     task[PROFIT_TRAINING_TARGET] = -1.7
-    task["realized_net_return_pct"] = 99.0
 
     evidence = ml_signal_module._authoritative_trade_return_evidence([sample])
 
     assert evidence["sides"]["long"]["avg_return_pct"] == -1.7
+
+
+def test_authoritative_trade_return_evidence_rejects_old_realized_return_field() -> None:
+    sample = _authoritative_trade_sample()
+    task = sample["profit_supervision"]["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
+    task.pop(PROFIT_TRAINING_TARGET, None)
+    task["realized_net_return_pct"] = 99.0
+
+    evidence = ml_signal_module._authoritative_trade_return_evidence([sample])
+
+    assert evidence["sides"]["long"]["count"] == 0
 
 
 @pytest.mark.asyncio

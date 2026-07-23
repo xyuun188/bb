@@ -15,7 +15,6 @@ from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 def _cost_complete_sample(net_return: float) -> dict[str, object]:
     return {
-        "net_return_after_cost_pct": net_return,
         "cost_complete": True,
         "fee_return_pct": 0.04,
         "slippage_return_pct": 0.03,
@@ -33,7 +32,6 @@ def _cost_complete_sample(net_return: float) -> dict[str, object]:
                 AUTHORITATIVE_REALIZED_RETURN_TASK: {
                     "eligible": True,
                     PROFIT_TRAINING_TARGET: net_return,
-                    "realized_net_return_pct": net_return,
                 },
             },
         },
@@ -137,8 +135,11 @@ def test_high_win_rate_negative_expectancy_cannot_promote() -> None:
     )
 
     assert report["promotion_ready"] is False
-    assert report["average_net_return_after_cost_pct"] < 0
-    assert "average_fee_after_return_not_positive" in report["blocking_reasons"]
+    assert report["average_net_return_after_all_cost_pct"] < 0
+    assert (
+        "average_net_return_after_all_cost_not_positive"
+        in report["blocking_reasons"]
+    )
 
 
 def test_low_win_rate_positive_payoff_still_requires_positive_lower_half() -> None:
@@ -151,7 +152,7 @@ def test_low_win_rate_positive_payoff_still_requires_positive_lower_half() -> No
         ]
     )
 
-    assert report["average_net_return_after_cost_pct"] > 0
+    assert report["average_net_return_after_all_cost_pct"] > 0
     assert report["promotion_ready"] is False
     assert "empirical_return_lower_hinge_not_positive" in report["blocking_reasons"]
 
