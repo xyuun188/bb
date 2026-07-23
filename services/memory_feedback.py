@@ -7,10 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from services.authoritative_trade_outcome import (
-    AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
-    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-)
+from core.training_contracts import is_authoritative_expert_memory_extra
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 
 SIDES = ("long", "short")
@@ -49,20 +46,11 @@ def _safe_extra(value: Any) -> dict[str, Any]:
 
 def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
     extra = _safe_extra(memory.get("extra"))
-    source = str(extra.get("source") or "").lower()
-    if source.startswith("shadow") or str(memory.get("memory_type") or "").startswith("shadow_"):
-        return None
-    if extra.get("cost_complete") is not True:
-        return None
-    if extra.get("production_evidence_eligible") is not True:
+    if not is_authoritative_expert_memory_extra(extra):
         return None
     if extra.get("objective") != RETURN_OBJECTIVE_NAME:
         return None
     if extra.get("objective_version") != RETURN_OBJECTIVE_VERSION:
-        return None
-    if extra.get("authority_level") != AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY:
-        return None
-    if extra.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION:
         return None
 
     aggregation = _safe_dict(extra.get("outcome_aggregation"))
@@ -138,46 +126,39 @@ class MemoryFeedbackPolicy:
         }
         preferred = "neutral"
         return {
-            "enabled": bool(memories),
+            "enabled": any(
+                item["canonical_outcome_count"] > 0 for item in by_side.values()
+            ),
             "preferred_side_by_memory": preferred,
             "by_side": by_side,
             "decision_habit": self._decision_habit(by_side, preferred),
             "policy": (
-                "Shadow and cost-incomplete memories are observation-only. Only authoritative "
-                "fee-after outcomes may tighten risk; memory never grants production permission."
+                "Only complete authoritative OKX fee-after outcomes are accepted; memory never "
+                "grants production permission."
             ),
         }
 
     def _side_feedback(self, side: str, memories: list[dict[str, Any]]) -> dict[str, Any]:
-        shadow = 0
-        trade = 0
         positive = 0
         risk = 0
-        missed = 0
         top_reasons: list[str] = []
         outcomes: list[dict[str, Any]] = []
         seen_positions: set[int] = set()
 
         for memory in memories:
-            memory_type = str(memory.get("memory_type") or "lesson")
-            evidence = max(_safe_int(memory.get("evidence_count"), 1), 1)
-            if memory_type.startswith("shadow_"):
-                shadow += evidence
-                if memory_type == "shadow_missed_opportunity":
-                    missed += evidence
-            else:
-                trade += evidence
             outcome = canonical_memory_outcome(memory)
-            if outcome is not None:
-                position_ids = set(outcome["position_ids"])
-                if not position_ids.intersection(seen_positions):
-                    outcomes.append(outcome)
-                    seen_positions.update(position_ids)
-                    if outcome["total_pnl_usdt"] > 0:
-                        positive += outcome["count"]
-                    elif outcome["total_pnl_usdt"] < 0:
-                        risk += outcome["count"]
-            if outcome is not None and len(top_reasons) < 3:
+            if outcome is None:
+                continue
+            position_ids = set(outcome["position_ids"])
+            if position_ids.intersection(seen_positions):
+                continue
+            outcomes.append(outcome)
+            seen_positions.update(position_ids)
+            if outcome["total_pnl_usdt"] > 0:
+                positive += outcome["count"]
+            elif outcome["total_pnl_usdt"] < 0:
+                risk += outcome["count"]
+            if len(top_reasons) < 3:
                 lesson = str(memory.get("lesson") or memory.get("market_pattern") or "").strip()
                 if lesson:
                     top_reasons.append(lesson[:96])
@@ -206,10 +187,7 @@ class MemoryFeedbackPolicy:
         utility = (return_quality + pnl_efficiency) / 2.0
         return {
             "side": side,
-            "memory_count": len(memories),
-            "shadow_evidence_count": shadow,
-            "trade_evidence_count": trade,
-            "missed_opportunity_count": missed,
+            "authoritative_memory_count": len(outcomes),
             "positive_evidence_count": positive,
             "risk_evidence_count": risk,
             "net_evidence_count": positive - risk,

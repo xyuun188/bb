@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,6 +188,64 @@ def test_expert_memory_training_is_scoped_to_current_epoch() -> None:
 
     assert "epoch_start = load_training_epoch_start()" in source
     assert "ExpertMemory.created_at >= epoch_start" in source
+
+
+@pytest.mark.asyncio
+async def test_expert_memory_training_rejects_forged_non_authoritative_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    common_extra = {
+        "authority_level": "okx_settlement_and_execution",
+        "outcome_version": "2026-07-19.authoritative-trade-outcome.v2",
+        "outcome_id": "ato:1",
+        "outcome_fingerprint": "fingerprint-1",
+        "production_evidence_eligible": True,
+        "cost_complete": True,
+        "net_return_after_all_cost_pct": 1.5,
+        "objective": training.RETURN_OBJECTIVE_NAME,
+        "objective_version": training.RETURN_OBJECTIVE_VERSION,
+    }
+
+    def row(row_id: int, source: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=row_id,
+            expert_name="trend_expert",
+            symbol="BTC/USDT",
+            side="long",
+            market_pattern="pattern",
+            confidence_score=0.8,
+            success_count=1,
+            failure_count=0,
+            lesson="lesson",
+            extra={**common_extra, "source": source},
+        )
+
+    class Result:
+        def scalars(self) -> Result:
+            return self
+
+        def all(self) -> list[SimpleNamespace]:
+            return [row(1, "authoritative_trade_outcome"), row(2, "forged_source")]
+
+    class Session:
+        async def execute(self, _statement) -> Result:
+            return Result()
+
+    @asynccontextmanager
+    async def session_context():
+        yield Session()
+
+    monkeypatch.setattr(training, "get_session_ctx", session_context)
+    monkeypatch.setattr(
+        training,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 7, 24, tzinfo=UTC),
+    )
+
+    examples = await training._load_expert_memory_examples()
+
+    assert len(examples) == 1
+    assert json.loads(examples[0]["messages"][1]["content"])["payload"]["id"] == 1
 
 
 def test_shadow_response_chooses_fee_after_side_even_when_gross_points_elsewhere() -> None:

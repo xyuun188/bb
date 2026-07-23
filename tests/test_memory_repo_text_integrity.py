@@ -22,6 +22,8 @@ def _outcome_extra(*, position_id: int, outcome_id: str, pnl: float, return_pct:
         "authority_level": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
         "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         "outcome_id": outcome_id,
+        "outcome_fingerprint": f"fingerprint:{outcome_id}",
+        "cost_complete": True,
         "production_evidence_eligible": True,
         "realized_pnl": pnl,
         "net_return_after_all_cost_pct": return_pct,
@@ -63,6 +65,8 @@ def _install_fake_sanitizer(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
         if isinstance(value, str):
             return f"unified:{value}"
         if isinstance(value, dict):
+            if value.get("source") == "authoritative_trade_outcome":
+                return value
             return {"unified": value}
         return value
 
@@ -157,14 +161,48 @@ async def test_bulk_memory_lookup_limits_each_expert_inside_ranked_query() -> No
                             expert_label=expert_name,
                             symbol="BTC/USDT",
                             side="long",
-                            memory_type="shadow_missed_opportunity",
+                            memory_type="authoritative_trade_outcome",
                             market_pattern=f"pattern-{index}",
                             lesson=f"lesson-{index}",
                             recommended_action="observation_only",
                             evidence_count=1,
                             memory_key=f"{expert_name}:{index}",
                             is_active=True,
-                            extra={"authority_rank": 100 if index == 0 else 0},
+                            extra={
+                                **_outcome_extra(
+                                    position_id=index + 1,
+                                    outcome_id=f"ato:{expert_name}:{index}",
+                                    pnl=1.0,
+                                    return_pct=1.0,
+                                ),
+                                "authority_rank": 100 if index == 0 else 0,
+                            },
+                        )
+                    )
+                for source in ("local_provisional_reflection", "shadow_backtest"):
+                    session.add(
+                        ExpertMemory(
+                            expert_name=expert_name,
+                            expert_label=expert_name,
+                            symbol="BTC/USDT",
+                            side="long",
+                            memory_type="invalid_memory",
+                            market_pattern="invalid-pattern",
+                            lesson="invalid-lesson",
+                            recommended_action="observation_only",
+                            evidence_count=1,
+                            memory_key=f"{expert_name}:{source}",
+                            is_active=True,
+                            extra={
+                                **_outcome_extra(
+                                    position_id=1000,
+                                    outcome_id=f"invalid:{source}",
+                                    pnl=100.0,
+                                    return_pct=100.0,
+                                ),
+                                "source": source,
+                                "authority_rank": 1000,
+                            },
                         )
                     )
             await session.commit()
@@ -180,6 +218,11 @@ async def test_bulk_memory_lookup_limits_each_expert_inside_ranked_query() -> No
             "risk_expert": 3,
         }
         assert all(rows[0].extra["authority_rank"] == 100 for rows in grouped.values())
+        assert all(
+            row.extra["source"] == "authoritative_trade_outcome"
+            for rows in grouped.values()
+            for row in rows
+        )
     finally:
         await engine.dispose()
 
@@ -203,7 +246,12 @@ async def test_upsert_memory_uses_unified_runtime_text_boundary(
             "lesson": "raw lesson",
             "recommended_action": "reduce_risk",
             "memory_key": "trend:BTC:long",
-            "extra": {"note": "raw extra"},
+            "extra": _outcome_extra(
+                position_id=1,
+                outcome_id="ato:text-boundary",
+                pnl=1.0,
+                return_pct=1.0,
+            ),
         }
     )
 
@@ -211,7 +259,7 @@ async def test_upsert_memory_uses_unified_runtime_text_boundary(
     assert memory.lesson == "unified:raw lesson"
     assert memory.market_pattern == "unified:raw pattern"
     assert memory.recommended_action == "unified:reduce_risk"
-    assert memory.extra == {"unified": {"note": "raw extra"}}
+    assert memory.extra["source"] == "authoritative_trade_outcome"
     assert "confidence_adjustment" not in memory.__table__.columns
     assert "position_size_multiplier" not in memory.__table__.columns
     assert "raw lesson" in calls
@@ -238,7 +286,31 @@ async def test_upsert_memory_rejects_removed_policy_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upsert_memory_updates_existing_observation_without_policy_fields() -> None:
+async def test_upsert_memory_rejects_non_authoritative_source() -> None:
+    repo = MemoryRepository(FakeSession())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="complete authoritative OKX outcome"):
+        await repo.upsert_memory(
+            {
+                "expert_name": "risk_expert",
+                "memory_key": "risk:BTC:long",
+                "lesson": "invalid lesson",
+                "market_pattern": "invalid pattern",
+                "extra": {
+                    **_outcome_extra(
+                        position_id=1,
+                        outcome_id="ato:forged",
+                        pnl=100.0,
+                        return_pct=100.0,
+                    ),
+                    "source": "forged_source",
+                },
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_upsert_memory_updates_existing_authoritative_observation() -> None:
     existing = SimpleNamespace(
         evidence_count=1,
         success_count=0,
@@ -268,6 +340,12 @@ async def test_upsert_memory_updates_existing_observation_without_policy_fields(
             "memory_key": "risk:BTC:long",
             "lesson": "new observation",
             "market_pattern": "new pattern",
+            "extra": _outcome_extra(
+                position_id=2,
+                outcome_id="ato:update",
+                pnl=-1.0,
+                return_pct=-1.0,
+            ),
         }
     )
 

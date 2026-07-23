@@ -1,16 +1,15 @@
-"""Shadow backtest lifecycle and memory generation."""
+"""Shadow backtest lifecycle and training-label generation."""
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 
 from ai_brain.base_model import DecisionOutput
-from config.settings import FIXED_AI_MODEL_SLOTS, settings
 from core.market_facts import (
     build_market_fact,
     build_shadow_market_fact_contract,
@@ -365,7 +364,7 @@ def compact_shadow_leverage_counterfactuals(
 
 @dataclass(slots=True)
 class ShadowBacktestService:
-    """Record delayed market outcomes and convert strong results into memory."""
+    """Record delayed market outcomes for shadow training and evaluation."""
 
     latest_price_provider: LatestPriceProvider
     symbol_normalizer: SymbolNormalizer
@@ -376,9 +375,6 @@ class ShadowBacktestService:
     latest_market_fact_provider: LatestMarketFactProvider | None = None
     price_path_provider: PricePathProvider | None = None
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
-    fixed_model_slots: list[dict[str, Any]] = field(
-        default_factory=lambda: list(FIXED_AI_MODEL_SLOTS)
-    )
 
     async def create(
         self,
@@ -652,7 +648,6 @@ class ShadowBacktestService:
             if not completions:
                 return 0
 
-            memory_requests: list[tuple[Any, dict[str, Any]]] = []
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
                 reload_rows = getattr(repo, "get_pending_shadow_backtests_by_ids", None)
@@ -685,30 +680,6 @@ class ShadowBacktestService:
                             symbol=getattr(row, "symbol", None),
                             reasons=quarantine_result.get("reasons"),
                         )
-                        continue
-                    if settings.shadow_memory_enabled:
-                        memory_requests.append((row, completion))
-
-            # Shadow outcomes are authoritative training facts. Observation-only
-            # memory enrichment must never roll their completed transaction back.
-            for row, completion in memory_requests:
-                try:
-                    async with self.session_factory() as memory_session:
-                        memory_repo = self.repository_factory(memory_session)
-                        await self._record_memory_in_session(
-                            memory_repo,
-                            row,
-                            long_return=completion["long_return"],
-                            short_return=completion["short_return"],
-                            best_action=completion["best_action"],
-                            fee_after_outcome=completion["fee_after_outcome"],
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "failed to record shadow observation memory",
-                        shadow_backtest_id=getattr(row, "id", None),
-                        error=safe_error_text(exc),
-                    )
             logger.info("shadow backtests updated", count=completed_count)
             return completed_count
         except Exception as exc:
@@ -737,209 +708,3 @@ class ShadowBacktestService:
         ):
             return f"实际更优方向是 {side_label(best_action)}，用于后续复盘。"
         return ""
-
-    async def _record_memory_in_session(
-        self,
-        repo: Any,
-        row: Any,
-        *,
-        long_return: float,
-        short_return: float,
-        best_action: str,
-        fee_after_outcome: dict[str, Any],
-    ) -> None:
-        """Turn shadow backtest outcomes into small, reusable expert memories."""
-        decision_action = str(getattr(row, "decision_action", "") or "hold")
-        symbol = str(getattr(row, "symbol", "") or "")
-        horizon = int(getattr(row, "horizon_minutes", 0) or 0)
-        if not symbol or horizon <= 0:
-            return
-        if fee_after_outcome.get("cost_complete") is not True:
-            return
-
-        if decision_action == "hold" and best_action in {"long", "short"}:
-            realized_net_pct = self.float_parser(
-                fee_after_outcome.get(f"{best_action}_net_return_after_all_cost_pct"),
-                0.0,
-            )
-            if realized_net_pct <= 0.0:
-                return
-            memory_type = "shadow_missed_opportunity"
-            side = best_action
-            success_count = 0
-            failure_count = 0
-            outcome_text = (
-                f"当时选择观望，但 {horizon} 分钟后"
-                f"{side_label(side)}方向估算费后收益约 {realized_net_pct:.2f}%。"
-            )
-            recommended = "shadow_observation_only"
-        elif decision_action in {"long", "short"}:
-            side = decision_action
-            realized_net_pct = self.float_parser(
-                fee_after_outcome.get(f"{side}_net_return_after_all_cost_pct"),
-                0.0,
-            )
-            if realized_net_pct > 0.0:
-                memory_type = "shadow_good_signal"
-                success_count = 0
-                failure_count = 0
-                outcome_text = (
-                    f"影子复盘显示：{side_label(side)}信号在 {horizon} 分钟后"
-                    f"估算费后收益约 {realized_net_pct:.2f}%，仅保留为待验证观察。"
-                )
-                recommended = "shadow_observation_only"
-            elif realized_net_pct < 0.0:
-                memory_type = "shadow_bad_signal"
-                success_count = 0
-                failure_count = 0
-                opposite = "short" if side == "long" else "long"
-                opposite_net_pct = self.float_parser(
-                    fee_after_outcome.get(f"{opposite}_net_return_after_all_cost_pct"),
-                    0.0,
-                )
-                outcome_text = (
-                    f"影子复盘显示：{side_label(side)}信号在 {horizon} 分钟后"
-                    f"估算费后亏损约 {abs(realized_net_pct):.2f}%，而"
-                    f"{side_label(opposite)}方向估算费后收益约 {opposite_net_pct:.2f}%。"
-                )
-                recommended = "shadow_risk_observation_only"
-            else:
-                return
-        else:
-            return
-
-        feature_snapshot = getattr(row, "feature_snapshot", None) or {}
-        pattern = self._memory_pattern(feature_snapshot, symbol, side, horizon)
-        labels = {slot["name"]: slot.get("label", slot["name"]) for slot in self.fixed_model_slots}
-        for expert_name, lesson in self._expert_lessons(
-            symbol=symbol,
-            side=side,
-            memory_type=memory_type,
-            outcome_text=outcome_text,
-        ).items():
-            await repo.upsert_memory(
-                {
-                    "expert_name": expert_name,
-                    "expert_label": labels.get(expert_name, expert_name),
-                    "symbol": symbol,
-                    "side": side,
-                    "memory_type": memory_type,
-                    "market_pattern": pattern,
-                    "lesson": lesson,
-                    "recommended_action": recommended,
-                    "evidence_count": 1,
-                    "success_count": success_count,
-                    "failure_count": failure_count,
-                    "memory_key": (
-                        f"{expert_name}|shadow_correlated_path|"
-                        f"{getattr(row, 'decision_id', None) or getattr(row, 'id', None)}|"
-                        f"{symbol}|{side}|{self._feature_bucket(feature_snapshot)}"
-                    ),
-                    "extra": {
-                        "source": "shadow_backtest",
-                        "shadow_backtest_id": getattr(row, "id", None),
-                        "decision_id": getattr(row, "decision_id", None),
-                        "decision_action": decision_action,
-                        "best_action": best_action,
-                        "horizon_minutes": horizon,
-                        "entry_price": getattr(row, "entry_price", None),
-                        "actual_price": getattr(row, "actual_price", None),
-                        "long_return_pct": long_return * 100,
-                        "short_return_pct": short_return * 100,
-                        "net_return_after_all_cost_pct": realized_net_pct,
-                        "objective": RETURN_OBJECTIVE_NAME,
-                        "objective_version": RETURN_OBJECTIVE_VERSION,
-                        "cost_complete": True,
-                        "production_evidence_eligible": False,
-                        "correlation_group": (
-                            f"shadow_decision:{getattr(row, 'decision_id', None) or getattr(row, 'id', None)}"
-                        ),
-                        "fee_after_outcome": fee_after_outcome,
-                    },
-                }
-            )
-
-    def _expert_lessons(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        memory_type: str,
-        outcome_text: str,
-    ) -> dict[str, str]:
-        label = side_label(side)
-        if memory_type == "shadow_missed_opportunity":
-            return {
-                "trend_expert": (
-                    f"{symbol} {label}机会曾被观望错过。{outcome_text}"
-                    "当方向结构、ADX、均线和 MACD 同向时，可以提高方向支持，但不能直接决定仓位。"
-                ),
-                "momentum_expert": (
-                    f"{symbol} {label}机会曾被观望错过。{outcome_text}"
-                    "如果预期净收益、手续费覆盖和亏损概率都合格，可以支持小仓位盈利质量试单。"
-                ),
-                "sentiment_expert": (
-                    f"{symbol} {label}机会曾被观望错过。{outcome_text}"
-                    "如果 1/5/10/30 分钟路径和事件冲击风险有利，可以支持更早执行。"
-                ),
-                "risk_expert": (
-                    f"{symbol} {label}机会曾被观望错过。{outcome_text}"
-                    "没有硬风险时，优先用仓位和杠杆控制风险，不要直接否决交易。"
-                ),
-            }
-        if memory_type == "shadow_good_signal":
-            return {
-                "trend_expert": (
-                    f"{symbol} {label}信号被影子复盘验证有效。{outcome_text}"
-                    "下次出现相似方向结构时，可以适当提高方向信心。"
-                ),
-                "momentum_expert": (
-                    f"{symbol} {label}信号被影子复盘验证有效。{outcome_text}"
-                    "当扣费后预期净收益和盈亏质量仍为正时，可以支持执行。"
-                ),
-                "sentiment_expert": (
-                    f"{symbol} {label}信号被影子复盘验证有效。{outcome_text}"
-                    "短周期路径延续相似时，可以支持当前执行时机。"
-                ),
-                "risk_expert": (
-                    f"{symbol} {label}信号被影子复盘验证有效。{outcome_text}"
-                    "没有硬风险时，可以允许小仓位执行。"
-                ),
-            }
-        return {
-            "trend_expert": (
-                f"{symbol} {label}信号在影子复盘中表现偏弱。{outcome_text}"
-                "下次必须先看到趋势延续，再提高方向信心。"
-            ),
-            "momentum_expert": (
-                f"{symbol} {label}信号在影子复盘中表现偏弱。{outcome_text}"
-                "追单前要检查预期净收益、手续费覆盖和盈亏比是否过弱。"
-            ),
-            "sentiment_expert": (
-                f"{symbol} {label}信号在影子复盘中表现偏弱。{outcome_text}"
-                "执行前要确认短周期路径是否已经反转。"
-            ),
-            "risk_expert": (
-                f"{symbol} {label}信号在影子复盘中表现偏弱。{outcome_text}"
-                "相似条件下需要降低仓位/杠杆，必要时阻止新开仓。"
-            ),
-        }
-
-    def _memory_pattern(
-        self,
-        feature_snapshot: dict[str, Any],
-        symbol: str,
-        side: str,
-        horizon: int,
-    ) -> str:
-        return (
-            f"{symbol} {side_label(side)}影子复盘 {horizon}分钟，"
-            f"ADX={self.float_parser(feature_snapshot.get('adx_14'), 0.0):.1f}，"
-            f"量比={self.float_parser(feature_snapshot.get('volume_ratio'), 0.0):.2f}，"
-            f"5周期收益={self.float_parser(feature_snapshot.get('returns_5'), 0.0) * 100:.2f}%，"
-            f"盘口倾斜={self.float_parser(feature_snapshot.get('orderbook_imbalance'), 0.0):.2f}"
-        )
-
-    def _feature_bucket(self, feature_snapshot: dict[str, Any]) -> str:
-        del feature_snapshot
-        return "continuous_market_features"

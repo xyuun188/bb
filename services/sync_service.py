@@ -2432,9 +2432,7 @@ class OkxSyncService:
                         exit_price=exit_price,
                         entry_fee=entry_fee,
                         close_fee=close_fee,
-                        gross_pnl=gross_pnl,
                         source="okx_reconcile",
-                        decision=None,
                     )
 
                     existing_close_order = None
@@ -2830,9 +2828,7 @@ class OkxSyncService:
                 exit_price=close_price,
                 entry_fee=entry_fee,
                 close_fee=close_fee,
-                gross_pnl=gross_pnl,
                 source="okx_reconcile",
-                decision=None,
             )
             existing_close_order = None
             if close_order_id:

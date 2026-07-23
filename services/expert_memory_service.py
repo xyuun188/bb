@@ -7,7 +7,6 @@ from typing import Any
 
 import structlog
 
-from ai_brain.base_model import DecisionOutput
 from config.settings import ENSEMBLE_TRADER_NAME, FIXED_AI_MODEL_SLOTS, settings
 from core.safe_output import safe_error_text
 from db.repositories.memory_repo import MemoryRepository
@@ -141,11 +140,9 @@ class ExpertMemoryService:
         exit_price: float,
         entry_fee: float,
         close_fee: float,
-        gross_pnl: float,
         source: str,
-        decision: DecisionOutput | None = None,
     ) -> bool:
-        """Create a compact post-trade reflection and update expert memories."""
+        """Create a reflection link that authoritative OKX backfill will replace."""
 
         if not self.memory_enabled_provider():
             return False
@@ -162,26 +159,9 @@ class ExpertMemoryService:
             quantity = float(pos.quantity or 0.0)
             notional = abs(entry_price * quantity)
             pnl_pct = realized_pnl / notional if notional > 0 else 0.0
-            funding_fee = float(getattr(pos, "funding_fee", 0.0) or 0.0)
-            cost_complete = bool(
-                notional > 0
-                and entry_fee is not None
-                and close_fee is not None
-                and hasattr(pos, "funding_fee")
-            )
             hold_minutes = position_hold_minutes(pos)
             outcome = "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat"
-            pattern = reflection_pattern(pos, pnl_pct, hold_minutes)
             mistake, improvement = reflection_summary(pos, outcome, pnl_pct, hold_minutes)
-            expert_lessons = build_expert_lessons(
-                pos=pos,
-                outcome=outcome,
-                pnl_pct=pnl_pct,
-                hold_minutes=hold_minutes,
-                pattern=pattern,
-                decision=decision,
-                model_slots=self.model_slots,
-            )
             repo = MemoryRepository(session)
             reflection = await repo.create_reflection(
                 {
@@ -200,7 +180,7 @@ class ExpertMemoryService:
                     "outcome": outcome,
                     "mistake_summary": mistake,
                     "improvement_summary": improvement,
-                    "expert_lessons": expert_lessons,
+                    "expert_lessons": {},
                     "source": source,
                 }
             )
@@ -208,38 +188,6 @@ class ExpertMemoryService:
                 reflection = await repo.get_reflection_by_position_id(int(pos.id or 0))
             if reflection is None:
                 return False
-
-            for lesson in expert_lessons.values():
-                await repo.upsert_memory(
-                    {
-                        **lesson,
-                        "source_position_id": int(pos.id or 0),
-                        "extra": {
-                            "reflection_id": reflection.id,
-                            "realized_pnl": realized_pnl,
-                            "pnl_pct": pnl_pct,
-                            "pnl_pct_deprecated_ratio": True,
-                            "net_return_after_all_cost_pct": pnl_pct * 100.0,
-                            "objective": "maximize_expected_realized_net_return_after_cost",
-                            "objective_version": "2026-07-12.v1",
-                            "cost_complete": cost_complete,
-                            "production_evidence_eligible": False,
-                            "authority_level": "local_provisional_settlement",
-                            "authority_rank": 10,
-                            "outcome_version": None,
-                            "source": "local_provisional_reflection",
-                            "provisional_source": source,
-                            "hold_minutes": hold_minutes,
-                            "gross_pnl": gross_pnl,
-                            "entry_fee": entry_fee,
-                            "close_fee": close_fee,
-                            "funding_fee": funding_fee,
-                            "source_position_id": int(pos.id or 0),
-                            "settlement_status": getattr(pos, "settlement_status", None),
-                            "settlement_source": getattr(pos, "settlement_source", None),
-                        },
-                    }
-                )
             return True
         except Exception as exc:
             logger.warning(
@@ -258,26 +206,27 @@ class ExpertMemoryService:
                 mode=execution_mode,
                 since=load_training_epoch_start(),
             )
-            settlement_trusted = [
-                outcome for outcome in outcomes if outcome.get("settlement_fact_trusted") is True
+            complete_outcomes = [
+                outcome
+                for outcome in outcomes
+                if outcome.get("settlement_fact_trusted") is True
+                and outcome.get("outcome_complete") is True
             ]
             async with self.session_factory() as session:
                 processed = 0
-                complete = 0
-                for outcome in settlement_trusted:
+                for outcome in complete_outcomes:
                     processed += int(
                         await self._record_authoritative_outcome_in_session(session, outcome)
                     )
-                    complete += int(outcome.get("outcome_complete") is True)
                 report = {
                     "status": "completed",
                     "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
                     "scanned": len(outcomes),
-                    "eligible": len(settlement_trusted),
+                    "eligible": len(complete_outcomes),
                     "unique_lifecycles": len(
-                        {str(item.get("lifecycle_key") or "") for item in settlement_trusted}
+                        {str(item.get("lifecycle_key") or "") for item in complete_outcomes}
                     ),
-                    "complete_before_reflection_sync": complete,
+                    "complete_before_reflection_sync": len(complete_outcomes),
                     "processed": processed,
                 }
                 logger.info("trade reflection backfill completed", **report)
@@ -335,6 +284,8 @@ class ExpertMemoryService:
             return False
 
         canonical = build_authoritative_trade_outcome(outcome, reflection=reflection)
+        if canonical.get("outcome_complete") is not True:
+            return False
         lesson_text = (
             f"Authoritative fee-after outcome {canonical['outcome_id']}: symbol={symbol}, "
             f"side={side}, result={result_label}, net_return_pct={net_return_pct:.8f}, "
@@ -372,8 +323,8 @@ class ExpertMemoryService:
                         "net_return_after_all_cost_pct": net_return_pct,
                         "objective": "maximize_expected_realized_net_return_after_cost",
                         "objective_version": "2026-07-12.v1",
-                        "cost_complete": canonical.get("settlement_fact_trusted") is True,
-                        "production_evidence_eligible": canonical.get("outcome_complete") is True,
+                        "cost_complete": True,
+                        "production_evidence_eligible": True,
                         "hold_minutes": hold_minutes,
                         "attribution": canonical.get("attribution"),
                         "counterfactual_production_weight": 0.0,
@@ -416,15 +367,6 @@ def position_hold_minutes(pos: Any) -> float:
     return max((closed - opened).total_seconds() / 60.0, 0.0)
 
 
-def reflection_pattern(pos: Any, pnl_pct: float, hold_minutes: float) -> str:
-    side_label = "做多" if str(pos.side).lower() == "long" else "做空"
-    leverage = float(getattr(pos, "leverage", 1.0) or 1.0)
-    return (
-        f"{pos.symbol} {side_label}，费后收益率={pnl_pct:.6%}，"
-        f"持仓分钟={hold_minutes:.2f}，杠杆={leverage:.2f}x"
-    )
-
-
 def reflection_summary(
     pos: Any,
     outcome: str,
@@ -433,64 +375,10 @@ def reflection_summary(
 ) -> tuple[str, str]:
     side_label = "做多" if str(pos.side).lower() == "long" else "做空"
     observation = (
-        f"{pos.symbol} {side_label} 权威结算结果={outcome}，"
-        f"费后收益率={pnl_pct:.6%}，持仓分钟={hold_minutes:.2f}。"
+        f"{pos.symbol} {side_label} 本地平仓记录={outcome}，"
+        f"暂存收益率={pnl_pct:.6%}，持仓分钟={hold_minutes:.2f}；等待 OKX 权威结果回写。"
     )
-    return observation, "仅作为训练与复盘事实；不得直接调整方向、仓位、杠杆或退出。"
-
-
-def build_expert_lessons(
-    *,
-    pos: Any,
-    outcome: str,
-    pnl_pct: float,
-    hold_minutes: float,
-    pattern: str,
-    decision: DecisionOutput | None = None,
-    model_slots: Sequence[dict[str, Any]] = FIXED_AI_MODEL_SLOTS,
-) -> dict[str, dict[str, Any]]:
-    del decision
-    side = str(pos.side or "").lower()
-    symbol = str(pos.symbol or "")
-    is_profit = outcome == "profit"
-    is_loss = outcome == "loss"
-    memory_type = "fee_after_outcome_observation"
-    evidence_success = 1 if is_profit else 0
-    evidence_failure = 1 if is_loss else 0
-
-    labels = {
-        str(slot["name"]): slot.get("label", slot["name"])
-        for slot in model_slots
-        if slot.get("name")
-    }
-    base_key = f"{symbol}|{side}|{memory_type}|{lesson_bucket(pnl_pct, hold_minutes)}"
-    lesson = (
-        f"权威费后结果事实：symbol={symbol}, side={side}, outcome={outcome}, "
-        f"net_return_after_all_cost_pct={pnl_pct * 100.0:.8f}, "
-        f"hold_minutes={hold_minutes:.4f}, pattern={pattern}。"
-    )
-    result: dict[str, dict[str, Any]] = {}
-    for expert_name in labels:
-        result[expert_name] = {
-            "expert_name": expert_name,
-            "expert_label": labels.get(expert_name, expert_name),
-            "symbol": symbol,
-            "side": side,
-            "memory_type": memory_type,
-            "market_pattern": pattern,
-            "lesson": lesson,
-            "recommended_action": "observation_only",
-            "evidence_count": 1,
-            "success_count": evidence_success,
-            "failure_count": evidence_failure,
-            "memory_key": f"{expert_name}|{base_key}",
-        }
-    return result
-
-
-def lesson_bucket(pnl_pct: float, hold_minutes: float) -> str:
-    del pnl_pct, hold_minutes
-    return "canonical_fee_after_outcome"
+    return observation, "暂存记录不进入专家记忆、训练或晋升；仅等待权威 outcome 覆盖。"
 
 
 def _empty_memory_context() -> dict[str, Any]:

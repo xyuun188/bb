@@ -148,3 +148,19 @@ def test_low_win_high_payoff_beats_high_win_negative_expectancy() -> None:
 def test_profit_factor_is_undefined_without_a_loss_denominator() -> None:
     assert profit_factor([0.8, 0.3, 1.1]) is None
     assert profit_factor([0.0, 0.0]) is None
+
+
+def test_removed_expert_memory_paths_do_not_return_to_runtime_code() -> None:
+    runtime_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for root in (ROOT / "config", ROOT / "db", ROOT / "scripts", ROOT / "services")
+        for path in root.rglob("*.py")
+    )
+
+    for removed_identifier in (
+        "local_provisional_reflection",
+        "shadow_memory_enabled",
+        "_record_memory_in_session",
+        "build_expert_lessons",
+    ):
+        assert removed_identifier not in runtime_sources

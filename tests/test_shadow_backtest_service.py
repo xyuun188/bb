@@ -34,7 +34,6 @@ class _FakeRepo:
         self.created: list[dict[str, Any]] = []
         self.due_rows: list[Any] = []
         self.completed: list[dict[str, Any]] = []
-        self.memories: list[dict[str, Any]] = []
 
     async def create_shadow_backtest(self, data: dict[str, Any]) -> None:
         self.created.append(data)
@@ -47,10 +46,6 @@ class _FakeRepo:
         for key, value in data.items():
             setattr(row, key, value)
         self.completed.append(data)
-
-    async def upsert_memory(self, data: dict[str, Any]) -> None:
-        self.memories.append(data)
-
 
 _ENTRY_TIMESTAMP_MS = 1_783_990_800_000
 _RESULT_TIMESTAMP_MS = _ENTRY_TIMESTAMP_MS + 60 * 60_000
@@ -356,12 +351,7 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
 
 
 @pytest.mark.asyncio
-async def test_shadow_backtest_cost_incomplete_positive_move_does_not_create_memory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+async def test_shadow_backtest_cost_incomplete_move_keeps_gross_label_only() -> None:
     repo = _FakeRepo()
     row = SimpleNamespace(
         id=7,
@@ -394,16 +384,10 @@ async def test_shadow_backtest_cost_incomplete_positive_move_does_not_create_mem
             "note": "",
         }
     ]
-    assert repo.memories == []
 
 
 @pytest.mark.asyncio
-async def test_shadow_backtest_records_fee_after_observation_without_probe_permission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
+async def test_shadow_backtest_records_fee_after_training_label_only() -> None:
     repo = _FakeRepo()
     row = SimpleNamespace(
         id=8,
@@ -454,140 +438,11 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     assert leverage_evidence["leverage_10x_long_fee_after_margin_return_pct"] == (
         pytest.approx(label_contract["long_net_return_after_all_cost_pct"] * 10)
     )
-    assert len(repo.memories) == 4
-    assert {item["expert_name"] for item in repo.memories} == {
-        "trend_expert",
-        "momentum_expert",
-        "sentiment_expert",
-        "risk_expert",
-    }
-    assert all(item["memory_type"] == "shadow_missed_opportunity" for item in repo.memories)
-    assert repo.memories[0]["extra"]["actual_price"] == 101.0
-    assert all("confidence_adjustment" not in item for item in repo.memories)
-    assert all("position_size_multiplier" not in item for item in repo.memories)
-    assert all(item["success_count"] == 0 for item in repo.memories)
-    assert all(item["failure_count"] == 0 for item in repo.memories)
-    assert all(item["extra"]["cost_complete"] is True for item in repo.memories)
-    assert all(
-        item["extra"]["production_evidence_eligible"] is False for item in repo.memories
-    )
-    assert all(item["recommended_action"] == "shadow_observation_only" for item in repo.memories)
-    assert repo.memories[0]["extra"]["net_return_after_all_cost_pct"] < 1.0
-
-
-@pytest.mark.asyncio
-async def test_shadow_completion_commits_before_best_effort_memory_write(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
-
-    class CommitTrackingSessionCtx:
-        completed_contexts = 0
-
-        async def __aenter__(self) -> object:
-            return object()
-
-        async def __aexit__(self, *_args: object) -> None:
-            type(self).completed_contexts += 1
-
-    class FailingMemoryRepo(_FakeRepo):
-        async def upsert_memory(self, _data: dict[str, Any]) -> None:
-            assert CommitTrackingSessionCtx.completed_contexts >= 2
-            raise RuntimeError("memory storage unavailable")
-
-    repo = FailingMemoryRepo()
-    repo.due_rows = [
-        SimpleNamespace(
-            id=9,
-            decision_id=124,
-            model_name="ensemble_trader",
-            execution_mode="paper",
-            symbol="BTC/USDT",
-            decision_action="hold",
-            entry_price=100.0,
-            horizon_minutes=10,
-            status="pending",
-            note="",
-            feature_snapshot={
-                "bid": 99.99,
-                "ask": 100.01,
-                "orderbook_bid_depth": 100_000.0,
-                "orderbook_ask_depth": 100_000.0,
-                "taker_fee_rate": 0.0005,
-                "funding_rate": 0.0,
-                "funding_data_available": True,
-                "funding_interval_minutes": 480.0,
-            },
-        )
-    ]
-
-    async def latest_price(_symbol: str) -> float:
-        return 101.0
-
-    service = ShadowBacktestService(
-        latest_price_provider=latest_price,
-        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
-        float_parser=_float,
-        session_factory=CommitTrackingSessionCtx,
-        repository_factory=lambda _session: repo,
-    )
-
-    assert await service.update_due() == 1
-    assert len(repo.completed) == 1
-
-
-@pytest.mark.asyncio
-async def test_shadow_horizons_share_one_correlated_memory_key_per_expert(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
-    repo = _FakeRepo()
-    feature_snapshot = {
-        "bid": 99.99,
-        "ask": 100.01,
-        "orderbook_bid_depth": 100_000.0,
-        "orderbook_ask_depth": 100_000.0,
-        "taker_fee_rate": 0.0005,
-        "funding_rate": 0.0,
-        "funding_data_available": True,
-        "funding_interval_minutes": 480.0,
-    }
-    repo.due_rows = [
-        SimpleNamespace(
-            id=row_id,
-            decision_id=456,
-            model_name="ensemble_trader",
-            symbol="BTC/USDT",
-            decision_action="hold",
-            entry_price=100.0,
-            horizon_minutes=horizon,
-            status="pending",
-            note="",
-            feature_snapshot=feature_snapshot,
-        )
-        for row_id, horizon in ((10, 10), (11, 30))
-    ]
-
-    await _service(repo, latest_price=101.0).update_due()
-
-    assert len(repo.memories) == 8
-    assert len({item["memory_key"] for item in repo.memories}) == 4
-    assert {
-        item["extra"]["correlation_group"] for item in repo.memories
-    } == {"shadow_decision:456"}
 
 
 @pytest.mark.asyncio
 async def test_due_shadow_fetches_current_account_fee_once_per_mode(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
     repo = _FakeRepo()
     repo.due_rows = [
         SimpleNamespace(
@@ -635,17 +490,14 @@ async def test_due_shadow_fetches_current_account_fee_once_per_mode(
     assert repo.due_rows[0].feature_snapshot["fee_rate_source"] == (
         "okx_account_trade_fee.takerU"
     )
-    assert len(repo.memories) == 4
-    assert all(item["extra"]["cost_complete"] is True for item in repo.memories)
+    assert repo.due_rows[0].feature_snapshot["training_label_contract"][
+        "fee_after_complete"
+    ] is True
 
 
 @pytest.mark.asyncio
 async def test_shadow_backtest_price_collection_does_not_hold_database_session(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", False)
     repo = _FakeRepo()
     repo.due_rows = [
         SimpleNamespace(
@@ -692,11 +544,7 @@ async def test_shadow_backtest_price_collection_does_not_hold_database_session(
 
 @pytest.mark.asyncio
 async def test_shadow_backtest_service_does_not_apply_fixed_price_range_tolerance(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
     repo = _FakeRepo()
     row = SimpleNamespace(
         id=8,
@@ -724,17 +572,12 @@ async def test_shadow_backtest_service_does_not_apply_fixed_price_range_toleranc
 
     assert row.status != "quarantined"
     assert "price_outside_24h_range" not in row.note
-    assert repo.memories == []
     assert repo.completed[0]["actual_price"] == pytest.approx(0.3910)
 
 
 @pytest.mark.asyncio
 async def test_shadow_backtest_quarantines_zero_turnover_robo_entry_fact(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "shadow_memory_enabled", True)
     repo = _FakeRepo()
     row = SimpleNamespace(
         id=88,
@@ -770,7 +613,6 @@ async def test_shadow_backtest_quarantines_zero_turnover_robo_entry_fact(
 
     assert row.status == "quarantined"
     assert "entry:zero_notional_turnover" in row.note
-    assert repo.memories == []
 
 
 def test_shadow_backtest_side_label() -> None:

@@ -12,8 +12,6 @@ from services.expert_memory_service import (
     ExpertMemoryService,
     _reflection_lifecycle_key,
     _reflection_position_rank,
-    build_expert_lessons,
-    reflection_pattern,
     reflection_summary,
 )
 
@@ -46,27 +44,10 @@ def test_trade_reflection_templates_are_clean_chinese() -> None:
         closed_at=datetime(2026, 6, 8, 1, 4, tzinfo=UTC),
     )
 
-    pattern = reflection_pattern(pos, pnl_pct=-0.012, hold_minutes=4.0)
     mistake, improvement = reflection_summary(pos, "loss", -0.012, 4.0)
-    lessons = build_expert_lessons(
-        pos=pos,
-        outcome="loss",
-        pnl_pct=-0.012,
-        hold_minutes=4.0,
-        pattern=pattern,
-        model_slots=[{"name": "trend_expert", "label": "趋势专家"}],
-    )
 
-    _assert_clean_chinese(pattern)
     _assert_clean_chinese(mistake)
-    assert "不得直接调整方向、仓位、杠杆或退出" in improvement
-    assert lessons["trend_expert"]["expert_label"] == "趋势专家"
-    for lesson in lessons.values():
-        _assert_clean_chinese(lesson["lesson"])
-        _assert_clean_chinese(lesson["market_pattern"])
-        assert lesson["recommended_action"] == "observation_only"
-        assert "confidence_adjustment" not in lesson
-        assert "position_size_multiplier" not in lesson
+    assert "不进入专家记忆、训练或晋升" in improvement
 
 
 def test_authoritative_reflection_backfill_deduplicates_exchange_lifecycle() -> None:
@@ -153,9 +134,8 @@ async def test_expert_memory_context_loads_all_experts_in_one_query(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_expert_memory_service_records_reflection_and_memories(monkeypatch) -> None:
+async def test_local_close_records_reflection_without_expert_memory(monkeypatch) -> None:
     created_reflections: list[dict[str, Any]] = []
-    upserted_memories: list[dict[str, Any]] = []
 
     class FakeMemoryRepository:
         def __init__(self, _session: Any) -> None:
@@ -164,9 +144,6 @@ async def test_expert_memory_service_records_reflection_and_memories(monkeypatch
         async def create_reflection(self, data: dict[str, Any]) -> SimpleNamespace:
             created_reflections.append(data)
             return SimpleNamespace(id=321)
-
-        async def upsert_memory(self, data: dict[str, Any]) -> None:
-            upserted_memories.append(data)
 
     monkeypatch.setattr(expert_memory_module, "MemoryRepository", FakeMemoryRepository)
     service = ExpertMemoryService(
@@ -188,37 +165,28 @@ async def test_expert_memory_service_records_reflection_and_memories(monkeypatch
         closed_at=datetime.now(UTC),
     )
 
-    await service.record_trade_reflection_in_session(
+    processed = await service.record_trade_reflection_in_session(
         object(),
         pos,
         exit_price=98.0,
         entry_fee=0.1,
         close_fee=0.1,
-        gross_pnl=-3.8,
         source="unit_test",
-        decision=None,
     )
 
+    assert processed is True
     assert len(created_reflections) == 1
-    assert len(upserted_memories) == 1
     reflection = created_reflections[0]
     assert reflection["outcome"] == "loss"
     assert reflection["source"] == "unit_test"
     assert reflection["closed_at"] == pos.closed_at
+    assert reflection["expert_lessons"] == {}
     _assert_clean_chinese(reflection["mistake_summary"])
-    assert "不得直接调整方向、仓位、杠杆或退出" in reflection["improvement_summary"]
-    assert all(memory["extra"]["reflection_id"] == 321 for memory in upserted_memories)
-    assert all(
-        memory["extra"]["net_return_after_all_cost_pct"] == pytest.approx(-2.0)
-        for memory in upserted_memories
-    )
-    assert all(memory["extra"]["source_position_id"] == 7 for memory in upserted_memories)
+    assert "不进入专家记忆、训练或晋升" in reflection["improvement_summary"]
 
 
 @pytest.mark.asyncio
-async def test_existing_reflection_still_refreshes_return_memories(monkeypatch) -> None:
-    upserted_memories: list[dict[str, Any]] = []
-
+async def test_existing_local_reflection_does_not_create_expert_memory(monkeypatch) -> None:
     class FakeMemoryRepository:
         def __init__(self, _session: Any) -> None:
             pass
@@ -229,9 +197,6 @@ async def test_existing_reflection_still_refreshes_return_memories(monkeypatch) 
         async def get_reflection_by_position_id(self, position_id: int) -> SimpleNamespace:
             assert position_id == 7
             return SimpleNamespace(id=654)
-
-        async def upsert_memory(self, data: dict[str, Any]) -> None:
-            upserted_memories.append(data)
 
     monkeypatch.setattr(expert_memory_module, "MemoryRepository", FakeMemoryRepository)
     service = ExpertMemoryService(
@@ -262,14 +227,10 @@ async def test_existing_reflection_still_refreshes_return_memories(monkeypatch) 
         exit_price=2.2,
         entry_fee=0.1,
         close_fee=0.1,
-        gross_pnl=-1.7,
         source="authoritative_settlement_backfill",
     )
 
     assert processed is True
-    assert len(upserted_memories) == 1
-    assert all(row["extra"]["reflection_id"] == 654 for row in upserted_memories)
-    assert all(row["extra"]["net_return_after_all_cost_pct"] == -10.0 for row in upserted_memories)
 
 
 @pytest.mark.asyncio
@@ -293,7 +254,12 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
                 "lifecycle_key": "paper|ICP|1",
                 "settlement_fact_trusted": True,
                 "outcome_complete": True,
-            }
+            },
+            {
+                "lifecycle_key": "paper|ICP|2",
+                "settlement_fact_trusted": True,
+                "outcome_complete": False,
+            },
         ]
 
     service = ExpertMemoryService(
@@ -315,6 +281,8 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
     report = await service.backfill_trade_reflections("paper")
 
     assert report["status"] == "completed"
+    assert report["scanned"] == 2
+    assert report["eligible"] == 1
     assert report["processed"] == 1
     assert processed == ["paper|ICP|1"]
     assert loader_calls[0]["mode"] == "paper"

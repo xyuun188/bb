@@ -13,6 +13,8 @@ SHADOW_LABEL_VERSION = "2026-07-14.native-shadow-label.v1"
 SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"
 AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-19.authoritative-trade-outcome.v2"
 AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-07-23.net-return-after-all-cost.v1"
+AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
+AUTHORITATIVE_EXPERT_MEMORY_SOURCE = "authoritative_trade_outcome"
 AUTHORITATIVE_TRADE_OUTCOME_SOURCES = frozenset(
     {
         "okx_position_history",
@@ -62,6 +64,21 @@ def _fingerprint(payload: Any) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def is_authoritative_expert_memory_extra(value: Any) -> bool:
+    """Return whether an expert-memory payload is a complete OKX outcome fact."""
+
+    extra = _dict(value)
+    return bool(
+        _text(extra.get("source")) == AUTHORITATIVE_EXPERT_MEMORY_SOURCE
+        and _text(extra.get("authority_level")) == AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY
+        and _text(extra.get("outcome_version")) == AUTHORITATIVE_TRADE_OUTCOME_VERSION
+        and extra.get("production_evidence_eligible") is True
+        and extra.get("cost_complete") is True
+        and _text(extra.get("outcome_id"))
+        and _text(extra.get("outcome_fingerprint"))
+    )
 
 
 def build_shadow_label_contract(

@@ -34,6 +34,7 @@ from config.settings import settings  # noqa: E402
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text, safe_print  # noqa: E402
+from core.training_contracts import is_authoritative_expert_memory_extra  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
 from models.learning import ExpertMemory  # noqa: E402
 from scripts.train_local_ai_tools_models import (  # noqa: E402
@@ -1435,10 +1436,7 @@ async def _load_expert_memory_examples() -> list[dict[str, Any]]:
     examples: list[dict[str, Any]] = []
     for row in rows:
         extra = row.extra if isinstance(row.extra, dict) else {}
-        if not (
-            extra.get("production_evidence_eligible") is True
-            and extra.get("cost_complete") is True
-        ):
+        if not is_authoritative_expert_memory_extra(extra):
             continue
         payload = {
             "id": int(row.id or 0),

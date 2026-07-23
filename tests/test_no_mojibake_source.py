@@ -26,7 +26,6 @@ SCAN_TARGETS = (
 
 ALLOWED_FILES = {
     Path("tests/test_batch_expert_json_stability.py"),
-    Path("tests/test_expert_memory_cleanup.py"),
     Path("tests/test_expert_memory_service.py"),
     Path("tests/test_strategy_learning.py"),
 }

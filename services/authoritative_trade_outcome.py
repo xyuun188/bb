@@ -15,6 +15,7 @@ from sqlalchemy import select
 from core.runtime_data_retention_contract import is_ai_decision_retention_payload
 from core.training_contracts import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
+    AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
     AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
@@ -29,7 +30,6 @@ from services.profit_training_contract import (
     validate_profit_training_sample,
 )
 
-AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
 AUTHORITATIVE_TRADE_OUTCOME_CONSUMERS = (
     "local_ml",
     "local_ai_tools",

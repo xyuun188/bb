@@ -7,8 +7,8 @@ from sqlalchemy import Float, cast, func, or_, select
 
 from core.symbols import normalize_trading_symbol
 from core.training_contracts import (
-    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     SHADOW_LABEL_VERSION,
+    is_authoritative_expert_memory_extra,
 )
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
@@ -396,6 +396,8 @@ def _normalize_memory_payload(data: dict[str, Any]) -> dict[str, Any]:
     for key in ("recommended_action", "extra"):
         if key in data:
             data[key] = sanitize_runtime_text(data.get(key))
+    if not is_authoritative_expert_memory_extra(data.get("extra")):
+        raise ValueError("expert memory requires a complete authoritative OKX outcome contract")
     if not _memory_text_usable(data.get("lesson")) or not _memory_text_usable(
         data.get("market_pattern")
     ):
@@ -420,8 +422,10 @@ def _normalize_shadow_backtest_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _memory_row_usable(row: ExpertMemory) -> bool:
-    return _memory_text_usable(getattr(row, "lesson", None)) and _memory_text_usable(
-        getattr(row, "market_pattern", None)
+    return (
+        is_authoritative_expert_memory_extra(getattr(row, "extra", None))
+        and _memory_text_usable(getattr(row, "lesson", None))
+        and _memory_text_usable(getattr(row, "market_pattern", None))
     )
 
 
@@ -437,12 +441,7 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
     previous = _memory_outcome_aggregation(existing)
     if previous.get("return_unit") != "percentage_points":
         previous = {}
-    if (
-        incoming.get("source") != "authoritative_trade_outcome"
-        or incoming.get("authority_level") != "okx_settlement_and_execution"
-        or incoming.get("outcome_version") != AUTHORITATIVE_TRADE_OUTCOME_VERSION
-        or incoming.get("production_evidence_eligible") is not True
-    ):
+    if not is_authoritative_expert_memory_extra(incoming):
         return {**existing, **incoming}
 
     realized_pnl = _finite_float(incoming.get("realized_pnl"), None)

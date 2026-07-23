@@ -24,6 +24,7 @@ def _trade_memory(
             "source": "authoritative_trade_outcome",
             "source_position_id": position_id,
             "outcome_id": f"ato:{position_id}",
+            "outcome_fingerprint": f"fingerprint:{position_id}",
             "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
             "authority_level": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
             "net_return_after_all_cost_pct": net_return_pct,
@@ -36,27 +37,24 @@ def _trade_memory(
     }
 
 
-def test_shadow_missed_opportunities_remain_observation_only() -> None:
+def test_non_authoritative_memory_is_rejected() -> None:
     feedback = MemoryFeedbackPolicy().build(
         [
             {
                 "side": "short",
-                "memory_type": "shadow_missed_opportunity",
-                "confidence_adjustment": 0.9,
-                "confidence_score": 1.0,
-                "evidence_count": 164,
+                "memory_type": "invalid_memory",
                 "extra": {
-                    "source": "shadow_backtest",
-                    "short_return_pct": 20.0,
-                    "cost_complete": False,
-                    "production_evidence_eligible": False,
+                    "source": "forged_source",
+                    "cost_complete": True,
+                    "production_evidence_eligible": True,
                 },
             }
         ]
     )
 
     short = feedback["by_side"]["short"]
-    assert short["shadow_evidence_count"] == 164
+    assert feedback["enabled"] is False
+    assert short["authoritative_memory_count"] == 0
     assert short["canonical_outcome_count"] == 0
     assert short["candidate_score_bonus"] == 0.0
     assert short["score_adjustment"] == 0.0
@@ -64,13 +62,12 @@ def test_shadow_missed_opportunities_remain_observation_only() -> None:
     assert feedback["decision_habit"]["posture"] == "observation_only"
 
 
-def test_authoritative_fee_after_loss_overrides_any_shadow_count() -> None:
+def test_authoritative_fee_after_loss_ignores_non_authoritative_rows() -> None:
     memories = [
         {
             "side": "short",
-            "memory_type": "shadow_missed_opportunity",
-            "evidence_count": 164,
-            "extra": {"source": "shadow_backtest", "production_evidence_eligible": False},
+            "memory_type": "invalid_memory",
+            "extra": {"source": "forged_source", "production_evidence_eligible": True},
         },
         _trade_memory(
             side="short",

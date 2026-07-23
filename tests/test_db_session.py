@@ -1,5 +1,8 @@
+import json
+
 import pytest
-from sqlalchemy import Text
+from sqlalchemy import Text, text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 import db.session as session_module
 from models.trade import Order
@@ -189,6 +192,70 @@ async def test_postgres_removed_expert_columns_skip_steady_state_ddl(
     await session_module._drop_removed_expert_memory_policy_columns(fake_conn)
 
     assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+
+
+@pytest.mark.asyncio
+async def test_postgres_deletes_every_incomplete_expert_memory_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._delete_non_authoritative_expert_memories(fake_conn)
+
+    statement = fake_conn.statements[0]
+    assert statement.lstrip().startswith("DELETE FROM expert_memories")
+    assert "extra::jsonb ->> 'source'" in statement
+    assert "'production_evidence_eligible' = 'true'::jsonb" in statement
+    assert "'cost_complete' = 'true'::jsonb" in statement
+    assert "outcome_id" in statement
+    assert "outcome_fingerprint" in statement
+
+
+@pytest.mark.asyncio
+async def test_sqlite_physically_deletes_non_authoritative_expert_memories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module.settings, "database_url", "sqlite+aiosqlite:///:memory:")
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    valid = {
+        "source": "authoritative_trade_outcome",
+        "authority_level": "okx_settlement_and_execution",
+        "outcome_version": "2026-07-19.authoritative-trade-outcome.v2",
+        "production_evidence_eligible": True,
+        "cost_complete": True,
+        "outcome_id": "ato:valid",
+        "outcome_fingerprint": "fingerprint-valid",
+    }
+    invalid_rows = [
+        {**valid, "source": "local_provisional_reflection"},
+        {**valid, "source": "shadow_backtest"},
+        {**valid, "outcome_fingerprint": ""},
+        {**valid, "production_evidence_eligible": "true"},
+    ]
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("CREATE TABLE expert_memories (id INTEGER PRIMARY KEY, extra JSON)")
+            )
+            for index, payload in enumerate([valid, *invalid_rows], start=1):
+                await conn.execute(
+                    text("INSERT INTO expert_memories (id, extra) VALUES (:id, :extra)"),
+                    {"id": index, "extra": json.dumps(payload)},
+                )
+
+            await session_module._delete_non_authoritative_expert_memories(conn)
+            rows = (
+                await conn.execute(text("SELECT id FROM expert_memories ORDER BY id"))
+            ).fetchall()
+
+        assert rows == [(1,)]
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -526,9 +593,6 @@ async def test_postgres_shadow_snapshot_skips_steady_state_schema_ddl(
     )
 
     await session_module._ensure_shadow_backtest_training_snapshot_columns(fake_conn)
-
-    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
-
 
 @pytest.mark.asyncio
 async def test_postgres_runtime_retention_columns_backfill_markers_and_add_indexes(

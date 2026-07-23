@@ -321,3 +321,14 @@
 - 删除 `ModelPerformanceSnapshot` ORM、RiskRepository 读写方法和训练重置引用；数据库启动迁移直接执行 `DROP TABLE IF EXISTS model_performance_snapshots`，旧错误派生数据不再留作隐式回退。
 - 模型晋升唯一保留 `model_promotion_policy` 的真实收益分布评估、artifact 生命周期和 `production_trade_gate` 授权；专家竞争服务只保留为专家质量诊断，不得切换活动模型或授予生产权限。
 - 本地验证 `2786 passed, 4 skipped`，Ruff 和前端 Node 语法检查通过。线上部署后 7 个 stale 源文件被删除，PostgreSQL `to_regclass('public.model_performance_snapshots')` 返回空，FastAPI 路由中不存在 `/api/models`；交易进程仍为 `paper + paused=false`、心跳新鲜、market error 为空并继续运行策略上下文阶段。
+
+## 23. 专家记忆与影子训练标签彻底解耦
+
+- 专家记忆只接受完整 OKX 权威结果合同：`source=authoritative_trade_outcome`、`authority_level=okx_settlement_and_execution`、当前 `outcome_version`、`cost_complete=true`、`production_evidence_eligible=true`，并且 `outcome_id` 与 `outcome_fingerprint` 均非空。该判定集中在 `core.training_contracts.is_authoritative_expert_memory_extra`，写入仓储、提示词检索、FinQuant 训练加载和反馈策略统一调用，不再各自维护宽松条件。
+- 本地平仓只创建等待 OKX 回写的 `TradeReflection`，不再生成 `local_provisional_reflection` 专家记忆，也不再把本地 PnL 比例伪装成 `net_return_after_all_cost_pct`。权威回填只处理 `settlement_fact_trusted=true` 且 `outcome_complete=true` 的结果。
+- `ShadowBacktestService` 只生成带费用合同和证据指纹的影子训练标签；删除影子结果复制到 `ExpertMemory` 的事务、配置开关、相关特征分桶/文本模板/关联 memory key 和兼容反馈计数。影子样本继续服务训练与晋升评估，但不能进入下一次交易提示词。
+- 数据库启动迁移对 PostgreSQL 和 SQLite 都执行结构化 JSON 合同检查，所有非权威、不完整或伪造布尔值的 `expert_memories` 直接物理删除，不保留 inactive 兼容记录。`MemoryRepository.upsert_memory` 同时拒绝不完整合同，旧来源无法再次写入。
+- 删除无人调用的一次性 `scripts/cleanup_expert_memory_text.py`、其专用测试和只验证影子专家记忆可用的旧测试文件；新增删除契约，禁止 `local_provisional_reflection`、`shadow_memory_enabled`、`_record_memory_in_session` 和 `build_expert_lessons` 回流运行代码。
+- 部署前线上 `expert_memories` 共 56 条：权威 0、`shadow_backtest` 56、合同不完整 56；部署后总数、影子数、临时数和合同不完整数全部为 0，FinQuant 专家记忆训练加载结果为 0。后续只有新的完整 OKX 权威结果能重新生成专家记忆。
+- 本地 Ruff 全通过，完整测试为 `2784 passed, 4 skipped`。线上服务和模型隧道均 active，控制态为 `paper + paused=false + ensemble_trader`，交易心跳和训练调度心跳新鲜，最近十分钟无 warning/error 日志。
+- 当前自动交易仍存在独立阻断，不能记为已恢复：部署后市场轮次 `run_market_analysis=true`、扫描 20 个标的、14 个特征有效，但 `rank_selected_count=0`、决策 0；四个二级候选均因 `okx_private_entry_instrument_probe_failed` 被拒绝。下一批必须定位并彻底修复 OKX 私有标的探测/超时链路，再以非零候选和实际规则决策验收。

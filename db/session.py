@@ -16,6 +16,11 @@ from core.runtime_data_retention_contract import (
     RUNTIME_DATA_RETENTION_SOURCE,
     RUNTIME_DATA_RETENTION_VERSION,
 )
+from core.training_contracts import (
+    AUTHORITATIVE_EXPERT_MEMORY_SOURCE,
+    AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
+    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+)
 from models.base import Base
 
 _engine = None
@@ -175,6 +180,7 @@ async def init_db() -> None:
                     """))
         await _ensure_trade_fact_columns(conn)
         await _drop_removed_expert_memory_policy_columns(conn)
+        await _delete_non_authoritative_expert_memories(conn)
         await _drop_removed_model_performance_snapshots_table(conn)
         await _ensure_ai_decision_model_health_columns(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
@@ -242,6 +248,50 @@ async def _drop_removed_expert_memory_policy_columns(conn: Any) -> None:
     for name in ("confidence_adjustment", "position_size_multiplier"):
         if name in existing:
             await conn.execute(text(f"ALTER TABLE expert_memories DROP COLUMN {name}"))
+
+
+async def _delete_non_authoritative_expert_memories(conn: Any) -> None:
+    """Permanently remove expert memories not backed by a complete OKX outcome."""
+
+    params = {
+        "source": AUTHORITATIVE_EXPERT_MEMORY_SOURCE,
+        "authority": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
+        "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+    }
+    if "postgresql" in settings.database_url:
+        await conn.execute(
+            text("""
+                DELETE FROM expert_memories
+                WHERE NOT (
+                    COALESCE(extra::jsonb ->> 'source', '') = :source
+                    AND COALESCE(extra::jsonb ->> 'authority_level', '') = :authority
+                    AND COALESCE(extra::jsonb ->> 'outcome_version', '') = :version
+                    AND extra::jsonb -> 'production_evidence_eligible' = 'true'::jsonb
+                    AND extra::jsonb -> 'cost_complete' = 'true'::jsonb
+                    AND BTRIM(COALESCE(extra::jsonb ->> 'outcome_id', '')) <> ''
+                    AND BTRIM(COALESCE(extra::jsonb ->> 'outcome_fingerprint', '')) <> ''
+                )
+                """),
+            params,
+        )
+        return
+    if "sqlite" in settings.database_url:
+        await conn.execute(
+            text("""
+                DELETE FROM expert_memories
+                WHERE NOT (
+                    json_valid(extra)
+                    AND COALESCE(json_extract(extra, '$.source'), '') = :source
+                    AND COALESCE(json_extract(extra, '$.authority_level'), '') = :authority
+                    AND COALESCE(json_extract(extra, '$.outcome_version'), '') = :version
+                    AND json_type(extra, '$.production_evidence_eligible') = 'true'
+                    AND json_type(extra, '$.cost_complete') = 'true'
+                    AND TRIM(COALESCE(json_extract(extra, '$.outcome_id'), '')) <> ''
+                    AND TRIM(COALESCE(json_extract(extra, '$.outcome_fingerprint'), '')) <> ''
+                )
+                """),
+            params,
+        )
 
 
 async def _drop_removed_model_performance_snapshots_table(conn: Any) -> None:

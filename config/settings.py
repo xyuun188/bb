@@ -369,7 +369,6 @@ class Settings(BaseSettings):
     position_analysis_watchdog_seconds: int = 180
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
-    shadow_memory_enabled: bool = True
     ai_llm_concurrency: int = 2
     ai_llm_call_delay_seconds: float = 0.15
     ai_expert_timeout_seconds: float = 30.0
