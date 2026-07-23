@@ -40,7 +40,6 @@ from services.execution_reason_localizer import localize_execution_reason
 from services.high_risk_review_audit import HighRiskReviewAuditService
 from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
 from services.ml_signal_service import MLSignalService
-from services.model_dynamic_routing import ModelDynamicRoutingService
 from services.model_expert_competition import ModelExpertCompetitionService
 from services.model_expert_health import ModelExpertHealthService
 from services.model_training_registry import build_model_training_registry
@@ -153,7 +152,6 @@ DB_AUDIT_KEYS = (
     "strategy_signal_root_cause",
     "production_source_health",
     "model_training",
-    "model_dynamic_routing",
     "high_risk_review_audit",
     "crypto_feature_coverage",
     "shadow_missed_opportunity",
@@ -185,7 +183,6 @@ CARD_OWNER_PATHS = {
     "model_training": "web_dashboard/api/data_collection.py",
     "model_expert_health": "services/model_expert_health.py",
     "model_expert_competition": "services/model_expert_competition.py",
-    "model_dynamic_routing": "services/model_dynamic_routing.py",
     "high_risk_review_audit": "services/high_risk_review_audit.py",
     "crypto_feature_coverage": "services/crypto_feature_coverage.py",
     "shadow_missed_opportunity": "services/shadow_missed_opportunity_closed_loop.py",
@@ -202,7 +199,6 @@ NODE_OWNER_PATHS = {
     "model_training": "web_dashboard/api/data_collection.py",
     "model_expert_health": "services/model_expert_health.py",
     "model_expert_competition": "services/model_expert_competition.py",
-    "model_dynamic_routing": "services/model_dynamic_routing.py",
     "high_risk_review_audit": "services/high_risk_review_audit.py",
     "shadow_missed_opportunity": "services/shadow_missed_opportunity_closed_loop.py",
     "strong_opportunity": "services/strong_opportunity.py",
@@ -649,23 +645,6 @@ def _safe_crypto_feature_report(report: dict[str, Any]) -> dict[str, Any]:
             continue
         if str(feature.get("status") or "") in {"missing", "stale", "low_confidence"}:
             feature["live_entry_influence"] = "blocked"
-    return safe
-
-
-def _safe_dynamic_routing_report(report: dict[str, Any]) -> dict[str, Any]:
-    safe = copy.deepcopy(report if isinstance(report, dict) else {})
-    safe["audit_only"] = True
-    safe["live_route_mutation"] = False
-    safe["can_apply_live_route"] = False
-    summary = _safe_dict(safe.get("summary"))
-    safe["promotion_gate"] = {
-        "canary_ready_count": int(summary.get("canary_ready_count") or 0),
-        "live_ml_ready_count": int(summary.get("live_ml_ready_count") or 0),
-        "live_blocked_count": int(summary.get("live_blocked_count") or 0),
-        "live_route_mutation": False,
-        "can_apply_live_route": False,
-        "policy": "shadow/canary/live evidence is report-only until live mutation is explicitly enabled outside this audit.",
-    }
     return safe
 
 
@@ -2475,68 +2454,6 @@ async def _model_expert_competition_audit() -> dict[str, Any]:
             "本卡只读展示基线和费后收益差异。",
             "模型晋升必须使用权威费后收益分布与完整治理证据。",
             "本报告不能改变生产专家集合、权重或路由。",
-        ],
-    )
-
-
-async def _model_dynamic_routing_audit() -> dict[str, Any]:
-    try:
-        report = _safe_dynamic_routing_report(
-            await ModelDynamicRoutingService().report(
-                hours=MODEL_EXPERT_AUDIT_HOURS,
-                limit=MODEL_EXPERT_AUDIT_LIMIT,
-            )
-        )
-    except Exception as exc:
-        return _audit_card(
-            "model_dynamic_routing",
-            "模型动态路由",
-            "warning",
-            "模型动态路由报告读取失败；保持全量专家主链路，不启用路由变更。",
-            details={"error": safe_error_text(exc, limit=180), "audit_only": True},
-            next_actions=[
-                "先确认 ai_decisions.raw_llm_response.dynamic_model_routing 是否正常写入。"
-            ],
-        )
-    summary = _safe_dict(report.get("summary"))
-    blockers = _safe_dict(report.get("blocking_reason_counts"))
-    observations = _safe_dict(report.get("safety_observations"))
-    unsafe_attempts = int(summary.get("unsafe_live_mutation_attempts") or 0)
-    ineligible_executed = int(
-        observations.get("ineligible_return_contract_executed_count") or 0
-    )
-    route_count = int(summary.get("route_plan_count") or 0)
-    promotion_gate = _safe_dict(report.get("promotion_gate"))
-    warning = bool(unsafe_attempts or ineligible_executed or blockers or route_count == 0)
-    return _audit_card(
-        "model_dynamic_routing",
-        "模型动态路由",
-        "warning" if warning else "ok",
-        (
-            "动态路由仍处于影子/观察阶段，尚不能替换主链路。"
-            if warning
-            else "动态路由影子报告正常，未发现阻塞项。"
-        ),
-        details={
-            "audit_only": True,
-            "live_route_mutation": False,
-            "can_apply_live_route": False,
-            "summary": summary,
-            "blocking_reason_counts": blockers,
-            "safety_observations": observations,
-            "unsafe_live_mutation_attempts": unsafe_attempts,
-            "promotion_gate": promotion_gate,
-        },
-        evidence=[
-            {"label": "路由计划", "value": route_count},
-            {"label": "影子计划", "value": int(summary.get("shadow_only_count") or 0)},
-            {"label": "理论少调用", "value": int(summary.get("estimated_call_reduction") or 0)},
-            {"label": "收益合同不合格却执行", "value": ineligible_executed},
-        ],
-        next_actions=[
-            "没有 C2/C3 基线和线上观察前，不得把动态路由应用到真实专家调用。",
-            "不得为了降延迟跳过 risk_expert 或必要风控复核。",
-            "若弱证据执行或快亏平增加，继续保持 shadow_only 并先诊断执行质量。",
         ],
     )
 
@@ -4526,15 +4443,6 @@ def _issue_ledger_state(
     ):
         return "observing", "观察项 / 基线或竞赛样本不足"
     if (
-        key == "model_dynamic_routing"
-        and status == "warning"
-        and bool(details.get("audit_only"))
-        and not bool(details.get("live_route_mutation"))
-        and not bool(details.get("can_apply_live_route"))
-        and not bool(details.get("unsafe_live_mutation_attempts"))
-    ):
-        return "observing", "观察项 / 动态路由影子阶段"
-    if (
         key == "high_risk_review_audit"
         and status == "warning"
         and bool(details.get("audit_only"))
@@ -4764,7 +4672,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "阻断三期模型服务器的影子或灰度路由。"
             ),
             upstream=["server_migration"],
-            downstream=["model_training", "model_expert_health", "model_dynamic_routing"],
+            downstream=["model_training", "model_expert_health"],
             checks=[
                 "下载清单",
                 "验证清单",
@@ -4844,7 +4752,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ["model_expert_health"],
             impact="评估模型/专家参与、采纳、收益、耗时、JSON 错误和未返回率，只输出体检建议。",
             upstream=["model_training"],
-            downstream=["strategy_decision", "model_routing"],
+            downstream=["strategy_decision"],
             checks=["24/72小时贡献", "采纳后收益", "JSON错误率", "未返回率"],
         ),
         _node_from_cards(
@@ -4855,19 +4763,8 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ["model_expert_competition"],
             impact="对模型/专家与基线的离线/影子/模拟竞赛结果做证据化比较，不直接改真实权重。",
             upstream=["model_expert_health", "model_training"],
-            downstream=["model_routing", "strategy_decision"],
+            downstream=["strategy_decision"],
             checks=["基线对比", "影子竞赛", "模拟 A/B", "权重建议来源"],
-        ),
-        _node_from_cards(
-            "model_dynamic_routing",
-            "模型动态路由",
-            "模型层",
-            cards_by_key,
-            ["model_dynamic_routing"],
-            impact="根据候选质量、readiness、贡献、延迟、风险和事件状态生成影子路由计划；初期不替换主链路。",
-            upstream=["model_expert_health", "model_expert_competition", "crypto_feature_coverage"],
-            downstream=["strategy_decision", "risk_guard"],
-            checks=["影子路由计划", "理论少调用", "阻塞原因", "弱证据/快亏观察"],
         ),
         _node_from_cards(
             "high_risk_review_audit",
@@ -4876,7 +4773,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cards_by_key,
             ["high_risk_review_audit"],
             impact="审计独立高风险复核的触发、审批、阻断和不安全执行，不修改生产门。",
-            upstream=["model_dynamic_routing", "strategy_decision"],
+            upstream=["strategy_decision"],
             downstream=["risk_guard", "okx_execution"],
             checks=["硬复核触发", "审批状态", "阻断数量", "不安全执行"],
         ),
@@ -5248,7 +5145,6 @@ async def _collect_system_audit_status_unlocked(
         ("model_training", _model_training_audit),
         ("model_expert_health", _model_expert_health_audit),
         ("model_expert_competition", _model_expert_competition_audit),
-        ("model_dynamic_routing", _model_dynamic_routing_audit),
         ("high_risk_review_audit", _high_risk_review_audit),
         ("crypto_feature_coverage", _crypto_feature_coverage_audit),
         ("shadow_missed_opportunity", _shadow_missed_opportunity_audit),
@@ -5436,12 +5332,6 @@ async def model_expert_competition_status(hours: int = 72, limit: int = 1200) ->
             row["recommended_weight_action"] = "observation_only"
             row["can_apply_live_weight"] = False
     return sanitize_payload(report)
-
-
-@router.get("/model-dynamic-routing/status")
-async def model_dynamic_routing_status(hours: int = 72, limit: int = 1200) -> dict[str, Any]:
-    report = await ModelDynamicRoutingService().report(hours=hours, limit=limit)
-    return sanitize_payload(_safe_dynamic_routing_report(report))
 
 
 @router.get("/high-risk-review-audit/status")

@@ -280,3 +280,12 @@
 - 模拟交易不读取生产门禁；进入执行服务时会清除裁决载荷中夹带的生产门禁，避免模拟样本被错误标记为模型实盘责任。
 - 策略学习只提供历史先验上下文，不提供生产授权。`production_influence_enabled` / `production_influence_eligible` 已删除并替换为 `historical_prior_context_enabled` / `historical_prior_context_eligible`，旧键不迁移、不双读。
 - Dashboard、持续策略路由、纸面冠军和线上健康检查统一使用“历史先验上下文”命名，并继续显式声明 `can_authorize_entry=false`、`production_permission=false`。
+
+## 19. 删除无执行效果的动态模型路由
+
+- 原 `services/model_dynamic_routing.py` 在全部专家已经调用完成后才生成报告，始终选择全部专家、跳过 0 个专家、理论调用减少量为 0，不会改变任何真实执行路径。
+- 该功能只向决策载荷写入 `dynamic_model_routing`，再由系统巡检重复统计 shadow/readiness 和永远为 false 的 mutation 字段；它不是路由器，也不产生训练或盈利闭环价值。
+- 已删除动态路由服务、ensemble 决策载荷写入、`/model-dynamic-routing/status` 接口、系统巡检卡、依赖图节点、Dashboard 映射和原专用测试，不保留弃用接口或兼容返回。
+- `live_route_mutation`、`applied_to_live_calls`、`can_apply_live_route` 和 `unsafe_live_mutation_attempts` 已从运行代码删除；模型生产授权继续只由 `production_trade_gate v2` 和 `live_ml_ready` 决定。
+- 模型专家健康与竞赛仍保留为只读质量证据，但它们直接服务于训练诊断和策略决策，不再指向一个不存在执行效果的中间路由节点。
+- 新增删除契约测试，持续验证服务文件、ensemble 源码、系统巡检卡/API 和 Dashboard 都不能重新出现该功能。

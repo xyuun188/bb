@@ -22,7 +22,6 @@ from config.settings import (
     ENSEMBLE_TRADER_NAME,
     FIXED_AI_MODEL_SLOTS,
 )
-from core.safe_output import safe_error_text
 from services.dynamic_exit_policy import assess_dynamic_exit
 from services.entry_signal_extraction import (
     enrich_signal_payload,
@@ -33,7 +32,6 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
-from services.model_dynamic_routing import plan_dynamic_model_route
 from services.paper_exploration import build_paper_exploration_contract
 from services.paper_training import (
     build_paper_training_contract,
@@ -159,7 +157,6 @@ class EnsembleCoordinator:
         raw["model_timings"] = model_timings
         raw["timing_breakdown"] = timing_records
         raw["latency_summary"] = self._latency_summary(timing_records, model_timings)
-        self._attach_dynamic_model_routing(features, context, raw)
         if isinstance(context.get("ml_signal"), dict):
             raw["ml_signal"] = context.get("ml_signal")
         if isinstance(context.get("local_ai_tools"), dict):
@@ -234,31 +231,6 @@ class EnsembleCoordinator:
             ),
         }
         return opinions, expert_context, timing, model_timings
-
-    def _attach_dynamic_model_routing(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        raw: dict[str, Any],
-    ) -> None:
-        try:
-            raw["dynamic_model_routing"] = plan_dynamic_model_route(
-                features,
-                context,
-                model_health=self._safe_dict(context.get("model_expert_health")),
-                competition=self._safe_dict(context.get("model_expert_competition")),
-                feature_coverage=self._safe_dict(context.get("crypto_feature_coverage")),
-            )
-        except Exception as exc:
-            raw["dynamic_model_routing"] = {
-                "audit_only": True,
-                "mode": "shadow_only",
-                "applied_to_live_calls": False,
-                "live_route_mutation": False,
-                "can_apply_live_route": False,
-                "blocking_reasons": ["routing_plan_error"],
-                "error": safe_error_text(exc, limit=180),
-            }
 
     def _unique(self, values: list[str]) -> list[str]:
         result: list[str] = []

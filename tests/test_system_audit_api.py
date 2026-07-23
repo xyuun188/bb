@@ -1666,60 +1666,6 @@ async def test_model_expert_competition_audit_never_allows_live_weight_change(
 
 
 @pytest.mark.asyncio
-async def test_model_dynamic_routing_audit_and_endpoint_force_read_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[int, int]] = []
-
-    class FakeDynamicRoutingService:
-        async def report(self, *, hours: int = 72, limit: int = 1200) -> dict[str, Any]:
-            calls.append((hours, limit))
-            return {
-                "audit_only": False,
-                "live_route_mutation": True,
-                "can_apply_live_route": True,
-                "summary": {
-                    "route_plan_count": 3,
-                    "shadow_only_count": 2,
-                    "canary_ready_count": 1,
-                    "live_ml_ready_count": 0,
-                    "live_blocked_count": 3,
-                    "estimated_call_reduction": 4,
-                    "unsafe_live_mutation_attempts": 1,
-                },
-                "blocking_reason_counts": {"competition_baseline_missing": 2},
-                "safety_observations": {"weak_evidence_executed_count": 1},
-            }
-
-    monkeypatch.setattr(
-        system_audit,
-        "ModelDynamicRoutingService",
-        lambda: FakeDynamicRoutingService(),
-    )
-
-    card = await system_audit._model_dynamic_routing_audit()
-    endpoint_report = await system_audit.model_dynamic_routing_status(hours=24, limit=200)
-
-    assert calls == [
-        (system_audit.MODEL_EXPERT_AUDIT_HOURS, system_audit.MODEL_EXPERT_AUDIT_LIMIT),
-        (24, 200),
-    ]
-    assert card["key"] == "model_dynamic_routing"
-    assert card["status"] == "warning"
-    assert card["details"]["audit_only"] is True
-    assert card["details"]["live_route_mutation"] is False
-    assert card["details"]["can_apply_live_route"] is False
-    assert card["details"]["unsafe_live_mutation_attempts"] == 1
-    assert card["details"]["promotion_gate"]["canary_ready_count"] == 1
-    assert card["details"]["promotion_gate"]["live_ml_ready_count"] == 0
-    assert card["details"]["promotion_gate"]["live_blocked_count"] == 3
-    assert endpoint_report["audit_only"] is True
-    assert endpoint_report["live_route_mutation"] is False
-    assert endpoint_report["can_apply_live_route"] is False
-    assert endpoint_report["promotion_gate"]["live_blocked_count"] == 3
-
-
-@pytest.mark.asyncio
 async def test_high_risk_review_audit_and_endpoint_force_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3181,18 +3127,6 @@ def test_issue_ledger_marks_shadow_only_governance_warnings_as_observing() -> No
             },
         ),
         system_audit._audit_card(
-            "model_dynamic_routing",
-            "模型动态路由",
-            "warning",
-            "动态路由仍处于影子阶段。",
-            details={
-                "audit_only": True,
-                "live_route_mutation": False,
-                "can_apply_live_route": False,
-                "unsafe_live_mutation_attempts": 0,
-            },
-        ),
-        system_audit._audit_card(
             "high_risk_review_audit",
             "High-risk review",
             "warning",
@@ -3281,11 +3215,10 @@ def test_issue_ledger_marks_shadow_only_governance_warnings_as_observing() -> No
 
     ledger = system_audit._issue_ledger_from_cards(cards)
 
-    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 9, "total": 9}
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 8, "total": 8}
     assert {item["key"] for item in ledger["observing"]} == {
         "model_expert_health",
         "model_expert_competition",
-        "model_dynamic_routing",
         "high_risk_review_audit",
         "crypto_feature_coverage",
         "shadow_missed_opportunity",

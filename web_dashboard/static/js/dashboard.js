@@ -6383,7 +6383,6 @@ const SYSTEM_AUDIT_NODE_LABELS = Object.freeze({
     model_training: '模型与训练数据',
     model_expert_health: '模型/专家体检',
     model_expert_competition: '模型/专家竞赛',
-    model_dynamic_routing: '模型动态路由',
     model_routing: '模型路由',
     high_risk_review_audit: '高风险独立复核',
     shadow_missed_opportunity: '影子错失机会复盘',
