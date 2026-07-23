@@ -10,6 +10,7 @@ from services.profit_supervision import (
     MARKET_OPPORTUNITY_TASK,
     PROFIT_SUPERVISION_VERSION,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
 def _cost_complete_sample(net_return: float) -> dict[str, object]:
@@ -31,6 +32,7 @@ def _cost_complete_sample(net_return: float) -> dict[str, object]:
                 },
                 AUTHORITATIVE_REALIZED_RETURN_TASK: {
                     "eligible": True,
+                    PROFIT_TRAINING_TARGET: net_return,
                     "realized_net_return_pct": net_return,
                 },
             },
@@ -109,7 +111,10 @@ def test_return_objective_promotes_positive_fee_after_distribution() -> None:
     report = _return_report((0.8, 0.7, 0.6, -0.1))
 
     assert report["promotion_ready"] is True
-    assert report["optimization_target"] == "realized_fee_after_return"
+    assert report["optimization_target"] == PROFIT_TRAINING_TARGET
+    assert report["separated_distributions"]["authoritative_realized_trade"][
+        PROFIT_TRAINING_TARGET
+    ]["count"] == 4
     assert report["empirical_return_lower_hinge_pct"] > 0
     assert report["policy_provenance"]["sample_count"] == 4
 

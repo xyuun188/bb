@@ -18,6 +18,7 @@ from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
     weighted_distribution,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_objective import (
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
@@ -145,7 +146,7 @@ def build_return_objective_report(
     actual_return_pairs = weighted_pairs(
         trade_candidates,
         AUTHORITATIVE_REALIZED_RETURN_TASK,
-        "realized_net_return_pct",
+        PROFIT_TRAINING_TARGET,
     )
     actual_cost_pairs = weighted_pairs(
         trade_candidates,
@@ -201,7 +202,7 @@ def build_return_objective_report(
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "label_name": RETURN_LABEL_NAME,
         "label_version": RETURN_LABEL_VERSION,
-        "optimization_target": "realized_fee_after_return",
+        "optimization_target": PROFIT_TRAINING_TARGET,
         "sample_count": len(returns),
         "actual_realized_return_sample_count": len(actual_return_pairs),
         "shadow_market_opportunity_sample_count": min(len(market_long), len(market_short)),
@@ -223,6 +224,9 @@ def build_return_objective_report(
             },
             "authoritative_realized_trade": {
                 "source_authority": "okx_position_history",
+                "net_return_after_all_cost_pct": weighted_distribution(
+                    actual_return_pairs
+                ),
                 "net_return_after_cost_pct": weighted_distribution(actual_return_pairs),
                 "execution_cost_pct": weighted_distribution(actual_cost_pairs),
                 "slippage_pct": weighted_distribution(actual_slippage_pairs),
@@ -330,7 +334,7 @@ def build_phase3_promotion_recommendation(
 
     return {
         "policy": RETURN_PROMOTION_POLICY_VERSION,
-        "optimization_target": "realized_fee_after_return",
+        "optimization_target": PROFIT_TRAINING_TARGET,
         "current_stage": str(model_stage or "shadow").lower(),
         "training_mode": str(training_mode or "shadow").lower(),
         "recommended_stage": recommended_stage,

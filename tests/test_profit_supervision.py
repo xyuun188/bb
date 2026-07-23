@@ -11,6 +11,7 @@ from services.profit_supervision import (
     profit_supervision_report,
     select_trade_calibration,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
 def _shadow_sample(*, sample_id: int, decision_id: int, horizon: int) -> dict:
@@ -68,6 +69,16 @@ def _trade_sample() -> dict:
             "payoff_profile_label": "positive_payoff",
             "losing_exit_attribution": "",
         },
+        "profit_training_contract": {
+            "eligible": True,
+            "target": PROFIT_TRAINING_TARGET,
+            "target_value": 0.6,
+            "outcome": "profit",
+            "decision_authority": "system",
+            "evidence_fingerprint": "profit-contract-test",
+            "reason": "profit_training_sample_ready",
+            "blockers": [],
+        },
     }
     sample["profit_supervision"] = build_profit_supervision_contract(
         sample,
@@ -103,6 +114,20 @@ def test_verified_execution_pair_is_authoritative_realized_return() -> None:
 
     assert task["eligible"] is True
     assert task["source_authority"] == "okx_verified_execution_pair"
+
+
+def test_authoritative_return_prefers_profit_training_contract_target() -> None:
+    trade = _trade_sample()
+    trade["profit_learning_labels"]["net_return_after_cost_pct"] = 99.0
+    trade["profit_training_contract"]["target_value"] = -2.4
+    trade["profit_training_contract"]["outcome"] = "loss"
+
+    contract = build_profit_supervision_contract(trade, kind="trade")
+    task = contract["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
+
+    assert task["return_target"] == PROFIT_TRAINING_TARGET
+    assert task[PROFIT_TRAINING_TARGET] == -2.4
+    assert task["realized_net_return_pct"] == -2.4
 
 
 def test_multi_horizon_rows_share_one_decision_weight_budget() -> None:

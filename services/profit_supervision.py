@@ -22,6 +22,7 @@ from core.training_contracts import (
     SHADOW_FEE_AFTER_LABEL_VERSION,
 )
 from services.execution_cost_model import execution_cost_estimate
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 PROFIT_SUPERVISION_VERSION = "2026-07-14.separated-profit-supervision.v1"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
@@ -287,7 +288,18 @@ def build_profit_supervision_contract(
         }
         cost_task = _trade_cost_labels(labels, sample)
         cost_task["eligible"] = bool(quality_eligible and cost_task.get("eligible"))
-        net_return = _safe_float(labels.get("net_return_after_cost_pct"))
+        profit_contract = _safe_dict(sample.get("profit_training_contract"))
+        contract_target = (
+            _safe_float(profit_contract.get("target_value"))
+            if profit_contract.get("eligible") is True
+            and profit_contract.get("target") == PROFIT_TRAINING_TARGET
+            else None
+        )
+        net_return = (
+            contract_target
+            if contract_target is not None
+            else _safe_float(labels.get("net_return_after_cost_pct"))
+        )
         source = _safe_text(sample.get("source"))
         trusted = bool(
             quality_eligible
@@ -302,6 +314,13 @@ def build_profit_supervision_contract(
             "actual_execution": True,
             "lifecycle_key": _safe_text(sample.get("lifecycle_key")),
             "side": _safe_text(sample.get("side")).lower(),
+            "return_target": (
+                PROFIT_TRAINING_TARGET
+                if contract_target is not None
+                else "net_return_after_cost_pct"
+            ),
+            "net_return_after_all_cost_pct": net_return,
+            "profit_training_contract": profit_contract,
             "realized_net_return_pct": net_return,
             "realized_net_pnl_usdt": _safe_float(labels.get("realized_net_pnl_usdt")),
             "gross_market_return_pct": _safe_float(
@@ -485,7 +504,7 @@ def profit_supervision_report(
         _task_pairs(
             trade_samples,
             AUTHORITATIVE_REALIZED_RETURN_TASK,
-            "realized_net_return_pct",
+            PROFIT_TRAINING_TARGET,
         )
     )
     report = {
@@ -532,11 +551,18 @@ def profit_supervision_report(
             ),
         },
         "authoritative_realized_trade": {
+            "net_return_after_all_cost_pct": weighted_distribution(
+                _task_pairs(
+                    trade_samples,
+                    AUTHORITATIVE_REALIZED_RETURN_TASK,
+                    PROFIT_TRAINING_TARGET,
+                )
+            ),
             "net_return_after_cost_pct": weighted_distribution(
                 _task_pairs(
                     trade_samples,
                     AUTHORITATIVE_REALIZED_RETURN_TASK,
-                    "realized_net_return_pct",
+                    PROFIT_TRAINING_TARGET,
                 )
             ),
             "hold_minutes": weighted_distribution(
@@ -619,7 +645,7 @@ def authoritative_trade_calibration(
         net_pairs = _task_pairs(
             samples,
             AUTHORITATIVE_REALIZED_RETURN_TASK,
-            "realized_net_return_pct",
+            PROFIT_TRAINING_TARGET,
         )
         cost_pairs = _task_pairs(
             samples,
@@ -640,6 +666,7 @@ def authoritative_trade_calibration(
             "source_authority": "okx_position_history",
             "symbol": key.rsplit("|", 1)[0],
             "side": side,
+            "net_return_after_all_cost_pct": weighted_distribution(net_pairs),
             "net_return_after_cost_pct": weighted_distribution(net_pairs),
             "execution_cost_pct": weighted_distribution(cost_pairs),
             "slippage_pct": weighted_distribution(slippage_pairs),
