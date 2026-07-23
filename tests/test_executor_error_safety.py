@@ -357,6 +357,16 @@ class _EntryInstrumentAvailabilityCcxt:
         return {"longLeverage": 1.0, "shortLeverage": 1.0, "info": []}
 
 
+class _FailingEntryInstrumentAvailabilityCcxt(_EntryInstrumentAvailabilityCcxt):
+    async def fetch_leverage(
+        self,
+        symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.fetch_leverage_calls.append(symbol)
+        raise TimeoutError("private leverage transport timed out")
+
+
 class _ReloadableMarketCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -1419,6 +1429,16 @@ async def test_okx_entry_instrument_availability_uses_private_account_and_cache(
     assert pi["error_code"] == "51001"
     assert pi_cached["cache_hit"] is True
     assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT", "PI/USDT:USDT"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_instrument_prefilter_does_not_retry_transport_failure() -> None:
+    exchange = _FailingEntryInstrumentAvailabilityCcxt()
+    result = await _executor(exchange).entry_instrument_availability("BTC/USDT")
+
+    assert result["available"] is False
+    assert result["reason"] == "okx_private_entry_instrument_probe_failed"
+    assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
 
 
 @pytest.mark.asyncio

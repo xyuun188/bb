@@ -61,6 +61,17 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert "systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}" in source
 
 
+def test_sync_to_online_server_requires_okx_network_route() -> None:
+    from scripts.sync_to_online_server import _okx_network_probe_command
+
+    command = _okx_network_probe_command()
+
+    assert "--noproxy '*'" in command
+    assert "https://www.okx.com/api/v5/public/time" in command
+    assert "okx-network-unavailable" in command
+    assert "exit 9" in command
+
+
 def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 

@@ -403,17 +403,19 @@ class OKXExecutor(AbstractExecutor):
         fn,
         *args,
         _expected_error_codes: set[str] | frozenset[str] | None = None,
+        _max_attempts: int | None = None,
         **kwargs,
     ):
         """Execute an API call with retry + rate limit handling."""
         last_error = None
         method_name = getattr(fn, "__name__", "")
+        attempts = max(1, min(int(_max_attempts or MAX_RETRIES), MAX_RETRIES))
         expected_error_codes = {
             str(code).strip()
             for code in (_expected_error_codes or set())
             if str(code).strip()
         }
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(attempts):
             try:
                 await self._rate_limiter.wait_for_token()
                 self._ensure_rest_url()
@@ -429,7 +431,7 @@ class OKXExecutor(AbstractExecutor):
                     attempt=attempt,
                     timeout=OKX_REST_CALL_TIMEOUT,
                 )
-                if attempt < MAX_RETRIES - 1:
+                if attempt < attempts - 1:
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
@@ -439,7 +441,7 @@ class OKXExecutor(AbstractExecutor):
             except ExchangeAPIError as e:
                 message = safe_error_text(e)
                 error_code = self._exchange_error_code(e, message)
-                if self._is_time_difference_error(message) and attempt < MAX_RETRIES - 1:
+                if self._is_time_difference_error(message) and attempt < attempts - 1:
                     logger.warning(
                         "OKX SDK time drift detected; resyncing and retrying",
                         method=method_name,
@@ -450,12 +452,12 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
-                if self._is_rate_limit_error(message) and attempt < MAX_RETRIES - 1:
+                if self._is_rate_limit_error(message) and attempt < attempts - 1:
                     logger.warning("OKX SDK rate limited", method=method_name, attempt=attempt)
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
-                if self._is_transient_system_error(message) and attempt < MAX_RETRIES - 1:
+                if self._is_transient_system_error(message) and attempt < attempts - 1:
                     logger.warning(
                         "OKX SDK temporary system error; retrying",
                         method=method_name,
@@ -479,7 +481,7 @@ class OKXExecutor(AbstractExecutor):
                     payload=getattr(e, "payload", None),
                 ) from e
             except Exception as e:
-                if self._is_broken_rest_url_error(e) and attempt < MAX_RETRIES - 1:
+                if self._is_broken_rest_url_error(e) and attempt < attempts - 1:
                     logger.warning(
                         "OKX executor REST URL state invalid; reinitializing SDK client",
                         method=method_name,
@@ -493,12 +495,12 @@ class OKXExecutor(AbstractExecutor):
                     last_error = e
                     continue
                 message = safe_error_text(e)
-                if self._is_rate_limit_error(message) and attempt < MAX_RETRIES - 1:
+                if self._is_rate_limit_error(message) and attempt < attempts - 1:
                     logger.warning("OKX SDK call rate limited", method=method_name, attempt=attempt)
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
-                if self._is_network_retryable_error(message) and attempt < MAX_RETRIES - 1:
+                if self._is_network_retryable_error(message) and attempt < attempts - 1:
                     logger.warning(
                         "OKX SDK network error; retrying",
                         method=method_name,
@@ -4904,6 +4906,7 @@ class OKXExecutor(AbstractExecutor):
                 resolved_symbol,
                 {"mgnMode": "cross"},
                 _expected_error_codes={"51001"},
+                _max_attempts=1,
             )
             result = {
                 "available": True,

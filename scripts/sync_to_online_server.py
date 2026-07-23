@@ -695,6 +695,16 @@ def _install_requirements_command(remote_app_dir: str) -> str:
     )
 
 
+def _okx_network_probe_command() -> str:
+    return (
+        "okx_code=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' "
+        "--connect-timeout 5 --max-time 10 https://www.okx.com/api/v5/public/time || true); "
+        'if [ "$okx_code" != "200" ]; then '
+        'echo "okx-network-unavailable:$okx_code"; exit 9; fi; '
+        'echo "okx-network-ok"; '
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote-app-dir", default=REMOTE_APP_DIR)
@@ -876,6 +886,7 @@ def main() -> None:
                 f"{model_tunnel_active_check}"
                 f"systemctl is-active {_remote_quote(args.service)} && "
                 f"systemctl is-active {_remote_quote(args.dashboard_service)} && "
+                f"{_okx_network_probe_command()}"
                 "for i in $(seq 1 30); do "
                 "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
                 'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
@@ -888,6 +899,7 @@ def main() -> None:
         command = (
             f"systemctl restart {_remote_quote(args.service)} && "
             f"systemctl is-active {_remote_quote(args.service)} && "
+            f"{_okx_network_probe_command()}"
             "for i in $(seq 1 30); do "
             "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
             'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '

@@ -332,3 +332,13 @@
 - 部署前线上 `expert_memories` 共 56 条：权威 0、`shadow_backtest` 56、合同不完整 56；部署后总数、影子数、临时数和合同不完整数全部为 0，FinQuant 专家记忆训练加载结果为 0。后续只有新的完整 OKX 权威结果能重新生成专家记忆。
 - 本地 Ruff 全通过，完整测试为 `2784 passed, 4 skipped`。线上服务和模型隧道均 active，控制态为 `paper + paused=false + ensemble_trader`，交易心跳和训练调度心跳新鲜，最近十分钟无 warning/error 日志。
 - 当前自动交易仍存在独立阻断，不能记为已恢复：部署后市场轮次 `run_market_analysis=true`、扫描 20 个标的、14 个特征有效，但 `rank_selected_count=0`、决策 0；四个二级候选均因 `okx_private_entry_instrument_probe_failed` 被拒绝。下一批必须定位并彻底修复 OKX 私有标的探测/超时链路，再以非零候选和实际规则决策验收。
+
+## 24. 修复 OKX DNS 污染与私有标的探测超时风暴
+
+- 精确根因不是凭据、模型或候选排序：线上交易进程没有代理，系统 DNS 曾把 `www.okx.com` 解析为不可路由的 `169.254.0.2`，别名为 `awscn.okpool.top`；因此 `fetch_leverage`、持仓、余额、成交和订单历史等全部私有 REST 请求都会连接超时。强制可信解析地址时 OKX public-time 在约 80ms 返回 200，证明公网出口本身正常。
+- 服务器网卡由 `/etc/netplan/50-network.yaml` 管理。已从持久配置删除产生污染结果的 `114.114.114.114`，DNS 固定为 `8.8.8.8` 与 `1.1.1.1`，配置权限收紧为 `0600`，执行 `netplan apply` 和 `resolvectl flush-caches`。修复后 A 记录恢复为 Cloudflare 公网地址，连续 5 次 OKX REST 均返回 200，耗时 55-89ms。
+- 候选阶段的私有 `get_leverage` 只是账户可寻址性预筛，不是最终下单。该预筛改为单次尝试；网络失败后当前候选失败关闭，并由下一轮在 30 秒失败缓存过期后重试，不再在同一轮对每个候选执行 3 次、每次 10 秒的阻塞重试。下单前执行事实、杠杆、余额、仓位和风险合同仍保持完整私有校验，不降低交易安全边界。
+- `scripts/sync_to_online_server.py` 的 split 和非 split 部署验收都新增 OKX public-time 直连硬检查，显式绕过代理。HTTP 非 200 时输出 `okx-network-unavailable` 并以退出码 9 失败；服务 active、模型隧道 active、Dashboard 302 不能再掩盖 OKX 网络不可用。部署实测输出 `okx-network-ok`。
+- 修复后新进程自动轮次恢复为 `paper + paused=false`，扫描 240 个标的、34 个特征有效、3 个候选入选；私有标的探测 4 个中 3 个成功，另 1 个由 OKX 明确返回 `51001`，没有再出现 `fetch_leverage` 三连超时。
+- DNS 修复后先产生 16 条市场决策并实际执行 `ETH/USDT long` 决策 `107659`；防复发代码部署后的观察窗口又新增 10 条决策、1 条实际执行，运行摘要为 `decision_count=1`、`execution_count=1`。因此模型未晋升前的 OKX demo 规则交易已经恢复到真实下单，不再只是服务心跳或候选分析。
+- 本地 Ruff 全通过，完整测试为 `2786 passed, 4 skipped`。当前仍有两个独立待处理问题：本地 ML 因无法形成互斥 decision-group 训练/留出集而跳过，以及订单事实同步的少数可选阶段仍有内部预算 `TimeoutError`；它们不再阻断本轮候选和 demo 下单，但必须在后续批次分别治理。
