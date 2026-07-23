@@ -611,6 +611,52 @@ def test_fill_refresh_preserves_submission_and_persists_protection_execution() -
     assert order.okx_raw_fills["fills_history_confirmed"] is True
 
 
+def test_fill_refresh_preserves_all_trade_ids_beyond_old_varchar_limit() -> None:
+    filled_at = datetime(2026, 7, 23, 1, 58, tzinfo=UTC)
+    trade_ids = tuple(str(520871550 + index) for index in range(57))
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=1.0,
+        price=0.76,
+        status="filled",
+        fee=0.0,
+        exchange_order_id="3767139693117542400",
+    )
+    fill = OkxNativeFillGroup(
+        order_id="3767139693117542400",
+        trade_ids=trade_ids,
+        inst_id="ZAMA-USDT-SWAP",
+        symbol="ZAMA/USDT",
+        side="buy",
+        pos_side="net",
+        contracts=57.0,
+        avg_price=0.7667,
+        fee_abs=0.1,
+        fill_pnl=0.0,
+        timestamp_ms=filled_at.timestamp() * 1000,
+        timestamp=filled_at,
+        raw_count=57,
+        rows=(),
+    )
+
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order,
+        fill,
+        now=filled_at,
+        sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=1.0,
+        contract_size_source="okx_public_instruments",
+    )
+
+    assert len(order.okx_trade_ids) > 500
+    assert tuple(order.okx_trade_ids.split(",")) == trade_ids
+    assert order.okx_raw_fills["trade_ids"] == list(trade_ids)
+
+
 def test_confirmed_algo_fill_refreshes_only_until_protection_execution_is_complete() -> None:
     order = Order(
         model_name="okx_authoritative_sync",

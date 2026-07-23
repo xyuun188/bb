@@ -271,7 +271,7 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
         order_columns = {row[1] for row in result.fetchall()}
         sqlite_order_columns = {
             "okx_inst_id": "VARCHAR(64)",
-            "okx_trade_ids": "VARCHAR(500)",
+            "okx_trade_ids": "TEXT",
             "okx_fill_contracts": "FLOAT",
             "okx_fill_pnl": "FLOAT",
             "okx_state": "VARCHAR(40)",
@@ -341,7 +341,7 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
         order_columns = await _postgres_table_columns(conn, "orders")
         postgres_order_columns = {
             "okx_inst_id": "ALTER TABLE orders ADD COLUMN okx_inst_id VARCHAR(64)",
-            "okx_trade_ids": "ALTER TABLE orders ADD COLUMN okx_trade_ids VARCHAR(500)",
+            "okx_trade_ids": "ALTER TABLE orders ADD COLUMN okx_trade_ids TEXT",
             "okx_fill_contracts": (
                 "ALTER TABLE orders ADD COLUMN okx_fill_contracts DOUBLE PRECISION"
             ),
@@ -357,6 +357,27 @@ async def _ensure_trade_fact_columns(conn: Any) -> None:
         for name, ddl in postgres_order_columns.items():
             if name not in order_columns:
                 await conn.execute(text(ddl))
+        if "okx_trade_ids" in order_columns:
+            await conn.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = current_schema()
+                              AND table_name = 'orders'
+                              AND column_name = 'okx_trade_ids'
+                              AND data_type <> 'text'
+                        ) THEN
+                            ALTER TABLE orders
+                            ALTER COLUMN okx_trade_ids TYPE TEXT;
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
 
 
 async def _ensure_trade_fact_indexes(conn: Any) -> None:

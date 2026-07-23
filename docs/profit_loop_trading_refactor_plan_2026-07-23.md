@@ -289,3 +289,11 @@
 - `live_route_mutation`、`applied_to_live_calls`、`can_apply_live_route` 和 `unsafe_live_mutation_attempts` 已从运行代码删除；模型生产授权继续只由 `production_trade_gate v2` 和 `live_ml_ready` 决定。
 - 模型专家健康与竞赛仍保留为只读质量证据，但它们直接服务于训练诊断和策略决策，不再指向一个不存在执行效果的中间路由节点。
 - 新增删除契约测试，持续验证服务文件、ensemble 源码、系统巡检卡/API 和 Dashboard 都不能重新出现该功能。
+
+## 20. 完整保留 OKX 成交 ID 事实
+
+- 线上 `order_fact_sync` 的 SQLAlchemy autoflush 降级根因不是事务查询顺序，而是 `orders.okx_trade_ids VARCHAR(500)` 无法容纳一个订单的 57 个真实 OKX trade IDs。
+- 禁止使用 `session.no_autoflush` 隐藏长度错误，也禁止截断 ID 串；全部成交 ID 都属于训练、费用、成交数量和责任归因的权威证据。
+- `Order.okx_trade_ids` 已改为无长度上限 `TEXT`；SQLite 新库直接创建 `TEXT`，PostgreSQL 启动迁移将现有非 text 列原位转换为 `TEXT`。
+- `okx_raw_fills.trade_ids` 与 `okx_trade_ids` 继续保存同一完整 ID 集，训练和审计仍可按逗号拆分，不引入双字段或兼容读取。
+- 回归测试使用线上同规模的 57 个 trade IDs，验证字符串长度超过 500 且顺序、数量和原始事实完全保留。

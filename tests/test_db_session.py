@@ -1,6 +1,8 @@
 import pytest
+from sqlalchemy import Text
 
 import db.session as session_module
+from models.trade import Order
 
 
 class _FakeConnection:
@@ -264,6 +266,14 @@ async def test_postgres_trade_fact_columns_skip_existing_columns(
         "ALTER COLUMN entry_exchange_order_id TYPE VARCHAR(500)" in statement
         for statement in fake_conn.statements
     )
+    assert any(
+        "ALTER COLUMN okx_trade_ids TYPE TEXT" in statement
+        for statement in fake_conn.statements
+    )
+
+
+def test_order_trade_ids_uses_unbounded_text_column() -> None:
+    assert isinstance(Order.__table__.c.okx_trade_ids.type, Text)
 
 
 @pytest.mark.asyncio

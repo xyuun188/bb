@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -23,7 +23,7 @@ class Order(Base, TimestampMixin):
     exchange_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     okx_inst_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    okx_trade_ids: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    okx_trade_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
     okx_fill_contracts: Mapped[float | None] = mapped_column(Float, nullable=True)
     okx_fill_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
     okx_state: Mapped[str | None] = mapped_column(String(40), nullable=True)
