@@ -1889,6 +1889,109 @@ async def test_okx_authoritative_sync_attention_pauses_new_pair_analysis() -> No
 
 
 @pytest.mark.asyncio
+async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(
+            is_open=False,
+            get_state=lambda: {"daily_pnl": 0.0},
+        ),
+    )
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service._okx_authoritative_sync_status_payload = lambda: {"status": "ok"}
+    service.ml_signal_service = SimpleNamespace(
+        status=lambda: {
+            "available": True,
+            "allow_live_position_influence": False,
+            "artifact_activation_manifest": {
+                "production_influence_authorized": False,
+            },
+            "metrics": {},
+        }
+    )
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="test",
+        raw_response={
+            "authoritative_return_candidate": {
+                "side_evidence": {
+                    "expected_net_return_pct": 1.0,
+                    "return_lcb_pct": 0.5,
+                    "production_source_count": 100,
+                    "profit_factor": 3.0,
+                }
+            },
+            "production_return_policy": {"eligible": True},
+        },
+    )
+
+    gate = await service.production_trade_gate_snapshot(
+        decision,
+        "ensemble_trader",
+        "live",
+        open_positions=[],
+    )
+
+    assert gate["mode"] == "live_rules_canary"
+    assert gate["decision_authority"] == "rules"
+    assert gate["model_can_influence"] is False
+    assert gate["evidence"]["training"]["current_decision_return_evidence"][
+        "expected_net_return_pct"
+    ] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_ml() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(
+            is_open=False,
+            get_state=lambda: {"daily_pnl": 0.0},
+        ),
+    )
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service._okx_authoritative_sync_status_payload = lambda: {"status": "ok"}
+    service.ml_signal_service = SimpleNamespace(
+        status=lambda: {
+            "available": True,
+            "allow_live_position_influence": True,
+            "artifact_activation_manifest": {
+                "activation_stage": "active",
+                "production_influence_authorized": True,
+            },
+            "metrics": {
+                "sample_count": 50,
+                "expected_net_return_pct": 0.2,
+                "return_lcb_pct": 0.05,
+                "profit_factor": 1.4,
+            },
+        }
+    )
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="test",
+        raw_response={},
+    )
+
+    gate = await service.production_trade_gate_snapshot(
+        decision,
+        "ensemble_trader",
+        "live",
+        open_positions=[],
+    )
+
+    assert gate["mode"] == "live_ml"
+    assert gate["decision_authority"] == "model"
+    assert gate["model_can_influence"] is True
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_auto_train_blocks_when_okx_daily_training_gate_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

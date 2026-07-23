@@ -3295,6 +3295,75 @@ class TradingService:
             open_positions,
         )
 
+    async def _production_trade_gate_model_status(self) -> dict[str, Any]:
+        ml_signal_service = getattr(self, "ml_signal_service", None)
+        if ml_signal_service is None:
+            return {}
+        try:
+            status = ml_signal_service.status()
+            if inspect.isawaitable(status):
+                status = await status
+        except Exception as exc:
+            return {
+                "available": False,
+                "status": "error",
+                "reason": safe_error_text(exc),
+            }
+        return self._safe_dict(status)
+
+    def _production_trade_gate_model_payload(
+        self,
+        *,
+        model_name: str,
+        model_mode: str,
+        ml_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        activation = self._safe_dict(ml_status.get("artifact_activation_manifest"))
+        readiness = self._safe_dict(ml_status.get("readiness"))
+        influence_policy = self._safe_dict(ml_status.get("influence_policy"))
+        metrics = dict(self._safe_dict(ml_status.get("metrics")))
+        for key in (
+            "sample_count",
+            "production_sample_count",
+            "closed_trade_sample_count",
+            "expected_net_return_pct",
+            "avg_return_pct",
+            "top_avg_return_pct",
+            "return_lcb_pct",
+            "top_return_lcb_pct",
+            "top_long_return_lcb_pct",
+            "top_short_return_lcb_pct",
+            "profit_factor",
+            "top_profit_factor",
+            "top_long_profit_factor",
+            "top_short_profit_factor",
+        ):
+            if key not in metrics and ml_status.get(key) not in (None, ""):
+                metrics[key] = ml_status.get(key)
+        allow_live = readiness.get("allow_live_position_influence") is True or ml_status.get(
+            "allow_live_position_influence"
+        ) is True
+        production_authorized = (
+            activation.get("production_influence_authorized") is True
+            or ml_status.get("production_influence_authorized") is True
+            or influence_policy.get("production_influence_authorized") is True
+        )
+        live_ml_authorized = allow_live and production_authorized
+        return {
+            "artifact_lifecycle": (
+                activation.get("activation_stage")
+                or ml_status.get("artifact_lifecycle")
+                or ("active" if live_ml_authorized else "shadow")
+            ),
+            "allow_live_position_influence": live_ml_authorized,
+            "production_influence_authorized": live_ml_authorized,
+            "live_ml_ready": live_ml_authorized,
+            "model_name": model_name,
+            "model_mode": model_mode,
+            "metrics": metrics,
+            "ml_status": ml_status,
+        }
+
     async def production_trade_gate_snapshot(
         self,
         decision: DecisionOutput,
@@ -3308,23 +3377,23 @@ class TradingService:
         candidate = self._safe_dict(raw.get("authoritative_return_candidate"))
         side_evidence = self._safe_dict(candidate.get("side_evidence"))
         return_policy = self._safe_dict(raw.get("production_return_policy"))
-        metrics = dict(side_evidence)
-        metrics.update(return_policy)
+        current_decision_metrics = dict(side_evidence)
+        current_decision_metrics.update(return_policy)
         source_count = self._safe_float(
-            metrics.get("production_source_count")
-            or metrics.get("return_source_count")
-            or metrics.get("sample_count"),
+            current_decision_metrics.get("production_source_count")
+            or current_decision_metrics.get("return_source_count")
+            or current_decision_metrics.get("sample_count"),
             0.0,
         )
         if source_count:
-            metrics["production_sample_count"] = int(source_count)
-            metrics["sample_count"] = int(source_count)
+            current_decision_metrics["production_sample_count"] = int(source_count)
+            current_decision_metrics["sample_count"] = int(source_count)
 
         sync_reason = self._okx_authoritative_sync_entry_block_reason()
         okx_payload = self._okx_authoritative_sync_status_payload()
         breaker_state = self.risk_engine.circuit_breaker.get_state()
         daily_pnl = self._safe_float(breaker_state.get("daily_pnl"), 0.0) or 0.0
-        live_authorized = str(model_mode or "").lower() not in {"", "paper"}
+        ml_status = await self._production_trade_gate_model_status()
         gate = evaluate_production_trade_gate(
             okx={
                 "healthy": sync_reason is None,
@@ -3348,17 +3417,14 @@ class TradingService:
                 "daily_loss_usdt": max(-daily_pnl, 0.0),
                 "breaker": breaker_state,
             },
-            model={
-                "artifact_lifecycle": "active" if live_authorized else "shadow",
-                "allow_live_position_influence": live_authorized,
-                "production_influence_authorized": live_authorized,
-                "live_ml_ready": live_authorized,
-                "model_name": model_name,
-                "model_mode": model_mode,
-                "metrics": metrics,
-            },
+            model=self._production_trade_gate_model_payload(
+                model_name=model_name,
+                model_mode=model_mode,
+                ml_status=ml_status,
+            ),
             training={
                 "source": "decision_raw_response",
+                "current_decision_return_evidence": current_decision_metrics,
                 "quality_report": self._safe_dict(raw.get("quality_report")),
             },
             settings={"rules_canary_enabled": True},
