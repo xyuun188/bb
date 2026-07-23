@@ -101,7 +101,7 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
             },
             "local_ml_readiness": {
                 "readiness_state": "degraded",
-                "allow_live_position_influence": False,
+                "live_ml_ready": False,
                 "strategy_blueprint": {
                     "strategy_id": "trained-model-v1",
                     "execution_scope": "paper_only",

@@ -28,6 +28,20 @@ async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     await init_db()
 
 
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    epoch_start = datetime(2026, 6, 27, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(dashboard, "load_training_epoch_start", lambda: epoch_start)
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_training_epoch_start",
+        lambda: epoch_start,
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models.load_training_epoch_start",
+        lambda: epoch_start,
+    )
+
+
 @pytest.mark.asyncio
 async def test_model_server_settings_are_encrypted_and_masked(
     monkeypatch: pytest.MonkeyPatch,
@@ -235,14 +249,14 @@ async def test_local_ai_tools_status_uses_client_when_dashboard_is_split(
     assert result["available"] is True
     assert result["models"]["profit"] == "trained"
     assert result["completed_shadow_sample_count"] == 1
-    assert result["raw_shadow_sample_count"] == 1
-    assert result["legacy_shadow_sample_count"] == 0
-    assert result["service_model_window_shadow_sample_count"] == 42
-    assert result["service_model_window_trade_sample_count"] == 7
+    assert result["trade_sample_count"] == 0
+    assert result["artifact_training_shadow_sample_count"] == 42
+    assert result["artifact_training_trade_sample_count"] == 7
+    assert result["pre_epoch_data_training_allowed"] is False
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_status_uses_phase3_completed_count_when_dashboard_is_split(
+async def test_ml_signal_status_uses_current_epoch_count_when_dashboard_is_split(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -289,13 +303,14 @@ async def test_ml_signal_status_uses_phase3_completed_count_when_dashboard_is_sp
     assert result["auto_train_enabled"] is True
     assert result["training_shadow_sample_count"] == 1
     assert result["completed_shadow_sample_count"] == 1
-    assert result["raw_shadow_sample_count"] == 42
-    assert result["legacy_shadow_sample_count"] == 41
-    assert result["new_shadow_sample_count"] == 0
+    assert result["artifact_training_shadow_sample_count"] == 42
+    assert result["new_shadow_sample_count"] == 1
+    assert "raw_shadow_sample_count" not in result
+    assert "legacy_shadow_sample_count" not in result
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_status_does_not_promote_legacy_sample_counts(
+async def test_ml_signal_status_does_not_promote_artifact_sample_counts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -327,13 +342,14 @@ async def test_ml_signal_status_does_not_promote_legacy_sample_counts(
 
     assert result["training_shadow_sample_count"] == 0
     assert result["completed_shadow_sample_count"] == 0
-    assert result["phase3_new_shadow_sample_count"] == 0
-    assert result["raw_shadow_sample_count"] == 150810
-    assert result["legacy_shadow_sample_count"] == 150810
+    assert result["new_shadow_sample_count"] == 0
+    assert result["artifact_training_shadow_sample_count"] == 150810
+    assert "raw_shadow_sample_count" not in result
+    assert "legacy_shadow_sample_count" not in result
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_status_uses_training_window_when_legacy_cursor_is_stale(
+async def test_ml_signal_status_rebases_when_artifact_cursor_is_stale(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -361,10 +377,9 @@ async def test_ml_signal_status_uses_training_window_when_legacy_cursor_is_stale
     finally:
         await close_db()
 
-    assert result["phase3_clean_completed_shadow_sample_count"] == 6906
-    assert result["last_trained_phase3_shadow_sample_count"] == 5940
-    assert result["phase3_new_shadow_sample_count"] == 966
-    assert result["new_shadow_sample_count"] == 966
+    assert result["completed_shadow_sample_count"] == 6906
+    assert result["last_trained_completed_shadow_sample_count"] == 0
+    assert result["new_shadow_sample_count"] == 6906
 
 
 @pytest.mark.asyncio
@@ -377,8 +392,6 @@ async def test_ml_signal_status_uses_live_completed_total_not_artifact_total(
                 "available": True,
                 "status": "learning_only",
                 "sample_count": 1657,
-                "phase3_clean_trainable_shadow_sample_count": 2359,
-                "phase3_clean_completed_shadow_sample_count": 2359,
                 "last_trained_completed_shadow_sample_count": 2359,
             }
 
@@ -391,10 +404,7 @@ async def test_ml_signal_status_uses_live_completed_total_not_artifact_total(
 
     result = await dashboard.get_ml_signal_status()
 
-    assert result["phase3_clean_completed_shadow_sample_count"] == 2492
-    assert result["last_trained_phase3_shadow_sample_count"] == 2359
-    assert result["phase3_new_shadow_sample_count"] == 133
+    assert result["completed_shadow_sample_count"] == 2492
+    assert result["last_trained_completed_shadow_sample_count"] == 2359
     assert result["new_shadow_sample_count"] == 133
-    assert result["completed_shadow_sample_count_source"] == (
-        "live_phase3_clean_training_view"
-    )
+    assert result["completed_shadow_sample_count_source"] == "current_training_epoch"

@@ -61,7 +61,7 @@ def test_summary_exposes_artifact_and_protection_inventory() -> None:
             "orders": [],
             "positions": [{"id": 3}],
             "local_ml_artifact": {
-                "allow_live_position_influence": False,
+                "live_ml_ready": False,
                 "registry": {"version": "artifact-v1"},
             },
             "okx_protection_inventory": {
@@ -99,7 +99,7 @@ def test_root_cause_fixture_preserves_incident_and_rollback_evidence() -> None:
 
     artifact = payload["local_ml_artifact"]
     assert artifact["registry"]["version"] == "20260714T095512798363Z-57c22201"
-    assert artifact["allow_live_position_influence"] is True
+    assert artifact["live_ml_ready"] is True
     metrics = artifact["manifest"]["metrics"]
     assert metrics["top_short_profit_factor"] == 1_000_000.0
     assert metrics["top_short_avg_return_pct"] > 70.0

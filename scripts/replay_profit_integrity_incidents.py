@@ -201,7 +201,7 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
         "before": {
             "expected_return_pct": old_expected,
             "lower_quantile_return_pct": old_lower,
-            "production_influence": bool(evidence["ml_signal"]["allow_live_position_influence"]),
+            "production_influence": bool(evidence["ml_signal"]["live_ml_ready"]),
         },
         "after": {
             "distribution_production_eligible": distribution["production_eligible"],

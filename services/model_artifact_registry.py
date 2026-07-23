@@ -13,19 +13,14 @@ from typing import Any
 
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 
-ARTIFACT_REGISTRY_VERSION = "2026-07-15.v2"
-ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-15.v1"
+ARTIFACT_REGISTRY_VERSION = "2026-07-24.v3"
+ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-24.v2"
 _WRITABLE_ACTIVATION_STAGES = frozenset({"shadow", "canary", "active"})
-_READABLE_ACTIVATION_STAGES = frozenset(
-    {*_WRITABLE_ACTIVATION_STAGES, "live"}
-)
+_READABLE_ACTIVATION_STAGES = _WRITABLE_ACTIVATION_STAGES
 _ALLOWED_STAGE_TRANSITIONS = {
     "shadow": frozenset({"canary"}),
     "canary": frozenset({"active"}),
-    # Existing manifests used `live` for the unified production artifact.
-    "live": frozenset({"active"}),
 }
-_MIGRATABLE_REGISTRY_VERSIONS = frozenset({"2026-07-11.v1"})
 
 
 def _sha256(path: Path) -> str:
@@ -123,17 +118,13 @@ class ModelArtifactRegistry:
 
     @property
     def active_path(self) -> Path:
-        """Canonical unified runtime pointer; shares the legacy current.json file."""
+        """Canonical unified runtime pointer."""
 
         return self.current_path
 
     @property
     def rollback_path(self) -> Path:
         return self.model_root / "rollback.json"
-
-    @property
-    def retired_pointers_root(self) -> Path:
-        return self.model_root / "retired_pointers"
 
     def persist_candidate_joblib(
         self,
@@ -256,53 +247,16 @@ class ModelArtifactRegistry:
         candidate = self.resolve_candidate(required=True)
         assert candidate is not None
         previous_pointer = _read_json(self.current_path) if self.current_path.exists() else None
-        previous: ResolvedModelArtifact | None = None
-        retirement: dict[str, Any] | None = None
-        if previous_pointer is not None:
-            previous_registry_version = str(
-                previous_pointer.get("artifact_registry_version") or ""
-            )
-            if previous_registry_version != ARTIFACT_REGISTRY_VERSION:
-                if previous_registry_version not in _MIGRATABLE_REGISTRY_VERSIONS:
-                    raise ValueError(
-                        "unsupported current registry version cannot be retired"
-                    )
-                self._validate_migratable_current_pointer(previous_pointer)
-                retired_at = datetime.now(UTC)
-                retirement_path = self.retired_pointers_root / (
-                    f"current-{retired_at.strftime('%Y%m%dT%H%M%S%fZ')}-"
-                    f"{uuid.uuid4().hex[:8]}.json"
-                )
-                retirement = {
-                    "reason": "incompatible_artifact_registry_version",
-                    "from_registry_version": previous_registry_version or None,
-                    "to_registry_version": ARTIFACT_REGISTRY_VERSION,
-                    "pointer_sha256": _payload_sha256(previous_pointer),
-                    "retired_pointer_path": str(retirement_path),
-                    "retired_at": retired_at.isoformat(),
-                }
-            else:
-                previous = self.resolve_current()
-                if previous is None:
-                    raise ValueError("current artifact pointer disappeared during promotion")
-        effective_evidence = dict(activation_evidence)
-        if retirement is not None:
-            effective_evidence["registry_migration"] = retirement
-        activation = self._build_activation_manifest(candidate, effective_evidence)
+        previous = self.resolve_current() if previous_pointer is not None else None
+        if previous_pointer is not None and previous is None:
+            raise ValueError("current artifact pointer disappeared during promotion")
+        activation = self._build_activation_manifest(candidate, activation_evidence)
         activation_root = candidate.manifest_path.parent / "activations"
         activation_path = activation_root / f"a-{uuid.uuid4().hex[:8]}.json"
         _write_json_once(activation_path, activation)
         activation_hash = _sha256(activation_path)
 
-        if retirement is not None:
-            retirement_path = Path(str(retirement["retired_pointer_path"]))
-            retirement_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(self.current_path, retirement_path)
-            _write_json_once(
-                retirement_path.with_suffix(".retirement.json"),
-                retirement,
-            )
-        elif previous_pointer is not None and previous is not None:
+        if previous_pointer is not None and previous is not None:
             _write_json_atomic(
                 self.rollback_path,
                 {
@@ -503,64 +457,6 @@ class ModelArtifactRegistry:
         ):
             raise ValueError("oos_return_evaluation is incomplete")
 
-    def _validate_migratable_current_pointer(
-        self,
-        pointer: dict[str, Any],
-    ) -> None:
-        registry_version = _required_text(pointer, "artifact_registry_version")
-        if registry_version not in _MIGRATABLE_REGISTRY_VERSIONS:
-            raise ValueError("unsupported current registry version cannot be retired")
-        if pointer.get("model_id") != self.model_id:
-            raise ValueError("incompatible current pointer model identity mismatch")
-        if pointer.get("pointer_role") not in (None, "current"):
-            raise ValueError("incompatible current pointer role mismatch")
-        version = _required_text(pointer, "version")
-        version_root = (self.versions_root / version).resolve(strict=True)
-        manifest_path = (
-            self.model_root / _required_text(pointer, "manifest_path")
-        ).resolve(strict=True)
-        manifest_path.relative_to(version_root)
-        manifest_hash = _required_text(pointer, "manifest_sha256")
-        if not _is_sha256(manifest_hash) or _sha256(manifest_path) != manifest_hash:
-            raise ValueError("incompatible current manifest hash verification failed")
-        manifest = _read_json(manifest_path)
-        if manifest.get("artifact_registry_version") != registry_version:
-            raise ValueError("incompatible current manifest registry mismatch")
-        if manifest.get("artifact_model_id") != self.model_id:
-            raise ValueError("incompatible current manifest model identity mismatch")
-        if manifest.get("artifact_version") != version:
-            raise ValueError("incompatible current manifest version mismatch")
-        model_path = (
-            version_root / _required_text(manifest, "model_relative_path")
-        ).resolve(strict=True)
-        metadata_path = (
-            version_root / _required_text(manifest, "metadata_relative_path")
-        ).resolve(strict=True)
-        model_path.relative_to(version_root)
-        metadata_path.relative_to(version_root)
-        artifact_hash = _required_text(pointer, "sha256")
-        if (
-            not _is_sha256(artifact_hash)
-            or manifest.get("artifact_sha256") != artifact_hash
-            or _sha256(model_path) != artifact_hash
-        ):
-            raise ValueError("incompatible current model hash verification failed")
-        metadata_hash = _required_text(pointer, "metadata_sha256")
-        if (
-            not _is_sha256(metadata_hash)
-            or manifest.get("metadata_sha256") != metadata_hash
-            or _sha256(metadata_path) != metadata_hash
-        ):
-            raise ValueError("incompatible current metadata hash verification failed")
-        metadata = _read_json(metadata_path)
-        if (
-            metadata.get("artifact_registry_version") != registry_version
-            or metadata.get("artifact_model_id") != self.model_id
-            or metadata.get("artifact_version") != version
-            or metadata.get("artifact_sha256") != artifact_hash
-        ):
-            raise ValueError("incompatible current metadata identity mismatch")
-
     def _build_activation_manifest(
         self,
         candidate: ResolvedModelArtifact,
@@ -569,7 +465,7 @@ class ModelArtifactRegistry:
         stage = _required_text(evidence, "activation_stage")
         if stage not in _WRITABLE_ACTIVATION_STAGES:
             raise ValueError("activation_stage must be shadow, canary, or active")
-        production_authorized = evidence.get("production_influence_authorized") is True
+        production_authorized = evidence.get("live_ml_ready") is True
         paper_canary_authorized = evidence.get("paper_canary_authorized") is True
         readiness_state = str(evidence.get("readiness_state") or "").strip()
         blockers = evidence.get("blocking_reasons")
@@ -614,7 +510,7 @@ class ModelArtifactRegistry:
             if not isinstance(return_evidence, dict):
                 raise ValueError(f"{stage} activation requires a return evidence report")
             if (
-                return_evidence.get("allow_live_position_influence") is not True
+                return_evidence.get("live_ml_ready") is not True
                 or return_evidence.get("state") not in {"ready", "partial_ready"}
                 or list(return_evidence.get("blocking_reasons") or [])
             ):
@@ -714,7 +610,7 @@ class ModelArtifactRegistry:
                 evidence.get("paper_canary_report") or {}
             ),
             "activation_stage": stage,
-            "production_influence_authorized": production_authorized,
+            "live_ml_ready": production_authorized,
             "paper_canary_authorized": paper_canary_authorized,
             "blocking_reasons": blockers,
             "activated_at": datetime.now(UTC).isoformat(),
@@ -937,7 +833,7 @@ class ModelArtifactRegistry:
         stage = activation.get("activation_stage")
         if stage not in _READABLE_ACTIVATION_STAGES:
             raise ValueError("artifact activation stage is invalid")
-        production_authorized = activation.get("production_influence_authorized") is True
+        production_authorized = activation.get("live_ml_ready") is True
         paper_canary_authorized = activation.get("paper_canary_authorized") is True
         blockers = activation.get("blocking_reasons")
         blockers = blockers if isinstance(blockers, list) else []
@@ -957,7 +853,7 @@ class ModelArtifactRegistry:
                 or list(paper_report.get("blocking_reasons") or [])
             ):
                 raise ValueError("paper canary artifact activation evidence is incomplete")
-        elif stage in {"canary", "active", "live"} and (
+        elif stage in {"canary", "active"} and (
             not production_authorized
             or activation.get("readiness_state") not in {"ready", "partial_ready"}
             or blockers
@@ -965,10 +861,10 @@ class ModelArtifactRegistry:
             raise ValueError("production artifact activation evidence is incomplete")
         if stage == "active" and activation.get("readiness_state") != "ready":
             raise ValueError("active artifact requires ready return evidence")
-        if stage in {"canary", "active", "live"} and not paper_canary_authorized:
+        if stage in {"canary", "active"} and not paper_canary_authorized:
             return_evidence = activation.get("return_evidence_report")
             if not isinstance(return_evidence, dict) or (
-                return_evidence.get("allow_live_position_influence") is not True
+                return_evidence.get("live_ml_ready") is not True
                 or return_evidence.get("state") not in {"ready", "partial_ready"}
                 or list(return_evidence.get("blocking_reasons") or [])
             ):

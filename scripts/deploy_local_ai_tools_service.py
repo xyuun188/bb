@@ -65,8 +65,8 @@ MODEL_DIR = Path(
         str(PHASE3_ROOT / "models" / "local_ai_tools"),
     )
 )
-ARTIFACT_REGISTRY_VERSION = "2026-07-15.local-ai-tools.v2"
-ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-15.local-ai-tools-activation.v2"
+ARTIFACT_REGISTRY_VERSION = "2026-07-24.local-ai-tools.v3"
+ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-24.local-ai-tools-activation.v3"
 ARTIFACT_MODEL_ID = "local_ai_tools_quant_bundle"
 VERSIONS_ROOT = MODEL_DIR / "versions"
 CANDIDATE_POINTER_PATH = MODEL_DIR / "candidate.json"
@@ -194,9 +194,7 @@ _STATUS_METADATA_KEYS = (
     "training_policy",
     "trade_sample_cursor_policy",
     "training_mode",
-    "requested_model_stage",
     "model_stage",
-    "evaluation_policy",
     "artifact_persisted",
     "preflight_only",
     "persist_artifact_requested",
@@ -209,7 +207,7 @@ _STATUS_METADATA_KEYS = (
     "artifact_model_id",
     "artifact_version",
     "artifact_lifecycle",
-    "production_influence_authorized",
+    "live_ml_ready",
     "artifact_activation_manifest",
     "live_promotion_manifest",
     "walk_forward_report",
@@ -316,8 +314,6 @@ class TrainRequest(BaseModel):
     return_objective_report: dict[str, Any] = {}
     profit_supervision_report: dict[str, Any] = {}
     training_mode: str = "shadow"
-    model_stage: str = "shadow"
-    evaluation_policy: dict[str, Any] = {}
     promotion_recommendation: dict[str, Any] = {}
     persist_artifact: bool = False
     confirm_phase3_rebuild: bool = False
@@ -995,10 +991,6 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         blockers.append("walk_forward_evidence_incomplete")
     loso_report = metadata.get("leave_one_symbol_out_report") or {}
     oos_report = metadata.get("oos_return_evaluation") or {}
-    authoritative_sides = (
-        (metadata.get("authoritative_trade_return_evidence") or {}).get("sides")
-        or {}
-    )
     walk_sides = walk_forward.get("sides") or {}
     for side in ("long", "short"):
         if (walk_sides.get(side) or {}).get("promotion_math_ready") is not True:
@@ -1017,23 +1009,20 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
             blockers.append(f"{side}_walk_forward_fold_not_ready")
         if (loso_report.get(side) or {}).get("stable") is not True:
             blockers.append(f"{side}_leave_one_symbol_out_not_stable")
-        for scope, evidence in (
-            ("oos", oos_report.get(side) or {}),
-            ("authoritative", authoritative_sides.get(side) or {}),
+        evidence = oos_report.get(side) or {}
+        if evidence.get("profit_factor") is None:
+            blockers.append(f"{side}_oos_profit_factor_undefined")
+        if evidence.get("promotion_math_ready") is not True:
+            blockers.append(f"{side}_oos_return_evidence_not_ready")
+        if any(
+            evidence.get(field) is None
+            for field in (
+                "return_lcb_pct",
+                "cvar_10_pct",
+                "max_drawdown_pct",
+            )
         ):
-            if evidence.get("profit_factor") is None:
-                blockers.append(f"{side}_{scope}_profit_factor_undefined")
-            if evidence.get("promotion_math_ready") is not True:
-                blockers.append(f"{side}_{scope}_return_evidence_not_ready")
-            if any(
-                evidence.get(field) is None
-                for field in (
-                    "return_lcb_pct",
-                    "cvar_10_pct",
-                    "max_drawdown_pct",
-                )
-            ):
-                blockers.append(f"{side}_{scope}_tail_evidence_incomplete")
+            blockers.append(f"{side}_oos_tail_evidence_incomplete")
     return list(dict.fromkeys(blockers))
 
 
@@ -1359,7 +1348,7 @@ def _resolve_artifact_pointer(
         ):
             raise ValueError("Local AI activation return-evidence identity mismatch.")
         stage = activation.get("activation_stage")
-        production_authorized = activation.get("production_influence_authorized") is True
+        production_authorized = activation.get("live_ml_ready") is True
         if stage in {"shadow", "canary"} and production_authorized:
             raise ValueError("Observation-only local AI artifact has production authorization.")
         if stage == "canary":
@@ -1371,14 +1360,11 @@ def _resolve_artifact_pointer(
                 or recommendation.get("canary_ready") is not True
             ):
                 raise ValueError("Canary local AI activation contract is incomplete.")
-        if stage in {"active", "live"}:
+        if stage == "active":
             recommendation = activation.get("promotion_recommendation") or {}
             if (
-                recommendation.get("recommended_stage") not in {"active", "live"}
-                or recommendation.get(
-                    "active_ready", recommendation.get("live_ready")
-                )
-                is not True
+                recommendation.get("recommended_stage") != "active"
+                or recommendation.get("live_ml_ready") is not True
             ):
                 raise ValueError("Active local AI activation recommendation is incomplete.")
             if not production_authorized:
@@ -1396,7 +1382,7 @@ def _resolve_artifact_pointer(
                 or activation.get("production_permission") is not True
             ):
                 raise ValueError("Active local AI activation permission is incomplete.")
-        if stage not in {"shadow", "canary", "active", "live"}:
+        if stage not in {"shadow", "canary", "active"}:
             raise ValueError("Local AI activation stage is invalid.")
     elif role == "challenger":
         rejection_path = (
@@ -1492,7 +1478,7 @@ def persist_candidate_bundle(
         "artifact_version": version,
         "artifact_lifecycle": "candidate",
         "model_stage": "candidate",
-        "production_influence_authorized": False,
+        "live_ml_ready": False,
     }
     persisted_bundle = dict(bundle)
     persisted_bundle["metadata"] = registry_metadata
@@ -1540,17 +1526,14 @@ def _governed_candidate_activation_stage(
     evidence_blockers: list[str],
 ) -> str:
     recommended = str(promotion_recommendation.get("recommended_stage") or "shadow").lower()
-    active_ready = promotion_recommendation.get(
-        "active_ready", promotion_recommendation.get("live_ready")
-    )
     if (
-        recommended in {"active", "live"}
-        and active_ready is True
+        recommended == "active"
+        and promotion_recommendation.get("live_ml_ready") is True
         and not evidence_blockers
     ):
         return "active"
     if (
-        recommended in {"canary", "active", "live"}
+        recommended in {"canary", "active"}
         and promotion_recommendation.get("canary_ready") is True
         and promotion_recommendation.get("canary_execution_scope") == "paper_only"
         and promotion_recommendation.get("canary_production_permission") is False
@@ -1560,7 +1543,7 @@ def _governed_candidate_activation_stage(
 
 
 def _local_artifact_stage_rank(stage: str) -> int:
-    return {"shadow": 0, "canary": 1, "active": 2, "live": 2}.get(
+    return {"shadow": 0, "canary": 1, "active": 2}.get(
         str(stage or "").lower(),
         -1,
     )
@@ -1698,7 +1681,7 @@ def _local_activation_manifest(
         ),
         "activation_stage": activation_stage,
         "transition_from_stage": transition_from_stage,
-        "production_influence_authorized": production_authorized,
+        "live_ml_ready": production_authorized,
         "execution_scope": (
             "production"
             if activation_stage == "active"
@@ -1788,7 +1771,6 @@ def transition_current_artifact(
     allowed_targets = {
         "shadow": {"canary"},
         "canary": {"active"},
-        "live": {"active"},
     }
     if activation_stage not in allowed_targets.get(current_stage, set()):
         raise ValueError(
@@ -2007,8 +1989,8 @@ def _load_bundle_unlocked() -> dict[str, Any] | None:
             **metadata,
             "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
             "model_stage": activation.get("activation_stage") or "unregistered",
-            "production_influence_authorized": bool(
-                activation.get("production_influence_authorized")
+            "live_ml_ready": bool(
+                activation.get("live_ml_ready")
             ),
             "artifact_activation_manifest": activation,
         }
@@ -2236,8 +2218,8 @@ def _model_artifact_status() -> dict[str, Any]:
         "artifact_model_id": ARTIFACT_MODEL_ID,
         "artifact_version": current.get("version") if current else None,
         "artifact_lifecycle": activation_stage,
-        "production_influence_authorized": bool(
-            (activation or {}).get("production_influence_authorized")
+        "live_ml_ready": bool(
+            (activation or {}).get("live_ml_ready")
         ),
         "model_path": str(current["model_path"]) if current else None,
         "metadata_path": str(current["metadata_path"]) if current else None,
@@ -2254,8 +2236,8 @@ def _model_artifact_status() -> dict[str, Any]:
         "artifact_lifecycle": activation_stage,
         "model_stage": activation_stage if model_bundle_available else "candidate",
         "artifact_activation_manifest": activation_status,
-        "production_influence_authorized": bool(
-            (activation or {}).get("production_influence_authorized")
+        "live_ml_ready": bool(
+            (activation or {}).get("live_ml_ready")
         ),
     }
 
@@ -3689,7 +3671,7 @@ def with_model_metadata(
             "model_stage",
             "training_mode",
             "profit_supervision_version",
-            "production_influence_authorized",
+            "live_ml_ready",
         ):
             if key in metadata:
                 payload.setdefault(key, metadata.get(key))
@@ -3703,8 +3685,8 @@ def with_model_metadata(
             or "candidate"
         ).lower()
         live_authorized = bool(
-            activation_stage in {"active", "live"}
-            and metadata.get("production_influence_authorized") is True
+            activation_stage == "active"
+            and metadata.get("live_ml_ready") is True
             and not _production_return_evidence_blockers(metadata)
         )
         if not live_authorized:
@@ -3719,13 +3701,13 @@ def with_model_metadata(
             payload["route_mode"] = f"{activation_stage}_observation"
             payload["live_mutation"] = False
             payload["production_permission"] = False
-            payload["promotion_ready"] = False
+            payload["live_ml_ready"] = False
         else:
             payload["route_mode"] = "live"
             payload["live_mutation"] = True
             payload["live_influence"] = True
             payload["production_permission"] = True
-            payload["promotion_ready"] = True
+            payload["live_ml_ready"] = True
         distribution_inputs_ready = all(
             isinstance(distribution_inputs.get(side), dict)
             and distribution_inputs[side].get("production_eligible") is True
@@ -4249,10 +4231,7 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, Any]:
     artifact_status = _model_artifact_status()
-    live_authorized = bool(
-        artifact_status.get("artifact_lifecycle") in {"active", "live"}
-        and artifact_status.get("production_influence_authorized") is True
-    )
+    live_authorized = artifact_status.get("live_ml_ready") is True
     payload = {
         "ok": True,
         "service": "phase3_quant_api",
@@ -4562,16 +4541,6 @@ def train(req: TrainRequest) -> dict[str, Any]:
         trainable_trade_samples
     )
     profiles = _train_profiles(trainable_trade_samples)
-    evaluation_policy = req.evaluation_policy or {
-        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
-        "requires_walk_forward": True,
-        "phase": "phase3_model_factory",
-    }
-    evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
-    evaluation_policy.setdefault("live_mutation", False)
-    evaluation_policy.setdefault("requires_walk_forward", True)
-    evaluation_policy.setdefault("phase", "phase3_model_factory")
     fingerprint_payload = {
         "shadow": [
             {
@@ -4736,9 +4705,8 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": str(req.training_mode or "shadow"),
-        "requested_model_stage": str(req.model_stage or "shadow"),
         "model_stage": "candidate",
-        "evaluation_policy": evaluation_policy,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
         "artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild),
         "preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild),
         "persist_artifact_requested": bool(req.persist_artifact),
@@ -4747,12 +4715,12 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "artifact_activation_manifest": {
             "status": "not_activated",
             "activation_stage": "candidate",
-            "production_influence_authorized": False,
+            "live_ml_ready": False,
         },
         "live_promotion_manifest": {
             "status": "not_issued",
             "reason": "candidate_requires_independent_shadow_and_return_readiness",
-            "production_influence_authorized": False,
+            "live_ml_ready": False,
         },
         "training_objective": (
             "Predict shadow market opportunity and counterfactual execution cost as "
@@ -4792,7 +4760,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
             else "candidate_requires_independent_shadow_activation"
         ),
         "blocking_reasons": return_evidence_blockers,
-        "production_influence_authorized": False,
+        "live_ml_ready": False,
     }
     bundle = {
         "metadata": metadata,
@@ -4892,7 +4860,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         **current["metadata"],
         "artifact_version": current["version"],
         "artifact_activation_stage": activation_stage,
-        "production_influence_authorized": activation_stage == "active",
+        "live_ml_ready": activation_stage == "active",
         "candidate_version": candidate["version"],
         "champion_comparison": champion_comparison,
     }
@@ -5907,15 +5875,15 @@ def _remote_smoke_command() -> str:
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
         "assert health.get('live_mutation') is live, health\n"
-        "assert health.get('artifact_lifecycle') in {'shadow', 'canary', 'active', 'live'}, health\n"
-        "assert health.get('production_influence_authorized') is live, health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') in {'shadow', 'canary', 'active', 'live'}, health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('production_influence_authorized') is live, health\n"
+        "assert health.get('artifact_lifecycle') in {'shadow', 'canary', 'active'}, health\n"
+        "assert health.get('live_ml_ready') is live, health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') in {'shadow', 'canary', 'active'}, health\n"
+        "assert health.get('artifact_activation_manifest', {}).get('live_ml_ready') is live, health\n"
         "assert profit.get('trained') is True, profit\n"
         "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"
         "assert profit.get('live_mutation') is False, profit\n"
         "assert profit.get('production_permission') is live, profit\n"
-        "assert profit.get('promotion_ready') is live, profit\n"
+        "assert profit.get('live_ml_ready') is live, profit\n"
         "assert profit.get('prediction_quality', {}).get('production_eligible') is live, profit\n"
         "assert profit.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', profit\n"
         "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
@@ -5928,7 +5896,7 @@ def _remote_smoke_command() -> str:
         "    'health_contract': {\n"
         "        'artifact_version': health.get('artifact_version'),\n"
         "        'artifact_lifecycle': health.get('artifact_lifecycle'),\n"
-        "        'production_influence_authorized': health.get('production_influence_authorized'),\n"
+        "        'live_ml_ready': health.get('live_ml_ready'),\n"
         "        'training_data_sha256': health.get('training_data_sha256'),\n"
         "        'source_code_sha256': health.get('source_code_sha256'),\n"
         "        'return_evidence_ready': health.get('artifact_activation_manifest', {}).get('return_evidence_ready'),\n"

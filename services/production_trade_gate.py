@@ -155,12 +155,9 @@ def _model_profit_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
     return not blockers, blockers
 
 
-def _model_live_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
-    lifecycle = str(model.get("artifact_lifecycle") or model.get("stage") or "").lower()
+def _model_live_ml_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
     influence_allowed = model.get("live_ml_ready") is True
     blockers: list[str] = []
-    if lifecycle not in {"active", "live"} and not bool(model.get("live_ml_ready")):
-        blockers.append("model_not_promoted_to_live")
     if not influence_allowed:
         blockers.append("model_live_influence_not_authorized")
     profit_ready, profit_blockers = _model_profit_ready(model)
@@ -215,7 +212,7 @@ def evaluate_production_trade_gate(
             evidence=evidence,
         )
 
-    model_ready, model_blockers = _model_live_ready(model)
+    model_ready, model_blockers = _model_live_ml_ready(model)
     if model_ready:
         return ProductionTradeGateResult(
             can_trade=True,

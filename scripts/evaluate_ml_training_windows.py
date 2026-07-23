@@ -443,7 +443,7 @@ def evaluate_variant(
         {
             "status": "evaluated",
             "readiness_state": readiness.get("state"),
-            "allow_live_position_influence": bool(readiness.get("allow_live_position_influence")),
+            "live_ml_ready": bool(readiness.get("live_ml_ready")),
             "blocking_reason_codes": [
                 str(item.get("code"))
                 for item in blocking
@@ -480,7 +480,7 @@ async def run(*, include_extended: bool = False) -> dict[str, Any]:
         for variant in selected_variants
     ]
     ready_variants = [
-        item["variant"] for item in results if item.get("allow_live_position_influence")
+        item["variant"] for item in results if item.get("live_ml_ready")
     ]
     return {
         "dry_run": True,

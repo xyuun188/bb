@@ -9,12 +9,10 @@ local rows from OKX native fills (`instId`, `ordId`, `tradeId`, `fillSz`,
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isclose
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -73,9 +71,6 @@ from services.trade_execution_contract import validate_entry_execution_contract
 logger = structlog.get_logger(__name__)
 
 PHASE3_DEFAULT_ORDER_SYNC_START = PHASE3_CLEAN_START_LOCAL
-DEFAULT_COLD_START_MARKER_PATH = (
-    Path(__file__).resolve().parent.parent / "data" / "phase3_cold_start_reset_marker.json"
-)
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 500
 DEFAULT_TIMEOUT_SECONDS = 8.0
@@ -515,7 +510,6 @@ class OkxOrderFactSyncService:
         limit: int = DEFAULT_LIMIT,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         executor_factory: Any | None = None,
-        cold_start_marker_path: str | Path | None = DEFAULT_COLD_START_MARKER_PATH,
         phase3_order_sync_start: datetime | None = PHASE3_DEFAULT_ORDER_SYNC_START,
     ) -> None:
         self.mode = "live" if str(mode or "").lower() == "live" else "paper"
@@ -523,9 +517,6 @@ class OkxOrderFactSyncService:
         self.limit = max(1, min(int(limit or DEFAULT_LIMIT), 2000))
         self.timeout_seconds = max(float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS), 0.5)
         self.executor_factory = executor_factory or OKXExecutor
-        self.cold_start_marker_path = (
-            Path(cold_start_marker_path) if cold_start_marker_path is not None else None
-        )
         self.phase3_order_sync_start = _aware_utc(
             phase3_order_sync_start or PHASE3_DEFAULT_ORDER_SYNC_START
         )
@@ -1174,18 +1165,6 @@ class OkxOrderFactSyncService:
         """
 
         return _aware_utc(self.phase3_order_sync_start)
-
-    def _load_cold_start_reset_at(self) -> datetime | None:
-        marker_path = self.cold_start_marker_path
-        if marker_path is None or not marker_path.exists():
-            return None
-        try:
-            payload = json.loads(marker_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if str(payload.get("mode") or "paper") != self.mode:
-            return None
-        return _parse_datetime(payload.get("reset_at"))
 
     async def _load_local_orders(
         self,

@@ -72,6 +72,7 @@ from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTraining
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
+from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -2871,31 +2872,6 @@ def _safe_int_value(value: Any, default: int = 0) -> int:
         return default
 
 
-def _explicit_phase3_count(status: dict[str, Any], *keys: str) -> int | None:
-    for key in keys:
-        if key not in status:
-            continue
-        value = _safe_int_value(status.get(key), 0)
-        if value >= 0:
-            return value
-    return None
-
-
-async def _completed_local_ai_shadow_backtest_total() -> int:
-    if not _trading_service:
-        try:
-            from services.ml_signal_service import count_shadow_training_rows
-
-            return int(await count_shadow_training_rows())
-        except Exception as exc:
-            _log_dashboard_fallback("local ai tools phase3 sample count fallback", exc)
-            return 0
-    counter = getattr(_trading_service, "completed_shadow_backtest_total", None)
-    if not callable(counter):
-        return 0
-    return int(await counter())
-
-
 def _reset_trading_decision_runtime_state() -> None:
     if not _trading_service:
         return
@@ -5377,88 +5353,45 @@ async def get_ml_signal_status():
     if not isinstance(status, dict):
         return status
 
-    raw_training_count = _safe_int_value(
+    artifact_training_count = _safe_int_value(
         status.get("sample_count") or status.get("trained_sample_count"), 0
     )
-    explicit_training_count = _explicit_phase3_count(
-        status,
-        "phase3_clean_trainable_shadow_sample_count",
-        "phase3_clean_completed_shadow_sample_count",
-    )
-    if explicit_training_count is None:
-        explicit_training_count = await _completed_ml_shadow_sample_count()
-    training_count = int(explicit_training_count or 0)
-    status["phase3_clean_trainable_shadow_sample_count"] = training_count
-    status["training_shadow_sample_count"] = training_count
-    status["raw_shadow_sample_count"] = raw_training_count
-    status["legacy_shadow_sample_count"] = max(raw_training_count - training_count, 0)
-    status.setdefault("training_window_policy", "all_current_clean_cost_complete_samples")
-
     try:
-        # Artifact metadata is the last-trained cursor, not the current database total.
-        # Always read the live clean view so the "new, untrained" counter can advance.
         completed_total = await _completed_ml_shadow_sample_count()
         completed_total = int(completed_total or 0)
-        completed_total = max(completed_total, training_count)
-        status["phase3_clean_completed_shadow_sample_count"] = completed_total
+        trained_cursor = _trained_shadow_cursor(status, completed_total)
+        status["training_policy"] = "current_training_epoch_only"
+        status["training_epoch_started_at"] = load_training_epoch_start().isoformat()
+        status["pre_epoch_data_training_allowed"] = False
+        status["artifact_training_shadow_sample_count"] = artifact_training_count
+        status["training_shadow_sample_count"] = completed_total
         status["completed_shadow_sample_count"] = completed_total
         status["total_shadow_sample_count"] = completed_total
-        status["completed_shadow_sample_count_source"] = (
-            "live_phase3_clean_training_view"
-        )
-
-        auto_last = (
-            status.get("auto_train_last_result")
-            if isinstance(status.get("auto_train_last_result"), dict)
-            else {}
-        )
-        auto_new = (
-            auto_last.get("phase3_new_shadow_sample_count") if isinstance(auto_last, dict) else None
-        )
-        if auto_new is None:
-            trained_cursor = _phase3_trained_shadow_cursor(status, completed_total)
-            status["last_trained_phase3_shadow_sample_count"] = trained_cursor
-            auto_new = max(int(completed_total) - trained_cursor, 0)
-        status["phase3_new_shadow_sample_count"] = int(auto_new or 0)
-        status["new_shadow_sample_count"] = int(auto_new or 0)
+        status["last_trained_completed_shadow_sample_count"] = trained_cursor
+        status["new_shadow_sample_count"] = max(completed_total - trained_cursor, 0)
+        status["completed_shadow_sample_count_source"] = "current_training_epoch"
+        status["training_window_policy"] = "all_current_epoch_cost_complete_samples"
     except Exception as exc:
         _log_dashboard_fallback("ml signal sample count fallback", exc)
-        status["phase3_clean_completed_shadow_sample_count"] = None
+        status["training_shadow_sample_count"] = None
         status["completed_shadow_sample_count"] = None
         status["total_shadow_sample_count"] = None
-        status["phase3_new_shadow_sample_count"] = None
         status["new_shadow_sample_count"] = None
         status["sample_count_blocker"] = (
-            "phase3_completed_shadow_sample_count_unavailable:"
+            "current_training_epoch_shadow_count_unavailable:"
             f"{safe_error_text(exc, limit=120)}"
         )
 
     return status
 
 
-def _phase3_trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
-    """Return the trained shadow cursor using the same Phase 3 sample-count scale."""
-    candidates = (
-        status.get("last_trained_phase3_shadow_sample_count"),
-        status.get("phase3_trained_shadow_sample_count"),
-        status.get("last_trained_completed_shadow_sample_count"),
-        status.get("last_trained_completed_sample_count"),
-        status.get("sample_count"),
-        status.get("trained_sample_count"),
+def _trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
+    """Return the explicit current-epoch cursor; stale values fail closed to zero."""
+
+    cursor = _optional_non_negative_int(
+        status.get("last_trained_completed_shadow_sample_count")
     )
-    for value in candidates:
-        cursor = _optional_non_negative_int(value)
-        if cursor is not None and cursor <= completed_total:
-            return cursor
-    return min(
-        _safe_int_value(
-            status.get("training_shadow_sample_count")
-            or status.get("sample_count")
-            or status.get("trained_sample_count"),
-            0,
-        ),
-        completed_total,
-    )
+    return cursor if cursor is not None and cursor <= completed_total else 0
 
 
 def _optional_non_negative_int(value: Any) -> int | None:
@@ -5496,34 +5429,39 @@ async def get_local_ai_tools_status():
         }
     if isinstance(status, dict):
         try:
-            completed_total = await _completed_local_ai_shadow_backtest_total()
-            service_shadow_count = _safe_int_value(
+            from scripts.train_local_ai_tools_models import (
+                _completed_shadow_sample_count,
+                _completed_trade_sample_count,
+            )
+            completed_shadow_count, completed_trade_count = await asyncio.gather(
+                _completed_shadow_sample_count(),
+                _completed_trade_sample_count(),
+            )
+            artifact_shadow_count = _safe_int_value(
                 status.get("shadow_sample_count") or status.get("training_shadow_sample_count"),
                 0,
             )
-            service_trade_count = _safe_int_value(status.get("trade_sample_count"), 0)
-            explicit_phase3_count = _explicit_phase3_count(
-                status,
-                "phase3_clean_trainable_shadow_sample_count",
-                "phase3_clean_completed_shadow_sample_count",
+            artifact_trade_count = _safe_int_value(status.get("trade_sample_count"), 0)
+            status.update(
+                {
+                    "training_policy": "current_training_epoch_only",
+                    "training_epoch_started_at": load_training_epoch_start().isoformat(),
+                    "pre_epoch_data_training_allowed": False,
+                    "shadow_sample_count": int(completed_shadow_count),
+                    "completed_shadow_sample_count": int(completed_shadow_count),
+                    "training_shadow_sample_count": int(completed_shadow_count),
+                    "total_shadow_sample_count": int(completed_shadow_count),
+                    "trade_sample_count": int(completed_trade_count),
+                    "completed_trade_sample_count": int(completed_trade_count),
+                    "training_trade_sample_count": int(completed_trade_count),
+                    "artifact_training_shadow_sample_count": artifact_shadow_count,
+                    "artifact_training_trade_sample_count": artifact_trade_count,
+                    "training_sample_source": "current_training_epoch",
+                    "training_window_policy": "all_current_epoch_cost_complete_samples",
+                }
             )
-            phase3_count = int(
-                explicit_phase3_count if explicit_phase3_count is not None else completed_total
-            )
-            status["phase3_clean_trainable_shadow_sample_count"] = phase3_count
-            status["phase3_clean_completed_shadow_sample_count"] = phase3_count
-            status["shadow_sample_count"] = phase3_count
-            status["completed_shadow_sample_count"] = phase3_count
-            status["training_shadow_sample_count"] = phase3_count
-            status["total_shadow_sample_count"] = phase3_count
-            status["raw_shadow_sample_count"] = phase3_count
-            status["legacy_shadow_sample_count"] = 0
-            status["service_model_window_shadow_sample_count"] = service_shadow_count
-            status["service_model_window_trade_sample_count"] = service_trade_count
-            status["training_sample_source"] = "phase3_clean_completed_shadow_backtests"
-            status.setdefault("training_window_policy", "all_current_clean_cost_complete_samples")
         except Exception as exc:
-            _log_dashboard_fallback("local ai tools shadow count fallback", exc)
+            _log_dashboard_fallback("local ai tools training cursor fallback", exc)
         scheduler_state = MODEL_TRAINING_STATE_STORE.read()
         scheduler_models = (
             scheduler_state.get("models")

@@ -39,8 +39,7 @@ def _governed_payload(long_return: float, short_return: float) -> dict:
     return {
         "available": True,
         "route_mode": "live",
-        "live_influence": True,
-        "promotion_ready": True,
+        "live_ml_ready": True,
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "label_name": RETURN_LABEL_NAME,
@@ -67,7 +66,7 @@ def _governed_payload(long_return: float, short_return: float) -> dict:
 def _governed_ml(long_return: float, short_return: float) -> dict:
     return {
         **_governed_payload(long_return, short_return),
-        "allow_live_position_influence": True,
+        "live_ml_ready": True,
         "influence_enabled": True,
         "influence_policy": {
             "long": {"enabled": True},
@@ -151,7 +150,7 @@ def test_shadow_model_still_exposes_direction_for_paper_training() -> None:
         {
             "route_mode": "shadow_observation",
             "live_influence": False,
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "influence_enabled": False,
             "promotion_ready": False,
         }

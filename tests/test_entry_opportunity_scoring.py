@@ -134,9 +134,8 @@ def _live_ml() -> dict:
     return {
         "available": True,
         "route_mode": "live",
-        "live_ml_ready": True,
-        "live_influence": True,
-        "allow_live_position_influence": True,
+            "live_influence": True,
+            "live_ml_ready": True,
         "influence_enabled": True,
         "promotion_ready": True,
         "objective_name": RETURN_OBJECTIVE_NAME,
@@ -156,7 +155,7 @@ def _live_ml() -> dict:
             "long": _return_distribution("long", 0.8),
             "short": _return_distribution("short", -0.2),
         },
-        "readiness": {"allow_live_position_influence": True},
+        "readiness": {"live_ml_ready": True},
         "influence_policy": {"long": {"enabled": True}, "short": {"enabled": True}},
         "predictions": [
             {
@@ -337,7 +336,6 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
     decision.raw_response["ml_signal"].update(
         {
             "live_ml_ready": False,
-            "allow_live_position_influence": False,
             "influence_enabled": False,
             "advisory_enabled": True,
         }
@@ -366,7 +364,7 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
         {
             "route_mode": "shadow_observation",
             "live_influence": False,
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "influence_enabled": False,
             "artifact_lifecycle": "canary",
             "model_version": "model-v1",
@@ -410,7 +408,7 @@ def test_paper_strategy_cannot_authorize_same_model_in_live_mode() -> None:
         {
             "route_mode": "shadow_observation",
             "live_influence": False,
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "influence_enabled": False,
             "artifact_lifecycle": "canary",
             "model_version": "model-v1",
@@ -448,12 +446,12 @@ def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"].update(
         {
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "influence_enabled": False,
             "trained_sample_count": 100,
             "model_version": "2026-07-13T12:00:00+00:00",
             "readiness": {
-                "allow_live_position_influence": False,
+                "live_ml_ready": False,
                 "blocking_reasons": [
                     {"code": "long_top_return_lcb_not_positive"},
                 ],

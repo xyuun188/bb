@@ -27,7 +27,7 @@ from services.return_objective import (
 )
 
 PAPER_OBSERVATION_REPORT_REL_PATH = "phase3_paper_resume_observation_reports/latest.json"
-RETURN_PROMOTION_POLICY_VERSION = "2026-07-14.separated-return-promotion.v2"
+RETURN_PROMOTION_POLICY_VERSION = "2026-07-24.model-owned-return-promotion.v3"
 logger = logging.getLogger(__name__)
 
 
@@ -79,19 +79,13 @@ def load_latest_paper_observation_report(root: Path | None = None) -> dict[str, 
     }
 
 
-def _median(values: list[float]) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    middle = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[middle]
-    return (ordered[middle - 1] + ordered[middle]) / 2.0
-
-
-def _lower_half(values: list[float]) -> list[float]:
-    ordered = sorted(values)
-    return ordered[: max((len(ordered) + 1) // 2, 1)]
+def _model_action(sample: dict[str, Any]) -> str:
+    action = str(sample.get("model_shadow_action") or "").strip().lower()
+    if action in {"buy", "open_long"}:
+        return "long"
+    if action in {"sell", "open_short"}:
+        return "short"
+    return action
 
 
 def build_return_objective_report(
@@ -123,6 +117,10 @@ def build_return_objective_report(
             if (current := task(sample, task_name)).get("eligible") is True
         ]
 
+    def profit_contract(sample: dict[str, Any]) -> dict[str, Any]:
+        realized = task(sample, AUTHORITATIVE_REALIZED_RETURN_TASK)
+        return _safe_dict(realized.get("profit_training_contract"))
+
     market_long = weighted_pairs(
         shadow_candidates,
         MARKET_OPPORTUNITY_TASK,
@@ -143,11 +141,32 @@ def build_return_objective_report(
         COUNTERFACTUAL_EXECUTION_COST_TASK,
         "short_total_cost_pct",
     )
-    actual_return_pairs = weighted_pairs(
+    all_actual_return_pairs = weighted_pairs(
         trade_candidates,
         AUTHORITATIVE_REALIZED_RETURN_TASK,
         PROFIT_TRAINING_TARGET,
     )
+    model_live_return_pairs = [
+        (realized.get(PROFIT_TRAINING_TARGET), sample.get("sample_weight", 1.0))
+        for sample in trade_candidates
+        if (realized := task(sample, AUTHORITATIVE_REALIZED_RETURN_TASK)).get("eligible")
+        is True
+        and profit_contract(sample).get("decision_authority") == "model"
+    ]
+    model_shadow_return_pairs: list[tuple[Any, Any]] = []
+    for sample in shadow_candidates:
+        supervision = _safe_dict(sample.get("profit_supervision"))
+        labels = _safe_dict(supervision.get("fee_after_return_labels"))
+        action = _model_action(sample)
+        if labels.get("complete") is not True or action not in {"long", "short"}:
+            continue
+        model_shadow_return_pairs.append(
+            (
+                labels.get(f"{action}_net_return_after_all_cost_pct"),
+                sample.get("sample_weight", 1.0),
+            )
+        )
+    model_return_pairs = [*model_shadow_return_pairs, *model_live_return_pairs]
     actual_cost_pairs = weighted_pairs(
         trade_candidates,
         COUNTERFACTUAL_EXECUTION_COST_TASK,
@@ -159,29 +178,38 @@ def build_return_objective_report(
         "slippage_pct",
     )
     returns = [
-        float(value)
-        for value, weight in actual_return_pairs
+        (float(value), float(weight))
+        for value, weight in model_return_pairs
         if _safe_float(value, None) is not None and (_safe_float(weight, 0.0) or 0.0) > 0
     ]
-    lower = _lower_half(returns) if returns else []
-    profit = sum(max(value, 0.0) for value in returns)
-    loss = abs(sum(min(value, 0.0) for value in returns))
-    avg_return = sum(returns) / len(returns) if returns else None
-    lower_hinge = _median(lower)
+    model_distribution = weighted_distribution(returns)
+    profit = sum(max(value, 0.0) * weight for value, weight in returns)
+    loss = abs(sum(min(value, 0.0) * weight for value, weight in returns))
+    avg_return = _safe_float(model_distribution.get("expected"), None)
+    lower_hinge = _safe_float(model_distribution.get("lower_hinge"), None)
+    negative_weight = sum(weight for value, weight in returns if value < 0)
     downside_mean = (
-        sum(abs(value) for value in returns if value < 0)
-        / sum(value < 0 for value in returns)
-        if any(value < 0 for value in returns)
+        sum(abs(value) * weight for value, weight in returns if value < 0)
+        / negative_weight
+        if negative_weight > 0
         else 0.0
     )
     profit_factor = profit / loss if loss > 0 else None
+    alignment_counts: dict[str, int] = {}
+    for sample in trade_candidates:
+        contract = profit_contract(sample)
+        if contract.get("decision_authority") != "rules":
+            continue
+        alignment = str(contract.get("model_shadow_alignment") or "").strip()
+        if alignment:
+            alignment_counts[alignment] = alignment_counts.get(alignment, 0) + 1
     blockers: list[str] = []
     if not market_long or not market_short:
         blockers.append("shadow_market_opportunity_distribution_missing")
     if not shadow_cost_long or not shadow_cost_short:
         blockers.append("counterfactual_execution_cost_distribution_missing")
     if not returns:
-        blockers.append("authoritative_realized_return_distribution_missing")
+        blockers.append("model_attributed_return_distribution_missing")
     if not actual_cost_pairs:
         blockers.append("authoritative_execution_cost_distribution_missing")
     if not actual_slippage_pairs:
@@ -204,7 +232,10 @@ def build_return_objective_report(
         "label_version": RETURN_LABEL_VERSION,
         "optimization_target": PROFIT_TRAINING_TARGET,
         "sample_count": len(returns),
-        "actual_realized_return_sample_count": len(actual_return_pairs),
+        "effective_sample_size": model_distribution.get("effective_sample_size"),
+        "model_shadow_return_sample_count": len(model_shadow_return_pairs),
+        "model_live_return_sample_count": len(model_live_return_pairs),
+        "actual_realized_return_sample_count": len(all_actual_return_pairs),
         "shadow_market_opportunity_sample_count": min(len(market_long), len(market_short)),
         "shadow_counterfactual_cost_sample_count": min(
             len(shadow_cost_long), len(shadow_cost_short)
@@ -224,10 +255,24 @@ def build_return_objective_report(
             },
             "authoritative_realized_trade": {
                 "source_authority": "okx_position_history",
-                PROFIT_TRAINING_TARGET: weighted_distribution(actual_return_pairs),
+                PROFIT_TRAINING_TARGET: weighted_distribution(all_actual_return_pairs),
                 "execution_cost_pct": weighted_distribution(actual_cost_pairs),
                 "slippage_pct": weighted_distribution(actual_slippage_pairs),
             },
+            "model_attributed_return": {
+                "source_authority": (
+                    "model_shadow_native_market_path_plus_model_live_okx_position_history"
+                ),
+                PROFIT_TRAINING_TARGET: model_distribution,
+                "shadow": weighted_distribution(model_shadow_return_pairs),
+                "live": weighted_distribution(model_live_return_pairs),
+            },
+        },
+        "rules_canary_attribution": {
+            "decision_authority": "rules",
+            "model_shadow_alignment_counts": alignment_counts,
+            "included_in_model_return_distribution": False,
+            "purpose": "diagnostic_and_training_alignment_only",
         },
         "production_combination": {
             "version": PRODUCTION_RETURN_COMBINATION_VERSION,
@@ -242,9 +287,7 @@ def build_return_objective_report(
         "average_net_return_after_all_cost_pct": (
             round(avg_return, 8) if avg_return is not None else None
         ),
-        "median_net_return_after_all_cost_pct": (
-            round(float(_median(returns)), 8) if returns else None
-        ),
+        "median_net_return_after_all_cost_pct": model_distribution.get("median"),
         "empirical_return_lower_hinge_pct": (
             round(float(lower_hinge), 8) if lower_hinge is not None else None
         ),
@@ -255,7 +298,7 @@ def build_return_objective_report(
         "blocking_reasons": blockers,
         "policy_provenance": {
             "source": (
-                "shadow_market_and_cost_observation_plus_authoritative_okx_trade_returns"
+                "model_shadow_fee_after_returns_plus_model_authoritative_okx_returns"
             ),
             "observation_window": "provided_non_overlapping_training_evaluation_samples",
             "sample_count": len(returns),
@@ -269,10 +312,8 @@ def build_return_objective_report(
 def build_phase3_promotion_recommendation(
     *,
     training_mode: str,
-    model_stage: str,
     quality_report: dict[str, Any] | None,
     governance_report: dict[str, Any] | None,
-    evaluation_policy: dict[str, Any] | None = None,
     paper_observation_report: dict[str, Any] | None = None,
     completed_shadow_sample_count: int = 0,
     completed_trade_sample_count: int = 0,
@@ -280,7 +321,6 @@ def build_phase3_promotion_recommendation(
 ) -> dict[str, Any]:
     quality = _safe_dict(quality_report)
     governance = _safe_dict(governance_report)
-    policy = _safe_dict(evaluation_policy)
     paper = _safe_dict(paper_observation_report)
     return_report = _safe_dict(return_objective_report)
     totals = _safe_dict(quality.get("totals"))
@@ -299,8 +339,7 @@ def build_phase3_promotion_recommendation(
         )
     if effective_weight is not None and effective_weight <= 0:
         blockers.append("effective_training_weight_zero")
-    paper_required = bool(policy.get("requires_paper_observation", True))
-    if paper_required and not bool(paper.get("can_use_for_promotion")):
+    if not bool(paper.get("can_use_for_promotion")):
         blockers.append("paper_observation_not_healthy")
     for unsafe_key in ("starts_trading_service", "submits_orders", "changes_model_routing"):
         if bool(paper.get(unsafe_key)):
@@ -318,28 +357,22 @@ def build_phase3_promotion_recommendation(
             active_blockers.append("return_objective_report_missing")
     if str(training_mode or "").lower() != "walk_forward":
         active_blockers.append("walk_forward_required")
-    if str(model_stage or "").lower() not in {"active", "live"}:
-        active_blockers.append("model_stage_not_active")
-    if not bool(policy.get("live_mutation")):
-        active_blockers.append("live_mutation_not_enabled")
     active_blockers = list(dict.fromkeys(active_blockers))
     recommended_stage = (
         "active" if not active_blockers else "canary" if not canary_blockers else "shadow"
     )
-    if contamination != "low" or str(model_stage or "").lower() in {"degraded", "retired"}:
+    if contamination != "low":
         recommended_stage = "degraded"
 
     return {
         "policy": RETURN_PROMOTION_POLICY_VERSION,
         "optimization_target": PROFIT_TRAINING_TARGET,
-        "current_stage": str(model_stage or "shadow").lower(),
         "training_mode": str(training_mode or "shadow").lower(),
         "recommended_stage": recommended_stage,
         "canary_ready": not canary_blockers,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
-        "active_ready": not active_blockers,
-        "live_ready": not active_blockers,
+        "live_ml_ready": not active_blockers,
         "canary_blocking_reasons": canary_blockers,
         "active_blocking_reasons": active_blockers,
         "live_blocking_reasons": active_blockers,
@@ -356,9 +389,8 @@ def build_phase3_promotion_recommendation(
         },
         "return_objective_gate": return_report,
         "paper_observation_gate": {
-            "required": paper_required,
+            "required": True,
             "status": paper.get("status") or "missing",
             "can_use_for_promotion": bool(paper.get("can_use_for_promotion")),
         },
-        "live_mutation": bool(policy.get("live_mutation")),
     }

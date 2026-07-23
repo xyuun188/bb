@@ -32,7 +32,6 @@ from services.continuous_strategy_routing import (
 )
 from services.model_strategy_blueprint import paper_strategy_replay_available
 from services.paper_strategy_champion import PaperStrategyChampionService
-from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.shadow_backtest_service import shadow_fee_after_outcome
 from services.shadow_training_quarantine import assess_shadow_row
@@ -41,6 +40,7 @@ from services.strategy_historical_replay import (
     build_strategy_historical_replay,
 )
 from services.text_integrity import sanitize_runtime_text
+from services.training_epoch import load_training_epoch_start
 
 logger = structlog.get_logger(__name__)
 
@@ -163,7 +163,11 @@ def _shadow_cost_evidence(
     return snapshot, long_gross, short_gross, outcome, []
 
 
-def _historical_replay_observation(row: Any) -> tuple[dict[str, Any] | None, list[str]]:
+def _historical_replay_observation(
+    row: Any,
+    *,
+    epoch_start: datetime,
+) -> tuple[dict[str, Any] | None, list[str]]:
     replay_snapshot = _safe_dict(
         getattr(row, "training_feature_snapshot", None)
     )
@@ -179,7 +183,7 @@ def _historical_replay_observation(row: Any) -> tuple[dict[str, Any] | None, lis
     quality = assess_shadow_row(row)
     training_eligible = bool(
         isinstance(created_at, datetime)
-        and created_at >= PHASE3_CLEAN_START_UTC
+        and created_at >= epoch_start
         and not quality.exclude_from_training
     )
     return {
@@ -1261,8 +1265,10 @@ class StrategyLearningService:
         selected_mode = "live" if str(mode).lower() == "live" else "paper"
         effective_hours = max(int(hours or 1), 1)
         effective_limit = max(int(limit or 1), 1)
-        since = datetime.now(UTC) - timedelta(hours=effective_hours)
+        epoch_start = load_training_epoch_start()
+        since = max(datetime.now(UTC) - timedelta(hours=effective_hours), epoch_start)
         since_naive = since.replace(tzinfo=None)
+        epoch_start_naive = epoch_start.replace(tzinfo=None)
         outcomes = await load_authoritative_trade_outcomes(
             mode=selected_mode,
             since=since,
@@ -1331,8 +1337,7 @@ class StrategyLearningService:
                             .where(
                                 ShadowBacktest.execution_mode == "paper",
                                 ShadowBacktest.status == "completed",
-                                ShadowBacktest.created_at
-                                >= PHASE3_CLEAN_START_UTC.replace(tzinfo=None),
+                                ShadowBacktest.created_at >= epoch_start_naive,
                                 ShadowBacktest.long_return_pct.is_not(None),
                                 ShadowBacktest.short_return_pct.is_not(None),
                                 or_(
@@ -1502,7 +1507,10 @@ class StrategyLearningService:
 
         replay_excluded: dict[str, int] = {}
         for row in replay_shadows:
-            replay_observation, reasons = _historical_replay_observation(row)
+            replay_observation, reasons = _historical_replay_observation(
+                row,
+                epoch_start=epoch_start,
+            )
             if replay_observation is not None:
                 shadow_replay_observations.append(replay_observation)
                 continue

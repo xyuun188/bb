@@ -545,7 +545,7 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
                     "target": "net_return_after_all_cost_pct",
                     "target_value": 10.0,
                     "outcome": "profit",
-                    "decision_authority": "system",
+                    "decision_authority": "model",
                     "evidence_fingerprint": f"profit-contract-test-{index}",
                     "blockers": [],
                     "model_shadow_alignment": "no_model_shadow_prediction",

@@ -251,12 +251,6 @@ async def collect_phase3_rebuild_preflight(
         training = _training_payload_unavailable(exc)
         collection_errors["training_payload"] = training["collection_error"]
     payload = training["payload"]
-    evaluation_policy = {
-        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": False,
-        "requires_walk_forward": True,
-        "phase": "phase3_model_factory",
-    }
     paper_observation_report = load_latest_paper_observation_report(root=ROOT)
     return_objective_report = build_return_objective_report(
         trade_samples=payload["trade_samples"],
@@ -264,10 +258,8 @@ async def collect_phase3_rebuild_preflight(
     )
     promotion = build_phase3_promotion_recommendation(
         training_mode="shadow",
-        model_stage="shadow",
         quality_report=payload["quality_report"],
         governance_report=payload["governance_report"],
-        evaluation_policy=evaluation_policy,
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=training["completed_shadow_sample_count"],
         completed_trade_sample_count=training["completed_trade_sample_count"],
@@ -276,9 +268,10 @@ async def collect_phase3_rebuild_preflight(
     local_ai_tools = {
         "available": True,
         "status": "preflight_ready",
-        "shadow_sample_count": training["trainable_shadow_sample_count"],
-        "trade_sample_count": training["trainable_trade_sample_count"],
-        "trainable_trade_sample_count": training["trainable_trade_sample_count"],
+        "training_policy": "current_training_epoch_only",
+        "pre_epoch_data_training_allowed": False,
+        "training_shadow_sample_count": training["trainable_shadow_sample_count"],
+        "training_trade_sample_count": training["trainable_trade_sample_count"],
         "raw_trade_sample_count": training["raw_trade_sample_count"],
         "quarantined_trade_sample_count": training["quarantined_trade_sample_count"],
         "sequence_sample_count": training["sequence_sample_count"],
@@ -289,8 +282,6 @@ async def collect_phase3_rebuild_preflight(
         "training_mode": "shadow",
         "model_stage": "shadow",
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": False,
-        "evaluation_policy": evaluation_policy,
         "promotion_recommendation": promotion,
     }
     try:

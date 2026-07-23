@@ -21,6 +21,7 @@ from services.authoritative_trade_outcome import (
 from services.memory_feedback import MemoryFeedbackPolicy
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.trade_fact_trust import closed_position_trade_fact_trusted
+from services.training_epoch import load_training_epoch_start
 
 logger = structlog.get_logger(__name__)
 
@@ -253,7 +254,10 @@ class ExpertMemoryService:
         """Bind reflections and memories to canonical OKX outcome events."""
 
         try:
-            outcomes = await self.authoritative_outcome_loader(mode=execution_mode)
+            outcomes = await self.authoritative_outcome_loader(
+                mode=execution_mode,
+                since=load_training_epoch_start(),
+            )
             settlement_trusted = [
                 outcome for outcome in outcomes if outcome.get("settlement_fact_trusted") is True
             ]

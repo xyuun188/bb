@@ -240,6 +240,30 @@ async def test_shadow_backtest_service_creates_pending_horizons() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shadow_backtest_persists_explicit_model_side_for_rules_canary() -> None:
+    repo = _FakeRepo()
+    feature_vector = SimpleNamespace(current_price=100.0, close=99.0)
+    decision = _decision()
+    decision.raw_response = {
+        "production_trade_gate": {
+            "mode": "live_rules_canary",
+            "decision_authority": "rules",
+            "model_can_influence": False,
+        },
+        "model_shadow_decision": {
+            "action": "short",
+            "observation_only": True,
+        },
+    }
+
+    await _service(repo).create(123, decision, feature_vector, "live")
+
+    snapshot = repo.created[0]["feature_snapshot"]
+    assert snapshot["model_shadow_action"] == "short"
+    assert snapshot["model_shadow_action_source"] == "explicit_model_shadow_decision"
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence() -> None:
     repo = _FakeRepo()
     feature_vector = SimpleNamespace(current_price=100.0, close=99.0)

@@ -10,7 +10,7 @@ def test_gate_allows_rules_canary_before_model_promotion() -> None:
         risk={"open_position_count": 0},
         model={
             "artifact_lifecycle": "shadow",
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "metrics": {"sample_count": 5},
         },
         settings={"rules_canary_enabled": True},

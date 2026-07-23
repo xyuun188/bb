@@ -8,11 +8,9 @@ must stay in explicit allowlisted scripts with backup.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import or_, select
@@ -38,6 +36,7 @@ from services.okx_position_confirmation import (
     find_current_position_entry_confirmation,
     order_has_current_position_snapshot_confirmation,
 )
+from services.training_epoch import load_training_epoch_start
 
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 200
@@ -46,8 +45,6 @@ DEFAULT_MAX_PULL_ATTEMPTS = 2
 MAX_AUTHORITATIVE_FILL_PAGES = 10
 LOCAL_ORDER_SYNC_GRACE_SECONDS = 120.0
 QUANTITY_TOLERANCE_RATIO = 0.02
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_COLD_START_MARKER_PATH = ROOT / "data" / "phase3_cold_start_reset_marker.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +150,6 @@ class OkxAuthoritativeSyncService:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_pull_attempts: int = DEFAULT_MAX_PULL_ATTEMPTS,
         executor_factory: Any | None = None,
-        cold_start_marker_path: str | Path | None = DEFAULT_COLD_START_MARKER_PATH,
     ) -> None:
         self.mode = str(mode or "paper")
         self.lookback_hours = max(int(lookback_hours or DEFAULT_LOOKBACK_HOURS), 1)
@@ -161,19 +157,12 @@ class OkxAuthoritativeSyncService:
         self.timeout_seconds = max(float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS), 0.5)
         self.max_pull_attempts = max(1, min(int(max_pull_attempts or 1), 3))
         self.executor_factory = executor_factory or OKXExecutor
-        self.cold_start_marker_path = (
-            Path(cold_start_marker_path) if cold_start_marker_path is not None else None
-        )
 
     async def collect(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         nominal_since = started_at - timedelta(hours=self.lookback_hours)
-        watermark = self._load_cold_start_watermark()
-        since = max(
-            item
-            for item in (nominal_since, watermark.get("reset_at"))
-            if isinstance(item, datetime)
-        )
+        epoch_started_at = load_training_epoch_start()
+        since = max(nominal_since, epoch_started_at)
         since_naive = since.replace(tzinfo=None)
         local_orders, local_positions, local_decisions = await self._load_local_facts(since_naive)
         symbols = {
@@ -303,10 +292,7 @@ class OkxAuthoritativeSyncService:
             "nominal_okx_fill_window_start": nominal_since.isoformat(),
             "okx_fill_window_start": since.isoformat(),
             "effective_fill_window_start": since.isoformat(),
-            "cold_start_watermark_applied": bool(watermark.get("applied")),
-            "cold_start_reset_at": _iso(watermark.get("reset_at")),
-            "cold_start_marker_path": watermark.get("path"),
-            "cold_start_marker_error": watermark.get("error"),
+            "training_epoch_started_at": epoch_started_at.isoformat(),
             "duration_seconds": round((datetime.now(UTC) - started_at).total_seconds(), 6),
             "local_order_count": len(local_orders),
             "local_position_count": len(local_positions),
@@ -544,33 +530,6 @@ class OkxAuthoritativeSyncService:
             protection_algo_rows,
             instrument_contract_sizes,
         )
-
-    def _load_cold_start_watermark(self) -> dict[str, Any]:
-        if self.mode != "paper" or self.cold_start_marker_path is None:
-            return {"applied": False, "reset_at": None}
-        marker_path = self.cold_start_marker_path
-        if not marker_path.exists():
-            return {"applied": False, "reset_at": None, "path": str(marker_path)}
-        try:
-            payload = json.loads(marker_path.read_text(encoding="utf-8"))
-            if str(payload.get("mode") or "paper") != "paper":
-                return {"applied": False, "reset_at": None, "path": str(marker_path)}
-            reset_at = _parse_datetime(payload.get("reset_at"))
-            if reset_at is None:
-                return {
-                    "applied": False,
-                    "reset_at": None,
-                    "path": str(marker_path),
-                    "error": "missing_or_invalid_reset_at",
-                }
-            return {"applied": True, "reset_at": reset_at, "path": str(marker_path)}
-        except Exception as exc:
-            return {
-                "applied": False,
-                "reset_at": None,
-                "path": str(marker_path),
-                "error": safe_error_text(exc, limit=120),
-            }
 
     async def _load_local_facts(
         self,

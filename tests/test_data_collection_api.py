@@ -51,6 +51,20 @@ async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     await init_db()
 
 
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    epoch_start = datetime(2026, 6, 27, 16, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        data_collection_module,
+        "load_training_epoch_start",
+        lambda: epoch_start,
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models.load_training_epoch_start",
+        lambda: epoch_start,
+    )
+
+
 @pytest.mark.asyncio
 async def test_data_collection_status_exposes_sources_and_training(
     monkeypatch: pytest.MonkeyPatch,
@@ -184,9 +198,16 @@ async def test_data_collection_normalizes_unknown_local_ai_status(
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
     )
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_shadow_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_trade_count", AsyncMock(return_value=0))
-
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_shadow_count",
+        lambda: _async_value(0),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_trade_count",
+        lambda: _async_value(0),
+    )
     status = await data_collection_module._local_ai_training_status()
 
     assert status["status"] == "learning_only"
@@ -208,8 +229,8 @@ async def test_data_collection_reads_local_ai_status_once_without_fixed_outer_ti
                 "available": True,
                 "service_available": True,
                 "status": "shadow",
-                "phase3_clean_completed_shadow_sample_count": 12,
-                "phase3_clean_completed_trade_sample_count": 3,
+                "shadow_sample_count": 12,
+                "trade_sample_count": 3,
             }
 
     monkeypatch.setattr(
@@ -219,12 +240,12 @@ async def test_data_collection_reads_local_ai_status_once_without_fixed_outer_ti
     )
     monkeypatch.setattr(
         data_collection_module,
-        "_phase3_completed_shadow_count",
+        "_completed_training_shadow_count",
         AsyncMock(return_value=12),
     )
     monkeypatch.setattr(
         data_collection_module,
-        "_phase3_completed_trade_count",
+        "_completed_training_trade_count",
         AsyncMock(return_value=3),
     )
 
@@ -243,7 +264,7 @@ def test_data_collection_local_ai_status_has_no_duplicate_normalizer_or_outer_ti
     ]
     raw_status_block = source[
         source.index("async def _raw_local_ai_tools_status") : source.index(
-            "async def _phase3_completed_shadow_count"
+            "async def _completed_training_shadow_count"
         )
     ]
 
@@ -253,7 +274,7 @@ def test_data_collection_local_ai_status_has_no_duplicate_normalizer_or_outer_ti
 
 
 @pytest.mark.asyncio
-async def test_data_collection_does_not_promote_legacy_training_counts_to_phase3(
+async def test_data_collection_does_not_promote_artifact_counts_to_current_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLocalAIToolsClient:
@@ -272,20 +293,22 @@ async def test_data_collection_does_not_promote_legacy_training_counts_to_phase3
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
     )
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_shadow_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_trade_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(data_collection_module, "_completed_training_shadow_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(data_collection_module, "_completed_training_trade_count", AsyncMock(return_value=0))
 
     status = await data_collection_module._local_ai_training_status()
 
     assert status["shadow_sample_count"] == 0
     assert status["training_shadow_sample_count"] == 0
     assert status["completed_shadow_sample_count"] == 0
-    assert status["raw_shadow_sample_count"] == 150810
-    assert status["legacy_shadow_sample_count"] == 150810
+    assert status["artifact_training_shadow_sample_count"] == 150810
+    assert status["artifact_training_trade_sample_count"] == 99
+    assert status["pre_epoch_data_training_allowed"] is False
+    assert "legacy_shadow_sample_count" not in status
 
 
 @pytest.mark.asyncio
-async def test_data_collection_uses_phase3_db_counts_when_local_ai_window_is_empty(
+async def test_data_collection_uses_epoch_db_counts_when_artifact_window_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLocalAIToolsClient:
@@ -304,23 +327,22 @@ async def test_data_collection_uses_phase3_db_counts_when_local_ai_window_is_emp
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
     )
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_shadow_count", AsyncMock(return_value=4206))
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_trade_count", AsyncMock(return_value=34))
+    monkeypatch.setattr(data_collection_module, "_completed_training_shadow_count", AsyncMock(return_value=4206))
+    monkeypatch.setattr(data_collection_module, "_completed_training_trade_count", AsyncMock(return_value=34))
 
     status = await data_collection_module._local_ai_training_status()
 
     assert status["shadow_sample_count"] == 4206
     assert status["training_shadow_sample_count"] == 4206
     assert status["completed_shadow_sample_count"] == 4206
-    assert status["raw_shadow_sample_count"] == 4206
-    assert status["legacy_shadow_sample_count"] == 0
+    assert status["artifact_training_shadow_sample_count"] == 0
     assert status["trade_sample_count"] == 34
     assert status["training_trade_sample_count"] == 34
     assert status["completed_trade_sample_count"] == 34
 
 
 @pytest.mark.asyncio
-async def test_data_collection_prefers_largest_phase3_clean_shadow_count(
+async def test_data_collection_uses_canonical_epoch_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLocalAIToolsClient:
@@ -330,7 +352,6 @@ async def test_data_collection_prefers_largest_phase3_clean_shadow_count(
                 "service_available": True,
                 "status": "ready",
                 "shadow_sample_count": 4206,
-                "phase3_clean_completed_shadow_sample_count": 4206,
                 "completed_shadow_sample_count": 1361,
                 "trade_sample_count": 34,
                 "completed_trade_sample_count": 12,
@@ -341,8 +362,8 @@ async def test_data_collection_prefers_largest_phase3_clean_shadow_count(
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
     )
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_shadow_count", AsyncMock(return_value=4206))
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_trade_count", AsyncMock(return_value=34))
+    monkeypatch.setattr(data_collection_module, "_completed_training_shadow_count", AsyncMock(return_value=4206))
+    monkeypatch.setattr(data_collection_module, "_completed_training_trade_count", AsyncMock(return_value=34))
 
     status = await data_collection_module._local_ai_training_status()
 
@@ -355,7 +376,7 @@ async def test_data_collection_prefers_largest_phase3_clean_shadow_count(
 
 
 @pytest.mark.asyncio
-async def test_data_collection_does_not_expand_explicit_phase3_counts_with_db_fallback(
+async def test_data_collection_ignores_stale_explicit_artifact_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLocalAIToolsClient:
@@ -365,9 +386,7 @@ async def test_data_collection_does_not_expand_explicit_phase3_counts_with_db_fa
                 "service_available": True,
                 "status": "ready",
                 "shadow_sample_count": 4206,
-                "phase3_clean_completed_shadow_sample_count": 4206,
                 "trade_sample_count": 34,
-                "phase3_clean_completed_trade_sample_count": 34,
             }
 
     monkeypatch.setattr(
@@ -375,19 +394,17 @@ async def test_data_collection_does_not_expand_explicit_phase3_counts_with_db_fa
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
     )
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_shadow_count", AsyncMock(return_value=12650))
-    monkeypatch.setattr(data_collection_module, "_phase3_completed_trade_count", AsyncMock(return_value=144))
+    monkeypatch.setattr(data_collection_module, "_completed_training_shadow_count", AsyncMock(return_value=12650))
+    monkeypatch.setattr(data_collection_module, "_completed_training_trade_count", AsyncMock(return_value=144))
 
     status = await data_collection_module._local_ai_training_status()
 
-    assert status["shadow_sample_count"] == 4206
-    assert status["completed_shadow_sample_count"] == 4206
-    assert status["raw_shadow_sample_count"] == 4206
-    assert status["legacy_shadow_sample_count"] == 0
-    assert status["trade_sample_count"] == 34
-    assert status["completed_trade_sample_count"] == 34
-    assert status["raw_trade_sample_count"] == 34
-    assert status["legacy_trade_sample_count"] == 0
+    assert status["shadow_sample_count"] == 12650
+    assert status["completed_shadow_sample_count"] == 12650
+    assert status["artifact_training_shadow_sample_count"] == 4206
+    assert status["trade_sample_count"] == 144
+    assert status["completed_trade_sample_count"] == 144
+    assert status["artifact_training_trade_sample_count"] == 34
 
 
 @pytest.mark.asyncio
@@ -408,14 +425,11 @@ async def test_data_collection_marks_available_local_ai_bundle_ready(
                 "models": {"profit": "trained"},
                 "training_mode": "walk_forward",
                 "model_stage": "canary",
-                "evaluation_policy": {
                 "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                    "live_mutation": False,
-                    "requires_walk_forward": True,
-                },
+                "live_ml_ready": False,
                 "promotion_recommendation": {
                     "recommended_stage": "canary",
-                    "live_ready": False,
+                    "live_ml_ready": False,
                 },
             }
 
@@ -423,6 +437,16 @@ async def test_data_collection_marks_available_local_ai_bundle_ready(
         data_collection_module._dash,
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_shadow_count",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_trade_count",
+        AsyncMock(return_value=0),
     )
 
     status = await data_collection_module._local_ai_training_status()
@@ -435,8 +459,7 @@ async def test_data_collection_marks_available_local_ai_bundle_ready(
     assert status["training_mode"] == "walk_forward"
     assert status["model_stage"] == "canary"
     assert status["promotion_flow"] == "candidate_to_shadow_to_canary_to_active"
-    assert status["live_mutation"] is False
-    assert status["evaluation_policy"]["requires_walk_forward"] is True
+    assert status["live_ml_ready"] is False
     assert status["promotion_recommendation"]["recommended_stage"] == "canary"
 
 
@@ -458,6 +481,16 @@ async def test_data_collection_unknown_local_ai_without_samples_is_ready(
         data_collection_module._dash,
         "_dashboard_local_ai_tools_client",
         lambda: FakeLocalAIToolsClient(),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_shadow_count",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_trade_count",
+        AsyncMock(return_value=0),
     )
 
     status = await data_collection_module._local_ai_training_status()
@@ -806,7 +839,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert captured["kwargs"]["confirm_phase3_rebuild"] is True
     assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
     assert captured["kwargs"]["promotion_recommendation"]["policy"] == (
-        "2026-07-14.separated-return-promotion.v2"
+        "2026-07-24.model-owned-return-promotion.v3"
     )
     assert result["return_objective_report"]["objective_name"] == (
         "maximize_expected_realized_net_return_after_cost"
@@ -814,9 +847,9 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is True
     assert result["promotion_recommendation"]["policy"] == (
-        "2026-07-14.separated-return-promotion.v2"
+        "2026-07-24.model-owned-return-promotion.v3"
     )
-    assert result["promotion_recommendation"]["live_ready"] is False
+    assert result["promotion_recommendation"]["live_ml_ready"] is False
 
 
 @pytest.mark.asyncio
@@ -938,8 +971,8 @@ async def test_training_governance_snapshot_excludes_pre_phase3_samples(
     assert report["sample_total_count"] == 1
     assert report["trainable_sample_count"] == 1
     assert report["symbol_counts"] == {"NEW/USDT": 1}
-    assert report["phase3_start_date"] == "2026-06-28"
-    assert report["raw_records_preserved"] is False
+    assert report["training_epoch_started_at"] == "2026-06-27T16:00:00+00:00"
+    assert report["raw_records_preserved"] is True
 
 
 @pytest.mark.asyncio
@@ -998,7 +1031,7 @@ async def test_data_collection_status_is_read_only_for_training_quarantine(
         body["training"]["governance"]["local_ai_tools"]["deep_quality_evaluation"]
         == "deferred_to_training_refresh"
     )
-    assert body["training"]["governance"]["local_ai_tools"]["raw_records_preserved"] is False
+    assert body["training"]["governance"]["local_ai_tools"]["raw_records_preserved"] is True
     assert "external_event_scraper_interval_seconds" in body["config"]
     assert "external_event_scraper_sources" in body["config"]
 

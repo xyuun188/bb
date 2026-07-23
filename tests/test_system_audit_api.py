@@ -1127,16 +1127,12 @@ async def test_model_training_audit_does_not_run_full_self_check(
                     "text_sentiment_sample_count": 11,
                     "training_mode": "walk_forward",
                     "model_stage": "canary",
+                    "promotion_flow": "candidate_to_shadow_to_canary_to_active",
                     "trained_models_available": True,
                     "trained_at": "2026-07-09T05:00:00+00:00",
-                    "evaluation_policy": {
-                        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                        "live_mutation": False,
-                        "requires_walk_forward": True,
-                    },
                     "promotion_recommendation": {
                         "recommended_stage": "canary",
-                        "live_ready": False,
+                        "live_ml_ready": False,
                     },
                     "models": {"profit": "ExtraTreesRegressor"},
                 },
@@ -1213,7 +1209,7 @@ async def test_model_training_audit_does_not_run_full_self_check(
     assert card["details"]["runtime_probe"]["status"] == "ok"
     assert card["details"]["phase3_training_governance"]["training_mode"] == "walk_forward"
     assert card["details"]["phase3_training_governance"]["model_stage"] == "canary"
-    assert card["details"]["phase3_training_governance"]["live_mutation"] is False
+    assert card["details"]["phase3_training_governance"]["live_ml_ready"] is False
     assert card["details"]["local_ai_tools"]["models"]["profit"] == "ExtraTreesRegressor"
     assert (
         card["details"]["local_ai_tools"]["promotion_recommendation"]["recommended_stage"]
@@ -1421,7 +1417,7 @@ async def test_model_training_audit_reports_retired_artifacts_as_rebuild_gate(
     readiness = card["details"]["phase3_rebuild_readiness"]
     assert readiness["read_only"] is True
     assert readiness["can_persist_artifact"] is False
-    assert readiness["live_mutation"] is False
+    assert "live_mutation" not in readiness
     assert "unresolved_or_untrusted_artifacts_block_rebuild" in readiness["blockers"]
     assert any(item["label"] == "Rebuild gate" for item in card["evidence"])
     assert any(
@@ -1690,7 +1686,7 @@ async def test_model_dynamic_routing_audit_and_endpoint_force_read_only(
                     "route_plan_count": 3,
                     "shadow_only_count": 2,
                     "canary_ready_count": 1,
-                    "live_ready_count": 0,
+                    "live_ml_ready_count": 0,
                     "live_blocked_count": 3,
                     "estimated_call_reduction": 4,
                     "unsafe_live_mutation_attempts": 1,
@@ -1719,7 +1715,7 @@ async def test_model_dynamic_routing_audit_and_endpoint_force_read_only(
     assert card["details"]["can_apply_live_route"] is False
     assert card["details"]["unsafe_live_mutation_attempts"] == 1
     assert card["details"]["promotion_gate"]["canary_ready_count"] == 1
-    assert card["details"]["promotion_gate"]["live_ready_count"] == 0
+    assert card["details"]["promotion_gate"]["live_ml_ready_count"] == 0
     assert card["details"]["promotion_gate"]["live_blocked_count"] == 3
     assert endpoint_report["audit_only"] is True
     assert endpoint_report["live_route_mutation"] is False
@@ -2482,16 +2478,19 @@ async def test_model_training_status_timeout_is_observing_when_runtime_tools_are
                 "local_ai_tools": {
                     "available": False,
                     "status": "timeout",
-                    "shadow_sample_count": 0,
-                    "trade_sample_count": 0,
+                    "training_policy": "current_training_epoch_only",
+                    "pre_epoch_data_training_allowed": False,
+                    "training_shadow_sample_count": 541,
+                    "training_trade_sample_count": 57,
                     "text_sentiment_sample_count": 0,
                 },
                 "governance": {
                     "status": "ok",
                     "local_ai_tools": {
-                        "phase3_clean_trainable_sample_count": 541,
-                        "trainable_sample_count": 541,
-                        "trade_sample_count": 57,
+                        "training_policy": "current_training_epoch_only",
+                        "pre_epoch_data_training_allowed": False,
+                        "training_shadow_sample_count": 541,
+                        "training_trade_sample_count": 57,
                     },
                 },
             },
@@ -2673,6 +2672,11 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
         f"sqlite+aiosqlite:///{db_path.as_posix()}",
     )
     monkeypatch.setattr(system_audit, "_now", lambda: now)
+    monkeypatch.setattr(
+        system_audit,
+        "load_training_epoch_start",
+        lambda: now - timedelta(minutes=30),
+    )
     monkeypatch.setattr(system_audit, "_okx_reconciliation_cache", None)
 
     await init_db()
@@ -2696,7 +2700,16 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
                 was_executed=True,
                 created_at=(now - timedelta(minutes=4)).replace(tzinfo=None),
             )
-            session.add_all([decision, linked_decision])
+            pre_epoch_decision = AIDecision(
+                model_name="test_model",
+                symbol="FIL/USDT",
+                action="close_long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(hours=1)).replace(tzinfo=None),
+            )
+            session.add_all([decision, linked_decision, pre_epoch_decision])
             await session.flush()
             session.add_all(
                 [
@@ -2727,6 +2740,20 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
                         exchange_order_id="close-linked",
                         filled_at=(now - timedelta(minutes=4)).replace(tzinfo=None),
                         created_at=(now - timedelta(minutes=4)).replace(tzinfo=None),
+                    ),
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=pre_epoch_decision.id,
+                        symbol="FIL/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=10,
+                        price=1.5,
+                        status="filled",
+                        exchange_order_id="pre-epoch-close-missing",
+                        filled_at=(now - timedelta(hours=1)).replace(tzinfo=None),
+                        created_at=(now - timedelta(hours=1)).replace(tzinfo=None),
                     ),
                     Position(
                         model_name="test_model",

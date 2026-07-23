@@ -33,6 +33,7 @@ from services.paper_training import (
     paper_training_contract_reasons,
 )
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
+from services.training_epoch import load_training_epoch_start
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
@@ -77,7 +78,11 @@ class TradeExecutionContractService:
 
         capped_hours = max(1, min(int(hours or 24), 168))
         capped_limit = max(1, min(int(limit or 500), 5000))
-        since_utc = _as_utc(since) or datetime.now(UTC) - timedelta(hours=capped_hours)
+        requested_since = _as_utc(since) or datetime.now(UTC) - timedelta(
+            hours=capped_hours
+        )
+        epoch_start = load_training_epoch_start()
+        since_utc = max(requested_since, epoch_start)
         since_naive = since_utc.replace(tzinfo=None)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
@@ -134,11 +139,15 @@ class TradeExecutionContractService:
                 .scalars()
                 .all()
             )
-        return summarize_trade_execution_contract(
+        report = summarize_trade_execution_contract(
             decisions,
             orders=orders,
             positions=positions,
         )
+        report["window_start"] = since_utc.isoformat()
+        report["training_epoch_started_at"] = epoch_start.isoformat()
+        report["pre_epoch_contracts_can_block_entries"] = False
+        return report
 
 
 def summarize_trade_execution_contract(

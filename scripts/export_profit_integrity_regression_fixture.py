@@ -221,7 +221,7 @@ def _artifact_payload(status):
     return {
         "available": bool(status.get("available")),
         "readiness_state": status.get("readiness_state") or status.get("status"),
-        "allow_live_position_influence": bool(status.get("allow_live_position_influence")),
+        "live_ml_ready": bool(status.get("live_ml_ready")),
         "trained_at": status.get("trained_at"),
         "model_stage": status.get("model_stage"),
         "registry": _pick(registry, ("model_id", "registry_version", "version", "sha256")),
@@ -485,7 +485,7 @@ def _summary(payload: dict[str, Any]) -> dict[str, Any]:
         "order_count": len(payload.get("orders") or []),
         "position_count": len(payload.get("positions") or []),
         "artifact_version": (artifact.get("registry") or {}).get("version"),
-        "artifact_live_influence": bool(artifact.get("allow_live_position_influence")),
+        "artifact_live_influence": bool(artifact.get("live_ml_ready")),
         "orphan_protection_count": len(inventory.get("orphan_keys") or []),
         "duplicate_protection_count": len(inventory.get("duplicate_keys") or []),
         "missing_protection_count": len(inventory.get("missing_protection_keys") or []),

@@ -65,6 +65,7 @@ from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAud
 from services.strong_opportunity import StrongOpportunityService
 from services.trade_execution_contract import TradeExecutionContractService
 from services.trading_params import DEFAULT_TRADING_PARAMS
+from services.training_epoch import load_training_epoch_start
 from web_dashboard.api import data_collection as data_collection_api
 from web_dashboard.api.text_sanitize import sanitize_payload
 
@@ -380,71 +381,6 @@ def _safe_int_value(value: Any, default: int = 0) -> int:
         return default
 
 
-def _phase3_merge_clean_training_view_into_local_tools(
-    local_tools: dict[str, Any],
-    governance: dict[str, Any],
-) -> dict[str, Any]:
-    """Use the Phase 3 clean training view when live service status has no samples."""
-
-    result = dict(local_tools)
-    clean_view = _safe_dict(governance.get("local_ai_tools"))
-    if not clean_view:
-        return result
-
-    clean_shadow_count = _safe_int_value(
-        clean_view.get("phase3_clean_trainable_sample_count")
-        or clean_view.get("trainable_sample_count")
-        or clean_view.get("total_trainable_count")
-    )
-    clean_trade_count = _safe_int_value(clean_view.get("trade_sample_count"))
-    current_shadow_count = _safe_int_value(
-        result.get("shadow_sample_count")
-        or result.get("trainable_sample_count")
-        or result.get("total_trainable_count")
-    )
-    current_trade_count = _safe_int_value(
-        result.get("trainable_trade_sample_count") or result.get("trade_sample_count")
-    )
-
-    if clean_shadow_count > current_shadow_count:
-        result["shadow_sample_count"] = clean_shadow_count
-        result["trainable_sample_count"] = clean_shadow_count
-        result["total_trainable_count"] = clean_shadow_count
-        result["phase3_clean_trainable_sample_count"] = clean_shadow_count
-        result["training_sample_source"] = "phase3_clean_training_view"
-    if clean_trade_count > current_trade_count:
-        result["trade_sample_count"] = clean_trade_count
-        result["trainable_trade_sample_count"] = clean_trade_count
-        result["training_trade_sample_source"] = "phase3_clean_training_view"
-
-    for key in (
-        "sequence_sample_count",
-        "text_sentiment_sample_count",
-        "completed_shadow_sample_count",
-        "completed_trade_sample_count",
-        "raw_trade_sample_count",
-        "quarantined_trade_sample_count",
-    ):
-        clean_value = _safe_int_value(clean_view.get(key))
-        if clean_value > _safe_int_value(result.get(key)):
-            result[key] = clean_value
-
-    if not _safe_dict(result.get("quality_report")):
-        quality = _safe_dict(clean_view.get("quality_report")) or _safe_dict(
-            governance.get("local_ai_quality_report")
-        )
-        if quality:
-            result["quality_report"] = quality
-    if not _safe_dict(result.get("governance_report")):
-        result["governance_report"] = governance
-
-    result.setdefault("phase3_training_policy", "clean_training_view_only")
-    result.setdefault("legacy_data_policy", "excluded_from_phase3_training")
-    result["legacy_data_training_allowed"] = False
-    result.setdefault("raw_records_preserved", True)
-    return result
-
-
 def _blocker_codes(blockers: list[Any]) -> set[str]:
     codes: set[str] = set()
     for item in blockers:
@@ -721,7 +657,7 @@ def _safe_dynamic_routing_report(report: dict[str, Any]) -> dict[str, Any]:
     summary = _safe_dict(safe.get("summary"))
     safe["promotion_gate"] = {
         "canary_ready_count": int(summary.get("canary_ready_count") or 0),
-        "live_ready_count": int(summary.get("live_ready_count") or 0),
+        "live_ml_ready_count": int(summary.get("live_ml_ready_count") or 0),
         "live_blocked_count": int(summary.get("live_blocked_count") or 0),
         "live_route_mutation": False,
         "can_apply_live_route": False,
@@ -1632,7 +1568,10 @@ async def _okx_reconciliation_light_scan(
     """
 
     lookback_days = max(int(days or 14), 1)
-    since = (_now() - timedelta(days=lookback_days)).replace(tzinfo=None)
+    nominal_since = _now() - timedelta(days=lookback_days)
+    epoch_started_at = load_training_epoch_start()
+    effective_since = max(nominal_since, epoch_started_at)
+    since = effective_since.replace(tzinfo=None)
     max_orders = int(max_close_orders) if max_close_orders is not None else None
     if max_orders is not None and max_orders <= 0:
         max_orders = None
@@ -1737,6 +1676,9 @@ async def _okx_reconciliation_light_scan(
     return SimpleNamespace(
         plans=plans,
         lookback_days=lookback_days,
+        nominal_window_start=nominal_since.isoformat(),
+        effective_window_start=effective_since.isoformat(),
+        training_epoch_started_at=epoch_started_at.isoformat(),
         candidate_order_count=candidate_order_count,
         scanned_order_count=len(rows),
         truncated=bool(max_orders is not None and candidate_order_count > len(rows)),
@@ -3329,10 +3271,10 @@ def _model_training_health_summary(
         if isinstance(local_tools.get("promotion_recommendation"), dict)
         else {}
     )
-    live_ready = bool(promotion.get("live_ready"))
+    live_ml_ready = promotion.get("live_ml_ready") is True
     canary_ready = bool(promotion.get("canary_ready"))
     if trained_models_available:
-        if live_ready or local_stage == "live":
+        if live_ml_ready:
             local_status = "trained_and_loaded"
         elif canary_ready or local_stage == "canary":
             local_status = "trained_canary_ready"
@@ -3351,7 +3293,7 @@ def _model_training_health_summary(
             "training_status": local_status,
             "trained_at": trained_at,
             "model_stage": local_stage,
-            "live_ready": live_ready,
+            "live_ml_ready": live_ml_ready,
             "canary_ready": canary_ready,
             "sample_counts": {
                 "shadow": _safe_int_value(local_tools.get("shadow_sample_count")),
@@ -3470,11 +3412,6 @@ async def _model_training_audit() -> dict[str, Any]:
     training = data_status.get("training") if isinstance(data_status, dict) else {}
     local_tools = training.get("local_ai_tools") if isinstance(training, dict) else {}
     governance = training.get("governance") if isinstance(training, dict) else {}
-    if isinstance(local_tools, dict) and isinstance(governance, dict):
-        local_tools = _phase3_merge_clean_training_view_into_local_tools(
-            local_tools,
-            governance,
-        )
     historical_trade_fact_audit_warning = isinstance(historical_trade_facts, Exception)
     if historical_trade_fact_audit_warning:
         historical_trade_fact_report = {
@@ -3571,17 +3508,11 @@ async def _model_training_audit() -> dict[str, Any]:
     runtime_probe_timeout = bool(runtime_probe.get("timeout"))
     local_tools_status = str(local_tools.get("status") or "").lower()
     clean_training_view_available = (
-        _safe_int_value(
-            local_tools.get("phase3_clean_trainable_sample_count")
-            or local_tools.get("trainable_sample_count")
-            or local_tools.get("shadow_sample_count")
-        )
-        > 0
-        and _safe_int_value(
-            local_tools.get("trainable_trade_sample_count") or local_tools.get("trade_sample_count")
-        )
-        > 0
-        and str(local_tools.get("phase3_training_policy") or "") == "clean_training_view_only"
+        _safe_int_value(local_tools.get("training_shadow_sample_count")) > 0
+        and _safe_int_value(local_tools.get("training_trade_sample_count")) > 0
+        and str(local_tools.get("training_policy") or "")
+        == "current_training_epoch_only"
+        and local_tools.get("pre_epoch_data_training_allowed") is False
     )
     local_tools_status_probe_slow = local_tools_status in {"timeout", "status_error"} and (
         bool(runtime_probe.get("local_ai_tools_available")) or clean_training_view_available
@@ -3629,25 +3560,15 @@ async def _model_training_audit() -> dict[str, Any]:
         or training_scheduler_unavailable
         or training_timeout_exceeded
     )
-    evaluation_policy = (
-        local_tools.get("evaluation_policy")
-        if isinstance(local_tools.get("evaluation_policy"), dict)
-        else {}
-    )
     promotion_flow = (
         local_tools.get("promotion_flow")
-        or evaluation_policy.get("promotion_flow")
         or "candidate_to_shadow_to_canary_to_active"
     )
     phase3_training_governance = {
         "training_mode": local_tools.get("training_mode") or "shadow",
         "model_stage": local_tools.get("model_stage") or "shadow",
-        "evaluation_policy": evaluation_policy,
         "promotion_flow": promotion_flow,
-        "live_mutation": bool(
-            local_tools.get("live_mutation") or evaluation_policy.get("live_mutation")
-        ),
-        "requires_walk_forward": bool(evaluation_policy.get("requires_walk_forward", True)),
+        "live_ml_ready": local_tools.get("live_ml_ready") is True,
         "policy": (
             "三期模型变更必须按影子 -> 灰度 -> 生产的顺序推进；"
             "审计可见性本身不得修改生产交易权重。"
@@ -3732,8 +3653,7 @@ async def _model_training_audit() -> dict[str, Any]:
                 "training_mode": phase3_training_governance["training_mode"],
                 "model_stage": phase3_training_governance["model_stage"],
                 "promotion_flow": phase3_training_governance["promotion_flow"],
-                "live_mutation": phase3_training_governance["live_mutation"],
-                "evaluation_policy": phase3_training_governance["evaluation_policy"],
+                "live_ml_ready": phase3_training_governance["live_ml_ready"],
                 "promotion_recommendation": (
                     local_tools.get("promotion_recommendation")
                     if isinstance(local_tools.get("promotion_recommendation"), dict)

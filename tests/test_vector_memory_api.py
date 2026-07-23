@@ -93,7 +93,7 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
 
 
 @pytest.mark.asyncio
-async def test_vector_memory_clear_endpoint_clears_phase3_index(
+async def test_vector_memory_clear_endpoint_clears_training_epoch_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_calls = 0
@@ -109,7 +109,7 @@ async def test_vector_memory_clear_endpoint_clears_phase3_index(
                 "status": "cleared",
                 "removed": 7,
                 "document_count": 0,
-                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "training_epoch_policy": "exclude_documents_before_training_epoch",
             }
 
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")

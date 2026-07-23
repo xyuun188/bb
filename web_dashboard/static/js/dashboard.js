@@ -4497,39 +4497,20 @@ function mlSampleCounts() {
         const value = Number(report[key]);
         return Number.isFinite(value) ? value : null;
     };
-    const trainingMl = mlFirstNumber(ml, [
-        'phase3_clean_trainable_shadow_sample_count',
-        'training_shadow_sample_count',
-    ]);
-    const completedMl = mlFirstNumber(ml, [
-        'phase3_clean_completed_shadow_sample_count',
-        'completed_shadow_sample_count',
-    ]);
-    const trainingLocal = mlFirstNumber(local, [
-        'phase3_clean_trainable_shadow_sample_count',
-        'training_shadow_sample_count',
-    ]);
-    const completedLocal = mlFirstNumber(local, [
-        'phase3_clean_completed_shadow_sample_count',
-        'completed_shadow_sample_count',
-    ]);
-    const trainingLocalTrade = mlFirstNumber(local, [
-        'phase3_clean_trainable_trade_sample_count',
-        'training_trade_sample_count',
-    ]);
-    const completedLocalTrade = mlFirstNumber(local, [
-        'phase3_clean_completed_trade_sample_count',
-        'completed_trade_sample_count',
-    ]);
+    const trainingMl = mlFirstNumber(ml, ['training_shadow_sample_count']);
+    const completedMl = mlFirstNumber(ml, ['completed_shadow_sample_count']);
+    const trainingLocal = mlFirstNumber(local, ['training_shadow_sample_count']);
+    const completedLocal = mlFirstNumber(local, ['completed_shadow_sample_count']);
+    const trainingLocalTrade = mlFirstNumber(local, ['training_trade_sample_count']);
+    const completedLocalTrade = mlFirstNumber(local, ['completed_trade_sample_count']);
     const configuredLimit = mlFirstNumber(ml, ['training_shadow_sample_limit'])
         ?? mlFirstNumber(local, ['training_shadow_sample_limit']);
     const limit = configuredLimit !== null && configuredLimit > 0
         ? configuredLimit
         : null;
-    let newCount = mlFirstNumber(ml, ['phase3_new_shadow_sample_count', 'new_shadow_sample_count'])
-        ?? mlFirstNumber(local, ['phase3_new_shadow_sample_count', 'new_shadow_sample_count']);
+    let newCount = mlFirstNumber(ml, ['new_shadow_sample_count'])
+        ?? mlFirstNumber(local, ['new_shadow_sample_count']);
     const previousCount = mlFirstNumber(ml, [
-            'last_trained_phase3_shadow_sample_count',
             'last_trained_completed_shadow_sample_count',
         ])
         ?? mlFirstNumber(autoLast, [
@@ -4964,9 +4945,9 @@ function renderPhase3PromotionGate(promotion, localTools = {}) {
         <div class="data-quality-panel">
             <strong>三期模型晋升检查</strong>
             <div class="data-collection-summary data-collection-summary-compact">
-                ${collectionMetric('建议阶段', collectionStatusLabel(gate.recommended_stage || localTools.model_stage || 'shadow', true), `训练模式：${collectionStatusLabel(localTools.training_mode || 'shadow', true)}`, gate.live_ready ? 'good' : gate.canary_ready ? 'warn' : 'muted')}
+                ${collectionMetric('建议阶段', collectionStatusLabel(gate.recommended_stage || localTools.model_stage || 'shadow', true), `训练模式：${collectionStatusLabel(localTools.training_mode || 'shadow', true)}`, gate.live_ml_ready ? 'good' : gate.canary_ready ? 'warn' : 'muted')}
                 ${collectionMetric('灰度是否就绪', gate.canary_ready ? '是' : '否', canaryBlockers.slice(0, 2).map(dashboardReasonText).join('；') || '没有灰度阻断', gate.canary_ready ? 'good' : 'warn')}
-                ${collectionMetric('生产是否就绪', gate.live_ready ? '是' : '否', liveBlockers.slice(0, 3).map(dashboardReasonText).join('；') || '生产影响权限保持关闭', gate.live_ready ? 'good' : 'warn')}
+                ${collectionMetric('生产是否就绪', gate.live_ml_ready ? '是' : '否', liveBlockers.slice(0, 3).map(dashboardReasonText).join('；') || '生产影响权限保持关闭', gate.live_ml_ready ? 'good' : 'warn')}
             </div>
         </div>`;
 }
@@ -5249,10 +5230,9 @@ function renderDataCollectionTraining(training) {
     const governance = training.governance || {};
     const localGovernance = governance.local_ai_tools || localTools.governance_report || {};
     const mlGovernance = governance.local_ml_signal || {};
-    const phase3CleanCount = Number(
-        governance.phase3_clean_trainable_shadow_sample_count
-        ?? localGovernance.phase3_clean_trainable_sample_count
-        ?? governance.local_ml_trainable_shadow_sample_count
+    const currentEpochCount = Number(
+        governance.current_epoch_trainable_shadow_sample_count
+        ?? localGovernance.current_epoch_trainable_sample_count
         ?? 0
     );
     const quarantinedCount = Number(
@@ -5287,7 +5267,7 @@ function renderDataCollectionTraining(training) {
                 <strong>训练数据治理</strong>
                 <div class="data-collection-summary data-collection-summary-compact">
                     ${collectionMetric('清洗状态', trainingGovernanceStatusLabel(localGovernance.status || governance.status), trainingGovernanceSummary(localGovernance), trainingGovernanceTone(localGovernance.status || governance.status))}
-                    ${collectionMetric('三期可训练', `${monitorNumber(phase3CleanCount, 0)} 条`, '只使用干净训练视图', phase3CleanCount > 0 ? 'good' : 'warn')}
+                    ${collectionMetric('当前训练纪元可训练', `${monitorNumber(currentEpochCount, 0)} 条`, '只使用当前训练纪元数据', currentEpochCount > 0 ? 'good' : 'warn')}
                     ${collectionMetric('隔离样本', `${monitorNumber(quarantinedCount, 0)} 条`, '旧数据不参与三期训练', quarantinedCount ? 'warn' : 'good')}
                     ${collectionMetric('降权样本', `${monitorNumber(localGovernance.downweighted_sample_count, 0)} 条`, '仅限三期干净窗口内弱证据', Number(localGovernance.downweighted_sample_count || 0) ? 'warn' : 'good')}
                 </div>
@@ -5351,9 +5331,9 @@ function trainingGovernanceSummary(report) {
 }
 
 function trainingGovernanceNotes(localReport, mlReport) {
-    const notes = ['三期重新开始训练；旧数据禁止进入新模型训练。'];
+    const notes = ['当前训练纪元已重新开始；纪元前数据禁止进入新模型训练。'];
     if (localReport?.requires_artifact_refresh || mlReport?.requires_artifact_refresh) {
-        notes.push('清洗策略已生效，下一轮训练只使用三期干净训练窗口。');
+        notes.push('清洗策略已生效，下一轮训练只使用当前训练纪元数据。');
     }
     const targets = localReport?.refresh_targets || mlReport?.refresh_targets || [];
     if (Array.isArray(targets) && targets.length) {
@@ -5361,21 +5341,6 @@ function trainingGovernanceNotes(localReport, mlReport) {
     }
     return notes.map(note => `<span>${escHtml(note)}</span>`).join('');
 }
-/*
-        notes.push('原始交易/分析记录保留，只隔离训练视图。');
-    }
-    if (localReport?.requires_artifact_refresh || mlReport?.requires_artifact_refresh) {
-        notes.push('清洗策略已生效，建议执行清洗刷新后观察新一轮模型表现。');
-    }
-    const targets = localReport?.refresh_targets || mlReport?.refresh_targets || [];
-    if (Array.isArray(targets) && targets.length) {
-        notes.push(`刷新目标：${targets.join(' / ')}`);
-    }
-    if (!notes.length) notes.push('暂无脏样本风险信号。');
-    return notes.map(note => `<span>${escHtml(note)}</span>`).join('');
-}
-
-*/
 
 async function refreshTrainingGovernance() {
     const container = document.getElementById('data-collection-training');
@@ -9784,8 +9749,8 @@ function mlLocalEvidenceHtml(status) {
             ${mlEvidenceRow('源码 SHA256', mlEvidenceValue(status.source_code_sha256))}
             ${mlEvidenceRow('Manifest 路径', mlEvidenceValue(registry.manifest_path || status.artifact_manifest_path))}
         </section>`,
-        `<section class="ml-evidence-panel ${activation.production_influence_authorized === true ? '' : 'warn'}">
-            <div class="ml-evidence-head"><strong>晋升与激活证据</strong><span>${activation.production_influence_authorized === true ? '已授权' : '未授权'}</span></div>
+        `<section class="ml-evidence-panel ${activation.live_ml_ready === true ? '' : 'warn'}">
+            <div class="ml-evidence-head"><strong>晋升与激活证据</strong><span>${activation.live_ml_ready === true ? '已授权' : '未授权'}</span></div>
             ${mlEvidenceRow('激活阶段', mlEvidenceValue(activation.activation_stage || status.artifact_lifecycle))}
             ${mlEvidenceRow('Walk-forward', mlEvidenceValue(walkForward.status))}
             ${mlEvidenceRow('滚动折数', mlSampleCountLabel(mlOptionalNumber(walkForward.folds?.length)))}
@@ -9839,7 +9804,7 @@ function renderMLSignalOverview() {
         : null;
     const readinessBlockers = Array.isArray(readiness.blocking_reasons) ? readiness.blocking_reasons : [];
     const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
-    const allowLivePositionInfluence = status.allow_live_position_influence === true;
+    const allowLivePositionInfluence = status.live_ml_ready === true;
     const influenceEnabled = status.influence_enabled === true && allowLivePositionInfluence;
     const controlledReadinessDegrade = ready && !allowLivePositionInfluence && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
     const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;

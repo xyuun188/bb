@@ -58,7 +58,7 @@ def test_complete_return_contract_has_no_root_cause() -> None:
     report = StrategySignalRootCauseAuditService().summarize(
         decisions=[_decision(complete=True)],
         shadows=[],
-        ml_status={"status": "ready", "allow_live_position_influence": True},
+        ml_status={"status": "ready", "live_ml_ready": True},
     )
 
     assert report["status"] == "ok"
@@ -73,7 +73,7 @@ def test_incomplete_cost_and_risk_budget_are_reported_without_mutation() -> None
     report = StrategySignalRootCauseAuditService().summarize(
         decisions=[decision],
         shadows=[SimpleNamespace(missed_opportunity=True)],
-        ml_status={"status": "degraded", "allow_live_position_influence": False},
+        ml_status={"status": "degraded", "live_ml_ready": False},
     )
 
     assert report["status"] == "warning"
@@ -204,7 +204,7 @@ def test_complete_live_rules_canary_is_reported_in_its_own_lifecycle() -> None:
     report = StrategySignalRootCauseAuditService().summarize(
         decisions=[_live_rules_canary_decision()],
         shadows=[],
-        ml_status={"status": "shadow", "allow_live_position_influence": False},
+        ml_status={"status": "shadow", "live_ml_ready": False},
     )
 
     assert report["status"] == "ok"

@@ -60,6 +60,15 @@ from services.training_data_quality import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ml_signal_module,
+        "load_training_epoch_start",
+        lambda: PHASE3_CLEAN_START_UTC,
+    )
+
+
 def test_loaded_local_ml_estimators_disable_parallel_single_row_inference() -> None:
     estimator = SimpleNamespace(n_jobs=-1)
     bundle = {"long_regressor": SimpleNamespace(named_steps={"model": estimator})}
@@ -289,9 +298,9 @@ def _service_with_metadata(metadata: dict) -> MLSignalService:
     service._bundle = {"metadata": _with_return_objective(metadata)}
     service._resolved_artifact = SimpleNamespace(
         activation_manifest={
-            "activation_stage": "live",
+            "activation_stage": "active",
             "readiness_state": "ready",
-            "production_influence_authorized": True,
+            "live_ml_ready": True,
             "blocking_reasons": [],
         }
     )
@@ -662,7 +671,7 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
         for fold in metadata["walk_forward_report"]["folds"]
     )
     assert metadata["artifact_activation_manifest"][
-        "production_influence_authorized"
+        "live_ml_ready"
     ] is False
     assert metadata["live_promotion_manifest"]["status"] == "not_issued"
     assert metadata["profit_supervision_report"][
@@ -681,8 +690,7 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["quality_report"]["profit_supervision"][
         "actual_realized_return_sample_count"
     ] == 1
-    assert metadata["evaluation_policy"]["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
-    assert metadata["evaluation_policy"]["live_mutation"] is False
+    assert metadata["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
     assert not model_path.exists()
     assert not metadata_path.exists()
 
@@ -713,7 +721,7 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
         {
             "activation_stage": "shadow",
             "readiness_state": "degraded",
-            "production_influence_authorized": False,
+            "live_ml_ready": False,
             "blocking_reasons": ["test_shadow_activation"],
         }
     )
@@ -722,7 +730,7 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
 
     assert registry.current_path.exists()
     assert status["available"] is True
-    assert status["allow_live_position_influence"] is False
+    assert status["live_ml_ready"] is False
     assert status["artifact_registry"]["available"] is True
     assert status["artifact_registry"]["sha256"] == metadata["artifact_sha256"]
     governance = status["governance_report"]
@@ -1180,8 +1188,8 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert result["reason"] == "trained_paper_bootstrap_canary_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
-    assert result["candidate_readiness"]["allow_live_position_influence"] is False
-    assert result["allow_live_position_influence"] is False
+    assert result["candidate_readiness"]["live_ml_ready"] is False
+    assert result["live_ml_ready"] is False
     assert result["artifact_activation_stage"] == "canary"
     assert result["paper_canary_authorized"] is True
     assert [item["activation_stage"] for item in promotion_evidence] == [
@@ -1189,7 +1197,7 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
         "canary",
     ]
     assert promotion_evidence[1]["paper_canary_authorized"] is True
-    assert promotion_evidence[1]["production_influence_authorized"] is False
+    assert promotion_evidence[1]["live_ml_ready"] is False
     assert promotion_evidence[1]["strategy_blueprint"][
         "paper_execution_eligible"
     ] is True
@@ -1365,8 +1373,8 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     assert result["reason"] == "trained_active_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
-    assert result["candidate_readiness"]["allow_live_position_influence"] is True
-    assert result["allow_live_position_influence"] is True
+    assert result["candidate_readiness"]["live_ml_ready"] is True
+    assert result["live_ml_ready"] is True
     assert result["artifact_activation_stage"] == "active"
     assert result["live_enabled_sides"] == ["long", "short"]
     assert [item["activation_stage"] for item in promotion_evidence] == [
@@ -1374,7 +1382,7 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
         "canary",
         "active",
     ]
-    assert promotion_evidence[2]["production_influence_authorized"] is True
+    assert promotion_evidence[2]["live_ml_ready"] is True
     assert promotion_evidence[2]["live_enabled_sides"] == ["long", "short"]
 
 
@@ -1710,7 +1718,7 @@ def test_ml_readiness_allows_low_win_rate_high_fee_after_return() -> None:
     readiness = build_ml_readiness_report(metadata, {"enabled": True})
 
     assert readiness["state"] == "ready"
-    assert readiness["allow_live_position_influence"] is True
+    assert readiness["live_ml_ready"] is True
     assert readiness["blocking_reasons"] == []
 
 
@@ -1722,7 +1730,7 @@ def test_ml_readiness_blocks_artifact_without_native_market_fact_contract() -> N
     codes = {item["code"] for item in readiness["blocking_reasons"]}
 
     assert readiness["state"] == "degraded"
-    assert readiness["allow_live_position_influence"] is False
+    assert readiness["live_ml_ready"] is False
     assert "artifact_market_fact_contract_missing_or_stale" in codes
 
 
@@ -1737,7 +1745,7 @@ def test_ml_readiness_blocks_artifact_with_market_fact_contract_violation() -> N
     codes = {item["code"] for item in readiness["blocking_reasons"]}
 
     assert readiness["state"] == "degraded"
-    assert readiness["allow_live_position_influence"] is False
+    assert readiness["live_ml_ready"] is False
     assert "artifact_market_fact_contract_violated" in codes
 
 
@@ -1762,7 +1770,7 @@ def test_ml_readiness_blocks_high_win_rate_negative_fee_after_return() -> None:
     codes = {item["code"] for item in readiness["blocking_reasons"]}
 
     assert readiness["state"] == "degraded"
-    assert readiness["allow_live_position_influence"] is False
+    assert readiness["live_ml_ready"] is False
     assert "long_top_return_lcb_not_positive" in codes
     assert "short_top_profit_factor_not_above_one" in codes
 
@@ -1772,7 +1780,7 @@ def test_ml_readiness_separates_paper_bootstrap_from_live_profit_gate() -> None:
 
     readiness = build_ml_readiness_report(metadata, {"enabled": False})
 
-    assert readiness["allow_live_position_influence"] is False
+    assert readiness["live_ml_ready"] is False
     assert readiness["paper_canary"]["authorized"] is True
     assert readiness["paper_canary"]["execution_scope"] == "paper_only"
     assert readiness["paper_canary"]["production_permission"] is False
@@ -2101,7 +2109,7 @@ def test_ml_signal_status_exposes_learning_only_readiness_reasons() -> None:
 
     reason_codes = {item["code"] for item in status["readiness"]["blocking_reasons"]}
     assert status["readiness_state"] == "degraded"
-    assert status["allow_live_position_influence"] is False
+    assert status["live_ml_ready"] is False
     assert status["readiness"]["metrics"]["dirty_sample_ratio"] == 0.0
     assert status["readiness"]["metrics"]["training_data_version"] == "2026-06-19.v1"
     assert status["readiness"]["metrics"]["required_training_data_version"] == DATA_QUALITY_VERSION
@@ -2168,7 +2176,7 @@ def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> N
     readiness = build_ml_readiness_report(metadata, {"enabled": True})
     long_diag = readiness["profit_quality_diagnostics"]["long"]
 
-    assert readiness["allow_live_position_influence"] is True
+    assert readiness["live_ml_ready"] is True
     assert long_diag["training_target"] == "fee_after_realized_return_quality"
     assert long_diag["top_avg_return_pct"] == -0.14
     assert long_diag["top_bottom_return_spread_pct"] == -0.12
@@ -2212,7 +2220,7 @@ def test_ml_signal_status_marks_ready_only_when_all_readiness_metrics_pass() -> 
 
     assert status["status"] == "ready"
     assert status["readiness_state"] == "ready"
-    assert status["allow_live_position_influence"] is True
+    assert status["live_ml_ready"] is True
     assert status["readiness"]["blocking_reasons"] == []
     assert status["readiness"]["metrics"]["long_pr_auc"] == 0.58
 
@@ -2225,13 +2233,13 @@ def test_live_activation_auto_degrades_when_training_fingerprint_is_invalid() ->
     status = service.status()
     codes = {item["code"] for item in status["readiness"]["blocking_reasons"]}
 
-    assert status["allow_live_position_influence"] is False
+    assert status["live_ml_ready"] is False
     assert status["influence_policy"]["enabled"] is False
     assert "artifact_training_data_sha256_missing_or_invalid" in codes
     assert "artifact_current_readiness_revalidation_failed" in codes
 
 
-def test_actual_trade_profit_factor_must_be_defined_for_each_live_side() -> None:
+def test_rules_trade_profit_factor_does_not_gate_model_readiness() -> None:
     metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
     long_evidence = metadata["authoritative_trade_return_evidence"]["sides"]["long"]
     long_evidence["profit_factor"] = None
@@ -2244,11 +2252,11 @@ def test_actual_trade_profit_factor_must_be_defined_for_each_live_side() -> None
         for item in status["readiness"]["side_blocking_reasons"]["long"]
     }
 
-    assert status["readiness_state"] == "partial_ready"
-    assert status["readiness"]["live_enabled_sides"] == ["short"]
-    assert status["influence_policy"]["long"]["enabled"] is False
+    assert status["readiness_state"] == "ready"
+    assert status["readiness"]["live_enabled_sides"] == ["long", "short"]
+    assert status["influence_policy"]["long"]["enabled"] is True
     assert status["influence_policy"]["short"]["enabled"] is True
-    assert "long_authoritative_profit_factor_undefined" in long_codes
+    assert "long_authoritative_profit_factor_undefined" not in long_codes
 
 
 def test_symbol_removal_instability_blocks_that_prediction_side() -> None:
@@ -2279,7 +2287,8 @@ def test_symbol_removal_instability_blocks_that_prediction_side() -> None:
 
     assert prediction["readiness"]["live_enabled_sides"] == ["short"]
     assert prediction["predictions"][0]["best_side"] == "long"
-    assert prediction["allow_live_position_influence"] is False
+    assert prediction["live_ml_ready"] is True
+    assert prediction["live_influence"] is False
     assert prediction["influence_policy"]["long"]["enabled"] is False
     assert "long_leave_one_symbol_out_stability_failed" in long_codes
 
@@ -2318,7 +2327,7 @@ def test_ml_signal_status_allows_directional_partial_live_influence() -> None:
 
     assert status["readiness_state"] == "partial_ready"
     assert status["status"] == "ready"
-    assert status["allow_live_position_influence"] is True
+    assert status["live_ml_ready"] is True
     assert status["readiness"]["live_enabled_sides"] == ["long"]
     assert status["readiness"]["blocking_reasons"] == []
     short_codes = {
@@ -2372,7 +2381,7 @@ def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> No
     prediction = service.predict({"current_price": 100.0, "atr_14": 1.0}, horizons=(10,))
 
     assert prediction["readiness_state"] == "partial_ready"
-    assert prediction["allow_live_position_influence"] is True
+    assert prediction["live_ml_ready"] is True
     assert prediction["predictions"][0]["best_side"] == "long"
     assert prediction["predictions"][0]["ml_influence_enabled"] is True
     assert prediction["predictions"][0]["profit_signal"] is True
@@ -2411,7 +2420,8 @@ def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() 
     assert long_distribution["lower_quantile_return_pct"] == pytest.approx(0.496)
     assert long_distribution["production_eligible"] is False
     assert "lower_quantile_above_raw_expected" in long_distribution["blockers"]
-    assert prediction["allow_live_position_influence"] is False
+    assert prediction["live_ml_ready"] is True
+    assert prediction["live_influence"] is False
     assert prediction["prediction_quality"]["production_eligible"] is False
 
 
@@ -2492,7 +2502,7 @@ def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_infl
     prediction = service.predict({"current_price": 100.0, "atr_14": 1.0}, horizons=(10,))
 
     assert prediction["readiness_state"] == "degraded"
-    assert prediction["allow_live_position_influence"] is False
+    assert prediction["live_ml_ready"] is False
     assert prediction["influence_policy"]["enabled"] is False
     assert prediction["influence_enabled"] is False
     assert prediction["profit_signal"] is False

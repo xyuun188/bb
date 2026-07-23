@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
-from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_objective import (
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
@@ -412,40 +411,6 @@ def _side_artifact_evidence_blockers(
                 f"{side_text}样本外收益下界、尾部风险或回撤证据不完整。",
             )
         )
-    authoritative = _safe_dict(
-        _safe_dict(
-            _safe_dict(metadata.get("authoritative_trade_return_evidence")).get("sides")
-        ).get(side)
-    )
-    authoritative_profit_factor = _safe_float(authoritative.get("profit_factor"), None)
-    if authoritative_profit_factor is None:
-        blockers.append(
-            _reason(
-                f"{side}_authoritative_profit_factor_undefined",
-                f"{side_text}真实成交盈亏比因缺少亏损分母而无法计算。",
-            )
-        )
-    elif authoritative_profit_factor <= 1.0:
-        blockers.append(
-            _reason(
-                f"{side}_authoritative_profit_factor_not_above_break_even",
-                f"{side_text}真实成交盈亏比没有高于自然盈亏平衡线 1。",
-                actual=authoritative_profit_factor,
-                required=1.0,
-            )
-        )
-    if (
-        authoritative.get("promotion_math_ready") is not True
-        or _safe_float(authoritative.get("return_lcb_pct"), None) is None
-        or _safe_float(authoritative.get("cvar_10_pct"), None) is None
-        or _safe_float(authoritative.get("max_drawdown_pct"), None) is None
-    ):
-        blockers.append(
-            _reason(
-                f"{side}_authoritative_return_tail_evidence_incomplete",
-                f"{side_text}真实成交收益下界、尾部风险或回撤证据不完整。",
-            )
-        )
     return blockers
 
 
@@ -691,15 +656,7 @@ def build_ml_readiness_report(
     }
     for side in ("long", "short"):
         profile = _safe_dict(actual_trade_profiles.get(f"*|{side}"))
-        actual_return = _safe_dict(profile.get(PROFIT_TRAINING_TARGET))
         actual_slippage = _safe_dict(profile.get("slippage_pct"))
-        if int(_safe_float(actual_return.get("count"), 0.0) or 0) <= 0:
-            side_blockers[side].append(
-                _reason(
-                    f"{side}_authoritative_realized_return_calibration_missing",
-                    f"{_side_label(side)}缺少权威真实成交收益校准。",
-                )
-            )
         if int(_safe_float(actual_slippage.get("count"), 0.0) or 0) <= 0:
             side_blockers[side].append(
                 _reason(
@@ -768,7 +725,7 @@ def build_ml_readiness_report(
 
     return {
         "state": state,
-        "allow_live_position_influence": partial_live_influence_allowed,
+        "live_ml_ready": partial_live_influence_allowed,
         "paper_canary": paper_canary,
         "live_enabled_sides": live_enabled_sides,
         "side_blocking_reasons": side_blockers,
@@ -862,7 +819,7 @@ def build_ml_readiness_report(
 def disabled_ml_readiness(reason_code: str, message: str) -> dict[str, Any]:
     return {
         "state": "disabled",
-        "allow_live_position_influence": False,
+        "live_ml_ready": False,
         "paper_canary": {
             "version": "2026-07-17.paper-bootstrap-readiness.v1",
             "state": "blocked",

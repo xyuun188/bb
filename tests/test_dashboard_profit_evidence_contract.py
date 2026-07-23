@@ -611,7 +611,7 @@ def test_phase11_dashboard_exposes_profit_evidence_without_zero_fallbacks() -> N
     ):
         assert token in SCRIPT
 
-    assert 'status["phase3_new_shadow_sample_count"] = None' in (
+    assert 'status["new_shadow_sample_count"] = None' in (
         ROOT / "web_dashboard/api/dashboard.py"
     ).read_text(encoding="utf-8")
     assert "readinessDistributionAvailable" in SCRIPT

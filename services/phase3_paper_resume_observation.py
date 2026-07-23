@@ -12,10 +12,7 @@ from typing import Any
 
 from config.settings import settings
 from core.safe_output import safe_error_text
-from services.okx_authoritative_sync import (
-    DEFAULT_COLD_START_MARKER_PATH,
-    OkxAuthoritativeSyncService,
-)
+from services.okx_authoritative_sync import OkxAuthoritativeSyncService
 from services.server_monitor_status import (
     collect_platform_runtime_status,
     collect_platform_server_status,
@@ -459,13 +456,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _load_cold_start_reset_at(path: Path | None = DEFAULT_COLD_START_MARKER_PATH) -> datetime | None:
-    if path is None or not Path(path).exists():
-        return None
-    payload = _read_json(Path(path))
-    return _parse_utc_datetime(payload.get("reset_at"))
-
-
 def _latest_report_from_candidates(paths: list[Path]) -> dict[str, Any]:
     for path in paths:
         payload = _read_json(path)
@@ -605,9 +595,6 @@ class Phase3PaperResumeObservationService:
         from models.trade import Order, Position
 
         window_start = _now() - timedelta(hours=max(int(self.observation_hours or 1), 1))
-        cold_start = _load_cold_start_reset_at()
-        if cold_start is not None and cold_start > window_start:
-            window_start = cold_start
         since_naive = window_start.replace(tzinfo=None)
         async with get_read_session_ctx() as session:
             created_shadow_count = _safe_int(
@@ -702,7 +689,6 @@ class Phase3PaperResumeObservationService:
             "audit_only": True,
             "window_start": window_start.isoformat(),
             "observation_hours": max(int(self.observation_hours or 1), 1),
-            "cold_start_reset_at": cold_start.isoformat() if cold_start else None,
             "created_shadow_count": created_shadow_count,
             "completed_shadow_count": completed_shadow_count,
             "specialist_shadow_sample_count": specialist_shadow_sample_count,

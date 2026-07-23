@@ -554,7 +554,6 @@ class LocalAIToolsClient:
             "training_data_sha256",
             "source_code_sha256",
             "return_distribution_input_version",
-            "evaluation_policy",
             "promotion_recommendation",
             "governance_report",
             "quality_report",
@@ -636,8 +635,6 @@ class LocalAIToolsClient:
         quality_report: dict[str, Any] | None = None,
         governance_report: dict[str, Any] | None = None,
         training_mode: str = "shadow",
-        model_stage: str = "shadow",
-        evaluation_policy: dict[str, Any] | None = None,
         paper_observation_report: dict[str, Any] | None = None,
         promotion_recommendation: dict[str, Any] | None = None,
         persist_artifact: bool = False,
@@ -648,13 +645,6 @@ class LocalAIToolsClient:
         circuit_open = self._circuit_open_payload()
         if circuit_open:
             return {"trained": False, "reason": "circuit_open", **circuit_open}
-        effective_evaluation_policy = evaluation_policy or {
-            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-            "live_mutation": False,
-            "requires_walk_forward": True,
-            "phase": "phase3_model_factory",
-            "requires_paper_observation": True,
-        }
         effective_paper_observation = (
             paper_observation_report or load_latest_paper_observation_report()
         )
@@ -669,10 +659,8 @@ class LocalAIToolsClient:
         )
         effective_promotion = promotion_recommendation or build_phase3_promotion_recommendation(
             training_mode=training_mode,
-            model_stage=model_stage,
             quality_report=quality_report or {},
             governance_report=governance_report or {},
-            evaluation_policy=effective_evaluation_policy,
             paper_observation_report=effective_paper_observation,
             completed_shadow_sample_count=int(completed_shadow_sample_count or 0),
             completed_trade_sample_count=int(completed_trade_sample_count or 0),
@@ -693,9 +681,6 @@ class LocalAIToolsClient:
             "quality_report": quality_report or {},
             "governance_report": governance_report or {},
             "training_mode": training_mode,
-            "model_stage": model_stage,
-            "evaluation_policy": effective_evaluation_policy,
-            "paper_observation_report": effective_paper_observation,
             "return_objective_report": return_objective_report,
             "profit_supervision_report": profit_supervision_report,
             "promotion_recommendation": effective_promotion,

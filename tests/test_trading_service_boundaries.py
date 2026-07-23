@@ -56,15 +56,14 @@ from services.trading_service import TradingService, _AnalysisRuntimeState
 from services.training_data_quality import DATA_QUALITY_VERSION
 
 
-def test_local_ai_tools_training_subprocess_requests_governed_walk_forward_live() -> None:
+def test_local_ai_tools_training_subprocess_requests_governed_walk_forward() -> None:
     source = inspect.getsource(
         trading_service.TradingService._run_local_ai_tools_training_subprocess
     )
 
     assert '"--training-mode"' in source
     assert '"walk_forward"' in source
-    assert '"--model-stage"' in source
-    assert '"live"' in source
+    assert '"--model-stage"' not in source
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -1903,9 +1902,9 @@ async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone
     service.ml_signal_service = SimpleNamespace(
         status=lambda: {
             "available": True,
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "artifact_activation_manifest": {
-                "production_influence_authorized": False,
+                "live_ml_ready": False,
             },
             "metrics": {},
         }
@@ -1959,10 +1958,9 @@ async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_m
         status=lambda: {
             "available": True,
             "live_ml_ready": True,
-            "allow_live_position_influence": True,
             "artifact_activation_manifest": {
                 "activation_stage": "active",
-                "production_influence_authorized": True,
+                "live_ml_ready": True,
             },
             "metrics": {
                 "sample_count": 50,

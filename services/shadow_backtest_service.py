@@ -207,6 +207,29 @@ def compact_local_ai_tools_shadow(local_ai_tools_context: dict[str, Any] | None)
     return compact if any(key in compact for key in _SHADOW_TOOL_NAMES) else {}
 
 
+def _model_shadow_action(
+    raw_response: dict[str, Any],
+    *,
+    primary_action: str,
+) -> tuple[str, str]:
+    """Persist the model's explicit side so rules-canary returns stay separate."""
+
+    if "model_shadow_decision" not in raw_response:
+        action = str(primary_action or "").strip().lower()
+        if action in {"buy", "open_long"}:
+            action = "long"
+        elif action in {"sell", "open_short"}:
+            action = "short"
+        return action if action in {"long", "short"} else "", "primary_model_decision"
+    shadow = raw_response.get("model_shadow_decision")
+    action = str(shadow.get("action") or "").strip().lower() if isinstance(shadow, dict) else ""
+    if action in {"buy", "open_long"}:
+        action = "long"
+    elif action in {"sell", "open_short"}:
+        action = "short"
+    return action if action in {"long", "short"} else "", "explicit_model_shadow_decision"
+
+
 def shadow_fee_after_outcome(
     row: Any,
     *,
@@ -390,6 +413,17 @@ class ShadowBacktestService:
                     feature_snapshot = {}
                 else:
                     feature_snapshot = dict(feature_snapshot)
+                raw_response = (
+                    decision.raw_response
+                    if isinstance(decision.raw_response, dict)
+                    else {}
+                )
+                shadow_action, shadow_source = _model_shadow_action(
+                    raw_response,
+                    primary_action=decision.action.value,
+                )
+                feature_snapshot["model_shadow_action"] = shadow_action
+                feature_snapshot["model_shadow_action_source"] = shadow_source
                 local_ai_shadow = compact_local_ai_tools_shadow(local_ai_tools_context)
                 if local_ai_shadow:
                     feature_snapshot["local_ai_tools_shadow"] = local_ai_shadow
@@ -422,11 +456,7 @@ class ShadowBacktestService:
                             "decision_confidence": float(decision.confidence or 0.0),
                             "entry_price": entry_price,
                             "feature_snapshot": feature_snapshot,
-                            "raw_llm_response": (
-                                decision.raw_response
-                                if isinstance(decision.raw_response, dict)
-                                else {}
-                            ),
+                            "raw_llm_response": raw_response,
                             "status": "pending",
                             "due_at": now + timedelta(minutes=int(horizon)),
                             "horizon_minutes": int(horizon),

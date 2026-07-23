@@ -12,7 +12,7 @@ def test_dynamic_route_preserves_all_experts_without_baseline() -> None:
         FeatureVector(symbol="BTC/USDT", sentiment_data_available=False),
         {
             "candidate_quality": "low",
-            "ml_signal": {"readiness": {"allow_live_position_influence": False}},
+            "ml_signal": {"readiness": {"live_ml_ready": False}},
         },
         model_health={
             "components": {
@@ -39,9 +39,7 @@ def test_dynamic_route_preserves_all_experts_without_baseline() -> None:
     assert "competition_baseline_missing" in route["blocking_reasons"]
     assert "ml_readiness_blocks_live_route" in route["blocking_reasons"]
     assert route["canary_ready"] is False
-    assert route["live_ready"] is False
-    assert "walk_forward_required" in route["live_blocking_reasons"]
-    assert "live_mutation_not_enabled" in route["live_blocking_reasons"]
+    assert route["live_ml_ready"] is False
     assert route["estimated_call_reduction"] == 0
     assert route["expert_reasons"]["risk_expert"] == [
         "full_governed_expert_set_preserved"
@@ -74,12 +72,8 @@ def test_dynamic_route_keeps_sentiment_for_news_events_even_if_health_is_weak() 
     assert route["applied_to_live_calls"] is False
     assert route["mode"] == "canary_ready"
     assert route["canary_ready"] is True
-    assert route["live_ready"] is False
-    assert route["live_blocking_reasons"] == [
-        "model_stage_not_live",
-        "walk_forward_required",
-        "live_mutation_not_enabled",
-    ]
+    assert route["live_ml_ready"] is False
+    assert route["live_blocking_reasons"] == ["ml_readiness_blocks_live_route"]
 
 
 def test_dynamic_route_does_not_use_fixed_market_thresholds_to_change_experts() -> None:
@@ -105,55 +99,41 @@ def test_dynamic_route_does_not_use_fixed_market_thresholds_to_change_experts() 
     assert route["mandatory_safety_experts"] == ["risk_expert"]
 
 
-def test_dynamic_route_live_requested_requires_walk_forward_and_explicit_enablement() -> None:
+def test_dynamic_route_active_requested_reads_only_live_ml_ready() -> None:
     features = FeatureVector(symbol="BTC/USDT")
 
     blocked = plan_dynamic_model_route(
         features,
-        {"candidate_quality": "high"},
+        {
+            "candidate_quality": "high",
+            "ml_signal": {"readiness": {"live_ml_ready": False}},
+        },
         competition={"baseline": {"sample_count": 20}, "blocking_reasons": []},
         feature_coverage={"status": "ok", "missing_features": []},
-        requested_stage="live",
-        training_governance={
-            "training_mode": "shadow",
-            "model_stage": "canary",
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-                "requires_walk_forward": True,
-            },
-        },
+        requested_stage="active",
     )
 
     assert blocked["mode"] == "active_blocked"
-    assert blocked["canary_ready"] is True
-    assert blocked["live_ready"] is False
+    assert blocked["canary_ready"] is False
+    assert blocked["live_ml_ready"] is False
     assert blocked["blocking_reasons"] == [
-        "model_stage_not_live",
-        "walk_forward_required",
-        "live_mutation_not_enabled",
+        "paper_canary_readiness_blocked",
+        "ml_readiness_blocks_live_route",
     ]
 
     ready = plan_dynamic_model_route(
         features,
-        {"candidate_quality": "high"},
+        {
+            "candidate_quality": "high",
+            "ml_signal": {"readiness": {"live_ml_ready": True}},
+        },
         competition={"baseline": {"sample_count": 20}, "blocking_reasons": []},
         feature_coverage={"status": "ok", "missing_features": []},
-        requested_stage="live",
-        training_governance={
-            "training_mode": "walk_forward",
-            "model_stage": "live",
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": True,
-                "requires_walk_forward": True,
-            },
-        },
+        requested_stage="active",
     )
 
-    assert ready["mode"] == "active_ready"
-    assert ready["active_ready"] is True
-    assert ready["live_ready"] is True
+    assert ready["mode"] == "active_route_ready"
+    assert ready["live_ml_ready"] is True
     assert ready["blocking_reasons"] == []
     assert ready["live_route_mutation"] is False
     assert ready["can_apply_live_route"] is False
@@ -221,7 +201,7 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
                     "skipped_experts": ["sentiment_expert", "position_expert"],
                     "estimated_call_reduction": 2,
                     "blocking_reasons": ["feature_coverage_missing"],
-                    "live_ready": False,
+                    "live_ml_ready": False,
                     "live_blocking_reasons": ["feature_coverage_missing"],
                     "applied_to_live_calls": True,
                     "live_route_mutation": True,
@@ -243,7 +223,7 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
     assert report["summary"]["shadow_only_count"] == 2
     assert report["summary"]["estimated_call_reduction"] == 4
     assert report["summary"]["unsafe_live_mutation_attempts"] == 1
-    assert report["summary"]["live_ready_count"] == 0
+    assert report["summary"]["live_ml_ready_count"] == 0
     assert report["summary"]["live_blocked_count"] == 2
     assert (
         report["safety_observations"]["ineligible_return_contract_executed_count"] == 1

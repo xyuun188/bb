@@ -2115,15 +2115,10 @@ Safety boundary:
 - No remote deletion, no SSH mutation, no service restart, no DB mutation, no historical deletion, no repair apply, no model routing change, no GPU allocation change, and no live trading behavior change.
 - If the gate cannot verify the server, it blocks Phase 3 model-server go-live instead of assuming readiness.
 
-### 13.17 Phase 3 Paper Cold-Start Watermark Completed
+### 13.17 Retired: Phase 3 Paper Cold-Start Watermark
 
-- Added guarded cold-start marker support:
-  - `scripts/phase3_cold_start_reset.py` writes `data/phase3_cold_start_reset_marker.json` after a confirmed apply.
-  - marker records `reset_at`, `policy_id=PHASE3_COLD_START_RESET`, paper scope, backup manifest path, deleted counts, preserved tables, OKX empty gate, and service gate evidence.
-- `services/okx_authoritative_sync.py` now applies the marker as an OKX fill-history watermark:
-  - nominal window remains the configured lookback, e.g. 24 hours.
-  - effective fill window becomes `max(nominal_since, cold_start_reset_at)`.
-  - pre-reset OKX fills are no longer compared against the intentionally empty local paper DB.
+- This historical deletion path was removed on 2026-07-24 because it deleted paper orders, positions and decisions and then hid older OKX fills behind a marker.
+- It is replaced by `scripts/reset_training_derived_state.py`, which removes only derived training state and preserves the exchange-backed fact ledger.
 - Online cold-start state verified after marker reconstruction:
   - `bb-paper-trading.service=inactive`.
   - OKX paper gate: `open_position_count=0`, `open_order_count=0`.
@@ -2134,17 +2129,13 @@ Safety boundary:
 
 Verification:
 
-- Cold-start reset regression: `3 passed`.
-- OKX authoritative watermark regression: included in `6 passed`.
-- Python compile check passed for `scripts/phase3_cold_start_reset.py` and `services/okx_authoritative_sync.py`.
-- Online direct audit confirmed watermark reduced the effective fill window from the nominal 24-hour window to the reset timestamp.
+- The old cold-start and watermark regressions were deleted with the implementation.
+- New derived-state reset regression verifies that raw trade facts and audit events remain intact.
 
 Safety boundary:
 
-- Paper cold-start scope only.
-- Live credentials remain unverifiable until OKX live API key is fixed; live rows were not treated as verified exchange facts.
-- No trading service restart was performed during marker deployment.
-- Marker only prevents false old-fill alerts; it does not hide post-reset OKX positions, orders, or fills.
+- The replacement requires `bb-paper-trading.service`, `bb-model-tunnels.service`, and `bb-dashboard.service` to be stopped before apply.
+- No marker can suppress or hide historical OKX facts.
 
 ### 13.18 OKX Native Facts Layer Started
 

@@ -46,7 +46,6 @@ from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
 )
-from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
     COUNTERFACTUAL_EXECUTION_COST_TASK,
@@ -77,6 +76,7 @@ from services.training_data_quality import (
     governance_report,
     quality_report,
 )
+from services.training_epoch import load_training_epoch_start
 
 logger = structlog.get_logger(__name__)
 
@@ -704,12 +704,12 @@ def _activation_gated_policy(
         activation_blockers if isinstance(activation_blockers, list) else []
     )
     manifest_authorized = bool(
-        stage in {"canary", "active", "live"}
-        and activation.get("production_influence_authorized") is True
+        stage in {"canary", "active"}
+        and activation.get("live_ml_ready") is True
         and activation.get("readiness_state") in {"ready", "partial_ready"}
         and not activation_blockers
     )
-    if manifest_authorized and readiness.get("allow_live_position_influence") is True:
+    if manifest_authorized and readiness.get("live_ml_ready") is True:
         live_sides = set(readiness.get("live_enabled_sides") or [])
         effective_influence = {
             **influence,
@@ -734,7 +734,7 @@ def _activation_gated_policy(
         "advisory_enabled": False,
         "influence_weight": 0.0,
         "activation_stage": stage,
-        "production_influence_authorized": False,
+        "live_ml_ready": False,
         "ungated_return_evidence_enabled": bool(influence.get("enabled")),
     }
     for side in ("long", "short"):
@@ -770,10 +770,10 @@ def _activation_gated_policy(
         **readiness,
         "state": (
             "shadow_ready"
-            if stage == "shadow" and readiness.get("allow_live_position_influence")
+            if stage == "shadow" and readiness.get("live_ml_ready")
             else readiness.get("state") or "promotion_blocked"
         ),
-        "allow_live_position_influence": False,
+        "live_ml_ready": False,
         "live_enabled_sides": [],
         "blocking_reasons": gated_blockers,
         "artifact_activation": activation,
@@ -1906,11 +1906,11 @@ def train_from_frame(
         "phase": "phase3_model_factory",
         "version": now,
         "trained_at": now,
+        "training_epoch_started_at": load_training_epoch_start().isoformat(),
+        "pre_epoch_data_training_allowed": False,
         "sample_count": int(len(frame)),
         "completed_shadow_sample_count": completed_count,
-        "phase3_clean_completed_shadow_sample_count": completed_count,
         "last_trained_completed_shadow_sample_count": completed_count,
-        "last_trained_phase3_shadow_sample_count": completed_count,
         "training_shadow_sample_count": int(len(frame)),
         "training_trade_sample_count": len(trade_samples or []),
         "completed_trade_sample_count": len(trade_samples or []),
@@ -2026,23 +2026,18 @@ def train_from_frame(
         "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": "walk_forward",
         "model_stage": "candidate",
-        "evaluation_policy": {
-            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
-            "requires_walk_forward": True,
-            "phase": "phase3_model_factory",
-        },
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
         "training_run_mode": "persist" if persist_artifact else "dry_run",
         "artifact_persisted": bool(persist_artifact),
         "artifact_activation_manifest": {
             "status": "not_activated",
             "activation_stage": "candidate",
-            "production_influence_authorized": False,
+            "live_ml_ready": False,
         },
         "live_promotion_manifest": {
             "status": "not_issued",
             "reason": "candidate_requires_independent_shadow_and_return_readiness",
-            "production_influence_authorized": False,
+            "live_ml_ready": False,
         },
         "note": "本地 ML 直接优化费后预期收益及左尾风险；胜率仅作为诊断，不参与开仓、评分、权重或晋升。",
     }
@@ -2128,7 +2123,6 @@ class MLSignalService:
                 "readiness_state": readiness["state"],
                 "readiness": readiness,
                 "live_ml_ready": False,
-                "allow_live_position_influence": False,
                 "model_path": str(self.model_path),
                 "artifact_registry": self._artifact_registry_status(),
                 "strategy_blueprint": build_model_strategy_blueprint(
@@ -2147,13 +2141,13 @@ class MLSignalService:
             readiness,
             self._resolved_artifact,
         )
-        allow_live_position_influence = bool(readiness.get("allow_live_position_influence"))
+        live_ml_ready = bool(readiness.get("live_ml_ready"))
         advisory_enabled = bool(
             influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
         )
         model_note = metadata.get("note")
         training_count = int(metadata.get("sample_count") or 0)
-        phase3_counts = self._phase3_sample_count_status(metadata)
+        training_epoch_counts = self._training_epoch_sample_count_status(metadata)
         activation = _safe_dict(
             self._resolved_artifact.activation_manifest
             if self._resolved_artifact is not None
@@ -2178,15 +2172,15 @@ class MLSignalService:
             ),
             "training_window_policy": metadata.get("training_window_policy")
             or "all_current_clean_cost_complete_samples",
-            **phase3_counts,
+            **training_epoch_counts,
             "status": (
                 "ready"
-                if allow_live_position_influence
+                if live_ml_ready
                 else str(readiness.get("state") or influence.get("status") or "learning_only")
             ),
             "mode": (
                 "entry_profit_filter"
-                if allow_live_position_influence
+                if live_ml_ready
                 else (
                     "advisory"
                     if advisory_enabled
@@ -2195,15 +2189,14 @@ class MLSignalService:
             ),
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
-            "live_ml_ready": allow_live_position_influence,
-            "allow_live_position_influence": allow_live_position_influence,
-            "influence_enabled": allow_live_position_influence,
+            "live_ml_ready": live_ml_ready,
+            "influence_enabled": live_ml_ready,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_note": model_note,
             "note": (
                 "ML 指标达标，当前允许参与开仓过滤、加分和机会排序。"
-                if allow_live_position_influence
+                if live_ml_ready
                 else (
                     "ML 硬指标有效但样本成熟度不足，当前按小权重提供收益解释，不做硬否决。"
                     if influence.get("advisory_enabled")
@@ -2294,8 +2287,8 @@ class MLSignalService:
         }
 
     @staticmethod
-    def _phase3_cursor_from_metadata(metadata: dict[str, Any], completed_count: int) -> int:
-        """Return a trained cursor on the current Phase 3 clean-sample scale."""
+    def _trained_cursor_from_metadata(metadata: dict[str, Any], completed_count: int) -> int:
+        """Return an explicit trained cursor on the current-epoch sample scale."""
 
         value = metadata.get("last_trained_completed_shadow_sample_count")
         try:
@@ -2304,28 +2297,28 @@ class MLSignalService:
             return 0
         return cursor if 0 <= cursor <= completed_count else 0
 
-    def _phase3_sample_count_status(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        """Expose authoritative clean-training counters without inferred fallbacks."""
+    def _training_epoch_sample_count_status(
+        self,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Expose only current-epoch training counters."""
 
         try:
-            completed_count = int(metadata.get("phase3_clean_completed_shadow_sample_count") or 0)
+            completed_count = int(metadata.get("completed_shadow_sample_count") or 0)
         except (TypeError, ValueError):
             completed_count = 0
-        if completed_count <= 0:
-            try:
-                completed_count = int(metadata.get("completed_shadow_sample_count") or 0)
-            except (TypeError, ValueError):
-                completed_count = 0
         completed_count = max(completed_count, 0)
-        trained_cursor = self._phase3_cursor_from_metadata(metadata, completed_count)
+        trained_cursor = self._trained_cursor_from_metadata(metadata, completed_count)
         new_count = max(completed_count - trained_cursor, 0)
         return {
-            "phase3_clean_completed_shadow_sample_count": completed_count,
-            "phase3_clean_trainable_shadow_sample_count": completed_count,
-            "last_trained_phase3_shadow_sample_count": trained_cursor,
-            "phase3_new_shadow_sample_count": new_count,
+            "training_policy": "current_training_epoch_only",
+            "training_epoch_started_at": metadata.get("training_epoch_started_at"),
+            "pre_epoch_data_training_allowed": False,
+            "completed_shadow_sample_count": completed_count,
+            "training_shadow_sample_count": completed_count,
+            "last_trained_completed_shadow_sample_count": trained_cursor,
             "new_shadow_sample_count": new_count,
-            "phase3_sample_cursor_policy": "phase3_clean_training_view_only",
+            "sample_cursor_policy": "current_training_epoch_only",
         }
 
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
@@ -2424,7 +2417,7 @@ class MLSignalService:
                 metadata = self._current_metadata()
                 cursor_metadata = self._training_cursor_metadata(metadata)
                 last_sample_count = int(cursor_metadata.get("sample_count") or 0)
-                last_completed_count = self._phase3_cursor_from_metadata(
+                last_completed_count = self._trained_cursor_from_metadata(
                     cursor_metadata,
                     completed_count,
                 )
@@ -2451,7 +2444,7 @@ class MLSignalService:
                     required_training_data_version
                     and training_data_version != required_training_data_version
                 )
-                learning_only = not bool(readiness.get("allow_live_position_influence"))
+                learning_only = not bool(readiness.get("live_ml_ready"))
                 new_samples = max(completed_count - last_completed_count, 0)
                 new_trade_samples = max(
                     completed_trade_count - last_completed_trade_count,
@@ -2469,7 +2462,7 @@ class MLSignalService:
                     "training_data_contract_stale": training_data_contract_stale,
                     "training_data_version": training_data_version or None,
                     "required_training_data_version": required_training_data_version or None,
-                    "cursor_source": "phase3_clean_training_view",
+                    "cursor_source": "current_training_epoch",
                     "promotion_requires_readiness": True,
                     "candidate_artifact_persisted": False,
                     "persist_artifact_only_when_readiness_allows_live_influence": False,
@@ -2609,7 +2602,7 @@ class MLSignalService:
                     trained_influence,
                 )
                 production_authorized = bool(
-                    trained_readiness.get("allow_live_position_influence")
+                    trained_readiness.get("live_ml_ready")
                     and trained_readiness.get("state") in {"ready", "partial_ready"}
                     and trained_readiness.get("live_enabled_sides")
                     and not trained_readiness.get("blocking_reasons")
@@ -2704,11 +2697,11 @@ class MLSignalService:
                         "candidate_readiness": candidate_readiness,
                         "readiness": readiness,
                         "readiness_state": readiness.get("state"),
-                        "allow_live_position_influence": bool(
-                            readiness.get("allow_live_position_influence")
+                        "live_ml_ready": bool(
+                            readiness.get("live_ml_ready")
                         ),
                         "influence_enabled": bool(
-                            readiness.get("allow_live_position_influence")
+                            readiness.get("live_ml_ready")
                         ),
                         "artifact_persisted": True,
                         "artifact_version": (
@@ -2757,7 +2750,7 @@ class MLSignalService:
                     **common_activation_evidence,
                     "activation_stage": "shadow",
                     "readiness_state": trained_readiness.get("state"),
-                    "production_influence_authorized": False,
+                    "live_ml_ready": False,
                     "paper_canary_authorized": False,
                     "live_enabled_sides": [],
                     "blocking_reasons": (
@@ -2785,7 +2778,7 @@ class MLSignalService:
                             if production_authorized
                             else "paper_canary_ready"
                         ),
-                        "production_influence_authorized": production_authorized,
+                        "live_ml_ready": production_authorized,
                         "paper_canary_authorized": paper_canary_authorized,
                         "live_enabled_sides": live_enabled_sides,
                         "blocking_reasons": [],
@@ -2807,7 +2800,7 @@ class MLSignalService:
                         **common_activation_evidence,
                         "activation_stage": "active",
                         "readiness_state": "ready",
-                        "production_influence_authorized": True,
+                        "live_ml_ready": True,
                         "paper_canary_authorized": False,
                         "live_enabled_sides": live_enabled_sides,
                         "blocking_reasons": [],
@@ -2832,7 +2825,7 @@ class MLSignalService:
                 self._bundle = None
                 self._loaded_mtime = None
                 self._ensure_loaded()
-                allow_live_position_influence = production_authorized
+                live_ml_ready = production_authorized
                 result = {
                     "trained": True,
                     "reason": (
@@ -2864,8 +2857,8 @@ class MLSignalService:
                     "candidate_influence_policy": candidate_influence,
                     "readiness": trained_readiness,
                     "readiness_state": trained_readiness.get("state"),
-                    "allow_live_position_influence": allow_live_position_influence,
-                    "influence_enabled": allow_live_position_influence,
+                    "live_ml_ready": live_ml_ready,
+                    "influence_enabled": live_ml_ready,
                     "influence_policy": trained_influence,
                     "artifact_persisted": bool(trained_metadata.get("artifact_persisted")),
                     "artifact_version": activated_artifact.version,
@@ -3080,7 +3073,7 @@ class MLSignalService:
                 "status": "no_model",
                 "readiness_state": readiness["state"],
                 "readiness": readiness,
-                "allow_live_position_influence": False,
+                "live_ml_ready": False,
                 "strategy_blueprint": build_model_strategy_blueprint(
                     metadata=None,
                     readiness=readiness,
@@ -3096,7 +3089,7 @@ class MLSignalService:
             readiness,
             self._resolved_artifact,
         )
-        allow_live_position_influence = bool(readiness.get("allow_live_position_influence"))
+        live_ml_ready = bool(readiness.get("live_ml_ready"))
         advisory_enabled = bool(
             influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
         )
@@ -3342,7 +3335,7 @@ class MLSignalService:
                     "profit_edge_pct": round(profit_edge, 4),
                     "profit_quality_score": round(profit_quality, 4),
                     "profit_signal": bool(
-                        allow_live_position_influence
+                        live_ml_ready
                         and side_influence.get("enabled")
                         and selected_market_distribution_ready
                         and selected_cost_distribution_ready
@@ -3353,7 +3346,7 @@ class MLSignalService:
                     ),
                     "risk_score": round(risk_score, 4),
                     "ml_influence_enabled": bool(
-                        allow_live_position_influence
+                        live_ml_ready
                         and side_influence.get("enabled")
                         and selected_market_distribution_ready
                         and selected_cost_distribution_ready
@@ -3391,7 +3384,7 @@ class MLSignalService:
             and primary.get("actual_trade_calibration_ready") is True
         )
         live_prediction_influence = bool(
-            allow_live_position_influence and current_prediction_ready
+            live_ml_ready and current_prediction_ready
         )
         activation = _safe_dict(
             self._resolved_artifact.activation_manifest
@@ -3402,7 +3395,7 @@ class MLSignalService:
         paper_canary_authorized = bool(
             activation.get("activation_stage") == "canary"
             and activation.get("paper_canary_authorized") is True
-            and activation.get("production_influence_authorized") is not True
+            and activation.get("live_ml_ready") is not True
             and paper_canary.get("authorized") is True
         )
         strategy_blueprint = build_model_strategy_blueprint(
@@ -3417,8 +3410,7 @@ class MLSignalService:
                 "live" if live_prediction_influence else "shadow_observation"
             ),
             "live_influence": live_prediction_influence,
-            "live_ml_ready": allow_live_position_influence,
-            "promotion_ready": allow_live_position_influence,
+            "live_ml_ready": live_ml_ready,
             "objective_name": metadata.get("objective_name"),
             "objective_version": metadata.get("objective_version"),
             "label_name": metadata.get("label_name"),
@@ -3444,7 +3436,7 @@ class MLSignalService:
                     "separated_market_cost_and_actual_calibration_ready"
                     if live_prediction_influence
                     else "current_prediction_contract_incomplete"
-                    if allow_live_position_influence
+                    if live_ml_ready
                     else "ml_readiness_blocks_live_influence"
                 ),
                 "blockers": [
@@ -3481,7 +3473,6 @@ class MLSignalService:
             ),
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
-            "allow_live_position_influence": live_prediction_influence,
             "influence_enabled": live_prediction_influence,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
@@ -3755,9 +3746,10 @@ class MLSignalService:
 
 
 async def load_shadow_training_rows() -> list[Any]:
+    epoch_start = load_training_epoch_start()
     base_filters = (
         ShadowBacktest.status == "completed",
-        ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+        ShadowBacktest.created_at >= epoch_start,
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
         or_(
@@ -3782,11 +3774,12 @@ async def load_shadow_training_rows() -> list[Any]:
 
 
 async def count_shadow_training_rows() -> int:
+    epoch_start = load_training_epoch_start()
     async with get_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
                 ShadowBacktest.status == "completed",
-                ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+                ShadowBacktest.created_at >= epoch_start,
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
             )

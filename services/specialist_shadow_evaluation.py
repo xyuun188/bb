@@ -9,6 +9,7 @@ from typing import Any
 from services.execution_cost_model import execution_cost_estimate
 from services.profit_supervision import shadow_fee_after_return_labels
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
+from services.training_epoch import load_training_epoch_start
 
 DEFAULT_WINDOW_HOURS = 168
 MAX_WORST_SAMPLE_COUNT = 8
@@ -1149,7 +1150,8 @@ class SpecialistShadowEvaluationService:
         from models.learning import ShadowBacktest
 
         capped_hours = max(1, min(int(hours or DEFAULT_WINDOW_HOURS), 24 * 90))
-        since = datetime.now(UTC) - timedelta(hours=capped_hours)
+        epoch_start = load_training_epoch_start()
+        since = max(datetime.now(UTC) - timedelta(hours=capped_hours), epoch_start)
         since_naive = since.replace(tzinfo=None)
         selected_mode = (
             "live" if str(mode or "").lower() == "live" else "paper" if mode else None

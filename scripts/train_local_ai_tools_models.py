@@ -33,7 +33,6 @@ from services.model_promotion_policy import (
     load_latest_paper_observation_report,
 )
 from services.okx_training_gate import okx_training_refresh_gate
-from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import (
@@ -41,6 +40,7 @@ from services.training_data_quality import (
     annotate_training_payload,
     artifact_bound_governance_report,
 )
+from services.training_epoch import load_training_epoch_start
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
@@ -455,6 +455,7 @@ def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
 async def _load_shadow_samples() -> list[dict[str, Any]]:
     before_id: int | None = None
     samples: list[dict[str, Any]] = []
+    epoch_start = load_training_epoch_start()
     while True:
         page_limit = _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE
         async with get_read_session_ctx() as session:
@@ -462,7 +463,7 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
                 select(*_shadow_sample_columns())
                 .where(
                     ShadowBacktest.status == "completed",
-                    ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+                    ShadowBacktest.created_at >= epoch_start,
                     ShadowBacktest.long_return_pct.is_not(None),
                     ShadowBacktest.short_return_pct.is_not(None),
                 )
@@ -499,6 +500,9 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
                     "decision_confidence": _as_float(row.get("decision_confidence")),
                     "horizon_minutes": int(row.get("horizon_minutes") or 10),
                     "features": compact_features,
+                    "model_shadow_action": str(
+                        features.get("model_shadow_action") or ""
+                    ).lower(),
                     "long_return_pct": _as_float(row.get("long_return_pct")),
                     "short_return_pct": _as_float(row.get("short_return_pct")),
                     "label_timestamp": row.get("label_timestamp"),
@@ -515,15 +519,16 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
 async def _load_trade_samples() -> list[dict[str, Any]]:
     """Load the only trainable realized-trade source."""
 
-    return await load_authoritative_trade_outcomes()
+    return await load_authoritative_trade_outcomes(since=load_training_epoch_start())
 
 
 async def _completed_shadow_sample_count() -> int:
+    epoch_start = load_training_epoch_start()
     async with get_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
                 ShadowBacktest.status == "completed",
-                ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
+                ShadowBacktest.created_at >= epoch_start,
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
             )
@@ -589,6 +594,7 @@ async def _load_sequence_samples() -> list[dict[str, Any]]:
         last_open_time = None
 
     async with get_read_session_ctx() as session:
+        epoch_start = load_training_epoch_start()
         stmt = (
             select(
                 Kline.symbol,
@@ -598,6 +604,7 @@ async def _load_sequence_samples() -> list[dict[str, Any]]:
                 Kline.volume,
             )
             .where(Kline.timeframe.in_(("1m", "5m", "15m", "1h")))
+            .where(Kline.open_time >= epoch_start)
             .order_by(Kline.symbol.asc(), Kline.timeframe.asc(), Kline.open_time.asc())
         )
         result = await session.stream(stmt)
@@ -657,6 +664,7 @@ def _symbols_from_json(value: Any) -> list[str]:
 
 
 async def _load_text_sentiment_samples() -> list[dict[str, Any]]:
+    epoch_start = load_training_epoch_start()
     async with get_session_ctx() as session:
         news_stmt = select(NewsArticle).order_by(
             NewsArticle.published_at.desc().nullslast(), NewsArticle.id.desc()
@@ -664,6 +672,8 @@ async def _load_text_sentiment_samples() -> list[dict[str, Any]]:
         social_stmt = select(SocialPost).order_by(
             SocialPost.posted_at.desc().nullslast(), SocialPost.id.desc()
         )
+        news_stmt = news_stmt.where(NewsArticle.published_at >= epoch_start)
+        social_stmt = social_stmt.where(SocialPost.posted_at >= epoch_start)
         news_result = await session.execute(news_stmt)
         social_result = await session.execute(social_stmt)
         news_rows = list(news_result.scalars().all())
@@ -712,12 +722,6 @@ async def _main() -> None:
         choices=("shadow", "formal", "walk_forward"),
         default="shadow",
         help="Phase-3 model-factory mode; default is shadow and never mutates live routing.",
-    )
-    parser.add_argument(
-        "--model-stage",
-        choices=("shadow", "canary", "live", "degraded", "retired"),
-        default="shadow",
-        help="Lifecycle stage recorded in the local_ai_tools metadata.",
     )
     parser.add_argument(
         "--persist-artifact",
@@ -800,19 +804,9 @@ async def _main() -> None:
         "quality_report": training_payload["quality_report"],
         "governance_report": training_payload["governance_report"],
         "training_mode": args.training_mode,
-        "model_stage": args.model_stage,
         "persist_artifact": bool(args.persist_artifact),
         "confirm_phase3_rebuild": bool(args.confirm_phase3_rebuild),
         "okx_daily_reconciliation_gate": okx_gate,
-        "evaluation_policy": {
-            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-            "live_mutation": bool(
-                args.training_mode == "walk_forward" and args.model_stage == "live"
-            ),
-            "requires_walk_forward": args.training_mode != "walk_forward",
-            "requires_paper_observation": True,
-            "phase": "phase3_model_factory",
-        },
         "paper_observation_report": paper_observation_report,
         "return_objective_report": return_objective_report,
         "profit_supervision_report": training_payload["quality_report"].get(
@@ -822,10 +816,8 @@ async def _main() -> None:
     }
     payload["promotion_recommendation"] = build_phase3_promotion_recommendation(
         training_mode=args.training_mode,
-        model_stage=args.model_stage,
         quality_report=training_payload["quality_report"],
         governance_report=training_payload["governance_report"],
-        evaluation_policy=payload["evaluation_policy"],
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=completed_shadow_count,
         completed_trade_sample_count=completed_trade_count,

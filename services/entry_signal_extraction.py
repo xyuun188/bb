@@ -46,15 +46,8 @@ _WRAPPER_METADATA_KEYS = (
     "challenger_model",
     "model_version",
     "route_mode",
-    "live_mutation",
-    "live_influence",
-    "influence_enabled",
-    "allow_live_position_influence",
-    "promotion_ready",
+    "live_ml_ready",
     "readiness",
-    "evaluation_policy",
-    "model_stage",
-    "training_mode",
     "objective",
     "objective_name",
     "objective_version",
@@ -181,16 +174,6 @@ _NON_PRODUCTION_ROUTE_MARKERS = (
     "learning_only",
     "promotion_blocked",
 )
-_NON_PRODUCTION_STAGES = {
-    "shadow",
-    "shadow_evaluating",
-    "candidate",
-    "inference_only",
-    "learning_only",
-    "promotion_blocked",
-}
-
-
 def _signal_governance_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     current = payload
@@ -268,7 +251,6 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
     governance_seen = False
     route_live = False
     live_influence_allowed = False
-    promotion_ready = False
     quality_approved = False
     objective_approved = False
     objective_version_approved = False
@@ -289,55 +271,21 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
                 }
             route_live = route_mode == "live"
 
-        stage = str(node.get("model_stage") or node.get("training_mode") or "").strip().lower()
-        if stage:
+        if "live_ml_ready" in node:
             governance_seen = True
-            if stage in _NON_PRODUCTION_STAGES:
-                return {
-                    "eligible": False,
-                    "reason": "non_production_model_stage",
-                    "model_stage": stage,
-                }
-
-        for key in (
-            "live_mutation",
-            "live_influence",
-            "influence_enabled",
-            "allow_live_position_influence",
-        ):
-            if key in node:
-                governance_seen = True
-                if node.get(key) is False:
-                    return {"eligible": False, "reason": f"{key}_disabled"}
-                if node.get(key) is True:
-                    live_influence_allowed = True
-
-        if "promotion_ready" in node:
-            governance_seen = True
-            if node.get("promotion_ready") is False:
-                return {"eligible": False, "reason": "promotion_not_ready"}
-            promotion_ready = node.get("promotion_ready") is True
+            if node.get("live_ml_ready") is not True:
+                return {"eligible": False, "reason": "live_ml_ready_disabled"}
+            live_influence_allowed = True
 
         readiness = safe_dict(node.get("readiness"))
         if readiness:
             governance_seen = True
-            if readiness.get("allow_live_position_influence") is False:
+            if readiness.get("live_ml_ready") is False:
                 return {
                     "eligible": False,
                     "reason": "readiness_blocks_live_influence",
                 }
-            if readiness.get("allow_live_position_influence") is True:
-                live_influence_allowed = True
-
-        evaluation_policy = safe_dict(node.get("evaluation_policy"))
-        if evaluation_policy:
-            governance_seen = True
-            if evaluation_policy.get("live_mutation") is False:
-                return {
-                    "eligible": False,
-                    "reason": "evaluation_policy_blocks_live_mutation",
-                }
-            if evaluation_policy.get("live_mutation") is True:
+            if readiness.get("live_ml_ready") is True:
                 live_influence_allowed = True
 
         prediction_quality = safe_dict(node.get("prediction_quality"))
@@ -421,8 +369,7 @@ def signal_production_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
     required = {
         "governance_metadata": governance_seen,
         "live_route": route_live,
-        "live_influence": live_influence_allowed,
-        "promotion_ready": promotion_ready,
+        "live_ml_ready": live_influence_allowed,
         "prediction_quality": quality_approved,
         "return_objective": objective_approved,
         "return_objective_version": objective_version_approved,

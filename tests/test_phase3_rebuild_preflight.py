@@ -198,7 +198,7 @@ async def test_phase3_rebuild_preflight_reports_confirmed_rebuild_gate(
     assert report["readiness"]["can_run_confirmed_rebuild"] is True
     assert report["readiness"]["can_persist_artifact"] is True
     assert report["readiness"]["target_artifacts"]["ml_signal"]["target_stage"] == "shadow"
-    assert report["readiness"]["live_mutation"] is False
+    assert "live_mutation" not in report["readiness"]
 
 
 @pytest.mark.asyncio

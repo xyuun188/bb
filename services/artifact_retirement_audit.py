@@ -162,20 +162,17 @@ def _unreferenced_registry_artifact(
 
 
 def _phase3_evidence(metadata: dict[str, Any]) -> dict[str, Any]:
-    evaluation_policy = _safe_dict(metadata.get("evaluation_policy"))
     governance_report = _safe_dict(metadata.get("governance_report"))
     quality_report = _safe_dict(metadata.get("quality_report"))
     return {
         "policy_id": metadata.get("artifact_policy_id") or metadata.get("policy_id"),
-        "phase": metadata.get("phase") or evaluation_policy.get("phase"),
+        "phase": metadata.get("phase"),
         "training_policy": metadata.get("trade_sample_cursor_policy")
         or metadata.get("training_policy")
         or governance_report.get("training_policy"),
         "training_mode": metadata.get("training_mode"),
         "model_stage": metadata.get("model_stage"),
-        "promotion_flow": evaluation_policy.get("promotion_flow")
-        or metadata.get("promotion_flow"),
-        "live_mutation": bool(evaluation_policy.get("live_mutation")),
+        "promotion_flow": metadata.get("promotion_flow"),
         "artifact_persisted": metadata.get("artifact_persisted"),
         "quality_version": quality_report.get("data_quality_version")
         or metadata.get("data_quality_version"),
@@ -204,7 +201,6 @@ def _artifact_classification(
     policy_ok = evidence["policy_id"] == PHASE3_ARTIFACT_POLICY_ID
     training_policy_ok = evidence["training_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
     promotion_ok = evidence["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
-    live_mutation_ok = evidence["live_mutation"] is False
     persisted_ok = evidence["artifact_persisted"] is True or normalized_relative_path.endswith(
         ".json"
     )
@@ -215,8 +211,6 @@ def _artifact_classification(
         reasons.append("training_policy_not_clean_view")
     if metadata and not promotion_ok:
         reasons.append("promotion_flow_missing_or_untrusted")
-    if metadata and not live_mutation_ok:
-        reasons.append("metadata_allows_live_mutation")
     if metadata and not persisted_ok:
         reasons.append("artifact_persisted_not_confirmed")
     registry_version = str(metadata.get("artifact_registry_version") or "").strip()
@@ -310,7 +304,8 @@ class ArtifactRetirementAuditService:
                     "can_influence_live": bool(
                         classification == "phase3_compatible"
                         and path.suffix.lower() in ARTIFACT_SUFFIXES
-                        and str(evidence.get("model_stage") or "").lower() in {"canary", "live"}
+                        and str(evidence.get("model_stage") or "").lower()
+                        in {"canary", "active"}
                     ),
                 }
             )

@@ -41,6 +41,7 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
     _load_trade_samples,
 )
 from services.training_data_quality import annotate_training_payload  # noqa: E402
+from services.training_epoch import load_training_epoch_start  # noqa: E402
 
 REMOTE_ROOT = "/data/BB"
 REMOTE_TRAINING_DIR = f"{REMOTE_ROOT}/training/finquant_expert"
@@ -1420,10 +1421,14 @@ def _return_objective_counterexample() -> dict[str, Any]:
 
 
 async def _load_expert_memory_examples() -> list[dict[str, Any]]:
+    epoch_start = load_training_epoch_start()
     async with get_session_ctx() as session:
         result = await session.execute(
             select(ExpertMemory)
-            .where(ExpertMemory.is_active.is_(True))
+            .where(
+                ExpertMemory.is_active.is_(True),
+                ExpertMemory.created_at >= epoch_start,
+            )
             .order_by(ExpertMemory.confidence_score.desc(), ExpertMemory.id.desc())
         )
         rows = list(result.scalars().all())

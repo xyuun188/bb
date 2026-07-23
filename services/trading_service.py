@@ -3348,8 +3348,6 @@ class TradingService:
                 or ml_status.get("artifact_lifecycle")
                 or ("active" if live_ml_authorized else "shadow")
             ),
-            "allow_live_position_influence": live_ml_authorized,
-            "production_influence_authorized": live_ml_authorized,
             "live_ml_ready": live_ml_authorized,
             "model_name": model_name,
             "model_mode": model_mode,
@@ -8458,8 +8456,6 @@ class TradingService:
             str(PROJECT_ROOT / "scripts" / "train_local_ai_tools_models.py"),
             "--training-mode",
             "walk_forward",
-            "--model-stage",
-            "live",
             "--persist-artifact",
             "--confirm-phase3-rebuild",
         ]

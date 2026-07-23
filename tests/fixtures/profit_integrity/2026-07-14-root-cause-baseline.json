@@ -438,7 +438,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 0.4603,
           "influence_enabled": true,
@@ -561,7 +561,7 @@
           "profit_quality_score": 4.2799,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "short"
@@ -3677,7 +3677,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 0.4282,
           "influence_enabled": true,
@@ -3801,7 +3801,7 @@
           "profit_quality_score": 3.1688,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "short"
@@ -6893,7 +6893,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 39.1433,
           "influence_enabled": true,
@@ -7017,7 +7017,7 @@
           "profit_quality_score": 222.3241,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "short"
@@ -10065,7 +10065,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 42.5421,
           "influence_enabled": true,
@@ -10188,7 +10188,7 @@
           "profit_quality_score": 232.475,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "short"
@@ -13227,7 +13227,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 42.5421,
           "influence_enabled": true,
@@ -13350,7 +13350,7 @@
           "profit_quality_score": 232.475,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "short"
@@ -16390,7 +16390,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 42.5421,
           "influence_enabled": true,
@@ -16513,7 +16513,7 @@
           "profit_quality_score": 232.475,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "short"
@@ -19553,7 +19553,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 49.3376,
           "influence_enabled": true,
@@ -19674,7 +19674,7 @@
           "profit_quality_score": 252.8866,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "long",
@@ -22706,7 +22706,7 @@
         },
         "ml_signal": {
           "advisory_enabled": false,
-          "allow_live_position_influence": true,
+          "live_ml_ready": true,
           "available": true,
           "expected_return_pct": 38.8628,
           "influence_enabled": true,
@@ -22827,7 +22827,7 @@
           "profit_quality_score": 221.4209,
           "profit_signal": true,
           "readiness": {
-            "allow_live_position_influence": true,
+            "live_ml_ready": true,
             "blocking_reasons": [],
             "live_enabled_sides": [
               "long",
@@ -25605,7 +25605,7 @@
   "git_head": "89550d916085395e5a61fbdf1a109324a8edfc46",
   "live_mutation": false,
   "local_ml_artifact": {
-    "allow_live_position_influence": true,
+    "live_ml_ready": true,
     "available": true,
     "manifest": {
       "artifact_model_id": "local_ml_profit_quality",

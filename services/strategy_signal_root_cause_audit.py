@@ -170,8 +170,8 @@ class StrategySignalRootCauseAuditService:
             "return_lcb_distribution": _distribution(return_lcbs),
             "ml": {
                 "status": ml_status.get("status") or "unknown",
-                "allow_live_position_influence": bool(
-                    ml_status.get("allow_live_position_influence")
+                "live_ml_ready": bool(
+                    ml_status.get("live_ml_ready")
                 ),
                 "readiness": ml_readiness,
             },

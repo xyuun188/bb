@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import settings
+from services.training_epoch import write_training_epoch
 from services.vector_memory.embedding import deterministic_text_vector
 from services.vector_memory.service import _decision_document, _hit_payload, _influence_payload
 from services.vector_memory.store import (
@@ -16,6 +17,15 @@ from services.vector_memory.store import (
     fields_to_hit,
 )
 from services.vector_memory.types import VectorMemoryDocument
+
+
+@pytest.fixture(autouse=True)
+def _current_training_epoch(tmp_path: Path) -> None:
+    write_training_epoch(
+        tmp_path / "training_epoch.json",
+        started_at=datetime(2026, 7, 24, tzinfo=UTC),
+        reset_id="test-vector-memory",
+    )
 
 
 def test_deterministic_text_vector_is_stable_and_normalized() -> None:
@@ -409,12 +419,6 @@ def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(
 
     assert service._auto_reindex_due(0) is True
 
-    service._write_reset_marker(
-        reason="test_phase3_reset",
-        reset_at=datetime.now(UTC),
-    )
-    assert service._auto_reindex_due(0) is False
-
     service._last_reindex_at = None
     assert service._auto_reindex_due(12) is True
 
@@ -426,7 +430,7 @@ def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(
 
 
 @pytest.mark.asyncio
-async def test_vector_memory_clear_index_writes_phase3_reset_marker(
+async def test_vector_memory_clear_index_uses_training_epoch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -434,6 +438,7 @@ async def test_vector_memory_clear_index_writes_phase3_reset_marker(
 
     monkeypatch.setattr(settings, "vector_memory_backend", "jsonl")
     monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
     service = VectorMemoryService(data_dir=tmp_path)
     service._get_store().upsert(
         [
@@ -479,10 +484,11 @@ async def test_vector_memory_clear_index_cancels_running_auto_reindex(
     await started.wait()
 
     result = await service.clear_index(reason="test_clear_cancels_auto_reindex")
+    assert service._auto_reindex_task is None
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
     status = await service.status()
 
     assert result["status"] == "cleared"
-    assert service._auto_reindex_task is None
     assert status["auto_reindex_running"] is False
     assert status["auto_reindex_due"] is False
 

@@ -1946,7 +1946,6 @@ def test_order_fact_sync_effective_since_is_phase3_start_not_rolling_lookback() 
     service = OkxOrderFactSyncService(
         mode="paper",
         lookback_hours=1,
-        cold_start_marker_path=None,
     )
     future_now = PHASE3_DEFAULT_ORDER_SYNC_START + timedelta(days=10)
 
@@ -2013,7 +2012,6 @@ async def test_order_fact_sync_repairs_confirmed_order_contract_size_from_instru
             mode="paper",
             lookback_hours=72,
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2095,7 +2093,6 @@ async def test_order_fact_sync_rechecks_ambiguous_verified_contract_size_from_in
             mode="paper",
             lookback_hours=72,
             executor_factory=_StaleVerifiedContractSizeExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2177,7 +2174,6 @@ async def test_order_fact_sync_refreshes_late_cumulative_fill_for_confirmed_orde
             mode="paper",
             lookback_hours=72,
             executor_factory=_LateCumulativeFillExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2261,7 +2257,6 @@ async def test_order_fact_sync_repairs_execution_result_contract_size_from_instr
             mode="paper",
             lookback_hours=72,
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2369,7 +2364,6 @@ async def test_order_fact_sync_confirms_only_phase3_orders_and_backfills_okx_fac
             mode="paper",
             lookback_hours=72,
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2467,7 +2461,6 @@ async def test_order_fact_sync_closes_matching_open_position_from_okx_position_h
             mode="paper",
             lookback_hours=72,
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2588,7 +2581,6 @@ async def test_order_fact_sync_closes_open_position_from_stored_linked_close_ord
             mode="paper",
             lookback_hours=72,
             executor_factory=_UnavailableExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2646,7 +2638,6 @@ async def test_order_fact_sync_slow_account_bills_do_not_starve_core_order_facts
             lookback_hours=72,
             timeout_seconds=2.0,
             executor_factory=_SlowFundingBillExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         assert report["okx_pull_available"] is True
@@ -2700,7 +2691,6 @@ async def test_order_fact_sync_order_history_timeout_keeps_core_fill_confirmatio
             lookback_hours=72,
             timeout_seconds=2.0,
             executor_factory=_OrderHistoryBusyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2764,7 +2754,6 @@ async def test_order_fact_sync_account_wide_fill_timeout_keeps_target_order_conf
             lookback_hours=72,
             timeout_seconds=2.0,
             executor_factory=_AccountWideFillBusyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2833,7 +2822,6 @@ async def test_order_fact_sync_prioritizes_target_order_fill_lookup_over_inst_sc
             lookback_hours=72,
             timeout_seconds=2.0,
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         ccxt = _Executor.ccxt_instances[-1]
@@ -2896,7 +2884,6 @@ async def test_order_fact_sync_persists_okx_funding_account_bills(
             mode="paper",
             lookback_hours=72,
             executor_factory=_FundingBillExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -2983,7 +2970,6 @@ async def test_order_fact_sync_keeps_order_confirmation_when_position_history_is
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_PositionHistoryBusyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3043,7 +3029,6 @@ async def test_order_fact_sync_persists_funding_bills_even_when_okx_pull_times_o
             mode="paper",
             lookback_hours=72,
             executor_factory=_FundingBillThenPullTimeoutExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3135,7 +3120,6 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_okx_close_fill(
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_FillPairOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3278,7 +3262,6 @@ async def test_order_fact_sync_repairs_closed_position_pnl_from_stored_okx_facts
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_NoHistoryExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3358,7 +3341,6 @@ async def test_order_fact_sync_repairs_confirmed_order_columns_from_stored_okx_f
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_NoHistoryExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3492,7 +3474,6 @@ async def test_order_fact_sync_repairs_stored_okx_facts_when_okx_pull_times_out(
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_PullTimeoutExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3576,7 +3557,6 @@ async def test_order_fact_sync_does_not_recount_already_recovered_execution_fact
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_PullTimeoutExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         assert report["okx_pull_available"] is True
@@ -3725,7 +3705,6 @@ async def test_order_fact_sync_recovers_close_fill_decision_fact_when_okx_pull_t
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_PullTimeoutExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -3828,7 +3807,6 @@ async def test_order_fact_sync_does_not_target_query_orders_already_seen_account
         await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         ccxt = _Executor.ccxt_instances[-1]
@@ -3880,7 +3858,6 @@ async def test_order_fact_sync_does_not_duplicate_beijing_midnight_orders(
             mode="paper",
             lookback_hours=1,
             executor_factory=_Executor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4035,7 +4012,6 @@ async def test_order_fact_sync_marks_current_position_confirmed_without_fill_con
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_CurrentPositionNoFillExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4132,7 +4108,6 @@ async def test_order_fact_sync_uses_full_account_history_page_budget(
             mode="paper",
             limit=500,
             executor_factory=FakeExecutor,
-            cold_start_marker_path=None,
         ).sync()
     finally:
         await close_db()
@@ -4198,7 +4173,6 @@ async def test_order_fact_sync_keeps_okx_execution_result_confirmed_when_history
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_NoHistoryExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4305,7 +4279,6 @@ async def test_order_fact_sync_recovers_okx_execution_result_fact_from_decision(
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_NoHistoryExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4346,7 +4319,6 @@ async def test_order_fact_sync_backfills_open_position_cache_from_okx_current_po
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_CurrentPositionOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4437,7 +4409,6 @@ async def test_order_fact_sync_updates_existing_open_position_cache_from_okx_cur
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_CurrentPositionOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4483,7 +4454,6 @@ async def test_order_fact_sync_preserves_complete_management_contract_on_protect
         await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_CurrentPositionOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
         async with get_session_ctx() as session:
             before = (
@@ -4499,7 +4469,6 @@ async def test_order_fact_sync_preserves_complete_management_contract_on_protect
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_CurrentPositionProtectionTimeoutExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4560,7 +4529,6 @@ async def test_order_fact_sync_links_reduce_only_partial_close_to_open_position(
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_PartialCloseCurrentPositionExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4636,7 +4604,6 @@ async def test_order_fact_sync_links_unlinked_partial_close_to_closed_lifecycle(
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_PartialCloseCurrentPositionExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4716,7 +4683,6 @@ async def test_order_fact_sync_preserves_canonical_open_position_entry_links_whe
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_CurrentPositionOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4758,7 +4724,6 @@ async def test_order_fact_sync_backfills_closed_position_from_okx_fill_pair_when
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_FillPairOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4834,7 +4799,6 @@ async def test_order_fact_sync_suppresses_manual_deleted_fill_pair_position(
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_FillPairOnlyExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -4908,7 +4872,6 @@ async def test_order_fact_sync_splits_reused_okx_pos_id_into_distinct_lifecycles
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_RepeatedPosIdLifecycleExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -5007,7 +4970,6 @@ async def test_order_fact_sync_suppresses_manual_deleted_position_history_lifecy
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_RepeatedPosIdLifecycleExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:
@@ -5054,7 +5016,6 @@ async def test_order_fact_sync_links_all_orders_inside_position_history_lifecycl
         report = await OkxOrderFactSyncService(
             mode="paper",
             executor_factory=_MultiFillLifecycleExecutor,
-            cold_start_marker_path=None,
         ).sync()
 
         async with get_session_ctx() as session:

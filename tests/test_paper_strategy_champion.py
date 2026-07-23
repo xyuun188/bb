@@ -112,7 +112,7 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
     activation = {
         "activation_stage": "canary",
         "paper_canary_authorized": True,
-        "production_influence_authorized": False,
+        "live_ml_ready": False,
         "champion_comparison": {
             "accepted": True,
             "reason": "challenger_quality_improved",

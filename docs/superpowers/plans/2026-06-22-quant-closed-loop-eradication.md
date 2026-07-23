@@ -959,7 +959,7 @@ AI 防偏要求：
 当前证据：
 
 - local ML 仍是 `degraded`。
-- `allow_live_position_influence=false`。
+- `live_ml_ready=false`。
 - 阻塞项为 long/short top return 低于阈值。
 - server_profit 在最新 entry 里仍多为反向或负贡献。
 - shadow missed opportunity 仍只能作为观察或复核证据，不能直接开仓。
@@ -1114,7 +1114,7 @@ AI 防偏要求：
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | A 乱码与文本治理 | 本地完成，真实库 dry-run 通过 | 只改文本治理写入边界、dry-run 审计脚本和系统巡检节点；不影响开仓/仓位/平仓/杠杆/模型权重/专家路由 | `pytest` 35 passed；脚本 `--help` 通过；Ruff/Black 局部通过 | 临时启动 DB 隧道后 dry-run 扫描 822 条：疑似记录 0、疑似字段 0、未修改数据；隧道已关闭 | 本轮统一提交（见 Git 历史） | 回滚本批改动文件即可；无 DB 迁移、无历史覆盖 | 还未部署线上服务；后续部署后需在系统巡检页面复查 `runtime_text_integrity` 节点 |
 | B 训练数据治理 | 本地完成，真实库 dry-run 通过 | 只改训练样本质量评估、shadow 隔离 dry-run、ML/Local AI 训练读入口与数据采集治理快照；不删除原始数据，不影响开仓/仓位/平仓/杠杆/模型权重 | `pytest` 42 passed；脚本 `--help` 通过；Ruff/Black 局部通过 | 临时 DB 隧道 dry-run 扫描 200 条 completed shadow：quarantined 0、top_reasons 空，未修改数据；隧道已关闭 | 本轮统一提交（见 Git 历史） | 回滚本批 touched files 即可；无 DB 迁移、无历史覆盖；如规则误伤可回退 `DATA_QUALITY_VERSION` v3 相关改动并重训 | 尚未部署线上服务；Batch C 需基于治理报告进入 ML readiness 状态机；真实交易行为改善仍需后续批次 |
-| C ML readiness | 本地完成，只读状态检查通过 | 只改 ML readiness 状态机、训练元数据指标、预测/状态接口 gating 与 dashboard 展示；不硬改 `ready`，不改开仓/仓位/平仓/杠杆/专家路由/真实模型权重 | `pytest` 16 passed；新增预测层 gating 回归测试；Ruff/Black 局部通过 | 只读检查本地模型：`status=learning_only`、`allow_live_position_influence=false`，阻塞项为样本/测试数不足、PR-AUC 缺失、训练数据版本旧、模型过旧；未修改真实交易状态 | 本轮统一提交（见 Git 历史） | 回滚本批 touched files 即可；无 DB 迁移、无历史覆盖；如 readiness 误判可回退 `services/ml_readiness.py` 与 ML status/predict 集成 | 尚未部署线上服务；旧模型因 v1 数据质量与 PR-AUC 缺失被保守锁为 learning_only，需后续重训/线上观察后才可能进入 ready |
+| C ML readiness | 本地完成，只读状态检查通过 | 只改 ML readiness 状态机、训练元数据指标、预测/状态接口 gating 与 dashboard 展示；不硬改 `ready`，不改开仓/仓位/平仓/杠杆/专家路由/真实模型权重 | `pytest` 16 passed；新增预测层 gating 回归测试；Ruff/Black 局部通过 | 只读检查本地模型：`status=learning_only`、`live_ml_ready=false`，阻塞项为样本/测试数不足、PR-AUC 缺失、训练数据版本旧、模型过旧；未修改真实交易状态 | 本轮统一提交（见 Git 历史） | 回滚本批 touched files 即可；无 DB 迁移、无历史覆盖；如 readiness 误判可回退 `services/ml_readiness.py` 与 ML status/predict 集成 | 尚未部署线上服务；旧模型因 v1 数据质量与 PR-AUC 缺失被保守锁为 learning_only，需后续重训/线上观察后才可能进入 ready |
 | C2 模型/专家体检 | 本地完成，真实库只读验证通过 | 只做模型/专家参与、采纳、收益、耗时、JSON 错误、未返回率体检与状态建议；不直接调整真实权重、不开启/禁用线上模型、不替换主链路 | `pytest` 29 passed；Ruff/Black 局部通过；新增只读完整报告接口 `/model-expert-health/status` 与系统巡检卡 | 临时 DB 隧道只读调用 C2 巡检卡成功：7 个组件、全部 `shadow_only` 复核建议、`live_weight_mutation=false`；未修改数据；隧道已关闭 | 本轮统一提交（见 Git 历史） | 回滚 `services/model_expert_health.py`、系统巡检接入与测试即可；无 DB 迁移、无权重/路由写入 | 尚未部署线上服务；当前真实库体检建议只是观察/复核，后续 C3 需建立基线竞赛后才能把贡献用于权重调整 |
 | C3 模型/专家竞赛 | 本地完成，真实库只读验证通过 | 建立只读竞赛报告、baseline 对比、shadow/sim/live 分层状态与权重建议来源；不直接提高/降低真实权重，不让新模型上线，不替换主链路 | `pytest` 18 passed；Ruff/Black 局部通过；新增只读完整报告接口 `/model-expert-competition/status` 与系统巡检卡 | 临时 DB 隧道只读调用 C3 巡检卡成功：`baseline_missing`、shadow 样本 1192、`can_apply_live_weight=false`、未修改数据；隧道已关闭 | 本轮统一提交（见 Git 历史） | 回滚 `services/model_expert_competition.py`、系统巡检接入与测试即可；无 DB 迁移、无权重/路由写入 | 当前真实库缺少可用 baseline outcome，竞赛报告只能阻塞真实权重判断；后续需补足 executed outcome 或模拟 A/B 账本后才可作为 C5 路由依据 |
 | C4 数字货币特征补强 | 本地完成，真实库只读验证通过 | 新增数字货币特征覆盖/新鲜度治理报告、数据采集页特征覆盖面板、系统巡检卡与只读接口；只做特征可用性审计，不改开仓/仓位/平仓/杠杆/模型权重/专家路由，不让缺失特征驱动实盘 | `pytest` 75 passed；Ruff/Black 局部通过；新增 `/crypto-feature-coverage/status` 与数据采集页 `feature_coverage` 只读返回 | 临时 DB 隧道只读调用 C4 报告和巡检卡成功：17 类特征、缺失 5、过期 0、已中性阻断 5、观测币种 56、`audit_only=true`、`live_signal_mutation=false`、`can_missing_features_drive_live_entry=false`、缺失策略 `neutral_blocked`；未修改数据；隧道已关闭 | 本轮统一提交（见 Git 历史） | 回滚 `services/crypto_feature_coverage.py`、系统巡检/数据采集接入、前端展示与测试即可；无 DB 迁移、无历史覆盖、无实盘参数改动 | 当前真实库仍缺少部分 C4 特征源，报告会阻断其真实开仓影响；后续如要让事件日历/清算/板块联动等进入可用状态，需先补真实采集来源和时间戳证据 |
@@ -1240,7 +1240,7 @@ AI 防偏要求：
 - 8 个 market 候选的 `score_gap = score - min_score_required` 全部为负：min -2.558195、median -1.989693、max -0.753132，说明当前不是下单链路丢单，而是证据评分未达开仓门槛。
 - `profit_quality_ratio`：min 0.361259、median 0.423606、max 0.469269；`loss_probability`：min 0.428200、median 0.541700、max 0.560100；`tail_risk_score`：min 0.342714、median 0.408209、max 0.441075。当前候选质量和风险结构仍偏弱。
 - expected net 组件拆解：`ai` 固定正贡献 0.15；`shadow_memory` 为正贡献且接近 cap；`local_ml` 全部 0；`server_profit` 全部负贡献；`fee` 和 `slippage` 全部负贡献；`timeseries` 仅小幅贡献。当前正 EV 主要由 AI 与影子错过机会支撑，尚不足以越过评分、质量和风险门槛。
-- `local_ml=0` 是 ML readiness 保护而非缺功能：线上模型最新训练于 2026-06-22T23:56:22Z，`sample_count=19982`、`test_count=4996`，但状态为 `degraded`、`allow_live_position_influence=false`。阻塞项包括 long PR-AUC 0.3587 < 0.52、short PR-AUC 0.3912 < 0.52、short top-score bucket return -0.011 < 0.05，以及 dirty/downweighted 样本比例 0.8976 > 0.08。质量报告显示 20,000 条 shadow 样本中 hold 17,947 条，主要原因是 `very_low_decision_confidence`、`hold_observation_downweighted`、`hold_missed_opportunity_downweighted`；不得硬改 ready 或放宽 readiness。
+- `local_ml=0` 是 ML readiness 保护而非缺功能：线上模型最新训练于 2026-06-22T23:56:22Z，`sample_count=19982`、`test_count=4996`，但状态为 `degraded`、`live_ml_ready=false`。阻塞项包括 long PR-AUC 0.3587 < 0.52、short PR-AUC 0.3912 < 0.52、short top-score bucket return -0.011 < 0.05，以及 dirty/downweighted 样本比例 0.8976 > 0.08。质量报告显示 20,000 条 shadow 样本中 hold 17,947 条，主要原因是 `very_low_decision_confidence`、`hold_observation_downweighted`、`hold_missed_opportunity_downweighted`；不得硬改 ready 或放宽 readiness。
 - `server_profit` 负贡献来自真实模型输出，不是字段映射错误：最新 market 候选中 `local-profit-trained-v2` 可用，但候选方向的 expected return 全为负，部分 best_side 只是“两边都负时较不差的一边”，因此 `local_profit_aligned=false`，expected net 组件中 server_profit 维持小幅负贡献约 -0.017 至 -0.028。不得把 best_side 文本当成正收益支持，也不得忽略负 expected return。
 
 手工系统巡检防偏口径：
@@ -1263,12 +1263,12 @@ AI 防偏要求：
 触发原因：前一轮已经证明 `local_ml=0` 是 ML readiness 保护，而不是 expected net 字段映射错误；但策略健康脚本本身没有直接输出 ML readiness、阻塞原因和训练质量摘要，后续 AI 仍可能把 `local_ml=0` 误读成“少接了一个功能”，进而走偏到硬改 `ready` 或放宽 readiness。因此本次只把 ML readiness 只读摘要接入策略健康脚本输出。
 
 本次修复范围：
-- `scripts/inspect_online_strategy_health.py`：新增 `local_ml_readiness_summary()`，调用 `MLSignalService().status()`，输出 `status/readiness_state/allow_live_position_influence/advisory_enabled/blocking_reason_codes/metrics/quality_totals/quality_top_reasons`。
-- `tests/test_inspect_online_strategy_health.py`：新增模板契约测试，锁定 `local_ml_readiness`、`allow_live_position_influence`、`blocking_reason_codes` 和质量原因字段，防止后续观察脚本退化。
+- `scripts/inspect_online_strategy_health.py`：新增 `local_ml_readiness_summary()`，调用 `MLSignalService().status()`，输出 `status/readiness_state/live_ml_ready/advisory_enabled/blocking_reason_codes/metrics/quality_totals/quality_top_reasons`。
+- `tests/test_inspect_online_strategy_health.py`：新增模板契约测试，锁定 `local_ml_readiness`、`live_ml_ready`、`blocking_reason_codes` 和质量原因字段，防止后续观察脚本退化。
 
 安全边界：
 - 本批只增加只读诊断字段，不改变开仓阈值、杠杆、仓位、平仓、模型权重、专家路由或风控门。
-- `local_ml_readiness.status=degraded` 与 `allow_live_position_influence=false` 必须被视为保护性阻断，不得硬改 `ready`，不得隐藏 blocking reasons，不得让未达标 ML 参与真实仓位放大。
+- `local_ml_readiness.status=degraded` 与 `live_ml_ready=false` 必须被视为保护性阻断，不得硬改 `ready`，不得隐藏 blocking reasons，不得让未达标 ML 参与真实仓位放大。
 - 影子错过机会、AI 正贡献或 expected net 为正，仍不能绕过 score gap、profit quality、loss probability、tail risk、server_profit 和交易执行契约。
 
 本地验证：
@@ -1283,13 +1283,13 @@ AI 防偏要求：
 - 120 分钟窗口（`2026-06-23T00:57:39Z`）：290 decisions，其中 `market_decisions=98`、`position_review_decisions=192`、`market_entry_decisions=11`；11 个 market 候选全部为 `risk_check:skipped`，`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
 - 120 分钟候选证据链：`expected_net_return_pct` 全部为正（min 0.280506、median 0.314058、max 0.337874），但 `position_size_pct` 全部为 0；`score_gap` 全部为负（min -2.578678、median -1.989693、max -0.753132），`profit_quality_ratio` median 0.419975，`loss_probability` median 0.5436，`tail_risk_score` median 0.399856。当前仍是候选质量与风险门未过，不是下单链路丢单。
 - expected net 组件拆解：`ai` 固定正贡献 0.15，`shadow_memory` 约 0.35 且为正，`local_ml` 全部 0，`server_profit` 全部负贡献（约 -0.017 到 -0.028），`fee/slippage` 为负，`timeseries` 仅小幅贡献。
-- `local_ml_readiness` 直连结果：`available=true`、`status=degraded`、`readiness_state=degraded`、`allow_live_position_influence=false`、`advisory_enabled=false`；阻塞项为 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`。
+- `local_ml_readiness` 直连结果：`available=true`、`status=degraded`、`readiness_state=degraded`、`live_ml_ready=false`、`advisory_enabled=false`；阻塞项为 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`。
 - ML 指标：`sample_count=19982`、`test_count=4996`、`dirty_sample_ratio=0.8979`、`long_pr_auc=0.372210098695988`、`short_pr_auc=0.38521014983148383`、`top_long_avg_return_pct=0.10222611240077366`、`top_short_avg_return_pct=-0.10458550472034482`、`training_data_version=2026-06-23.v3`。质量汇总为 total 20000、included 2042、downweighted 17940、excluded 18；主要原因仍是 `shadow:very_low_decision_confidence`、`shadow:hold_observation_downweighted`、`shadow:hold_missed_opportunity_downweighted`。
 
 同步后复查：
 - `python scripts/sync_to_online_server.py --split-services` 已同步 2 个变更文件：`docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`、`scripts/inspect_online_strategy_health.py`；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302` 健康响应。
 - 部署后 10 分钟窗口（`2026-06-23T01:01:22Z`）：21 decisions，其中 `market_decisions=9`、`position_review_decisions=12`、`market_entry_decisions=1`；该候选为 `risk_check:skipped`，`executed_entries=0`、`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`。
-- 部署后 120 分钟窗口（`2026-06-23T01:01:22Z`）：291 decisions，其中 `market_decisions=101`、`position_review_decisions=190`、`market_entry_decisions=11`；11 个 market 候选全部 `risk_check:skipped`，`orders=0`、`failed_orders=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。`local_ml_readiness` 仍为 degraded 且 `allow_live_position_influence=false`。
+- 部署后 120 分钟窗口（`2026-06-23T01:01:22Z`）：291 decisions，其中 `market_decisions=101`、`position_review_decisions=190`、`market_entry_decisions=11`；11 个 market 候选全部 `risk_check:skipped`，`orders=0`、`failed_orders=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。`local_ml_readiness` 仍为 degraded 且 `live_ml_ready=false`。
 - 稳定口径系统巡检（`record_history=False`，Python/dotenv 加载 `/data/bb/app/.env` 与 `/etc/bb/bb-runtime.env` 后以 OS 用户 `bb` 执行）：整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；`issue_ledger` fixed 5、unresolved 7、observing 4。`trade_loop` 最近 2 小时有分析但 0 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh；`trade_execution_contract.current_summary.contract_violation_count=0`、`weak_evidence_executed_count=0`、`fast_loss_without_strong_exit_count=0`，历史 24h violation 仍保留为 warning。`runtime_text_integrity` 为 ok，扫描 815 条、疑似记录 0。
 
 当前结论：
@@ -1335,7 +1335,7 @@ AI 防偏要求：
 - 部署后 10 分钟窗口（`2026-06-23T01:24:53Z`）：32 decisions，其中 `market_decisions=12`、`position_review_decisions=19`、`entry_decisions=2`、`market_entry_decisions=1`；`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。该 market 候选为 `blocked`，最终 `entry_pre_execution_skip`，实际下单方向费后预期净收益为 -0.071697%，系统未提交订单。
 - 部署后 120 分钟窗口（`2026-06-23T01:24:53Z`）：314 decisions，其中 `market_decisions=129`、`position_review_decisions=184`、`entry_decisions=13`、`market_entry_decisions=12`；`orders=0`、`failed_orders=0`、`positions_created=0`、`positions_closed=0`、`fast_loss_close_under_15m=0`，open_positions 仍为 2。
 - 120 分钟窗口的 12 个 market 候选全部为 `market_entry_evidence_tier_counts.blocked=12`；最终 `market_entry_final_skip_kind_counts` 为 `entry_evidence_wait=11`、`entry_pre_execution_skip=1`；`market_entry_evidence_effective_score_stats` 为 min 28.76099、median 31.25256、max 34.41474；`hard_block=0`、`shadow_only=0`、`tradeable_probe=0`。
-- 120 分钟窗口组件状态：`ai:aligned=12`、`shadow_memory:aligned=12`、`ml:ignored=12`、`timeseries:aligned=11`，但 `sentiment:opposite=11`、`server_profit:opposite=9`、`server_profit:ignored_negative_expected=3`、`symbol_side_history:opposite=2`。`local_ml_readiness` 仍为 `degraded` 且 `allow_live_position_influence=false`。
+- 120 分钟窗口组件状态：`ai:aligned=12`、`shadow_memory:aligned=12`、`ml:ignored=12`、`timeseries:aligned=11`，但 `sentiment:opposite=11`、`server_profit:opposite=9`、`server_profit:ignored_negative_expected=3`、`symbol_side_history:opposite=2`。`local_ml_readiness` 仍为 `degraded` 且 `live_ml_ready=false`。
 - 稳定口径系统巡检（`record_history=False`，Python/dotenv 加载 app/runtime env 后以 OS 用户 `bb` 执行）：整体 `warning`，`critical_cards=[]`，cards 16、warning 11、ok 5；`issue_ledger` fixed 5、unresolved 7、observing 4。`trade_loop` 最近 2 小时 310 decisions、0 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh；`trade_execution_contract.current_summary.contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`，历史 24h violation 仍保留为 warning；`runtime_text_integrity` 为 ok，扫描 815 条。
 
 当前结论：
@@ -1387,7 +1387,7 @@ AI 防偏要求：
 - 部署后 120 分钟窗口（`2026-06-23T02:33:58Z`）：330 decisions，其中 `market_decisions=133`、`position_review_decisions=196`、`entry_decisions=14`、`market_entry_decisions=13`；`orders=3`、`filled_orders=2`、`rejected_orders=1`、`pending_or_open_orders=0`、`positions_created=1`、`positions_closed=1`、`fast_loss_close_under_15m=1`。该窗口仍包含同步前 SAHARA 拒单与 ZETA 快亏样本。
 - 120 分钟窗口中 SAHARA 拒单 example 的 `execution_result` 仍为空，证明历史拒单的 OKX raw error 未能倒推恢复；本批修复只保证未来 `exchange_not_confirmed` 路径会写入 `execution_result.raw_response`。
 - 部署后 120 分钟 market entry evidence：阈值仍为 weak_probe 35、exploration 45、small 60、medium 70、normal 80；tier 统计为 `blocked=9`、`weak_conflict_probe=2`、`exploration=2`；raw score median `41.264163`，effective score median `34.40461`，score offset median `10.0`。
-- `local_ml_readiness` 仍为 `degraded`，`allow_live_position_influence=false`；阻塞项仍包括 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`，不得硬改 ready 或让未达标 ML 放大仓位。
+- `local_ml_readiness` 仍为 `degraded`，`live_ml_ready=false`；阻塞项仍包括 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`，不得硬改 ready 或让未达标 ML 放大仓位。
 - 稳定口径系统巡检（`record_history=False`，继承 dashboard 环境、以 OS 用户 `bb` 和 `/data/bb/app/.venv/bin/python` 执行）：整体 `warning`，`critical_cards=[]`，cards 16、warning 9、ok 7；`trade_loop` 为 ok，最近 2 小时 3 orders、open_positions 2、`market_analysis_paused=false`、runtime heartbeat fresh。
 - `trade_execution_contract` 巡检为 ok；全窗口 summary 中 `weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`、`contract_violation_count=0`。当前 runtime window 自 `2026-06-23T02:28:34Z` 起：25 decisions、0 executed entries、0 weak evidence executed、0 fast loss without strong exit、0 contract violations。
 - `runtime_text_integrity` 为 ok，扫描 810 条记录，疑似乱码记录 0；本轮没有引入新的运行时文本污染。
@@ -1471,7 +1471,7 @@ AI 防偏要求：
 - `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `scripts/inspect_online_strategy_health.py`，未重启交易服务。
 - 同步后 120m 观察窗口（`2026-06-23T03:41:22Z`）：346 decisions、12 entry_decisions、11 market_entry_decisions、orders 2、filled_orders 2、rejected_orders 0、positions_created 1、positions_closed 1、fast_loss_close_under_15m 1、open_positions 2。SAHARA 拒单已滚出 120m，ZETA 快亏仍在窗口内。
 - 同步后 `market_entry_final_skip_kind_counts` 为 `entry_evidence_shadow_only=5`、`entry_evidence_wait=5`、`executed=1`，不再出现 `unknown`。
-- 同步后 `market_entry_evidence_tier_counts` 为 `blocked=5`、`weak_conflict_probe=5`、`exploration=1`；`tradeable_probe_count=1`、`shadow_only_count=5`、`hard_block_count=0`。ML 仍为 `degraded`，`allow_live_position_influence=false`。
+- 同步后 `market_entry_evidence_tier_counts` 为 `blocked=5`、`weak_conflict_probe=5`、`exploration=1`；`tradeable_probe_count=1`、`shadow_only_count=5`、`hard_block_count=0`。ML 仍为 `degraded`，`live_ml_ready=false`。
 
 当前结论：
 - 这轮修复降低了观察误读风险：已执行/交易所未确认路径不会再被归为 `unknown`。
@@ -1630,7 +1630,7 @@ AI 防偏要求：
 
 线上同步与复查：
 - `python scripts/sync_to_online_server.py --split-services` 已同步 `web_dashboard/static/js/dashboard.js` 并重启 split services；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
-- 后端同环境直接调用 `get_data_collection_status()` 和 `get_ml_signal_status()` 均可返回；当前数据采集特征覆盖为 warning（缺失 5、过期 0），本地 ML 为 `degraded` 且 `allow_live_position_influence=false`，不是接口整体不可用。
+- 后端同环境直接调用 `get_data_collection_status()` 和 `get_ml_signal_status()` 均可返回；当前数据采集特征覆盖为 warning（缺失 5、过期 0），本地 ML 为 `degraded` 且 `live_ml_ready=false`，不是接口整体不可用。
 
 当前结论：
 - 如果用户页面同时出现系统巡检、数据采集、本地 ML 接口异常，优先检查登录态/401 和前端 fetch fallback；不要直接判定三个业务接口全部坏。
@@ -1655,7 +1655,7 @@ AI 防偏要求：
 
 安全边界：
 - 本批只补只读诊断字段，不改变 ML 训练阈值、readiness 状态机、模型权重、专家路由、开仓阈值、仓位、杠杆、平仓或风控 veto。
-- `dirty_sample_ratio_high` 不能被简单理解为阈值太严；当前 PR-AUC 未达标且 short top return 为负，必须继续保持 `allow_live_position_influence=false`。
+- `dirty_sample_ratio_high` 不能被简单理解为阈值太严；当前 PR-AUC 未达标且 short top return 为负，必须继续保持 `live_ml_ready=false`。
 - hold 样本主导说明训练数据结构仍不利于实盘收益判断；后续如果要修训练链路，必须先做 TDD 与离线验证，不能直接让 ML 参与真实仓位。
 
 本地验证：
@@ -1670,7 +1670,7 @@ AI 防偏要求：
 线上复查：
 - `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `scripts/inspect_online_strategy_health.py`，未重启交易服务。
 - 同步后 15m 观察窗口（`2026-06-23T03:48:18Z`）：44 decisions、0 entry_decisions、0 orders、0 rejected_orders、0 fast_loss_close_under_15m、open_positions 2。
-- `local_ml_readiness` 仍为 `degraded`，`allow_live_position_influence=false`；metrics 为 sample_count 19,982、test_count 4,996、dirty_sample_ratio 0.8988、long_pr_auc 0.3972、short_pr_auc 0.3765、top_short_avg_return_pct -0.0312。
+- `local_ml_readiness` 仍为 `degraded`，`live_ml_ready=false`；metrics 为 sample_count 19,982、test_count 4,996、dirty_sample_ratio 0.8988、long_pr_auc 0.3972、short_pr_auc 0.3765、top_short_avg_return_pct -0.0312。
 - 新增诊断字段显示 `quality_top_actions` 为 `shadow:hold=17970`、`shadow:short=1352`、`shadow:long=678`；`quality_top_reasons` 为 `shadow:very_low_decision_confidence=17970`、`shadow:hold_observation_downweighted=10603`、`shadow:hold_missed_opportunity_downweighted=7367`。
 
 当前结论：
@@ -1711,14 +1711,14 @@ AI 防偏要求：
 - 线上正式 `load_shadow_training_rows(limit=20000)` 只读 dry-run 耗时约 5.117s，返回 row type 为 `ShadowTrainingRow`；样本组成变为 `decision_action`: hold 15,000、long 1,950、short 3,050，非 hold 决策样本 5,000；`best_action`: hold 7,986、long 5,875、short 6,139，best-action 交易样本 12,014。
 - dry-run 未重训、未写 DB、未改模型 artifact、未改变线上交易参数。
 - 正式同步重启：`python scripts/sync_to_online_server.py --split-services` 后 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard `302`；由于代码文件已在 dry-run 前同步，本次正式同步只上传总控文档并重启服务，让新 loader 进入长期服务进程。
-- 重启后 15m 健康窗口：32 decisions，全部 hold；entry/orders/rejected/fast_loss 均为 0，open_positions 3；`local_ml_readiness` 仍为 degraded，`allow_live_position_influence=false`。
+- 重启后 15m 健康窗口：32 decisions，全部 hold；entry/orders/rejected/fast_loss 均为 0，open_positions 3；`local_ml_readiness` 仍为 degraded，`live_ml_ready=false`。
 - 重启后 120m 健康窗口：316 decisions，9 entry decisions，1 filled order，0 failed/rejected，0 fast_loss_close_under_15m，open_positions 3；该 1 笔成交发生在本批正式同步前，不能作为本批新执行样本。
 - 重启后系统巡检（`record_history=False`）：overall `warning`，`critical_cards=[]`，cards 16；`trade_execution_contract` 为 ok，current_summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`runtime_text_integrity` 为 ok。`model_training` 仍为 warning，但详情是学习观察、可选外部事件源未配置和运行探针超时，不是本批引入的交易执行风险。
 
 当前结论：
 - 这轮解决的是 ML 训练入口的样本窗口偏斜和加载性能问题：未来训练不会再被最近 hold 样本完全淹没，也不会因完整 ORM 装载 20,000 条而接近或超过超时。
 - 这不等于 ML 已经 ready。当前模型是否能参与真实仓位，仍必须看下一次训练后的 readiness 报告和线上观察指标。
-- 后续继续推进时，优先观察下一次训练的 `quality_top_actions`、PR-AUC、top/bottom return、dirty ratio、`allow_live_position_influence`，不得把样本平衡当成放宽开仓或放大仓位的理由。
+- 后续继续推进时，优先观察下一次训练的 `quality_top_actions`、PR-AUC、top/bottom return、dirty ratio、`live_ml_ready`，不得把样本平衡当成放宽开仓或放大仓位的理由。
 
 回滚点：
 - 代码层可回滚 `services/ml_signal_service.py` 与 `tests/test_ml_signal_training_quality.py`；本批无 DB 迁移、无历史覆盖、无模型 artifact 替换、无真实交易参数放宽。
@@ -1738,7 +1738,7 @@ AI 防偏要求：
 安全边界：
 - `--dry-run` 只能用于离线评估，不代表模型被部署，也不代表 readiness 变成 ready。
 - dry-run 指标通过时，也不得自动启用 ML 实盘影响；必须另走正式训练、artifact 替换、readiness 复查、线上观察和停止规则检查。
-- dry-run 指标不通过时，必须继续保持 `degraded/learning_only` 与 `allow_live_position_influence=false`，不得硬改 ready、降低 PR-AUC 门槛、放宽 dirty ratio、强开 probe、放大仓位或绕过风控 veto。
+- dry-run 指标不通过时，必须继续保持 `degraded/learning_only` 与 `live_ml_ready=false`，不得硬改 ready、降低 PR-AUC 门槛、放宽 dirty ratio、强开 probe、放大仓位或绕过风控 veto。
 - 本批不改变开仓阈值、仓位、杠杆、平仓、专家路由、模型权重、风险 veto 或真实交易执行逻辑。
 
 本地验证：
@@ -1760,7 +1760,7 @@ AI 防偏要求：
 - `python scripts/sync_to_online_server.py --split-services` 已同步总控文档；本轮代码文件此前已同步到线上，最终同步实际上传 1 个 changed file。同步后 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均为 active，Dashboard 返回 `302`。
 - 同步后 15m 健康摘要（`2026-06-23T06:09:33Z`）：39 decisions、15 market decisions、0 entry decisions、0 orders、0 rejected orders、0 fast_loss_close_under_15m、open_positions 3；没有触发新增执行风险。
 - 同步后 120m 健康摘要（`2026-06-23T06:09:34Z`）：325 decisions、11 entry decisions、9 market_entry_decisions、1 filled order、0 failed/rejected orders、0 fast_loss_close_under_15m、open_positions 3；该 1 笔 filled 属于窗口内历史样本，不证明本批 dry-run 闸门启用了 ML 或制造了新交易。
-- 同步后 `local_ml_readiness` 仍为 `degraded` 且 `allow_live_position_influence=false`；阻塞项仍为 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`。当前 artifact 状态仍在保护系统不让未达标 ML 影响实盘。
+- 同步后 `local_ml_readiness` 仍为 `degraded` 且 `live_ml_ready=false`；阻塞项仍为 `long_pr_auc_below_threshold`、`short_pr_auc_below_threshold`、`short_top_return_below_threshold`、`dirty_sample_ratio_high`。当前 artifact 状态仍在保护系统不让未达标 ML 影响实盘。
 - 同步后系统巡检（`record_history=False`）：overall `warning`，但 `critical_cards=[]`；`trade_execution_contract` 为 ok，current_summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`runtime_text_integrity` 为 ok，suspected_records 0、suspected_fields 0。`model_training` 仍为 warning，原因是可选增强数据源、运行探针或学习观察，不是本批新增交易执行风险。
 
 当前结论：
@@ -1812,7 +1812,7 @@ AI 防偏要求：
 - `python scripts/sync_to_online_server.py --split-services` 已同步总控文档并重启 `bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service`；三项服务均 active，Dashboard 返回 `302`。
 - 重启后 15m 健康摘要（`2026-06-23T07:00:53Z`）：36 decisions、10 market decisions、2 entry decisions、1 market_entry_decision、1 order、0 failed/rejected orders、1 fast_loss_close_under_15m、open_positions 6；该快亏样本为 `WLFI/USDT` short，持仓约 13.84 分钟，realized_pnl `-0.064212`，notional 约 `18.5896`。
 - 重启后 120m 健康摘要（`2026-06-23T07:01:08Z`）：346 decisions、116 market decisions、15 entry decisions、12 market_entry_decisions、5 orders，全部 filled，0 failed/rejected orders、1 fast_loss_close_under_15m、open_positions 6。
-- 重启后 `local_ml_readiness` 仍为 `degraded` 且 `allow_live_position_influence=false`；当前线上 artifact 的 readiness metrics 仍显示 `dirty_sample_ratio=0.7571`、`long_pr_auc=0.34560508478282215`、`short_pr_auc=0.3761940221638387`、`top_short_avg_return_pct=-0.037152709390829576`。
+- 重启后 `local_ml_readiness` 仍为 `degraded` 且 `live_ml_ready=false`；当前线上 artifact 的 readiness metrics 仍显示 `dirty_sample_ratio=0.7571`、`long_pr_auc=0.34560508478282215`、`short_pr_auc=0.3761940221638387`、`top_short_avg_return_pct=-0.037152709390829576`。
 - 重启后系统巡检（`record_history=False`，`2026-06-23T06:59:42Z`）：overall `warning`，但 `critical_cards=[]`，cards 16、warning 9、ok 7；`trade_execution_contract` 为 `ok`，24h summary 中 `contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`。
 - 当前运行窗口契约摘要：`decision_count=36`、`executed_entry_count=0`、`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_count=1`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`。因此当前存在快亏观察风险，但没有触发“快亏且无强退出证据”的硬停规则；后续如果快亏形成簇、出现无强退出快亏、失败/拒绝订单、弱证据执行或风控绕过，必须先停止推进并定位。
 - `runtime_text_integrity` 为 `ok`，扫描 809 条，suspected_records 0、suspected_fields 0；`model_training` 仍为 warning，主要来自可选增强数据源未配置与 runtime probe timeout，不是本批新增交易执行风险。
@@ -1861,7 +1861,7 @@ AI 防偏要求：
 
 线上只读复查：
 - `python scripts/sync_to_online_server.py --split-services --skip-restart` 已同步 `scripts/inspect_online_strategy_health.py`，未重启交易服务。
-- `python scripts/inspect_online_strategy_health.py --minutes 15 --summary`（`2026-06-23T08:44:31Z`）：50 decisions、0 orders、0 failed/rejected、0 fast_loss_close_under_15m、open_positions 6；`trade_execution_contract.status=ok`，`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`local_ml_readiness.status=degraded` 且 `allow_live_position_influence=false`。
+- `python scripts/inspect_online_strategy_health.py --minutes 15 --summary`（`2026-06-23T08:44:31Z`）：50 decisions、0 orders、0 failed/rejected、0 fast_loss_close_under_15m、open_positions 6；`trade_execution_contract.status=ok`，`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`；`local_ml_readiness.status=degraded` 且 `live_ml_ready=false`。
 - `python scripts/inspect_online_strategy_health.py --minutes 120 --summary`（`2026-06-23T08:44:31Z`）：408 decisions、2 orders、1 filled、1 rejected、positions_created 0、positions_closed 1、open_positions 6、`fast_loss_close_under_15m=1`。
 - 120m 拒单样本为 order `2561`、decision `118360`、`TSLA/USDT`、buy、`status=rejected`、`quantity=0`、`exchange_order_id=null`；OKX raw error 为 `sCode=51155`，原因是本地合规限制导致该 pair 不可交易。该样本没有成交，不得计入收益样本。
 - 120m 快亏样本为 position `1614`、`WLFI/USDT` short，持仓约 `13.844` 分钟，realized_pnl `-0.0642124`，notional `18.5896`；同窗口 `trade_execution_contract.summary.fast_loss_without_strong_exit_count=0`，因此它是快亏观察风险，不是“无强退出证据快亏”的硬停违规。
@@ -1870,7 +1870,7 @@ AI 防偏要求：
 当前结论：
 - 本轮解决的是策略健康观察口径防偏和输出可靠性问题，不是收益闭环完成。
 - 当前 15m 窗口干净；120m 窗口仍包含 1 条 TSLA/USDT 拒单和 1 条 WLFI/USDT 快亏观察样本。拒单/快亏观察风险仍要求继续监控，不能据此推进仓位放大、阈值放宽或 ML live influence。
-- 后续 AI 执行总控时必须优先看 `--summary` 输出中的 `rejected_orders`、`failed_orders`、`trade_execution_contract.summary`、`violations`、`fast_loss_samples`、`local_ml_readiness.allow_live_position_influence`，再决定是否继续下一步；不能只看完整报告里的某一个计数。
+- 后续 AI 执行总控时必须优先看 `--summary` 输出中的 `rejected_orders`、`failed_orders`、`trade_execution_contract.summary`、`violations`、`fast_loss_samples`、`local_ml_readiness.live_ml_ready`，再决定是否继续下一步；不能只看完整报告里的某一个计数。
 
 回滚点：
 - 代码层可回滚 `scripts/inspect_online_strategy_health.py` 与 `tests/test_inspect_online_strategy_health.py`；本批无 DB 迁移、无历史覆盖、无服务重启、无模型 artifact 替换、无真实交易参数放宽。
@@ -1904,7 +1904,7 @@ AI 防偏要求：
 
 线上同步与只读复查：
 - `python scripts/sync_to_online_server.py --split-services` 已同步 `services/entry_opportunity_gate.py` 与 `services/trading_service.py` 并重启服务；`bb-model-tunnels.service`、`bb-paper-trading.service`、`bb-dashboard.service` 均 active，Dashboard 返回 `302`。
-- 部署后 15m 摘要（`2026-06-23T09:12:18Z`）：33 decisions、0 orders、0 failed/rejected、0 fast_loss_close_under_15m、open_positions 6；`trade_execution_contract.status=ok`，全部 violation counters 为 0；`local_ml_readiness.status=degraded` 且 `allow_live_position_influence=false`。
+- 部署后 15m 摘要（`2026-06-23T09:12:18Z`）：33 decisions、0 orders、0 failed/rejected、0 fast_loss_close_under_15m、open_positions 6；`trade_execution_contract.status=ok`，全部 violation counters 为 0；`local_ml_readiness.status=degraded` 且 `live_ml_ready=false`。
 - 部署后 120m 摘要（`2026-06-23T09:12:18Z`）：425 decisions、1 order、0 filled、1 failed/rejected、open_positions 6、0 fast_loss_close_under_15m；拒单仍是部署前旧 `TSLA/USDT` order `2561`，订单时间 `2026-06-23T07:45:10Z`，会随 120m 窗口滚出。
 - 当前没有新增弱证据执行、负预期执行、无强退出快亏、loss re-entry 或风控绕过；但 Batch H 仍未完成，不能据此推进仓位放大、阈值放宽或 ML live influence。
 
@@ -1929,12 +1929,12 @@ AI 防偏要求：
 - `services/secure_runtime_config.py`：当 systemd runtime env 已注入 `LOCAL_AI_TOOLS_API_KEY` 时，启动加载 secure settings 不再用旧的 `local_ai_tools.api_key` 密文覆盖它；修复 18001 本地量化工具明明 runtime key 正确、Dashboard 启动后却被旧 key 覆盖成 401 的问题。
 - `web_dashboard/api/system_health.py`：系统自检的 `recent_failed_orders` 补查订单关联 `decision_id`，并将明确归因为 OKX 51155、合规限制、不可交易 symbol 等已处理终态拒单降为 `info`；未知拒单、未决单、未归因终态失败仍保持 warning。
 - `web_dashboard/api/system_health.py`：运行时模型自检只把当前固定专家槽和高风险复核模型视为必需模型；额外/旧配置模型如 `deepseek-v4-pro` 探测失败只作为环境观察项，不再拖红当前系统。
-- `web_dashboard/static/js/dashboard.js`：Local ML `degraded/learning_only` 且 `allow_live_position_influence=false` 时展示为“学习观察” warning，不再渲染成红色异常；模型接口不可用时仍然是 bad。
+- `web_dashboard/static/js/dashboard.js`：Local ML `degraded/learning_only` 且 `live_ml_ready=false` 时展示为“学习观察” warning，不再渲染成红色异常；模型接口不可用时仍然是 bad。
 
 安全边界：
 - 本批不修改开仓阈值、证据 tier、仓位、杠杆、平仓、模型权重、专家路由、ML readiness 门槛、风控 veto 或真实交易执行逻辑。
 - `crypto_feature_coverage.status=warning` 仍是真实数据质量 warning：当前缺失 `liquidation_risk`、`btc_eth_anchor`、`sector_correlation`、`abnormal_wick`、`event_calendar`，缺失特征继续按 `neutral_blocked` 处理，不能改成 ok。
-- 本地 ML `readiness_state=degraded` 且 `allow_live_position_influence=false` 是真实受控降级，不允许后续 AI 为了页面全绿而强行 ready、降低 PR-AUC/样本质量门槛或允许实盘仓位影响。
+- 本地 ML `readiness_state=degraded` 且 `live_ml_ready=false` 是真实受控降级，不允许后续 AI 为了页面全绿而强行 ready、降低 PR-AUC/样本质量门槛或允许实盘仓位影响。
 - `recent_failed_orders` 只对“终态 + 明确已处理归因”的拒单降级；未知失败单、pending/open/partial 订单、没有执行原因的拒单仍必须保留 warning。
 - runtime env 保护只针对 `LOCAL_AI_TOOLS_API_KEY`，不改变 OKX、AI provider、高风险复核和数据源密钥的 secure settings 加载规则。
 
@@ -1953,7 +1953,7 @@ AI 防偏要求：
 - 系统巡检页：overall `warning`，但 `critical=0`；cards 16、warning 10、ok 6；`model_training` 为 warning，`hard_failure=false`、`observing=true`、`runtime_probe.status=ok`、`ai_model_count=2`；`crypto_feature_coverage` 为 warning 且 `error=null`。
 - 系统自检页：overall `ok`；critical 0、warning 0、ok 15、info 2；`recent_failed_orders` 已降为 info，order `2561` 为已处理终态拒单，`handled_terminal_failure_count=1`、`unhandled_terminal_failure_count=0`、`has_unresolved_order=false`。
 - 服务器监控页：`status=ok`、`available=true`、`remote_monitor_available=true`；`qwen3-14b-trade` 与 `deepseek-r1-14b-risk` 均 `available=true`；`local_ai_tools_available=true`、`local_ai_tools_status_ok=true`。
-- 本地 ML 页后端：`ml_signal_status.available=true`、`status=degraded`、`readiness_state=degraded`、`allow_live_position_influence=false`、`influence_enabled=false`；`local_ai_tools_status.available=true`、`service_available=true`。
+- 本地 ML 页后端：`ml_signal_status.available=true`、`status=degraded`、`readiness_state=degraded`、`live_ml_ready=false`、`influence_enabled=false`；`local_ai_tools_status.available=true`、`service_available=true`。
 
 当前结论：
 - 本轮已处理用户可见 Dashboard 健康面的“异常/误报/密钥覆盖/旧拒单”问题：数据采集不再抛特征覆盖 TimeoutError，Local AI tools 不再因旧 secure key 被 401，服务器监控恢复 ok，系统自检不再把已处理 TSLA 拒单当成新故障。
@@ -2040,7 +2040,7 @@ AI 防偏要求：
 - 2026-06-23 11:42 UTC 只读窗口：最近 120 分钟共 411 条 decisions，其中 market decisions 122 条、market unique symbols 34 个；market top symbols 为 ETH 10、CL 9、BZ 8、SUI 7、XRP 7、LPT 7、CRV 6、HOOD 6 等。说明“只扫几个固定币”不成立。
 - 同一窗口最终 market entry candidates 只有 8 条，集中在 3 个 symbol：XRP 4、HOOD 3、SOL 1；动作分布为 short 5、long 3。说明“经过排序/门禁后候选集中在少数币”是事实。
 - 同一窗口 entry skip 为 `entry_evidence_wait=6`、`entry_pre_execution_skip=1`、`entry_evidence_shadow_only=1`；evidence tier 为 `blocked=7`、`weak_conflict_probe=1`。同期策略健康仍为 orders 0、failed/rejected 0、positions_created/closed 0、fast_loss_close_under_15m 0，交易执行契约为 ok。
-- 本地 ML 仍为 `degraded`，`allow_live_position_influence=false`；阻塞项仍包括 long AUC/PR-AUC/accuracy 低、short PR-AUC/top return 低、dirty sample ratio 高等。当前 0 开仓更像是候选质量、证据强度、预期收益质量、ML 降级和风控门共同作用，不是订单提交链路丢单。
+- 本地 ML 仍为 `degraded`，`live_ml_ready=false`；阻塞项仍包括 long AUC/PR-AUC/accuracy 低、short PR-AUC/top return 低、dirty sample ratio 高等。当前 0 开仓更像是候选质量、证据强度、预期收益质量、ML 降级和风控门共同作用，不是订单提交链路丢单。
 
 安全边界：
 - 本批只修 UI/API 展示一致性、前端 JS 作用域和只读诊断记录，不修改开仓阈值、证据 tier、仓位、杠杆、平仓、模型权重、专家路由、ML readiness、风控 veto 或真实交易执行逻辑。
@@ -2099,7 +2099,7 @@ AI 防偏要求：
 线上只读复查：
 - `python scripts/inspect_online_strategy_health.py --minutes 120 --summary`（`2026-06-23T11:48:06Z`）：413 decisions、0 orders、0 failed/rejected、0 positions_created/closed、open_positions 6、fast_loss_close_under_15m 0。
 - 交易执行契约仍为 ok：`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`、`reentry_without_strong_unlock_count=0`。
-- ML 仍为 `degraded`，`allow_live_position_influence=false`，阻塞项仍包括 long AUC/PR-AUC/accuracy、short PR-AUC/top return 和 dirty sample ratio。
+- ML 仍为 `degraded`，`live_ml_ready=false`，阻塞项仍包括 long AUC/PR-AUC/accuracy、short PR-AUC/top return 和 dirty sample ratio。
 - 新增 `market_symbol_diagnostics` 当前窗口显示：market decisions 121、market unique symbols 34、market top3 share 0.22314；market entry candidates 8、market entry unique symbols 3、market entry top symbols 为 XRP 4、HOOD 3、SOL 1，market entry top3 share 1.0，`entry_unique_to_market_unique_ratio=0.088235`。
 - market entry skip/tier 当前仍为 `entry_evidence_wait=6`、`entry_pre_execution_skip=1`、`entry_evidence_shadow_only=1`；`blocked=7`、`weak_conflict_probe=1`。结论仍是候选末端证据不足，非下单链路丢单。
 
@@ -2194,7 +2194,7 @@ AI 防偏要求：
 - 现在可以实事求是地回答用户：系统确实有全市场候选池和轮转，最近窗口 market unique symbols 并不低；但每轮真正送入 AI 深度 market 分析的不是 120 个，而是 feature fetch 预算取 12 个，再由动态 market budget/ranker 通常收窄到 2 个。
 - 这会造成协作记录里 market 分析 symbol 看起来相似，也可能是长期不开仓的上游原因之一：AI 反复看到少量高排名候选，如果这些候选 evidence tier 长期 blocked/weak，就会持续不开仓。
 - 但当前仍不能把问题简单归因于“没有全市场筛选”，也不能直接提高 market_symbol_limit 制造成交；提高预算会增加 LLM 资源占用并可能抢占持仓复盘，必须先评估延迟、watchdog、missed opportunity 质量和 ranker 淘汰分布。
-- 当前 0 订单仍不是下单链路丢单：交易执行契约 ok，failed/rejected 为 0，硬停计数为 0；ML 仍 degraded 且 `allow_live_position_influence=false`。
+- 当前 0 订单仍不是下单链路丢单：交易执行契约 ok，failed/rejected 为 0，硬停计数为 0；ML 仍 degraded 且 `live_ml_ready=false`。
 
 后续 AI 防偏要求：
 - 看到候选重复时，必须按五层顺序解释：OKX/auto scan 大池、feature fetch 预算、feature valid、ranker/budget 选中、entry evidence/skip_kind；缺一层都不能下结论。
@@ -2279,7 +2279,7 @@ AI 防偏要求：
 - 同一 60m 窗口：`market_symbol_budget` median 2、`rank_selected_count` median 2、`market_feature_after_dedupe_count` median 2、`rank_filtered_out_candidates` p75 8、`rank_underfilled_count=1`。这说明主要收窄发生在 budget/ranker 之后，而不是没有全市场候选。
 - 同一 60m 窗口 filtered reason 聚合：`analysis_notional_below_floor=132`、`analysis_volume_ratio_below_floor=127`、`recent_abnormal_wick=12`、`analysis_adx_below_floor=8`、`analysis_volatility_above_cap=4`、`analysis_day_change_above_cap=2`。
 - 120m 精简复核：437 decisions、130 market decisions、36 market unique symbols、5 market entry candidates、3 market entry unique symbols、58 candidate funnels；scan median 120、feature fetch median 12、feature valid median 12、market budget median 2、rank selected median 2、feature invalid zero 58、rank filtered out p75 8、recent dedupe positive 2。
-- 120m budget 复核：latest `market_limit_policy=position_first_low_risk_underfilled`，`configured_market_symbol_limit=8` 但 `selected_market_symbol_limit=2`，`roster_underfilled=true`。交易执行契约仍 `ok`，`executed_entry_count=0`；ML 仍 `degraded` 且 `allow_live_position_influence=false`。
+- 120m budget 复核：latest `market_limit_policy=position_first_low_risk_underfilled`，`configured_market_symbol_limit=8` 但 `selected_market_symbol_limit=2`，`roster_underfilled=true`。交易执行契约仍 `ok`，`executed_entry_count=0`；ML 仍 `degraded` 且 `live_ml_ready=false`。
 
 当前结论：
 - 现在可以明确回答用户：当前系统有全市场扫描池，最近窗口不是只盯固定几个交易对；但 AI 深度 market 分析链路会从 120 个扫描候选收窄到 12 个 feature fetch，再由 budget/ranker 通常收窄到 2 个送入 AI。
@@ -2322,7 +2322,7 @@ AI 防偏要求：
 - `python scripts/inspect_online_strategy_health.py --minutes 20 --market-symbol-only` 已完整返回，未再被 20,000 字符截断；`--summary` 也已改为窄版 market diagnostics 并完整返回。
 - 20m 窗口：73 decisions、17 market decisions、0 market entry decisions、0 orders、0 failed/rejected、0 positions_created/closed、open_positions 5、fast_loss_close_under_15m 0。
 - 交易执行契约：`status=ok`，`executed_entry_count=0`、`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`。
-- ML readiness：仍为 `degraded`，`allow_live_position_influence=false`；阻塞项为 `long_pr_auc_below_threshold`、`long_top_return_below_threshold`、`short_pr_auc_below_threshold`；`long_pr_auc=0.335069`、`short_pr_auc=0.407735`、`top_long_avg_return_pct=-0.052489`、`top_short_avg_return_pct=0.172264`。
+- ML readiness：仍为 `degraded`，`live_ml_ready=false`；阻塞项为 `long_pr_auc_below_threshold`、`long_top_return_below_threshold`、`short_pr_auc_below_threshold`；`long_pr_auc=0.335069`、`short_pr_auc=0.407735`、`top_long_avg_return_pct=-0.052489`、`top_short_avg_return_pct=0.172264`。
 - 候选窗口：`scan_symbol_count` median 120，`feature_fetch_requested_count` median 48，`feature_valid_count` median 35，`market_symbol_budget` median 8，`rank_selected_count` median 4，`rank_filtered_out_candidates` median 30，`recent_analysis_dedupe_count` median 0。
 - ranker 过滤主因：`analysis_notional_below_floor=410`、`analysis_volume_ratio_below_floor=250`、`recent_abnormal_wick=21`、`analysis_adx_below_floor=12`、`analysis_volatility_above_cap=5`、`analysis_day_change_above_cap=2`。
 - 过滤/预算外回放：`sampled_symbol_count=71`、`sampled_occurrence_count=140`、`market_entry_after_filter_count=0`、`positive_expected_net_after_filter_count=0`、`executed_after_filter_count=0`。当前窗口没有证据表明被过滤/预算外 symbol 后续形成了正费后 entry 候选。
@@ -2412,7 +2412,7 @@ AI 防偏要求：
 - 系统自检：overall `ok`，summary 为 critical 0、warning 0、ok 15、info 1，problem_keys 为空。
 - 系统巡检：overall `warning`，但 `critical=0`、`unresolved=0`；issue ledger 为 `fixed=7`、`unresolved=0`、`observing=9`、`total=16`。`model_training.summary="模型服务可用；可选增强数据源未配置。"`，`hard_failure=false`、`runtime_probe.status=ok`、`ai_model_count=2`、`model_critical_items=[]`。
 - 策略健康 120m 摘要：405 decisions、3 orders、3 filled、failed/rejected/pending 均 0、positions_created 3、positions_closed 0、open_positions 8、fast_loss_close_under_15m 0；交易执行契约 `ok`，`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`。
-- local ML readiness：`status=ready`、`readiness_state=ready`、`allow_live_position_influence=true`、`blocking_reason_codes=[]`；训练窗口 5541 样本，long PR-AUC 0.5501、short PR-AUC 0.5599、top long return 0.4828%、top short return 0.3177%。
+- local ML readiness：`status=ready`、`readiness_state=ready`、`live_ml_ready=true`、`blocking_reason_codes=[]`；训练窗口 5541 样本，long PR-AUC 0.5501、short PR-AUC 0.5599、top long return 0.4828%、top short return 0.3177%。
 - 候选诊断仍显示真实观察项：120m 窗口 scan median 120、feature fetch median 48、feature valid median 46、market budget median 8、rank selected median 8；过滤主因仍为 notional/volume/异常影线等，`positive_expected_net_after_filter_count=0`。这说明当前不支持通过放宽质量底线、仓位、杠杆或 evidence 来“补成交”。
 
 当前结论：
@@ -2454,7 +2454,7 @@ AI 防偏要求：
 - `python scripts/inspect_online_strategy_health.py --minutes 120 --entry-only`（UTC `2026-06-23T21:05:28Z`，北京 `2026-06-24 05:05:28`）完整返回新字段。
 - 120m 窗口：406 decisions、95 market decisions、23 entry decisions、1 market entry decision、3 executed entries、3 orders、3 filled、failed/rejected 均 0、positions_created 3、positions_closed 0、open_positions 8、fast_loss_close_under_15m 0。
 - 交易执行契约：`status=ok`、`executed_entry_count=3`、`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`、`fast_loss_without_strong_exit_count=0`。
-- local ML readiness：`status=ready`、`allow_live_position_influence=true`、`blocking_reason_codes=[]`、训练窗口 5541 样本，long PR-AUC 0.5501、short PR-AUC 0.5599。
+- local ML readiness：`status=ready`、`live_ml_ready=true`、`blocking_reason_codes=[]`、训练窗口 5541 样本，long PR-AUC 0.5501、short PR-AUC 0.5599。
 - 已成交 entry 诊断：3 笔均为 `evidence_tier=exploration`、`sizing_quality=probe`、`decision_leverage=3x`；订单名义金额 median 30.408U、min 4.4996U、max 35.1434U；决策仓位比例 median 0.0021；expected net 全为正，median 0.714895；profit quality median 0.99291；loss probability median 0.4863；tail risk median 0.252338。
 - 小单原因计数：`low_payoff_quality=3`，其中 `notional_floor_blocked=2`；两笔明确写明“收益质量不足或小盈大亏风险偏高，不抬高仓位”。订单均 `filled`，不是交易所拒单或本地提交失败。
 
@@ -2510,7 +2510,7 @@ AI 防偏要求：
 - 远端代码复查确认包含 `_decision_execution_error_text`、`AIDecision.raw_llm_response` 查询和 `raw_llm_response.is_not(None)` 恢复条件。
 - 线上同环境只读探针显示：最近 30h 有 4 条 51155 样本，`RESOLV/USDT` 与 `COAI/USDT` 的 `execution_reason_has_51155=false`、`raw_has_51155=true`；新恢复逻辑已把 `RESOLV/USDT`、`COAI/USDT` 恢复为执行前 block，`TSLA/USDT` 与 `MAGIC/USDT` 当前未误拦截。
 - 部署后 `python scripts/inspect_online_strategy_health.py --minutes 20 --entry-only`：80 decisions、5 entry decisions、3 executed entries、4 orders、4 filled、failed/rejected/rejected_orders 均 0、open_positions 16、fast_loss_close_under_15m 0；交易执行契约 `status=ok`、`contract_violation_count=0`、`weak_evidence_executed_count=0`、`negative_expected_executed_count=0`。
-- 同一窗口 ML readiness 为 `ready`，`allow_live_position_influence=true`；但已成交 entry 仍主要为 `evidence_tier=exploration`、`sizing_quality=probe`、`low_payoff_quality=true`、`notional_floor_blocked`，订单名义金额约 11U-17U。
+- 同一窗口 ML readiness 为 `ready`，`live_ml_ready=true`；但已成交 entry 仍主要为 `evidence_tier=exploration`、`sizing_quality=probe`、`low_payoff_quality=true`、`notional_floor_blocked`，订单名义金额约 11U-17U。
 
 当前结论：
 - OKX 51155 这类“明知不可交易还重复提交”的浪费已处理到重启恢复层；后续同类 symbol 应在提交 OKX 前被 blocklist 拦截，而不是再次形成 rejected order。
@@ -3391,7 +3391,7 @@ Git 与线上部署：
   - 当 readiness blocker 包含 `long_top_return_below_threshold` 或 `short_top_return_below_threshold` 时，根因卡会输出：
     - `blocking_reason_codes`
     - `readiness_state`
-    - `allow_live_position_influence`
+    - `live_ml_ready`
     - `top_long_avg_return_pct`
     - `top_short_avg_return_pct`
     - `bottom_long_avg_return_pct`
@@ -3749,7 +3749,7 @@ Git 与线上部署：
 ## 六十九、Batch I 二期阶段 3 补充记录：ML 自动训练 artifact 晋级门，阻止 degraded 候选替换线上模型（2026-06-26）
 
 触发原因：
-- 继续二期收益闭环时，线上 6 小时根因审计显示 `ml_not_contributing` 与 `ml_top_return_not_profitable` 仍是核心阻塞；当前线上 `local_ml_readiness=degraded`，`allow_live_position_influence=false`。
+- 继续二期收益闭环时，线上 6 小时根因审计显示 `ml_not_contributing` 与 `ml_top_return_not_profitable` 仍是核心阻塞；当前线上 `local_ml_readiness=degraded`，`live_ml_ready=false`。
 - 生产等价 dry-run 训练评估显示，当前候选训练窗口没有任何 variant 通过 readiness；主要指标包括 long/short top bucket fee 后收益为负、long PR-AUC 不达标、top return 不优于 bottom bucket 等。
 - 复查 `MLSignalService.maybe_auto_train()` 发现自动训练会直接调用 `train_from_frame()` 的默认持久化路径：先写 `data/ml_signal/winrate_model.joblib` 和 metadata，再热加载。也就是说，即便新训练结果 degraded，也可能先替换线上 artifact。
 
@@ -3757,7 +3757,7 @@ Git 与线上部署：
 - `services/ml_signal_service.py`：自动训练改为两阶段晋级：
   - 第一阶段只调用 `train_from_frame(..., persist_artifact=False)` 生成候选元数据，不写模型文件、不热加载。
   - 立即使用现有 `_influence_policy()` 与 `build_ml_readiness_report()` 评估候选 readiness。
-  - 候选 `allow_live_position_influence=false` 时返回 `candidate_readiness_rejected`，保留上一版线上 artifact，并输出候选 metrics、readiness blockers、训练窗口组成和质量 totals。
+  - 候选 `live_ml_ready=false` 时返回 `candidate_readiness_rejected`，保留上一版线上 artifact，并输出候选 metrics、readiness blockers、训练窗口组成和质量 totals。
   - 只有候选 readiness 通过时，才第二次调用 `train_from_frame(..., persist_artifact=True)` 写 artifact，并热加载。
 - `services/ml_signal_service.py`：`training_policy` 增加 `promotion_requires_readiness=true`、`candidate_artifact_persisted=false`、`persist_artifact_only_when_readiness_allows_live_influence=true`，避免后续 AI 把“训练已跑”误读成“模型可上线影响交易”。
 - `services/ml_signal_service.py`：候选被拒后增加进程内冷却判断；在未达到重新评估间隔或新增样本门槛前，自动训练不会每 30 分钟反复跑同一批 degraded 候选。
@@ -3765,7 +3765,7 @@ Git 与线上部署：
 - `tests/test_trading_service_boundaries.py`：更新旧自动训练边界测试，明确 `force=True` 只强制评估候选，不代表绕过 readiness 强制写 artifact。
 
 安全边界：
-- 本批不降低 ML readiness 阈值，不硬启 `allow_live_position_influence`，不改变开仓阈值、收益质量门、server_profit、仓位、杠杆、止盈止损、OKX 下单或平仓规则。
+- 本批不降低 ML readiness 阈值，不硬启 `live_ml_ready`，不改变开仓阈值、收益质量门、server_profit、仓位、杠杆、止盈止损、OKX 下单或平仓规则。
 - 本批不替换线上模型 artifact；只有未来候选模型真实通过现有 readiness 才允许自动晋级。
 - 这不会直接让系统多开仓、放大仓位或立刻盈利；它解决的是“不要把不赚钱/不达标的候选模型写上线继续污染判断”。
 - 如果后续用户看到 ML 仍 degraded，这是正确受控状态，不得为了页面好看改成 ready。
@@ -3792,7 +3792,7 @@ Git 与线上部署：
 - 15 分钟线上策略健康：
   - `trade_execution_contract.status=ok`
   - `orders=0`、`failed_orders=0`、`rejected_orders=0`、`fast_loss_close_under_15m=0`
-  - `local_ml_readiness.status=degraded`、`allow_live_position_influence=false`
+  - `local_ml_readiness.status=degraded`、`live_ml_ready=false`
 - 120 分钟线上策略健康：
   - `trade_execution_contract.status=ok`
   - `orders=1`、`filled_orders=1`、`failed_orders=0`、`rejected_orders=0`、`fast_loss_close_under_15m=0`
@@ -3807,7 +3807,7 @@ Git 与线上部署：
 后续 AI 防偏要求：
 - 后续看到 `candidate_readiness_rejected` 时，必须解释为“候选模型未准入，线上 artifact 保持不变”，不得说成训练失败或系统故障。
 - 后续不得把 `force=True` 当作强制写模型；它只能强制跑候选评估，不能绕过 readiness。
-- 任何“让 ML 参与实盘影响”的动作，都必须以 `candidate_readiness.allow_live_position_influence=true` 且本地/线上验证通过为前提。
+- 任何“让 ML 参与实盘影响”的动作，都必须以 `candidate_readiness.live_ml_ready=true` 且本地/线上验证通过为前提。
 - 如果自动训练反复被拒，必须回到样本选择、标签、特征、side-aware 分桶、费后收益和 shadow 质量，而不是降低 readiness 阈值。
 
 回滚点：

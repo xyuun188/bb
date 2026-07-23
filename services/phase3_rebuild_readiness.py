@@ -68,15 +68,8 @@ class Phase3RebuildReadinessService:
         warnings: list[str] = []
         passed: list[str] = []
 
-        shadow_count = _safe_int(
-            local_tools.get("shadow_sample_count")
-            or local_tools.get("trainable_sample_count")
-            or local_tools.get("total_trainable_count")
-        )
-        trade_count = _safe_int(
-            local_tools.get("trainable_trade_sample_count")
-            or local_tools.get("trade_sample_count")
-        )
+        shadow_count = _safe_int(local_tools.get("training_shadow_sample_count"))
+        trade_count = _safe_int(local_tools.get("training_trade_sample_count"))
         quality_report = _safe_dict(local_tools.get("quality_report"))
         totals = _safe_dict(quality_report.get("totals"))
         excluded_total = _safe_int(totals.get("excluded"))
@@ -135,21 +128,14 @@ class Phase3RebuildReadinessService:
         elif runtime_status == "ok":
             passed.append("model_runtime_probe_ok")
 
-        evaluation_policy = _safe_dict(local_tools.get("evaluation_policy"))
         promotion_flow = (
             local_tools.get("promotion_flow")
-            or evaluation_policy.get("promotion_flow")
             or PHASE3_REQUIRED_PROMOTION_FLOW
         )
         if promotion_flow != PHASE3_REQUIRED_PROMOTION_FLOW:
             blockers.append("promotion_flow_not_phase3")
         else:
             passed.append("promotion_flow_ok")
-        if bool(local_tools.get("live_mutation") or evaluation_policy.get("live_mutation")):
-            blockers.append("live_mutation_must_remain_disabled_for_rebuild_gate")
-        else:
-            passed.append("live_mutation_disabled")
-
         if requested_persist_artifact and not confirm_phase3_rebuild:
             blockers.append("confirmed_rebuild_required_for_artifact_write")
         if not requested_persist_artifact:
@@ -193,7 +179,6 @@ class Phase3RebuildReadinessService:
             "audit_only": True,
             "mutates_database": False,
             "writes_artifacts": False,
-            "live_mutation": False,
             "can_run_confirmed_rebuild": can_run_confirmed_rebuild,
             "can_persist_artifact": can_persist,
             "requires_persist_artifact_flag": True,

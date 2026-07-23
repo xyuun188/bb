@@ -224,3 +224,39 @@
 4. OKX 平仓事实回写：交易责任标记为 `decision_authority=rules`；模型旁路预测单独生成 `model_shadow_alignment`，用真实 `net_return_after_all_cost_pct` 学习“支持了亏损方向”或“避开了亏损方向”。
 
 上述四阶段不读取 `live_ml_profit_contract` 才能运行，也不允许旧 `net_return_after_cost_pct` 进入机会评分、定仓或收益分布组合。规则小仓的单笔风险预算独立取自当日剩余亏损预算和最大并发仓位，再由压力损失反推名义金额，避免风险预算与仓位互相定义。
+
+## 13. 本轮晋升与旧逻辑清理结果
+
+- 模型晋升唯一权限字段为 `live_ml_ready`；`allow_live_position_influence` 和 `production_influence_authorized` 已从代码、接口和测试中删除。
+- 晋升收益只读取两类模型证据：影子样本中明确记录的 `model_shadow_action` 费后收益，以及 `decision_authority=model` 的 OKX 权威成交收益。
+- `decision_authority=rules` 的真实成交收益不进入模型收益分布，只保留真实手续费、资金费、滑点和证据指纹，用于规则归因、执行成本校准和 `model_shadow_alignment` 诊断。
+- 模型影子方向缺失时直接隔离，不能从规则成交方向、旧字段或默认值推导。
+- 晋升报告的均值、下四分位和 Profit Factor 使用样本相关性权重；规则亏损不会通过另一条 readiness 或远端 artifact 校验链间接惩罚模型。
+- `model_stage`、`evaluation_policy.live_mutation` 不再是训练请求的授权输入；artifact 只按晋升报告生成 candidate -> shadow -> canary -> active。
+- registry 和远端量化服务已升级为新版本，旧 artifact 不迁移、不双读，必须通过显式衍生数据清理后重新生成。
+
+## 14. 派生训练层彻底重置合同
+
+- 唯一清理入口为 `python scripts/reset_training_derived_state.py --apply --confirm RESET_TRAINING_DERIVED_STATE`；默认只输出计划，不执行删除。
+- 清理对象只有影子样本、复盘、专家记忆、策略快照、模型收益快照、权益缓存、模型 artifact、训练 cursor、scheduler state、向量索引和 Dashboard 最新缓存。
+- `orders`、`positions`、`okx_position_history`、`okx_account_bills`、`ai_decisions`、`strategy_learning_events`、`risk_events`、费用、资金费、滑点、realized PnL、用户和密钥审计永不删除。
+- 清理完成后原子写入 `data/training_epoch.json`；影子、OKX 真实成交、Kline 序列、新闻和社交训练加载器都只读取该 epoch 之后的数据。
+- 删除 `scripts/phase3_cold_start_reset.py`，不再提供删除 paper 订单、持仓、决策或重置虚拟账户的旧入口。
+- 删除 OKX authoritative sync 和 order fact sync 对 `phase3_cold_start_reset_marker.json` 的读取；旧 marker 不能再截断或隐藏原始成交事实。
+- 删除只服务于废弃 `strategy_learning_state.json` 的乱码修复脚本；不保留弃用壳、迁移器或双读路径。
+- 执行清理前必须停止 `bb-paper-trading.service`、`bb-model-tunnels.service` 和 `bb-dashboard.service`；清理后先生成新样本，再进行 preflight、正式训练和收益晋升评估。
+
+## 15. 当前训练纪元唯一口径
+
+- `data/training_epoch.json` 是训练、晋升和当前交易契约审计的唯一时间边界；marker 缺失或损坏时必须阻断，不再回退到固定 Phase 3 日期。
+- Dashboard、本地 ML、本地 AI tools 和系统审计只发布 `training_shadow_sample_count`、`training_trade_sample_count`、`completed_*`、`last_trained_*` 和 `artifact_training_*`；删除 `phase3_*`、`legacy_*`、`raw_*` 训练计数双读。
+- `ExpertMemoryService`、FinQuant 专家 LoRA、专家影子评估、影子质量隔离和策略历史回放只读取当前 epoch 数据；重置前交易不得重新生成当前复盘、专家记忆或晋升证据。
+- `TradeExecutionContractService` 使用 `max(请求窗口起点, 当前 epoch)`；epoch 前合同违规继续保留为历史审计事实，但不能永久阻断当前规则小仓开仓。
+- 向量记忆缺少 epoch 时返回明确错误状态并禁止检索、重建和清理操作；禁用状态接口仍可读，不得因 marker 缺失返回 HTTP 500。
+
+## 16. 当前 OKX 审计唯一时间边界
+
+- `OkxTradeFactIntegrityService`、`OkxAuthoritativeSyncService` 和 Dashboard 当前对账统一使用 `max(配置回看起点, 当前 training epoch)`；epoch 前问题只留在历史审计，不得阻断当前交易或训练。
+- 删除合约面值缺失时使用 `ctVal=1` 的默认回退。数量一致性只接受 OKX `base_quantity`，或 `filled_contracts * ctVal` 的可验证换算。
+- 缺少 `base_quantity/ctVal` 时明确输出 `contract_specification_evidence_missing`，禁止生成虚假的数量差异和名义金额差异；该事实必须补齐证据后才能进入训练。
+- 当前 epoch marker 缺失或损坏时三个当前态审计全部失败关闭，不读取固定日期、不读取旧 marker、不放行历史窗口。

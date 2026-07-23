@@ -938,7 +938,7 @@ def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
 
     assert "status.readiness || {}" in overview_block
     assert "readiness.blocking_reasons" in overview_block
-    assert "allow_live_position_influence" in overview_block
+    assert "live_ml_ready" in overview_block
     assert "readiness.metrics" in overview_block
     assert "dirty_sample_ratio" in overview_block
     assert "long_pr_auc" in overview_block
@@ -1020,15 +1020,15 @@ def test_server_monitor_gpu_summary_uses_all_cards() -> None:
     assert "卡汇总" in script
 
 
-def test_data_collection_ui_explains_phase3_clean_training_view() -> None:
+def test_data_collection_ui_explains_current_training_epoch() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "phase3CleanCount" in script
+    assert "currentEpochCount" in script
     assert "旧数据参与训练" not in script
-    assert "只使用干净训练视图" in script
+    assert "只使用当前训练纪元数据" in script
     assert "冷启动待补齐，不驱动开仓" in script
     assert "缺失/过期特征默认中性阻断" in script
-    assert "三期重新开始训练；旧数据禁止进入新模型训练" in script
+    assert "当前训练纪元已重新开始；纪元前数据禁止进入新模型训练" in script
     assert "三期相似样本记忆" in script
 
 

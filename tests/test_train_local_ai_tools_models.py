@@ -22,6 +22,15 @@ from scripts.train_local_ai_tools_models import (
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 
 
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        train_script,
+        "load_training_epoch_start",
+        lambda: PHASE3_CLEAN_START_UTC,
+    )
+
+
 async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     await close_db()
     db_path = tmp_path / "local-ai-tools-shadow-training.db"
@@ -128,6 +137,7 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
                             "current_price": 100.0,
                             "rsi_14": 53.0,
                             "returns_1": 0.01,
+                            "model_shadow_action": "short",
                             "taker_fee_rate": 0.0004,
                             "training_market_fact_contract": {"version": "native-fact-v1"},
                             "training_label_contract": {
@@ -178,6 +188,7 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
     assert samples[0]["features"]["current_price"] == 100.0
     assert samples[0]["features"]["rsi_14"] == 53.0
     assert samples[0]["decision_id"] == 101
+    assert samples[0]["model_shadow_action"] == "short"
     assert samples[0]["label_version"] == "native-label-v1"
     assert samples[0]["features"]["training_market_fact_contract"] == {
         "version": "native-fact-v1"
@@ -222,12 +233,6 @@ async def test_local_ai_tools_training_post_preserves_phase3_training_policy() -
         {
             "shadow_samples": [],
             "training_mode": "walk_forward",
-            "model_stage": "shadow",
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-                "requires_walk_forward": False,
-            },
         },
         request_timeout=3.0,
         transport=httpx.MockTransport(handler),
@@ -235,12 +240,8 @@ async def test_local_ai_tools_training_post_preserves_phase3_training_policy() -
 
     assert result == {"trained": True}
     assert captured_payload["training_mode"] == "walk_forward"
-    assert captured_payload["model_stage"] == "shadow"
-    assert captured_payload["evaluation_policy"] == {
-        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": False,
-        "requires_walk_forward": False,
-    }
+    assert "model_stage" not in captured_payload
+    assert "evaluation_policy" not in captured_payload
 
 
 @pytest.mark.asyncio
@@ -255,7 +256,7 @@ async def test_local_ai_tools_training_post_preserves_promotion_recommendation()
         "policy": "phase3_candidate_to_shadow_to_canary_to_active",
         "recommended_stage": "canary",
         "canary_ready": True,
-        "live_ready": False,
+        "live_ml_ready": False,
     }
     result = await _post_training_payload(
         "https://local-ai-tools.test/",
@@ -537,8 +538,8 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
         "skipped": True,
         "reason": "phase3_preflight_no_quarantine_writes",
     }
-    assert payload["evaluation_policy"]["phase"] == "phase3_model_factory"
-    assert payload["evaluation_policy"]["live_mutation"] is False
+    assert "evaluation_policy" not in payload
+    assert "model_stage" not in payload
 
 
 @pytest.mark.asyncio

@@ -42,7 +42,7 @@ def _target_argv(target: str, *, persist_artifact: bool) -> tuple[str, list[str]
         argv = [script_path]
     else:
         script_path = "scripts/train_local_ai_tools_models.py"
-        argv = [script_path, "--training-mode", "shadow", "--model-stage", "shadow"]
+        argv = [script_path, "--training-mode", "shadow"]
     if persist_artifact:
         argv.extend(("--persist-artifact", "--confirm-phase3-rebuild"))
     return script_path, argv

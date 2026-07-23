@@ -178,6 +178,16 @@ def test_finquant_preference_counterexample_prefers_low_win_positive_expectancy(
     assert json.loads(preference["chosen"])["best_side"] == "candidate_a"
 
 
+def test_expert_memory_training_is_scoped_to_current_epoch() -> None:
+    source = training.ROOT.joinpath(
+        "scripts",
+        "finquant_expert_lora_training.py",
+    ).read_text(encoding="utf-8")
+
+    assert "epoch_start = load_training_epoch_start()" in source
+    assert "ExpertMemory.created_at >= epoch_start" in source
+
+
 def test_shadow_response_chooses_fee_after_side_even_when_gross_points_elsewhere() -> None:
     response = training._shadow_response(
         {

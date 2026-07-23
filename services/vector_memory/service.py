@@ -4,25 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from config.settings import settings
 from core.safe_output import safe_error_text
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.news import NewsArticle
+from services.training_epoch import load_training_epoch_start
 from services.vector_memory.store import VectorMemoryStore, build_vector_memory_store
 from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 
 logger = structlog.get_logger(__name__)
-PHASE3_VECTOR_MEMORY_RESET_MARKER = "phase3_vector_memory_reset_marker.json"
 _VECTOR_MEMORY_DECISION_RAW_KEYS = ("opportunity_score", "decision_maker")
 _VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX = "vector_memory_raw__"
 
@@ -98,43 +97,23 @@ class VectorMemoryService:
         )
         return True
 
-    @property
-    def _reset_marker_path(self) -> Path:
-        return self._base_data_dir / "vector_memory" / PHASE3_VECTOR_MEMORY_RESET_MARKER
-
     def _load_reset_at(self) -> datetime | None:
-        path = self._reset_marker_path
-        if not path.exists():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        value = payload.get("reset_at") if isinstance(payload, dict) else None
-        if not isinstance(value, str) or not value.strip():
-            return None
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return load_training_epoch_start(self._base_data_dir / "training_epoch.json")
 
-    def _write_reset_marker(self, *, reason: str, reset_at: datetime) -> None:
-        path = self._reset_marker_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "reset_at": reset_at.isoformat(),
-                    "reason": reason,
-                    "phase3_policy": "old_vector_index_excluded_from_clean_training",
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+    def _training_epoch_status(self) -> dict[str, Any]:
+        try:
+            reset_at = self._load_reset_at()
+        except RuntimeError as exc:
+            return {
+                "training_epoch_initialized": False,
+                "reset_at": None,
+                "training_epoch_blocker": safe_error_text(exc, limit=180),
+            }
+        return {
+            "training_epoch_initialized": True,
+            "reset_at": _iso(reset_at),
+            "training_epoch_blocker": None,
+        }
 
     async def reset_store(self) -> None:
         """Reload the configured backend after settings change."""
@@ -145,25 +124,24 @@ class VectorMemoryService:
             self._last_error = ""
             self._last_reindex_at = None
 
-    async def clear_index(self, *, reason: str = "phase3_cold_start_reset") -> dict[str, Any]:
-        """Clear old vector-memory documents before a Phase 3 clean rebuild."""
+    async def clear_index(self, *, reason: str = "training_derived_state_reset") -> dict[str, Any]:
+        """Clear vector documents before rebuilding from the current training epoch."""
 
         await self._cancel_auto_reindex()
         async with self._lock:
             try:
+                reset_at = self._load_reset_at()
                 removed = self._get_store().clear()
-                reset_at = datetime.now(UTC)
-                self._write_reset_marker(reason=reason, reset_at=reset_at)
                 self._last_error = ""
                 self._last_reindex_at = None
                 return {
                     "enabled": self.enabled,
                     "status": "cleared",
                     "reason": reason,
-                    "reset_at": reset_at.isoformat(),
+                    "reset_at": _iso(reset_at),
                     "removed": removed,
                     "document_count": 0,
-                    "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                    "training_epoch_policy": "exclude_documents_before_training_epoch",
                     "store": self._get_store().stats(),
                 }
             except Exception as exc:
@@ -175,12 +153,13 @@ class VectorMemoryService:
                     "reason": reason,
                     "removed": 0,
                     "error": self._last_error,
-                    "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                    "training_epoch_policy": "exclude_documents_before_training_epoch",
                 }
 
     async def status(self) -> dict[str, Any]:
         """Return current vector memory status."""
 
+        epoch_status = self._training_epoch_status()
         if not self.enabled:
             return {
                 "enabled": False,
@@ -190,12 +169,28 @@ class VectorMemoryService:
                 "configured_backend": settings.vector_memory_backend,
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
-                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "training_epoch_policy": "exclude_documents_before_training_epoch",
                 "clean_rebuild_required": True,
-                "reset_at": _iso(self._load_reset_at()),
+                **epoch_status,
                 "auto_reindex_enabled": False,
                 "auto_reindex_due": False,
                 "auto_reindex_running": False,
+            }
+        if not epoch_status["training_epoch_initialized"]:
+            return {
+                "enabled": True,
+                "backend": "unavailable",
+                "status": "error",
+                "document_count": 0,
+                "configured_backend": settings.vector_memory_backend,
+                "last_reindex_at": _iso(self._last_reindex_at),
+                "last_error": epoch_status["training_epoch_blocker"],
+                "training_epoch_policy": "exclude_documents_before_training_epoch",
+                "clean_rebuild_required": True,
+                **epoch_status,
+                "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
+                "auto_reindex_due": False,
+                "auto_reindex_running": self._auto_reindex_running(),
             }
         try:
             self.ensure_fresh_index(reason="status")
@@ -211,9 +206,9 @@ class VectorMemoryService:
                 "path": stats.get("path"),
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
-                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "training_epoch_policy": "exclude_documents_before_training_epoch",
                 "clean_rebuild_required": document_count <= 0,
-                "reset_at": _iso(self._load_reset_at()),
+                **epoch_status,
                 **auto_state,
             }
         except Exception as exc:
@@ -232,9 +227,9 @@ class VectorMemoryService:
                         "path": stats.get("path"),
                         "last_reindex_at": _iso(self._last_reindex_at),
                         "last_error": "",
-                        "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                        "training_epoch_policy": "exclude_documents_before_training_epoch",
                         "clean_rebuild_required": document_count <= 0,
-                        "reset_at": _iso(self._load_reset_at()),
+                        **epoch_status,
                         "store_recovered": True,
                         **auto_state,
                     }
@@ -249,9 +244,9 @@ class VectorMemoryService:
                 "configured_backend": settings.vector_memory_backend,
                 "last_reindex_at": _iso(self._last_reindex_at),
                 "last_error": self._last_error,
-                "phase3_policy": "old_vector_index_excluded_from_clean_training",
+                "training_epoch_policy": "exclude_documents_before_training_epoch",
                 "clean_rebuild_required": True,
-                "reset_at": _iso(self._load_reset_at()),
+                **epoch_status,
                 "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
                 "auto_reindex_due": False,
                 "auto_reindex_running": self._auto_reindex_running(),
@@ -274,7 +269,7 @@ class VectorMemoryService:
                     "status": "ok",
                     "indexed": indexed,
                     "reset_at": _iso(reset_at),
-                    "source_filter": "phase3_reset_at_or_later" if reset_at else "current_recent",
+                    "source_filter": "training_epoch_or_later",
                     "last_reindex_at": _iso(self._last_reindex_at),
                     "store": self._get_store().stats(),
                     "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
@@ -295,7 +290,7 @@ class VectorMemoryService:
                             "indexed": indexed,
                             "reset_at": _iso(reset_at),
                             "source_filter": (
-                                "phase3_reset_at_or_later" if reset_at else "current_recent"
+                                "training_epoch_or_later"
                             ),
                             "last_reindex_at": _iso(self._last_reindex_at),
                             "store": self._get_store().stats(),
@@ -329,6 +324,14 @@ class VectorMemoryService:
 
         if not self.enabled:
             return {"enabled": False, "status": "disabled", "hits": []}
+        epoch_status = self._training_epoch_status()
+        if not epoch_status["training_epoch_initialized"]:
+            return {
+                "enabled": True,
+                "status": "error",
+                "hits": [],
+                **epoch_status,
+            }
         text = str(query or "").strip()
         if not text:
             return {"enabled": True, "status": "empty_query", "hits": []}
@@ -456,7 +459,9 @@ class VectorMemoryService:
         if self._auto_reindex_running():
             return False
         if document_count <= 0:
-            return self._load_reset_at() is None
+            return self._last_reindex_at is None or datetime.now(UTC) - self._last_reindex_at >= timedelta(
+                seconds=self._auto_reindex_interval()
+            )
         if self._last_reindex_at is None:
             return True
         return datetime.now(UTC) - self._last_reindex_at >= timedelta(
@@ -520,7 +525,15 @@ class VectorMemoryService:
             news_query = select(NewsArticle)
             if since is not None:
                 decision_query = decision_query.where(AIDecision.created_at >= since)
-                news_query = news_query.where(NewsArticle.fetched_at >= since)
+                news_query = news_query.where(
+                    or_(
+                        NewsArticle.published_at >= since,
+                        and_(
+                            NewsArticle.published_at.is_(None),
+                            NewsArticle.fetched_at >= since,
+                        ),
+                    )
+                )
             decision_rows = [
                 _vector_memory_decision_from_mapping(row)
                 for row in (

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 
 import pytest
@@ -29,47 +28,6 @@ SOURCE_CODE_SHA256 = "b" * 64
 SOURCE_CODE_VERSION = f"source-sha256:{SOURCE_CODE_SHA256}"
 
 
-def _file_sha256(path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_legacy_current_pointer(registry: ModelArtifactRegistry) -> dict:
-    version = "legacy-version"
-    version_root = registry.versions_root / version
-    version_root.mkdir(parents=True)
-    model_path = version_root / "model.joblib"
-    metadata_path = version_root / "model_metadata.json"
-    manifest_path = version_root / "manifest.json"
-    model_path.write_bytes(b"legacy-model")
-    artifact_hash = _file_sha256(model_path)
-    metadata = {
-        "artifact_registry_version": "2026-07-11.v1",
-        "artifact_model_id": registry.model_id,
-        "artifact_version": version,
-        "artifact_sha256": artifact_hash,
-    }
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    metadata_hash = _file_sha256(metadata_path)
-    manifest = {
-        **metadata,
-        "metadata_sha256": metadata_hash,
-        "model_relative_path": "model.joblib",
-        "metadata_relative_path": "model_metadata.json",
-    }
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    pointer = {
-        "artifact_registry_version": "2026-07-11.v1",
-        "model_id": registry.model_id,
-        "version": version,
-        "manifest_path": str(manifest_path.relative_to(registry.model_root)),
-        "sha256": artifact_hash,
-        "metadata_sha256": metadata_hash,
-        "manifest_sha256": _file_sha256(manifest_path),
-    }
-    registry.current_path.write_text(json.dumps(pointer), encoding="utf-8")
-    return pointer
-
-
 def _metadata() -> dict:
     return {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
@@ -78,6 +36,7 @@ def _metadata() -> dict:
         "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
         "training_mode": "walk_forward",
         "model_stage": "candidate",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
         "sample_count": 128,
         "last_trained_completed_shadow_sample_count": 256,
         "quality_report": {"data_quality_version": "2026-07-11.v5"},
@@ -144,10 +103,6 @@ def _metadata() -> dict:
                 "promotion_math_ready": True,
             },
         },
-        "evaluation_policy": {
-            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
-        },
     }
 
 
@@ -155,7 +110,7 @@ def _shadow_activation(*, reason: str = "actual_trade_calibration_not_ready") ->
     return {
         "activation_stage": "shadow",
         "readiness_state": "degraded",
-        "production_influence_authorized": False,
+        "live_ml_ready": False,
         "blocking_reasons": [reason],
         "evidence_contract": "artifact_integrity_and_return_readiness",
     }
@@ -170,14 +125,14 @@ def _production_activation(
     enabled_sides = sides or ["long", "short"]
     readiness = {
         "state": state,
-        "allow_live_position_influence": True,
+        "live_ml_ready": True,
         "live_enabled_sides": enabled_sides,
         "blocking_reasons": [],
     }
     return {
         "activation_stage": stage,
         "readiness_state": state,
-        "production_influence_authorized": True,
+        "live_ml_ready": True,
         "live_enabled_sides": enabled_sides,
         "blocking_reasons": [],
         "return_evidence_report": readiness,
@@ -222,7 +177,7 @@ def test_registry_persists_versioned_hash_verified_artifact(tmp_path) -> None:
     assert current.pointer_role == "current"
     assert current.activation_manifest is not None
     assert current.activation_manifest["activation_stage"] == "shadow"
-    assert current.activation_manifest["production_influence_authorized"] is False
+    assert current.activation_manifest["live_ml_ready"] is False
     assert not registry.candidate_path.exists()
 
 
@@ -377,41 +332,7 @@ def test_rejected_candidate_is_preserved_as_challenger_without_replacing_champio
     assert cursor_metadata["last_trained_completed_shadow_sample_count"] == 512
 
 
-def test_promotion_retires_known_incompatible_current_pointer(tmp_path) -> None:
-    registry = ModelArtifactRegistry(
-        root=tmp_path / "model_artifacts",
-        model_id="local_ml_profit_quality",
-    )
-    candidate = registry.persist_candidate_joblib(
-        {"weights": [2]},
-        _metadata(),
-        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
-        code_version=SOURCE_CODE_VERSION,
-    )
-    legacy_pointer = _write_legacy_current_pointer(registry)
-
-    current = registry.promote_candidate(_shadow_activation())
-
-    assert current.version == candidate.version
-    assert current.activation_manifest["registry_migration"]["reason"] == (
-        "incompatible_artifact_registry_version"
-    )
-    assert current.activation_manifest["registry_migration"][
-        "from_registry_version"
-    ] == "2026-07-11.v1"
-    retired = [
-        path
-        for path in registry.retired_pointers_root.glob("current-*.json")
-        if not path.name.endswith(".retirement.json")
-    ]
-    assert len(retired) == 1
-    assert json.loads(retired[0].read_text(encoding="utf-8")) == legacy_pointer
-    audit = retired[0].with_suffix(".retirement.json")
-    assert json.loads(audit.read_text(encoding="utf-8"))["pointer_sha256"]
-    assert registry.resolve_rollback() is None
-
-
-def test_promotion_does_not_retire_unknown_or_corrupt_current_pointer(tmp_path) -> None:
+def test_promotion_rejects_old_or_corrupt_current_pointer(tmp_path) -> None:
     registry = ModelArtifactRegistry(
         root=tmp_path / "model_artifacts",
         model_id="local_ml_profit_quality",
@@ -429,12 +350,11 @@ def test_promotion_does_not_retire_unknown_or_corrupt_current_pointer(tmp_path) 
     }
     registry.current_path.write_text(json.dumps(unknown_pointer), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="cannot be retired"):
+    with pytest.raises(ValueError, match="unsupported artifact registry pointer version"):
         registry.promote_candidate(_shadow_activation())
 
     assert json.loads(registry.current_path.read_text(encoding="utf-8")) == unknown_pointer
     assert registry.resolve_candidate() is not None
-    assert not registry.retired_pointers_root.exists()
 
     corrupt_pointer = {
         "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
@@ -447,7 +367,6 @@ def test_promotion_does_not_retire_unknown_or_corrupt_current_pointer(tmp_path) 
 
     assert json.loads(registry.current_path.read_text(encoding="utf-8")) == corrupt_pointer
     assert registry.resolve_candidate() is not None
-    assert not registry.retired_pointers_root.exists()
 
 
 def test_registry_rejects_tampered_activation_manifest(tmp_path) -> None:
@@ -491,7 +410,7 @@ def test_active_activation_requires_bound_return_evidence(tmp_path) -> None:
             {
                 "activation_stage": "active",
                 "readiness_state": "ready",
-                "production_influence_authorized": True,
+                "live_ml_ready": True,
                 "blocking_reasons": [],
             }
         )
@@ -503,7 +422,7 @@ def test_active_activation_requires_bound_return_evidence(tmp_path) -> None:
     assert registry.resolve_active().sha256 == current.sha256
     assert registry.active_path == registry.current_path
     assert registry.status()["activation_manifest"][
-        "production_influence_authorized"
+        "live_ml_ready"
     ] is True
 
 
@@ -581,7 +500,7 @@ def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> N
     )
     readiness = {
         "state": "partial_ready",
-        "allow_live_position_influence": True,
+        "live_ml_ready": True,
         "live_enabled_sides": ["long"],
         "blocking_reasons": [],
         "side_blocking_reasons": {
@@ -595,7 +514,7 @@ def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> N
         {
             "activation_stage": "canary",
             "readiness_state": "partial_ready",
-            "production_influence_authorized": True,
+            "live_ml_ready": True,
             "live_enabled_sides": ["long"],
             "blocking_reasons": [],
             "return_evidence_report": readiness,
@@ -604,7 +523,7 @@ def test_canary_activation_validates_only_partial_ready_live_side(tmp_path) -> N
 
     assert current.activation_manifest["activation_stage"] == "canary"
     assert current.activation_manifest["live_enabled_sides"] == ["long"]
-    assert current.activation_manifest["production_influence_authorized"] is True
+    assert current.activation_manifest["live_ml_ready"] is True
 
 
 def test_paper_canary_activation_does_not_grant_production_permission(tmp_path) -> None:
@@ -631,7 +550,7 @@ def test_paper_canary_activation_does_not_grant_production_permission(tmp_path) 
         {
             "activation_stage": "canary",
             "readiness_state": "paper_canary_ready",
-            "production_influence_authorized": False,
+            "live_ml_ready": False,
             "paper_canary_authorized": True,
             "blocking_reasons": [],
             "paper_canary_report": paper_report,
@@ -642,7 +561,7 @@ def test_paper_canary_activation_does_not_grant_production_permission(tmp_path) 
     activation = current.activation_manifest
     assert activation["activation_stage"] == "canary"
     assert activation["paper_canary_authorized"] is True
-    assert activation["production_influence_authorized"] is False
+    assert activation["live_ml_ready"] is False
 
 
 def test_default_loader_does_not_fall_back_to_retired_legacy_artifact(tmp_path) -> None:

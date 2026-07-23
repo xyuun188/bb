@@ -52,7 +52,6 @@ def test_shadow_signal_remains_observable_but_cannot_influence_production() -> N
         **_contract_fields(),
         "available": True,
         "route_mode": "shadow_candidate",
-        "live_mutation": False,
         "best_side": "short",
         "expected_return_pct": 92.0,
     }
@@ -66,7 +65,7 @@ def test_wrapper_governance_cannot_be_removed_by_payload_unwrapping() -> None:
     payload = {
         "ok": True,
         "route_mode": "live",
-        "evaluation_policy": {"live_mutation": False},
+        "live_ml_ready": False,
         "data": {"prediction": {"best_side": "long", "expected_return_pct": 1.2}},
     }
 
@@ -74,12 +73,12 @@ def test_wrapper_governance_cannot_be_removed_by_payload_unwrapping() -> None:
 
     assert result == {
         "eligible": False,
-        "reason": "evaluation_policy_blocks_live_mutation",
+        "reason": "live_ml_ready_disabled",
     }
 
     extracted = first_tool_payload({"local_ai_tools": {"profit_prediction": payload}}, "profit_prediction")
     assert signal_production_eligibility(extracted)["reason"] == (
-        "evaluation_policy_blocks_live_mutation"
+        "live_ml_ready_disabled"
     )
 
 
@@ -87,11 +86,10 @@ def test_explicit_unpromoted_signal_cannot_use_live_route_label() -> None:
     payload = {
         "available": True,
         "route_mode": "live",
-        "live_mutation": True,
-        "promotion_ready": False,
+        "live_ml_ready": False,
     }
 
-    assert signal_production_eligibility(payload)["reason"] == "promotion_not_ready"
+    assert signal_production_eligibility(payload)["reason"] == "live_ml_ready_disabled"
 
 
 def test_live_separated_supervision_signal_is_production_eligible() -> None:
@@ -99,8 +97,7 @@ def test_live_separated_supervision_signal_is_production_eligible() -> None:
         **_contract_fields(),
         "available": True,
         "route_mode": "live",
-        "live_mutation": True,
-        "promotion_ready": True,
+        "live_ml_ready": True,
         "artifact_objective": RETURN_OBJECTIVE_NAME,
         "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
         "artifact_persisted": True,
@@ -127,7 +124,7 @@ def test_dynamic_prediction_quality_block_overrides_live_route() -> None:
     payload = {
         "available": True,
         "route_mode": "live",
-        "live_mutation": True,
+        "live_ml_ready": True,
         "prediction_quality": {
             "production_eligible": False,
             "anomalous": True,
@@ -145,8 +142,7 @@ def test_complete_training_metadata_cannot_recover_shadow_route_for_production()
         "available": True,
         "trained": True,
         "route_mode": "shadow_candidate",
-        "live_mutation": False,
-        "promotion_ready": False,
+        "live_ml_ready": False,
         "artifact_objective": RETURN_OBJECTIVE_NAME,
         "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
         "artifact_persisted": True,
@@ -187,8 +183,7 @@ def test_each_required_live_governance_field_is_fail_closed() -> None:
         **_contract_fields(),
         "available": True,
         "route_mode": "live",
-        "live_mutation": True,
-        "promotion_ready": True,
+        "live_ml_ready": True,
         "artifact_objective": RETURN_OBJECTIVE_NAME,
         "artifact_objective_version": RETURN_OBJECTIVE_VERSION,
         "label_name": RETURN_LABEL_NAME,
@@ -203,8 +198,7 @@ def test_each_required_live_governance_field_is_fail_closed() -> None:
     }
     removals = {
         "route_mode": "live_route",
-        "live_mutation": "live_influence",
-        "promotion_ready": "promotion_ready",
+        "live_ml_ready": "live_ml_ready",
         "artifact_objective": "return_objective",
         "artifact_objective_version": "return_objective_version",
         "label_name": "return_label",
@@ -227,8 +221,7 @@ def test_live_governance_without_standard_distribution_is_observation_only() -> 
     payload = {
         "available": True,
         "route_mode": "live",
-        "live_mutation": True,
-        "promotion_ready": True,
+        "live_ml_ready": True,
         "best_side": "long",
         "artifact_objective": RETURN_OBJECTIVE_NAME,
         "artifact_objective_version": RETURN_OBJECTIVE_VERSION,

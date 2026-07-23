@@ -6,12 +6,9 @@ from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
 def test_phase3_rebuild_readiness_blocks_when_clean_training_inputs_are_weak() -> None:
     report = Phase3RebuildReadinessService().report(
         local_ai_tools={
-            "shadow_sample_count": 120,
-            "trade_sample_count": 4,
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-            },
+            "training_shadow_sample_count": 120,
+            "training_trade_sample_count": 4,
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         },
         governance={"status": "clean", "contamination_risk": "low"},
         historical_trade_fact_audit={
@@ -39,8 +36,8 @@ def test_phase3_rebuild_readiness_blocks_when_clean_training_inputs_are_weak() -
 def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() -> None:
     report = Phase3RebuildReadinessService().report(
         local_ai_tools={
-            "shadow_sample_count": 500,
-            "trade_sample_count": 80,
+            "training_shadow_sample_count": 500,
+            "training_trade_sample_count": 80,
             "quality_report": {
                 "totals": {
                     "total": 580,
@@ -48,10 +45,7 @@ def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() 
                     "effective_weight_ratio": 0.91,
                 }
             },
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-            },
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         },
         governance={"status": "clean", "contamination_risk": "low"},
         historical_trade_fact_audit={
@@ -73,7 +67,6 @@ def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() 
     assert report["status"] == "ready_with_warnings"
     assert report["can_run_confirmed_rebuild"] is True
     assert report["can_persist_artifact"] is True
-    assert report["live_mutation"] is False
     assert report["target_artifacts"]["local_ai_tools"]["target_stage"] == "shadow"
     assert report["target_artifacts"]["local_ai_tools"]["can_persist_artifact"] is True
     assert "legacy_artifacts_preserved_read_only" in report["warnings"]
@@ -84,12 +77,9 @@ def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() 
 def test_phase3_rebuild_readiness_requires_double_confirmation_for_write() -> None:
     report = Phase3RebuildReadinessService().report(
         local_ai_tools={
-            "shadow_sample_count": 500,
-            "trade_sample_count": 80,
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-            },
+            "training_shadow_sample_count": 500,
+            "training_trade_sample_count": 80,
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         },
         governance={"status": "clean", "contamination_risk": "low"},
         historical_trade_fact_audit={"status": "clean", "trainable_closed_positions": 80},
@@ -108,12 +98,9 @@ def test_phase3_rebuild_readiness_requires_double_confirmation_for_write() -> No
 def test_phase3_rebuild_readiness_blocks_untrusted_artifacts() -> None:
     report = Phase3RebuildReadinessService().report(
         local_ai_tools={
-            "shadow_sample_count": 500,
-            "trade_sample_count": 80,
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-            },
+            "training_shadow_sample_count": 500,
+            "training_trade_sample_count": 80,
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         },
         governance={"status": "clean", "contamination_risk": "low"},
         historical_trade_fact_audit={"status": "clean", "trainable_closed_positions": 80},
@@ -133,12 +120,9 @@ def test_phase3_rebuild_readiness_blocks_untrusted_artifacts() -> None:
 def test_phase3_rebuild_readiness_fails_closed_when_contamination_is_unverified() -> None:
     report = Phase3RebuildReadinessService().report(
         local_ai_tools={
-            "shadow_sample_count": 500,
-            "trade_sample_count": 80,
-            "evaluation_policy": {
-                "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                "live_mutation": False,
-            },
+            "training_shadow_sample_count": 500,
+            "training_trade_sample_count": 80,
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         },
         governance={"status": "quarantined", "contamination_risk": "unknown"},
         historical_trade_fact_audit={"status": "clean", "trainable_closed_positions": 80},

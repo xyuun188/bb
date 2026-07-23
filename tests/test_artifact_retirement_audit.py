@@ -62,11 +62,8 @@ async def test_phase3_artifact_with_clean_manifest_is_compatible(tmp_path) -> No
                 "trade_sample_cursor_policy": "clean_training_view_only",
                 "training_mode": "walk_forward",
                 "model_stage": "canary",
-                "artifact_persisted": True,
-                "evaluation_policy": {
                 "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-                    "live_mutation": False,
-                },
+                "artifact_persisted": True,
                 "quality_report": {"data_quality_version": "2026-06-27.phase3"},
             }
         ),

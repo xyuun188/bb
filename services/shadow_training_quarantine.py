@@ -20,6 +20,7 @@ from db.session import get_session_ctx
 from models.learning import ShadowBacktest
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import SampleQualityAssessment, assess_shadow_sample
+from services.training_epoch import load_training_epoch_start
 
 QUARANTINE_STATUS = "quarantined"
 TRAINING_QUARANTINE_MARKER = "[training_quarantine]"
@@ -140,6 +141,7 @@ async def quarantine_dirty_shadow_samples(
     cursor_id: int | None = None
     reason_counts: Counter[str] = Counter()
     source_status_counts: Counter[str] = Counter()
+    epoch_start = load_training_epoch_start()
 
     async with get_session_ctx() as session:
         audited_statuses = ("completed", "quarantined") if dry_run else ("completed",)
@@ -148,6 +150,7 @@ async def quarantine_dirty_shadow_samples(
                 await session.execute(
                     select(func.count(ShadowBacktest.id)).where(
                         ShadowBacktest.status.in_(audited_statuses),
+                        ShadowBacktest.created_at >= epoch_start,
                         ShadowBacktest.long_return_pct.is_not(None),
                         ShadowBacktest.short_return_pct.is_not(None),
                     )
@@ -158,6 +161,7 @@ async def quarantine_dirty_shadow_samples(
         for _batch_index in range(batches):
             stmt = select(ShadowBacktest).where(
                 ShadowBacktest.status.in_(audited_statuses),
+                ShadowBacktest.created_at >= epoch_start,
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
             ).options(
@@ -227,6 +231,7 @@ async def quarantine_dirty_shadow_samples(
         "batch_size": size,
         "max_batches": batches,
         "only_newer_than_id": only_newer_than_id,
+        "training_epoch_started_at": epoch_start.isoformat(),
         "scanned": scanned,
         "total_candidate_count": total_candidate_count,
         "coverage_complete": scanned >= total_candidate_count,

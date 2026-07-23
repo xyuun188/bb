@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,6 +15,14 @@ from services.okx_authoritative_sync import (
     OkxFillGroup,
     _local_order_verified_okx_raw_contract_size,
 )
+
+
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "services.okx_authoritative_sync.load_training_epoch_start",
+        lambda: datetime.now(UTC) - timedelta(days=3650),
+    )
 
 
 class _FakeCcxt:
@@ -167,6 +174,48 @@ class _AgedUnlinkedFillExecutor(_FakeExecutor):
 class _FreshUnlinkedFillExecutor(_FakeExecutor):
     async def get_positions_strict(self) -> list[dict[str, Any]]:
         return []
+
+
+class _PreEpochFillExecutor(_FakeExecutor):
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return []
+
+    async def _get_ccxt(self) -> _FakeCcxt:
+        timestamp_ms = int((datetime.now(UTC) - timedelta(hours=2)).timestamp() * 1000)
+        return _FakeCcxt(timestamp_ms=timestamp_ms)
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_excludes_pre_epoch_fills(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-epoch.db').as_posix()}",
+    )
+    epoch_started_at = datetime.now(UTC) - timedelta(hours=1)
+    monkeypatch.setattr(
+        "services.okx_authoritative_sync.load_training_epoch_start",
+        lambda: epoch_started_at,
+    )
+    await init_db()
+    try:
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            executor_factory=_PreEpochFillExecutor,
+        ).collect()
+
+        assert report["status"] == "ok"
+        assert report["okx_fill_order_count"] == 0
+        assert report["issue_count"] == 0
+        assert report["effective_fill_window_start"] == epoch_started_at.isoformat()
+        assert report["training_epoch_started_at"] == epoch_started_at.isoformat()
+    finally:
+        await close_db()
 
 
 class _LimitBackfillFillCcxt(_FakeCcxt):
@@ -568,17 +617,6 @@ class _OldFillExecutor(_FakeExecutor):
     async def _get_ccxt(self) -> _FakeCcxt:
         old_timestamp_ms = int((datetime.now(UTC) - timedelta(hours=25)).timestamp() * 1000)
         return _FakeCcxt(timestamp_ms=old_timestamp_ms)
-
-
-class _PreResetFillExecutor(_FakeExecutor):
-    async def get_positions_strict(self) -> list[dict[str, Any]]:
-        return []
-
-    async def _get_ccxt(self) -> _FakeCcxt:
-        pre_reset_timestamp_ms = int(
-            (datetime.now(UTC) - timedelta(hours=2)).timestamp() * 1000
-        )
-        return _FakeCcxt(timestamp_ms=pre_reset_timestamp_ms)
 
 
 class _SpkPositionExecutor(_FakeExecutor):
@@ -1466,47 +1504,6 @@ async def test_okx_authoritative_sync_prioritizes_unlinked_local_order_contexts(
 
     assert "aave-protection-close" in contexts
     assert executor.ccxt.order_history_params[0]["ordId"] == "aave-protection-close"
-
-
-@pytest.mark.asyncio
-async def test_okx_authoritative_sync_ignores_pre_cold_start_fills(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    await close_db()
-    monkeypatch.setattr(
-        settings,
-        "database_url",
-        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-watermark.db').as_posix()}",
-    )
-    marker_path = tmp_path / "phase3_cold_start_reset_marker.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "mode": "paper",
-                "policy_id": "PHASE3_COLD_START_RESET",
-                "reset_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    await init_db()
-    try:
-        report = await OkxAuthoritativeSyncService(
-            mode="paper",
-            lookback_hours=24,
-            executor_factory=_PreResetFillExecutor,
-            cold_start_marker_path=marker_path,
-        ).collect()
-
-        kinds = {issue["kind"] for issue in report["issues"]}
-        assert report["cold_start_watermark_applied"] is True
-        assert report["cold_start_reset_at"] is not None
-        assert report["okx_fill_order_count"] == 0
-        assert "okx_fill_missing_local_order" not in kinds
-        assert report["status"] == "ok"
-    finally:
-        await close_db()
 
 
 @pytest.mark.asyncio

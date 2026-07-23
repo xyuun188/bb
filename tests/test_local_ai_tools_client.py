@@ -254,13 +254,8 @@ async def test_local_ai_tools_train_sends_training_cursors(
     assert captured["payload"]["quarantined_trade_sample_count"] == 24
     assert captured["payload"]["trade_sample_cursor_policy"] == "clean_training_view_only"
     assert captured["payload"]["training_mode"] == "shadow"
-    assert captured["payload"]["model_stage"] == "shadow"
-    assert (
-        captured["payload"]["evaluation_policy"]["promotion_flow"]
-        == "candidate_to_shadow_to_canary_to_active"
-    )
-    assert captured["payload"]["evaluation_policy"]["live_mutation"] is False
-    assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
+    assert "model_stage" not in captured["payload"]
+    assert "evaluation_policy" not in captured["payload"]
     assert captured["payload"]["persist_artifact"] is False
     assert captured["payload"]["confirm_phase3_rebuild"] is False
     assert captured["payload"]["return_objective_report"]["objective_name"] == (
@@ -300,8 +295,7 @@ async def test_local_ai_tools_train_can_explicitly_request_confirmed_rebuild(
     assert captured["path"] == "/train"
     assert captured["payload"]["persist_artifact"] is True
     assert captured["payload"]["confirm_phase3_rebuild"] is True
-    assert captured["payload"]["evaluation_policy"]["phase"] == "phase3_model_factory"
-    assert captured["payload"]["evaluation_policy"]["live_mutation"] is False
+    assert "evaluation_policy" not in captured["payload"]
 
 
 @pytest.mark.asyncio
@@ -334,13 +328,13 @@ async def test_local_ai_tools_train_builds_default_promotion_recommendation(
 
     recommendation = captured["payload"]["promotion_recommendation"]
     return_objective_report = captured["payload"]["return_objective_report"]
-    assert recommendation["policy"] == "2026-07-14.separated-return-promotion.v2"
+    assert recommendation["policy"] == "2026-07-24.model-owned-return-promotion.v3"
     assert recommendation["canary_ready"] is True
     assert recommendation["canary_execution_scope"] == "paper_only"
     assert recommendation["canary_production_permission"] is False
-    assert recommendation["live_ready"] is False
+    assert recommendation["live_ml_ready"] is False
     assert "walk_forward_required" in recommendation["live_blocking_reasons"]
-    assert captured["payload"]["paper_observation_report"]["status"] == "healthy"
+    assert "paper_observation_report" not in captured["payload"]
     assert return_objective_report["objective_name"] == (
         "maximize_expected_realized_net_return_after_cost"
     )

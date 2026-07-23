@@ -20,6 +20,14 @@ from services.specialist_shadow_evaluation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "services.specialist_shadow_evaluation.load_training_epoch_start",
+        lambda: datetime(2026, 7, 23, tzinfo=UTC),
+    )
+
+
 async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     await close_db()
     db_path = tmp_path / "specialist-shadow.db"

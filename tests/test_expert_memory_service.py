@@ -277,6 +277,7 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
     monkeypatch,
 ) -> None:
     processed: list[str] = []
+    loader_calls: list[dict] = []
 
     class SessionContext:
         async def __aenter__(self):
@@ -285,7 +286,8 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
         async def __aexit__(self, *_args):
             return False
 
-    async def load_outcomes(**_kwargs):
+    async def load_outcomes(**kwargs):
+        loader_calls.append(kwargs)
         return [
             {
                 "lifecycle_key": "paper|ICP|1",
@@ -305,9 +307,15 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
         return True
 
     monkeypatch.setattr(service, "_record_authoritative_outcome_in_session", record)
+    monkeypatch.setattr(
+        "services.expert_memory_service.load_training_epoch_start",
+        lambda: datetime(2026, 7, 24, tzinfo=UTC),
+    )
 
     report = await service.backfill_trade_reflections("paper")
 
     assert report["status"] == "completed"
     assert report["processed"] == 1
     assert processed == ["paper|ICP|1"]
+    assert loader_calls[0]["mode"] == "paper"
+    assert loader_calls[0]["since"] == datetime(2026, 7, 24, tzinfo=UTC)

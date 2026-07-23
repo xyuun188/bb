@@ -28,6 +28,7 @@ from services.manual_close_marker import (
     is_local_non_exchange_close_marker,
     is_manual_close_order,
 )
+from services.training_epoch import load_training_epoch_start
 
 DEFAULT_LOOKBACK_HOURS = 72
 DEFAULT_LIMIT = 500
@@ -37,6 +38,7 @@ POSITION_SYMBOL_MISMATCH_SEVERITY = "critical"
 QUANTITY_MISMATCH_SEVERITY = "critical"
 PRICE_MISMATCH_SEVERITY = "warning"
 NOTIONAL_MISMATCH_SEVERITY = "warning"
+CONTRACT_SPECIFICATION_EVIDENCE_MISSING_SEVERITY = "warning"
 ORDER_POSITION_MISSING_SEVERITY = "warning"
 POSITION_LINK_MISSING_SEVERITY = "critical"
 POSITION_LINK_MISMATCH_SEVERITY = "critical"
@@ -102,7 +104,10 @@ class OkxTradeFactIntegrityService:
         self.limit = max(1, min(int(limit or DEFAULT_LIMIT), 5000))
 
     async def audit(self) -> dict[str, Any]:
-        since = datetime.now(UTC) - timedelta(hours=self.lookback_hours)
+        checked_at = datetime.now(UTC)
+        nominal_since = checked_at - timedelta(hours=self.lookback_hours)
+        epoch_started_at = load_training_epoch_start()
+        since = max(nominal_since, epoch_started_at)
         since_naive = since.replace(tzinfo=None)
         async with get_read_session_ctx() as session:
             await _start_consistent_read_snapshot(session)
@@ -183,6 +188,9 @@ class OkxTradeFactIntegrityService:
             checked_orders=len(orders),
             checked_positions=len(positions),
             lookback_hours=self.lookback_hours,
+            nominal_since=nominal_since,
+            since=since,
+            epoch_started_at=epoch_started_at,
         )
 
     def _audit_order_against_raw(
@@ -212,7 +220,7 @@ class OkxTradeFactIntegrityService:
             raw.get("contract_size"),
             raw.get("contractSize"),
             _nested(raw, "info", "ctVal"),
-            default=1.0,
+            default=0.0,
         )
         raw_contracts = _first_positive(
             raw.get("filled_contracts"),
@@ -233,12 +241,29 @@ class OkxTradeFactIntegrityService:
             default=0.0,
         )
         expected_base_quantity = (
-            raw_contracts * contract_size
+            raw_base_quantity
+            if raw_base_quantity > 0
+            else raw_contracts * contract_size
             if raw_contracts > 0 and contract_size > 0
-            else raw_base_quantity if raw_base_quantity > 0 else raw_contracts
+            else 0.0
         )
-
-
+        if local_quantity > 0 and raw_contracts > 0 and expected_base_quantity <= 0:
+            issues.append(
+                TradeFactIssue(
+                    kind="contract_specification_evidence_missing",
+                    severity=CONTRACT_SPECIFICATION_EVIDENCE_MISSING_SEVERITY,
+                    order_id=int(order.id),
+                    decision_id=int(order.decision_id or 0) or None,
+                    symbol=local_symbol,
+                    expected_symbol=raw_symbol or local_symbol,
+                    order_quantity=local_quantity,
+                    raw_contracts=raw_contracts,
+                    reason=(
+                        "OKX execution exposes contract counts but no authoritative "
+                        "base_quantity or ctVal; quantity and notional comparisons are disabled."
+                    ),
+                )
+            )
         if (
             local_quantity > 0
             and expected_base_quantity > 0
@@ -1152,6 +1177,9 @@ def _summary(
     checked_orders: int,
     checked_positions: int,
     lookback_hours: int,
+    nominal_since: datetime,
+    since: datetime,
+    epoch_started_at: datetime,
 ) -> dict[str, Any]:
     severity_counts = Counter(issue.severity for issue in issues)
     kind_counts = Counter(issue.kind for issue in issues)
@@ -1162,6 +1190,9 @@ def _summary(
         "read_only": True,
         "status": status,
         "lookback_hours": lookback_hours,
+        "nominal_audit_window_start": nominal_since.isoformat(),
+        "audit_window_start": since.isoformat(),
+        "training_epoch_started_at": epoch_started_at.isoformat(),
         "checked_orders": int(checked_orders),
         "checked_positions": int(checked_positions),
         "issue_count": len(issues),

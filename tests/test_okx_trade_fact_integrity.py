@@ -15,6 +15,14 @@ from services.okx_trade_fact_integrity import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "services.okx_trade_fact_integrity.load_training_epoch_start",
+        lambda: datetime.now(UTC) - timedelta(days=3650),
+    )
+
+
 async def _reset_db(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     await close_db()
     monkeypatch.setattr(
@@ -71,7 +79,7 @@ def _execution_raw(
     *,
     inst_id: str = "H-USDT-SWAP",
     contracts: float = 100.0,
-    contract_size: float = 0.1,
+    contract_size: float | None = 0.1,
     avg_price: float = 2.44,
 ) -> dict:
     return {
@@ -89,6 +97,133 @@ def _execution_raw(
             }
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_trade_fact_audit_excludes_pre_epoch_mismatches(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        epoch_started_at = datetime.now(UTC) - timedelta(hours=1)
+        monkeypatch.setattr(
+            "services.okx_trade_fact_integrity.load_training_epoch_start",
+            lambda: epoch_started_at,
+        )
+        filled_at = epoch_started_at - timedelta(minutes=30)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="H/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(contracts=1, contract_size=1),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="H/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=999.0,
+                    price=2.44,
+                    status="filled",
+                    decision_id=decision.id,
+                    exchange_order_id="pre-epoch-mismatch",
+                    filled_at=filled_at,
+                    created_at=filled_at,
+                )
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["checked_orders"] == 0
+        assert report["issue_count"] == 0
+        assert report["audit_window_start"] == epoch_started_at.isoformat()
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_trade_fact_audit_does_not_assume_contract_size_one(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=10)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="H/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    contracts=0.29,
+                    contract_size=None,
+                    avg_price=0.15,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="H/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=290.0,
+                        price=0.15,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="missing-contract-specification",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="H/USDT",
+                        side="long",
+                        quantity=290.0,
+                        entry_price=0.15,
+                        current_price=0.15,
+                        leverage=1.0,
+                        is_open=True,
+                        okx_inst_id="H-USDT-SWAP",
+                        entry_exchange_order_id="missing-contract-specification",
+                        created_at=filled_at + timedelta(seconds=10),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+        evidence_issue = next(
+            issue
+            for issue in report["issues"]
+            if issue["kind"] == "contract_specification_evidence_missing"
+        )
+
+        assert report["status"] == "warning"
+        assert "contract_base_quantity_mismatch" not in kinds
+        assert "notional_mismatch" not in kinds
+        assert evidence_issue["raw_contracts"] == pytest.approx(0.29)
+        assert evidence_issue["contract_size"] is None
+        assert evidence_issue["expected_base_quantity"] is None
+    finally:
+        await close_db()
 
 
 def _recent_filled_at(*, minutes_ago: int) -> datetime:

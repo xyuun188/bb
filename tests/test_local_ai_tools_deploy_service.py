@@ -549,7 +549,7 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
     assert payload["model_stage"] == "shadow"
     assert payload["route_mode"] == "shadow_observation"
     assert payload["production_permission"] is False
-    assert payload["promotion_ready"] is False
+    assert payload["live_ml_ready"] is False
     assert payload["prediction_quality"]["production_eligible"] is False
     assert all(
         item["production_eligible"] is False
@@ -582,7 +582,7 @@ def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Pat
     assert status["status_endpoint_uses_metadata_only"] is True
     assert status["artifact_activation_manifest"]["activation_stage"] == "shadow"
     assert status["artifact_activation_manifest"][
-        "production_influence_authorized"
+        "live_ml_ready"
     ] is False
 
 
@@ -741,7 +741,7 @@ def test_local_ai_candidate_activation_is_atomic_and_rollbackable(tmp_path: Path
     runtime_bundle = module.load_bundle()
     assert runtime_bundle["metadata"]["artifact_lifecycle"] == "shadow"
     assert runtime_bundle["metadata"]["model_stage"] == "shadow"
-    assert runtime_bundle["metadata"]["production_influence_authorized"] is False
+    assert runtime_bundle["metadata"]["live_ml_ready"] is False
     assert runtime_bundle["metadata"]["artifact_version"] == second["version"]
     assert module._resolve_artifact_pointer(
         module.ROLLBACK_POINTER_PATH,
@@ -809,13 +809,13 @@ def test_local_ai_registry_rejects_live_activation_without_return_readiness(
     activation.update(
         {
             "activation_stage": "active",
-            "production_influence_authorized": True,
+            "live_ml_ready": True,
             "return_evidence_ready": True,
             "execution_scope": "production",
             "production_permission": True,
             "promotion_recommendation": {
                 "recommended_stage": "active",
-                "active_ready": True,
+                "live_ml_ready": True,
             },
         }
     )
@@ -848,7 +848,7 @@ def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> No
         "canary_ready": True,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
-        "live_ready": False,
+        "live_ml_ready": False,
     }
 
     evidence = {"promotion_recommendation": recommendation}
@@ -862,7 +862,7 @@ def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> No
     assert activation["activation_stage"] == "canary"
     assert activation["execution_scope"] == "paper_only"
     assert activation["production_permission"] is False
-    assert activation["production_influence_authorized"] is False
+    assert activation["live_ml_ready"] is False
     assert activation["canary_authorized"] is True
     assert activation["return_evidence_ready"] is False
 
@@ -881,8 +881,7 @@ def test_local_ai_registry_activates_active_only_with_complete_evidence(
         "canary_ready": True,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
-        "active_ready": True,
-        "live_ready": True,
+        "live_ml_ready": True,
     }
 
     evidence = {"promotion_recommendation": recommendation}
@@ -900,7 +899,7 @@ def test_local_ai_registry_activates_active_only_with_complete_evidence(
     assert activation["activation_stage"] == "active"
     assert activation["execution_scope"] == "production"
     assert activation["production_permission"] is True
-    assert activation["production_influence_authorized"] is True
+    assert activation["live_ml_ready"] is True
     assert activation["return_evidence_ready"] is True
 
 
@@ -915,7 +914,7 @@ def test_local_ai_registry_rejects_regressive_active_challenger(
         "canary_ready": True,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
-        "active_ready": True,
+        "live_ml_ready": True,
     }
     evidence = {"promotion_recommendation": recommendation}
     module.transition_current_artifact(evidence, activation_stage="canary")
@@ -974,7 +973,7 @@ def test_local_ai_registry_accepts_strictly_improved_active_challenger(
         "canary_ready": True,
         "canary_execution_scope": "paper_only",
         "canary_production_permission": False,
-        "active_ready": True,
+        "live_ml_ready": True,
     }
     evidence = {"promotion_recommendation": recommendation}
     module.transition_current_artifact(evidence, activation_stage="canary")
@@ -2019,17 +2018,17 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
     assert '"completed_trade_sample_count": int(' in SERVICE_CODE
     assert '"last_trained_completed_trade_sample_count": int(' in SERVICE_CODE
     assert 'training_mode: str = "shadow"' in SERVICE_CODE
-    assert 'model_stage: str = "shadow"' in SERVICE_CODE
+    assert 'model_stage: str = "shadow"' not in SERVICE_CODE
     assert "promotion_recommendation: dict[str, Any] = {}" in SERVICE_CODE
     assert '"training_mode": str(req.training_mode or "shadow")' in SERVICE_CODE
-    assert '"requested_model_stage": str(req.model_stage or "shadow")' in SERVICE_CODE
+    assert "requested_model_stage" not in SERVICE_CODE
     assert '"model_stage": "candidate"' in SERVICE_CODE
     assert '"promotion_recommendation": req.promotion_recommendation or {}' in SERVICE_CODE
     assert (
         'PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"'
         in SERVICE_CODE
     )
-    assert 'evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)' in SERVICE_CODE
+    assert '"promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW' in SERVICE_CODE
     assert '"live_mutation": live_authorized' in SERVICE_CODE
 
 
@@ -2048,9 +2047,7 @@ def test_local_ai_tools_generated_service_persists_phase3_artifact_policy() -> N
     assert '"reason": "phase3_preflight_no_artifact_write"' in SERVICE_CODE
     assert 'if not req.confirm_phase3_rebuild:' in SERVICE_CODE
     assert '"reason": "phase3_rebuild_confirmation_required"' in SERVICE_CODE
-    assert 'evaluation_policy.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)' in SERVICE_CODE
-    assert 'evaluation_policy.setdefault("live_mutation", False)' in SERVICE_CODE
-    assert 'evaluation_policy.setdefault("phase", "phase3_model_factory")' in SERVICE_CODE
+    assert "evaluation_policy" not in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_targets() -> None:
@@ -2568,7 +2565,7 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
         metadata
     )
     assert current["activation_manifest"]["activation_stage"] == "shadow"
-    assert current["activation_manifest"]["production_influence_authorized"] is False
+    assert current["activation_manifest"]["live_ml_ready"] is False
     assert current["activation_manifest"]["return_evidence_ready"] is False
     assert current["activation_manifest"]["return_evidence_blockers"]
     assert not module.CANDIDATE_POINTER_PATH.exists()
@@ -2636,10 +2633,10 @@ def test_phase3_quant_api_remote_smoke_checks_governed_activation_contract() -> 
     assert "health.get('root') == '/data/BB'" in command
     assert "health.get('live_mutation') is live" in command
     assert (
-        "health.get('artifact_lifecycle') in {'shadow', 'canary', 'active', 'live'}"
+        "health.get('artifact_lifecycle') in {'shadow', 'canary', 'active'}"
         in command
     )
-    assert "health.get('production_influence_authorized') is live" in command
+    assert "health.get('live_ml_ready') is live" in command
     assert "profit.get('trained') is True" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command
     assert "profit.get('return_distribution_input_version')" in command

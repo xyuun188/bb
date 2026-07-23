@@ -60,9 +60,9 @@ def build_model_strategy_blueprint(
         for side in _safe_list(paper_gate.get("eligible_sides"))
         if str(side).lower() in {"long", "short"}
     }
-    production_authorized = bool(
-        stage in {"canary", "active", "live"}
-        and active.get("production_influence_authorized") is True
+    live_ml_ready = bool(
+        stage in {"canary", "active"}
+        and active.get("live_ml_ready") is True
         and production_sides
     )
     paper_canary_authorized = bool(
@@ -74,7 +74,7 @@ def build_model_strategy_blueprint(
     )
     eligible_sides = sorted(production_sides or paper_sides)
     paper_execution_eligible = bool(
-        production_authorized or paper_canary_authorized
+        live_ml_ready or paper_canary_authorized
     )
     champion_comparison = _safe_dict(active.get("champion_comparison"))
     oos_evaluation = _safe_dict(model.get("oos_return_evaluation"))
@@ -99,7 +99,7 @@ def build_model_strategy_blueprint(
         "eligible_sides": eligible_sides,
     }
     blockers: list[str] = []
-    if stage not in {"canary", "active", "live"}:
+    if stage not in {"canary", "active"}:
         blockers.append("trained_model_not_canary_or_active")
     if not eligible_sides:
         blockers.append("trained_model_has_no_governed_side")
@@ -255,10 +255,10 @@ def paper_strategy_authorization(
     if not model_version or model_version != champion_version:
         return {**result, "reason": "paper_strategy_model_version_mismatch"}
     lifecycle = str(model_signal.get("artifact_lifecycle") or "").lower()
-    if lifecycle not in {"canary", "active", "live"}:
+    if lifecycle not in {"canary", "active"}:
         return {**result, "reason": "paper_strategy_model_lifecycle_ineligible"}
 
-    live_ready = model_signal.get("allow_live_position_influence") is True
+    live_ml_ready = model_signal.get("live_ml_ready") is True
     paper_gate = _safe_dict(model_signal.get("paper_canary"))
     canary_ready = bool(
         model_signal.get("paper_canary_authorized") is True
@@ -270,7 +270,7 @@ def paper_strategy_authorization(
             for value in _safe_list(paper_gate.get("eligible_sides"))
         }
     )
-    if not live_ready and not canary_ready:
+    if not live_ml_ready and not canary_ready:
         return {**result, "reason": "paper_strategy_model_authorization_missing"}
     return {
         **result,

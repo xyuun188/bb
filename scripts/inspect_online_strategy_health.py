@@ -149,7 +149,7 @@ async def main():
         ml_status = {
             "available": False,
             "readiness_state": "unavailable",
-            "allow_live_position_influence": False,
+            "live_ml_ready": False,
             "error": str(exc)[:180],
         }
     try:
@@ -379,7 +379,7 @@ def _summarize_report(report: dict) -> dict:
         "contract_violations": contract.get("violation_reason_counts") or {},
         "contract_policy": contract.get("policy") or {},
         "ml_readiness_state": ml_status.get("readiness_state") or ml_status.get("state"),
-        "ml_live_influence": bool(ml_status.get("allow_live_position_influence")),
+        "ml_live_influence": bool(ml_status.get("live_ml_ready")),
         "model_strategy_blueprint": {
             key: strategy_blueprint.get(key)
             for key in (
@@ -518,10 +518,9 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
                     key: promotion.get(key)
                     for key in (
                         "optimization_target",
-                        "current_stage",
                         "recommended_stage",
                         "canary_ready",
-                        "live_ready",
+                        "live_ml_ready",
                         "canary_blocking_reasons",
                         "live_blocking_reasons",
                     )

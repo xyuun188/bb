@@ -109,7 +109,7 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "new_trade_sample_count",
         "artifact_persisted",
         "readiness_state",
-        "allow_live_position_influence",
+        "live_ml_ready",
     )
     summary: dict[str, Any] = {}
     for key in keys:

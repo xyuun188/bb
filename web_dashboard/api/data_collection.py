@@ -27,10 +27,9 @@ from data_feed.external_event_scraper import (
 )
 from data_feed.news_fetcher import RSS_FEEDS
 from db.session import get_session_ctx
-from models.learning import ShadowBacktest, TradeReflection
+from models.learning import ShadowBacktest
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
-from models.trade import Position
 from services.crypto_feature_coverage import CryptoFeatureCoverageService
 from services.ml_signal_service import (
     AUTO_TRAIN_LEASE_STALE_SECONDS,
@@ -39,10 +38,10 @@ from services.ml_signal_service import (
 )
 from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS
 from services.okx_training_gate import okx_training_refresh_gate
-from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
+from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api import dashboard as _dash
 from web_dashboard.api.security import require_dashboard_write_access
@@ -100,10 +99,6 @@ def _safe_int_count(value: Any, default: int = 0) -> int:
     except (TypeError, ValueError):
         return default
     return max(parsed, 0)
-
-
-def _max_count(*values: Any) -> int:
-    return max((_safe_int_count(value) for value in values), default=0)
 
 
 def _safe_feature_coverage_status(result: Any) -> dict[str, Any]:
@@ -527,46 +522,25 @@ async def _training_sample_quality() -> dict[str, Any]:
 
 
 async def _local_ai_training_status() -> dict[str, Any]:
-    # Read the lightweight service contract once. This function already derives the
-    # authoritative Phase 3 counters below, so calling the Dashboard normalizer would
-    # duplicate the remote request and database counts under an unrelated fixed timeout.
+    # Read the remote artifact cursor once and publish database counts separately.
     status, db_completed_shadow_count, db_completed_trade_count = await asyncio.gather(
         _raw_local_ai_tools_status(),
-        _phase3_completed_shadow_count(),
-        _phase3_completed_trade_count(),
+        _completed_training_shadow_count(),
+        _completed_training_trade_count(),
     )
     if not isinstance(status, dict):
         return {"available": False, "status": "invalid_status"}
-    original_raw_shadow_count = _safe_int_count(
-        status.get("service_model_window_shadow_sample_count")
-        or status.get("raw_shadow_sample_count")
-        or status.get("shadow_sample_count")
-    )
-    original_raw_trade_count = _safe_int_count(
-        status.get("service_model_window_trade_sample_count")
-        or status.get("raw_trade_sample_count")
-        or status.get("trade_sample_count")
-    )
-    original_text_count = _safe_int_count(status.get("text_sentiment_sample_count"))
-    raw_shadow_count = _max_count(
-        original_raw_shadow_count,
-        status.get("raw_shadow_sample_count"),
-        status.get("shadow_sample_count"),
-    )
-    raw_trade_count = _max_count(
-        original_raw_trade_count,
-        status.get("raw_trade_sample_count"),
-        status.get("trade_sample_count"),
-    )
-    text_count = _max_count(original_text_count, status.get("text_sentiment_sample_count"))
+    artifact_shadow_count = _safe_int_count(status.get("shadow_sample_count"))
+    artifact_trade_count = _safe_int_count(status.get("trade_sample_count"))
+    text_count = _safe_int_count(status.get("text_sentiment_sample_count"))
     raw_status = str(status.get("status") or "unknown")
     service_available = bool(status.get("service_available", status.get("available")))
     visible_status = _visible_local_ai_training_status(
         raw_status,
         available=service_available,
         model_bundle_available=bool(status.get("model_bundle_available")),
-        shadow_count=raw_shadow_count,
-        trade_count=raw_trade_count,
+        shadow_count=db_completed_shadow_count,
+        trade_count=db_completed_trade_count,
         text_count=text_count,
     )
     governance_report = (
@@ -574,76 +548,38 @@ async def _local_ai_training_status() -> dict[str, Any]:
         if isinstance(status.get("governance_report"), dict)
         else {}
     )
-    explicit_shadow_counts = [
-        status.get("phase3_clean_trainable_shadow_sample_count"),
-        status.get("phase3_clean_completed_shadow_sample_count"),
-        governance_report.get("phase3_clean_trainable_shadow_sample_count"),
-        governance_report.get("trainable_shadow_sample_count"),
-        governance_report.get("shadow_sample_count"),
-    ]
-    explicit_trade_counts = [
-        status.get("phase3_clean_trainable_trade_sample_count"),
-        status.get("phase3_clean_completed_trade_sample_count"),
-        status.get("trainable_trade_sample_count"),
-    ]
-    phase3_shadow_count = _max_count(*explicit_shadow_counts)
-    if phase3_shadow_count <= 0 and not any(value is not None for value in explicit_shadow_counts):
-        phase3_shadow_count = db_completed_shadow_count
-    phase3_trade_count = _max_count(*explicit_trade_counts)
-    if phase3_trade_count <= 0 and not any(value is not None for value in explicit_trade_counts):
-        phase3_trade_count = raw_trade_count if raw_trade_count > 0 and phase3_shadow_count > 0 else db_completed_trade_count
-    raw_shadow_count = max(raw_shadow_count, phase3_shadow_count)
-    raw_trade_count = max(raw_trade_count, phase3_trade_count)
+    training_shadow_count = db_completed_shadow_count
+    training_trade_count = db_completed_trade_count
+    epoch_started_at = load_training_epoch_start()
     return {
         "available": service_available,
         "status": visible_status,
         "raw_status": raw_status,
-        "phase3_training_policy": "clean_training_view_only",
-        "legacy_data_policy": "excluded_from_phase3_training",
-        "legacy_data_training_allowed": False,
-        "raw_records_preserved": False,
-        "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
+        "training_policy": "current_training_epoch_only",
+        "training_epoch_started_at": epoch_started_at.isoformat(),
+        "pre_epoch_data_training_allowed": False,
         "model_bundle_available": bool(status.get("model_bundle_available")),
         "service_available": service_available,
         "trained_at": status.get("trained_at"),
         "training_mode": status.get("training_mode"),
         "model_stage": status.get("model_stage"),
-        "evaluation_policy": (
-            status.get("evaluation_policy") if isinstance(status.get("evaluation_policy"), dict) else {}
-        ),
-        "promotion_flow": (
-            status.get("promotion_flow")
-            or (
-                status.get("evaluation_policy", {}).get("promotion_flow")
-                if isinstance(status.get("evaluation_policy"), dict)
-                else None
-            )
-        ),
-        "live_mutation": bool(
-            status.get("live_mutation")
-            or (
-                status.get("evaluation_policy", {}).get("live_mutation")
-                if isinstance(status.get("evaluation_policy"), dict)
-                else False
-            )
-        ),
+        "promotion_flow": status.get("promotion_flow"),
+        "live_ml_ready": status.get("live_ml_ready") is True,
         "promotion_recommendation": (
             status.get("promotion_recommendation")
             if isinstance(status.get("promotion_recommendation"), dict)
             else {}
         ),
-        "shadow_sample_count": phase3_shadow_count,
-        "training_shadow_sample_count": phase3_shadow_count,
-        "raw_shadow_sample_count": raw_shadow_count,
-        "legacy_shadow_sample_count": max(raw_shadow_count - phase3_shadow_count, 0),
-        "trade_sample_count": phase3_trade_count,
-        "training_trade_sample_count": phase3_trade_count,
-        "raw_trade_sample_count": raw_trade_count,
-        "legacy_trade_sample_count": max(raw_trade_count - phase3_trade_count, 0),
+        "shadow_sample_count": training_shadow_count,
+        "training_shadow_sample_count": training_shadow_count,
+        "artifact_training_shadow_sample_count": artifact_shadow_count,
+        "trade_sample_count": training_trade_count,
+        "training_trade_sample_count": training_trade_count,
+        "artifact_training_trade_sample_count": artifact_trade_count,
         "sequence_sample_count": _safe_int_count(status.get("sequence_sample_count")),
         "text_sentiment_sample_count": text_count,
-        "completed_shadow_sample_count": phase3_shadow_count,
-        "completed_trade_sample_count": phase3_trade_count,
+        "completed_shadow_sample_count": training_shadow_count,
+        "completed_trade_sample_count": training_trade_count,
         "quality_report": (
             status.get("quality_report") if isinstance(status.get("quality_report"), dict) else {}
         ),
@@ -667,69 +603,28 @@ async def _raw_local_ai_tools_status() -> dict[str, Any]:
     return status
 
 
-async def _phase3_completed_shadow_count() -> int:
-    dashboard_counter = getattr(_dash, "_completed_local_ai_shadow_backtest_total", None)
-    if callable(dashboard_counter):
-        try:
-            return int(await dashboard_counter())
-        except Exception as exc:
-            logger.warning(
-                "data collection dashboard local-ai shadow count fallback failed",
-                error=safe_error_text(exc),
-            )
-    async with get_session_ctx() as session:
-        result = await session.execute(
-            select(func.count(ShadowBacktest.id)).where(
-                ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,
-                ShadowBacktest.status == "completed",
-                ShadowBacktest.long_return_pct.is_not(None),
-                ShadowBacktest.short_return_pct.is_not(None),
-            )
-        )
-        return int(result.scalar() or 0)
+async def _completed_training_shadow_count() -> int:
+    from scripts.train_local_ai_tools_models import _completed_shadow_sample_count
+
+    return int(await _completed_shadow_sample_count())
 
 
-async def _phase3_completed_trade_count() -> int:
-    trade_reflection_count = 0
-    closed_position_count = 0
-    async with get_session_ctx() as session:
-        try:
-            trade_reflection_result = await session.execute(
-                select(func.count(TradeReflection.id)).where(
-                    TradeReflection.created_at >= PHASE3_CLEAN_START_UTC
-                )
-            )
-            trade_reflection_count = int(trade_reflection_result.scalar() or 0)
-        except Exception as exc:
-            logger.warning(
-                "data collection trade reflection count unavailable",
-                error=safe_error_text(exc, limit=180),
-            )
-        try:
-            closed_position_result = await session.execute(
-                select(func.count(Position.id)).where(
-                    Position.is_open.is_(False),
-                    Position.closed_at.is_not(None),
-                    Position.created_at >= PHASE3_CLEAN_START_UTC,
-                )
-            )
-            closed_position_count = int(closed_position_result.scalar() or 0)
-        except Exception as exc:
-            logger.warning(
-                "data collection closed position count unavailable",
-                error=safe_error_text(exc, limit=180),
-            )
-    return trade_reflection_count + closed_position_count
+async def _completed_training_trade_count() -> int:
+    from scripts.train_local_ai_tools_models import _completed_trade_sample_count
+
+    return int(await _completed_trade_sample_count())
 
 
 async def _training_governance_snapshot() -> dict[str, Any]:
     try:
         sample_limit = max(int(GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT), 1)
+        epoch_started_at = load_training_epoch_start()
+        trade_count = await _completed_training_trade_count()
         async with get_session_ctx() as session:
-            phase3_filter = (ShadowBacktest.created_at >= PHASE3_CLEAN_START_UTC,)
+            epoch_filter = (ShadowBacktest.created_at >= epoch_started_at,)
             completed_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(
-                    *phase3_filter,
+                    *epoch_filter,
                     ShadowBacktest.status == "completed",
                     ShadowBacktest.long_return_pct.is_not(None),
                     ShadowBacktest.short_return_pct.is_not(None),
@@ -737,12 +632,12 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             )
             quarantined_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(
-                    *phase3_filter,
+                    *epoch_filter,
                     ShadowBacktest.status == "quarantined",
                 )
             )
             shadow_window_filter = (
-                *phase3_filter,
+                *epoch_filter,
                 ShadowBacktest.status.in_(("completed", "quarantined")),
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
@@ -768,7 +663,7 @@ async def _training_governance_snapshot() -> dict[str, Any]:
                     await session.execute(
                         select(ShadowBacktest.decision_action, func.count(ShadowBacktest.id))
                         .where(
-                            *phase3_filter,
+                            *epoch_filter,
                             ShadowBacktest.status == "completed",
                             ShadowBacktest.long_return_pct.is_not(None),
                             ShadowBacktest.short_return_pct.is_not(None),
@@ -786,18 +681,6 @@ async def _training_governance_snapshot() -> dict[str, Any]:
                     )
                 ).all()
             )
-            trade_reflection_result = await session.execute(
-                select(func.count(TradeReflection.id)).where(
-                    TradeReflection.created_at >= PHASE3_CLEAN_START_UTC
-                )
-            )
-            closed_position_result = await session.execute(
-                select(func.count(Position.id)).where(
-                    Position.is_open.is_(False),
-                    Position.closed_at.is_not(None),
-                    Position.created_at >= PHASE3_CLEAN_START_UTC,
-                )
-            )
 
         completed_count = int(completed_result.scalar() or 0)
         quarantined_count = int(quarantined_result.scalar() or 0)
@@ -814,9 +697,6 @@ async def _training_governance_snapshot() -> dict[str, Any]:
         symbol_counts = {
             str(symbol or "unknown"): int(count or 0) for symbol, count in shadow_symbol_rows
         }
-        trade_count = int(trade_reflection_result.scalar() or 0) + int(
-            closed_position_result.scalar() or 0
-        )
         if quarantined_count:
             status = "quarantined"
             summary = f"已隔离 {quarantined_count} 条训练样本；原始记录保留。"
@@ -829,16 +709,15 @@ async def _training_governance_snapshot() -> dict[str, Any]:
         shadow_report = {
             "status": status,
             "summary": summary,
-            "phase3_training_policy": "clean_training_view_only",
-            "legacy_data_policy": "excluded_from_phase3_training",
-            "legacy_data_training_allowed": False,
-            "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
+            "training_policy": "current_training_epoch_only",
+            "training_epoch_started_at": epoch_started_at.isoformat(),
+            "pre_epoch_data_training_allowed": False,
             "sampled": 0,
             "sample_limit": sample_limit,
             "sample_total_count": sample_total_count,
             "raw_sample_count": sample_total_count,
-            "phase3_clean_trainable_sample_count": completed_count,
-            "trainable_sample_source": "phase3_clean_completed_shadow_backtests",
+            "current_epoch_trainable_sample_count": completed_count,
+            "trainable_sample_source": "current_epoch_completed_shadow_backtests",
             "trainable_sample_count": completed_count,
             "quarantined_sample_count": quarantined_count,
             "historical_audit_sample_count": 0,
@@ -854,9 +733,9 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             },
             "latest_sample_at": _iso(latest_sample_at),
             "data_freshness_minutes": _age_minutes(latest_sample_at),
-            "cleanup_mode": "phase3_clean_window_only",
-            "raw_records_preserved": False,
-            "raw_records_preserved_for_audit_only": False,
+            "cleanup_mode": "current_training_epoch_only",
+            "raw_records_preserved": True,
+            "raw_records_preserved_for_audit_only": True,
             "quarantine_applied": bool(quarantined_count),
             "requires_artifact_refresh": bool(quarantined_count),
             "refresh_targets": [
@@ -870,17 +749,16 @@ async def _training_governance_snapshot() -> dict[str, Any]:
         local_ai_report["trade_sample_count"] = trade_count
         return {
             "status": "ok",
-            "phase3_training_policy": "clean_training_view_only",
-            "legacy_data_policy": "excluded_from_phase3_training",
-            "legacy_data_training_allowed": False,
-            "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
-            "raw_records_preserved": False,
+            "training_policy": "current_training_epoch_only",
+            "training_epoch_started_at": epoch_started_at.isoformat(),
+            "pre_epoch_data_training_allowed": False,
+            "raw_records_preserved": True,
             "local_ai_tools": local_ai_report,
             "local_ai_quality_report": shadow_report,
             "local_ml_signal": shadow_report,
             "local_ml_quality_report": shadow_report,
             "local_ml_trainable_shadow_sample_count": completed_count,
-            "phase3_clean_trainable_shadow_sample_count": completed_count,
+            "current_epoch_trainable_shadow_sample_count": completed_count,
             "quarantined_shadow_sample_count": quarantined_count,
             "historical_audit_shadow_sample_count": 0,
             "training_quarantine": {
@@ -1023,13 +901,6 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             raw_trade_sample_count - trainable_trade_sample_count,
             0,
         )
-        evaluation_policy = {
-            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-            "live_mutation": False,
-            "requires_walk_forward": True,
-            "requires_paper_observation": True,
-            "phase": "phase3_model_factory",
-        }
         paper_observation_report = load_latest_paper_observation_report()
         return_objective_report = build_return_objective_report(
             trade_samples=payload["trade_samples"],
@@ -1037,10 +908,8 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
         )
         promotion_recommendation = build_phase3_promotion_recommendation(
             training_mode="shadow",
-            model_stage="shadow",
             quality_report=payload["quality_report"],
             governance_report=payload["governance_report"],
-            evaluation_policy=evaluation_policy,
             paper_observation_report=paper_observation_report,
             completed_shadow_sample_count=completed_shadow_count,
             completed_trade_sample_count=completed_trade_count,
@@ -1061,8 +930,6 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             quality_report=payload["quality_report"],
             governance_report=payload["governance_report"],
             training_mode="shadow",
-            model_stage="shadow",
-            evaluation_policy=evaluation_policy,
             paper_observation_report=paper_observation_report,
             promotion_recommendation=promotion_recommendation,
             persist_artifact=True,

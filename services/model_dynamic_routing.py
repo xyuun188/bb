@@ -12,7 +12,7 @@ ALL_ENTRY_EXPERTS = (
     "position_expert",
     "risk_expert",
 )
-VALID_ROUTE_STAGES = {"shadow", "canary", "active", "live"}
+VALID_ROUTE_STAGES = {"shadow", "canary", "active"}
 
 
 class ModelDynamicRoutingService:
@@ -74,13 +74,11 @@ def plan_dynamic_model_route(
     requested = str(requested_stage or governance.get("model_stage") or "shadow").lower()
     if requested not in VALID_ROUTE_STAGES:
         requested = "shadow"
-    if requested == "live":
-        requested = "active"
-    canary_blockers = _canary_route_blockers(ctx, competition_report, coverage, governance)
-    live_blockers = _live_route_blockers(ctx, competition_report, coverage, governance)
+    canary_blockers = _canary_route_blockers(ctx, competition_report, coverage)
+    live_blockers = _live_route_blockers(ctx, competition_report, coverage)
     blocking_reasons = live_blockers if requested == "active" else canary_blockers
     if requested == "active":
-        mode = "active_blocked" if live_blockers else "active_ready"
+        mode = "active_blocked" if live_blockers else "active_route_ready"
     else:
         mode = "shadow_only" if canary_blockers else "canary_ready"
     selected_list = list(ALL_ENTRY_EXPERTS)
@@ -93,8 +91,7 @@ def plan_dynamic_model_route(
         "can_apply_live_route": False,
         "requested_stage": requested,
         "canary_ready": not bool(canary_blockers),
-        "active_ready": not bool(live_blockers),
-        "live_ready": not bool(live_blockers),
+        "live_ml_ready": not bool(live_blockers),
         "canary_blocking_reasons": canary_blockers,
         "live_blocking_reasons": live_blockers,
         "selected_experts": selected_list,
@@ -127,7 +124,7 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
     negative_executed_count = 0
     unsafe_live_mutation_attempts = 0
     estimated_call_reduction = 0
-    live_ready_count = 0
+    live_ml_ready_count = 0
     live_blocked_count = 0
     for decision in decisions:
         raw = _safe_dict(_row_get(decision, "raw_llm_response"))
@@ -142,9 +139,9 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
         for name in _safe_list(route.get("selected_experts")):
             selected_counts[str(name)] += 1
         estimated_call_reduction += int(_safe_float(route.get("estimated_call_reduction"), 0.0))
-        if bool(route.get("live_ready")):
-            live_ready_count += 1
-        if route.get("mode") in {"active_blocked", "live_blocked"} or _safe_list(
+        if bool(route.get("live_ml_ready")):
+            live_ml_ready_count += 1
+        if route.get("mode") == "active_blocked" or _safe_list(
             route.get("live_blocking_reasons")
         ):
             live_blocked_count += 1
@@ -169,8 +166,7 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
             "route_plan_count": route_plan_count,
             "shadow_only_count": int(mode_counts.get("shadow_only") or 0),
             "canary_ready_count": int(mode_counts.get("canary_ready") or 0),
-            "live_ready_count": live_ready_count,
-            "active_ready_count": live_ready_count,
+            "live_ml_ready_count": live_ml_ready_count,
             "live_blocked_count": live_blocked_count,
             "active_blocked_count": live_blocked_count,
             "estimated_call_reduction": estimated_call_reduction,
@@ -191,7 +187,7 @@ def summarize_dynamic_model_routing(decisions: list[Any]) -> dict[str, Any]:
             "routing_report_is_read_only",
             "unsafe_live_mutation_is_never_honored",
             "ineligible_return_contracts_require_observation_before_canary",
-            "live_route_requires_walk_forward_and_manual_enablement",
+            "live_route_requires_the_authoritative_live_ml_ready_result",
         ],
     }
 
@@ -203,16 +199,12 @@ def _route_governance(
     source = training_governance if isinstance(training_governance, dict) else {}
     if not source:
         source = _safe_dict(context.get("phase3_training_governance"))
-    evaluation_policy = _safe_dict(source.get("evaluation_policy"))
     return {
         "training_mode": str(source.get("training_mode") or "shadow").lower(),
         "model_stage": str(source.get("model_stage") or "shadow").lower(),
         "promotion_flow": source.get("promotion_flow")
-        or evaluation_policy.get("promotion_flow")
         or "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": bool(source.get("live_mutation") or evaluation_policy.get("live_mutation")),
-        "requires_walk_forward": bool(evaluation_policy.get("requires_walk_forward", True)),
-        "evaluation_policy": evaluation_policy,
+        "live_ml_ready": source.get("live_ml_ready") is True,
     }
 
 
@@ -220,7 +212,6 @@ def _canary_route_blockers(
     context: dict[str, Any],
     competition: dict[str, Any],
     coverage: dict[str, Any],
-    governance: dict[str, Any],
 ) -> list[str]:
     blockers: list[str] = []
     if _paper_canary_readiness_blocks_route(context):
@@ -242,8 +233,6 @@ def _canary_route_blockers(
         coverage.get("missing_features")
     ):
         blockers.append("feature_coverage_missing")
-    if governance.get("model_stage") in {"degraded", "retired"}:
-        blockers.append("model_stage_not_canary_eligible")
     return list(dict.fromkeys(blockers))
 
 
@@ -251,27 +240,21 @@ def _live_route_blockers(
     context: dict[str, Any],
     competition: dict[str, Any],
     coverage: dict[str, Any],
-    governance: dict[str, Any],
 ) -> list[str]:
-    blockers = _canary_route_blockers(context, competition, coverage, governance)
+    blockers = _canary_route_blockers(context, competition, coverage)
     if _ml_readiness_blocks_route(context):
         blockers.append("ml_readiness_blocks_live_route")
-    if governance.get("model_stage") != "live":
-        blockers.append("model_stage_not_live")
-    if governance.get("requires_walk_forward") and governance.get("training_mode") != "walk_forward":
-        blockers.append("walk_forward_required")
-    if not governance.get("live_mutation"):
-        blockers.append("live_mutation_not_enabled")
     return list(dict.fromkeys(blockers))
 
 
 def _ml_readiness_blocks_route(context: dict[str, Any]) -> bool:
     readiness = _safe_dict(_safe_dict(context.get("ml_signal")).get("readiness"))
-    if readiness and readiness.get("allow_live_position_influence") is False:
-        return True
-    if _safe_dict(context.get("readiness")).get("allow_live_position_influence") is False:
-        return True
-    return False
+    if readiness:
+        return readiness.get("live_ml_ready") is not True
+    readiness = _safe_dict(context.get("readiness"))
+    if readiness:
+        return readiness.get("live_ml_ready") is not True
+    return True
 
 
 def _paper_canary_readiness_blocks_route(context: dict[str, Any]) -> bool:
@@ -279,7 +262,7 @@ def _paper_canary_readiness_blocks_route(context: dict[str, Any]) -> bool:
     paper = _safe_dict(readiness.get("paper_canary"))
     if paper:
         return paper.get("authorized") is not True
-    return bool(readiness and readiness.get("allow_live_position_influence") is False)
+    return bool(readiness and readiness.get("live_ml_ready") is False)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
