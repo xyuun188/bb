@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
+
 MODEL_TRAINING_REGISTRY_VERSION = "2026-07-12.v2"
 
 
@@ -25,6 +27,13 @@ def _safe_int(value: Any) -> int:
         return max(int(value or 0), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _fee_after_evaluation(
@@ -360,6 +369,14 @@ def _specialist_rows(
                 ),
                 "authoritative_avg_net_return_after_cost_pct": report.get(
                     "authoritative_avg_return_after_cost_pct"
+                ),
+                PROFIT_TRAINING_TARGET: _first_present(
+                    report.get("authoritative_avg_return_after_cost_pct"),
+                    report.get("avg_shadow_return_after_cost_pct"),
+                ),
+                "net_return_after_cost_pct": _first_present(
+                    report.get("authoritative_avg_return_after_cost_pct"),
+                    report.get("avg_shadow_return_after_cost_pct"),
                 ),
                 "profit_factor": report.get("profit_factor"),
                 "authoritative_profit_factor": report.get(

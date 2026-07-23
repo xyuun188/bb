@@ -2325,6 +2325,30 @@ def test_local_ai_training_rejects_missing_label_or_decision_identity(
         assert result["reason"] == "chronological_training_identity_incomplete"
 
 
+def test_local_ai_tools_generated_service_uses_profit_target_distribution(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    assert module.f({module.PROFIT_TRAINING_TARGET: 0.0}, module.PROFIT_TRAINING_TARGET, float("nan")) == 0.0
+
+    sample = _training_shadow_samples(count=1)[0]
+    sample["profit_supervision"]["tasks"][module.AUTHORITATIVE_REALIZED_RETURN_TASK] = {
+        "eligible": True,
+        module.PROFIT_TRAINING_TARGET: 1.25,
+        "realized_net_return_pct": 9.99,
+        "stop_loss_slippage_pct": 0.03,
+        "hold_minutes": 42,
+        "side": "long",
+    }
+
+    profiles = module._train_profiles([sample])
+    profile = profiles["BTC/USDT|long"]
+
+    assert profile[module.PROFIT_TRAINING_TARGET]["count"] == 1
+    assert profile[module.PROFIT_TRAINING_TARGET]["expected"] == pytest.approx(1.25)
+    assert profile["net_return_after_cost_pct"]["expected"] == pytest.approx(1.25)
+
+
 def test_local_ai_walk_forward_tail_policy_ignores_future_extreme_returns(
     tmp_path: Path,
 ) -> None:
@@ -2547,6 +2571,7 @@ def test_local_ai_tools_generated_service_uses_quality_weights() -> None:
     assert '"quality_report": req.quality_report or {}' in SERVICE_CODE
     assert "trainable_trade_samples = [" in SERVICE_CODE
     assert 'if not bool(sample.get("exclude_from_training"))' in SERVICE_CODE
+    assert 'PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"' in SERVICE_CODE
 
 
 def test_local_ai_tools_systemd_uses_env_file_for_secrets() -> None:

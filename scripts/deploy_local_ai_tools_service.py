@@ -97,6 +97,7 @@ FEATURE_KEYS = [
     "news_article_count", "decision_confidence", "horizon_minutes",
 ]
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
+PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
 RETURN_OBJECTIVE_VERSION = "2026-07-14.separated-supervision.v2"
 RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
@@ -324,7 +325,8 @@ class TrainRequest(BaseModel):
 
 def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
     try:
-        value = float(features.get(key, default) or default)
+        raw = features.get(key, default)
+        value = float(default if raw is None or raw == "" else raw)
         return value if math.isfinite(value) else default
     except Exception:
         return default
@@ -876,7 +878,11 @@ def _authoritative_trade_return_evidence(
         tasks = supervision.get("tasks") or {}
         realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
         side = str(realized.get("side") or sample.get("side") or "").lower()
-        value = f(realized, "realized_net_return_pct", float("nan"))
+        value = f(
+            realized,
+            PROFIT_TRAINING_TARGET,
+            f(realized, "realized_net_return_pct", float("nan")),
+        )
         if (
             supervision.get("version") != PROFIT_SUPERVISION_VERSION
             or realized.get("eligible") is not True
@@ -2511,6 +2517,26 @@ def _weighted_empirical_distribution(values: list[tuple[Any, Any]]) -> dict[str,
     }
 
 
+def _return_profile_distribution(profile: dict[str, Any]) -> dict[str, Any]:
+    distribution = profile.get(PROFIT_TRAINING_TARGET)
+    if not isinstance(distribution, dict):
+        distribution = profile.get("net_return_after_cost_pct")
+    return distribution if isinstance(distribution, dict) else {}
+
+
+def _authoritative_return_target_value(sample: dict[str, Any]) -> Any:
+    tasks = ((sample.get("profit_supervision") or {}).get("tasks") or {})
+    realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
+    value = realized.get(PROFIT_TRAINING_TARGET)
+    if value is None:
+        value = realized.get("realized_net_return_pct")
+    if value is None:
+        value = sample.get(PROFIT_TRAINING_TARGET)
+    if value is None:
+        value = sample.get("net_return_after_cost_pct")
+    return value
+
+
 def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
     buckets: dict[str, list[dict[str, Any]]] = {}
     for row in trade_samples:
@@ -2547,8 +2573,12 @@ def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
             "source_authority": "okx_position_history",
             "symbol": key.rsplit("|", 1)[0],
             "side": side,
+            PROFIT_TRAINING_TARGET: _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, PROFIT_TRAINING_TARGET)
+            ),
             "net_return_after_cost_pct": _weighted_empirical_distribution(
-                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "realized_net_return_pct")
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, PROFIT_TRAINING_TARGET)
+                or task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "realized_net_return_pct")
             ),
             "execution_cost_pct": _weighted_empirical_distribution(
                 task_pairs(EXECUTION_COST_TASK, "total_cost_pct")
@@ -4579,6 +4609,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 "id": sample.get("id"),
                 "position_id": sample.get("position_id"),
                 "realized_pnl": sample.get("realized_pnl"),
+                PROFIT_TRAINING_TARGET: _authoritative_return_target_value(sample),
                 "net_return_after_cost_pct": sample.get("net_return_after_cost_pct"),
                 "sample_weight": sample.get("sample_weight"),
                 "profit_supervision": sample.get("profit_supervision") or {},
@@ -4954,7 +4985,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             )
             quality = best_lower_bound
             actual_calibration_ready = all(
-                int((profile.get("net_return_after_cost_pct") or {}).get("count") or 0) > 0
+                int(_return_profile_distribution(profile).get("count") or 0) > 0
                 and int((profile.get("slippage_pct") or {}).get("count") or 0) > 0
                 for profile in (long_profile, short_profile)
             )
@@ -5217,11 +5248,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "counterfactual_execution_cost_distribution"
                 ]
                 actual_calibration_ready = all(
-                    int(
-                        (profile.get("net_return_after_cost_pct") or {}).get("count")
-                        or 0
-                    )
-                    > 0
+                    int(_return_profile_distribution(profile).get("count") or 0) > 0
                     and int((profile.get("slippage_pct") or {}).get("count") or 0)
                     > 0
                     for profile in (

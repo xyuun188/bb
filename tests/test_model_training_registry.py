@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from services.model_training_registry import build_model_training_registry
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SHA256 = "a" * 64
@@ -181,6 +182,8 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
                     "model": "google/timesfm-2.5-200m-pytorch",
                     "actual_inference_count": 31,
                     "promotion_ready": False,
+                    "avg_shadow_return_after_cost_pct": -0.2,
+                    "authoritative_avg_return_after_cost_pct": 0.35,
                     "promotion_blockers": ["tail_loss"],
                 },
                 {
@@ -200,12 +203,28 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
     assert rows["timesfm_2_5"]["lifecycle"] == "inference_only"
     assert rows["timesfm_2_5"]["training_mode"] == "inference_only"
     assert rows["timesfm_2_5"]["evaluation_mode"] == "shadow_evaluating"
+    assert rows["timesfm_2_5"][PROFIT_TRAINING_TARGET] == 0.35
     assert rows["timesfm_2_5"]["fine_tune_available"] is False
     assert rows["chronos_2"]["trainable"] is False
     assert rows["chronos_2"]["model_family"] == "amazon/chronos-2"
-    assert rows["finbert"]["lifecycle"] == "inference_only"
-    assert rows["finbert"]["model_family"] == "ProsusAI/finbert"
-    assert rows["finbert"]["model_family"] != "local-sentiment-trained-v2"
+
+
+def test_registry_preserves_zero_authoritative_profit_target() -> None:
+    payload = build_model_training_registry(
+        specialist_report={
+            "generated_at": "2026-07-23T00:00:00+00:00",
+            "models": [
+                {
+                    "model": "google/timesfm-2.5-200m-pytorch",
+                    "authoritative_avg_return_after_cost_pct": 0.0,
+                    "avg_shadow_return_after_cost_pct": 0.8,
+                },
+            ],
+        }
+    )
+
+    rows = _by_id(payload)
+    assert rows["timesfm_2_5"][PROFIT_TRAINING_TARGET] == 0.0
 
 
 def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() -> None:
