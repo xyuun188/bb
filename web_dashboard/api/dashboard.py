@@ -92,7 +92,6 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
 # In-memory reference to the trading service (set by main loop)
 _trading_service = None
 _data_service = None
-_competition_service = None
 _local_ai_tools_status_client = None
 _ml_signal_status_service = None
 _EXCHANGE_MARK_CACHE_TTL_SECONDS = 15.0
@@ -2203,12 +2202,11 @@ def _decision_type(action: str | None) -> tuple[str, str]:
     return "other", "其他决策"
 
 
-def set_services(trading_svc, data_svc, competition_svc):
+def set_services(trading_svc, data_svc):
     """Called by main loop to inject service references for API access."""
-    global _trading_service, _data_service, _competition_service
+    global _trading_service, _data_service
     _trading_service = trading_svc
     _data_service = data_svc
-    _competition_service = competition_svc
 
 
 def _dashboard_okx_executor_for_mode(mode: str) -> Any | None:

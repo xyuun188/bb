@@ -62,7 +62,7 @@ python scripts/run_live_trading.py
 | `executor/` | Paper executor (virtual) + OKX executor (live/demo) |
 | `risk_manager/` | Position limits, stop-loss, black swan, circuit breaker |
 | `backtest/` | Backtrader integration for strategy validation |
-| `services/` | Trading orchestration, model competition, notifications |
+| `services/` | Trading orchestration, profit training, and model governance |
 | `workers/` | Main event loop, data collector, model evaluator |
 | `web_dashboard/` | FastAPI + WebSocket dashboard on port 8002 |
 
@@ -82,7 +82,6 @@ The best model (by composite score) is auto-promoted to live trading.
 |--------|------|-------------|
 | GET | `/api/status` | System status |
 | GET | `/api/dashboard/summary` | Aggregate dashboard data |
-| GET | `/api/models` | Model rankings |
 | GET | `/api/trades` | Trade history |
 | GET | `/api/positions` | Open positions |
 | POST | `/api/control/mode` | Switch paper/live |

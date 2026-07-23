@@ -43,7 +43,7 @@ from models.learning import (  # noqa: E402
 )
 from models.market_data import Kline, Ticker  # noqa: E402
 from models.news import NewsArticle, SocialPost  # noqa: E402
-from models.risk import ModelPerformanceSnapshot, RiskEvent  # noqa: E402
+from models.risk import RiskEvent  # noqa: E402
 from models.secure_config import SecureSetting, SecureSettingAudit  # noqa: E402
 from models.trade import OkxPositionHistory, Order, Position  # noqa: E402
 from services.training_epoch import write_training_epoch  # noqa: E402
@@ -61,7 +61,6 @@ DERIVED_TABLES = (
     ("trade_reflections", TradeReflection.__table__),
     ("expert_memories", ExpertMemory.__table__),
     ("strategy_profile_snapshots", StrategyProfileSnapshot.__table__),
-    ("model_performance_snapshots", ModelPerformanceSnapshot.__table__),
     ("execution_equity_snapshots", ExecutionEquitySnapshot.__table__),
 )
 

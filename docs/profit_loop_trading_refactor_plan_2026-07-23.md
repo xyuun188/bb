@@ -311,3 +311,13 @@
 - live 凭据缺失时，交易循环在新市场分析前直接给出缺失字段并停止扫描，禁止继续消耗行情、排序和私有接口探测资源。没有真实 live 凭据时只能运行 OKX demo 交易，系统不得伪装成实盘可交易。
 - 2026-07-24 线上部署验收：控制状态已明确恢复为 `mode=paper`、`active_model_name=ensemble_trader`、`paused=false`；交易心跳新鲜且无 market error，当前自动轮次 `run_market_analysis=true`、`scan_symbol_count=240`、`feature_fetch_requested_count=48`、`feature_valid_count=8`、`rank_selected_count=2`，已进入 `market_ai:ETH/USDT`。这证明模型晋升前的 OKX demo 规则交易路径已恢复实际分析候选，不再被旧暂停或已删除手动模式阻断。
 - 同一线上验收确认 v3 对缺少 live 凭据返回 `can_trade=false`、`mode=blocked`、`reason=okx_live_credentials_missing`，且服务器旧 `services/market_direct_entry_processor.py` 已不存在。真实小仓实盘必须先由用户在 Dashboard 安全配置三项 OKX live 凭据；在此之前系统只运行 demo，禁止自动复制 paper 密钥或绕过门禁。
+
+## 22. 删除无效单模型竞争与错误绩效快照
+
+- `CompetitionService` 已不具备竞争前提：执行模型固定为唯一 `ensemble_trader`，paper/live 启动器也只把该模型加入活动集合；每小时给唯一模型排第一既不能晋升模型，也不能改变权威生产授权。
+- 该服务的收益口径不符合训练合同：它从持仓 `realized_pnl` 再次减入场/平仓手续费并加资金费，随后除以账户初始余额而非该笔交易权威 notional；最大回撤还用买卖订单现金流近似权益曲线。它写出的排名、Sharpe、回撤和 `model_performance_snapshots` 不能作为 `net_return_after_all_cost_pct` 晋升证据。
+- 已彻底删除 `services/competition_service.py`、对应测试、paper/live 启动时评估、每小时评估任务、Dashboard service 注入、模型设置保存后的重复评估，以及无人使用的 `/api/models`、模型 performance/decisions 路由；不保留废弃接口或兼容响应。
+- 同时删除只有构造/自测、没有任何运行调用的 `NotificationService`、通知配置字段和测试；删除没有入口或调用者的整个旧 `workers` 编排包，禁止正式启动器之外再形成独立采集、交易或模型评估循环。
+- 删除 `ModelPerformanceSnapshot` ORM、RiskRepository 读写方法和训练重置引用；数据库启动迁移直接执行 `DROP TABLE IF EXISTS model_performance_snapshots`，旧错误派生数据不再留作隐式回退。
+- 模型晋升唯一保留 `model_promotion_policy` 的真实收益分布评估、artifact 生命周期和 `production_trade_gate` 授权；专家竞争服务只保留为专家质量诊断，不得切换活动模型或授予生产权限。
+- 本地验证 `2786 passed, 4 skipped`，Ruff 和前端 Node 语法检查通过。线上部署后 7 个 stale 源文件被删除，PostgreSQL `to_regclass('public.model_performance_snapshots')` 返回空，FastAPI 路由中不存在 `/api/models`；交易进程仍为 `paper + paused=false`、心跳新鲜、market error 为空并继续运行策略上下文阶段。

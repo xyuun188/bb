@@ -85,10 +85,6 @@ def _source(relative_path: str) -> str:
             "services/entry_strategy_mode.py",
             (r"win_rate\s*[<>]=", r"md_win_rate\s*[<>]="),
         ),
-        (
-            "services/competition_service.py",
-            (r"score\s*=\s*\([^)]*win_rate", r"decision_accuracy\s*\*\s*0\."),
-        ),
     ],
 )
 def test_win_rate_does_not_flow_into_production_decisions(

@@ -559,15 +559,6 @@ async def _sync_models_to_running_services() -> None:
     if executor:
         executor._model_names = [ENSEMBLE_TRADER_NAME]
 
-    # Update competition service active models and trigger evaluation
-    if _dash._competition_service:
-        _dash._competition_service.set_active_models([ENSEMBLE_TRADER_NAME])
-        rankings = await _dash._competition_service.evaluate_all_models(force=True)
-        log.info(
-            "rankings updated", count=len(rankings), models=[r["model_name"] for r in rankings]
-        )
-
-
 # ── OKX Settings (split paper / live) ──
 
 

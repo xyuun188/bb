@@ -220,6 +220,15 @@ async def test_sqlite_drops_removed_expert_memory_policy_columns(
 
 
 @pytest.mark.asyncio
+async def test_schema_init_drops_removed_model_performance_snapshots_table() -> None:
+    fake_conn = _FakeConnection()
+
+    await session_module._drop_removed_model_performance_snapshots_table(fake_conn)
+
+    assert fake_conn.statements == ["DROP TABLE IF EXISTS model_performance_snapshots"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_trade_fact_columns_skip_existing_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -6300,7 +6300,7 @@ class TradingService:
     async def run_once(self, analysis_scope: str = "full") -> dict[str, Any]:
         """Execute one iteration of the trading loop.
 
-        Returns a summary dict for dashboard/notifications.
+        Returns a summary dict for runtime observers.
         """
         settings.refresh_runtime_env(force=True)
         if not self._running:

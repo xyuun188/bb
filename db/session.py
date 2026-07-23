@@ -175,6 +175,7 @@ async def init_db() -> None:
                     """))
         await _ensure_trade_fact_columns(conn)
         await _drop_removed_expert_memory_policy_columns(conn)
+        await _drop_removed_model_performance_snapshots_table(conn)
         await _ensure_ai_decision_model_health_columns(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
         await _ensure_runtime_data_retention_columns(conn)
@@ -241,6 +242,12 @@ async def _drop_removed_expert_memory_policy_columns(conn: Any) -> None:
     for name in ("confidence_adjustment", "position_size_multiplier"):
         if name in existing:
             await conn.execute(text(f"ALTER TABLE expert_memories DROP COLUMN {name}"))
+
+
+async def _drop_removed_model_performance_snapshots_table(conn: Any) -> None:
+    """Remove the obsolete single-model competition snapshot table."""
+
+    await conn.execute(text("DROP TABLE IF EXISTS model_performance_snapshots"))
 
 
 async def _ensure_trade_fact_columns(conn: Any) -> None:

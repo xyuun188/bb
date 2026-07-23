@@ -426,9 +426,6 @@ class Settings(BaseSettings):
     system_audit_history_max_records: int = 500
 
     # --- Notifications ---
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
-    dingtalk_webhook_url: str = ""
 
     # --- Logging ---
     log_level: str = "INFO"
