@@ -523,6 +523,18 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
                     "complete": True,
                     "fingerprint": f"fee-after-label-test-{index}",
                 },
+                profit_training_contract={
+                    "eligible": True,
+                    "reason": "profit_training_sample_ready",
+                    "target": "net_return_after_all_cost_pct",
+                    "target_value": 10.0,
+                    "outcome": "profit",
+                    "decision_authority": "system",
+                    "evidence_fingerprint": f"profit-contract-test-{index}",
+                    "blockers": [],
+                    "model_shadow_alignment": "no_model_shadow_prediction",
+                    "version": "2026-07-23.profit-loop-training.v1",
+                },
             )
             for index, source in enumerate(
                 ("okx_position_history", "okx_verified_execution_pair"),
@@ -541,6 +553,41 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
     assert "authoritative_realized_return_distribution_missing" not in report[
         "blocking_reasons"
     ]
+
+
+def test_authoritative_trade_sample_requires_profit_training_contract() -> None:
+    sample = _trade_sample(
+        source="okx_position_history",
+        event_type="AuthoritativeTradeOutcome",
+        outcome_version=AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+        outcome_id="ato:test-missing-profit-contract",
+        outcome_fingerprint="fingerprint-test-missing-profit-contract",
+        trade_fact_trusted=True,
+        lifecycle_key="okx-position:test-missing-profit-contract",
+        execution_slippage_usdt=0.0,
+        execution_mode="paper",
+        training_evidence_gaps=[],
+        pnl_source="okx_position_history_realized_pnl",
+        training_label_contract={
+            "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
+            "label_name": "realized_fee_after_return_pct",
+            "execution_mode": "paper",
+            "lifecycle_key": "okx-position:test-missing-profit-contract",
+            "decision_id": 1001,
+            "entry_order_ids": ["entry-test-missing-profit-contract"],
+            "close_order_ids": ["close-test-missing-profit-contract"],
+            "realized_fee_after_return_pct": 10.0,
+            "fee_usdt": -0.05,
+            "funding_fee_usdt": 0.0,
+            "complete": True,
+            "fingerprint": "fee-after-label-test-missing-profit-contract",
+        },
+    )
+
+    assessment = assess_trade_sample(sample)
+
+    assert assessment.exclude_from_training is True
+    assert assessment.reasons == ("profit_training_contract_missing",)
 
 
 def test_training_payload_enriches_shadow_missed_opportunity_labels() -> None:

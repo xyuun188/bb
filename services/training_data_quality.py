@@ -31,6 +31,7 @@ from services.profit_supervision import (
     profit_supervision_report,
     shadow_fee_after_return_labels,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_loss_attribution import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -511,6 +512,27 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             return _final_assessment(
                 0.0,
                 ["missing_authoritative_fee_after_label_contract"],
+                exclude=True,
+            )
+        profit_contract = _safe_dict(sample.get("profit_training_contract"))
+        if not profit_contract:
+            return _final_assessment(
+                0.0,
+                ["profit_training_contract_missing"],
+                exclude=True,
+            )
+        if (
+            profit_contract.get("eligible") is not True
+            or profit_contract.get("target") != PROFIT_TRAINING_TARGET
+            or _safe_float(profit_contract.get("target_value"), None) is None
+            or _safe_str(profit_contract.get("outcome")) not in {"profit", "loss", "flat"}
+            or not _safe_str(profit_contract.get("decision_authority"))
+            or not _safe_str(profit_contract.get("evidence_fingerprint"))
+        ):
+            reason = _safe_str(profit_contract.get("reason")) or "invalid"
+            return _final_assessment(
+                0.0,
+                [f"profit_training_contract:{reason}"],
                 exclude=True,
             )
     model_name = _safe_str(sample.get("model_name")).lower()
