@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
 def _cards() -> list[dict]:
@@ -38,7 +39,7 @@ def _cards() -> list[dict]:
         {
             "key": "model_training",
             "status": "ok",
-            "details": {"optimization_target": "realized_fee_after_return"},
+            "details": {"optimization_target": PROFIT_TRAINING_TARGET},
         },
         {"key": "phase3_model_server_readiness", "status": "ok", "details": {}},
     ]
@@ -50,7 +51,7 @@ def test_phase3_go_no_go_accepts_complete_dynamic_return_architecture() -> None:
     assert report["ready"] is True
     assert report["status"] == "go"
     assert report["blockers"] == []
-    assert report["policy"]["optimization_target"] == "realized_fee_after_return"
+    assert report["policy"]["optimization_target"] == PROFIT_TRAINING_TARGET
     assert report["policy"]["win_rate_is_diagnostic_only"] is True
     assert report["policy"]["expert_memory_strategy_learning_are_observation_only"] is True
 

@@ -1,6 +1,7 @@
 import pytest
 
 from scripts import inspect_online_strategy_health
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
 def test_decode_remote_json_ignores_runtime_logs_before_final_payload() -> None:
@@ -39,7 +40,7 @@ def test_remote_template_compiles_and_uses_dynamic_return_contract() -> None:
     assert "get_shadow_backtests" in template
     assert "audit_protection_order_integrity" in template
     assert "get_positions_strict" in template
-    assert "realized_fee_after_return" in template
+    assert PROFIT_TRAINING_TARGET in template
     assert "timedelta(minutes=WINDOW_MINUTES)" in template
     assert 'APP_ROOT = Path("/data/bb/app")' in template
     assert "_inherit_dashboard_runtime_environment()" in template
@@ -196,7 +197,7 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
         }
     )
 
-    assert summary["optimization_target"] == "realized_fee_after_return"
+    assert summary["optimization_target"] == PROFIT_TRAINING_TARGET
     assert summary["contract_summary"]["contract_violation_count"] == 2
     assert summary["ml_live_influence"] is False
     assert summary["model_strategy_blueprint"]["execution_scope"] == "paper_only"

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
+
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -153,11 +155,11 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         or _safe_dict(training.get("policy")).get("optimization_target")
         or ""
     )
-    if objective and objective != "realized_fee_after_return":
+    if objective and objective != PROFIT_TRAINING_TARGET:
         blockers.append(
             _blocker(
                 "model_training_objective_mismatch",
-                "Model training is not governed by realized fee-after return.",
+                "Model training is not governed by authoritative all-cost net return.",
                 evidence={"optimization_target": objective},
             )
         )
@@ -180,7 +182,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             "executed_dynamic_exit_contract_gap_count": exit_gaps,
         },
         "policy": {
-            "optimization_target": "realized_fee_after_return",
+            "optimization_target": PROFIT_TRAINING_TARGET,
             "win_rate_is_diagnostic_only": True,
             "expert_memory_strategy_learning_are_observation_only": True,
             "fixed_strategy_thresholds_forbidden": True,

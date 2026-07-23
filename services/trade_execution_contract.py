@@ -29,6 +29,7 @@ from services.paper_training import (
     PAPER_TRAINING_VERSION,
     paper_training_contract_reasons,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
@@ -209,7 +210,7 @@ def summarize_trade_execution_contract(
         "exit_contracts": exit_rows[:50],
         "violations": violations[:100],
         "policy": {
-            "optimization_target": "realized_fee_after_return",
+            "optimization_target": PROFIT_TRAINING_TARGET,
             "entry_requires_positive_fee_after_return": True,
             "entry_requires_positive_return_lcb": True,
             "normal_entry_requires_positive_fee_after_return": True,

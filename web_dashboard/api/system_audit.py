@@ -56,6 +56,7 @@ from services.phase3_server_migration_audit import Phase3ServerMigrationAuditSer
 from services.phase3_stage_handoff import Phase3StageHandoffService
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 from services.production_source_health import ProductionSourceHealthService
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.server_monitor_status import collect_platform_runtime_status
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
@@ -816,7 +817,7 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     safe["live_exit_mutation"] = False
     safe["can_bypass_risk_controls"] = False
     policy = _safe_dict(safe.get("policy"))
-    policy["optimization_target"] = "realized_fee_after_return"
+    policy["optimization_target"] = PROFIT_TRAINING_TARGET
     policy["entry_requires_positive_fee_after_return"] = True
     policy["entry_requires_positive_return_lcb"] = True
     policy["entry_requires_live_execution_cost"] = True

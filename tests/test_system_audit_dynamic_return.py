@@ -205,7 +205,7 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
         {
             "key": "model_training",
             "status": "ok",
-            "details": {"optimization_target": "realized_fee_after_return"},
+            "details": {"optimization_target": "net_return_after_all_cost_pct"},
         },
         {"key": "phase3_model_server_readiness", "status": "ok", "details": {}},
     ]

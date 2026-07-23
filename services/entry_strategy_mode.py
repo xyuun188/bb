@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -78,7 +80,7 @@ class EntryStrategyModeContextPolicy:
             },
             "risk_mode": "dynamic_return_budget",
             "dynamic_opportunity_score_enabled": True,
-            "goal": "maximize_realized_fee_after_return",
+            "goal": PROFIT_TRAINING_TARGET,
             "execution_policy": "authoritative_fee_after_return_lcb_and_dynamic_risk_budget",
             "policy_provenance": provenance,
         }

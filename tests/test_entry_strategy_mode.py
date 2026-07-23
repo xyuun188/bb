@@ -1,4 +1,5 @@
 from services.entry_strategy_mode import EntryStrategyModeContextPolicy
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
 def _base_kwargs(**overrides):
@@ -22,7 +23,7 @@ def test_strategy_context_is_observation_only() -> None:
     result = EntryStrategyModeContextPolicy().build(**_base_kwargs())
 
     assert result["strategy"] == "authoritative_return_capture"
-    assert result["goal"] == "maximize_realized_fee_after_return"
+    assert result["goal"] == PROFIT_TRAINING_TARGET
     assert result["policy_provenance"]["source"] == (
         "account_pnl_side_returns_and_current_portfolio_state"
     )

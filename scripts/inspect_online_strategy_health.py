@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from services.profit_training_contract import PROFIT_TRAINING_TARGET  # noqa: E402
 
 REMOTE_SCRIPT_TEMPLATE = r'''
 import asyncio
@@ -78,6 +79,7 @@ MARKET_SYMBOL_ONLY = __MARKET_SYMBOL_ONLY__
 ENTRY_ONLY = __ENTRY_ONLY__
 DECISION_ID = __DECISION_ID__
 REPLAY_ONLY = __REPLAY_ONLY__
+PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 
 
 async def _read_stage(name, awaitable):
@@ -163,7 +165,7 @@ async def main():
         "window_minutes": WINDOW_MINUTES,
         "audit_only": True,
         "live_mutation": False,
-        "optimization_target": "realized_fee_after_return",
+        "optimization_target": PROFIT_TRAINING_TARGET,
         "trade_execution_contract": contract,
         "local_ml_readiness": ml_status,
         "model_training_registry": model_registry,
@@ -372,7 +374,7 @@ def _summarize_report(report: dict) -> dict:
     return {
         "generated_at": report.get("generated_at"),
         "window_minutes": report.get("window_minutes"),
-        "optimization_target": "realized_fee_after_return",
+        "optimization_target": PROFIT_TRAINING_TARGET,
         "contract_summary": contract.get("summary") or {},
         "contract_violations": contract.get("violation_reason_counts") or {},
         "contract_policy": contract.get("policy") or {},

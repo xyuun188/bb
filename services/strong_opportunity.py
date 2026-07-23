@@ -13,6 +13,7 @@ from sqlalchemy import select
 from core.symbols import normalize_trading_symbol
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.trade_execution_contract import validate_production_entry_contract
 
 DEFAULT_LOOKBACK_HOURS = 24
@@ -93,7 +94,7 @@ class StrongOpportunityService:
             "strong_candidates": [row.as_dict() for row in strong[:20]],
             "near_misses": [row.as_dict() for row in near[:20]],
             "contract": {
-                "optimization_target": "realized_fee_after_return",
+                "optimization_target": PROFIT_TRAINING_TARGET,
                 "requires_positive_return_lcb": True,
                 "requires_live_execution_cost": True,
                 "requires_dynamic_risk_budget": True,

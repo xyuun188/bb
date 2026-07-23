@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import settings
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 GO_NO_GO_REL = "phase3_go_no_go_reports/latest.json"
 OBSERVATION_REL = "phase3_paper_resume_observation_reports/latest.json"
@@ -211,7 +212,7 @@ def evaluate_phase3_stage_handoff_inputs(
             "okx_daily": {"available": bool(okx_daily.get("available"))},
         },
         "policy": {
-            "optimization_target": "realized_fee_after_return",
+            "optimization_target": PROFIT_TRAINING_TARGET,
             "dynamic_return_gate_is_authoritative": True,
             "expert_memory_shadow_strategy_learning_are_observation_only": True,
         },
