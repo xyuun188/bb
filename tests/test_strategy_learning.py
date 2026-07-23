@@ -62,7 +62,7 @@ def _sample(
         "symbol": symbol,
         "side": side,
         "market_regime": regime,
-        "net_return_after_cost_pct": return_pct,
+        "net_return_after_all_cost_pct": return_pct,
         "net_pnl_after_all_costs_usdt": return_pct,
         "timestamp": f"2026-07-12T{source_id:02d}:00:00+00:00",
     }

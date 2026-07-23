@@ -217,7 +217,7 @@ class ExpertMemoryService:
                             "realized_pnl": realized_pnl,
                             "pnl_pct": pnl_pct,
                             "pnl_pct_deprecated_ratio": True,
-                            "net_return_after_cost_pct": pnl_pct * 100.0,
+                            "net_return_after_all_cost_pct": pnl_pct * 100.0,
                             "objective": "maximize_expected_realized_net_return_after_cost",
                             "objective_version": "2026-07-12.v1",
                             "cost_complete": cost_complete,
@@ -363,7 +363,7 @@ class ExpertMemoryService:
                         "authority_level": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
                         "authority_rank": 100,
                         "realized_pnl": realized_pnl,
-                        "net_return_after_cost_pct": net_return_pct,
+                        "net_return_after_all_cost_pct": net_return_pct,
                         "objective": "maximize_expected_realized_net_return_after_cost",
                         "objective_version": "2026-07-12.v1",
                         "cost_complete": canonical.get("settlement_fact_trusted") is True,
@@ -460,7 +460,7 @@ def build_expert_lessons(
     base_key = f"{symbol}|{side}|{memory_type}|{lesson_bucket(pnl_pct, hold_minutes)}"
     lesson = (
         f"权威费后结果事实：symbol={symbol}, side={side}, outcome={outcome}, "
-        f"net_return_after_cost_pct={pnl_pct * 100.0:.8f}, "
+        f"net_return_after_all_cost_pct={pnl_pct * 100.0:.8f}, "
         f"hold_minutes={hold_minutes:.4f}, pattern={pattern}。"
     )
     result: dict[str, dict[str, Any]] = {}

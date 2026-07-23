@@ -14,6 +14,7 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.dynamic_exit_policy import apply_dynamic_exit
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
+from services.live_ml_profit_contract import apply_live_ml_profit_contract
 from services.normal_paper_trade import ensure_normal_paper_trade_contract
 from services.paper_exploration import (
     assess_paper_exploration_entry,
@@ -24,7 +25,6 @@ from services.paper_training import (
     is_paper_training_decision,
 )
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
-from services.return_execution_policy import apply_production_entry_policy
 from services.trade_recommendation_contract import (
     attach_risk_adjusted_trade_recommendation,
     paper_trade_recommendation_reason_text,
@@ -541,16 +541,16 @@ class EntryPolicy:
                     "production_trade_gate": rules_canary_gate,
                 }
             )
-        production_assessment = apply_production_entry_policy(decision)
-        if not production_assessment.eligible:
+        live_ml_assessment = apply_live_ml_profit_contract(decision)
+        if not live_ml_assessment.eligible:
             return PolicyGateResult.block(
-                "production_return_policy",
-                production_assessment.reason,
+                "live_ml_profit_contract",
+                live_ml_assessment.reason,
                 {
                     "pipeline_context": context.public_data(),
                     "stage_status": "skipped",
-                    "skip_kind": "production_return_policy",
-                    "production_return_policy": production_assessment.to_dict(),
+                    "skip_kind": "live_ml_profit_contract",
+                    "live_ml_profit_contract": live_ml_assessment.to_dict(),
                 },
             )
 
@@ -558,7 +558,7 @@ class EntryPolicy:
             {
                 "intent": "entry",
                 "pipeline_context": context.public_data(),
-                "production_return_policy": production_assessment.to_dict(),
+                "live_ml_profit_contract": live_ml_assessment.to_dict(),
             }
         )
 

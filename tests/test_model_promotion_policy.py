@@ -159,7 +159,7 @@ def test_low_win_rate_positive_payoff_still_requires_positive_lower_half() -> No
 
 def test_cost_incomplete_returns_are_excluded_and_fail_closed() -> None:
     report = build_return_objective_report(
-        trade_samples=[{"net_return_after_cost_pct": 9.0, "cost_complete": False}]
+        trade_samples=[{"net_return_after_all_cost_pct": 9.0, "cost_complete": False}]
     )
 
     assert report["available"] is False
@@ -176,7 +176,7 @@ def test_legacy_profit_learning_labels_cannot_bypass_supervision_contract() -> N
                 "profit_learning_labels": {
                     "sample_kind": "trade",
                     "cost_basis_label": "fee_plus_funding",
-                    "net_return_after_cost_pct": -1.25,
+                    "net_return_after_all_cost_pct": -1.25,
                     "training_supervision_ready": True,
                     "realized_net_pnl_usdt": -1.25,
                     "fee_estimate_usdt": 0.08,
@@ -203,7 +203,7 @@ def test_unified_profit_learning_labels_fail_closed_without_funding_cost() -> No
                 "profit_learning_labels": {
                     "sample_kind": "trade",
                     "cost_basis_label": "fee_only",
-                    "net_return_after_cost_pct": 1.25,
+                    "net_return_after_all_cost_pct": 1.25,
                     "training_supervision_ready": True,
                     "realized_net_pnl_usdt": 1.25,
                     "fee_estimate_usdt": 0.08,

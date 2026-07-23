@@ -118,6 +118,7 @@ from services.expert_memory_service import ExpertMemoryService
 from services.fast_risk_exit_execution import FastRiskExitExecutionProcessor
 from services.forced_exit import ForcedExitPolicy
 from services.high_risk_review_service import HighRiskReviewService
+from services.live_rules_canary_signal import apply_live_rules_canary_signal
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.manual_trade_execution import ManualTradeExecutionProcessor
 from services.manual_trade_risk_assessment import ManualTradeRiskAssessmentPolicy
@@ -3378,9 +3379,9 @@ class TradingService:
         raw = self._safe_dict(decision.raw_response)
         candidate = self._safe_dict(raw.get("authoritative_return_candidate"))
         side_evidence = self._safe_dict(candidate.get("side_evidence"))
-        return_policy = self._safe_dict(raw.get("production_return_policy"))
+        live_ml_contract = self._safe_dict(raw.get("live_ml_profit_contract"))
         current_decision_metrics = dict(side_evidence)
-        current_decision_metrics.update(return_policy)
+        current_decision_metrics.update(live_ml_contract)
         source_count = self._safe_float(
             current_decision_metrics.get("production_source_count")
             or current_decision_metrics.get("return_source_count")
@@ -5373,6 +5374,25 @@ class TradingService:
             )
         return scorer.score_candidate(decision, strategy)
 
+    async def _apply_live_rules_canary_market_signal(
+        self,
+        decision: DecisionOutput,
+        model_name: str,
+        model_mode: str,
+        open_positions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Replace live market output with the authoritative rules signal when selected."""
+
+        if str(model_mode or "").lower() == "paper":
+            return None
+        gate = await self.production_trade_gate_snapshot(
+            decision,
+            model_name,
+            model_mode,
+            open_positions or [],
+        )
+        return apply_live_rules_canary_signal(decision, gate)
+
     async def _prepare_entry_for_hard_risk(
         self,
         decision: DecisionOutput,
@@ -5380,10 +5400,22 @@ class TradingService:
         open_positions: list[dict[str, Any]] | None = None,
         decision_db_id: int | None = None,
     ) -> None:
-        """Generate dynamic return sizing before invoking the hard risk engine."""
+        """Generate lifecycle-specific sizing before invoking the hard risk engine."""
 
         if not decision.is_entry:
             return
+        if str(model_mode or "").lower() != "paper":
+            raw = dict(self._safe_dict(decision.raw_response))
+            gate = self._safe_dict(raw.get("production_trade_gate"))
+            if not gate:
+                gate = await self.production_trade_gate_snapshot(
+                    decision,
+                    str(decision.model_name or ENSEMBLE_TRADER_NAME),
+                    model_mode,
+                    open_positions or [],
+                )
+                raw["production_trade_gate"] = gate
+            decision.raw_response = raw
         await self.entry_policy.prepare_dynamic_risk_contract(
             decision,
             model_mode,
@@ -5415,10 +5447,10 @@ class TradingService:
             else ("exit" if decision.is_exit else "hold")
         )
         opportunity = self._safe_dict(raw.get("opportunity_score"))
-        policy = self._safe_dict(raw.get("production_return_policy"))
+        live_ml_contract = self._safe_dict(raw.get("live_ml_profit_contract"))
         dynamic_exit = self._safe_dict(raw.get("dynamic_exit_policy"))
         primary_source = (
-            "authoritative_fee_after_return_distribution"
+            "authoritative_all_cost_profit_distribution"
             if decision.is_entry
             else "position_economics_dynamic_exit" if decision.is_exit else "observation_only_hold"
         )
@@ -5430,7 +5462,7 @@ class TradingService:
             "side": side,
             "expected_net_return_pct": opportunity.get("expected_net_return_pct"),
             "return_lcb_pct": opportunity.get("return_lcb_pct"),
-            "production_return_eligible": policy.get("eligible"),
+            "live_ml_profit_eligible": live_ml_contract.get("eligible"),
             "dynamic_exit_eligible": dynamic_exit.get("eligible"),
             "expert_memory_strategy_learning_role": "observation_only",
         }
@@ -7333,6 +7365,12 @@ class TradingService:
                         "entry_candidate_evidence", entry_candidate_evidence
                     )
                     decision.raw_response["market_context_timings"] = market_context_timings
+                await self._apply_live_rules_canary_market_signal(
+                    decision,
+                    model_name,
+                    model_mode,
+                    open_positions,
+                )
                 self._attach_market_candidate_funnel(
                     decision,
                     market_candidate_funnel,

@@ -1,4 +1,4 @@
-"""Read-only root-cause audit for the production return contract."""
+"""Read-only root-cause audit for lifecycle-specific entry contracts."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ class StrategySignalRootCauseAuditService:
             lifecycle = entry_contract_lifecycle(raw)
             lifecycle_counts[lifecycle] += 1
             if lifecycle == "production_return":
-                policy = _safe_dict(raw.get("production_return_policy"))
+                policy = _safe_dict(raw.get("live_ml_profit_contract"))
                 expected = _maybe_float(policy.get("expected_net_return_pct"))
                 lcb = _maybe_float(policy.get("return_lcb_pct"))
                 if expected is not None:
@@ -149,6 +149,16 @@ class StrategySignalRootCauseAuditService:
             "production_return_blocked_count": (
                 lifecycle_counts["production_return"]
                 - lifecycle_ready_counts["production_return"]
+            ),
+            "live_rules_canary_entry_count": lifecycle_counts[
+                "live_rules_canary"
+            ],
+            "live_rules_canary_ready_count": lifecycle_ready_counts[
+                "live_rules_canary"
+            ],
+            "live_rules_canary_blocked_count": (
+                lifecycle_counts["live_rules_canary"]
+                - lifecycle_ready_counts["live_rules_canary"]
             ),
             "paper_canary_entry_count": lifecycle_counts["paper_bootstrap_canary"],
             "paper_canary_ready_count": lifecycle_ready_counts[
@@ -204,12 +214,35 @@ def _distribution(values: list[float]) -> dict[str, Any]:
 
 def _cause_message(code: str) -> str:
     return {
-        "production_return_policy_missing_or_ineligible": "The production return policy is absent or ineligible.",
+        "live_ml_profit_contract_missing_or_ineligible": "The live-ML profit contract is absent or ineligible.",
         "fee_after_expected_return_not_positive": "Fee-after expected return is not positive.",
         "fee_after_return_lcb_not_positive": "Fee-after return lower confidence bound is not positive.",
-        "production_return_distribution_missing": "No production-eligible return observations are available.",
-        "production_return_provenance_incomplete": "Return-policy provenance is incomplete.",
-        "opportunity_return_distribution_ineligible": "The opportunity return distribution is not production eligible.",
+        "live_ml_return_distribution_missing": "No live-ML profit observations are available.",
+        "live_ml_profit_contract_provenance_incomplete": "Live-ML profit-contract provenance is incomplete.",
+        "opportunity_profit_distribution_ineligible": "The opportunity profit distribution is not eligible for live ML.",
+        "live_rules_canary_gate_mode_invalid": "The rules-canary trade-gate mode is invalid.",
+        "production_trade_gate_not_open": "The production trade gate is not open.",
+        "rules_canary_authority_not_rules": "Rules do not own the canary decision.",
+        "rules_canary_model_influence_not_disabled": "Model influence is still enabled for a rules canary.",
+        "rules_canary_signal_missing_or_ineligible": "The authoritative rules-canary direction signal is missing or ineligible.",
+        "rules_canary_signal_authority_invalid": "Rules do not own the canary direction signal.",
+        "rules_canary_signal_model_influence_invalid": "Model influence is enabled in the canary direction signal.",
+        "rules_canary_signal_provenance_incomplete": "Rules-canary signal provenance is incomplete.",
+        "rules_canary_signal_action_mismatch": "The submitted action differs from the authoritative rules signal.",
+        "rules_canary_model_shadow_contract_missing": "The observation-only model shadow contract is missing.",
+        "rules_canary_max_notional_missing": "The rules-canary notional limit is missing.",
+        "rules_canary_daily_loss_budget_exhausted": "The rules-canary daily loss budget is exhausted.",
+        "rules_canary_max_open_positions_missing": "The rules-canary concurrent-position limit is missing.",
+        "rules_canary_exchange_minimum_incomplete": "The OKX minimum-order contract facts are incomplete.",
+        "rules_canary_notional_below_exchange_minimum": "The bounded rules-canary notional is below the OKX minimum order.",
+        "rules_canary_exchange_minimum_contract_mismatch": "The persisted OKX minimum-order contract does not match its source facts.",
+        "rules_canary_order_notional_missing": "The rules-canary order notional is missing.",
+        "rules_canary_order_notional_above_gate_limit": "The rules-canary order exceeds the trade-gate limit.",
+        "rules_canary_execution_cost_incomplete": "The rules-canary execution-cost contract is incomplete.",
+        "rules_canary_risk_sizing_ineligible": "The rules-canary risk sizing is ineligible.",
+        "rules_canary_risk_budget_algebra_invalid": "The rules-canary risk-budget algebra is invalid.",
+        "rules_canary_stressed_loss_algebra_invalid": "The rules-canary stressed-loss algebra is invalid.",
+        "rules_canary_leverage_not_one": "The rules-canary leverage is not one.",
         "live_execution_cost_incomplete": "Live execution cost is unavailable or incomplete.",
         "execution_cost_provenance_incomplete": "Execution-cost provenance is incomplete.",
         "dynamic_risk_budget_ineligible": "The dynamic risk budget is ineligible.",

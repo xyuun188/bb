@@ -42,7 +42,7 @@ def test_executed_entry_without_positive_return_contract_is_reported() -> None:
         id=7,
         action="long",
         was_executed=True,
-        raw_llm_response={"production_return_policy": {"eligible": False}},
+        raw_llm_response={"live_ml_profit_contract": {"eligible": False}},
     )
     report = summarize_shadow_missed_opportunities([], decisions=[decision])
 

@@ -59,7 +59,7 @@ def _trade_sample() -> dict:
         "sample_weight": 1.0,
         "exclude_from_training": False,
         "profit_learning_labels": {
-            "net_return_after_cost_pct": 0.6,
+            "net_return_after_all_cost_pct": 0.6,
             "realized_net_pnl_usdt": 12.0,
             "gross_return_on_notional_pct": 0.72,
             "fee_return_pct": 0.08,
@@ -118,7 +118,7 @@ def test_verified_execution_pair_is_authoritative_realized_return() -> None:
 
 def test_authoritative_return_prefers_profit_training_contract_target() -> None:
     trade = _trade_sample()
-    trade["profit_learning_labels"]["net_return_after_cost_pct"] = 99.0
+    trade["profit_learning_labels"]["net_return_after_all_cost_pct"] = 99.0
     trade["profit_training_contract"]["target_value"] = -2.4
     trade["profit_training_contract"]["outcome"] = "loss"
 
@@ -193,7 +193,7 @@ def test_authoritative_return_rejects_old_net_return_label_without_contract() ->
         "target_value": None,
         "reason": "missing_contract",
     }
-    trade["profit_learning_labels"]["net_return_after_cost_pct"] = 99.0
+    trade["profit_learning_labels"]["net_return_after_all_cost_pct"] = 99.0
 
     contract = build_profit_supervision_contract(trade, kind="trade")
     task = contract["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]

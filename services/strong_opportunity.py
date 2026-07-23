@@ -14,7 +14,10 @@ from core.symbols import normalize_trading_symbol
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
-from services.trade_execution_contract import validate_production_entry_contract
+from services.trade_execution_contract import (
+    entry_contract_lifecycle,
+    validate_entry_execution_contract,
+)
 
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 500
@@ -105,9 +108,13 @@ class StrongOpportunityService:
 
     def _classify(self, decision: AIDecision) -> StrongOpportunityCandidate:
         raw = _safe_dict(decision.raw_llm_response)
-        policy = _safe_dict(raw.get("production_return_policy"))
-        contract, reasons = validate_production_entry_contract(raw)
+        lifecycle = entry_contract_lifecycle(raw)
+        policy = _safe_dict(raw.get("live_ml_profit_contract"))
+        gate = _safe_dict(raw.get("production_trade_gate"))
+        rules_contract = _safe_dict(raw.get("live_rules_canary_contract"))
+        contract, reasons = validate_entry_execution_contract(raw)
         metrics = {
+            "contract_lifecycle": lifecycle,
             "expected_net_return_pct": _safe_float(policy.get("expected_net_return_pct")),
             "return_lcb_pct": _safe_float(policy.get("return_lcb_pct")),
             "production_source_count": int(_safe_float(policy.get("production_source_count"))),
@@ -120,6 +127,19 @@ class StrongOpportunityService:
             "final_notional_usdt": _safe_float(contract.get("final_notional_usdt")),
             "side": _entry_side(decision.action),
         }
+        if lifecycle == "live_rules_canary":
+            metrics.update(
+                {
+                    "expected_net_return_pct": None,
+                    "return_lcb_pct": None,
+                    "production_source_count": 0,
+                    "max_notional_usdt": _safe_float(contract.get("max_notional_usdt")),
+                    "order_notional_usdt": _safe_float(contract.get("order_notional_usdt")),
+                    "gate_reason": gate.get("reason"),
+                    "gate_version": gate.get("version"),
+                    "rules_contract_scope": rules_contract.get("execution_scope"),
+                }
+            )
         strong = not reasons
         return StrongOpportunityCandidate(
             decision_id=int(decision.id or 0),
@@ -130,7 +150,13 @@ class StrongOpportunityService:
             executed=bool(decision.was_executed),
             strong_opportunity=strong,
             shadow_only=not strong,
-            stage="production_return_ready" if strong else "observe_only",
+            stage=(
+                "live_rules_canary_ready"
+                if strong and lifecycle == "live_rules_canary"
+                else "production_return_ready"
+                if strong
+                else "observe_only"
+            ),
             block_reasons=tuple(reasons),
             metrics=metrics,
         )

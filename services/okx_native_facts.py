@@ -27,6 +27,43 @@ FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
 OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO = 0.02
 
 
+def okx_minimum_order_notional_usdt(
+    contract_spec: dict[str, Any] | None,
+    mark_price: Any,
+) -> dict[str, Any]:
+    """Return the exchange minimum order value for an OKX linear swap."""
+
+    spec = contract_spec if isinstance(contract_spec, dict) else {}
+    price = max(_safe_float(mark_price, 0.0), 0.0)
+    ct_val = max(_safe_float(spec.get("ctVal"), 0.0), 0.0)
+    ct_mult = max(_safe_float(spec.get("ctMult"), 0.0), 0.0)
+    min_size = max(_safe_float(spec.get("minSz"), 0.0), 0.0)
+    lot_size = max(_safe_float(spec.get("lotSz"), 0.0), 0.0)
+    minimum_contracts = max(min_size, lot_size)
+    contract_unit_notional = ct_val * ct_mult * price
+    complete = bool(
+        price > 0
+        and ct_val > 0
+        and ct_mult > 0
+        and minimum_contracts > 0
+        and contract_unit_notional > 0
+    )
+    return {
+        "production_eligible": complete,
+        "mark_price": round(price, 12),
+        "ct_val": round(ct_val, 12),
+        "ct_mult": round(ct_mult, 12),
+        "min_size_contracts": round(min_size, 12),
+        "lot_size_contracts": round(lot_size, 12),
+        "minimum_contracts": round(minimum_contracts, 12),
+        "contract_unit_notional_usdt": round(contract_unit_notional, 8),
+        "minimum_notional_usdt": round(
+            minimum_contracts * contract_unit_notional if complete else 0.0,
+            8,
+        ),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class OkxNativeFillGroup:
     order_id: str

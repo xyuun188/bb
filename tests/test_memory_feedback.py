@@ -26,7 +26,7 @@ def _trade_memory(
             "outcome_id": f"ato:{position_id}",
             "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
             "authority_level": AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
-            "net_return_after_cost_pct": net_return_pct,
+            "net_return_after_all_cost_pct": net_return_pct,
             "realized_pnl": pnl_usdt,
             "objective": RETURN_OBJECTIVE_NAME,
             "objective_version": RETURN_OBJECTIVE_VERSION,

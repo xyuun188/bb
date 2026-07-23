@@ -328,7 +328,7 @@ class EntryOpportunityScoringPolicy:
         )
         input_blockers = []
         if len(claimed_contracts) != len(claimed_components):
-            input_blockers.append("claimed_production_return_distribution_missing")
+            input_blockers.append("claimed_profit_target_distribution_missing")
         cost_distributions = _unique_distribution_rows(
             [
                 safe_dict(component.get("counterfactual_execution_cost_distribution"))
@@ -407,13 +407,13 @@ class EntryOpportunityScoringPolicy:
                 {
                     **row,
                     "_net_count": safe_dict(
-                        row.get("net_return_after_cost_pct")
+                        row.get("net_return_after_all_cost_pct")
                     ).get("count"),
                     "_net_expected": safe_dict(
-                        row.get("net_return_after_cost_pct")
+                        row.get("net_return_after_all_cost_pct")
                     ).get("expected"),
                     "_net_lower_hinge": safe_dict(
-                        row.get("net_return_after_cost_pct")
+                        row.get("net_return_after_all_cost_pct")
                     ).get("lower_hinge"),
                     "_slippage_count": safe_dict(row.get("slippage_pct")).get(
                         "count"
@@ -450,7 +450,9 @@ class EntryOpportunityScoringPolicy:
             _mean(
                 [
                     float(
-                        safe_dict(row.get("net_return_after_cost_pct"))["expected"]
+                        safe_dict(row.get("net_return_after_all_cost_pct"))[
+                            "expected"
+                        ]
                     )
                     for row in valid_calibrations
                 ]
@@ -461,7 +463,9 @@ class EntryOpportunityScoringPolicy:
         actual_net_lower_hinge = (
             min(
                 float(
-                    safe_dict(row.get("net_return_after_cost_pct"))["lower_hinge"]
+                    safe_dict(row.get("net_return_after_all_cost_pct"))[
+                        "lower_hinge"
+                    ]
                 )
                 for row in valid_calibrations
             )

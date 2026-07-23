@@ -226,7 +226,7 @@ def test_dynamic_routing_report_summarizes_shadow_routes_and_safety_observations
                     "applied_to_live_calls": True,
                     "live_route_mutation": True,
                 },
-                "production_return_policy": {
+                "live_ml_profit_contract": {
                     "eligible": False,
                     "return_lcb_pct": -0.2,
                 },

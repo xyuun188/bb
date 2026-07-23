@@ -691,10 +691,7 @@ def build_ml_readiness_report(
     }
     for side in ("long", "short"):
         profile = _safe_dict(actual_trade_profiles.get(f"*|{side}"))
-        actual_return = _safe_dict(
-            profile.get(PROFIT_TRAINING_TARGET)
-            or profile.get("net_return_after_cost_pct")
-        )
+        actual_return = _safe_dict(profile.get(PROFIT_TRAINING_TARGET))
         actual_slippage = _safe_dict(profile.get("slippage_pct"))
         if int(_safe_float(actual_return.get("count"), 0.0) or 0) <= 0:
             side_blockers[side].append(

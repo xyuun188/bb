@@ -80,8 +80,8 @@ def build_shadow_label_contract(
     market_contract = _dict(market_fact_contract)
     market_provenance = _dict(market_contract.get("provenance"))
     costs = _dict(cost_facts)
-    long_net_return = _float(costs.get("long_net_return_after_cost_pct"))
-    short_net_return = _float(costs.get("short_net_return_after_cost_pct"))
+    long_net_return = _float(costs.get("long_net_return_after_all_cost_pct"))
+    short_net_return = _float(costs.get("short_net_return_after_all_cost_pct"))
     fee_after_complete = bool(
         costs.get("cost_complete") is True
         and long_net_return is not None
@@ -100,8 +100,8 @@ def build_shadow_label_contract(
                 "fee_after_complete": True,
                 "long_gross_return_pct": float(long_return_pct),
                 "short_gross_return_pct": float(short_return_pct),
-                "long_net_return_after_cost_pct": long_net_return,
-                "short_net_return_after_cost_pct": short_net_return,
+                "long_net_return_after_all_cost_pct": long_net_return,
+                "short_net_return_after_all_cost_pct": short_net_return,
             }
         )
     payload = {
@@ -179,11 +179,11 @@ def compact_shadow_label_contract(
                 "fee_after_complete": True,
                 "long_gross_return_pct": labels.get("long_gross_return_pct"),
                 "short_gross_return_pct": labels.get("short_gross_return_pct"),
-                "long_net_return_after_cost_pct": labels.get(
-                    "long_net_return_after_cost_pct"
+                "long_net_return_after_all_cost_pct": labels.get(
+                    "long_net_return_after_all_cost_pct"
                 ),
-                "short_net_return_after_cost_pct": labels.get(
-                    "short_net_return_after_cost_pct"
+                "short_net_return_after_all_cost_pct": labels.get(
+                    "short_net_return_after_all_cost_pct"
                 ),
             }
         )
@@ -198,8 +198,8 @@ def shadow_fee_after_label_values(
 
     value = _dict(contract)
     labels = _dict(value.get("labels")) or value
-    long_net = _float(labels.get("long_net_return_after_cost_pct"))
-    short_net = _float(labels.get("short_net_return_after_cost_pct"))
+    long_net = _float(labels.get("long_net_return_after_all_cost_pct"))
+    short_net = _float(labels.get("short_net_return_after_all_cost_pct"))
     complete = bool(
         labels.get("fee_after_complete") is True
         and labels.get("fee_after_label_version") == SHADOW_FEE_AFTER_LABEL_VERSION
@@ -209,8 +209,8 @@ def shadow_fee_after_label_values(
     return {
         "version": labels.get("fee_after_label_version"),
         "complete": complete,
-        "long_net_return_after_cost_pct": long_net if complete else None,
-        "short_net_return_after_cost_pct": short_net if complete else None,
+        "long_net_return_after_all_cost_pct": long_net if complete else None,
+        "short_net_return_after_all_cost_pct": short_net if complete else None,
     }
 
 
@@ -263,8 +263,8 @@ def shadow_label_contract_reasons(
         for key in (
             "fee_after_label_version",
             "fee_after_complete",
-            "long_net_return_after_cost_pct",
-            "short_net_return_after_cost_pct",
+            "long_net_return_after_all_cost_pct",
+            "short_net_return_after_all_cost_pct",
         )
     )
     if fee_after_declared:
@@ -272,8 +272,8 @@ def shadow_label_contract_reasons(
         if fee_after.get("complete") is not True:
             reasons.append("shadow_fee_after_label_incomplete")
         else:
-            long_net = float(fee_after["long_net_return_after_cost_pct"])
-            short_net = float(fee_after["short_net_return_after_cost_pct"])
+            long_net = float(fee_after["long_net_return_after_all_cost_pct"])
+            short_net = float(fee_after["short_net_return_after_all_cost_pct"])
             expected_best = (
                 "long"
                 if long_net > 0.0 and long_net >= short_net

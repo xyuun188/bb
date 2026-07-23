@@ -37,7 +37,7 @@ def _decision(**kwargs: Any) -> SimpleNamespace:
     defaults = {
         "id": 42,
         "raw_llm_response": {
-            "production_return_policy": {
+            "live_ml_profit_contract": {
                 "eligible": True,
                 "expected_net_return_pct": 0.8,
                 "return_lcb_pct": 0.2,

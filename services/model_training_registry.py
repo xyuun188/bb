@@ -365,8 +365,8 @@ def _specialist_rows(
                 ),
                 "evaluation_objective": "net_return_after_all_cost_profit_factor_tail_loss",
                 PROFIT_TRAINING_TARGET: _first_present(
-                    report.get("authoritative_avg_return_after_cost_pct"),
-                    report.get("avg_shadow_return_after_cost_pct"),
+                    report.get("authoritative_avg_return_after_all_cost_pct"),
+                    report.get("avg_shadow_return_after_all_cost_pct"),
                 ),
                 "profit_factor": report.get("profit_factor"),
                 "authoritative_profit_factor": report.get(

@@ -340,7 +340,7 @@ def _replay_entry(
     lower = _float(return_contract.get("lower_quantile_return_pct"))
     execution_cost = _float(observation.get("execution_cost_pct"))
     funding_return = _float(observation.get(f"{side}_funding_return_pct"))
-    realized = _float(observation.get(f"{side}_net_return_after_cost_pct"))
+    realized = _float(observation.get(f"{side}_net_return_after_all_cost_pct"))
     if None in {expected, lower, execution_cost, funding_return, realized}:
         return None, "model_replay_fee_after_values_incomplete"
     expected_after_cost = float(expected) - float(execution_cost) + float(funding_return)
@@ -355,11 +355,11 @@ def _replay_entry(
             "side": side,
             "market_regime": str(observation.get("market_regime") or "").lower(),
             "horizon_minutes": horizon_minutes,
-            "net_return_after_cost_pct": round(float(realized), 8),
+            "net_return_after_all_cost_pct": round(float(realized), 8),
             "gross_return_pct": observation.get(f"{side}_gross_return_pct"),
             "execution_cost_pct": round(float(execution_cost), 8),
             "funding_return_pct": round(float(funding_return), 8),
-            "model_expected_return_after_cost_pct": round(expected_after_cost, 8),
+            "model_expected_return_after_all_cost_pct": round(expected_after_cost, 8),
             "model_return_lcb_after_cost_pct": round(lower_after_cost, 8),
             "paper_continuous_evaluation": True,
             "normal_entry_return_gate_passed": bool(

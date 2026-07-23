@@ -1253,8 +1253,8 @@ def _trade_response(sample: dict[str, Any]) -> dict[str, Any]:
 def _required_shadow_fee_after_returns(sample: dict[str, Any]) -> tuple[float, float]:
     values: list[float] = []
     for key in (
-        "long_net_return_after_cost_pct",
-        "short_net_return_after_cost_pct",
+        "long_net_return_after_all_cost_pct",
+        "short_net_return_after_all_cost_pct",
     ):
         try:
             value = float(sample.get(key))
@@ -1274,8 +1274,8 @@ def _shadow_response(sample: dict[str, Any]) -> dict[str, Any]:
             "missed_opportunity" if sample.get("missed_opportunity") else "shadow_observation"
         ),
         "best_side": best_side,
-        "long_net_return_after_cost_pct": round(long_return, 6),
-        "short_net_return_after_cost_pct": round(short_return, 6),
+        "long_net_return_after_all_cost_pct": round(long_return, 6),
+        "short_net_return_after_all_cost_pct": round(short_return, 6),
         "lesson": "Rank future candidates by after-cost payoff and avoid suppressing high-quality opportunities without explicit counter-evidence.",
         "risk_guidance": {
             "do_not_trade_without_confirmation": True,
@@ -1367,8 +1367,8 @@ def _shadow_rejected_response(
     chosen_return = long_return if chosen_side == "long" else short_return
     rejected_return = short_return if chosen_side == "long" else long_return
     return rejected, {
-        "chosen_net_return_after_cost_pct": round(chosen_return, 8),
-        "rejected_net_return_after_cost_pct": round(rejected_return, 8),
+        "chosen_net_return_after_all_cost_pct": round(chosen_return, 8),
+        "rejected_net_return_after_all_cost_pct": round(rejected_return, 8),
         "return_uplift_pct": round(chosen_return - rejected_return, 8),
     }
 
@@ -1380,13 +1380,13 @@ def _return_objective_counterexample() -> dict[str, Any]:
             "win_rate": 0.35,
             "avg_win_pct": 4.0,
             "avg_loss_pct": -1.0,
-            "expected_net_return_after_cost_pct": 0.75,
+            "expected_net_return_after_all_cost_pct": 0.75,
         },
         "candidate_b": {
             "win_rate": 0.80,
             "avg_win_pct": 0.10,
             "avg_loss_pct": -2.0,
-            "expected_net_return_after_cost_pct": -0.32,
+            "expected_net_return_after_all_cost_pct": -0.32,
         },
     }
     chosen = {
@@ -1407,8 +1407,8 @@ def _return_objective_counterexample() -> dict[str, Any]:
         chosen,
         rejected_response=rejected,
         preference_metrics={
-            "chosen_net_return_after_cost_pct": 0.75,
-            "rejected_net_return_after_cost_pct": -0.32,
+            "chosen_net_return_after_all_cost_pct": 0.75,
+            "rejected_net_return_after_all_cost_pct": -0.32,
             "return_uplift_pct": 1.07,
         },
     )
@@ -1439,8 +1439,8 @@ async def _load_expert_memory_examples() -> list[dict[str, Any]]:
             "confidence_score": _safe_float(row.confidence_score),
             "success_count": int(row.success_count or 0),
             "failure_count": int(row.failure_count or 0),
-            "net_return_after_cost_pct": _safe_float(
-                extra.get("net_return_after_cost_pct")
+            "net_return_after_all_cost_pct": _safe_float(
+                extra.get("net_return_after_all_cost_pct")
             ),
             "objective": extra.get("objective"),
             "objective_version": extra.get("objective_version"),
@@ -1583,9 +1583,9 @@ async def build_dataset() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "features",
                 "gross_long_return_pct",
                 "gross_short_return_pct",
-                "long_net_return_after_cost_pct",
-                "short_net_return_after_cost_pct",
-                "best_action_after_cost",
+                "long_net_return_after_all_cost_pct",
+                "short_net_return_after_all_cost_pct",
+                "best_action_after_all_cost",
                 "missed_opportunity",
             )
             if key in sample

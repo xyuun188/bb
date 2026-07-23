@@ -138,7 +138,7 @@ def _side_return(row: Any, side: str) -> float | None:
         }
     )
     return _safe_float(
-        fee_after.get(f"{side}_net_return_after_cost_pct"),
+        fee_after.get(f"{side}_net_return_after_all_cost_pct"),
         None,
     )
 

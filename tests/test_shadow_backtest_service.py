@@ -204,12 +204,12 @@ def test_shadow_fee_after_label_uses_funding_when_it_changes_the_best_side() -> 
     )
 
     assert outcome["cost_complete"] is True
-    assert outcome["long_net_return_after_cost_pct"] < 0.0
-    assert outcome["short_net_return_after_cost_pct"] > 0.0
+    assert outcome["long_net_return_after_all_cost_pct"] < 0.0
+    assert outcome["short_net_return_after_all_cost_pct"] > 0.0
     scenarios = outcome["leverage_counterfactuals"]
     assert [item["leverage"] for item in scenarios] == [1, 2, 3, 5, 10]
     assert scenarios[-1]["short_fee_after_margin_return_pct"] == pytest.approx(
-        outcome["short_net_return_after_cost_pct"] * 10
+        outcome["short_net_return_after_all_cost_pct"] * 10
     )
     assert all(item["creates_order"] is False for item in scenarios)
     assert outcome["leverage_counterfactual_policy"]["creates_order"] is False
@@ -419,7 +419,7 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     assert label_contract["horizon_minutes"] == 10
     assert label_contract["fee_after_label_version"] == SHADOW_FEE_AFTER_LABEL_VERSION
     assert label_contract["fee_after_complete"] is True
-    assert label_contract["long_net_return_after_cost_pct"] < label_contract[
+    assert label_contract["long_net_return_after_all_cost_pct"] < label_contract[
         "long_return_pct"
     ]
     assert shadow_label_contract_reasons(
@@ -430,7 +430,7 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
     assert leverage_evidence["scenario_count"] == 5
     assert leverage_evidence["creates_order"] is False
     assert leverage_evidence["leverage_10x_long_fee_after_margin_return_pct"] == (
-        pytest.approx(label_contract["long_net_return_after_cost_pct"] * 10)
+        pytest.approx(label_contract["long_net_return_after_all_cost_pct"] * 10)
     )
     assert len(repo.memories) == 4
     assert {item["expert_name"] for item in repo.memories} == {
@@ -450,7 +450,7 @@ async def test_shadow_backtest_records_fee_after_observation_without_probe_permi
         item["extra"]["production_evidence_eligible"] is False for item in repo.memories
     )
     assert all(item["recommended_action"] == "shadow_observation_only" for item in repo.memories)
-    assert repo.memories[0]["extra"]["net_return_after_cost_pct"] < 1.0
+    assert repo.memories[0]["extra"]["net_return_after_all_cost_pct"] < 1.0
 
 
 @pytest.mark.asyncio

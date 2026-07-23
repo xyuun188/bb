@@ -204,7 +204,7 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
             "distribution_production_eligible": distribution["production_eligible"],
             "distribution_blockers": distribution["blockers"],
             "production_contribution": 0.0 if distribution["blockers"] else 1.0,
-            "authoritative_return_after_cost_pct": authoritative[
+            "authoritative_return_after_all_cost_pct": authoritative[
                 "authoritative_pnl_ratio_pct"
             ],
             "outcome_complete": authoritative["outcome_complete"],

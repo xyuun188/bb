@@ -11,7 +11,7 @@
     "market_price_facts": "core/market_facts.py",
     "execution_cost": "services/execution_cost_model.py",
     "return_distribution": "services/return_objective.py",
-    "production_entry_eligibility": "services/return_execution_policy.py",
+    "production_entry_eligibility": "services/live_ml_profit_contract.py",
     "persisted_entry_contract_audit": "services/trade_execution_contract.py",
     "risk_budget_and_sizing": "services/entry_profit_risk_sizing.py",
     "exchange_execution_and_protection": "executor/okx_executor.py",
@@ -22,7 +22,7 @@
     {
       "legacy_path": "runtime recovery return distribution production contribution",
       "production_consumers": ["entry opportunity scoring", "return execution policy"],
-      "test_consumers": ["test_entry_opportunity_scoring.py", "test_return_execution_policy.py"],
+      "test_consumers": ["test_entry_opportunity_scoring.py", "test_live_ml_profit_contract.py"],
       "data_migration": "none; historical incident fixture remains read-only",
       "replacement_owner": "governed standardized return distribution",
       "deletion_commit": "b52abd9"

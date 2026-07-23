@@ -143,7 +143,7 @@ def test_production_distribution_deducts_live_cost_once_and_keeps_transform_audi
             {
                 "source_authority": "okx_position_history",
                 "side": "long",
-                "net_return_after_cost_pct": {
+                "net_return_after_all_cost_pct": {
                     "count": 12,
                     "expected": 0.5,
                     "lower_hinge": 0.4,
@@ -226,7 +226,7 @@ def test_paper_model_weights_change_central_return_without_weakening_tail_guard(
             {
                 "source_authority": "okx_position_history",
                 "side": "long",
-                "net_return_after_cost_pct": {
+                "net_return_after_all_cost_pct": {
                     "count": 12,
                     "expected": 0.5,
                     "lower_hinge": 0.4,

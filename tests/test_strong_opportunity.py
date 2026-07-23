@@ -30,7 +30,7 @@ def _provenance() -> dict[str, object]:
 def _raw(*, complete: bool = True) -> dict[str, object]:
     provenance = _provenance()
     return {
-        "production_return_policy": {
+        "live_ml_profit_contract": {
             "eligible": complete,
             "expected_net_return_pct": 1.2,
             "return_lcb_pct": 0.4,

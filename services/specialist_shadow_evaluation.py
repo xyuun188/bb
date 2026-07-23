@@ -180,10 +180,10 @@ def _actual_best_side(row: Any) -> str:
         return best
     fee_after = shadow_fee_after_return_labels(_shadow_quality_payload(row))
     long_return = _safe_float(
-        fee_after.get("long_net_return_after_cost_pct"), None
+        fee_after.get("long_net_return_after_all_cost_pct"), None
     )
     short_return = _safe_float(
-        fee_after.get("short_net_return_after_cost_pct"), None
+        fee_after.get("short_net_return_after_all_cost_pct"), None
     )
     if long_return is None or short_return is None:
         return ""
@@ -483,12 +483,12 @@ def _compact_worst_sample(
         "actual_best_side": actual_side,
         "actual_return_pct": round(float(actual_return), 6),
         "expected_return_pct": None if expected_return is None else round(float(expected_return), 6),
-        "long_net_return_after_cost_pct": shadow_fee_after_return_labels(
+        "long_net_return_after_all_cost_pct": shadow_fee_after_return_labels(
             _shadow_quality_payload(row)
-        ).get("long_net_return_after_cost_pct"),
-        "short_net_return_after_cost_pct": shadow_fee_after_return_labels(
+        ).get("long_net_return_after_all_cost_pct"),
+        "short_net_return_after_all_cost_pct": shadow_fee_after_return_labels(
             _shadow_quality_payload(row)
-        ).get("short_net_return_after_cost_pct"),
+        ).get("short_net_return_after_all_cost_pct"),
         "created_at": _iso_row_datetime(row, "created_at"),
         "due_at": _iso_row_datetime(row, "due_at"),
         "sequence_length": sequence_length,
@@ -510,11 +510,11 @@ def _event_timestamp(event: dict[str, Any]) -> str:
 def _canonical_net_return(event: dict[str, Any]) -> float | None:
     """Return only the current fee-after objective label.
 
-    Legacy ``return_after_cost_pct`` data is deliberately not accepted here:
+    Legacy ``return_after_all_cost_pct`` data is deliberately not accepted here:
     silently consuming it would let old objective data influence promotion.
     """
 
-    return _safe_float(event.get("net_return_after_cost_pct"), None)
+    return _safe_float(event.get("net_return_after_all_cost_pct"), None)
 
 
 def _walk_forward_report(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -544,7 +544,7 @@ def _walk_forward_report(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "sample_count": len(fold_events),
                 "start_at": _event_timestamp(fold_events[0]) if fold_events else None,
                 "end_at": _event_timestamp(fold_events[-1]) if fold_events else None,
-                "avg_return_after_cost_pct": round(sum(returns) / max(len(returns), 1), 6),
+                "avg_return_after_all_cost_pct": round(sum(returns) / max(len(returns), 1), 6),
                 "return_lcb_pct": round(fold_lcb, 6) if fold_lcb is not None else None,
                 "win_rate": round(
                     sum(1 for value in returns if value > 0) / max(len(returns), 1),
@@ -583,7 +583,7 @@ def _regime_stability_report(events: list[dict[str, Any]]) -> dict[str, Any]:
         {
             "regime": regime,
             "sample_count": len(values),
-            "avg_return_after_cost_pct": round(sum(values) / max(len(values), 1), 6),
+            "avg_return_after_all_cost_pct": round(sum(values) / max(len(values), 1), 6),
             "win_rate": round(sum(1 for value in values if value > 0) / max(len(values), 1), 6),
             "return_lcb_pct": round(_mean_lcb(values) or 0.0, 6),
         }
@@ -619,9 +619,9 @@ def _rolling_distribution_report(events: list[dict[str, Any]]) -> dict[str, Any]
         windows.append(
             {
                 "window_size": window_size,
-                "avg_return_after_cost_pct": round(sum(values) / window_size, 6),
+                "avg_return_after_all_cost_pct": round(sum(values) / window_size, 6),
                 "win_rate": round(sum(1 for value in values if value > 0) / window_size, 6),
-                "worst_return_after_cost_pct": round(min(values), 6),
+                "worst_return_after_all_cost_pct": round(min(values), 6),
                 "return_lcb_pct": round(return_lcb, 6) if return_lcb is not None else None,
             }
         )
@@ -731,7 +731,7 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         "direction_hit_rate": round(hit_rate, 6),
         "false_signal_count": int(metric.get("false_signal_count") or 0),
         "avg_realized_return_pct": round(avg_realized, 6),
-        "avg_shadow_return_after_cost_pct": round(avg_realized, 6),
+        "avg_shadow_return_after_all_cost_pct": round(avg_realized, 6),
         "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
         "gross_profit_return_pct": round(gross_profit, 6),
         "gross_loss_return_pct": round(gross_loss, 6),
@@ -763,7 +763,7 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         "authoritative_direction_mismatch_count": int(
             metric.get("authoritative_direction_mismatch_count") or 0
         ),
-        "authoritative_avg_return_after_cost_pct": round(avg_authoritative, 6),
+        "authoritative_avg_return_after_all_cost_pct": round(avg_authoritative, 6),
         "authoritative_return_lcb_pct": (
             round(authoritative_return_lcb, 6)
             if authoritative_return_lcb is not None
@@ -779,8 +779,8 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         ),
         "authoritative_gross_profit_return_pct": round(authoritative_gross_profit, 6),
         "authoritative_gross_loss_return_pct": round(authoritative_gross_loss, 6),
-        "authoritative_worst_return_after_cost_pct": authoritative_worst,
-        "authoritative_best_return_after_cost_pct": metric.get(
+        "authoritative_worst_return_after_all_cost_pct": authoritative_worst,
+        "authoritative_best_return_after_all_cost_pct": metric.get(
             "authoritative_best_return_pct"
         ),
         "authoritative_tail_loss_count": int(
@@ -809,7 +809,7 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
             "direction_hit_rate": round(hit_rate, 6),
             "avg_realized_return_pct": round(avg_realized, 6),
             "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,
-            "authoritative_avg_return_after_cost_pct": round(avg_authoritative, 6),
+            "authoritative_avg_return_after_all_cost_pct": round(avg_authoritative, 6),
             "authoritative_profit_factor": (
                 round(authoritative_profit_factor, 6)
                 if authoritative_profit_factor is not None
@@ -958,7 +958,7 @@ def summarize_specialist_shadow_evaluation(
                             "actual_best_side": actual_side,
                             "gross_return_pct": round(float(gross_return), 6),
                             "execution_cost": execution_cost,
-                            "net_return_after_cost_pct": round(actual_return, 6),
+                            "net_return_after_all_cost_pct": round(actual_return, 6),
                             "created_at": _iso_row_datetime(row, "created_at"),
                             "label_timestamp": _iso_row_datetime(row, "due_at"),
                             "market_regime": _market_regime(row),
@@ -1038,7 +1038,7 @@ def summarize_specialist_shadow_evaluation(
                     "predicted_side": _safe_str(candidate.get("direction")).lower(),
                     "actual_position_side": actual_position_side,
                     "actual_inference": bool(candidate.get("actual_inference")),
-                    "observed_position_net_return_after_cost_pct": round(
+                    "observed_position_net_return_after_all_cost_pct": round(
                         float(authoritative_return), 6
                     ),
                     "label_timestamp": _safe_str(_row_get(sample, "label_timestamp")),
@@ -1077,7 +1077,7 @@ def summarize_specialist_shadow_evaluation(
                 )
                 evidence["label_usable"] = True
                 evidence["label_reason"] = "prediction_matches_observed_position_side"
-                evidence["net_return_after_cost_pct"] = round(float(authoritative_return), 6)
+                evidence["net_return_after_all_cost_pct"] = round(float(authoritative_return), 6)
                 metric["authoritative_evidence"].append(evidence)
                 metric["authoritative_events"].append(evidence)
 

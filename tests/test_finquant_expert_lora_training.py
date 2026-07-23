@@ -171,8 +171,8 @@ def test_finquant_preference_counterexample_prefers_low_win_positive_expectancy(
 
     assert user_payload["candidate_a"]["win_rate"] == pytest.approx(0.35)
     assert user_payload["candidate_b"]["win_rate"] == pytest.approx(0.80)
-    assert preference["metrics"]["chosen_net_return_after_cost_pct"] > 0
-    assert preference["metrics"]["rejected_net_return_after_cost_pct"] < 0
+    assert preference["metrics"]["chosen_net_return_after_all_cost_pct"] > 0
+    assert preference["metrics"]["rejected_net_return_after_all_cost_pct"] < 0
     assert json.loads(preference["chosen"])["best_side"] == "candidate_a"
 
 
@@ -181,18 +181,18 @@ def test_shadow_response_chooses_fee_after_side_even_when_gross_points_elsewhere
         {
             "gross_long_return_pct": 2.0,
             "gross_short_return_pct": -2.0,
-            "long_net_return_after_cost_pct": -0.2,
-            "short_net_return_after_cost_pct": 0.3,
+            "long_net_return_after_all_cost_pct": -0.2,
+            "short_net_return_after_all_cost_pct": 0.3,
             "missed_opportunity": True,
         }
     )
 
     assert response["best_side"] == "short"
-    assert response["long_net_return_after_cost_pct"] == -0.2
-    assert response["short_net_return_after_cost_pct"] == 0.3
+    assert response["long_net_return_after_all_cost_pct"] == -0.2
+    assert response["short_net_return_after_all_cost_pct"] == 0.3
     assert "long_return_pct" not in response
 
-    with pytest.raises(ValueError, match="missing long_net_return_after_cost_pct"):
+    with pytest.raises(ValueError, match="missing long_net_return_after_all_cost_pct"):
         training._shadow_response({"long_return_pct": 9.0, "short_return_pct": -9.0})
 
 

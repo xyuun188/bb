@@ -95,7 +95,7 @@ function strategyLearningProfileTitle(profile) {
 
 function strategyLearningOwnerLabel(owner) {
     const labels = {
-        return_execution_policy: '实时费后收益',
+        live_ml_profit_contract: '实时费后收益',
         dynamic_entry_risk_budget: '入场风险预算',
         dynamic_position_capacity: '仓位容量',
         dynamic_exit_policy: '动态退出',
@@ -154,7 +154,7 @@ function strategyLearningProductionOverview(data) {
         ? production.execution_owners
         : Array.isArray(runtime.execution_owners) ? runtime.execution_owners : [];
     const ownerItems = owners.length ? owners : [
-        'return_execution_policy',
+        'live_ml_profit_contract',
         'dynamic_entry_risk_budget',
         'dynamic_position_capacity',
         'dynamic_exit_policy',

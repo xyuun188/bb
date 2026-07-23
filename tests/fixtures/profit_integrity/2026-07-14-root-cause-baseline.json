@@ -870,7 +870,7 @@
                   "total": 30
                 },
                 "label": "negative",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -0.9767,
@@ -941,7 +941,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-13T23:40:41.034260+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -1558,7 +1558,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -1675,7 +1675,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -2883,7 +2883,7 @@
           "return_budget_fraction": 0.00335192,
           "snapshot_price": 2.17
         },
-        "production_return_policy": {
+        "live_ml_profit_contract": {
           "eligible": true,
           "execution_cost_pct": 0.125108,
           "expected_loss_pct": 0.125108,
@@ -2927,7 +2927,7 @@
           },
           "position_size_pct": 0.32688507,
           "production_source_count": 1,
-          "reason": "production_return_policy_passed",
+          "reason": "live_ml_profit_contract_passed",
           "return_lcb_pct": 0.210084,
           "uncertainty_pct": 0.125108
         },
@@ -3104,7 +3104,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -3221,7 +3221,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -4117,7 +4117,7 @@
                   "total": 30
                 },
                 "label": "neutral",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -0.5005,
@@ -4188,7 +4188,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T00:19:31.128551+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -4805,7 +4805,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -4919,7 +4919,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -6195,7 +6195,7 @@
           "return_budget_fraction": 0.00314699,
           "snapshot_price": 0.072
         },
-        "production_return_policy": {
+        "live_ml_profit_contract": {
           "eligible": true,
           "execution_cost_pct": 0.113501,
           "expected_loss_pct": 0.113501,
@@ -6239,7 +6239,7 @@
           },
           "position_size_pct": 0.35416758,
           "production_source_count": 1,
-          "reason": "production_return_policy_passed",
+          "reason": "live_ml_profit_contract_passed",
           "return_lcb_pct": 0.201198,
           "uncertainty_pct": 0.113501
         },
@@ -6416,7 +6416,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -6530,7 +6530,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -7335,7 +7335,7 @@
                   "total": 30
                 },
                 "label": "neutral",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -1.8157,
@@ -7406,7 +7406,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T00:50:39.217108+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -8023,7 +8023,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -8137,7 +8137,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -9588,7 +9588,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -9702,7 +9702,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -10498,7 +10498,7 @@
                   "total": 30
                 },
                 "label": "neutral",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -1.7594,
@@ -10569,7 +10569,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T02:05:22.692771+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -11185,7 +11185,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -11299,7 +11299,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -12750,7 +12750,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -12864,7 +12864,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -13660,7 +13660,7 @@
                   "total": 30
                 },
                 "label": "neutral",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -1.7594,
@@ -13731,7 +13731,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T02:06:39.342152+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -14348,7 +14348,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -14462,7 +14462,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -15913,7 +15913,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -16027,7 +16027,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -16823,7 +16823,7 @@
                   "total": 30
                 },
                 "label": "neutral",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -1.7594,
@@ -16894,7 +16894,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T02:24:41.067935+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -17511,7 +17511,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -17625,7 +17625,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -19076,7 +19076,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -19190,7 +19190,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -19976,7 +19976,7 @@
                   "total": 30
                 },
                 "label": "neutral",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -1.7594,
@@ -20047,7 +20047,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T02:54:45.637658+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -20664,7 +20664,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -20778,7 +20778,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -22229,7 +22229,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -22343,7 +22343,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -23130,7 +23130,7 @@
                   "total": 30
                 },
                 "label": "negative",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": "2026-07-12.v1",
                 "live_mutation": false,
                 "long_expected_return_pct": -2.1153,
@@ -23201,7 +23201,7 @@
                     "total": 30
                   },
                   "generated_at": "2026-07-14T04:21:04.880465+00:00",
-                  "label_name": "net_return_after_cost_pct",
+                  "label_name": "net_return_after_all_cost_pct",
                   "label_version": "2026-07-12.v1",
                   "live_mutation": false,
                   "model_version": "local-sentiment-trained-v2.v1",
@@ -23818,7 +23818,7 @@
                 "params": {
                   "current_return_contract_required": true,
                   "execution_owners": [
-                    "return_execution_policy",
+                    "live_ml_profit_contract",
                     "dynamic_entry_risk_budget",
                     "dynamic_position_capacity",
                     "dynamic_exit_policy"
@@ -23932,7 +23932,7 @@
                 "current_market_regime": "return_distribution_observation",
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -25383,7 +25383,7 @@
               "params": {
                 "current_return_contract_required": true,
                 "execution_owners": [
-                  "return_execution_policy",
+                  "live_ml_profit_contract",
                   "dynamic_entry_risk_budget",
                   "dynamic_position_capacity",
                   "dynamic_exit_policy"
@@ -25497,7 +25497,7 @@
               "current_market_regime": "return_distribution_observation",
               "current_return_contract_required": true,
               "execution_owners": [
-                "return_execution_policy",
+                "live_ml_profit_contract",
                 "dynamic_entry_risk_budget",
                 "dynamic_position_capacity",
                 "dynamic_exit_policy"
@@ -25695,7 +25695,7 @@
               "after_fee_quality": {
                 "avg_loss_usdt": 0.0,
                 "avg_net_pnl_usdt": 0.0,
-                "avg_return_after_cost_pct": 0.0,
+                "avg_return_after_all_cost_pct": 0.0,
                 "avg_win_usdt": 0.0,
                 "flat_count": 0,
                 "gross_loss_usdt": 0.0,
@@ -25797,7 +25797,7 @@
             "after_fee_quality": {
               "avg_loss_usdt": 0.0,
               "avg_net_pnl_usdt": 0.0,
-              "avg_return_after_cost_pct": 0.0,
+              "avg_return_after_all_cost_pct": 0.0,
               "avg_win_usdt": 0.0,
               "flat_count": 0,
               "gross_loss_usdt": 0.0,
@@ -25900,7 +25900,7 @@
           "total": 3476
         },
         "training_label_consistency": {
-          "avg_return_after_cost_pct": 0.0,
+          "avg_return_after_all_cost_pct": 0.0,
           "checked_return_count": 0,
           "error_count": 0,
           "errors": [],
@@ -26346,7 +26346,7 @@
             "expert_label": "最终交易员",
             "expert_name": "decision_maker",
             "failure_count": 1,
-            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
+            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_all_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
             "market_pattern": "ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x",
             "memory_key": "decision_maker|ICP/USDT|short|fee_after_outcome_observation|canonical_fee_after_outcome",
             "memory_type": "fee_after_outcome_observation",
@@ -26360,7 +26360,7 @@
             "expert_label": "盈利质量专家",
             "expert_name": "momentum_expert",
             "failure_count": 1,
-            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
+            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_all_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
             "market_pattern": "ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x",
             "memory_key": "momentum_expert|ICP/USDT|short|fee_after_outcome_observation|canonical_fee_after_outcome",
             "memory_type": "fee_after_outcome_observation",
@@ -26374,7 +26374,7 @@
             "expert_label": "持仓退出专家",
             "expert_name": "position_expert",
             "failure_count": 1,
-            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
+            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_all_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
             "market_pattern": "ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x",
             "memory_key": "position_expert|ICP/USDT|short|fee_after_outcome_observation|canonical_fee_after_outcome",
             "memory_type": "fee_after_outcome_observation",
@@ -26388,7 +26388,7 @@
             "expert_label": "异常风控专家",
             "expert_name": "risk_expert",
             "failure_count": 1,
-            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
+            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_all_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
             "market_pattern": "ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x",
             "memory_key": "risk_expert|ICP/USDT|short|fee_after_outcome_observation|canonical_fee_after_outcome",
             "memory_type": "fee_after_outcome_observation",
@@ -26402,7 +26402,7 @@
             "expert_label": "短线时序专家",
             "expert_name": "sentiment_expert",
             "failure_count": 1,
-            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
+            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_all_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
             "market_pattern": "ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x",
             "memory_key": "sentiment_expert|ICP/USDT|short|fee_after_outcome_observation|canonical_fee_after_outcome",
             "memory_type": "fee_after_outcome_observation",
@@ -26416,7 +26416,7 @@
             "expert_label": "行情方向专家",
             "expert_name": "trend_expert",
             "failure_count": 1,
-            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
+            "lesson": "权威费后结果事实：symbol=ICP/USDT, side=short, outcome=loss, net_return_after_all_cost_pct=-5.51319027, hold_minutes=292.3970, pattern=ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x。",
             "market_pattern": "ICP/USDT 做空，费后收益率=-5.513190%，持仓分钟=292.40，杠杆=1.00x",
             "memory_key": "trend_expert|ICP/USDT|short|fee_after_outcome_observation|canonical_fee_after_outcome",
             "memory_type": "fee_after_outcome_observation",
@@ -27294,7 +27294,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -27357,7 +27357,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -27430,7 +27430,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -27493,7 +27493,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -27629,7 +27629,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -27775,7 +27775,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -27911,7 +27911,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28047,7 +28047,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28191,7 +28191,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28327,7 +28327,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28463,7 +28463,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28607,7 +28607,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28743,7 +28743,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -28879,7 +28879,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29023,7 +29023,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29159,7 +29159,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29295,7 +29295,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29439,7 +29439,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29575,7 +29575,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29711,7 +29711,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29855,7 +29855,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -29991,7 +29991,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -30127,7 +30127,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"
@@ -30271,7 +30271,7 @@
           "current_market_regime": "return_distribution_observation",
           "current_return_contract_required": true,
           "execution_owners": [
-            "return_execution_policy",
+            "live_ml_profit_contract",
             "dynamic_entry_risk_budget",
             "dynamic_position_capacity",
             "dynamic_exit_policy"

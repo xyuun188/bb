@@ -24,7 +24,7 @@ def _provenance(*, samples: int = 8, fallback_reason: str = "") -> dict[str, obj
 def _entry_raw() -> dict[str, object]:
     provenance = _provenance()
     return {
-        "production_return_policy": {
+        "live_ml_profit_contract": {
             "eligible": True,
             "expected_net_return_pct": 0.8,
             "return_lcb_pct": 0.2,
@@ -64,13 +64,116 @@ def _decision(decision_id: int, action: str, raw: dict[str, object]) -> SimpleNa
     )
 
 
-def _filled_order(decision_id: int) -> SimpleNamespace:
+def _filled_order(
+    decision_id: int,
+    *,
+    quantity: float = 1.2,
+    price: float = 100.0,
+) -> SimpleNamespace:
     return SimpleNamespace(
         decision_id=decision_id,
         status="filled",
-        quantity=1.2,
-        price=100.0,
+        quantity=quantity,
+        price=price,
     )
+
+
+def _rules_canary_raw(
+    *,
+    final_notional: float = 8.0,
+    max_notional: float = 10.0,
+    signal_action: str = "long",
+) -> dict[str, object]:
+    provenance = _provenance()
+    stress_fraction = 0.025
+    planned_loss = final_notional * stress_fraction
+    exchange_minimum = {
+        "production_eligible": True,
+        "minimum_notional_usdt": 1.0,
+    }
+    return {
+        "production_trade_gate": {
+            "can_trade": True,
+            "mode": "live_rules_canary",
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "reason": "collecting_authoritative_profit_samples",
+            "version": "test-gate",
+            "risk": {
+                "max_notional_usdt": max_notional,
+                "max_open_positions": 1,
+                "max_daily_loss_usdt": 3.0,
+            },
+        },
+        "live_rules_canary_signal": {
+            "version": "test-rules-canary-signal",
+            "execution_scope": "live_rules_canary",
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "production_eligible": True,
+            "action": signal_action,
+            "policy_provenance": provenance,
+        },
+        "model_shadow_decision": {
+            "action": "short",
+            "observation_only": True,
+            "can_authorize_entry": False,
+            "can_change_size_or_leverage": False,
+        },
+        "live_rules_canary_contract": {
+            "execution_scope": "live_rules_canary",
+            "production_permission": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "order_notional_usdt": final_notional,
+            "max_notional_usdt": max_notional,
+            "exchange_min_notional_usdt": 1.0,
+            "gate_version": "test-gate",
+            "gate_reason": "collecting_authoritative_profit_samples",
+            "blockers": [],
+        },
+        "opportunity_score": {
+            "production_eligible": False,
+            "execution_cost": {
+                "production_eligible": True,
+                "total_pct": 0.08,
+                "order_notional_usdt": final_notional,
+                "order_size_complete": True,
+                "policy_provenance": provenance,
+            },
+        },
+        "profit_risk_sizing": {
+            "contract_version": "test-rules-canary-sizing",
+            "contract_lifecycle": "live_rules_canary",
+            "production_eligible": True,
+            "execution_scope": "live_rules_canary",
+            "production_permission": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "risk_budget_usdt": max(planned_loss, 0.5),
+            "planned_stressed_loss_usdt": planned_loss,
+            "stressed_loss_fraction": stress_fraction,
+            "target_notional_usdt": final_notional,
+            "target_inst_id": "BTC-USDT-SWAP",
+            "target_price": 100.0,
+            "selected_contract_spec": {
+                "ctVal": "0.01",
+                "ctMult": "1",
+                "minSz": "1",
+                "lotSz": "1",
+            },
+            "exchange_minimum_order": exchange_minimum,
+            "exchange_min_notional_usdt": 1.0,
+            "final_notional_usdt": final_notional,
+            "final_margin_usdt": final_notional,
+            "final_leverage": 1.0,
+            "leverage_tier_selection": {
+                "production_eligible": True,
+                "max_leverage": 20.0,
+            },
+            "policy_provenance": provenance,
+        },
+    }
 
 
 def test_complete_dynamic_return_entry_contract_is_clean() -> None:
@@ -86,8 +189,8 @@ def test_complete_dynamic_return_entry_contract_is_clean() -> None:
 
 def test_non_positive_fee_after_return_cannot_execute() -> None:
     raw = _entry_raw()
-    raw["production_return_policy"]["expected_net_return_pct"] = -0.01
-    raw["production_return_policy"]["return_lcb_pct"] = -0.2
+    raw["live_ml_profit_contract"]["expected_net_return_pct"] = -0.01
+    raw["live_ml_profit_contract"]["return_lcb_pct"] = -0.2
 
     report = summarize_trade_execution_contract(
         [_decision(2, "short", raw)],
@@ -97,6 +200,69 @@ def test_non_positive_fee_after_return_cannot_execute() -> None:
     reasons = report["violation_reason_counts"]
     assert reasons["fee_after_expected_return_not_positive"] == 1
     assert reasons["fee_after_return_lcb_not_positive"] == 1
+
+
+def test_live_rules_canary_contract_does_not_require_live_ml_profit_contract() -> None:
+    report = summarize_trade_execution_contract(
+        [_decision(20, "long", _rules_canary_raw())],
+        orders=[_filled_order(20, quantity=0.08)],
+    )
+
+    assert report["summary"]["executed_entry_count"] == 1
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["entry_contracts"][0]["contract_lifecycle"] == "live_rules_canary"
+
+
+def test_live_rules_canary_contract_enforces_gate_notional_limit() -> None:
+    report = summarize_trade_execution_contract(
+        [
+            _decision(
+                21,
+                "short",
+                _rules_canary_raw(
+                    final_notional=12.0,
+                    max_notional=10.0,
+                    signal_action="short",
+                ),
+            )
+        ],
+        orders=[_filled_order(21, quantity=0.12)],
+    )
+
+    reasons = report["violation_reason_counts"]
+    assert reasons == {
+        "filled_order_notional_above_rules_canary_limit": 1,
+        "rules_canary_order_notional_above_gate_limit": 1,
+    }
+
+
+def test_live_rules_canary_contract_rejects_notional_below_exchange_minimum() -> None:
+    raw = _rules_canary_raw(final_notional=0.5)
+
+    report = summarize_trade_execution_contract(
+        [_decision(23, "long", raw)],
+        orders=[_filled_order(23, quantity=0.005)],
+    )
+
+    reasons = report["violation_reason_counts"]
+    assert reasons["rules_canary_notional_below_exchange_minimum"] == 1
+
+
+def test_live_rules_canary_contract_requires_authoritative_rule_signal() -> None:
+    raw = _rules_canary_raw()
+    raw.pop("live_rules_canary_signal")
+
+    report = summarize_trade_execution_contract(
+        [_decision(22, "long", raw)],
+        orders=[_filled_order(22, quantity=0.08)],
+    )
+
+    reasons = report["violation_reason_counts"]
+    assert reasons["rules_canary_signal_missing_or_ineligible"] == 1
+    assert reasons["rules_canary_signal_authority_invalid"] == 1
+    assert reasons["rules_canary_signal_model_influence_invalid"] == 1
+    assert reasons["rules_canary_signal_provenance_incomplete"] == 1
 
 
 def test_missing_cost_or_provenance_fails_closed() -> None:

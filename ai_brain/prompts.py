@@ -348,9 +348,9 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             or item.get("consistency") == "divergent"
         )
     ] or validations
-    production_return_policy = (
-        context.get("production_return_policy")
-        if isinstance(context.get("production_return_policy"), dict)
+    live_ml_profit_contract = (
+        context.get("live_ml_profit_contract")
+        if isinstance(context.get("live_ml_profit_contract"), dict)
         else {}
     )
     payload = {
@@ -387,8 +387,8 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
         ),
         "add_evidence": compact_value(context.get("add_evidence") or {}, depth=1),
         "opportunity_score": compact_value(context.get("opportunity_score") or {}, depth=1),
-        "production_return_policy": compact_value(
-            production_return_policy,
+        "live_ml_profit_contract": compact_value(
+            live_ml_profit_contract,
             depth=2,
             dict_limit=10,
         ),
@@ -441,8 +441,8 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             depth=1,
             dict_limit=8,
         )
-        compact_payload["production_return_policy"] = compact_value(
-            compact_payload.get("production_return_policy") or {},
+        compact_payload["live_ml_profit_contract"] = compact_value(
+            compact_payload.get("live_ml_profit_contract") or {},
             depth=1,
             dict_limit=6,
         )
@@ -451,7 +451,7 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
             return text
 
         for key, empty_value in (
-            ("production_return_policy", {}),
+            ("live_ml_profit_contract", {}),
             ("portfolio_profit_protection", {}),
             ("opportunity_score", {}),
             ("add_evidence", {}),
@@ -552,9 +552,9 @@ def build_batch_experts_user_prompt(
     strategy_mode = (
         context.get("strategy_mode") if isinstance(context.get("strategy_mode"), dict) else {}
     )
-    production_return_policy = (
-        context.get("production_return_policy")
-        if isinstance(context.get("production_return_policy"), dict)
+    live_ml_profit_contract = (
+        context.get("live_ml_profit_contract")
+        if isinstance(context.get("live_ml_profit_contract"), dict)
         else {}
     )
     strategy_learning = (
@@ -591,8 +591,8 @@ def build_batch_experts_user_prompt(
             ),
             "can_authorize_entry": False,
         },
-        "production_return_policy": compact_value(
-            production_return_policy,
+        "live_ml_profit_contract": compact_value(
+            live_ml_profit_contract,
             depth=1,
             dict_limit=6,
         ),

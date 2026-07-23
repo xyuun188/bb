@@ -27,7 +27,7 @@ def test_incident_replay_fails_old_profit_evidence_at_current_boundaries() -> No
     assert icp["before"]["lower_quantile_return_pct"] > icp["before"]["expected_return_pct"]
     assert "lower_quantile_above_raw_expected" in icp["after"]["distribution_blockers"]
     assert icp["after"]["production_contribution"] == 0.0
-    assert icp["after"]["authoritative_return_after_cost_pct"] < 0.0
+    assert icp["after"]["authoritative_return_after_all_cost_pct"] < 0.0
     assert icp["after"]["stop_execution_slippage"]["status"] == "measured"
     assert icp["after"]["stop_execution_slippage"]["contribution_usdt"] < 0.0
 

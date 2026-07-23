@@ -24,7 +24,7 @@ def _outcome_extra(*, position_id: int, outcome_id: str, pnl: float, return_pct:
         "outcome_id": outcome_id,
         "production_evidence_eligible": True,
         "realized_pnl": pnl,
-        "net_return_after_cost_pct": return_pct,
+        "net_return_after_all_cost_pct": return_pct,
         "source_position_id": position_id,
     }
 

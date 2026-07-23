@@ -9,7 +9,10 @@ from math import isclose, isfinite
 from types import SimpleNamespace
 from typing import Any
 
-from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
+from services.okx_native_facts import (
+    OKX_PROTECTION_EXECUTION_VERSION,
+    okx_minimum_order_notional_usdt,
+)
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
@@ -242,6 +245,7 @@ def _entry_contract_row(
     )
     contract, reasons = validate_entry_execution_contract(
         raw,
+        entry_action=_action(decision),
         filled_notional_usdt=filled_notional,
         executed=executed,
         filled_order_present=_has_filled_order(orders),
@@ -266,6 +270,8 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     exploration = _safe_dict(raw.get("paper_exploration"))
     training = _safe_dict(raw.get("paper_training"))
     canary = _safe_dict(raw.get("paper_bootstrap_canary"))
+    trade_gate = _safe_dict(raw.get("production_trade_gate"))
+    rules_canary_contract = _safe_dict(raw.get("live_rules_canary_contract"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
     if (
@@ -292,6 +298,12 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
         or opportunity.get("contract_lifecycle") == "paper_bootstrap_canary"
     ):
         return "paper_bootstrap_canary"
+    if (
+        trade_gate.get("mode") == "live_rules_canary"
+        or rules_canary_contract.get("execution_scope") == "live_rules_canary"
+        or sizing.get("execution_scope") == "live_rules_canary"
+    ):
+        return "live_rules_canary"
     return "production_return"
 
 
@@ -317,6 +329,7 @@ def entry_opportunity_evidence_score(raw: dict[str, Any]) -> float | None:
 def validate_entry_execution_contract(
     raw: dict[str, Any],
     *,
+    entry_action: Any | None = None,
     filled_notional_usdt: float = 0.0,
     executed: bool = False,
     filled_order_present: bool | None = None,
@@ -341,6 +354,14 @@ def validate_entry_execution_contract(
     if lifecycle == "paper_exploration":
         return validate_paper_exploration_entry_contract(
             raw,
+            filled_notional_usdt=filled_notional_usdt,
+            executed=executed,
+            filled_order_present=filled_order_present,
+        )
+    if lifecycle == "live_rules_canary":
+        return validate_live_rules_canary_entry_contract(
+            raw,
+            entry_action=entry_action,
             filled_notional_usdt=filled_notional_usdt,
             executed=executed,
             filled_order_present=filled_order_present,
@@ -976,6 +997,240 @@ def _paper_canary_observation_reasons(canary: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def build_live_rules_canary_entry_contract(
+    raw: dict[str, Any],
+    *,
+    entry_action: Any | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Build the one pre-submit contract for bounded rules-led live entries."""
+
+    gate = _safe_dict(raw.get("production_trade_gate"))
+    signal = _safe_dict(raw.get("live_rules_canary_signal"))
+    model_shadow = _safe_dict(raw.get("model_shadow_decision"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    cost = _safe_dict(opportunity.get("execution_cost"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    risk = _safe_dict(gate.get("risk"))
+    reasons: list[str] = []
+
+    max_notional = _safe_float(risk.get("max_notional_usdt"))
+    final_notional = _safe_float(sizing.get("final_notional_usdt"))
+    execution_notional = _safe_float(cost.get("order_notional_usdt"))
+    order_notional = max(final_notional, execution_notional)
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"))
+    stress_fraction = _safe_float(sizing.get("stressed_loss_fraction"))
+    target_notional = _safe_float(sizing.get("target_notional_usdt"))
+    final_margin = _safe_float(sizing.get("final_margin_usdt"))
+    final_leverage = _safe_float(sizing.get("final_leverage"))
+    leverage_tier = _safe_dict(sizing.get("leverage_tier_selection"))
+    declared_exchange_minimum = _safe_dict(sizing.get("exchange_minimum_order"))
+    exchange_minimum = okx_minimum_order_notional_usdt(
+        _safe_dict(sizing.get("selected_contract_spec")),
+        sizing.get("target_price"),
+    )
+    exchange_min_notional = _safe_float(
+        exchange_minimum.get("minimum_notional_usdt")
+    )
+
+    if gate.get("mode") != "live_rules_canary":
+        reasons.append("live_rules_canary_gate_mode_invalid")
+    if gate.get("can_trade") is not True:
+        reasons.append("production_trade_gate_not_open")
+    if gate.get("decision_authority") != "rules":
+        reasons.append("rules_canary_authority_not_rules")
+    if gate.get("model_can_influence") is not False:
+        reasons.append("rules_canary_model_influence_not_disabled")
+    if (
+        signal.get("production_eligible") is not True
+        or signal.get("action") not in {"long", "short"}
+        or signal.get("execution_scope") != "live_rules_canary"
+    ):
+        reasons.append("rules_canary_signal_missing_or_ineligible")
+    if signal.get("decision_authority") != "rules":
+        reasons.append("rules_canary_signal_authority_invalid")
+    if signal.get("model_can_influence") is not False:
+        reasons.append("rules_canary_signal_model_influence_invalid")
+    normalized_action = str(getattr(entry_action, "value", entry_action) or "").lower()
+    normalized_action = {
+        "buy": "long",
+        "open_long": "long",
+        "sell": "short",
+        "open_short": "short",
+    }.get(normalized_action, normalized_action)
+    if normalized_action and signal.get("action") != normalized_action:
+        reasons.append("rules_canary_signal_action_mismatch")
+    if not _provenance_complete(signal.get("policy_provenance")):
+        reasons.append("rules_canary_signal_provenance_incomplete")
+    if (
+        model_shadow.get("observation_only") is not True
+        or model_shadow.get("can_authorize_entry") is not False
+        or model_shadow.get("can_change_size_or_leverage") is not False
+    ):
+        reasons.append("rules_canary_model_shadow_contract_missing")
+    if max_notional <= 0:
+        reasons.append("rules_canary_max_notional_missing")
+    if order_notional <= 0:
+        reasons.append("rules_canary_order_notional_missing")
+    elif max_notional > 0 and order_notional > max_notional + 1e-8:
+        reasons.append("rules_canary_order_notional_above_gate_limit")
+    if (
+        cost.get("production_eligible") is not True
+        or cost.get("order_size_complete") is not True
+        or _safe_float(cost.get("total_pct")) <= 0
+    ):
+        reasons.append("rules_canary_execution_cost_incomplete")
+    if not _provenance_complete(cost.get("policy_provenance")):
+        reasons.append("rules_canary_execution_cost_provenance_incomplete")
+    if execution_notional <= 0 or not isclose(
+        execution_notional,
+        final_notional,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("rules_canary_execution_cost_notional_mismatch")
+    if sizing.get("production_eligible") is not True:
+        reasons.append("rules_canary_risk_sizing_ineligible")
+    if sizing.get("contract_lifecycle") != "live_rules_canary":
+        reasons.append("rules_canary_sizing_lifecycle_invalid")
+    if sizing.get("execution_scope") != "live_rules_canary":
+        reasons.append("rules_canary_sizing_scope_invalid")
+    if sizing.get("production_permission") is not True:
+        reasons.append("rules_canary_sizing_permission_missing")
+    if sizing.get("decision_authority") != "rules":
+        reasons.append("rules_canary_sizing_authority_invalid")
+    if sizing.get("model_can_influence") is not False:
+        reasons.append("rules_canary_sizing_model_influence_invalid")
+    if not _provenance_complete(sizing.get("policy_provenance")):
+        reasons.append("rules_canary_sizing_provenance_incomplete")
+    if risk_budget <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
+        reasons.append("rules_canary_risk_budget_algebra_invalid")
+    if stress_fraction <= 0 or not isclose(
+        planned_loss,
+        final_notional * stress_fraction,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("rules_canary_stressed_loss_algebra_invalid")
+    if final_notional <= 0 or final_notional > target_notional + 1e-8:
+        reasons.append("rules_canary_notional_target_invalid")
+    if (
+        not str(sizing.get("target_inst_id") or "").strip()
+        or exchange_minimum.get("production_eligible") is not True
+    ):
+        reasons.append("rules_canary_exchange_minimum_incomplete")
+    elif final_notional + 1e-8 < exchange_min_notional:
+        reasons.append("rules_canary_notional_below_exchange_minimum")
+    if (
+        declared_exchange_minimum.get("production_eligible") is not True
+        or not isclose(
+            _safe_float(declared_exchange_minimum.get("minimum_notional_usdt")),
+            exchange_min_notional,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        )
+        or not isclose(
+            _safe_float(sizing.get("exchange_min_notional_usdt")),
+            exchange_min_notional,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        )
+    ):
+        reasons.append("rules_canary_exchange_minimum_contract_mismatch")
+    if not isclose(final_leverage, 1.0, rel_tol=0.0, abs_tol=1e-8):
+        reasons.append("rules_canary_leverage_not_one")
+    if not isclose(final_margin, final_notional, rel_tol=1e-9, abs_tol=1e-8):
+        reasons.append("rules_canary_margin_algebra_invalid")
+    if leverage_tier.get("production_eligible") is not True:
+        reasons.append("rules_canary_leverage_tier_ineligible")
+
+    reasons = list(dict.fromkeys(reasons))
+    contract = {
+        "contract_lifecycle": "live_rules_canary",
+        "contract_complete": not reasons,
+        "execution_scope": sizing.get("execution_scope"),
+        "production_permission": sizing.get("production_permission"),
+        "decision_authority": sizing.get("decision_authority"),
+        "model_can_influence": sizing.get("model_can_influence"),
+        "max_notional_usdt": max_notional,
+        "risk_budget_usdt": risk_budget,
+        "final_notional_usdt": final_notional,
+        "order_notional_usdt": order_notional,
+        "exchange_min_notional_usdt": exchange_min_notional,
+        "execution_cost_pct": _safe_float(cost.get("total_pct")),
+        "planned_stressed_loss_usdt": planned_loss,
+        "stressed_loss_fraction": stress_fraction,
+        "final_leverage": final_leverage,
+        "gate_version": gate.get("version"),
+        "gate_reason": gate.get("reason"),
+        "signal_version": signal.get("version"),
+        "signal_action": signal.get("action"),
+        "sizing_contract_version": sizing.get("contract_version"),
+        "blockers": reasons,
+    }
+    return contract, reasons
+
+
+def validate_live_rules_canary_entry_contract(
+    raw: dict[str, Any],
+    *,
+    entry_action: Any | None = None,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate persisted rules-canary lineage and any resulting fill."""
+
+    rules_contract = _safe_dict(raw.get("live_rules_canary_contract"))
+    contract, reasons = build_live_rules_canary_entry_contract(
+        raw,
+        entry_action=entry_action,
+    )
+    if rules_contract.get("execution_scope") != "live_rules_canary":
+        reasons.append("live_rules_canary_contract_missing")
+    if rules_contract.get("production_permission") is not True:
+        reasons.append("live_rules_canary_permission_missing")
+    if rules_contract.get("decision_authority") != "rules":
+        reasons.append("live_rules_canary_contract_authority_invalid")
+    if rules_contract.get("model_can_influence") is not False:
+        reasons.append("live_rules_canary_contract_model_influence_invalid")
+    if _safe_list(rules_contract.get("blockers")):
+        reasons.append("live_rules_canary_contract_persisted_with_blockers")
+    if any(
+        not isclose(
+            _safe_float(rules_contract.get(key)),
+            _safe_float(contract.get(key)),
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        )
+        for key in (
+            "max_notional_usdt",
+            "order_notional_usdt",
+            "exchange_min_notional_usdt",
+        )
+    ):
+        reasons.append("live_rules_canary_contract_notional_mismatch")
+    if rules_contract.get("gate_version") != contract.get("gate_version"):
+        reasons.append("live_rules_canary_contract_gate_version_mismatch")
+    if executed and filled_order_present is not True:
+        reasons.append("executed_entry_without_filled_order")
+
+    filled_notional = max(_safe_float(filled_notional_usdt), 0.0)
+    if (
+        executed
+        and filled_notional > 0
+        and _safe_float(contract.get("max_notional_usdt")) > 0
+        and filled_notional > _safe_float(contract.get("max_notional_usdt")) + 1e-8
+    ):
+        reasons.append("filled_order_notional_above_rules_canary_limit")
+
+    reasons = list(dict.fromkeys(reasons))
+    contract["contract_complete"] = not reasons
+    contract["filled_order_notional_usdt"] = filled_notional
+    contract["blockers"] = reasons
+    return contract, reasons
+
+
 def validate_production_entry_contract(
     raw: dict[str, Any],
     *,
@@ -985,25 +1240,25 @@ def validate_production_entry_contract(
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate the persisted production-entry contract without mutating it."""
 
-    policy = _safe_dict(raw.get("production_return_policy"))
+    policy = _safe_dict(raw.get("live_ml_profit_contract"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
     cost = _safe_dict(opportunity.get("execution_cost"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     reasons: list[str] = []
     if not policy or policy.get("eligible") is not True:
-        reasons.append("production_return_policy_missing_or_ineligible")
+        reasons.append("live_ml_profit_contract_missing_or_ineligible")
     if _safe_float(policy.get("expected_net_return_pct"), 0.0) <= 0:
         reasons.append("fee_after_expected_return_not_positive")
     if _safe_float(policy.get("return_lcb_pct"), 0.0) <= 0:
         reasons.append("fee_after_return_lcb_not_positive")
     if _safe_int(policy.get("production_source_count")) <= 0:
-        reasons.append("production_return_distribution_missing")
+        reasons.append("live_ml_return_distribution_missing")
     if _safe_float(policy.get("position_size_pct"), 0.0) <= 0:
         reasons.append("dynamic_position_budget_zero")
     if not _provenance_complete(policy.get("policy_provenance")):
-        reasons.append("production_return_provenance_incomplete")
+        reasons.append("live_ml_profit_contract_provenance_incomplete")
     if opportunity.get("production_eligible") is not True:
-        reasons.append("opportunity_return_distribution_ineligible")
+        reasons.append("opportunity_profit_distribution_ineligible")
     if not _provenance_complete(opportunity.get("policy_provenance")):
         reasons.append("opportunity_return_provenance_incomplete")
     if cost.get("production_eligible") is not True or _safe_float(cost.get("total_pct")) <= 0:

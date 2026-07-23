@@ -15,7 +15,7 @@ def _decision() -> DecisionOutput:
     calibration = {
         "source_authority": "okx_position_history",
         "profile_source": "symbol_side",
-        "net_return_after_cost_pct": {
+        "net_return_after_all_cost_pct": {
             "count": 12,
             "expected": 0.7,
             "lower_hinge": 0.5,
@@ -58,7 +58,12 @@ def _decision() -> DecisionOutput:
                 "reported_max_leverage": 20.0,
                 "target_inst_id": "BTC-USDT-SWAP",
                 "contract_specs": {
-                    "BTC-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
+                    "BTC-USDT-SWAP": {
+                        "ctVal": "1",
+                        "ctMult": "1",
+                        "minSz": "0.01",
+                        "lotSz": "0.01",
+                    },
                 },
                 "leverage_tiers": [
                     {"tier": "1", "minSz": "0", "maxSz": "100", "maxLeverage": 20},
@@ -250,6 +255,118 @@ async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
     assert large.suggested_leverage <= 12.0
     assert small_sizing["model_position_cap_applied"] is True
     assert small_sizing["final_notional_usdt"] <= small_sizing["model_final_notional_cap_usdt"]
+
+
+@pytest.mark.asyncio
+async def test_live_rules_canary_sizes_without_profit_distribution_or_model_control() -> None:
+    decision = _decision()
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["expected_net_return_pct"] = None
+    opportunity["return_lcb_pct"] = None
+    opportunity["return_distribution_contract"] = {}
+    opportunity["expected_net_breakdown"] = {"components": []}
+    decision.raw_response["production_trade_gate"] = {
+        "version": "test-rules-canary",
+        "mode": "live_rules_canary",
+        "can_trade": True,
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "risk": {
+            "max_notional_usdt": 10.0,
+            "max_open_positions": 1,
+            "max_daily_loss_usdt": 3.0,
+        },
+        "evidence": {"risk": {"daily_loss_usdt": 0.5}},
+    }
+    decision.position_size_pct = 0.9
+    decision.suggested_leverage = 20.0
+    decision.stop_loss_pct = 0.75
+    decision.take_profit_pct = 0.9
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "live", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["contract_lifecycle"] == "live_rules_canary"
+    assert sizing["execution_scope"] == "live_rules_canary"
+    assert sizing["decision_authority"] == "rules"
+    assert sizing["model_can_influence"] is False
+    assert sizing["final_notional_usdt"] == pytest.approx(10.0)
+    assert sizing["exchange_min_notional_usdt"] == pytest.approx(1.0)
+    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+    assert sizing["expected_net_return_pct"] == 0.0
+    assert sizing["model_position_cap_applied"] is False
+    assert decision.position_size_pct == pytest.approx(0.01)
+    assert decision.suggested_leverage == 1.0
+    assert decision.stop_loss_pct == pytest.approx(0.015)
+    assert decision.take_profit_pct == pytest.approx(0.0233)
+    assert "live_ml_profit_contract" not in decision.raw_response
+
+
+@pytest.mark.asyncio
+async def test_live_rules_canary_blocks_before_submit_when_exchange_minimum_exceeds_cap() -> None:
+    decision = _decision()
+    decision.feature_snapshot["current_price"] = 100_000.0
+    decision.raw_response["exchange_risk_facts"]["contract_specs"] = {
+        "BTC-USDT-SWAP": {
+            "ctVal": "0.01",
+            "ctMult": "1",
+            "minSz": "1",
+            "lotSz": "1",
+        }
+    }
+    decision.raw_response["production_trade_gate"] = {
+        "version": "test-rules-canary",
+        "mode": "live_rules_canary",
+        "can_trade": True,
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "risk": {
+            "max_notional_usdt": 10.0,
+            "max_open_positions": 1,
+            "max_daily_loss_usdt": 3.0,
+        },
+        "evidence": {"risk": {"daily_loss_usdt": 0.0}},
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "live", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert sizing["exchange_min_notional_usdt"] == pytest.approx(1000.0)
+    assert "rules_canary_notional_below_exchange_minimum" in sizing["reason"]
+    assert sizing["final_notional_usdt"] == 0.0
+    assert decision.position_size_pct == 0.0
+
+
+@pytest.mark.asyncio
+async def test_live_rules_canary_fails_closed_when_notional_limit_is_zero() -> None:
+    decision = _decision()
+    decision.raw_response["production_trade_gate"] = {
+        "version": "test-rules-canary",
+        "mode": "live_rules_canary",
+        "can_trade": False,
+        "decision_authority": "none",
+        "model_can_influence": False,
+        "risk": {
+            "max_notional_usdt": 0.0,
+            "max_open_positions": 1,
+            "max_daily_loss_usdt": 3.0,
+        },
+        "evidence": {"risk": {"daily_loss_usdt": 0.0}},
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "live", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert "production_trade_gate_not_open" in sizing["reason"]
+    assert "rules_canary_max_notional_missing" in sizing["reason"]
+    assert decision.position_size_pct == 0.0
+    assert sizing["final_notional_usdt"] == 0.0
 
 
 @pytest.mark.asyncio

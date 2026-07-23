@@ -12,6 +12,7 @@ from core.training_contracts import (
 )
 from db.repositories.base import BaseRepository
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
 
 DAMAGED_MEMORY_MARKERS = (
@@ -445,7 +446,7 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         return {**existing, **incoming}
 
     realized_pnl = _finite_float(incoming.get("realized_pnl"), None)
-    net_return = _finite_float(incoming.get("net_return_after_cost_pct"), None)
+    net_return = _finite_float(incoming.get(PROFIT_TRAINING_TARGET), None)
     if realized_pnl is None or net_return is None:
         return {**existing, **incoming}
 
@@ -505,8 +506,8 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
     )
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
     aggregation = {
-        "objective": "maximize_expected_realized_net_return_after_cost",
-        "objective_version": "2026-07-12.v1",
+        "objective": PROFIT_TRAINING_TARGET,
+        "objective_version": "2026-07-23.v1",
         "return_unit": "percentage_points",
         "count": count,
         "positive_count": positive_count,

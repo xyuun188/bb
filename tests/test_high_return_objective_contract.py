@@ -113,6 +113,23 @@ def test_local_quant_training_has_no_hindsight_best_direction_target() -> None:
     assert '"short_model": short_model' in source
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "services/entry_opportunity_scoring.py",
+        "services/entry_profit_risk_sizing.py",
+        "services/return_objective.py",
+    ),
+)
+def test_live_entry_pipeline_cannot_read_retired_return_target(
+    relative_path: str,
+) -> None:
+    source = _source(relative_path)
+
+    assert '"net_return_after_cost_pct"' not in source
+    assert '"net_return_after_all_cost_pct"' in source
+
+
 def test_finquant_uses_sft_then_trl_dpo_return_preferences() -> None:
     source = _source("scripts/finquant_expert_lora_training.py")
 

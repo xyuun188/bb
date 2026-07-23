@@ -417,7 +417,7 @@ def combine_production_return_distribution(
     slippage_expected_values: list[float] = []
     slippage_upper_values: list[float] = []
     for row in calibration_rows:
-        realized = row.get("net_return_after_cost_pct")
+        realized = row.get("net_return_after_all_cost_pct")
         slippage = row.get("slippage_pct")
         realized = realized if isinstance(realized, dict) else {}
         slippage = slippage if isinstance(slippage, dict) else {}

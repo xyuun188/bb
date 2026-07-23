@@ -301,8 +301,8 @@ def shadow_fee_after_outcome(
         "funding_return_long_pct": funding_return_long_pct if funding_present else None,
         "funding_return_short_pct": funding_return_short_pct if funding_present else None,
         "funding_interval_minutes": funding_interval_minutes,
-        "long_net_return_after_cost_pct": long_net_pct,
-        "short_net_return_after_cost_pct": short_net_pct,
+        "long_net_return_after_all_cost_pct": long_net_pct,
+        "short_net_return_after_all_cost_pct": short_net_pct,
         "leverage_counterfactuals": leverage_counterfactuals,
         "leverage_counterfactual_policy": {
             "source": "one_cost_complete_shadow_path_without_duplicate_orders",
@@ -576,8 +576,8 @@ class ShadowBacktestService:
                 feature_snapshot["training_leverage_counterfactuals"] = (
                     compact_shadow_leverage_counterfactuals(fee_after_outcome)
                 )
-                long_net = fee_after_outcome.get("long_net_return_after_cost_pct")
-                short_net = fee_after_outcome.get("short_net_return_after_cost_pct")
+                long_net = fee_after_outcome.get("long_net_return_after_all_cost_pct")
+                short_net = fee_after_outcome.get("short_net_return_after_all_cost_pct")
                 best_action = "hold"
                 if fee_after_outcome.get("cost_complete"):
                     if float(long_net) > 0.0 and float(long_net) >= float(short_net):
@@ -730,7 +730,7 @@ class ShadowBacktestService:
 
         if decision_action == "hold" and best_action in {"long", "short"}:
             realized_net_pct = self.float_parser(
-                fee_after_outcome.get(f"{best_action}_net_return_after_cost_pct"),
+                fee_after_outcome.get(f"{best_action}_net_return_after_all_cost_pct"),
                 0.0,
             )
             if realized_net_pct <= 0.0:
@@ -747,7 +747,7 @@ class ShadowBacktestService:
         elif decision_action in {"long", "short"}:
             side = decision_action
             realized_net_pct = self.float_parser(
-                fee_after_outcome.get(f"{side}_net_return_after_cost_pct"),
+                fee_after_outcome.get(f"{side}_net_return_after_all_cost_pct"),
                 0.0,
             )
             if realized_net_pct > 0.0:
@@ -765,7 +765,7 @@ class ShadowBacktestService:
                 failure_count = 0
                 opposite = "short" if side == "long" else "long"
                 opposite_net_pct = self.float_parser(
-                    fee_after_outcome.get(f"{opposite}_net_return_after_cost_pct"),
+                    fee_after_outcome.get(f"{opposite}_net_return_after_all_cost_pct"),
                     0.0,
                 )
                 outcome_text = (
@@ -817,7 +817,7 @@ class ShadowBacktestService:
                         "actual_price": getattr(row, "actual_price", None),
                         "long_return_pct": long_return * 100,
                         "short_return_pct": short_return * 100,
-                        "net_return_after_cost_pct": realized_net_pct,
+                        "net_return_after_all_cost_pct": realized_net_pct,
                         "objective": RETURN_OBJECTIVE_NAME,
                         "objective_version": RETURN_OBJECTIVE_VERSION,
                         "cost_complete": True,

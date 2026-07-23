@@ -131,6 +131,55 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert label["realized_net_pnl_usdt"] == 8.5
 
 
+def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> None:
+    history = _history(
+        mode="live",
+        row_identity="live|BTC-USDT-SWAP|pos-1|long|1",
+        close_avg_px=99_650.0,
+        realized_pnl=-8.5,
+        pnl=-7.0,
+        pnl_ratio=-0.0085,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "realizedPnl": "-8.5",
+        "pnl": "-7",
+        "pnlRatio": "-0.0085",
+    }
+    lineage = _complete_lineage()
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "production_trade_gate": {
+            "mode": "live_rules_canary",
+            "decision_authority": "rules",
+            "model_can_influence": False,
+        },
+        "live_rules_canary_signal": {
+            "version": "test-rules-canary-signal",
+            "production_eligible": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "action": "long",
+        },
+        "model_shadow_decision": {
+            "action": "short",
+            "confidence": 0.8,
+            "observation_only": True,
+            "can_authorize_entry": False,
+            "can_change_size_or_leverage": False,
+        },
+    }
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["decision_authority"] == "rules"
+    assert sample["model_shadow_prediction"]["action"] == "short"
+    assert sample["model_shadow_prediction"]["rules_execution_action"] == "long"
+    contract = sample["profit_training_contract"]
+    assert contract["eligible"] is True
+    assert contract["outcome"] == "loss"
+    assert contract["model_shadow_alignment"] == "avoided_losing_side"
+
+
 def test_paper_training_prefers_verified_account_contract_size_over_public_spec() -> None:
     history = _history(pnl=100.0, realized_pnl=98.5)
     lineage = _complete_lineage()

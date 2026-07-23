@@ -20,7 +20,7 @@
     },
     "ICP": {
       "after": {
-        "authoritative_return_after_cost_pct": -5.51319027,
+        "authoritative_return_after_all_cost_pct": -5.51319027,
         "distribution_blockers": [
           "lower_quantile_above_raw_expected",
           "lower_quantile_above_median"

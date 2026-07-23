@@ -40,7 +40,7 @@
 - 衍生数据重建。
 - 没有真实盈亏闭环的数据隔离，不参与晋升。
 - 训练主目标统一为 `net_return_after_all_cost_pct`。
-- `net_return_after_cost_pct`、`realized_net_return_pct`、`fee_after_return` 只作为历史兼容读取，不再作为主目标。
+- `net_return_after_cost_pct`、`realized_net_return_pct`、`fee_after_return` 已从运行代码和新衍生数据中删除；历史数据重建时直接丢弃这些旧字段，不做双读兼容。
 
 ## 4. 训练数据闭环
 
@@ -176,7 +176,7 @@
 重点清理对象：
 
 - `services/entry_opportunity_scoring.py`
-- `services/return_execution_policy.py`
+- `services/live_ml_profit_contract.py`
 - `services/trading_policies.py`
 - `services/execution_service.py`
 - `services/ml_signal_service.py`
@@ -213,3 +213,14 @@
 - 清理重复交易资格判断。
 - 简化 dashboard 主状态。
 - 建立旧衍生训练数据清理脚本和重建流程。
+
+## 12. `live_rules_canary` 已落地合同
+
+规则小仓实盘已拆分为四个唯一权威阶段：
+
+1. `live_rules_canary_signal`：只读当前技术特征生成方向；原模型结果写入 `model_shadow_decision`，不能改变真实 action。
+2. `profit_risk_sizing`：只读统一交易闸门、OKX 当前账户/档位/订单簿、合约规格和市场压力损失；模型仓位、杠杆和收益声明不参与定仓。若风险上限低于 OKX 最小合约金额，当前候选直接归零并继续尝试其他可成交币种。
+3. `live_rules_canary_contract`：执行前和成交后共用同一个合同构建器，同时验证方向来源、1 倍杠杆、风险代数、执行成本、名义金额上限和 OKX 最小合约金额；规格不完整或计算不一致时禁止提交。
+4. OKX 平仓事实回写：交易责任标记为 `decision_authority=rules`；模型旁路预测单独生成 `model_shadow_alignment`，用真实 `net_return_after_all_cost_pct` 学习“支持了亏损方向”或“避开了亏损方向”。
+
+上述四阶段不读取 `live_ml_profit_contract` 才能运行，也不允许旧 `net_return_after_cost_pct` 进入机会评分、定仓或收益分布组合。规则小仓的单笔风险预算独立取自当日剩余亏损预算和最大并发仓位，再由压力损失反推名义金额，避免风险预算与仓位互相定义。

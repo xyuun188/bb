@@ -104,7 +104,7 @@ def _decision() -> DecisionOutput:
     )
     calibration = {
         "source_authority": "okx_position_history",
-        "net_return_after_cost_pct": {"count": 12, "expected": 0.2, "lower_hinge": -0.1},
+        "net_return_after_all_cost_pct": {"count": 12, "expected": 0.2, "lower_hinge": -0.1},
         "slippage_pct": {"count": 12, "expected": 0.02, "upper_hinge": 0.03},
         "stop_loss_slippage_pct": {"count": 4, "expected": 0.03, "upper_hinge": 0.05},
     }

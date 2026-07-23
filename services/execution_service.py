@@ -33,6 +33,7 @@ from services.paper_training import (
     is_paper_training_decision,
 )
 from services.strategy_arbitration import arbitrate_decision
+from services.trade_execution_contract import build_live_rules_canary_entry_contract
 from services.trade_recommendation_contract import attach_trade_execution_result
 from services.trading_policies import PolicyGateResult
 
@@ -80,42 +81,10 @@ def _rules_canary_entry_contract_result(
     if gate.get("mode") != "live_rules_canary":
         return None
 
-    risk = _safe_dict(gate.get("risk"))
-    opportunity = _safe_dict(raw.get("opportunity_score"))
-    execution_cost = _safe_dict(opportunity.get("execution_cost"))
-    sizing = _safe_dict(raw.get("profit_risk_sizing"))
-    max_notional = _safe_float(risk.get("max_notional_usdt"), 0.0)
-    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
-    execution_notional = _safe_float(execution_cost.get("order_notional_usdt"), 0.0)
-    order_notional = max(final_notional, execution_notional)
-
-    blockers: list[str] = []
-    if gate.get("can_trade") is not True:
-        blockers.append("production_trade_gate_not_open")
-    if gate.get("decision_authority") != "rules":
-        blockers.append("rules_canary_authority_not_rules")
-    if gate.get("model_can_influence") is not False:
-        blockers.append("rules_canary_model_influence_not_disabled")
-    if max_notional <= 0:
-        blockers.append("rules_canary_max_notional_missing")
-    if order_notional <= 0:
-        blockers.append("rules_canary_order_notional_missing")
-    elif max_notional > 0 and order_notional > max_notional + 1e-8:
-        blockers.append("rules_canary_order_notional_above_gate_limit")
-    if execution_cost.get("order_size_complete") is not True:
-        blockers.append("rules_canary_execution_cost_incomplete")
-
-    contract = {
-        "execution_scope": "live_rules_canary",
-        "production_permission": True,
-        "decision_authority": "rules",
-        "model_can_influence": False,
-        "order_notional_usdt": order_notional,
-        "max_notional_usdt": max_notional,
-        "gate_version": gate.get("version"),
-        "gate_reason": gate.get("reason"),
-        "blockers": blockers,
-    }
+    contract, blockers = build_live_rules_canary_entry_contract(
+        raw,
+        entry_action=decision.action,
+    )
     if blockers:
         return PolicyGateResult.block(
             "live_rules_canary_contract_incomplete",
@@ -1316,6 +1285,17 @@ class ExecutionService:
             return_contract_result = _return_entry_contract_result(decision, model_mode)
             if not return_contract_result.passed:
                 return await block_before_submit(return_contract_result)
+            if (
+                return_contract_result.data.get("return_execution_contract")
+                == "live_rules_canary"
+            ):
+                raw = dict(_safe_dict(decision.raw_response))
+                raw["return_execution_contract"] = "live_rules_canary"
+                raw["production_permission"] = True
+                raw["live_rules_canary_contract"] = return_contract_result.data[
+                    "live_rules_canary_contract"
+                ]
+                decision.raw_response = raw
             if decision_db_id is not None:
                 attach_execution_parameters("entry_policy_passed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)

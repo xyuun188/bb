@@ -1924,7 +1924,7 @@ async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone
                     "profit_factor": 3.0,
                 }
             },
-            "production_return_policy": {"eligible": True},
+            "live_ml_profit_contract": {"eligible": True},
         },
     )
 
@@ -3158,7 +3158,7 @@ async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
 
 
 @pytest.mark.asyncio
-async def test_entry_policy_allows_live_rules_canary_without_production_return_policy() -> None:
+async def test_entry_policy_allows_live_rules_canary_without_live_ml_profit_contract() -> None:
     async def fake_sizing(
         decision: DecisionOutput,
         _model_mode: str,
@@ -3201,7 +3201,7 @@ async def test_entry_policy_allows_live_rules_canary_without_production_return_p
 
     assert result.passed is True
     assert result.data["intent"] == "live_rules_canary_entry"
-    assert "production_return_policy" not in decision.raw_response
+    assert "live_ml_profit_contract" not in decision.raw_response
 
 
 @pytest.mark.asyncio
@@ -3331,7 +3331,7 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
                         "actual_trade_calibration": {
                             "source_authority": "okx_position_history",
                             "profile_source": "symbol_side",
-                            "net_return_after_cost_pct": {
+                            "net_return_after_all_cost_pct": {
                                 "count": 3,
                                 "expected": 0.2,
                                 "lower_hinge": 0.1,
@@ -3365,6 +3365,92 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
     assert decision.raw_response["profit_risk_sizing"]["production_eligible"] is True
     assert decision.position_size_pct > 0
     assert assessment.approved is True
+
+
+@pytest.mark.asyncio
+async def test_live_trade_gate_is_attached_before_dynamic_sizing() -> None:
+    service = TradingService.__new__(TradingService)
+    events: list[str] = []
+
+    async def gate_snapshot(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        events.append("gate")
+        return {
+            "mode": "live_rules_canary",
+            "can_trade": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "risk": {"max_notional_usdt": 10.0},
+        }
+
+    async def prepare(
+        decision_arg: DecisionOutput,
+        _model_mode: str,
+        *,
+        open_positions: list[dict[str, Any]],
+    ) -> None:
+        assert open_positions == []
+        assert decision_arg.raw_response["production_trade_gate"]["mode"] == (
+            "live_rules_canary"
+        )
+        events.append("sizing")
+
+    async def persist_raw(_decision_id: int, _raw: dict[str, Any]) -> None:
+        events.append("persist")
+
+    service.production_trade_gate_snapshot = gate_snapshot  # type: ignore[method-assign]
+    service.entry_policy = SimpleNamespace(prepare_dynamic_risk_contract=prepare)
+    service._mark_decision_raw_response = persist_raw  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+
+    await service._prepare_entry_for_hard_risk(
+        decision,
+        "live",
+        [],
+        decision_db_id=18,
+    )
+
+    assert events == ["gate", "sizing", "persist"]
+
+
+@pytest.mark.asyncio
+async def test_live_market_signal_uses_rules_instead_of_model_direction() -> None:
+    service = TradingService.__new__(TradingService)
+
+    async def gate_snapshot(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "mode": "live_rules_canary",
+            "can_trade": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "risk": {"max_notional_usdt": 10.0},
+        }
+
+    service.production_trade_gate_snapshot = gate_snapshot  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.position_size_pct = 0.8
+    decision.suggested_leverage = 20.0
+    decision.feature_snapshot = {
+        "current_price": 100.0,
+        "atr_14": 1.0,
+        "returns_1": -0.01,
+        "returns_5": -0.02,
+        "returns_20": -0.03,
+        "macd_diff": -0.1,
+        "price_vs_sma20": -0.01,
+    }
+
+    signal = await service._apply_live_rules_canary_market_signal(
+        decision,
+        "ensemble_trader",
+        "live",
+        [],
+    )
+
+    assert signal is not None and signal["action"] == "short"
+    assert decision.action == Action.SHORT
+    assert decision.position_size_pct == 0.0
+    assert decision.suggested_leverage == 1.0
+    assert decision.raw_response["model_shadow_decision"]["action"] == "long"
 
 
 @pytest.mark.asyncio

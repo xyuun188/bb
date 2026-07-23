@@ -3,11 +3,11 @@ from copy import deepcopy
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.live_ml_profit_contract import apply_live_ml_profit_contract
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
 )
-from services.return_execution_policy import apply_production_entry_policy
 from services.return_objective import (
     COST_MODEL_VERSION,
     standardized_return_distribution,
@@ -142,7 +142,7 @@ def _decision() -> DecisionOutput:
 def test_return_policy_validates_authoritative_size_without_rederiving_it() -> None:
     decision = _decision()
 
-    result = apply_production_entry_policy(decision)
+    result = apply_live_ml_profit_contract(decision)
 
     assert result.eligible is True
     assert result.return_lcb_pct == pytest.approx(0.7)
@@ -158,7 +158,7 @@ def test_return_policy_rejects_shadow_only_or_missing_production_observations() 
     for component in components:
         component["production_eligible"] = False
 
-    result = apply_production_entry_policy(decision)
+    result = apply_live_ml_profit_contract(decision)
 
     assert result.eligible is False
     assert "production_return_observations_missing" in result.reason
@@ -177,7 +177,7 @@ def test_return_policy_rejects_runtime_recovery_distribution() -> None:
         "runtime_recovery"
     )
 
-    result = apply_production_entry_policy(decision)
+    result = apply_live_ml_profit_contract(decision)
 
     assert result.eligible is False
     assert result.production_source_count == 0
@@ -195,7 +195,7 @@ def test_return_policy_rejects_unverified_recovery_inclusion_flag() -> None:
         "runtime_recovery"
     )
 
-    result = apply_production_entry_policy(decision)
+    result = apply_live_ml_profit_contract(decision)
 
     assert result.eligible is False
     assert "production_return_observations_missing" in result.reason
@@ -205,7 +205,7 @@ def test_return_policy_rejects_missing_live_spread_instead_of_using_cost_fallbac
     decision = _decision()
     decision.raw_response["opportunity_score"]["execution_cost"]["spread_source"] = "missing"
 
-    result = apply_production_entry_policy(decision)
+    result = apply_live_ml_profit_contract(decision)
 
     assert result.eligible is False
     assert "live_spread_observation_missing" in result.reason
@@ -217,7 +217,7 @@ def test_return_policy_rejects_observation_only_execution_cost() -> None:
         "production_eligible"
     ] = False
 
-    result = apply_production_entry_policy(decision)
+    result = apply_live_ml_profit_contract(decision)
 
     assert result.eligible is False
     assert "execution_cost_distribution_missing" in result.reason
@@ -235,7 +235,7 @@ def test_obsolete_evidence_payload_cannot_change_production_adjudication() -> No
         "tradeable_probe": True,
     }
 
-    first_result = apply_production_entry_policy(first)
-    second_result = apply_production_entry_policy(second)
+    first_result = apply_live_ml_profit_contract(first)
+    second_result = apply_live_ml_profit_contract(second)
 
     assert first_result == second_result

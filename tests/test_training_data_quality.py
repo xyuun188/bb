@@ -16,6 +16,7 @@ from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
 from services.model_promotion_policy import build_return_objective_report
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
     annotate_training_payload,
@@ -123,7 +124,7 @@ def test_profit_learning_report_does_not_invent_profit_factor_without_losses() -
                     "sample_kind": "trade",
                     "training_supervision_ready": True,
                     "realized_net_pnl_usdt": 2.5,
-                    "net_return_after_cost_pct": 0.4,
+                    "net_return_after_all_cost_pct": 0.4,
                 }
             }
         ]
@@ -407,13 +408,13 @@ def test_shadow_training_payload_exposes_fee_after_labels_not_only_gross_returns
 
     sample = payload["shadow_samples"][0]
     assert sample["gross_long_return_pct"] == 0.05
-    assert sample["long_net_return_after_cost_pct"] < 0.0
-    assert sample["short_net_return_after_cost_pct"] < 0.0
-    assert sample["best_action_after_cost"] == "hold"
+    assert sample["long_net_return_after_all_cost_pct"] < 0.0
+    assert sample["short_net_return_after_all_cost_pct"] < 0.0
+    assert sample["best_action_after_all_cost"] == "hold"
     assert sample["fee_after_label_complete"] is True
     contract_label = sample["training_sample_contract"]["label"]
-    assert contract_label["long_net_return_after_cost_pct"] == sample[
-        "long_net_return_after_cost_pct"
+    assert contract_label["long_net_return_after_all_cost_pct"] == sample[
+        "long_net_return_after_all_cost_pct"
     ]
     assert "long_return_pct" not in contract_label
 
@@ -430,7 +431,7 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
                 leverage=1.0,
                 loss_attribution="position_too_small_fee_drag",
                 raw_llm_response={
-                    "production_return_policy": {
+                    "live_ml_profit_contract": {
                         "position_size_pct": 0.01,
                         "production_source_count": 2,
                         "policy_provenance": {
@@ -457,12 +458,12 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
     assert "size_efficiency_label" not in labels
     assert labels["cost_basis_label"] == "fee_plus_funding"
     assert labels["realized_net_pnl_usdt"] == -0.12
-    assert labels["return_after_cost_pct"] == -1.0
-    assert labels["net_return_after_cost_pct"] == -1.0
+    assert labels[PROFIT_TRAINING_TARGET] == -1.0
     assert labels["return_on_margin_pct"] == -1.0
-    assert labels["return_after_cost_pct_deprecated"] is True
-    assert labels["strategy_context"]["return_policy_version"] == "return-test-v1"
-    assert labels["strategy_context"]["return_policy_source_count"] == 2
+    assert "return_after_all_cost_pct" not in labels
+    assert "return_after_all_cost_pct_deprecated" not in labels
+    assert labels["strategy_context"]["profit_training_target"] == PROFIT_TRAINING_TARGET
+    assert labels["strategy_context"]["profit_training_contract_version"] == ""
     assert "decision_lane" not in labels["strategy_context"]
     assert trade["losing_exit_attribution"] == "position_too_small_fee_drag"
     report = payload["quality_report"]["by_kind"]["trade"]["profit_learning"]
@@ -480,7 +481,7 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
         "avg_net_pnl_usdt": -0.12,
         "avg_win_usdt": 0.0,
         "avg_loss_usdt": 0.12,
-        "avg_return_after_cost_pct": -1.0,
+        "avg_return_after_all_cost_pct": -1.0,
         "small_win_big_loss_ratio": 0.0,
         "quality_warnings": ["gross_loss_not_covered_by_profit"],
     }
@@ -549,7 +550,7 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
 
     assert report["available"] is True
     assert report["sample_count"] == 2
-    assert report["average_net_return_after_cost_pct"] == 10.0
+    assert report["average_net_return_after_all_cost_pct"] == 10.0
     assert "authoritative_realized_return_distribution_missing" not in report[
         "blocking_reasons"
     ]
@@ -1169,8 +1170,8 @@ def test_trade_return_uses_valid_derived_notional_over_tiny_placeholder() -> Non
 
     labels = payload["trade_samples"][0]["profit_learning_labels"]
     assert labels["notional_usdt"] == 200.0
-    assert labels["return_after_cost_pct"] == 2.0
-    assert labels["net_return_after_cost_pct"] == 2.0
+    assert labels[PROFIT_TRAINING_TARGET] == 2.0
+    assert "return_after_all_cost_pct" not in labels
 
 
 def test_trade_return_is_missing_for_zero_or_malformed_notional() -> None:

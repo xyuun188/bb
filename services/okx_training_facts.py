@@ -243,6 +243,47 @@ def _decision_authority(
     return "model"
 
 
+def _model_shadow_prediction(
+    raw_llm_response: dict[str, Any],
+    *,
+    decision_authority: str,
+) -> dict[str, Any]:
+    if decision_authority != "rules":
+        return {}
+    gate = _dict(raw_llm_response.get("production_trade_gate"))
+    signal = _dict(raw_llm_response.get("live_rules_canary_signal"))
+    shadow = _dict(raw_llm_response.get("model_shadow_decision"))
+    if (
+        gate.get("mode") != "live_rules_canary"
+        or gate.get("decision_authority") != "rules"
+        or gate.get("model_can_influence") is not False
+        or signal.get("production_eligible") is not True
+        or signal.get("decision_authority") != "rules"
+        or signal.get("model_can_influence") is not False
+        or signal.get("action") not in {"long", "short"}
+        or shadow.get("observation_only") is not True
+        or shadow.get("can_authorize_entry") is not False
+        or shadow.get("can_change_size_or_leverage") is not False
+    ):
+        return {}
+    action = _text(shadow.get("action")).lower()
+    if action in {"buy", "open_long"}:
+        action = "long"
+    elif action in {"sell", "open_short"}:
+        action = "short"
+    if action not in {"long", "short"}:
+        return {}
+    return {
+        "action": action,
+        "confidence": _safe_float(shadow.get("confidence"), None),
+        "source": "live_rules_canary_model_shadow_decision",
+        "observation_only": True,
+        "can_authorize_entry": False,
+        "rules_execution_action": signal.get("action"),
+        "signal_version": signal.get("version"),
+    }
+
+
 def _directional_price_return_pct(
     *,
     side: str,
@@ -951,6 +992,12 @@ def build_okx_history_training_sample(
         strategy_training_role=strategy_training_role,
     )
     sample["decision_authority"] = decision_authority
+    model_shadow_prediction = _model_shadow_prediction(
+        raw_llm_response,
+        decision_authority=decision_authority,
+    )
+    if model_shadow_prediction:
+        sample["model_shadow_prediction"] = model_shadow_prediction
     if notional is not None and notional > 0:
         sample["net_return_after_all_cost_pct"] = realized_pnl / notional * 100.0
     sample["profit_training_contract"] = validate_profit_training_sample(sample).to_dict()

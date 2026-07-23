@@ -19,6 +19,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
+from services.okx_native_facts import okx_minimum_order_notional_usdt
 from services.paper_exploration import (
     PAPER_EXPLORATION_MAX_LCB_GAP_RATIO,
     PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
@@ -35,6 +36,7 @@ from services.paper_training import (
 )
 
 RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
+LIVE_RULES_CANARY_SIZING_VERSION = "2026-07-23.live-rules-canary-sizing.v2"
 LEVERAGE_TIER_SELECTION_VERSION = "2026-07-15.okx-target-notional-tier.v1"
 
 EntryProfitRiskSizingEvaluator = Callable[
@@ -76,6 +78,16 @@ def _normalized_ratio(value: Any) -> float:
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _live_rules_canary_gate(
+    raw: dict[str, Any],
+    model_mode: str,
+) -> dict[str, Any]:
+    if str(model_mode or "").lower() == "paper":
+        return {}
+    gate = _safe_dict(raw.get("production_trade_gate"))
+    return gate if gate.get("mode") == "live_rules_canary" else {}
 
 
 def _tier_value(tier: dict[str, Any], *keys: str) -> float:
@@ -286,7 +298,7 @@ def _distribution_tail(value: Any) -> float:
 
 
 def _rolling_realized_lcb_pct(calibration: dict[str, Any]) -> float | None:
-    distribution = _safe_dict(calibration.get("net_return_after_cost_pct"))
+    distribution = _safe_dict(calibration.get("net_return_after_all_cost_pct"))
     count = int(_safe_float(distribution.get("count"), 0.0))
     lower = _safe_float(distribution.get("lower_hinge"), float("nan"))
     return lower if count > 0 and isfinite(lower) else None
@@ -599,11 +611,11 @@ def reconcile_profit_risk_sizing(
     )
     sizing["policy_provenance"] = provenance
     raw["profit_risk_sizing"] = sizing
-    return_policy = raw.get("production_return_policy")
-    if isinstance(return_policy, dict):
-        return_policy = dict(return_policy)
-        return_policy["position_size_pct"] = round(position_size, 8)
-        raw["production_return_policy"] = return_policy
+    live_ml_contract = raw.get("live_ml_profit_contract")
+    if isinstance(live_ml_contract, dict):
+        live_ml_contract = dict(live_ml_contract)
+        live_ml_contract["position_size_pct"] = round(position_size, 8)
+        raw["live_ml_profit_contract"] = live_ml_contract
     decision.raw_response = raw
     decision.position_size_pct = position_size if eligible else 0.0
     decision.suggested_leverage = leverage if eligible else 1.0
@@ -642,6 +654,15 @@ class EntryProfitRiskSizingPolicy:
             return
 
         raw = _safe_dict(decision.raw_response)
+        rules_canary_gate = _live_rules_canary_gate(raw, model_mode)
+        if rules_canary_gate:
+            await self._apply_live_rules_canary_sizing(
+                decision,
+                model_mode,
+                open_positions or [],
+                rules_canary_gate,
+            )
+            return
         paper_exploration = is_paper_exploration_decision(decision)
         paper_exploration_contract = _safe_dict(raw.get("paper_exploration"))
         exploration_selection_reasons = (
@@ -1062,6 +1083,325 @@ class EntryProfitRiskSizingPolicy:
         decision.suggested_leverage = leverage if eligible else 1.0
         decision.stop_loss_pct = stressed_loss_fraction if eligible else decision.stop_loss_pct
         decision.take_profit_pct = dynamic_take_profit if eligible else decision.take_profit_pct
+
+    async def _apply_live_rules_canary_sizing(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+        open_positions: list[dict[str, Any]],
+        gate: dict[str, Any],
+    ) -> None:
+        """Build a bounded live size without consuming model profit or size claims."""
+
+        raw = _safe_dict(decision.raw_response)
+        opportunity = _safe_dict(raw.get("opportunity_score"))
+        execution_cost = _safe_dict(opportunity.get("execution_cost"))
+        facts = (
+            await self.exchange_risk_facts(model_mode, decision, open_positions)
+            if self.exchange_risk_facts is not None
+            else _safe_dict(raw.get("exchange_risk_facts"))
+        )
+        allocated_margin = max(
+            _safe_float(await self.allocated_order_balance(model_mode, decision), 0.0),
+            0.0,
+        )
+        fact_margin = max(_safe_float(facts.get("available_margin_usdt"), 0.0), 0.0)
+        available_margin = (
+            min(allocated_margin, fact_margin)
+            if allocated_margin > 0 and fact_margin > 0
+            else fact_margin
+        )
+        account_equity = max(_safe_float(facts.get("account_equity_usdt"), 0.0), 0.0)
+        risk_limits = _safe_dict(gate.get("risk"))
+        gate_evidence_risk = _safe_dict(_safe_dict(gate.get("evidence")).get("risk"))
+        max_notional = max(_safe_float(risk_limits.get("max_notional_usdt"), 0.0), 0.0)
+        max_daily_loss = max(
+            _safe_float(risk_limits.get("max_daily_loss_usdt"), 0.0),
+            0.0,
+        )
+        max_open_positions = max(
+            int(_safe_float(risk_limits.get("max_open_positions"), 0.0)),
+            0,
+        )
+        current_daily_loss = max(
+            _safe_float(gate_evidence_risk.get("daily_loss_usdt"), 0.0),
+            0.0,
+        )
+        remaining_daily_loss = max(max_daily_loss - current_daily_loss, 0.0)
+
+        snapshot = _safe_dict(decision.feature_snapshot)
+        calibration = _actual_trade_calibration(opportunity)
+        atr_ratio = _atr_ratio(decision)
+        path_adverse = _path_adverse_fraction(decision)
+        volatility = _normalized_ratio(snapshot.get("volatility_20"))
+        wick = max(_safe_float(snapshot.get("abnormal_wick_max_pct"), 0.0) / 100.0, 0.0)
+        stop_slippage_tail = _distribution_tail(calibration.get("stop_loss_slippage_pct")) / 100.0
+        general_slippage_tail = _distribution_tail(calibration.get("slippage_pct")) / 100.0
+        cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
+        market_impact = (
+            max(
+                _safe_float(execution_cost.get("slippage_pct"), 0.0),
+                _safe_float(execution_cost.get("liquidity_penalty_pct"), 0.0),
+                _safe_float(execution_cost.get("imbalance_penalty_pct"), 0.0),
+                _safe_float(execution_cost.get("market_impact_pct"), 0.0),
+                cost_pct,
+            )
+            / 100.0
+        )
+        stressed_loss_fraction = max(
+            atr_ratio,
+            path_adverse,
+            volatility,
+            wick,
+            stop_slippage_tail,
+            general_slippage_tail,
+            market_impact,
+        )
+        take_profit_fraction = stressed_loss_fraction * 1.5 + cost_pct / 100.0
+        side_depth = max(
+            _safe_float(
+                snapshot.get(
+                    "orderbook_ask_depth"
+                    if _side(decision) == "long"
+                    else "orderbook_bid_depth"
+                ),
+                0.0,
+            ),
+            0.0,
+        )
+        portfolio, portfolio_blockers = _portfolio_risk_snapshot(
+            open_positions,
+            candidate_side=_side(decision),
+            contract_specs=_safe_dict(facts.get("contract_specs")),
+        )
+        per_trade_daily_loss_budget = (
+            max_daily_loss / max_open_positions
+            if max_daily_loss > 0 and max_open_positions > 0
+            else 0.0
+        )
+        risk_budget = min(remaining_daily_loss, per_trade_daily_loss_budget)
+        risk_limited_notional = (
+            risk_budget / stressed_loss_fraction
+            if risk_budget > 0 and stressed_loss_fraction > 0
+            else 0.0
+        )
+        target_notional = min(
+            max_notional,
+            risk_limited_notional,
+            available_margin,
+            side_depth,
+        )
+        target_price = max(
+            _safe_float(snapshot.get("current_price", snapshot.get("close")), 0.0),
+            0.0,
+        )
+        target_inst_id = str(
+            facts.get("target_inst_id") or okx_inst_id_from_symbol(decision.symbol)
+        ).upper()
+        contract_specs = _safe_dict(facts.get("contract_specs"))
+        selected_contract_spec = _safe_dict(contract_specs.get(target_inst_id))
+        exchange_minimum_order = okx_minimum_order_notional_usdt(
+            selected_contract_spec,
+            target_price,
+        )
+        exchange_min_notional = _safe_float(
+            exchange_minimum_order.get("minimum_notional_usdt"),
+            0.0,
+        )
+        existing_exposure = _candidate_existing_exposure(
+            decision,
+            open_positions,
+            contract_specs,
+        )
+        leverage_tier_selection = select_okx_leverage_tier(
+            facts.get("leverage_tiers"),
+            target_notional_usdt=target_notional,
+            mark_price=target_price,
+            contract_spec=selected_contract_spec,
+            current_position_notional_usdt=existing_exposure["notional_usdt"],
+            current_position_contracts=existing_exposure["contracts"],
+        )
+
+        reasons: list[str] = []
+        if gate.get("can_trade") is not True:
+            reasons.append("production_trade_gate_not_open")
+        if gate.get("decision_authority") != "rules":
+            reasons.append("rules_canary_authority_not_rules")
+        if gate.get("model_can_influence") is not False:
+            reasons.append("rules_canary_model_influence_not_disabled")
+        if max_notional <= 0:
+            reasons.append("rules_canary_max_notional_missing")
+        if max_daily_loss <= 0 or remaining_daily_loss <= 0:
+            reasons.append("rules_canary_daily_loss_budget_exhausted")
+        if max_open_positions <= 0:
+            reasons.append("rules_canary_max_open_positions_missing")
+        if facts.get("production_eligible") is not True:
+            reasons.append("exchange_risk_facts_ineligible")
+        if account_equity <= 0:
+            reasons.append("account_equity_missing")
+        if available_margin <= 0:
+            reasons.append("available_margin_missing")
+        if target_price <= 0:
+            reasons.append("rules_canary_mark_price_missing")
+        if exchange_minimum_order.get("production_eligible") is not True:
+            reasons.append("rules_canary_exchange_minimum_incomplete")
+        elif target_notional + 1e-8 < exchange_min_notional:
+            reasons.append("rules_canary_notional_below_exchange_minimum")
+        if execution_cost.get("production_eligible") is not True or cost_pct <= 0:
+            reasons.append("rules_canary_execution_cost_incomplete")
+        if side_depth <= 0:
+            reasons.append("live_orderbook_depth_missing")
+        if stressed_loss_fraction <= 0:
+            reasons.append("stressed_loss_fraction_missing")
+        if leverage_tier_selection.get("production_eligible") is not True:
+            reasons.append(
+                str(
+                    leverage_tier_selection.get("reason")
+                    or "okx_leverage_tier_ineligible"
+                )
+            )
+        reasons.extend(portfolio_blockers)
+        if risk_budget <= 0 or target_notional <= 0:
+            reasons.append("rules_canary_risk_budget_zero")
+
+        reasons = list(dict.fromkeys(reasons))
+        eligible = not reasons
+        final_notional = target_notional if eligible else 0.0
+        final_leverage = 1.0
+        final_margin = final_notional
+        position_size = (
+            final_margin / available_margin
+            if eligible and available_margin > 0
+            else 0.0
+        )
+        planned_loss = final_notional * stressed_loss_fraction
+        generated_at = datetime.now(UTC).isoformat()
+        audit_inputs = {
+            "gate_version": gate.get("version"),
+            "max_notional_usdt": max_notional,
+            "max_daily_loss_usdt": max_daily_loss,
+            "max_open_positions": max_open_positions,
+            "per_trade_daily_loss_budget_usdt": per_trade_daily_loss_budget,
+            "current_daily_loss_usdt": current_daily_loss,
+            "account_equity_usdt": account_equity,
+            "available_margin_usdt": available_margin,
+            "side_depth_usdt": side_depth,
+            "target_inst_id": target_inst_id,
+            "target_price": target_price,
+            "exchange_minimum_order": exchange_minimum_order,
+            "stressed_loss_fraction": stressed_loss_fraction,
+            "execution_cost_pct": cost_pct,
+            "current_portfolio_stressed_loss_usdt": portfolio[
+                "current_stressed_loss_usdt"
+            ],
+            "leverage_tier_input_fingerprint": _safe_dict(
+                leverage_tier_selection.get("policy_provenance")
+            ).get("input_fingerprint"),
+        }
+        provenance = {
+            "source": "production_trade_gate_and_current_okx_risk_facts",
+            "observation_window": "current_live_rules_canary_pre_entry",
+            "sample_count": 1,
+            "generated_at": generated_at,
+            "strategy_version": LIVE_RULES_CANARY_SIZING_VERSION,
+            "fallback_reason": "" if eligible else ",".join(reasons),
+            "input_fingerprint": _fingerprint(audit_inputs),
+        }
+        sizing = {
+            "contract_version": LIVE_RULES_CANARY_SIZING_VERSION,
+            "contract_lifecycle": "live_rules_canary",
+            "execution_scope": "live_rules_canary",
+            "production_permission": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "production_eligible": eligible,
+            "reason": "live_rules_canary_risk_budget_ready"
+            if eligible
+            else provenance["fallback_reason"],
+            "account_equity_usdt": round(account_equity, 8),
+            "available_margin_usdt": round(available_margin, 8),
+            "position_size_pct": round(position_size, 8),
+            "risk_budget_usdt": round(risk_budget, 8),
+            "single_trade_risk_budget_usdt": round(risk_budget, 8),
+            "portfolio_risk_budget_usdt": round(remaining_daily_loss, 8),
+            "remaining_portfolio_risk_budget_usdt": round(remaining_daily_loss, 8),
+            "current_portfolio_stressed_loss_usdt": round(
+                portfolio["current_stressed_loss_usdt"],
+                8,
+            ),
+            "planned_stressed_loss_usdt": round(planned_loss, 8),
+            "target_inst_id": target_inst_id,
+            "target_price": round(target_price, 12),
+            "target_notional_usdt": round(target_notional, 8),
+            "fill_notional_ceiling_usdt": round(target_notional, 8),
+            "risk_limited_target_notional_usdt": round(risk_limited_notional, 8),
+            "model_requested_position_fraction": 0.0,
+            "model_requested_leverage": 1.0,
+            "model_requested_notional_cap_usdt": 0.0,
+            "model_final_notional_cap_usdt": 0.0,
+            "model_position_cap_applied": False,
+            "final_notional_usdt": round(final_notional, 8),
+            "final_margin_usdt": round(final_margin, 8),
+            "final_leverage": final_leverage,
+            "expected_net_return_pct": 0.0,
+            "expected_profit_usdt": 0.0,
+            "declared_stop_loss_fraction": 0.0,
+            "stressed_loss_fraction": round(stressed_loss_fraction, 8),
+            "declared_take_profit_fraction": 0.0,
+            "dynamic_take_profit_fraction": round(take_profit_fraction, 8),
+            "stress_components": {
+                "atr_fraction": round(atr_ratio, 8),
+                "path_adverse_fraction": round(path_adverse, 8),
+                "volatility_fraction": round(volatility, 8),
+                "abnormal_wick_fraction": round(wick, 8),
+                "actual_stop_slippage_tail_fraction": round(
+                    stop_slippage_tail,
+                    8,
+                ),
+                "actual_execution_slippage_tail_fraction": round(
+                    general_slippage_tail,
+                    8,
+                ),
+                "current_orderbook_impact_fraction": round(market_impact, 8),
+            },
+            "rules_canary_limits": {
+                "max_notional_usdt": round(max_notional, 8),
+                "max_daily_loss_usdt": round(max_daily_loss, 8),
+                "max_open_positions": max_open_positions,
+                "per_trade_daily_loss_budget_usdt": round(
+                    per_trade_daily_loss_budget,
+                    8,
+                ),
+                "current_daily_loss_usdt": round(current_daily_loss, 8),
+                "remaining_daily_loss_usdt": round(remaining_daily_loss, 8),
+                "leverage_cap": 1,
+            },
+            "selected_contract_spec": selected_contract_spec,
+            "exchange_minimum_order": exchange_minimum_order,
+            "exchange_min_notional_usdt": round(exchange_min_notional, 8),
+            "portfolio_risk_snapshot": portfolio,
+            "exchange_contract_specs": contract_specs,
+            "exchange_risk_facts_provenance": facts.get("policy_provenance"),
+            "leverage_tier_selection": leverage_tier_selection,
+            "audit_inputs": audit_inputs,
+            "units": {
+                "money": "USDT",
+                "returns": "percentage_points",
+                "fractions": "decimal_ratio",
+                "position_size_pct": "available_margin_fraction",
+                "notional": "USDT",
+            },
+            "policy_provenance": provenance,
+        }
+        sizing["policy_provenance"]["contract_fingerprint"] = _fingerprint(sizing)
+        raw["profit_risk_sizing"] = sizing
+        raw.pop("dynamic_leverage_decision", None)
+        decision.raw_response = raw
+        decision.position_size_pct = position_size if eligible else 0.0
+        decision.suggested_leverage = final_leverage
+        if eligible:
+            decision.stop_loss_pct = stressed_loss_fraction
+            decision.take_profit_pct = take_profit_fraction
 
     async def _apply_paper_training_sizing(
         self,

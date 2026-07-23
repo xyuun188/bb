@@ -177,7 +177,7 @@ CARD_OWNER_PATHS = {
     "strategy_closed_loop": "web_dashboard/api/system_audit.py",
     "strategy_signal_root_cause": "services/strategy_signal_root_cause_audit.py",
     "production_source_health": "services/production_source_health.py",
-    "strategy_gate_contract": "services/return_execution_policy.py",
+    "strategy_gate_contract": "services/live_ml_profit_contract.py",
     "model_training": "web_dashboard/api/data_collection.py",
     "model_expert_health": "services/model_expert_health.py",
     "model_expert_competition": "services/model_expert_competition.py",
@@ -207,7 +207,7 @@ NODE_OWNER_PATHS = {
     "strategy_closed_loop": "web_dashboard/api/system_audit.py",
     "strategy_signal_root_cause": "services/strategy_signal_root_cause_audit.py",
     "production_source_health": "services/production_source_health.py",
-    "strategy_gate_contract": "services/return_execution_policy.py",
+    "strategy_gate_contract": "services/live_ml_profit_contract.py",
     "risk_guard": "services/trading_policies.py",
     "okx_execution": "services/execution_service.py",
     "position_sync": "services/position_sync_service.py",
@@ -4350,13 +4350,13 @@ def _strategy_gate_contract_audit() -> dict[str, Any]:
             (root / "services/dynamic_policy_values.py").read_text(encoding="utf-8")
         )
         return_source = ast.parse(
-            (root / "services/return_execution_policy.py").read_text(encoding="utf-8")
+            (root / "services/live_ml_profit_contract.py").read_text(encoding="utf-8")
         )
         runtime_contract_available = any(
             isinstance(node, ast.ClassDef) and node.name == "DynamicPolicyValue"
             for node in ast.walk(policy_source)
         ) and any(
-            isinstance(node, ast.ClassDef) and node.name == "ReturnExecutionAssessment"
+            isinstance(node, ast.ClassDef) and node.name == "LiveMLProfitContractAssessment"
             for node in ast.walk(return_source)
         )
     except Exception:
@@ -5110,7 +5110,7 @@ def _build_audit_nodes(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             impact="防止旧固定阈值、死分支、伪硬门槛重新卡住开仓。",
             upstream=["model_training", "strategy_decision", "strategy_closed_loop"],
             downstream=["risk_guard", "okx_execution"],
-            checks=["DynamicPolicyValue", "ReturnExecutionAssessment", "旧固定阈值残留"],
+            checks=["DynamicPolicyValue", "LiveMLProfitContractAssessment", "旧固定阈值残留"],
         ),
         _node_from_cards(
             "risk_guard",

@@ -58,8 +58,8 @@ OWNER_CONTRACTS = {
         },
     },
     "production_entry_eligibility": {
-        "owner": "services/return_execution_policy.py",
-        "calls": {"apply_production_entry_policy", "assess_production_entry"},
+        "owner": "services/live_ml_profit_contract.py",
+        "calls": {"apply_live_ml_profit_contract", "assess_live_ml_profit_contract"},
     },
     "persisted_entry_contract_audit": {
         "owner": "services/trade_execution_contract.py",
@@ -112,7 +112,7 @@ PRODUCTION_DECISION_FILES = {
     "services/entry_opportunity_scoring.py",
     "services/entry_profit_risk_sizing.py",
     "services/model_promotion_policy.py",
-    "services/return_execution_policy.py",
+    "services/live_ml_profit_contract.py",
     "services/strategy_learning.py",
 }
 RISK_OWNER_FILES = {

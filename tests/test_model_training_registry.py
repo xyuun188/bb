@@ -182,8 +182,8 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
                     "model": "google/timesfm-2.5-200m-pytorch",
                     "actual_inference_count": 31,
                     "promotion_ready": False,
-                    "avg_shadow_return_after_cost_pct": -0.2,
-                    "authoritative_avg_return_after_cost_pct": 0.35,
+                    "avg_shadow_return_after_all_cost_pct": -0.2,
+                    "authoritative_avg_return_after_all_cost_pct": 0.35,
                     "promotion_blockers": ["tail_loss"],
                 },
                 {
@@ -218,8 +218,8 @@ def test_registry_preserves_zero_authoritative_profit_target() -> None:
             "models": [
                 {
                     "model": "google/timesfm-2.5-200m-pytorch",
-                    "authoritative_avg_return_after_cost_pct": 0.0,
-                    "avg_shadow_return_after_cost_pct": 0.8,
+                    "authoritative_avg_return_after_all_cost_pct": 0.0,
+                    "avg_shadow_return_after_all_cost_pct": 0.8,
                 },
             ],
         }

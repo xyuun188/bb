@@ -44,7 +44,7 @@ def test_specialist_shadow_evaluation_default_report_dir_matches_phase3_readers(
 
 def test_specialist_reports_reject_legacy_return_label_fallback() -> None:
     legacy_event = {
-        "return_after_cost_pct": 9.0,
+        "return_after_all_cost_pct": 9.0,
         "label_timestamp": "2026-07-12T00:00:00+00:00",
         "market_regime": "trend",
     }
@@ -419,7 +419,7 @@ def test_specialist_shadow_evaluation_uses_per_event_execution_cost() -> None:
         - cost["slippage_pct"]
         - cost["funding_drag_pct"]
     )
-    assert model["avg_shadow_return_after_cost_pct"] == round(expected, 6)
+    assert model["avg_shadow_return_after_all_cost_pct"] == round(expected, 6)
     assert event["gross_return_pct"] == 0.10
     assert cost["production_eligible"] is True
 

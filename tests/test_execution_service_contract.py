@@ -180,6 +180,81 @@ def _dynamic_return_ready_decision() -> DecisionOutput:
     return decision
 
 
+def _live_rules_canary_ready_decision(*, max_notional: float = 100.0) -> DecisionOutput:
+    decision = _dynamic_return_ready_decision()
+    raw = decision.raw_response
+    provenance = raw["profit_risk_sizing"]["policy_provenance"]
+    final_notional = float(raw["profit_risk_sizing"]["final_notional_usdt"])
+    raw["production_trade_gate"] = {
+        "version": "test",
+        "mode": "live_rules_canary",
+        "can_trade": True,
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "risk": {
+            "max_notional_usdt": max_notional,
+            "max_open_positions": 1,
+            "max_daily_loss_usdt": 3.0,
+        },
+    }
+    raw["live_rules_canary_signal"] = {
+        "version": "test-rules-canary-signal",
+        "execution_scope": "live_rules_canary",
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "production_eligible": True,
+        "action": "short",
+        "policy_provenance": provenance,
+    }
+    raw["model_shadow_decision"] = {
+        "action": "long",
+        "observation_only": True,
+        "can_authorize_entry": False,
+        "can_change_size_or_leverage": False,
+    }
+    raw["opportunity_score"]["execution_cost"].update(
+        {
+            "total_pct": 0.08,
+            "order_notional_usdt": final_notional,
+            "order_size_complete": True,
+            "policy_provenance": provenance,
+        }
+    )
+    raw["profit_risk_sizing"].update(
+        {
+            "contract_version": "test-rules-canary-sizing",
+            "contract_lifecycle": "live_rules_canary",
+            "execution_scope": "live_rules_canary",
+            "production_permission": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "target_notional_usdt": final_notional,
+            "target_inst_id": "BTC-USDT-SWAP",
+            "target_price": 100.0,
+            "selected_contract_spec": {
+                "ctVal": "0.01",
+                "ctMult": "1",
+                "minSz": "1",
+                "lotSz": "1",
+            },
+            "exchange_minimum_order": {
+                "production_eligible": True,
+                "minimum_notional_usdt": 1.0,
+            },
+            "exchange_min_notional_usdt": 1.0,
+            "final_margin_usdt": final_notional,
+            "final_leverage": 1.0,
+            "leverage_tier_selection": {
+                "production_eligible": True,
+                "max_leverage": 20.0,
+            },
+        }
+    )
+    decision.position_size_pct = final_notional / 1000.0
+    decision.suggested_leverage = 1.0
+    return decision
+
+
 def _paper_training_ready_decision() -> DecisionOutput:
     provenance = {
         "source": "paper_training_test",
@@ -260,15 +335,7 @@ def test_dynamic_return_contract_accepts_complete_governed_entry() -> None:
 
 
 def test_live_rules_canary_bypasses_model_promotion_return_distribution() -> None:
-    decision = _dynamic_return_ready_decision()
-    decision.raw_response["production_trade_gate"] = {
-        "version": "test",
-        "mode": "live_rules_canary",
-        "can_trade": True,
-        "decision_authority": "rules",
-        "model_can_influence": False,
-        "risk": {"max_notional_usdt": 100.0},
-    }
+    decision = _live_rules_canary_ready_decision()
 
     result = _return_entry_contract_result(decision, "live")
 
@@ -278,15 +345,7 @@ def test_live_rules_canary_bypasses_model_promotion_return_distribution() -> Non
 
 
 def test_live_rules_canary_respects_gate_notional_limit() -> None:
-    decision = _dynamic_return_ready_decision()
-    decision.raw_response["production_trade_gate"] = {
-        "version": "test",
-        "mode": "live_rules_canary",
-        "can_trade": True,
-        "decision_authority": "rules",
-        "model_can_influence": False,
-        "risk": {"max_notional_usdt": 50.0},
-    }
+    decision = _live_rules_canary_ready_decision(max_notional=50.0)
 
     result = _return_entry_contract_result(decision, "live")
 
@@ -353,6 +412,65 @@ async def test_execution_service_attaches_trade_gate_before_entry_policy() -> No
     assert result is not None
     assert result.raw_response["policy_blocker"] == "stop_after_gate_for_test"
     assert raw_updates[-1]["production_trade_gate"]["mode"] == "live_rules_canary"
+
+
+@pytest.mark.asyncio
+async def test_execution_service_persists_live_rules_canary_contract_before_submit() -> None:
+    decision = _live_rules_canary_ready_decision()
+    raw_updates: list[dict[str, Any] | None] = []
+
+    class FilledExecutor:
+        async def place_order(
+            self,
+            current: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            del account_id, override_balance
+            return ExecutionResult(
+                order_id="local-rules-canary-entry",
+                exchange_order_id="okx-rules-canary-entry",
+                symbol=current.symbol,
+                side="sell",
+                order_type="market",
+                quantity=0.9,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    executor = FilledExecutor()
+
+    async def executor_provider(_mode: str) -> FilledExecutor:
+        return executor
+
+    async def gate_provider(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return dict(decision.raw_response["production_trade_gate"])
+
+    service = _test_execution_service(
+        okx_executor_provider=executor_provider,
+        production_trade_gate_provider=gate_provider,
+        raw_updates=raw_updates,
+    )
+    service.model_execution_mode_provider = lambda _model: "live"
+
+    result = await service.execute_candidate(
+        decision.symbol,
+        decision.model_name,
+        decision,
+        SimpleNamespace(warnings=[]),
+        2602,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert result is not None and result.status == OrderStatus.FILLED
+    contract = decision.raw_response["live_rules_canary_contract"]
+    assert contract["contract_complete"] is True
+    assert contract["execution_scope"] == "live_rules_canary"
+    assert contract["decision_authority"] == "rules"
+    assert contract["model_can_influence"] is False
+    assert raw_updates[-1]["live_rules_canary_contract"] == contract
 
 
 @pytest.mark.asyncio

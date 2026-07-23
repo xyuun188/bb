@@ -116,7 +116,7 @@ def _trade_calibration(side: str) -> dict:
         "symbol": "BTC/USDT",
         "side": side,
         "profile_source": "symbol_side",
-        "net_return_after_cost_pct": {
+        "net_return_after_all_cost_pct": {
             "count": 12,
             "expected": 0.7,
             "lower_hinge": 0.6,
@@ -470,7 +470,7 @@ def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
                 "trained": True,
                 "artifact_persisted": True,
                 "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
-                "label_name": "net_return_after_cost_pct",
+                "label_name": "net_return_after_all_cost_pct",
                 "label_version": RETURN_OBJECTIVE_VERSION,
             }
         )

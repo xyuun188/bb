@@ -14,7 +14,7 @@ from services.profit_supervision import (
 )
 from services.return_objective import validate_return_distribution_contract
 
-RETURN_EXECUTION_POLICY_VERSION = "2026-07-15.standardized-return-execution.v5"
+LIVE_ML_PROFIT_CONTRACT_VERSION = "2026-07-23.live-ml-profit-contract.v1"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -56,7 +56,7 @@ def _complete_provenance(value: Any) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class ReturnExecutionAssessment:
+class LiveMLProfitContractAssessment:
     eligible: bool
     reason: str
     expected_net_return_pct: float
@@ -72,7 +72,7 @@ class ReturnExecutionAssessment:
         return asdict(self)
 
 
-def _production_return_observations(opportunity: dict[str, Any]) -> list[float]:
+def _live_ml_profit_observations(opportunity: dict[str, Any]) -> list[float]:
     if (
         opportunity.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION
         or opportunity.get("return_combination_version")
@@ -101,7 +101,7 @@ def _production_return_observations(opportunity: dict[str, Any]) -> list[float]:
     return observations
 
 
-def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessment:
+def assess_live_ml_profit_contract(decision: DecisionOutput) -> LiveMLProfitContractAssessment:
     raw = _safe_dict(decision.raw_response)
     opportunity = _safe_dict(raw.get("opportunity_score"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
@@ -131,7 +131,7 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         breakdown.get("live_execution_cost_pct"),
         float("nan"),
     )
-    observations = _production_return_observations(opportunity)
+    observations = _live_ml_profit_observations(opportunity)
     uncertainty = _safe_float(
         distribution.get("uncertainty_penalty_pct"),
         float("nan"),
@@ -172,7 +172,7 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
         ),
         "sample_count": len(observations),
         "generated_at": generated_at,
-        "strategy_version": RETURN_EXECUTION_POLICY_VERSION,
+        "strategy_version": LIVE_ML_PROFIT_CONTRACT_VERSION,
         "fallback_reason": "",
         "upstream_provenance": {
             "return_distribution_mode": opportunity.get("return_distribution_mode"),
@@ -288,9 +288,9 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
 
     eligible = not reasons
     provenance["fallback_reason"] = "" if eligible else ",".join(reasons)
-    return ReturnExecutionAssessment(
+    return LiveMLProfitContractAssessment(
         eligible=eligible,
-        reason="production_return_policy_passed" if eligible else ",".join(reasons),
+        reason="live_ml_profit_contract_passed" if eligible else ",".join(reasons),
         expected_net_return_pct=round(expected_net, 8) if isfinite(expected_net) else 0.0,
         return_lcb_pct=round(return_lcb, 8) if isfinite(return_lcb) else 0.0,
         uncertainty_pct=round(uncertainty, 8) if isfinite(uncertainty) else 0.0,
@@ -302,10 +302,10 @@ def assess_production_entry(decision: DecisionOutput) -> ReturnExecutionAssessme
     )
 
 
-def apply_production_entry_policy(decision: DecisionOutput) -> ReturnExecutionAssessment:
-    assessment = assess_production_entry(decision)
+def apply_live_ml_profit_contract(decision: DecisionOutput) -> LiveMLProfitContractAssessment:
+    assessment = assess_live_ml_profit_contract(decision)
     raw = _safe_dict(decision.raw_response)
-    raw["production_return_policy"] = assessment.to_dict()
+    raw["live_ml_profit_contract"] = assessment.to_dict()
     decision.raw_response = raw
     if not assessment.eligible:
         decision.position_size_pct = 0.0

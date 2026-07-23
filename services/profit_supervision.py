@@ -191,9 +191,9 @@ def shadow_fee_after_return_labels(sample: dict[str, Any]) -> dict[str, Any]:
         "short_gross_return_pct": short_gross,
         "long_total_cost_pct": long_cost,
         "short_total_cost_pct": short_cost,
-        "long_net_return_after_cost_pct": long_net,
-        "short_net_return_after_cost_pct": short_net,
-        "best_action_after_cost": best_action,
+        "long_net_return_after_all_cost_pct": long_net,
+        "short_net_return_after_all_cost_pct": short_net,
+        "best_action_after_all_cost": best_action,
         "reason": "" if complete else "fee_after_shadow_label_incomplete",
     }
 

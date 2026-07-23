@@ -24,6 +24,10 @@ from models.learning import ShadowBacktest, TradeReflection
 from models.trade import Order, Position
 from services.okx_position_history_store import load_okx_position_history_records
 from services.okx_training_facts import build_okx_history_training_sample
+from services.profit_training_contract import (
+    PROFIT_TRAINING_TARGET,
+    validate_profit_training_sample,
+)
 
 AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
 AUTHORITATIVE_TRADE_OUTCOME_CONSUMERS = (
@@ -295,6 +299,17 @@ def build_authoritative_trade_outcome(
     gaps = list(dict.fromkeys(gaps))
     label_contract = _fee_after_label_contract(sample, evidence_gaps=gaps)
     sample["training_label_contract"] = label_contract
+    notional = _safe_float(sample.get("notional_usdt"), None)
+    realized_pnl = _safe_float(sample.get("realized_pnl"), None)
+    if notional is not None and notional > 0 and realized_pnl is not None:
+        sample[PROFIT_TRAINING_TARGET] = realized_pnl / notional * 100.0
+    authority = str(sample.get("decision_authority") or "").strip().lower()
+    if authority not in {"rules", "model", "manual", "system"}:
+        authority = "model" if str(sample.get("model_name") or "").strip() else "system"
+    sample["decision_authority"] = authority
+    sample["profit_training_contract"] = validate_profit_training_sample(
+        sample
+    ).to_dict()
 
     identity = {
         "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,

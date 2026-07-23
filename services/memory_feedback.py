@@ -102,9 +102,9 @@ def canonical_memory_outcome(memory: dict[str, Any]) -> dict[str, Any] | None:
 
     position_id = _safe_int(extra.get("source_position_id"), 0)
     outcome_id = str(extra.get("outcome_id") or "").strip()
-    if position_id <= 0 or not outcome_id or "net_return_after_cost_pct" not in extra:
+    if position_id <= 0 or not outcome_id or "net_return_after_all_cost_pct" not in extra:
         return None
-    net_return = _safe_float(extra.get("net_return_after_cost_pct"))
+    net_return = _safe_float(extra.get("net_return_after_all_cost_pct"))
     pnl = _safe_float(extra.get("realized_pnl"))
     return {
         "count": 1,
@@ -217,7 +217,7 @@ class MemoryFeedbackPolicy:
             "canonical_position_count": len(seen_positions),
             "cost_complete": bool(count),
             "total_realized_net_pnl_usdt": round(total_pnl, 6),
-            "avg_net_return_after_cost_pct": round(avg_return, 6),
+            "avg_net_return_after_all_cost_pct": round(avg_return, 6),
             "return_lcb_pct": round(return_lcb, 6),
             "worst_net_return_pct": round(worst_return, 6),
             "profit_factor": round(profit_factor, 6) if profit_factor is not None else None,

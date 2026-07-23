@@ -29,6 +29,31 @@ class EntryCandidateQueuePolicy:
     score_candidate: ScoreCandidate
     wait_sort_reason: WaitSortReason
 
+    def _score(
+        self,
+        decision: DecisionOutput,
+        strategy_context: dict[str, Any] | None,
+    ) -> tuple[float, str]:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        gate = raw.get("production_trade_gate")
+        gate = gate if isinstance(gate, dict) else {}
+        rules_signal = raw.get("live_rules_canary_signal")
+        rules_signal = rules_signal if isinstance(rules_signal, dict) else {}
+        if (
+            gate.get("mode") == "live_rules_canary"
+            and gate.get("decision_authority") == "rules"
+            and gate.get("model_can_influence") is False
+            and rules_signal.get("production_eligible") is True
+        ):
+            return (
+                float(rules_signal.get("score") or 0.0),
+                "live_rules_canary_technical_consensus",
+            )
+        return (
+            float(self.score_candidate(decision, strategy_context)),
+            "fee_after_return_lcb_minus_expected_downside_only",
+        )
+
     def ranked(
         self,
         candidates: list[EntryCandidate],
@@ -36,7 +61,7 @@ class EntryCandidateQueuePolicy:
     ) -> list[RankedEntryCandidate]:
         scored = [
             (
-                float(self.score_candidate(candidate[2], strategy_context)),
+                *self._score(candidate[2], strategy_context),
                 candidate,
             )
             for candidate in candidates
@@ -44,7 +69,7 @@ class EntryCandidateQueuePolicy:
         scored.sort(key=lambda item: item[0], reverse=True)
         count = len(scored)
         ranked: list[RankedEntryCandidate] = []
-        for rank, (score, candidate) in enumerate(scored, start=1):
+        for rank, (score, score_policy, candidate) in enumerate(scored, start=1):
             decision = candidate[2]
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             opportunity = (
@@ -56,7 +81,7 @@ class EntryCandidateQueuePolicy:
                 "rank": rank,
                 "candidate_count": count,
                 "score": round(score, 8),
-                "policy": "fee_after_return_lcb_minus_expected_downside_only",
+                "policy": score_policy,
             }
             raw["opportunity_score"] = opportunity
             decision.raw_response = raw

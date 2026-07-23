@@ -209,7 +209,7 @@ async def test_expert_memory_service_records_reflection_and_memories(monkeypatch
     assert "不得直接调整方向、仓位、杠杆或退出" in reflection["improvement_summary"]
     assert all(memory["extra"]["reflection_id"] == 321 for memory in upserted_memories)
     assert all(
-        memory["extra"]["net_return_after_cost_pct"] == pytest.approx(-2.0)
+        memory["extra"]["net_return_after_all_cost_pct"] == pytest.approx(-2.0)
         for memory in upserted_memories
     )
     assert all(memory["extra"]["source_position_id"] == 7 for memory in upserted_memories)
@@ -269,7 +269,7 @@ async def test_existing_reflection_still_refreshes_return_memories(monkeypatch) 
     assert processed is True
     assert len(upserted_memories) == 1
     assert all(row["extra"]["reflection_id"] == 654 for row in upserted_memories)
-    assert all(row["extra"]["net_return_after_cost_pct"] == -10.0 for row in upserted_memories)
+    assert all(row["extra"]["net_return_after_all_cost_pct"] == -10.0 for row in upserted_memories)
 
 
 @pytest.mark.asyncio

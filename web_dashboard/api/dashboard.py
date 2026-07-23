@@ -760,27 +760,31 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
     distribution = _safe_dict(opportunity.get("return_distribution_contract"))
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
     breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
-    policy = _safe_dict(raw.get("production_return_policy"))
+    policy = _safe_dict(raw.get("live_ml_profit_contract"))
     if not opportunity:
         if gate_mode == "live_rules_canary":
             return {
-                "available": False,
+                "available": gate.get("can_trade") is True,
+                "production_eligible": gate.get("can_trade") is True,
                 "production_trade_gate": gate,
                 "execution_mode": "live_rules_canary",
                 "blockers": [],
             }
         return {
             "available": False,
-            "blockers": ["production_return_distribution_missing"],
+            "production_trade_gate": gate,
+            "execution_mode": gate_mode or None,
+            "blockers": ["entry_opportunity_evidence_missing"],
         }
+    strict_live_ml = gate_mode in {"", "live_ml"}
     blockers = list(
         dict.fromkeys(
             str(value)
             for value in (
-                (["production_return_distribution_missing"] if not distribution else [])
+                (["live_ml_return_distribution_missing"] if strict_live_ml and not distribution else [])
                 + (["live_execution_cost_missing"] if not execution_cost else [])
                 + (["expected_net_breakdown_missing"] if not breakdown else [])
-                + (["production_return_policy_missing"] if not policy else [])
+                + (["live_ml_profit_contract_missing"] if strict_live_ml and not policy else [])
                 + _safe_list(distribution.get("blockers"))
                 + _safe_list(opportunity.get("blockers"))
                 + ([execution_cost.get("reason")] if execution_cost.get("production_eligible") is not True else [])
@@ -799,9 +803,12 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
                 ]
             )
         )
+    rules_canary_available = gate_mode == "live_rules_canary" and gate.get("can_trade") is True
     return {
-        "available": bool(distribution and execution_cost and breakdown and policy),
-        "production_eligible": opportunity.get("production_eligible") is True,
+        "available": rules_canary_available
+        or bool(distribution and execution_cost and breakdown and policy),
+        "production_eligible": rules_canary_available
+        or opportunity.get("production_eligible") is True,
         "production_trade_gate": gate,
         "execution_mode": gate_mode or None,
         "side": opportunity.get("side"),
@@ -844,7 +851,7 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
                 "cost_deduction_count",
             )
         },
-        "production_return_policy": {
+        "live_ml_profit_contract": {
             key: policy.get(key)
             for key in (
                 "eligible",

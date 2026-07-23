@@ -1222,7 +1222,7 @@ def _threshold_catalog() -> dict[str, Any]:
             label="费后收益执行资格",
             current="dynamic",
             effective="positive_return_lcb_with_complete_cost_and_provenance",
-            source="services.return_execution_policy",
+            source="services.live_ml_profit_contract",
             surface="生产执行",
             effect="只由当前费后收益分布、收益置信下界、实时成本和完整来源决定。",
             automation="缺收益、成本、有效期或来源时 fail-closed。",

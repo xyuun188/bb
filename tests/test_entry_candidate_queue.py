@@ -70,6 +70,52 @@ def test_entry_candidate_queue_ranks_by_opportunity_score() -> None:
     assert reasons_seen == [("BTC/USDT", 1, 3), ("SOL/USDT", 2, 3), ("ETH/USDT", 3, 3)]
 
 
+def test_rules_canary_queue_uses_rule_score_without_calling_profit_scorer() -> None:
+    def forbidden_profit_score(
+        _decision: DecisionOutput,
+        _strategy: dict[str, Any] | None,
+    ) -> float:
+        raise AssertionError("rules-canary queue must not call the profit scorer")
+
+    def wait_sort_reason(
+        _decision: DecisionOutput,
+        *,
+        rank: int,
+        candidate_count: int,
+    ) -> str:
+        return f"wait:{rank}/{candidate_count}"
+
+    first = _candidate("BTC/USDT", 100.0)
+    second = _candidate("ETH/USDT", -100.0)
+    for candidate, rule_score in ((first, 0.8), (second, 1.0)):
+        decision = candidate[2]
+        decision.raw_response.update(
+            {
+                "production_trade_gate": {
+                    "mode": "live_rules_canary",
+                    "decision_authority": "rules",
+                    "model_can_influence": False,
+                },
+                "live_rules_canary_signal": {
+                    "production_eligible": True,
+                    "score": rule_score,
+                },
+            }
+        )
+
+    ranked = EntryCandidateQueuePolicy(
+        forbidden_profit_score,
+        wait_sort_reason,
+    ).ranked([first, second], None)
+
+    assert [item.candidate[0] for item in ranked] == ["ETH/USDT", "BTC/USDT"]
+    assert [item.score for item in ranked] == [1.0, 0.8]
+    queue = ranked[0].candidate[2].raw_response["opportunity_score"][
+        "authoritative_queue"
+    ]
+    assert queue["policy"] == "live_rules_canary_technical_consensus"
+
+
 def test_entry_candidate_queue_strategy_context_cannot_override_return_order() -> None:
     def score_candidate(decision: DecisionOutput, strategy: dict[str, Any] | None) -> float:
         return float(decision.raw_response["test_score"])

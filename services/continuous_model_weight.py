@@ -189,7 +189,7 @@ def _specialist_evidence(
     gross_loss = sum(max(_finite(row.get("gross_loss_return_pct")) or 0.0, 0.0) for row in rows)
     average = (
         sum(
-            (_finite(row.get("avg_shadow_return_after_cost_pct")) or 0.0)
+            (_finite(row.get("avg_shadow_return_after_all_cost_pct")) or 0.0)
             * max(int(_finite(row.get("direction_count")) or 0), 0)
             for row in rows
         )

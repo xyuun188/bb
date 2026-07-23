@@ -48,7 +48,7 @@ STRATEGY_SCHEDULER_VERSION = "2026-07-15.historical-return-prior-scheduler.v2"
 PRODUCTION_STRATEGY_ID = "dynamic_fee_after_return_execution"
 PRODUCTION_STRATEGY_VERSION = "2026-07-15.dynamic-profit-execution.v1"
 EXECUTION_OWNERS = (
-    "return_execution_policy",
+    "live_ml_profit_contract",
     "dynamic_entry_risk_budget",
     "dynamic_position_capacity",
     "dynamic_exit_policy",
@@ -199,11 +199,11 @@ def _historical_replay_observation(row: Any) -> tuple[dict[str, Any] | None, lis
         ),
         "long_gross_return_pct": round(long_gross, 8),
         "short_gross_return_pct": round(short_gross, 8),
-        "long_net_return_after_cost_pct": outcome.get(
-            "long_net_return_after_cost_pct"
+        "long_net_return_after_all_cost_pct": outcome.get(
+            "long_net_return_after_all_cost_pct"
         ),
-        "short_net_return_after_cost_pct": outcome.get(
-            "short_net_return_after_cost_pct"
+        "short_net_return_after_all_cost_pct": outcome.get(
+            "short_net_return_after_all_cost_pct"
         ),
         "long_funding_return_pct": outcome.get("funding_return_long_pct"),
         "short_funding_return_pct": outcome.get("funding_return_short_pct"),
@@ -354,11 +354,11 @@ def _current_production_strategy(
             },
             "current_return_distribution": {
                 "status": "evaluated_per_decision",
-                "owner": "return_execution_policy",
+                "owner": "live_ml_profit_contract",
             },
             "live_execution_cost": {
                 "status": "evaluated_per_decision",
-                "owner": "return_execution_policy",
+                "owner": "live_ml_profit_contract",
             },
             "dynamic_risk_budget": {
                 "status": "evaluated_per_decision",
@@ -401,7 +401,7 @@ def _return_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
     returns = [
         float(value)
         for sample in samples
-        if (value := _optional_float(sample.get("net_return_after_cost_pct"))) is not None
+        if (value := _optional_float(sample.get("net_return_after_all_cost_pct"))) is not None
     ]
     pnls = [
         float(value)
@@ -422,7 +422,7 @@ def _return_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 float(value)
                 for sample in block
                 if (
-                    value := _optional_float(sample.get("net_return_after_cost_pct"))
+                    value := _optional_float(sample.get("net_return_after_all_cost_pct"))
                 )
                 is not None
             ]
@@ -724,8 +724,8 @@ def _shadow_report(
                     "source_id": sample.get("source_id"),
                     "symbol": sample.get("symbol"),
                     "side": sample.get("side"),
-                    "net_return_after_cost_pct": sample.get(
-                        "net_return_after_cost_pct"
+                    "net_return_after_all_cost_pct": sample.get(
+                        "net_return_after_all_cost_pct"
                     ),
                     "execution_cost_pct": sample.get("execution_cost_pct"),
                     "timestamp": sample.get("timestamp"),
@@ -1445,7 +1445,7 @@ class StrategyLearningService:
                     "side": str(outcome.get("side") or "").lower(),
                     "market_regime": regime_by_position.get(position_id, ""),
                     "net_pnl_after_all_costs_usdt": round(net_pnl, 8),
-                    "net_return_after_cost_pct": round(net_return, 8),
+                    "net_return_after_all_cost_pct": round(net_return, 8),
                     "return_basis_source": "okx_positions_history.pnlRatio",
                     "timestamp": _timestamp_text(outcome.get("label_timestamp")),
                     "cost_policy_provenance": _safe_dict(
@@ -1471,7 +1471,7 @@ class StrategyLearningService:
             for side in ("long", "short"):
                 gross_return = long_gross if side == "long" else short_gross
                 net_return = _optional_float(
-                    outcome.get(f"{side}_net_return_after_cost_pct")
+                    outcome.get(f"{side}_net_return_after_all_cost_pct")
                 )
                 shadow_samples.append(
                     {
@@ -1480,7 +1480,7 @@ class StrategyLearningService:
                         "symbol": str(getattr(row, "symbol", "") or "").upper(),
                         "side": side,
                         "market_regime": _regime_label(snapshot),
-                        "net_return_after_cost_pct": (
+                        "net_return_after_all_cost_pct": (
                             round(net_return, 8) if net_return is not None else None
                         ),
                         "gross_return_pct": round(gross_return, 8),

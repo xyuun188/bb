@@ -716,10 +716,6 @@ def _trade_shadow(sample: dict[str, Any]) -> dict[str, Any]:
     return _safe_dict(sample.get("shadow"))
 
 
-def _trade_return_policy(sample: dict[str, Any]) -> dict[str, Any]:
-    return _safe_dict(_trade_entry_raw(sample).get("production_return_policy"))
-
-
 def _trade_sizing(sample: dict[str, Any]) -> dict[str, Any]:
     return _safe_dict(_trade_entry_raw(sample).get("profit_risk_sizing"))
 
@@ -773,7 +769,7 @@ def _trade_notional_usdt(sample: dict[str, Any]) -> float | None:
     return max(candidates) if candidates else None
 
 
-def _trade_return_after_cost_pct(
+def _trade_return_after_all_cost_pct(
     sample: dict[str, Any], *, pnl: float, notional: float | None
 ) -> float | None:
     authoritative = _safe_float(sample.get("authoritative_pnl_ratio_pct"), None)
@@ -799,7 +795,6 @@ def _trade_position_size_pct(sample: dict[str, Any]) -> float | None:
     return _first_float(
         sample.get("position_size_pct"),
         _trade_sizing(sample).get("position_size_pct"),
-        _trade_return_policy(sample).get("position_size_pct"),
     )
 
 
@@ -880,13 +875,12 @@ def _trade_cost_basis_label(sample: dict[str, Any], *, fee: float | None) -> str
 
 
 def _trade_strategy_context(sample: dict[str, Any]) -> dict[str, Any]:
-    return_policy = _trade_return_policy(sample)
+    profit_contract = _safe_dict(sample.get("profit_training_contract"))
     return {
-        "return_policy_version": _safe_str(
-            _safe_dict(return_policy.get("policy_provenance")).get("strategy_version")
-        ),
-        "return_policy_source_count": int(
-            _safe_float(return_policy.get("production_source_count"), 0.0) or 0
+        "profit_training_target": PROFIT_TRAINING_TARGET,
+        "profit_training_contract_version": _safe_str(profit_contract.get("version")),
+        "profit_training_evidence_fingerprint": _safe_str(
+            profit_contract.get("evidence_fingerprint")
         ),
         "position_size_pct": _trade_position_size_pct(sample),
         "planned_leverage": _trade_planned_leverage(sample),
@@ -908,7 +902,7 @@ def _trade_profit_learning_labels(
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
     fee_dominated = bool(fee and abs(pnl) <= fee)
     notional = _trade_notional_usdt(sample)
-    net_return_after_cost_pct = _trade_return_after_cost_pct(
+    net_return_after_all_cost_pct = _trade_return_after_all_cost_pct(
         sample,
         pnl=pnl,
         notional=notional,
@@ -973,10 +967,8 @@ def _trade_profit_learning_labels(
         "fee_return_pct": fee_return_pct,
         "slippage_return_pct": slippage_return_pct,
         "funding_return_pct": funding_return_pct,
-        "net_return_after_cost_pct": net_return_after_cost_pct,
+        PROFIT_TRAINING_TARGET: net_return_after_all_cost_pct,
         "return_on_margin_pct": return_on_margin_pct,
-        "return_after_cost_pct": net_return_after_cost_pct,
-        "return_after_cost_pct_deprecated": True,
         "fee_estimate_usdt": fee,
         "funding_fee_usdt": funding_fee,
         "notional_usdt": notional,
@@ -989,9 +981,9 @@ def _shadow_profit_learning_labels(
     assessment: SampleQualityAssessment,
 ) -> dict[str, Any]:
     fee_after = shadow_fee_after_return_labels(sample)
-    best_action = _safe_str(fee_after.get("best_action_after_cost")).lower()
+    best_action = _safe_str(fee_after.get("best_action_after_all_cost")).lower()
     best_return = _safe_float(
-        fee_after.get(f"{best_action}_net_return_after_cost_pct"),
+        fee_after.get(f"{best_action}_net_return_after_all_cost_pct"),
         None,
     )
     missed = bool(sample.get("missed_opportunity")) and best_action in {"long", "short"}
@@ -1016,11 +1008,11 @@ def _shadow_profit_learning_labels(
         "missed_opportunity_label": missed_label,
         "shadow_outcome_label": outcome_label,
         "opportunity_side": best_action,
-        "long_net_return_after_cost_pct": fee_after.get(
-            "long_net_return_after_cost_pct"
+        "long_net_return_after_all_cost_pct": fee_after.get(
+            "long_net_return_after_all_cost_pct"
         ),
-        "short_net_return_after_cost_pct": fee_after.get(
-            "short_net_return_after_cost_pct"
+        "short_net_return_after_all_cost_pct": fee_after.get(
+            "short_net_return_after_all_cost_pct"
         ),
         "fee_after_label_version": fee_after.get("version"),
     }
@@ -1076,13 +1068,13 @@ def annotate_sample(sample: dict[str, Any], kind: SampleKind) -> dict[str, Any]:
                 "gross_short_return_pct": _safe_float(
                     annotated.get("short_return_pct"), None
                 ),
-                "long_net_return_after_cost_pct": fee_after.get(
-                    "long_net_return_after_cost_pct"
+                "long_net_return_after_all_cost_pct": fee_after.get(
+                    "long_net_return_after_all_cost_pct"
                 ),
-                "short_net_return_after_cost_pct": fee_after.get(
-                    "short_net_return_after_cost_pct"
+                "short_net_return_after_all_cost_pct": fee_after.get(
+                    "short_net_return_after_all_cost_pct"
                 ),
-                "best_action_after_cost": fee_after.get("best_action_after_cost"),
+                "best_action_after_all_cost": fee_after.get("best_action_after_all_cost"),
                 "fee_after_label_version": fee_after.get("version"),
                 "fee_after_label_complete": bool(fee_after.get("complete")),
             }
@@ -1164,16 +1156,16 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
     label = {
         "gross_long_return_pct": _safe_float(sample.get("long_return_pct"), None),
         "gross_short_return_pct": _safe_float(sample.get("short_return_pct"), None),
-        "long_net_return_after_cost_pct": _safe_float(
-            sample.get("long_net_return_after_cost_pct"), None
+        "long_net_return_after_all_cost_pct": _safe_float(
+            sample.get("long_net_return_after_all_cost_pct"), None
         ),
-        "short_net_return_after_cost_pct": _safe_float(
-            sample.get("short_net_return_after_cost_pct"), None
+        "short_net_return_after_all_cost_pct": _safe_float(
+            sample.get("short_net_return_after_all_cost_pct"), None
         ),
         "realized_pnl": _safe_float(sample.get("realized_pnl"), None),
         "outcome": _safe_str(sample.get("outcome")),
         "best_action": _safe_str(
-            sample.get("best_action_after_cost") or sample.get("best_action")
+            sample.get("best_action_after_all_cost") or sample.get("best_action")
         ),
         "fee_after_label_version": _safe_str(
             sample.get("fee_after_label_version")
@@ -1396,7 +1388,7 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                     else:
                         flat_count += 1
                 return_pct = _safe_float(
-                    labels.get("net_return_after_cost_pct"),
+                    labels.get("net_return_after_all_cost_pct"),
                     None,
                 )
                 if return_pct is not None:
@@ -1408,7 +1400,6 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 "training_supervision_ready",
                 "strategy_context",
                 "realized_net_pnl_usdt",
-                "return_after_cost_pct",
                 "fee_estimate_usdt",
                 "funding_fee_usdt",
                 "notional_usdt",
@@ -1447,7 +1438,7 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "avg_net_pnl_usdt": round(sum(trade_pnls) / max(len(trade_pnls), 1), 6),
             "avg_win_usdt": round(avg_win, 6),
             "avg_loss_usdt": round(avg_loss, 6),
-            "avg_return_after_cost_pct": round(
+            "avg_return_after_all_cost_pct": round(
                 sum(trade_returns) / max(len(trade_returns), 1),
                 6,
             ),
@@ -1476,7 +1467,7 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
         ready_count += 1
         pnl = _safe_float(labels.get("realized_net_pnl_usdt"), None)
         return_pct = _safe_float(
-            labels.get("net_return_after_cost_pct"),
+            labels.get("net_return_after_all_cost_pct"),
             None,
         )
         sample_key = _safe_str(sample.get("lifecycle_key") or sample.get("position_id"))
@@ -1490,7 +1481,7 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
             errors.append(
                 {
                     "sample_key": sample_key,
-                    "reason": "missing_net_return_after_cost_pct",
+                    "reason": "missing_net_return_after_all_cost_pct",
                 }
             )
             continue
@@ -1502,7 +1493,7 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
                     "sample_key": sample_key,
                     "reason": "pnl_return_sign_mismatch",
                     "pnl": round(pnl, 8),
-                    "return_after_cost_pct": round(return_pct, 8),
+                    "return_after_all_cost_pct": round(return_pct, 8),
                 }
             )
         components = _safe_float(sample.get("settlement_components_total"), None)
@@ -1527,7 +1518,7 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
                 "sample_key": "aggregate",
                 "reason": "positive_net_pnl_but_negative_average_return",
                 "net_pnl": round(pnl_total, 8),
-                "avg_return_after_cost_pct": round(avg_return, 8),
+                "avg_return_after_all_cost_pct": round(avg_return, 8),
             }
         )
     return {
@@ -1536,7 +1527,7 @@ def _training_label_consistency(samples: list[dict[str, Any]]) -> dict[str, Any]
         "supervision_ready_count": ready_count,
         "checked_return_count": return_count,
         "net_realized_pnl_usdt": round(pnl_total, 8),
-        "avg_return_after_cost_pct": round(avg_return, 8),
+        "avg_return_after_all_cost_pct": round(avg_return, 8),
         "error_count": len(errors),
         "errors": errors[:100],
     }
@@ -1561,16 +1552,16 @@ def _sample_source(sample: dict[str, Any], kind: str) -> str:
 
 def _sample_best_direction(sample: dict[str, Any]) -> str:
     best = _safe_str(
-        sample.get("best_action_after_cost") or sample.get("best_action")
+        sample.get("best_action_after_all_cost") or sample.get("best_action")
     ).lower()
     if best in {"long", "short", "hold"}:
         return best
     fee_after = shadow_fee_after_return_labels(sample)
     long_return = _safe_float(
-        fee_after.get("long_net_return_after_cost_pct"), None
+        fee_after.get("long_net_return_after_all_cost_pct"), None
     )
     short_return = _safe_float(
-        fee_after.get("short_net_return_after_cost_pct"), None
+        fee_after.get("short_net_return_after_all_cost_pct"), None
     )
     if long_return is None or short_return is None:
         return ""
@@ -1586,9 +1577,9 @@ def _sample_symbol(sample: dict[str, Any]) -> str:
 def _actual_return_for_side(sample: dict[str, Any], side: str) -> float | None:
     fee_after = shadow_fee_after_return_labels(sample)
     if side == "long":
-        return _safe_float(fee_after.get("long_net_return_after_cost_pct"), None)
+        return _safe_float(fee_after.get("long_net_return_after_all_cost_pct"), None)
     if side == "short":
-        return _safe_float(fee_after.get("short_net_return_after_cost_pct"), None)
+        return _safe_float(fee_after.get("short_net_return_after_all_cost_pct"), None)
     return None
 
 
@@ -1831,11 +1822,11 @@ def _compact_worst_shadow_sample(
         "actual_best_side": actual_side,
         "actual_return_pct": round(float(actual_return), 6),
         "expected_return_pct": None if expected_return is None else round(float(expected_return), 6),
-        "long_net_return_after_cost_pct": _safe_float(
-            sample.get("long_net_return_after_cost_pct"), None
+        "long_net_return_after_all_cost_pct": _safe_float(
+            sample.get("long_net_return_after_all_cost_pct"), None
         ),
-        "short_net_return_after_cost_pct": _safe_float(
-            sample.get("short_net_return_after_cost_pct"), None
+        "short_net_return_after_all_cost_pct": _safe_float(
+            sample.get("short_net_return_after_all_cost_pct"), None
         ),
         "sequence_length": sequence_length,
         "legacy_mixed_shadow": bool(legacy_mixed_shadow),
@@ -1976,10 +1967,10 @@ def _shadow_training_view_diagnostics(samples: list[dict[str, Any]]) -> dict[str
     projected: list[dict[str, Any]] = []
     for sample in trainable:
         long_return = _safe_float(
-            sample.get("long_net_return_after_cost_pct"), None
+            sample.get("long_net_return_after_all_cost_pct"), None
         )
         short_return = _safe_float(
-            sample.get("short_net_return_after_cost_pct"), None
+            sample.get("short_net_return_after_all_cost_pct"), None
         )
         if long_return is None or short_return is None:
             continue

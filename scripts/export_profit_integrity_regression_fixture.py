@@ -131,7 +131,7 @@ def _decision_payload(row):
             raw,
             (
                 "ml_signal", "authoritative_return_candidate", "direction_competition",
-                "opportunity_score", "production_return_policy", "entry_permission_policy",
+                "opportunity_score", "live_ml_profit_contract", "entry_permission_policy",
                 "profit_risk_sizing", "dynamic_leverage_decision", "execution_leverage",
                 "execution_parameters", "pre_execution_price_check", "execution_result",
                 "strategy_learning_context", "blocker", "policy_blocker", "skip_kind",

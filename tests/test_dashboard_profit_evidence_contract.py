@@ -305,7 +305,7 @@ def test_prediction_economics_reads_persisted_distribution_and_cost_once() -> No
                 "cost_deduction_count": 1,
             },
         },
-        "production_return_policy": {
+        "live_ml_profit_contract": {
             "eligible": True,
             "expected_net_return_pct": 0.4,
             "return_lcb_pct": 0.2,
@@ -326,10 +326,10 @@ def test_prediction_economics_reads_persisted_distribution_and_cost_once() -> No
     )
     assert incomplete["available"] is False
     assert incomplete["blockers"] == [
-        "production_return_distribution_missing",
+        "live_ml_return_distribution_missing",
         "live_execution_cost_missing",
         "expected_net_breakdown_missing",
-        "production_return_policy_missing",
+        "live_ml_profit_contract_missing",
     ]
 
 
@@ -346,7 +346,7 @@ def test_prediction_economics_keeps_rules_canary_model_blockers_out_of_trade_blo
         }
     )
 
-    assert evidence["available"] is False
+    assert evidence["available"] is True
     assert evidence["execution_mode"] == "live_rules_canary"
     assert evidence["blockers"] == []
 
