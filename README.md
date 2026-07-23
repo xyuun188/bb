@@ -86,7 +86,6 @@ The best model (by composite score) is auto-promoted to live trading.
 | GET | `/api/trades` | Trade history |
 | GET | `/api/positions` | Open positions |
 | POST | `/api/control/mode` | Switch paper/live |
-| POST | `/api/control/select-model` | Set live model |
 | WS | `/ws` | Real-time updates |
 
 ## Risk Controls

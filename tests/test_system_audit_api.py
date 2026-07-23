@@ -2810,7 +2810,6 @@ async def test_trade_loop_paused_market_analysis_is_observing(
             "running": True,
             "paused": True,
             "mode": "paper",
-            "scan_mode": "auto",
             "decision_interval": 30,
             "current_stage": "idle",
             "market_current_stage": "idle",
@@ -2827,7 +2826,6 @@ async def test_trade_loop_paused_market_analysis_is_observing(
         assert card["status"] == "warning"
         assert card["details"]["market_analysis_paused"] is True
         assert card["details"]["runtime_window"]["paused"] is True
-        assert card["details"]["runtime_window"]["scan_mode"] == "auto"
         assert "paused" in card["summary"].lower()
         assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
         assert ledger["observing"][0]["key"] == "trade_loop"
@@ -2868,7 +2866,6 @@ async def test_trade_loop_orderless_but_healthy_runtime_is_observing(
             "running": True,
             "paused": False,
             "mode": "paper",
-            "scan_mode": "auto",
             "decision_interval": 30,
             "current_stage": "idle",
             "market_current_stage": "idle",

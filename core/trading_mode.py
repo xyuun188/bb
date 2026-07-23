@@ -43,7 +43,6 @@ class TradingModeManager:
     def __init__(self, *, state_path: Path | None = None) -> None:
         self._mode: TradingMode = TradingMode.PAPER
         self._paused: bool = False
-        self._scan_mode: str = "auto"
         self._active_model_name: str | None = None
         self._mode_changed_at: datetime = datetime.utcnow()
         self._subscribers: list[ModeSubscriber] = []
@@ -75,21 +74,6 @@ class TradingModeManager:
     def is_paused(self) -> bool:
         self._load_state_from_disk()
         return self._paused
-
-    @property
-    def scan_mode(self) -> str:
-        self._load_state_from_disk()
-        return self._scan_mode
-
-    @property
-    def is_auto_scan(self) -> bool:
-        return self.scan_mode == "auto"
-
-    @property
-    def live_model_name(self) -> str | None:
-        """Backward-compatible alias for the unified active model."""
-
-        return self.active_model_name
 
     @property
     def active_model_name(self) -> str | None:
@@ -141,18 +125,6 @@ class TradingModeManager:
         self._persist_state_to_disk()
         await self._notify()
 
-    async def switch_to_auto(self) -> None:
-        self._scan_mode = "auto"
-        self._mode_changed_at = datetime.utcnow()
-        self._persist_state_to_disk()
-        await self._notify()
-
-    async def switch_to_manual(self) -> None:
-        self._scan_mode = "auto"
-        self._mode_changed_at = datetime.utcnow()
-        self._persist_state_to_disk()
-        await self._notify()
-
     def subscribe(self, callback: ModeSubscriber) -> None:
         """Register a callback invoked on mode/pause changes."""
         self._subscribers.append(callback)
@@ -181,9 +153,7 @@ class TradingModeManager:
         return {
             "mode": self._mode.value,
             "paused": self._paused,
-            "scan_mode": self._scan_mode,
             "active_model_name": self._active_model_name,
-            "live_model_name": self._active_model_name,
             "mode_changed_at": self._mode_changed_at.isoformat(),
         }
 
@@ -226,22 +196,9 @@ class TradingModeManager:
             if mode in {TradingMode.PAPER.value, TradingMode.LIVE.value}:
                 self._mode = TradingMode(mode)
             self._paused = bool(payload.get("paused", self._paused))
-            scan_mode = str(payload.get("scan_mode") or self._scan_mode)
-            self._scan_mode = "auto" if scan_mode != "auto" else scan_mode
             active_model_name = payload.get("active_model_name")
-            legacy_live_model_name = payload.get("live_model_name")
-            if (
-                active_model_name
-                and legacy_live_model_name
-                and str(active_model_name) != str(legacy_live_model_name)
-            ):
-                logger.warning(
-                    "trading control model aliases disagree; using active model",
-                    active_model_name=str(active_model_name),
-                )
-            selected_model_name = active_model_name or legacy_live_model_name
             self._active_model_name = (
-                str(selected_model_name) if selected_model_name else None
+                str(active_model_name) if active_model_name else None
             )
             changed_at = payload.get("mode_changed_at")
             if isinstance(changed_at, str) and changed_at:

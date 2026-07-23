@@ -23,10 +23,6 @@ class ModeSwitchRequest(BaseModel):
     mode: str  # "paper" or "live"
 
 
-class SelectModelRequest(BaseModel):
-    model_name: str
-
-
 class ManualTradeRequest(BaseModel):
     symbol: str
     model_name: str | None = None
@@ -39,10 +35,6 @@ class ManualClosePositionRequest(BaseModel):
 class ManualCloseAllPositionsRequest(BaseModel):
     mode: str | None = None
     reason: str | None = None
-
-
-class ScanModeRequest(BaseModel):
-    mode: str  # only "auto" is supported
 
 
 def _normalize_okx_bar(timeframe: str) -> str:
@@ -119,7 +111,6 @@ async def switch_mode(req: ModeSwitchRequest):
             ),
             "mode": "live",
             "active_model": mode_manager.active_model_name,
-            "live_model": mode_manager.active_model_name,
         }
 
 
@@ -134,16 +125,6 @@ async def pause_trading():
     }
 
 
-@router.post("/control/scan-mode")
-async def switch_scan_mode(req: ScanModeRequest):
-    """Keep scan mode on automatic portfolio discovery."""
-    mode = req.mode.lower()
-    if mode != "auto":
-        raise HTTPException(status_code=400, detail="主面板只支持自动模式，手动扫描已移除。")
-    await mode_manager.switch_to_auto()
-    return {"status": "ok", "message": "已切换为自动模式", "scan_mode": "auto"}
-
-
 @router.post("/control/resume")
 async def resume_trading():
     """Resume trading."""
@@ -155,27 +136,9 @@ async def resume_trading():
     }
 
 
-@router.post("/control/select-model")
-async def select_live_model(req: SelectModelRequest):
-    """Select the unified model used for both paper and live trading."""
-    if req.model_name != ENSEMBLE_TRADER_NAME:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Live execution is fixed to '{ENSEMBLE_TRADER_NAME}'.",
-        )
-    await mode_manager.select_active_model(ENSEMBLE_TRADER_NAME)
-
-    return {
-        "status": "ok",
-        "message": f"Active model set to '{ENSEMBLE_TRADER_NAME}'",
-        "active_model": ENSEMBLE_TRADER_NAME,
-        "live_model": ENSEMBLE_TRADER_NAME,
-    }
-
-
 @router.get("/control/state")
 async def get_control_state():
-    """Get current control state (mode, pause, live model)."""
+    """Get current execution-account and pause state."""
     state = mode_manager.get_state()
     if _dash._trading_service:
         state.update(_dash._trading_service.models.get_state())

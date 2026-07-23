@@ -7,10 +7,19 @@ from services.production_trade_gate import (
 )
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
+HEALTHY_LIVE_OKX = {
+    "execution_mode": "live",
+    "credentials_configured": True,
+    "healthy": True,
+    "ok": True,
+    "can_open_new_entries": True,
+    "status": "ok",
+}
+
 
 def test_gate_allows_rules_canary_before_model_promotion() -> None:
     gate = evaluate_production_trade_gate(
-        okx={"healthy": True, "can_open_new_entries": True},
+        okx=HEALTHY_LIVE_OKX,
         risk={"open_position_count": 0},
         model={
             "artifact_lifecycle": "shadow",
@@ -30,7 +39,7 @@ def test_gate_allows_rules_canary_before_model_promotion() -> None:
 
 def test_validator_rejects_old_or_incomplete_trade_gate_contracts() -> None:
     old_gate = {
-        "version": "2026-07-23.profit-loop-trade-gate.v1",
+        "version": "2026-07-24.profit-loop-trade-gate.v2",
         "can_trade": True,
         "mode": "live_ml",
         "decision_authority": "model",
@@ -53,7 +62,7 @@ def test_validator_rejects_old_or_incomplete_trade_gate_contracts() -> None:
 
 def test_gate_allows_live_ml_only_after_profit_and_authorization() -> None:
     gate = evaluate_production_trade_gate(
-        okx={"healthy": True, "can_open_new_entries": True},
+        okx=HEALTHY_LIVE_OKX,
         risk={"open_position_count": 0},
         model={
             "artifact_lifecycle": "active",
@@ -75,7 +84,7 @@ def test_gate_allows_live_ml_only_after_profit_and_authorization() -> None:
 
 def test_gate_uses_profit_training_target_for_live_ml() -> None:
     gate = evaluate_production_trade_gate(
-        okx={"healthy": True, "can_open_new_entries": True},
+        okx=HEALTHY_LIVE_OKX,
         risk={"open_position_count": 0},
         model={
             "artifact_lifecycle": "active",
@@ -95,7 +104,7 @@ def test_gate_uses_profit_training_target_for_live_ml() -> None:
 
 def test_gate_keeps_zero_rules_canary_notional_limit_closed() -> None:
     gate = evaluate_production_trade_gate(
-        okx={"healthy": True, "can_open_new_entries": True},
+        okx=HEALTHY_LIVE_OKX,
         risk={"open_position_count": 0},
         model={"artifact_lifecycle": "shadow"},
         settings={
@@ -112,7 +121,7 @@ def test_gate_keeps_zero_rules_canary_notional_limit_closed() -> None:
 
 def test_gate_blocks_unhealthy_okx_before_any_trading_mode() -> None:
     gate = evaluate_production_trade_gate(
-        okx={"healthy": False, "can_open_new_entries": True},
+        okx={**HEALTHY_LIVE_OKX, "healthy": False},
         risk={"open_position_count": 0},
         model={"live_ml_ready": True},
     )
@@ -124,7 +133,7 @@ def test_gate_blocks_unhealthy_okx_before_any_trading_mode() -> None:
 
 def test_gate_blocks_when_rules_canary_position_limit_reached() -> None:
     gate = evaluate_production_trade_gate(
-        okx={"healthy": True, "can_open_new_entries": True},
+        okx=HEALTHY_LIVE_OKX,
         risk={"open_position_count": 1},
         settings={"rules_canary_risk": {"max_open_positions": 1}},
     )
@@ -132,3 +141,27 @@ def test_gate_blocks_when_rules_canary_position_limit_reached() -> None:
     assert gate.can_trade is False
     assert gate.mode == "blocked"
     assert gate.reason == "max_open_positions_reached"
+
+
+def test_gate_blocks_live_mode_without_live_credentials() -> None:
+    gate = evaluate_production_trade_gate(
+        okx={**HEALTHY_LIVE_OKX, "credentials_configured": False},
+        risk={"open_position_count": 0},
+        settings={"rules_canary_enabled": True},
+    )
+
+    assert gate.can_trade is False
+    assert gate.mode == "blocked"
+    assert gate.reason == "okx_live_credentials_missing"
+
+
+def test_gate_fails_closed_when_okx_facts_are_missing() -> None:
+    gate = evaluate_production_trade_gate(
+        okx={},
+        risk={"open_position_count": 0},
+        settings={"rules_canary_enabled": True},
+    )
+
+    assert gate.can_trade is False
+    assert gate.mode == "blocked"
+    assert gate.reason == "okx_execution_mode_not_live"

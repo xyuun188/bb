@@ -1359,7 +1359,7 @@ async def _split_process_trading_stats(mode: str | None = None) -> dict[str, Any
         "last_position_round_finished_at": runtime_status.get("last_position_round_finished_at"),
         "last_round_error": runtime_status.get("last_round_error"),
         "okx_authoritative_sync": runtime_status.get("okx_authoritative_sync"),
-        "live_model": ENSEMBLE_TRADER_NAME,
+        "active_model": ENSEMBLE_TRADER_NAME,
         "models": [ENSEMBLE_TRADER_NAME],
         "risk": {},
         "decision_interval": decision_interval,
@@ -5321,9 +5321,7 @@ async def get_status(mode: str | None = None):
         **trading_stats,
         "mode": mode_manager.mode.value,
         "paused": mode_manager.is_paused,
-        "scan_mode": mode_manager.scan_mode,
         "active_model": mode_manager.active_model_name,
-        "live_model": mode_manager.active_model_name,
     }
 
 
@@ -5550,7 +5548,6 @@ async def get_dashboard_summary():
         **trading_stats,
         "mode": mode_manager.mode.value,
         "paused": mode_manager.is_paused,
-        "scan_mode": mode_manager.scan_mode,
         "today_decisions_total": today_decisions_total,
         "today_decisions_timezone": "Asia/Shanghai",
     }

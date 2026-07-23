@@ -521,7 +521,7 @@ async def _trading_service_running_item() -> dict[str, Any]:
         "交易主循环",
         "ok",
         "交易服务运行中，自动扫描处于可工作状态。",
-        details={"mode": mode_manager.mode.value, "scan_mode": mode_manager.scan_mode},
+        details={"mode": mode_manager.mode.value},
     )
 
 

@@ -203,7 +203,7 @@ async def test_dashboard_write_middleware_rejects_remote_write_without_admin_key
 
 
 @pytest.mark.asyncio
-async def test_dashboard_write_middleware_rejects_removed_manual_scan_mode(
+async def test_removed_scan_mode_endpoint_is_not_registered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configured = "unit-" + "dashboard-write-token"
@@ -218,8 +218,7 @@ async def test_dashboard_write_middleware_rejects_removed_manual_scan_mode(
             json={"mode": "manual"},
         )
 
-    assert response.status_code == 400
-    assert "自动模式" in response.json()["detail"]
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio

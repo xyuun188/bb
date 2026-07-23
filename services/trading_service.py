@@ -126,7 +126,6 @@ from services.market_analysis_selection import MarketAnalysisSelectionPolicy
 from services.market_auto_entry_processor import MarketAutoEntryProcessor
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 from services.market_decision_risk_assessment import MarketDecisionRiskAssessmentPolicy
-from services.market_direct_entry_processor import MarketDirectEntryProcessor
 from services.market_queued_entry_processor import MarketQueuedEntryProcessor
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import (
@@ -778,17 +777,6 @@ class TradingService:
             pre_execution_capacity_reason=self.entry_capacity.reason,
             execution_confirmed_checker=self._is_exchange_confirmed_execution,
         )
-        self.market_direct_entry_processor = MarketDirectEntryProcessor(
-            capacity_reason_provider=self.entry_capacity.reason,
-            capacity_reserver=self.entry_capacity.reserve_slot,
-            annotate_candidate_selection=self._annotate_candidate_selection,
-            mark_decision_raw_response=self._mark_decision_raw_response,
-            mark_decision_reason=self._mark_decision_reason,
-            result_recorder=self.market_decision_result_recorder,
-            candidate_executor=self._execute_candidate,
-            capacity_releaser=self.entry_capacity.release_slot,
-            execution_confirmed_checker=self._is_exchange_confirmed_execution,
-        )
         self.market_queued_entry_processor = MarketQueuedEntryProcessor(
             normalize_symbol=self._normalize_position_symbol,
             analysis_symbol_claimer=self._try_claim_analysis_symbol,
@@ -1398,10 +1386,18 @@ class TradingService:
         status = str(payload.get("status") or "").lower()
         requires_attention = int(payload.get("last_requires_attention_count") or 0)
         last_error = str(payload.get("last_error") or "").strip()
-        if status in {"warning", "stale"}:
-            reason = "OKX 自动对账异常"
-            if status == "stale":
-                reason = "OKX 自动对账已过期"
+        degraded_with_fresh_success = bool(
+            status == "degraded"
+            and payload.get("fresh_success_available") is True
+            and payload.get("last_failure_covered_by_fresh_success") is True
+        )
+        if status != "ok" and not degraded_with_fresh_success:
+            reason = {
+                "pending": "OKX 自动对账尚未完成首次成功同步",
+                "degraded": "OKX 自动对账处于降级状态",
+                "warning": "OKX 自动对账异常",
+                "stale": "OKX 自动对账已过期",
+            }.get(status, "OKX 自动对账状态不可用")
             if last_error:
                 reason = f"{reason}：{last_error}"
             return f"{reason}；暂停新开仓，等待 OKX 与本地后台状态恢复一致。"
@@ -3356,6 +3352,22 @@ class TradingService:
             "ml_status": ml_status,
         }
 
+    @staticmethod
+    def _okx_credential_presence(mode: str) -> dict[str, Any]:
+        selected_mode = "live" if str(mode).lower() == "live" else "paper"
+        credentials = settings.get_okx_credentials(selected_mode)
+        required_fields = ("api_key", "api_secret", "passphrase")
+        missing_fields = [
+            field
+            for field in required_fields
+            if not str(credentials.get(field) or "").strip()
+        ]
+        return {
+            "mode": selected_mode,
+            "configured": not missing_fields,
+            "missing_fields": missing_fields,
+        }
+
     async def production_trade_gate_snapshot(
         self,
         decision: DecisionOutput,
@@ -3383,16 +3395,43 @@ class TradingService:
 
         sync_reason = self._okx_authoritative_sync_entry_block_reason()
         okx_payload = self._okx_authoritative_sync_status_payload()
+        selected_mode = "live" if str(model_mode).lower() == "live" else "paper"
+        credential_presence = self._okx_credential_presence(selected_mode)
+        sync_status = str(okx_payload.get("status") or "").lower()
+        degraded_with_fresh_success = bool(
+            sync_status == "degraded"
+            and okx_payload.get("fresh_success_available") is True
+            and okx_payload.get("last_failure_covered_by_fresh_success") is True
+        )
+        current_state_verified = bool(
+            sync_reason is None and (sync_status == "ok" or degraded_with_fresh_success)
+        )
+        okx_healthy = bool(
+            selected_mode == "live"
+            and credential_presence["configured"]
+            and current_state_verified
+        )
         breaker_state = self.risk_engine.circuit_breaker.get_state()
         daily_pnl = self._safe_float(breaker_state.get("daily_pnl"), 0.0) or 0.0
         ml_status = await self._production_trade_gate_model_status()
         gate = evaluate_production_trade_gate(
             okx={
-                "healthy": sync_reason is None,
-                "ok": sync_reason is None,
-                "can_open_new_entries": sync_reason is None,
-                "status": "blocked" if sync_reason else okx_payload.get("status"),
-                "reason": sync_reason,
+                "execution_mode": selected_mode,
+                "credentials_configured": credential_presence["configured"],
+                "missing_credential_fields": credential_presence["missing_fields"],
+                "healthy": okx_healthy,
+                "ok": okx_healthy,
+                "can_open_new_entries": okx_healthy,
+                "status": sync_status or "unavailable",
+                "fresh_success_available": okx_payload.get("fresh_success_available") is True,
+                "last_failure_covered_by_fresh_success": (
+                    okx_payload.get("last_failure_covered_by_fresh_success") is True
+                ),
+                "reason": (
+                    "okx_live_credentials_missing"
+                    if not credential_presence["configured"]
+                    else sync_reason
+                ),
                 "authoritative_sync": okx_payload,
             },
             risk={
@@ -3997,15 +4036,14 @@ class TradingService:
         *,
         run_market_analysis: bool,
         run_position_analysis: bool,
-        auto_scan: bool,
     ) -> dict[str, bool]:
         """Build bounded feature-source options for one market discovery fetch."""
 
-        market_only_auto = bool(run_market_analysis and not run_position_analysis and auto_scan)
+        market_only = bool(run_market_analysis and not run_position_analysis)
         return {
-            "block_on_remote_ticker": not market_only_auto,
-            "block_on_remote_indicators": not market_only_auto,
-            "block_on_remote_derivatives": not market_only_auto,
+            "block_on_remote_ticker": not market_only,
+            "block_on_remote_indicators": not market_only,
+            "block_on_remote_derivatives": not market_only,
             # Cached K-lines and background refreshes are local/read-only. They
             # keep the ranker from seeing an empty candidate pool while the
             # final AI/entry gates still require complete current evidence.
@@ -4177,7 +4215,6 @@ class TradingService:
                 "running": bool(self._running),
                 "mode": mode_manager.mode.value,
                 "paused": mode_manager.is_paused,
-                "scan_mode": mode_manager.scan_mode,
                 "started_at": self._start_time.isoformat() if self._start_time else None,
                 "heartbeat_at": now.isoformat(),
                 "last_heartbeat_at": now.isoformat(),
@@ -4766,7 +4803,6 @@ class TradingService:
         configured_limit: int,
         run_market_analysis: bool,
         run_position_analysis: bool,
-        auto_scan: bool,
         feature_fetch_budget_diagnostics: dict[str, Any] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         configured = max(1, int(configured_limit or 0))
@@ -4786,7 +4822,7 @@ class TradingService:
         quorum = min(total, max(configured, breadth_target))
         allowed_deficit = max(1, math.ceil(configured * 0.12))
         near_quorum = max(configured, quorum - allowed_deficit)
-        eligible = bool(auto_scan and run_market_analysis and not run_position_analysis and total)
+        eligible = bool(run_market_analysis and not run_position_analysis and total)
         completed = int(completed_valid_count or 0)
         exact_met = bool(eligible and completed >= quorum)
         near_quorum_met = bool(eligible and not exact_met and completed >= near_quorum)
@@ -5837,7 +5873,6 @@ class TradingService:
         analysis_budget_context: dict[str, Any],
         market_symbol_budget: int,
         run_market_analysis: bool,
-        mode_is_auto_scan: bool,
         analysis_scope: str,
     ) -> dict[str, Any]:
         rank_diagnostics = self._safe_dict(rank_diagnostics)
@@ -5854,7 +5889,7 @@ class TradingService:
         return {
             "read_only": True,
             "is_entry_gate": False,
-            "mode": "auto" if mode_is_auto_scan else "manual",
+            "mode": "auto",
             "analysis_scope": analysis_scope,
             "run_market_analysis": bool(run_market_analysis),
             "scan_symbol_count": len(scan_symbols or []),
@@ -6407,13 +6442,11 @@ class TradingService:
                     }
                 )
 
-            # 1. Determine which symbols to process based on scan mode
+            # 1. Discover the bounded automatic market universe.
             self._set_loop_stage("select_symbols")
             if new_pair_pause_reason:
                 scan_symbols = []
-            elif mode_manager.is_auto_scan:
-                # Auto mode: rank all OKX USDT swaps, then pull indicators for
-                # a larger candidate pool before spending AI tokens on the best.
+            else:
                 try:
                     available = await self.data_service.get_available_symbols()
                     limit = max(1, int(settings.auto_scan_symbol_limit))
@@ -6437,11 +6470,6 @@ class TradingService:
                     limit=settings.auto_scan_symbol_limit,
                     candidate_pool=pool_limit,
                 )
-            else:
-                # Manual mode: only user-selected symbols
-                limit = len(settings.symbols)
-                scan_symbols = list(settings.symbols)
-
             position_scan_symbols = (
                 sorted(self.entry_symbol_universe.open_position_symbol_keys(open_positions))
                 if run_position_analysis
@@ -6482,7 +6510,7 @@ class TradingService:
                     *position_scan_symbols,
                 ]
             )
-            if run_market_analysis and mode_manager.is_auto_scan:
+            if run_market_analysis:
                 fetch_symbols = self._budget_auto_scan_feature_symbols(
                     fetch_symbols,
                     position_scan_symbols,
@@ -6541,7 +6569,6 @@ class TradingService:
                         feature_options = self._market_feature_fetch_options(
                             run_market_analysis=run_market_analysis,
                             run_position_analysis=run_position_analysis,
-                            auto_scan=mode_manager.is_auto_scan,
                         )
                         return sym, await asyncio.wait_for(
                             self._get_feature_vector_snapshot(
@@ -6608,7 +6635,6 @@ class TradingService:
                 configured_limit=max(1, int(settings.auto_scan_symbol_limit)),
                 run_market_analysis=run_market_analysis,
                 run_position_analysis=run_position_analysis,
-                auto_scan=mode_manager.is_auto_scan,
                 feature_fetch_budget_diagnostics=feature_fetch_budget_diagnostics,
             )
             early_quorum_diagnostics.update(
@@ -6709,11 +6735,7 @@ class TradingService:
                 market_feature_vectors = {}
             market_feature_vectors_before_rank = dict(market_feature_vectors)
             market_feature_vectors_after_rank = dict(market_feature_vectors)
-            base_market_limit = (
-                max(1, int(settings.auto_scan_symbol_limit))
-                if mode_manager.is_auto_scan
-                else len(market_feature_vectors)
-            )
+            base_market_limit = max(1, int(settings.auto_scan_symbol_limit))
             market_regime_context = self._market_regime_context(
                 market_feature_vectors or feature_vectors
             )
@@ -6739,7 +6761,7 @@ class TradingService:
                 if market_symbol_budget <= 0:
                     market_feature_vectors = {}
                     market_feature_vectors_after_rank = {}
-                elif mode_manager.is_auto_scan:
+                else:
                     model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
                     rank_limit = len(market_feature_vectors)
                     market_feature_vectors = self._rank_auto_feature_vectors(
@@ -6759,17 +6781,6 @@ class TradingService:
                     rank_diagnostics_snapshot = self._safe_dict(
                         getattr(self, "_last_auto_feature_rank_diagnostics", None)
                     )
-                    market_feature_vectors_after_rank = dict(market_feature_vectors)
-                elif len(market_feature_vectors) > market_symbol_budget:
-                    allowed_keys = {
-                        self._normalize_position_symbol(s)
-                        for s in list(market_feature_vectors.keys())[:market_symbol_budget]
-                    }
-                    market_feature_vectors = {
-                        s: fv
-                        for s, fv in market_feature_vectors.items()
-                        if self._normalize_position_symbol(s) in allowed_keys
-                    }
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
             if run_market_analysis and market_feature_vectors:
                 prewarm_symbols = self._market_indicator_prewarm_symbols(
@@ -6797,7 +6808,7 @@ class TradingService:
                 )
                 market_feature_vectors = hydrated_market_feature_vectors
                 feature_vectors.update(hydrated_market_feature_vectors)
-                if mode_manager.is_auto_scan and market_feature_vectors:
+                if market_feature_vectors:
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors,
                         len(market_feature_vectors),
@@ -6833,7 +6844,7 @@ class TradingService:
                     "changes_trading_thresholds": False,
                 }
             results["market_prewarmed_feature_hydration"] = hydration_diagnostics
-            if mode_manager.is_auto_scan and run_market_analysis and market_feature_vectors:
+            if run_market_analysis and market_feature_vectors:
                 market_feature_vectors, timeout_cooldown_diagnostics = (
                     self._filter_market_symbol_timeout_cooldowns(
                         market_feature_vectors
@@ -6853,7 +6864,7 @@ class TradingService:
                         getattr(self, "_market_timeout_retry_not_before", {}) or {}
                     ),
                 }
-            if mode_manager.is_auto_scan and run_market_analysis and market_feature_vectors:
+            if run_market_analysis and market_feature_vectors:
                 await self._ensure_market_analysis_selection_history()
                 market_feature_vectors = self._select_market_analysis_candidates(
                     market_feature_vectors,
@@ -6880,7 +6891,6 @@ class TradingService:
                 analysis_budget_context=analysis_budget_context,
                 market_symbol_budget=market_symbol_budget,
                 run_market_analysis=run_market_analysis,
-                mode_is_auto_scan=mode_manager.is_auto_scan,
                 analysis_scope=analysis_scope,
             )
             results["market_candidate_funnel"] = market_candidate_funnel
@@ -6896,9 +6906,6 @@ class TradingService:
                 budget_source=analysis_budget_context.get("budget_source"),
                 reason=analysis_budget_context.get("reason"),
             )
-            if mode_manager.is_auto_scan and market_feature_vectors:
-                # Already ranked by the dynamic analysis budget above.
-                pass
             strategy_mode_context["analysis_budget"] = analysis_budget_context
             logger.info(
                 "market regime prediction",
@@ -7664,32 +7671,17 @@ class TradingService:
                     )
                     continue
 
-                if mode_manager.is_auto_scan:
-                    await self.market_auto_entry_processor.process(
-                        symbol=symbol,
-                        model_name=model_name,
-                        decision=executed,
-                        assessment=assessment,
-                        decision_db_id=decision_db_id,
-                        results=results,
-                        model_mode=model_mode,
-                        open_positions=open_positions,
-                        staged_entry_counts=staged_entry_counts,
-                        strategy_mode_context=strategy_mode_context,
-                    )
-                    continue
-
-                await self.market_direct_entry_processor.process(
+                await self.market_auto_entry_processor.process(
                     symbol=symbol,
                     model_name=model_name,
-                    original_decision=decision,
-                    executed=executed,
+                    decision=executed,
                     assessment=assessment,
                     decision_db_id=decision_db_id,
                     results=results,
                     model_mode=model_mode,
                     open_positions=open_positions,
                     staged_entry_counts=staged_entry_counts,
+                    strategy_mode_context=strategy_mode_context,
                 )
                 continue
 
@@ -7822,11 +7814,7 @@ class TradingService:
                 )
             all_candidates = filtered_entry_candidates.accepted_candidates
 
-            # 4. Filter entry candidates: auto mode no longer limits the number of executable entries.
-            if mode_manager.is_auto_scan:
-                candidates_to_execute = all_candidates
-            else:
-                candidates_to_execute = all_candidates
+            candidates_to_execute = all_candidates
 
             # 5. Execute selected entry decisions
             for symbol, model_name, decision, assessment, decision_db_id in candidates_to_execute:
@@ -10503,6 +10491,13 @@ class TradingService:
             return okx_sync_reason
 
         model_mode = self._get_model_execution_mode(model_name)
+        credential_presence = self._okx_credential_presence(model_mode)
+        if model_mode == "live" and not credential_presence["configured"]:
+            missing = ", ".join(credential_presence["missing_fields"])
+            return (
+                "实盘 OKX 凭据未配置完整，暂停新市场分析和新开仓。"
+                f"缺少字段：{missing}。"
+            )
         cache_key = self._new_pair_pause_context_cache_key(
             model_name=model_name,
             model_mode=model_mode,
@@ -11613,7 +11608,7 @@ class TradingService:
             "last_market_round_summary": self._safe_dict(
                 getattr(self, "_last_market_round_summary", {})
             ),
-            "live_model": ENSEMBLE_TRADER_NAME,
+            "active_model": ENSEMBLE_TRADER_NAME,
             "models": [ENSEMBLE_TRADER_NAME],
             "risk": self.risk_engine.circuit_breaker.get_state(),
             "decision_interval": settings.decision_interval_seconds,
@@ -11625,5 +11620,4 @@ class TradingService:
             "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
         }
         self._write_runtime_heartbeat()
-        return stats
         return stats

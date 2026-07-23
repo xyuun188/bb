@@ -36,10 +36,10 @@ async def test_execution_mode_switch_preserves_unified_active_model(tmp_path: Pa
     await manager.switch_to_paper()
 
     assert manager.active_model_name == "ensemble_trader"
-    assert manager.live_model_name == manager.active_model_name
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     assert persisted["active_model_name"] == "ensemble_trader"
-    assert persisted["live_model_name"] == persisted["active_model_name"]
+    assert "live_model_name" not in persisted
+    assert "scan_mode" not in persisted
     with pytest.raises(ValueError, match="cannot replace the active model"):
         await manager.switch_to_live("different_model")
     assert manager.active_model_name == "ensemble_trader"
@@ -55,8 +55,7 @@ def test_unchanged_state_file_is_not_reloaded_on_every_property_access(
             {
                 "mode": "live",
                 "paused": False,
-                "scan_mode": "auto",
-                "live_model_name": "ensemble_trader",
+                "active_model_name": "ensemble_trader",
                 "mode_changed_at": "2026-06-23T00:00:00",
             },
             separators=(",", ":"),
@@ -79,5 +78,30 @@ def test_unchanged_state_file_is_not_reloaded_on_every_property_access(
     monkeypatch.setattr(path_type, "read_text", read_text_spy)
 
     assert manager.mode == TradingMode.LIVE
-    assert manager.live_model_name == "ensemble_trader"
+    assert manager.active_model_name == "ensemble_trader"
     assert read_count == 0
+
+
+def test_removed_control_keys_are_not_loaded(tmp_path: Path) -> None:
+    state_path = tmp_path / "trading-control-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "mode": "live",
+                "paused": False,
+                "scan_mode": "manual",
+                "live_model_name": "removed-model-alias",
+                "mode_changed_at": "2026-06-23T00:00:00",
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    manager = TradingModeManager(state_path=state_path)
+
+    assert manager.mode == TradingMode.LIVE
+    assert manager.active_model_name is None
+    assert not hasattr(manager, "scan_mode")
+    assert not hasattr(manager, "live_model_name")

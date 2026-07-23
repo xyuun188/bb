@@ -811,7 +811,6 @@ def test_market_auto_feature_fetch_can_build_cached_indicator_snapshots() -> Non
     options = TradingService._market_feature_fetch_options(
         run_market_analysis=True,
         run_position_analysis=False,
-        auto_scan=True,
     )
 
     assert options == {
@@ -828,7 +827,6 @@ def test_non_market_discovery_feature_fetch_keeps_complete_source_policy() -> No
     options = TradingService._market_feature_fetch_options(
         run_market_analysis=False,
         run_position_analysis=True,
-        auto_scan=True,
     )
 
     assert options["block_on_remote_ticker"] is True
@@ -1087,7 +1085,6 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
         configured_limit=8,
         run_market_analysis=True,
         run_position_analysis=False,
-        auto_scan=True,
     )
     assert met is True
     assert diagnostics["quorum"] == 16
@@ -1101,7 +1098,6 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
         configured_limit=8,
         run_market_analysis=True,
         run_position_analysis=False,
-        auto_scan=True,
     )
     assert near_met is True
     assert near_diagnostics["exact_met"] is False
@@ -1115,7 +1111,6 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
         configured_limit=8,
         run_market_analysis=True,
         run_position_analysis=False,
-        auto_scan=True,
     )
     assert budget_ready_met is True
     assert budget_ready_diagnostics["exact_met"] is False
@@ -1128,7 +1123,6 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
         configured_limit=8,
         run_market_analysis=True,
         run_position_analysis=False,
-        auto_scan=True,
     )
     assert not_met is False
 
@@ -1138,7 +1132,6 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
         configured_limit=8,
         run_market_analysis=True,
         run_position_analysis=True,
-        auto_scan=True,
     )
     assert position_scope_met is False
     assert position_scope_diagnostics["eligible"] is False
@@ -1890,7 +1883,35 @@ async def test_okx_authoritative_sync_attention_pauses_new_pair_analysis() -> No
 
 
 @pytest.mark.asyncio
-async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone() -> None:
+async def test_pending_okx_sync_pauses_new_pair_analysis() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "pending",
+        "last_error": None,
+        "last_requires_attention_count": 0,
+    }
+
+    reason = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[],
+    )
+
+    assert reason == (
+        "OKX 自动对账尚未完成首次成功同步；"
+        "暂停新开仓，等待 OKX 与本地后台状态恢复一致。"
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_key", "key")
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_secret", "secret")
+    monkeypatch.setattr(trading_service.settings, "okx_live_passphrase", "pass")
     service = TradingService.__new__(TradingService)
     service.risk_engine = SimpleNamespace(
         circuit_breaker=SimpleNamespace(
@@ -1945,7 +1966,12 @@ async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone
 
 
 @pytest.mark.asyncio
-async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_ml() -> None:
+async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_ml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_key", "key")
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_secret", "secret")
+    monkeypatch.setattr(trading_service.settings, "okx_live_passphrase", "pass")
     service = TradingService.__new__(TradingService)
     service.risk_engine = SimpleNamespace(
         circuit_breaker=SimpleNamespace(
@@ -1990,6 +2016,31 @@ async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_m
     assert gate["mode"] == "live_ml"
     assert gate["decision_authority"] == "model"
     assert gate["model_can_influence"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_credentials_missing_pauses_new_market_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_key", "")
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_secret", "")
+    monkeypatch.setattr(trading_service.settings, "okx_live_passphrase", "")
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service._get_model_execution_mode = lambda _model_name: "live"
+
+    reason = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[],
+    )
+
+    assert reason == (
+        "实盘 OKX 凭据未配置完整，暂停新市场分析和新开仓。"
+        "缺少字段：api_key, api_secret, passphrase。"
+    )
 
 
 @pytest.mark.asyncio
@@ -3702,6 +3753,7 @@ async def test_paper_new_pair_pause_treats_missing_okx_balance_snapshot_as_advis
         circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
         position_checker=SimpleNamespace(entry_capacity_reason=lambda **_kwargs: None),
     )
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
     refresh_calls: list[str] = []
     service._schedule_okx_balance_snapshot_refresh_for_new_pair_pause = (  # type: ignore[method-assign]
         lambda mode: refresh_calls.append(mode)
@@ -4138,7 +4190,6 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
         analysis_budget_context=analysis_budget,
         market_symbol_budget=2,
         run_market_analysis=True,
-        mode_is_auto_scan=True,
         analysis_scope="market",
     )
     decision = _decision(Action.HOLD)

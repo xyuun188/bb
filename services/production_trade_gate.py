@@ -17,7 +17,7 @@ TradeGateMode = Literal["observe", "live_rules_canary", "live_ml", "blocked"]
 DecisionAuthority = Literal["none", "rules", "model"]
 AuthorizedTradeGateMode = Literal["live_rules_canary", "live_ml"]
 
-PRODUCTION_TRADE_GATE_VERSION = "2026-07-24.profit-loop-trade-gate.v2"
+PRODUCTION_TRADE_GATE_VERSION = "2026-07-24.profit-loop-trade-gate.v3"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -148,14 +148,24 @@ def _risk_limits(settings: dict[str, Any], risk: dict[str, Any]) -> TradeGateRis
     )
 
 
-def _okx_healthy(okx: dict[str, Any]) -> bool:
-    if okx.get("healthy") is False or okx.get("ok") is False:
-        return False
-    if okx.get("can_open_new_entries") is False:
-        return False
-    if str(okx.get("status") or "").lower() in {"blocked", "unhealthy", "error"}:
-        return False
-    return True
+def _okx_blocker(okx: dict[str, Any]) -> str | None:
+    if str(okx.get("execution_mode") or "").lower() != "live":
+        return "okx_execution_mode_not_live"
+    if okx.get("credentials_configured") is not True:
+        return "okx_live_credentials_missing"
+    if okx.get("healthy") is not True or okx.get("ok") is not True:
+        return "okx_unhealthy"
+    if okx.get("can_open_new_entries") is not True:
+        return "okx_new_entries_blocked"
+    status = str(okx.get("status") or "").lower()
+    degraded_with_fresh_success = bool(
+        status == "degraded"
+        and okx.get("fresh_success_available") is True
+        and okx.get("last_failure_covered_by_fresh_success") is True
+    )
+    if status != "ok" and not degraded_with_fresh_success:
+        return "okx_status_not_ok"
+    return None
 
 
 def _risk_blocker(risk: dict[str, Any], limits: TradeGateRiskLimits) -> str | None:
@@ -249,13 +259,14 @@ def evaluate_production_trade_gate(
         "training": training,
     }
 
-    if not _okx_healthy(okx):
+    okx_reason = _okx_blocker(okx)
+    if okx_reason:
         return ProductionTradeGateResult(
             can_trade=False,
             mode="blocked",
             decision_authority="none",
             model_can_influence=False,
-            reason="okx_unhealthy",
+            reason=okx_reason,
             risk=limits,
             evidence=evidence,
         )

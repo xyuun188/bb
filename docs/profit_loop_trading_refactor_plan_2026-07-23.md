@@ -272,7 +272,7 @@
 
 ## 18. 生产交易授权单一路径
 
-- `production_trade_gate` 已升级为 `2026-07-24.profit-loop-trade-gate.v2`；生产开仓只接受当前版本，不兼容旧版本、不接受缺字段字典。
+- `production_trade_gate` 已升级为 `2026-07-24.profit-loop-trade-gate.v3`；生产开仓只接受当前版本，不兼容旧版本、不接受缺字段字典。
 - 唯一合法生产模式只有 `live_rules_canary + rules + model_can_influence=false` 和 `live_ml + model + model_can_influence=true`；模式、权责或版本不一致时统一失败关闭。
 - `ExecutionService` 对非模拟开仓强制要求权威门禁提供器；缺少提供器、返回空值、返回关闭门禁或返回旧门禁时，必须在获取 OKX 执行器前拒绝。
 - `EntryPolicy` 和最终执行合同只复核同一个门禁结果；`live_ml_profit_contract` 只提供收益安全证据，不能单独授予生产权限。
@@ -286,7 +286,7 @@
 - 原 `services/model_dynamic_routing.py` 在全部专家已经调用完成后才生成报告，始终选择全部专家、跳过 0 个专家、理论调用减少量为 0，不会改变任何真实执行路径。
 - 该功能只向决策载荷写入 `dynamic_model_routing`，再由系统巡检重复统计 shadow/readiness 和永远为 false 的 mutation 字段；它不是路由器，也不产生训练或盈利闭环价值。
 - 已删除动态路由服务、ensemble 决策载荷写入、`/model-dynamic-routing/status` 接口、系统巡检卡、依赖图节点、Dashboard 映射和原专用测试，不保留弃用接口或兼容返回。
-- `live_route_mutation`、`applied_to_live_calls`、`can_apply_live_route` 和 `unsafe_live_mutation_attempts` 已从运行代码删除；模型生产授权继续只由 `production_trade_gate v2` 和 `live_ml_ready` 决定。
+- `live_route_mutation`、`applied_to_live_calls`、`can_apply_live_route` 和 `unsafe_live_mutation_attempts` 已从运行代码删除；模型生产授权继续只由 `production_trade_gate v3` 和 `live_ml_ready` 决定。
 - 模型专家健康与竞赛仍保留为只读质量证据，但它们直接服务于训练诊断和策略决策，不再指向一个不存在执行效果的中间路由节点。
 - 新增删除契约测试，持续验证服务文件、ensemble 源码、系统巡检卡/API 和 Dashboard 都不能重新出现该功能。
 
@@ -297,3 +297,17 @@
 - `Order.okx_trade_ids` 已改为无长度上限 `TEXT`；SQLite 新库直接创建 `TEXT`，PostgreSQL 启动迁移将现有非 text 列原位转换为 `TEXT`。
 - `okx_raw_fills.trade_ids` 与 `okx_trade_ids` 继续保存同一完整 ID 集，训练和审计仍可按逗号拆分，不引入双字段或兼容读取。
 - 回归测试使用线上同规模的 57 个 trade IDs，验证字符串长度超过 500 且顺序、数量和原始事实完全保留。
+
+## 21. 人工暂停与自动市场扫描单一路径
+
+- 本轮确认生产交易门禁已经放行，但进程共享的 `data/trading-control-state.json` 仍保存此前人工设置的 `paused=true`；交易循环因此在权威生产门禁之外停止新市场分析，长期输出 `scan_symbol_count=0`。这不是模型晋升或余额风控导致，而是未恢复的人工控制状态。
+- 保留唯一有实际作用的人工暂停开关：暂停只停止新市场分析和新开仓，已有仓位继续行情刷新、复盘、止盈止损与平仓；恢复操作立即允许下一轮自动市场扫描。人工紧急暂停不得被服务重启或健康门禁自动解除。
+- 自动全市场扫描改为固定执行路径。删除 `scan_mode` 持久化字段、`/control/scan-mode` 接口、Dashboard 假切换状态、`is_auto_scan` 条件分支、永远回写自动模式的 `switch_to_manual`，以及仅由已删除手动分支调用的 `MarketDirectEntryProcessor` 和专用测试。
+- 模型身份只保留 `active_model_name` / `active_model`。删除 `live_model_name` 的持久化兼容读取、模型注册表兼容方法、`live_model` API 重复返回、`/control/select-model` 固定值接口和无调用前端函数；纸面与实盘执行账户共享同一活动模型，不再暴露第二套模型指针。
+- 交易控制状态文件后续只写入 `mode`、`paused`、`active_model_name` 和 `mode_changed_at`。旧 `scan_mode`、`live_model_name` 即使仍存在于历史文件中也不再读取；首次暂停、恢复、账户切换或模型选择后会以唯一字段集合覆盖旧文件。
+- 新增删除契约测试，持续禁止旧扫描入口、旧模型别名和旧直连执行器回流。部署验收必须同时满足 `paused=false`、`run_market_analysis=true`、`scan_symbol_count>0`，不能只凭生产门禁状态推断交易循环已恢复。
+- 线上继续验收发现实盘候选全部被 `okx_private_entry_instrument_probe_failed` 拒绝，精确错误为 `OKX API credentials are not configured`；加密配置服务本身正常，但线上仅配置 paper/demo 三项凭据，live 的 API Key、Secret、Passphrase 均缺失。
+- 生产门禁升级为失败关闭：必须明确满足 `execution_mode=live`、三项 live 凭据齐全、OKX 当前同步为 `status=ok`，或 `status=degraded` 但明确存在新鲜成功快照且该快照覆盖随后失败，同时 `can_open_new_entries=true`；否则返回 `okx_execution_mode_not_live`、`okx_live_credentials_missing`、`okx_unhealthy`、`okx_new_entries_blocked` 或 `okx_status_not_ok`，不再把空字典和未明确失败误判为健康。
+- live 凭据缺失时，交易循环在新市场分析前直接给出缺失字段并停止扫描，禁止继续消耗行情、排序和私有接口探测资源。没有真实 live 凭据时只能运行 OKX demo 交易，系统不得伪装成实盘可交易。
+- 2026-07-24 线上部署验收：控制状态已明确恢复为 `mode=paper`、`active_model_name=ensemble_trader`、`paused=false`；交易心跳新鲜且无 market error，当前自动轮次 `run_market_analysis=true`、`scan_symbol_count=240`、`feature_fetch_requested_count=48`、`feature_valid_count=8`、`rank_selected_count=2`，已进入 `market_ai:ETH/USDT`。这证明模型晋升前的 OKX demo 规则交易路径已恢复实际分析候选，不再被旧暂停或已删除手动模式阻断。
+- 同一线上验收确认 v3 对缺少 live 凭据返回 `can_trade=false`、`mode=blocked`、`reason=okx_live_credentials_missing`，且服务器旧 `services/market_direct_entry_processor.py` 已不存在。真实小仓实盘必须先由用户在 Dashboard 安全配置三项 OKX live 凭据；在此之前系统只运行 demo，禁止自动复制 paper 密钥或绕过门禁。

@@ -258,22 +258,8 @@ class ModelRegistry:
         self._active_model_name = name
         logger.info("active model set", name=name)
 
-    def get_live_model(self) -> AbstractAIModel | None:
-        """Backward-compatible alias for get_active_model()."""
-
-        return self.get_active_model()
-
-    def set_live_model(self, name: str) -> None:
-        """Backward-compatible alias that cannot create a second model pointer."""
-
-        self.set_active_model(name)
-
     @property
     def active_model_name(self) -> str | None:
-        return self._active_model_name
-
-    @property
-    def live_model_name(self) -> str | None:
         return self._active_model_name
 
     def unregister(self, name: str) -> bool:
@@ -1276,6 +1262,5 @@ class ModelRegistry:
             "models": self.model_names,
             "model_count": self.model_count,
             "active_model": self._active_model_name,
-            "live_model": self._active_model_name,
             "initialized": self._initialized,
         }

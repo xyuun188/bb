@@ -7,8 +7,6 @@
 const state = {
     mode: 'paper',
     paused: false,
-    scanMode: 'auto',
-    liveModel: null,
     models: [],
     tickers: {},
     decisions: [],
@@ -149,7 +147,6 @@ document.addEventListener('DOMContentLoaded', () => {
     initTradeTabs();
     initSettingsTabs();
     initDataCollectionSettingsForm();
-    initScanModeButtons();
     initPositionActions();
     initDashboardUserActions();
     initModalActionButtons();
@@ -448,7 +445,7 @@ async function fetchDashboardSummary() {
     const data = await fetchJSON('/api/dashboard/summary');
     if (!data) return;
 
-    updateModeDisplay(data.mode, data.paused, data.scan_mode);
+    updateModeDisplay(data.mode, data.paused);
     updateExecutionAccountPanel(data.execution_account || {});
     updateAccounts(data.accounts || [], data.execution_account || null);
     updateMarketData(data.market || {}, data.accounts || []);
@@ -626,10 +623,9 @@ function updatePositionsTable(positions, page = 1, totalPages = 1, totalItems = 
 }
 
 // --- Render Functions ---
-function updateModeDisplay(mode, paused, scanMode) {
+function updateModeDisplay(mode, paused) {
     state.mode = mode;
     state.paused = Boolean(paused);
-    state.scanMode = 'auto';
 
     const badge = document.getElementById('mode-badge');
     if (state.paused) {
@@ -658,9 +654,9 @@ function updateModeDisplay(mode, paused, scanMode) {
     });
     updateModeButtonAvailability();
 
-    const scanLabel = document.getElementById('scan-mode-label');
-    if (scanLabel) {
-        scanLabel.textContent = state.paused
+    const marketScanLabel = document.getElementById('scan-mode-label');
+    if (marketScanLabel) {
+        marketScanLabel.textContent = state.paused
             ? '已暂停新市场分析 · 持仓风控继续'
             : '自动扫描全市场 · 智能调度';
     }
@@ -1794,22 +1790,12 @@ async function togglePause() {
         }));
         const data = await response.json().catch(() => null);
         if (data && data.state) {
-            updateModeDisplay(data.state.mode, data.state.paused, data.state.scan_mode);
+            updateModeDisplay(data.state.mode, data.state.paused);
         }
         await fetchDashboardSummary();
     } finally {
         if (btn) btn.disabled = false;
     }
-}
-
-async function selectLiveModel(modelName) {
-    await fetchWithAuth('/api/control/select-model', dashboardWriteOptions({
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_name: modelName }),
-    }));
-    state.liveModel = modelName;
-    await fetchDashboardSummary();
 }
 
 // ========== All Decisions Page ==========
@@ -7456,9 +7442,9 @@ function scopedStageText(stats, scope) {
 }
 
 function updateAutoStatus(stats) {
-    const scanModeEl = document.getElementById('status-scan-mode');
-    if (scanModeEl) {
-        scanModeEl.textContent = state.paused
+    const marketScanEl = document.getElementById('status-scan-mode');
+    if (marketScanEl) {
+        marketScanEl.textContent = state.paused
             ? '已暂停新市场分析；已有仓位继续复盘 / 风控 / 平仓'
             : '\u81ea\u52a8\u626b\u63cf\u5168\u5e02\u573a (OKX)';
     }
@@ -7526,15 +7512,6 @@ function updateAutoStatus(stats) {
         errRow.style.display = err ? 'flex' : 'none';
         errEl.textContent = err || '-';
     }
-}
-
-// ========== Scan Mode Buttons ==========
-function initScanModeButtons() {
-    state.scanMode = 'auto';
-    const scanLabel = document.getElementById('scan-mode-label');
-    if (scanLabel) scanLabel.textContent = '自动扫描全市场 · 智能调度';
-    updateSymbolCount();
-    return;
 }
 
 // ========== Dashboard Account Settings ==========

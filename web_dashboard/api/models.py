@@ -25,11 +25,6 @@ async def list_models():
             if _trading_service and _trading_service.models
             else None
         ),
-        "live_model": (
-            _trading_service.models.active_model_name
-            if _trading_service and _trading_service.models
-            else None
-        ),
     }
 
 

@@ -356,7 +356,6 @@ class Settings(BaseSettings):
 
     # --- Trading Parameters ---
     trading_mode: TradingMode = TradingMode.PAPER
-    scan_mode: str = "auto"  # "auto" = scan all OKX pairs, "manual" = only settings.symbols
     symbols: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
     )
