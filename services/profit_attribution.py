@@ -342,7 +342,7 @@ def _signal_status(
         "label": label,
         "side": signal.get("side") or "",
         "expected_return_pct": _safe_float(signal.get("expected_return_pct"), 0.0),
-        "influence_enabled": signal.get("influence_enabled"),
+        "production_eligible": signal.get("production_eligible"),
         "status": "matched" if available else "missing",
         "missing_reason": "" if available else missing_reason,
     }

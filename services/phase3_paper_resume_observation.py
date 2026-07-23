@@ -366,14 +366,6 @@ def evaluate_phase3_paper_resume_observation_inputs(
                 },
             )
         )
-    elif bool(specialist.get("live_mutation")):
-        blockers.append(
-            _blocker(
-                "specialist_shadow_live_mutation_after_resume",
-                "Specialist shadow evaluation must remain shadow-only.",
-                evidence={"live_mutation": specialist.get("live_mutation")},
-            )
-        )
     else:
         passed.append("specialist_shadow_evaluation_fresh_after_resume")
 
@@ -408,7 +400,6 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "starts_trading_service": False,
         "submits_orders": False,
         "changes_model_routing": False,
-        "live_mutation": False,
         "paper_active": paper_active,
         "can_use_for_promotion": status == "healthy",
         "blockers": blockers,

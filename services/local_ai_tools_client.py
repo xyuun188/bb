@@ -34,6 +34,7 @@ from services.return_objective import (
     standardized_return_distribution,
     validate_return_distribution_contract,
 )
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 logger = structlog.get_logger(__name__)
 
@@ -260,7 +261,6 @@ class LocalAIToolsClient:
             normalized["action_label"] = "继续观察"
             normalized["reason"] = "本地退出模型仅提供观察画像，生产平仓由动态退出契约独占。"
             normalized["production_permission"] = False
-            normalized["live_mutation"] = False
         return self._attach_model_metadata(name, normalized)
 
     def _attach_return_distribution_contract(
@@ -548,8 +548,7 @@ class LocalAIToolsClient:
             "training_mode",
             "model_stage",
             "route_mode",
-            "live_mutation",
-            "live_trading_mutation",
+            "live_ml_ready",
             "artifact_persisted",
             "training_data_sha256",
             "source_code_sha256",
@@ -628,10 +627,7 @@ class LocalAIToolsClient:
         source: str = "local_trading_system_auto",
         completed_shadow_sample_count: int | None = None,
         completed_trade_sample_count: int | None = None,
-        raw_trade_sample_count: int | None = None,
-        trainable_trade_sample_count: int | None = None,
-        quarantined_trade_sample_count: int | None = None,
-        trade_sample_cursor_policy: str = "clean_training_view_only",
+        trade_sample_cursor_policy: str = CURRENT_TRAINING_EPOCH_POLICY,
         quality_report: dict[str, Any] | None = None,
         governance_report: dict[str, Any] | None = None,
         training_mode: str = "shadow",
@@ -674,9 +670,6 @@ class LocalAIToolsClient:
             "text_sentiment_samples": text_sentiment_samples or [],
             "completed_shadow_sample_count": completed_shadow_sample_count,
             "completed_trade_sample_count": completed_trade_sample_count,
-            "raw_trade_sample_count": raw_trade_sample_count,
-            "trainable_trade_sample_count": trainable_trade_sample_count,
-            "quarantined_trade_sample_count": quarantined_trade_sample_count,
             "trade_sample_cursor_policy": trade_sample_cursor_policy,
             "quality_report": quality_report or {},
             "governance_report": governance_report or {},

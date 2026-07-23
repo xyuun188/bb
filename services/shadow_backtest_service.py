@@ -87,7 +87,6 @@ _SHADOW_PROFESSIONAL_KEYS = (
     "baseline_response",
     "activation_blocker",
     "promotion_flow",
-    "live_mutation",
 )
 
 

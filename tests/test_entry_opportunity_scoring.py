@@ -59,7 +59,6 @@ def _live_payload(*, side: str, long_return: float, short_return: float) -> dict
         "available": True,
         "route_mode": "live",
         "live_ml_ready": True,
-        "live_influence": True,
         "promotion_ready": True,
         "horizon_minutes": 30,
         "objective_name": RETURN_OBJECTIVE_NAME,
@@ -134,9 +133,7 @@ def _live_ml() -> dict:
     return {
         "available": True,
         "route_mode": "live",
-            "live_influence": True,
-            "live_ml_ready": True,
-        "influence_enabled": True,
+        "live_ml_ready": True,
         "promotion_ready": True,
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
@@ -336,7 +333,6 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
     decision.raw_response["ml_signal"].update(
         {
             "live_ml_ready": False,
-            "influence_enabled": False,
             "advisory_enabled": True,
         }
     )
@@ -363,9 +359,7 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
     signal.update(
         {
             "route_mode": "shadow_observation",
-            "live_influence": False,
             "live_ml_ready": False,
-            "influence_enabled": False,
             "artifact_lifecycle": "canary",
             "model_version": "model-v1",
             "paper_canary_authorized": True,
@@ -407,9 +401,7 @@ def test_paper_strategy_cannot_authorize_same_model_in_live_mode() -> None:
     signal.update(
         {
             "route_mode": "shadow_observation",
-            "live_influence": False,
             "live_ml_ready": False,
-            "influence_enabled": False,
             "artifact_lifecycle": "canary",
             "model_version": "model-v1",
             "paper_canary_authorized": True,
@@ -447,7 +439,6 @@ def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
     decision.raw_response["ml_signal"].update(
         {
             "live_ml_ready": False,
-            "influence_enabled": False,
             "trained_sample_count": 100,
             "model_version": "2026-07-13T12:00:00+00:00",
             "readiness": {
@@ -467,7 +458,6 @@ def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
         payload.update(
             {
                 "route_mode": "shadow_candidate",
-                "live_influence": False,
                 "trained": True,
                 "artifact_persisted": True,
                 "training_cost_policy": "per_sample_live_spread_fee_and_funding_complete",
@@ -497,7 +487,6 @@ def test_observation_only_anomalous_server_prediction_cannot_enter_distribution(
         payload.update(
             {
                 "route_mode": "shadow_candidate",
-                "live_influence": False,
                 "promotion_ready": False,
                 "trained": True,
                 "prediction_quality": {

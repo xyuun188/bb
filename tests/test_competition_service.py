@@ -99,7 +99,6 @@ async def test_auto_promote_best_model_is_recommendation_only(
             "event": "best model promotion recommendation recorded without active switch",
             "model": "candidate-model",
             "current_active_model": "current-active-model",
-            "live_mutation": False,
             "policy": "phase3_observe_only",
         }
     ]

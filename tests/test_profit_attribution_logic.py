@@ -178,7 +178,6 @@ def test_obsolete_opportunity_source_aliases_cannot_fabricate_model_signals():
                 "side": "long",
                 "expected_return_pct": 0.42,
                 "ml_aligned": True,
-                "ml_influence_enabled": True,
                 "server_profit_best_side": "short",
                 "server_profit_expected_return_pct": 0.31,
                 "server_profit_loss_probability": 0.28,
@@ -200,27 +199,42 @@ def test_obsolete_opportunity_alias_cannot_recover_observe_only_ml_prediction():
                 "side": "long",
                 "expected_return_pct": 0.25,
                 "ml_aligned": True,
-                "ml_influence_enabled": False,
             }
         }
     )
 
     assert signals["ml"]["available"] is False
-    assert signals["ml"]["influence_enabled"] is True
+    assert signals["ml"]["production_eligible"] is False
 
 
-def test_extract_signal_sides_keeps_ml_prediction_visible_when_influence_disabled():
+def test_extract_signal_sides_keeps_ml_prediction_visible_without_model_authority():
     signals = extract_entry_signal_sides(
         {
             "ml_signal": _ml_payload("short", 0.73)
-        },
-        ml_influence_enabled=False,
+        }
     )
 
     assert signals["ml"]["available"] is True
-    assert signals["ml"]["influence_enabled"] is False
+    assert signals["ml"]["production_eligible"] is False
     assert signals["ml"]["side"] == "short"
     assert signals["ml"]["raw_expected_return_pct"] == 0.73
+
+
+def test_extract_signal_sides_uses_only_production_trade_gate_for_model_authority():
+    signals = extract_entry_signal_sides(
+        {
+            "ml_signal": _ml_payload("long", 0.81),
+            "production_trade_gate": {
+                "can_trade": True,
+                "mode": "live_ml",
+                "decision_authority": "model",
+                "model_can_influence": True,
+            },
+        }
+    )
+
+    assert signals["ml"]["available"] is True
+    assert signals["ml"]["production_eligible"] is True
 
 
 def test_profit_attribution_excludes_untrusted_closed_position_facts():

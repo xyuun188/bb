@@ -96,7 +96,7 @@ def _compact_prediction(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "available": payload.get("available"),
         "route_mode": payload.get("route_mode"),
-        "live_influence": payload.get("live_influence"),
+        "live_ml_ready": payload.get("live_ml_ready"),
         "model_version": payload.get("model_version"),
         "trained_sample_count": payload.get("trained_sample_count"),
         "prediction_quality": payload.get("prediction_quality"),
@@ -129,8 +129,8 @@ async def replay(*, decision_id: int, retrain_shadow: bool) -> dict[str, Any]:
     violations = [*after["invariant_violations"]]
     if forbidden_present:
         violations.append("inference_features_contain_realized_outcome_facts")
-    if after.get("live_influence") is True:
-        violations.append("shadow_replay_unexpectedly_enabled_live_influence")
+    if after.get("live_ml_ready") is True:
+        violations.append("shadow_replay_unexpectedly_live_ml_ready")
     if not linked_outcomes:
         violations.append("authoritative_outcome_not_linked_to_decision")
     return {

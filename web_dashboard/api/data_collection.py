@@ -41,7 +41,10 @@ from services.okx_training_gate import okx_training_refresh_gate
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import (
+    CURRENT_TRAINING_EPOCH_POLICY,
+    load_training_epoch_start,
+)
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api import dashboard as _dash
 from web_dashboard.api.security import require_dashboard_write_access
@@ -757,8 +760,7 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             "local_ai_quality_report": shadow_report,
             "local_ml_signal": shadow_report,
             "local_ml_quality_report": shadow_report,
-            "local_ml_trainable_shadow_sample_count": completed_count,
-            "current_epoch_trainable_shadow_sample_count": completed_count,
+            "training_shadow_sample_count": completed_count,
             "quarantined_shadow_sample_count": quarantined_count,
             "historical_audit_shadow_sample_count": 0,
             "training_quarantine": {
@@ -895,12 +897,6 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             return {"trained": False, "reason": "train_method_missing"}
         completed_shadow_count = await _completed_shadow_sample_count()
         completed_trade_count = await _completed_trade_sample_count()
-        raw_trade_sample_count = len(trade_samples)
-        trainable_trade_sample_count = len(payload["trade_samples"])
-        quarantined_trade_sample_count = max(
-            raw_trade_sample_count - trainable_trade_sample_count,
-            0,
-        )
         paper_observation_report = load_latest_paper_observation_report()
         return_objective_report = build_return_objective_report(
             trade_samples=payload["trade_samples"],
@@ -923,10 +919,7 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
             source="dashboard_training_governance_refresh",
             completed_shadow_sample_count=completed_shadow_count,
             completed_trade_sample_count=completed_trade_count,
-            raw_trade_sample_count=raw_trade_sample_count,
-            trainable_trade_sample_count=trainable_trade_sample_count,
-            quarantined_trade_sample_count=quarantined_trade_sample_count,
-            trade_sample_cursor_policy="clean_training_view_only",
+            trade_sample_cursor_policy=CURRENT_TRAINING_EPOCH_POLICY,
             quality_report=payload["quality_report"],
             governance_report=payload["governance_report"],
             training_mode="shadow",
@@ -940,10 +933,7 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
         result.setdefault("return_objective_report", return_objective_report)
         result.setdefault("promotion_recommendation", promotion_recommendation)
         result.setdefault("paper_observation_report", paper_observation_report)
-        result.setdefault("raw_trade_sample_count", raw_trade_sample_count)
-        result.setdefault("trainable_trade_sample_count", trainable_trade_sample_count)
-        result.setdefault("quarantined_trade_sample_count", quarantined_trade_sample_count)
-        result.setdefault("trade_sample_cursor_policy", "clean_training_view_only")
+        result.setdefault("trade_sample_cursor_policy", CURRENT_TRAINING_EPOCH_POLICY)
         result.setdefault("persist_artifact_requested", True)
         result.setdefault("confirm_phase3_rebuild", True)
         return result

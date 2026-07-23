@@ -575,7 +575,7 @@ def test_okx_daily_reconciliation_data_integrity_issue_blocks_entry_and_training
     assert report["can_open_new_entries"] is False
     assert report["can_refresh_training"] is False
     assert report["requires_attention"] is True
-    assert report["operational_gates"]["training_policy"] == "clean_training_view_only"
+    assert report["operational_gates"]["training_policy"] == "current_training_epoch_only"
     assert report["operational_gates"]["training_blockers"][0]["card_key"] == (
         "okx_trade_fact_integrity"
     )

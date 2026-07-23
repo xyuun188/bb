@@ -532,8 +532,6 @@ def entry_signal_payloads(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def extract_entry_signal_sides(
     raw: dict[str, Any],
-    *,
-    ml_influence_enabled: bool = True,
 ) -> dict[str, Any]:
     payloads = entry_signal_payloads(raw)
     ml = payloads["ml"]
@@ -541,6 +539,13 @@ def extract_entry_signal_sides(
     profit = payloads["server_profit"]
     timeseries = payloads["timeseries"]
     sentiment = payloads["sentiment"]
+    trade_gate = safe_dict(raw.get("production_trade_gate"))
+    ml_production_eligible = bool(
+        trade_gate.get("can_trade") is True
+        and trade_gate.get("mode") == "live_ml"
+        and trade_gate.get("decision_authority") == "model"
+        and trade_gate.get("model_can_influence") is True
+    )
     ml_side = payload_side(primary_ml)
     profit_side = payload_side(profit)
     timeseries_side = payload_side(timeseries)
@@ -577,7 +582,7 @@ def extract_entry_signal_sides(
     signals: dict[str, dict[str, Any]] = {
         "ml": {
             **distribution_signal(ml, ml_side),
-            "influence_enabled": bool(ml_influence_enabled),
+            "production_eligible": ml_production_eligible,
         },
         "server_profit": distribution_signal(profit, profit_side),
         "timeseries": distribution_signal(timeseries, timeseries_side),

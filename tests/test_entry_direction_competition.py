@@ -67,7 +67,6 @@ def _governed_ml(long_return: float, short_return: float) -> dict:
     return {
         **_governed_payload(long_return, short_return),
         "live_ml_ready": True,
-        "influence_enabled": True,
         "influence_policy": {
             "long": {"enabled": True},
             "short": {"enabled": True},
@@ -149,9 +148,7 @@ def test_shadow_model_still_exposes_direction_for_paper_training() -> None:
     payload.update(
         {
             "route_mode": "shadow_observation",
-            "live_influence": False,
             "live_ml_ready": False,
-            "influence_enabled": False,
             "promotion_ready": False,
         }
     )

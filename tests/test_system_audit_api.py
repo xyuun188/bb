@@ -203,7 +203,7 @@ def _patch_historical_trade_fact_audit(
         "read_only": True,
         "audit_only": True,
         "cleanup_mode": "quarantine_not_delete",
-        "training_policy": "clean_training_view_only",
+        "training_policy": "current_training_epoch_only",
         "checked_closed_positions": 0,
         "trainable_closed_positions": 0,
         "quarantined_closed_positions": 0,
@@ -237,7 +237,7 @@ def _patch_artifact_retirement_audit(
         "audit_only": True,
         "raw_artifacts_preserved": True,
         "can_delete_artifacts": False,
-        "training_policy": "clean_training_view_only",
+        "training_policy": "current_training_epoch_only",
         "artifact_count": 1,
         "phase3_compatible_count": 1,
         "retired_or_untrusted_count": 0,
@@ -345,7 +345,6 @@ def _patch_phase3_stage_handoff_audit(
                 "starts_trading_service": False,
                 "submits_orders": False,
                 "changes_model_routing": False,
-                "live_mutation": False,
                 "can_start_paper_with_operator_approval": stage_status == "paper_start_ready",
                 "can_enter_canary_with_operator_approval": False,
                 "can_enter_live": False,
@@ -1171,7 +1170,6 @@ async def test_model_training_audit_does_not_run_full_self_check(
             "completed_count": 20,
             "eligible_shadow_count": 12,
             "model_count": 1,
-            "live_mutation": False,
             "promotion_flow": "candidate_to_shadow_to_canary_to_active",
             "summary": {"promotion_ready_count": 0, "blocked_count": 1},
             "models": [
@@ -1193,7 +1191,7 @@ async def test_model_training_audit_does_not_run_full_self_check(
             "read_only": True,
             "audit_only": True,
             "cleanup_mode": "quarantine_not_delete",
-            "training_policy": "clean_training_view_only",
+            "training_policy": "current_training_epoch_only",
             "checked_closed_positions": 9,
             "trainable_closed_positions": 7,
             "quarantined_closed_positions": 2,
@@ -1227,7 +1225,7 @@ async def test_model_training_audit_does_not_run_full_self_check(
     assert health["items"][1]["kind"] == "specialist_shadow_evidence_source"
     assert card["evidence"][-1]["value"] == 12
     historical = card["details"]["historical_trade_fact_audit"]
-    assert historical["training_policy"] == "clean_training_view_only"
+    assert historical["training_policy"] == "current_training_epoch_only"
     assert historical["cleanup_mode"] == "quarantine_not_delete"
     assert historical["quarantined_closed_positions"] == 2
     assert historical["can_delete_history"] is False
@@ -1286,7 +1284,6 @@ async def test_model_training_audit_skips_duplicate_feature_coverage(
             "completed_count": 0,
             "eligible_shadow_count": 0,
             "model_count": 0,
-            "live_mutation": False,
             "summary": {"promotion_ready_count": 0, "blocked_count": 0},
             "models": [],
         },
@@ -1342,7 +1339,7 @@ async def test_model_training_audit_surfaces_missing_specialist_shadow_report(
     specialist = card["details"]["specialist_shadow_evaluation"]
     assert specialist["available"] is False
     assert specialist["reason"] == "specialist_shadow_evaluation_report_missing"
-    assert specialist["live_mutation"] is False
+    assert "live_mutation" not in specialist
 
 
 @pytest.mark.asyncio
@@ -1388,7 +1385,7 @@ async def test_model_training_audit_reports_retired_artifacts_as_rebuild_gate(
             "audit_only": True,
             "raw_artifacts_preserved": True,
             "can_delete_artifacts": False,
-            "training_policy": "clean_training_view_only",
+            "training_policy": "current_training_epoch_only",
             "artifact_count": 2,
             "phase3_compatible_count": 0,
             "retired_or_untrusted_count": 2,
@@ -1487,7 +1484,7 @@ async def test_model_training_audit_runs_database_reports_serially(
                 "read_only": True,
                 "audit_only": True,
                 "cleanup_mode": "quarantine_not_delete",
-                "training_policy": "clean_training_view_only",
+                "training_policy": "current_training_epoch_only",
                 "checked_closed_positions": 0,
                 "trainable_closed_positions": 0,
                 "quarantined_closed_positions": 0,
@@ -1515,7 +1512,6 @@ async def test_model_training_audit_runs_database_reports_serially(
             "completed_count": 0,
             "eligible_shadow_count": 0,
             "model_count": 0,
-            "live_mutation": False,
             "summary": {"promotion_ready_count": 0, "blocked_count": 0},
             "models": [],
         },
@@ -2526,7 +2522,7 @@ async def test_model_training_status_timeout_is_observing_when_runtime_tools_are
             "read_only": True,
             "audit_only": True,
             "cleanup_mode": "quarantine_not_delete",
-            "training_policy": "clean_training_view_only",
+            "training_policy": "current_training_epoch_only",
             "checked_closed_positions": 57,
             "trainable_closed_positions": 57,
             "quarantined_closed_positions": 0,
@@ -2543,7 +2539,6 @@ async def test_model_training_status_timeout_is_observing_when_runtime_tools_are
             "completed_count": 0,
             "eligible_shadow_count": 0,
             "model_count": 0,
-            "live_mutation": False,
             "summary": {"promotion_ready_count": 0, "blocked_count": 0},
             "models": [],
         },

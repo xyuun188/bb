@@ -232,7 +232,7 @@
 - `decision_authority=rules` 的真实成交收益不进入模型收益分布，只保留真实手续费、资金费、滑点和证据指纹，用于规则归因、执行成本校准和 `model_shadow_alignment` 诊断。
 - 模型影子方向缺失时直接隔离，不能从规则成交方向、旧字段或默认值推导。
 - 晋升报告的均值、下四分位和 Profit Factor 使用样本相关性权重；规则亏损不会通过另一条 readiness 或远端 artifact 校验链间接惩罚模型。
-- `model_stage`、`evaluation_policy.live_mutation` 不再是训练请求的授权输入；artifact 只按晋升报告生成 candidate -> shadow -> canary -> active。
+- `model_stage` 不再是训练请求的授权输入；`live_mutation` 已从运行代码、接口和预检 blocker 中删除，artifact 只按晋升报告生成 candidate -> shadow -> canary -> active。
 - registry 和远端量化服务已升级为新版本，旧 artifact 不迁移、不双读，必须通过显式衍生数据清理后重新生成。
 
 ## 14. 派生训练层彻底重置合同
@@ -260,3 +260,12 @@
 - 删除合约面值缺失时使用 `ctVal=1` 的默认回退。数量一致性只接受 OKX `base_quantity`，或 `filled_contracts * ctVal` 的可验证换算。
 - 缺少 `base_quantity/ctVal` 时明确输出 `contract_specification_evidence_missing`，禁止生成虚假的数量差异和名义金额差异；该事实必须补齐证据后才能进入训练。
 - 当前 epoch marker 缺失或损坏时三个当前态审计全部失败关闭，不读取固定日期、不读取旧 marker、不放行历史窗口。
+
+## 17. 训练策略与模型授权唯一字段
+
+- 训练策略只保留 `current_training_epoch_only`，唯一常量为 `services.training_epoch.CURRENT_TRAINING_EPOCH_POLICY`；删除 `clean_training_view_only` 和对应 Phase 3 常量。
+- 删除训练接口和预检报告顶层的 `raw_*`、`trainable_*`、`quarantined_*` 重复计数；当前训练样本只发布 `training_shadow_sample_count` 和 `training_trade_sample_count`，隔离统计留在质量报告。
+- 模型生产授权只保留 `live_ml_ready`；删除 `live_mutation`、`live_trading_mutation` 和 `live_influence`，Dashboard、registry、远端量化客户端和回放统一读取新字段。
+- 单次预测能否参与当前决策使用 `prediction_eligible` / `ml_prediction_eligible` 表示，但它不能授予生产权限；生产权限仍只来自 `production_trade_gate`。
+- 盈亏归因不再接受默认 ML 影响开关。只有当 `production_trade_gate` 同时满足 `can_trade=true`、`mode=live_ml`、`decision_authority=model`、`model_can_influence=true` 时，交易才标记为模型生产责任；无闸门和规则小仓交易一律不归责给模型。
+- 本地量化 API 没有当前 epoch artifact 时必须显式返回 `trained=false`、`live_ml_ready=false`、`production_permission=false`、`production_eligible=false`，不得伪造 `loss_probability` 或收益预测；部署 smoke 同时验证无 artifact 的观察态和有 artifact 的晋升态。

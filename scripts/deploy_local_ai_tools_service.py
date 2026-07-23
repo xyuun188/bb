@@ -80,7 +80,7 @@ PHASE3_DOWNLOAD_REPORT_PATH = (
     PHASE3_ROOT / "reports" / "inventory" / "phase3_model_download_manifest_latest.json"
 )
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
-PHASE3_REQUIRED_TRAINING_POLICY = "clean_training_view_only"
+CURRENT_TRAINING_EPOCH_POLICY = "current_training_epoch_only"
 PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
 LOCAL_REVIEW_DISABLED_DETAIL = (
     "Local AI tools do not provide high-risk trade review. "
@@ -3213,7 +3213,6 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "sequence_source": sequence_source,
             "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
         }
     try:
         import pandas as pd
@@ -3276,7 +3275,6 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
                 "actual_inference": False,
                 "reason": "chronos_empty_prediction",
                 "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-                "live_mutation": False,
             }
         horizon_index = min(horizon_step, len(predictions)) - 1
         last_close = closes[-1]
@@ -3320,7 +3318,6 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "prediction_count": len(predictions),
             "adapter": "chronos_2_pipeline_adapter",
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
         }
     except Exception as exc:
         return {
@@ -3333,7 +3330,6 @@ def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "actual_inference": False,
             "reason": safe_error(exc, 220),
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
         }
 
 
@@ -3353,7 +3349,6 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "sequence_source": sequence_source,
             "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
         }
     try:
         horizon_step = int(
@@ -3384,7 +3379,6 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
                 "actual_inference": False,
                 "reason": "timesfm_empty_prediction" if not backend_error else backend_error,
                 "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-                "live_mutation": False,
             }
         horizon_index = min(horizon_step, len(predictions)) - 1
         last_close = closes[-1]
@@ -3432,7 +3426,6 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "backend": backend,
             "model_dir": model_dir.as_posix(),
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
         }
     except Exception as exc:
         return {
@@ -3445,7 +3438,6 @@ def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
             "actual_inference": False,
             "reason": safe_error(exc, 220),
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-            "live_mutation": False,
         }
 
 
@@ -3491,7 +3483,6 @@ def _attach_timeseries_specialist_shadow(
         "primary_shadow_result": primary_shadow,
         "challenger_shadow_result": challenger_shadow,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
     }
     payload["fallback_reason"] = (
         "specialist_timeseries_shadow_only"
@@ -3621,7 +3612,6 @@ def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
         "tool": tool,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
     }
     for key in keys:
         if key in payload:
@@ -3654,8 +3644,8 @@ def with_model_metadata(
     payload.setdefault("fallback_reason", fallback_reason)
     payload.setdefault("feature_coverage", _feature_coverage(features or {}))
     payload.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
-    payload.setdefault("live_mutation", False)
     payload.setdefault("production_permission", False)
+    payload.setdefault("live_ml_ready", False)
     if payload.get("trained") is True:
         bundle = load_bundle()
         metadata = bundle.get("metadata") if isinstance(bundle, dict) else {}
@@ -3699,13 +3689,10 @@ def with_model_metadata(
                 distribution_input["blockers"] = list(dict.fromkeys(blockers))
                 distribution_input["production_eligible"] = False
             payload["route_mode"] = f"{activation_stage}_observation"
-            payload["live_mutation"] = False
             payload["production_permission"] = False
             payload["live_ml_ready"] = False
         else:
             payload["route_mode"] = "live"
-            payload["live_mutation"] = True
-            payload["live_influence"] = True
             payload["production_permission"] = True
             payload["live_ml_ready"] = True
         distribution_inputs_ready = all(
@@ -3952,7 +3939,6 @@ def _specialist_adapter_preflight(kind: str | None = None) -> dict[str, Any]:
         "root": PHASE3_ROOT.as_posix(),
         "policy": "phase3_specialist_adapter_preflight",
         "stage": "preflight_only",
-        "live_mutation": False,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
         "all_artifacts_ready": bool(rows) and all(row["artifact_ready"] for row in rows),
         "all_required_imports_ready": bool(rows)
@@ -3988,7 +3974,6 @@ def _specialist_model_chain(kind: str) -> dict[str, Any]:
         "actual_inference": False,
         "activation_gate": "specialist_adapter_and_walk_forward_required",
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
         "models": models,
     }
 
@@ -4017,7 +4002,6 @@ def _attach_specialist_shadow(
         "baseline_response": True,
         "activation_blocker": "specialist_adapter_and_walk_forward_required",
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
     }
     payload["fallback_reason"] = fallback_reason
     payload.pop("shadow_payload", None)
@@ -4054,7 +4038,6 @@ def _attach_baseline_only_shadow(
         "baseline_response": True,
         "activation_blocker": fallback_reason,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
     }
     payload["fallback_reason"] = fallback_reason
     return with_model_metadata(
@@ -4224,7 +4207,6 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
         "disagreement": round(disagreement, 6) if disagreement is not None else None,
         "predictions": predictions,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": False,
     }
 
 
@@ -4241,8 +4223,6 @@ def health() -> dict[str, Any]:
         "port": PHASE3_API_PORT,
         "policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
-        "live_mutation": live_authorized,
-        "live_trading_mutation": live_authorized,
         "route_mode": "live" if live_authorized else "shadow_observation",
         "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
         "review_backend": "disabled_use_trading_app_online_model",
@@ -4702,8 +4682,8 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
         "return_objective_report": req.return_objective_report or {},
-        "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
-        "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+        "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "training_mode": str(req.training_mode or "shadow"),
         "model_stage": "candidate",
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -5663,7 +5643,6 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
         "action": "hold",
         "reason": "本地退出画像只提供观察事实；生产平仓由动态退出契约独占。",
         "observations": observations,
-        "live_mutation": False,
         "production_permission": False,
     }, features=features, fallback_reason="dynamic_exit_policy_owns_production_exit")
 
@@ -5743,7 +5722,6 @@ def render_phase3_deploy_plan() -> dict[str, Any]:
         "port": PHASE3_API_PORT,
         "health_url": f"http://127.0.0.1:{PHASE3_API_PORT}/health",
         "shadow_only": True,
-        "live_mutation": False,
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "legacy_root_used": False,
     }
@@ -5869,26 +5847,33 @@ def _remote_smoke_command() -> str:
         "    'volume_ratio': 1.1,\n"
         "}\n"
         "health = get('/health')\n"
-        "live = health.get('artifact_lifecycle') in {'active', 'live'}\n"
+        "lifecycle = health.get('artifact_lifecycle')\n"
+        "has_artifact = lifecycle in {'shadow', 'canary', 'active'}\n"
+        "live = lifecycle == 'active'\n"
         "profit = post('/profit/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
         "exit_advice = post('/exit/advise', {'symbol': 'BTC/USDT', 'features': features, 'open_positions': []})\n"
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
-        "assert health.get('live_mutation') is live, health\n"
-        "assert health.get('artifact_lifecycle') in {'shadow', 'canary', 'active'}, health\n"
+        "assert lifecycle in {'unregistered', 'shadow', 'canary', 'active'}, health\n"
         "assert health.get('live_ml_ready') is live, health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('activation_stage') in {'shadow', 'canary', 'active'}, health\n"
-        "assert health.get('artifact_activation_manifest', {}).get('live_ml_ready') is live, health\n"
-        "assert profit.get('trained') is True, profit\n"
+        "activation = health.get('artifact_activation_manifest') or {}\n"
+        "if has_artifact:\n"
+        "    assert activation.get('activation_stage') == lifecycle, health\n"
+        "    assert activation.get('live_ml_ready') is live, health\n"
+        "else:\n"
+        "    assert not activation, health\n"
+        "assert profit.get('trained') is has_artifact, profit\n"
         "assert profit.get('shadow_payload', {}).get('tool') == 'profit_prediction', profit\n"
-        "assert profit.get('live_mutation') is False, profit\n"
         "assert profit.get('production_permission') is live, profit\n"
         "assert profit.get('live_ml_ready') is live, profit\n"
         "assert profit.get('prediction_quality', {}).get('production_eligible') is live, profit\n"
         "assert profit.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', profit\n"
         "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
         "assert all(item.get('production_eligible') is live for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
-        "assert 'loss_probability' in profit, profit\n"
+        "if has_artifact:\n"
+        "    assert 'loss_probability' in profit, profit\n"
+        "else:\n"
+        "    assert 'loss_probability' not in profit, profit\n"
         "assert exit_advice.get('action') == 'hold', exit_advice\n"
         "assert exit_advice.get('no_matching_position') is True, exit_advice\n"
         "print(json.dumps({\n"
@@ -5904,7 +5889,6 @@ def _remote_smoke_command() -> str:
         "    },\n"
         "    'profit_contract': {\n"
         "        'shadow_payload': bool(profit.get('shadow_payload')),\n"
-        "        'live_mutation': profit.get('live_mutation'),\n"
         "        'promotion_flow': profit.get('promotion_flow'),\n"
         "        'production_eligible': profit.get('prediction_quality', {}).get('production_eligible'),\n"
         "        'production_permission': profit.get('production_permission'),\n"

@@ -326,7 +326,6 @@ async def test_phase3_handoff_audit_is_permissionless_observation(
                 "starts_trading_service": False,
                 "submits_orders": False,
                 "changes_model_routing": False,
-                "live_mutation": False,
                 "blockers": [],
                 "warnings": [{"code": "observation_report_missing"}],
             }
@@ -365,4 +364,4 @@ async def test_strategy_closed_loop_is_critical_for_execution_contract_gap(
 
     assert card["status"] == "critical"
     assert card["details"]["audit_only"] is True
-    assert card["details"]["live_mutation"] is False
+    assert "live_mutation" not in card["details"]

@@ -31,6 +31,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 from config.settings import settings  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text  # noqa: E402
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY  # noqa: E402
 from web_dashboard.api import system_audit  # noqa: E402
 
 DEFAULT_REPORT_DIR = "okx_daily_reconciliation_reports"
@@ -393,7 +394,7 @@ def _operational_gates_from_cards(
         "requires_attention": requires_attention,
         "can_apply_repair": False,
         "can_write_database": False,
-        "training_policy": "clean_training_view_only",
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "entry_blockers": entry_blockers,
         "training_blockers": training_blockers,
         "attention_items": attention_items,

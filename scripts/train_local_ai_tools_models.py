@@ -40,7 +40,10 @@ from services.training_data_quality import (
     annotate_training_payload,
     artifact_bound_governance_report,
 )
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import (
+    CURRENT_TRAINING_EPOCH_POLICY,
+    load_training_epoch_start,
+)
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
@@ -146,7 +149,6 @@ _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "baseline_model",
     "activation_blocker",
     "promotion_flow",
-    "live_mutation",
 }
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -779,9 +781,6 @@ async def _main() -> None:
         )
     completed_shadow_count = await _completed_shadow_sample_count()
     completed_trade_count = await _completed_trade_sample_count()
-    raw_trade_sample_count = len(trade_samples)
-    trainable_trade_sample_count = len(training_payload["trade_samples"])
-    quarantined_trade_sample_count = max(raw_trade_sample_count - trainable_trade_sample_count, 0)
     paper_observation_report = load_latest_paper_observation_report()
     return_objective_report = build_return_objective_report(
         trade_samples=training_payload["trade_samples"],
@@ -796,10 +795,7 @@ async def _main() -> None:
         "text_sentiment_samples": training_payload["text_sentiment_samples"],
         "completed_shadow_sample_count": completed_shadow_count,
         "completed_trade_sample_count": completed_trade_count,
-        "raw_trade_sample_count": raw_trade_sample_count,
-        "trainable_trade_sample_count": trainable_trade_sample_count,
-        "quarantined_trade_sample_count": quarantined_trade_sample_count,
-        "trade_sample_cursor_policy": "clean_training_view_only",
+        "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "training_quarantine": quarantine_result,
         "quality_report": training_payload["quality_report"],
         "governance_report": training_payload["governance_report"],

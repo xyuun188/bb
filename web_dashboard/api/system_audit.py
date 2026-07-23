@@ -65,7 +65,10 @@ from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAud
 from services.strong_opportunity import StrongOpportunityService
 from services.trade_execution_contract import TradeExecutionContractService
 from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import (
+    CURRENT_TRAINING_EPOCH_POLICY,
+    load_training_epoch_start,
+)
 from web_dashboard.api import data_collection as data_collection_api
 from web_dashboard.api.text_sanitize import sanitize_payload
 
@@ -934,7 +937,6 @@ def _specialist_shadow_latest_report() -> dict[str, Any]:
     return {
         "available": False,
         "ok": False,
-        "live_mutation": False,
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "completed_count": 0,
         "eligible_shadow_count": 0,
@@ -1213,36 +1215,6 @@ def _load_trading_runtime_audit_window() -> dict[str, Any]:
     }
 
 
-
-
-def _ml_influence_reason_from_decisions(decisions: list[Any]) -> dict[str, Any]:
-    reasons: Counter[str] = Counter()
-    influence_flags: Counter[str] = Counter()
-    for row in decisions:
-        opportunity = _decision_opportunity(row)
-        if "ml_influence_enabled" in opportunity:
-            influence_flags[str(bool(opportunity.get("ml_influence_enabled"))).lower()] += 1
-        components = _decision_evidence(row).get("components")
-        if not isinstance(components, list):
-            continue
-        for component in components:
-            if not isinstance(component, dict) or component.get("source") != "ml":
-                continue
-            reason = str(component.get("reason") or component.get("status") or "unknown")
-            reasons[reason[:160]] += 1
-    if not reasons:
-        summary = "最近开仓候选没有返回 ML 证据组件。"
-    elif reasons.most_common(1)[0][0] == "ignored":
-        summary = "ML 组件被标记为 ignored，但未写入具体原因，需要检查证据构建上下文。"
-    else:
-        summary = reasons.most_common(1)[0][0]
-    return {
-        "summary": summary,
-        "top_reasons": [
-            {"reason": reason, "count": count} for reason, count in reasons.most_common(5)
-        ],
-        "ml_influence_enabled_flags": dict(influence_flags),
-    }
 
 
 async def _trade_loop_audit() -> dict[str, Any]:
@@ -3005,7 +2977,6 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         ),
         details={
             "audit_only": True,
-            "live_mutation": False,
             "strategy_signal": root_report,
             "trade_execution_contract": contract_report,
         },
@@ -3420,7 +3391,7 @@ async def _model_training_audit() -> dict[str, Any]:
             "audit_only": True,
             "error": safe_error_text(historical_trade_facts, limit=180),
             "cleanup_mode": "quarantine_not_delete",
-            "training_policy": "clean_training_view_only",
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
             "can_delete_history": False,
             "can_apply_repair": False,
         }
@@ -3688,7 +3659,6 @@ async def _model_training_audit() -> dict[str, Any]:
                     :8
                 ],
                 "models": specialist_models[:8],
-                "live_mutation": bool(specialist_shadow_evaluation.get("live_mutation")),
                 "promotion_flow": specialist_shadow_evaluation.get("promotion_flow")
                 or "candidate_to_shadow_to_canary_to_active",
                 "reason": specialist_shadow_evaluation.get("reason"),
@@ -4523,7 +4493,6 @@ def _issue_ledger_state(
             and not bool(details.get("starts_trading_service"))
             and not bool(details.get("submits_orders"))
             and not bool(details.get("changes_model_routing"))
-            and not bool(details.get("live_mutation"))
             and not _safe_list(details.get("blockers"))
         ):
             return "observing", "观察项 / 动态费后收益准备状态"
@@ -4629,7 +4598,6 @@ def _issue_ledger_state(
         and not bool(details.get("starts_trading_service"))
         and not bool(details.get("submits_orders"))
         and not bool(details.get("changes_model_routing"))
-        and not bool(details.get("live_mutation"))
     ):
         return "observing", "观察项 / 模拟盘恢复预热窗口"
     if (

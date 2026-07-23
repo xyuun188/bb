@@ -158,10 +158,7 @@ def evaluate_phase3_stage_handoff_inputs(
     else:
         warnings.append(_warning("okx_report_missing", "OKX reconciliation report is missing."))
 
-    if specialist.get("available") and (
-        specialist.get("live_mutation") is True
-        or specialist.get("production_permission") is True
-    ):
+    if specialist.get("available") and specialist.get("production_permission") is True:
         blockers.append(
             _blocker(
                 "specialist_observation_boundary_violated",
@@ -194,7 +191,6 @@ def evaluate_phase3_stage_handoff_inputs(
         "changes_position_size": False,
         "changes_leverage": False,
         "changes_model_promotion": False,
-        "live_mutation": False,
         "blockers": blockers,
         "warnings": warnings,
         "passed_checks": passed,

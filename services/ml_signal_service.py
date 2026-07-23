@@ -35,7 +35,6 @@ from models.learning import ShadowBacktest
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
-    PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.dynamic_policy_values import empirical_policy_value
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
@@ -76,7 +75,10 @@ from services.training_data_quality import (
     governance_report,
     quality_report,
 )
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import (
+    CURRENT_TRAINING_EPOCH_POLICY,
+    load_training_epoch_start,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -2022,8 +2024,8 @@ def train_from_frame(
         ),
         "feature_keys": FEATURE_KEYS,
         "mode": "entry_profit_filter",
-        "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
-        "trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+        "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "training_mode": "walk_forward",
         "model_stage": "candidate",
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -2190,7 +2192,6 @@ class MLSignalService:
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
             "live_ml_ready": live_ml_ready,
-            "influence_enabled": live_ml_ready,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_note": model_note,
@@ -2700,9 +2701,6 @@ class MLSignalService:
                         "live_ml_ready": bool(
                             readiness.get("live_ml_ready")
                         ),
-                        "influence_enabled": bool(
-                            readiness.get("live_ml_ready")
-                        ),
                         "artifact_persisted": True,
                         "artifact_version": (
                             current_artifact.version
@@ -2858,7 +2856,6 @@ class MLSignalService:
                     "readiness": trained_readiness,
                     "readiness_state": trained_readiness.get("state"),
                     "live_ml_ready": live_ml_ready,
-                    "influence_enabled": live_ml_ready,
                     "influence_policy": trained_influence,
                     "artifact_persisted": bool(trained_metadata.get("artifact_persisted")),
                     "artifact_version": activated_artifact.version,
@@ -3345,7 +3342,7 @@ class MLSignalService:
                         and profit_edge > 0.0
                     ),
                     "risk_score": round(risk_score, 4),
-                    "ml_influence_enabled": bool(
+                    "ml_prediction_eligible": bool(
                         live_ml_ready
                         and side_influence.get("enabled")
                         and selected_market_distribution_ready
@@ -3409,7 +3406,6 @@ class MLSignalService:
             "route_mode": (
                 "live" if live_prediction_influence else "shadow_observation"
             ),
-            "live_influence": live_prediction_influence,
             "live_ml_ready": live_ml_ready,
             "objective_name": metadata.get("objective_name"),
             "objective_version": metadata.get("objective_version"),
@@ -3473,7 +3469,7 @@ class MLSignalService:
             ),
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
-            "influence_enabled": live_prediction_influence,
+            "prediction_eligible": live_prediction_influence,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_version": strategy_blueprint.get("model_version"),

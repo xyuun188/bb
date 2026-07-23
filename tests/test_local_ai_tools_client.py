@@ -235,10 +235,7 @@ async def test_local_ai_tools_train_sends_training_cursors(
         [{"id": 2}],
         completed_shadow_sample_count=1234,
         completed_trade_sample_count=56,
-        raw_trade_sample_count=80,
-        trainable_trade_sample_count=56,
-        quarantined_trade_sample_count=24,
-        trade_sample_cursor_policy="clean_training_view_only",
+        trade_sample_cursor_policy="current_training_epoch_only",
         promotion_recommendation={
             "policy": "phase3_candidate_to_shadow_to_canary_to_active",
             "recommended_stage": "shadow",
@@ -249,10 +246,7 @@ async def test_local_ai_tools_train_sends_training_cursors(
     assert captured["path"] == "/train"
     assert captured["payload"]["completed_shadow_sample_count"] == 1234
     assert captured["payload"]["completed_trade_sample_count"] == 56
-    assert captured["payload"]["raw_trade_sample_count"] == 80
-    assert captured["payload"]["trainable_trade_sample_count"] == 56
-    assert captured["payload"]["quarantined_trade_sample_count"] == 24
-    assert captured["payload"]["trade_sample_cursor_policy"] == "clean_training_view_only"
+    assert captured["payload"]["trade_sample_cursor_policy"] == "current_training_epoch_only"
     assert captured["payload"]["training_mode"] == "shadow"
     assert "model_stage" not in captured["payload"]
     assert "evaluation_policy" not in captured["payload"]
@@ -880,7 +874,7 @@ async def test_local_ai_tools_status_preserves_health_supervision_and_route_cont
             "profit_supervision_version": "separated-supervision-v1",
             "profit_supervision_report": supervision,
             "route_mode": "shadow_observation",
-            "live_mutation": False,
+            "live_ml_ready": False,
             "artifact_persisted": True,
         }
 
@@ -901,7 +895,7 @@ async def test_local_ai_tools_status_preserves_health_supervision_and_route_cont
     assert result["label_version"] == "separated-label-v2"
     assert result["cost_model_version"] == "authoritative-cost-v2"
     assert result["route_mode"] == "shadow_observation"
-    assert result["live_mutation"] is False
+    assert result["live_ml_ready"] is False
     assert result["artifact_persisted"] is True
 
 

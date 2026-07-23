@@ -2677,7 +2677,7 @@ function renderAnalysisMlSignal(signal) {
                 </span>
             </div>`;
     }).join('');
-    const influenceEnabled = signal.influence_enabled !== false && (signal.mode === 'entry_profit_filter' || signal.status === 'entry_profit_filter');
+    const influenceEnabled = signal.prediction_eligible === true && (signal.mode === 'entry_profit_filter' || signal.status === 'entry_profit_filter');
     const modeLabel = influenceEnabled
         ? '参与开仓过滤'
         : '学习观察中';
@@ -5231,7 +5231,7 @@ function renderDataCollectionTraining(training) {
     const localGovernance = governance.local_ai_tools || localTools.governance_report || {};
     const mlGovernance = governance.local_ml_signal || {};
     const currentEpochCount = Number(
-        governance.current_epoch_trainable_shadow_sample_count
+        governance.training_shadow_sample_count
         ?? localGovernance.current_epoch_trainable_sample_count
         ?? 0
     );
@@ -9805,7 +9805,7 @@ function renderMLSignalOverview() {
     const readinessBlockers = Array.isArray(readiness.blocking_reasons) ? readiness.blocking_reasons : [];
     const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
     const allowLivePositionInfluence = status.live_ml_ready === true;
-    const influenceEnabled = status.influence_enabled === true && allowLivePositionInfluence;
+    const influenceEnabled = allowLivePositionInfluence;
     const controlledReadinessDegrade = ready && !allowLivePositionInfluence && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
     const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;
     const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
@@ -9975,7 +9975,7 @@ function renderTrainableModels() {
         description: `任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
         samples: `${mlSampleCountLabel(mlOptionalNumber(model.sample_count))} 条可追溯样本`,
         trainedAt: model.trained_at ? toBeijingTime(model.trained_at) : '-',
-        usage: model.live_influence ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
+        usage: model.live_ml_ready ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
         metrics: [
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },

@@ -1099,7 +1099,6 @@ def summarize_specialist_shadow_evaluation(
         "ok": True,
         "generated_at": datetime.now(UTC).isoformat(),
         "policy": "phase3_specialist_shadow_evaluation_v2",
-        "live_mutation": False,
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "completed_count": completed_count,
         "eligible_shadow_count": eligible_count,

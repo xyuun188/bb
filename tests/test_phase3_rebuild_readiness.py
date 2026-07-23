@@ -14,7 +14,7 @@ def test_phase3_rebuild_readiness_blocks_when_clean_training_inputs_are_weak() -
         historical_trade_fact_audit={
             "status": "dirty",
             "trainable_closed_positions": 0,
-            "training_policy": "clean_training_view_only",
+            "training_policy": "current_training_epoch_only",
         },
         artifact_retirement_audit={"status": "ready", "retired_or_untrusted_count": 0},
         runtime_probe={"status": "ok"},
@@ -51,7 +51,7 @@ def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() 
         historical_trade_fact_audit={
             "status": "clean",
             "trainable_closed_positions": 80,
-            "training_policy": "clean_training_view_only",
+            "training_policy": "current_training_epoch_only",
         },
         artifact_retirement_audit={
             "status": "ready_with_retired_legacy",

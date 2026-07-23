@@ -7,7 +7,6 @@ import pytest
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
-    PHASE3_REQUIRED_TRAINING_POLICY,
     ArtifactRetirementAuditService,
 )
 from services.ml_signal_service import MLSignalService
@@ -23,6 +22,7 @@ from services.return_objective import (
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
 )
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 SOURCE_CODE_SHA256 = "b" * 64
 SOURCE_CODE_VERSION = f"source-sha256:{SOURCE_CODE_SHA256}"
@@ -33,7 +33,7 @@ def _metadata() -> dict:
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "artifact_persisted": True,
         "phase": "phase3_model_factory",
-        "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "training_mode": "walk_forward",
         "model_stage": "candidate",
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,

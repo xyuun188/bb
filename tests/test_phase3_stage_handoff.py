@@ -18,7 +18,6 @@ def _inputs() -> dict:
         "specialist_shadow_report": {
             "available": True,
             "checked_at": now,
-            "live_mutation": False,
             "production_permission": False,
         },
         "rebuild_preflight_report": {"available": True, "checked_at": now},

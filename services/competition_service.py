@@ -214,7 +214,6 @@ class CompetitionService:
                 "best model promotion recommendation recorded without active switch",
                 model=best,
                 current_active_model=mode_manager.active_model_name,
-                live_mutation=False,
                 policy="phase3_observe_only",
             )
         return best

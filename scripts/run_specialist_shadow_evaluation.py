@@ -83,7 +83,6 @@ async def _main() -> None:
         "promotion_ready_count": (report.get("summary") or {}).get("promotion_ready_count"),
         "blocked_count": (report.get("summary") or {}).get("blocked_count"),
         "top_blocked_reasons": (report.get("summary") or {}).get("top_blocked_reasons") or [],
-        "live_mutation": False,
     }
     safe_print(json.dumps(report if args.print_json else summary, ensure_ascii=False, indent=indent))
 

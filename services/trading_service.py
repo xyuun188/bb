@@ -207,6 +207,7 @@ from services.trade_recommendation_contract import (
 from services.trading_agent_skills import TradingAgentSkillBook
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.text_sanitize import sanitize_text
 
@@ -8312,7 +8313,7 @@ class TradingService:
                 "trained": False,
                 "reason": okx_gate.get("reason") or "okx_training_refresh_blocked",
                 "okx_daily_reconciliation_gate": okx_gate,
-                "trade_sample_cursor_policy": "clean_training_view_only",
+                "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
             }
 
         status_probe_error = ""
@@ -8369,10 +8370,10 @@ class TradingService:
                 "learning_only": learning_only,
                 "trigger": "new_clean_cost_complete_sample_or_training_view_rebase",
                 "distribution_requirement": "non_empty_train_and_holdout",
-                "training_window_policy": "all_current_clean_cost_complete_samples",
+                "training_window_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 "cursor_source": "last_trained_completed_shadow_sample_count",
                 "trade_cursor_source": "last_trained_completed_trade_sample_count",
-                "trade_cursor_policy": "clean_training_view_only",
+                "trade_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 "process_boundary": "dedicated_training_subprocess",
                 "cursor_process_isolated": True,
                 "shadow_training_view_rebased": shadow_training_view_rebased,

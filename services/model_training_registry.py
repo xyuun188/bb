@@ -164,7 +164,7 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         "sample_count": _safe_int(
             status.get("training_shadow_sample_count") or status.get("sample_count")
         ),
-        "live_influence": live,
+        "live_ml_ready": live,
         "quality_state": readiness,
         "blocking_reasons": _safe_list(status.get("blocking_reason_codes")),
         "identity_verified": available,
@@ -253,7 +253,7 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                     if model_key == "exit"
                     else status.get("shadow_sample_count")
                 ),
-                "live_influence": live_ml_ready,
+                "live_ml_ready": live_ml_ready,
                 "quality_state": lifecycle,
                 "blocking_reasons": _safe_list(promotion.get("live_blocking_reasons")),
                 "identity_verified": artifact_available,
@@ -346,7 +346,7 @@ def _specialist_rows(
                 "artifact_available": runtime_available,
                 "trained_at": None,
                 "sample_count": inference_count,
-                "live_influence": False,
+                "live_ml_ready": False,
                 "quality_state": (
                     "promotion_ready_for_canary_review"
                     if promotion_ready
@@ -427,7 +427,7 @@ def _llm_rows(
         "artifact_available": finquant_specialized,
         "trained_at": specialization.get("trained_at"),
         "sample_count": _safe_int(specialization.get("sample_count")),
-        "live_influence": False,
+        "live_ml_ready": False,
         "quality_state": "specialized" if finquant_specialized else "specialization_missing",
         "blocking_reasons": [] if finquant_specialized else ["finquant_specialization_missing"],
         "identity_verified": finquant_specialized,
@@ -484,9 +484,7 @@ def _llm_rows(
                 "artifact_available": bool(row["runtime_available"]),
                 "trained_at": None,
                 "sample_count": evaluation["evaluation_sample_count"],
-                "live_influence": bool(
-                    row["model_id"] == "deepseek_online_decision" and row["runtime_available"]
-                ),
+                "live_ml_ready": False,
                 "identity_verified": bool(row["runtime_available"]),
                 "alias_only": False,
             }

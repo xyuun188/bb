@@ -25603,7 +25603,6 @@
   "fixture_version": "2026-07-14.profit-integrity-baseline.v1",
   "generated_at": "2026-07-14T10:06:16.094449+00:00",
   "git_head": "89550d916085395e5a61fbdf1a109324a8edfc46",
-  "live_mutation": false,
   "local_ml_artifact": {
     "live_ml_ready": true,
     "available": true,

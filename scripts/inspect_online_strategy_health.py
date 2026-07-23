@@ -164,7 +164,6 @@ async def main():
         "generated_at": datetime.now(UTC).isoformat(),
         "window_minutes": WINDOW_MINUTES,
         "audit_only": True,
-        "live_mutation": False,
         "optimization_target": PROFIT_TRAINING_TARGET,
         "trade_execution_contract": contract,
         "local_ml_readiness": ml_status,
@@ -379,7 +378,7 @@ def _summarize_report(report: dict) -> dict:
         "contract_violations": contract.get("violation_reason_counts") or {},
         "contract_policy": contract.get("policy") or {},
         "ml_readiness_state": ml_status.get("readiness_state") or ml_status.get("state"),
-        "ml_live_influence": bool(ml_status.get("live_ml_ready")),
+        "ml_live_ml_ready": ml_status.get("live_ml_ready") is True,
         "model_strategy_blueprint": {
             key: strategy_blueprint.get(key)
             for key in (
@@ -415,7 +414,7 @@ def _summarize_report(report: dict) -> dict:
                     "runtime_available",
                     "artifact_available",
                     "sample_count",
-                    "live_influence",
+                    "live_ml_ready",
                     "quality_state",
                     "blocking_reasons",
                 )
@@ -510,7 +509,7 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
                         "objective_version",
                         "label_version",
                         "profit_supervision_version",
-                        "live_influence",
+                        "live_ml_ready",
                     )
                     if key in local_ai_tools
                 },

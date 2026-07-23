@@ -85,7 +85,6 @@ def _specialist() -> dict[str, Any]:
         "available": True,
         "generated_at": datetime.now(UTC).isoformat(),
         "eligible_shadow_count": 2,
-        "live_mutation": False,
     }
 
 

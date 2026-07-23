@@ -199,7 +199,7 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
 
     assert summary["optimization_target"] == PROFIT_TRAINING_TARGET
     assert summary["contract_summary"]["contract_violation_count"] == 2
-    assert summary["ml_live_influence"] is False
+    assert summary["ml_live_ml_ready"] is False
     assert summary["model_strategy_blueprint"]["execution_scope"] == "paper_only"
     assert summary["model_strategy_blueprint"]["live_execution_permission"] is False
     assert summary["model_training_summary"]["trainable_count"] == 8

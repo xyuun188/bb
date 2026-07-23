@@ -350,7 +350,6 @@ async def main():
         "fixture_version": "2026-07-14.profit-integrity-baseline.v1",
         "generated_at": datetime.now(UTC).isoformat(),
         "audit_only": True,
-        "live_mutation": False,
         "decision_ids": DECISION_IDS,
         "decisions": decisions,
         "shadow_backtests": shadows,

@@ -23,7 +23,6 @@ from services import ml_signal_service as ml_signal_module
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
-    PHASE3_REQUIRED_TRAINING_POLICY,
 )
 from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
@@ -58,6 +57,7 @@ from services.training_data_quality import (
     MARKET_FACT_CONTRACT_VERSION,
     quality_report,
 )
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 
 @pytest.fixture(autouse=True)
@@ -652,8 +652,8 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
     assert metadata["training_run_mode"] == "dry_run"
     assert metadata["artifact_policy_id"] == PHASE3_ARTIFACT_POLICY_ID
     assert metadata["phase"] == "phase3_model_factory"
-    assert metadata["training_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
-    assert metadata["trade_sample_cursor_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
+    assert metadata["training_policy"] == CURRENT_TRAINING_EPOCH_POLICY
+    assert metadata["trade_sample_cursor_policy"] == CURRENT_TRAINING_EPOCH_POLICY
     assert metadata["training_mode"] == "walk_forward"
     assert metadata["model_stage"] == "candidate"
     assert len(metadata["training_data_sha256"]) == 64
@@ -2288,7 +2288,7 @@ def test_symbol_removal_instability_blocks_that_prediction_side() -> None:
     assert prediction["readiness"]["live_enabled_sides"] == ["short"]
     assert prediction["predictions"][0]["best_side"] == "long"
     assert prediction["live_ml_ready"] is True
-    assert prediction["live_influence"] is False
+    assert prediction["prediction_eligible"] is False
     assert prediction["influence_policy"]["long"]["enabled"] is False
     assert "long_leave_one_symbol_out_stability_failed" in long_codes
 
@@ -2383,7 +2383,7 @@ def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> No
     assert prediction["readiness_state"] == "partial_ready"
     assert prediction["live_ml_ready"] is True
     assert prediction["predictions"][0]["best_side"] == "long"
-    assert prediction["predictions"][0]["ml_influence_enabled"] is True
+    assert prediction["predictions"][0]["ml_prediction_eligible"] is True
     assert prediction["predictions"][0]["profit_signal"] is True
 
 
@@ -2421,7 +2421,7 @@ def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() 
     assert long_distribution["production_eligible"] is False
     assert "lower_quantile_above_raw_expected" in long_distribution["blockers"]
     assert prediction["live_ml_ready"] is True
-    assert prediction["live_influence"] is False
+    assert prediction["prediction_eligible"] is False
     assert prediction["prediction_quality"]["production_eligible"] is False
 
 
@@ -2504,7 +2504,7 @@ def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_infl
     assert prediction["readiness_state"] == "degraded"
     assert prediction["live_ml_ready"] is False
     assert prediction["influence_policy"]["enabled"] is False
-    assert prediction["influence_enabled"] is False
+    assert prediction["prediction_eligible"] is False
     assert prediction["profit_signal"] is False
-    assert prediction["predictions"][0]["ml_influence_enabled"] is False
+    assert prediction["predictions"][0]["ml_prediction_eligible"] is False
     assert prediction["predictions"][0]["profit_signal"] is False

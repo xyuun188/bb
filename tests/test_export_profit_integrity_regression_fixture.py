@@ -23,7 +23,7 @@ def test_remote_template_compiles_and_is_read_only() -> None:
     assert "MLSignalService().status()" in template
     assert "get_position_protection_orders(None)" in template
     assert '"audit_only": True' in template
-    assert '"live_mutation": False' in template
+    assert '"live_mutation"' not in template
     assert "cancel" not in template.lower()
     assert "commit()" not in template
 
@@ -92,7 +92,7 @@ def test_root_cause_fixture_preserves_incident_and_rollback_evidence() -> None:
     payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
     assert payload["audit_only"] is True
-    assert payload["live_mutation"] is False
+    assert "live_mutation" not in payload
     assert payload["decision_ids"] == list(fixture_export.INCIDENT_DECISION_IDS)
     assert payload["git_head"] == "89550d916085395e5a61fbdf1a109324a8edfc46"
     assert all(len(value) == 64 for value in payload["source_sha256"].values())

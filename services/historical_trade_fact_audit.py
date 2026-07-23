@@ -12,6 +12,7 @@ from models.learning import TradeReflection
 from models.trade import Position
 from services.manual_close_marker import is_manual_close_exchange_order_id
 from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 REPAIR_REFLECTION_SOURCES = {
     "missing_closed_position_repair",
@@ -181,7 +182,7 @@ class HistoricalTradeFactAuditService:
             "audit_only": True,
             "raw_records_preserved": True,
             "cleanup_mode": "quarantine_not_delete",
-            "training_policy": "clean_training_view_only",
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
             "lookback_days": lookback_days,
             "limit": limit,
             "checked_closed_positions": checked,

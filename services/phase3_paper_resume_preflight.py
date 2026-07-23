@@ -425,14 +425,6 @@ def evaluate_phase3_paper_resume_preflight_inputs(
                 },
             )
         )
-    elif bool(specialist.get("live_mutation")):
-        blockers.append(
-            _blocker(
-                "specialist_shadow_live_mutation_enabled",
-                "Specialist evaluation must remain shadow-only before paper resumes.",
-                evidence={"live_mutation": specialist.get("live_mutation")},
-            )
-        )
     else:
         passed.append("specialist_shadow_evaluation_fresh")
 
@@ -448,7 +440,6 @@ def evaluate_phase3_paper_resume_preflight_inputs(
         "starts_trading_service": False,
         "submits_orders": False,
         "changes_model_routing": False,
-        "live_mutation": False,
         "can_resume_paper": not blockers,
         "requires_operator_start": True,
         "target_service": "bb-paper-trading.service",
@@ -647,7 +638,6 @@ class Phase3PaperResumePreflightService:
             "status": "missing",
             "read_only": True,
             "audit_only": True,
-            "live_mutation": False,
             "reason": "specialist_shadow_evaluation_report_missing",
             "candidate_paths": [str(path) for path in candidates],
         }

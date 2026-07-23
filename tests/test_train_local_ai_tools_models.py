@@ -299,7 +299,6 @@ def test_local_ai_tools_shadow_features_are_compacted_for_training_payload() -> 
                     "artifacts_ready": True,
                     "actual_inference": True,
                     "baseline_response": True,
-                    "live_mutation": False,
                     "shadow_result": {
                         "model": "timesfm-2.5-shadow-challenger",
                         "actual_inference": True,

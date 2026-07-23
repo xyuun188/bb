@@ -278,7 +278,7 @@ def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() 
         assert rows[model_id]["training_mode"] == "inference_only"
         assert rows[model_id]["evaluation_mode"] == "shadow_evaluating"
         assert rows[model_id]["quality_state"] == "promotion_blocked"
-        assert rows[model_id]["live_influence"] is False
+        assert rows[model_id]["live_ml_ready"] is False
         assert rows[model_id]["fine_tune_available"] is False
     assert rows["finbert_tone"]["model_family"] == "yiyanghkust/finbert-tone"
     assert payload["summary"]["identity_failure_count"] == 0

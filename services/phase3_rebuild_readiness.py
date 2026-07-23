@@ -7,8 +7,8 @@ from typing import Any
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
-    PHASE3_REQUIRED_TRAINING_POLICY,
 )
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -157,14 +157,14 @@ class Phase3RebuildReadinessService:
                 "can_run_confirmed_rebuild": can_run_confirmed_rebuild,
                 "can_persist_artifact": can_persist,
                 "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
-                "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+                "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 "target_stage": "shadow",
             },
             "local_ai_tools": {
                 "can_run_confirmed_rebuild": can_run_confirmed_rebuild,
                 "can_persist_artifact": can_persist,
                 "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
-                "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+                "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 "target_stage": "shadow",
             },
         }
@@ -186,7 +186,7 @@ class Phase3RebuildReadinessService:
             "requested_persist_artifact": bool(requested_persist_artifact),
             "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),
             "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
-            "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
             "blockers": list(dict.fromkeys(blockers)),
             "warnings": list(dict.fromkeys(warnings)),

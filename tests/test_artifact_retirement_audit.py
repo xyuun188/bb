@@ -59,7 +59,7 @@ async def test_phase3_artifact_with_clean_manifest_is_compatible(tmp_path) -> No
             {
                 "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
                 "phase": "phase3_model_factory",
-                "trade_sample_cursor_policy": "clean_training_view_only",
+                "trade_sample_cursor_policy": "current_training_epoch_only",
                 "training_mode": "walk_forward",
                 "model_stage": "canary",
                 "promotion_flow": "candidate_to_shadow_to_canary_to_active",
@@ -119,7 +119,7 @@ async def test_unreferenced_registry_version_is_retired_without_hiding_unknown_a
                 "artifact_model_id": "local_ml_profit_quality",
                 "artifact_version": active_version,
                 "phase": "phase3_model_factory",
-                "training_policy": "clean_training_view_only",
+                "training_policy": "current_training_epoch_only",
                 "model_stage": "shadow",
                 "artifact_persisted": True,
                 "promotion_flow": "candidate_to_shadow_to_canary_to_active",

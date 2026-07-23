@@ -994,7 +994,7 @@ def _extract_primary_ml(raw: dict[str, Any]) -> dict[str, Any]:
         )
         or 0.0,
         "win_rate": _safe_float(primary.get("best_win_rate"), 0.0) or 0.0,
-        "influence_enabled": bool(ml.get("influence_enabled", True)),
+        "prediction_eligible": ml.get("prediction_eligible") is True,
         "summary": ml.get("suggestion") or ml.get("note") or "",
     }
 

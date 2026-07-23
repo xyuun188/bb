@@ -105,7 +105,6 @@ async def collect_phase3_go_no_go_report() -> dict[str, Any]:
         "starts_trading_service": False,
         "submits_orders": False,
         "changes_model_routing": False,
-        "live_mutation": False,
         "overall_audit_status": audit.get("status"),
         "overall_summary": audit.get("summary") or {},
         "go_no_go_card_status": gate_card.get("status"),
@@ -162,7 +161,6 @@ async def _main() -> int:
                 "starts_trading_service": False,
                 "submits_orders": False,
                 "changes_model_routing": False,
-                "live_mutation": False,
                 "report_source": "latest_persisted_unavailable",
             }
         if report is None:

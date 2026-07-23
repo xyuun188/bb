@@ -270,12 +270,12 @@ async def _training_source_metrics(
         "ticker_count": ticker_count,
         "news_count": news_count,
         "social_count": social_count,
-        "training_window_policy": "all_current_clean_cost_complete_samples",
+        "training_window_policy": "current_training_epoch_only",
         "quality_report": payload["quality_report"],
-        "trainable_shadow_sample_count": len(payload["shadow_samples"]),
-        "trainable_trade_sample_count": len(payload["trade_samples"]),
-        "trainable_sequence_sample_count": len(payload["sequence_samples"]),
-        "trainable_text_sentiment_sample_count": len(payload["text_sentiment_samples"]),
+        "training_shadow_sample_count": len(payload["shadow_samples"]),
+        "training_trade_sample_count": len(payload["trade_samples"]),
+        "training_sequence_sample_count": len(payload["sequence_samples"]),
+        "training_text_sentiment_sample_count": len(payload["text_sentiment_samples"]),
     }
 
 

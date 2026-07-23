@@ -13,6 +13,7 @@ from config.settings import settings
 
 TRAINING_EPOCH_VERSION = "2026-07-24.v1"
 TRAINING_EPOCH_FILENAME = "training_epoch.json"
+CURRENT_TRAINING_EPOCH_POLICY = "current_training_epoch_only"
 
 
 def training_epoch_path(root: Path | None = None) -> Path:

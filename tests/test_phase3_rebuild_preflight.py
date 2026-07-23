@@ -46,11 +46,8 @@ def _training_payload() -> dict[str, Any]:
         },
         "completed_shadow_sample_count": 500,
         "completed_trade_sample_count": 80,
-        "raw_shadow_sample_count": 500,
-        "trainable_shadow_sample_count": 500,
-        "raw_trade_sample_count": 84,
-        "trainable_trade_sample_count": 80,
-        "quarantined_trade_sample_count": 4,
+        "training_shadow_sample_count": 500,
+        "training_trade_sample_count": 80,
         "sequence_sample_count": 12,
         "text_sentiment_sample_count": 7,
     }
@@ -64,7 +61,7 @@ async def _fake_historical_report(**_kwargs: Any) -> dict[str, Any]:
     return {
         "status": "clean",
         "read_only": True,
-        "training_policy": "clean_training_view_only",
+        "training_policy": "current_training_epoch_only",
         "trainable_closed_positions": 80,
         "quarantined_closed_positions": 0,
     }
@@ -132,7 +129,7 @@ async def test_phase3_rebuild_preflight_is_read_only_and_lists_commands(
     assert "paper_observation_report_missing" not in report["promotion_recommendation"][
         "canary_blocking_reasons"
     ]
-    assert report["training_summary"]["trainable_shadow_sample_count"] == 500
+    assert report["training_summary"]["training_shadow_sample_count"] == 500
     assert report["commands"]["ml_signal"]["preflight_command"] == (
         "python scripts/train_ml_signal_model.py"
     )

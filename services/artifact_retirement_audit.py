@@ -10,9 +10,9 @@ from typing import Any
 
 from config.settings import settings
 from core.safe_output import safe_error_text
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
-PHASE3_REQUIRED_TRAINING_POLICY = "clean_training_view_only"
 PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
 
 ARTIFACT_SUFFIXES = {".joblib", ".pkl", ".pickle", ".onnx", ".pt", ".safetensors", ".bin"}
@@ -199,7 +199,7 @@ def _artifact_classification(
         reasons.append("missing_phase3_metadata")
 
     policy_ok = evidence["policy_id"] == PHASE3_ARTIFACT_POLICY_ID
-    training_policy_ok = evidence["training_policy"] == PHASE3_REQUIRED_TRAINING_POLICY
+    training_policy_ok = evidence["training_policy"] == CURRENT_TRAINING_EPOCH_POLICY
     promotion_ok = evidence["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
     persisted_ok = evidence["artifact_persisted"] is True or normalized_relative_path.endswith(
         ".json"
@@ -208,7 +208,7 @@ def _artifact_classification(
     if metadata and not policy_ok:
         reasons.append("artifact_policy_id_not_phase3")
     if metadata and not training_policy_ok:
-        reasons.append("training_policy_not_clean_view")
+        reasons.append("training_policy_not_current_epoch")
     if metadata and not promotion_ok:
         reasons.append("promotion_flow_missing_or_untrusted")
     if metadata and not persisted_ok:
@@ -343,7 +343,7 @@ class ArtifactRetirementAuditService:
             "read_only": True,
             "raw_artifacts_preserved": True,
             "can_delete_artifacts": False,
-            "training_policy": PHASE3_REQUIRED_TRAINING_POLICY,
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
             "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
             "root": str(root),
             "scan_relative_paths": list(self.scan_relative_paths),

@@ -280,7 +280,6 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
                 "kind": "timeseries",
                 "actual_inference": True,
                 "baseline_response": True,
-                "live_mutation": False,
                 "shadow_result": {
                     "model": "timesfm-2.5-shadow-challenger",
                     "actual_inference": True,
@@ -300,7 +299,6 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
                 "kind": "sentiment",
                 "actual_inference": True,
                 "baseline_response": False,
-                "live_mutation": False,
                 "predictions": {
                     "sentiment_primary": {
                         "available": True,

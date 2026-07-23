@@ -323,7 +323,7 @@ def test_local_ai_tools_health_returns_service_status_without_trained_bundle() -
     assert '"service": "phase3_quant_api"' in SERVICE_CODE
     assert '"root": PHASE3_ROOT.as_posix()' in SERVICE_CODE
     assert '"port": PHASE3_API_PORT' in SERVICE_CODE
-    assert '"live_mutation": False' in SERVICE_CODE
+    assert '"live_mutation"' not in SERVICE_CODE
     assert '"status_endpoint_uses_metadata_only": True' in SERVICE_CODE
     assert '"review_backend": "disabled_use_trading_app_online_model"' in SERVICE_CODE
 
@@ -338,7 +338,7 @@ def test_local_ai_tools_generated_service_adds_phase3_model_metadata() -> None:
     assert '"feature_coverage"' in SERVICE_CODE
     assert '"shadow_payload"' in SERVICE_CODE
     assert '"promotion_flow"' in SERVICE_CODE
-    assert '"live_mutation"' in SERVICE_CODE
+    assert '"live_ml_ready"' in SERVICE_CODE
     assert '_attach_baseline_only_shadow("profit_prediction"' in SERVICE_CODE
     assert 'with_model_metadata("time_series_prediction"' in SERVICE_CODE
     assert 'with_model_metadata("sentiment_analysis"' in SERVICE_CODE
@@ -363,7 +363,7 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert health["service"] == "phase3_quant_api"
     assert health["root"] == "/data/BB"
     assert health["port"] == 8101
-    assert health["live_mutation"] is False
+    assert "live_mutation" not in health
     assert health["trained_models_available"] is False
 
     payload = module.with_model_metadata(
@@ -385,9 +385,9 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     )
 
     assert payload["promotion_flow"] == "candidate_to_shadow_to_canary_to_active"
-    assert payload["live_mutation"] is False
+    assert "live_mutation" not in payload
     assert payload["shadow_payload"]["tool"] == "profit_prediction"
-    assert payload["shadow_payload"]["live_mutation"] is False
+    assert "live_mutation" not in payload["shadow_payload"]
     assert payload["shadow_payload"]["return_distribution_input_version"] == (
         module.RETURN_DISTRIBUTION_INPUT_VERSION
     )
@@ -414,6 +414,8 @@ def test_generated_service_without_artifact_fails_closed_without_heuristic_retur
         assert payload["available"] is False
         assert payload["trained"] is False
         assert payload["best_side"] == "hold"
+        assert payload["live_ml_ready"] is False
+        assert payload["production_permission"] is False
         assert payload["prediction_quality"]["production_eligible"] is False
         assert payload["return_distribution_input_version"] == (
             module.RETURN_DISTRIBUTION_INPUT_VERSION
@@ -1058,7 +1060,7 @@ def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> N
     assert timeseries_chain["actual_inference"] is False
     assert sentiment_chain["primary_model"] == "ProsusAI/finbert"
     assert sentiment_chain["challenger_model"] == "yiyanghkust/finbert-tone"
-    assert sentiment_chain["live_mutation"] is False
+    assert "live_mutation" not in sentiment_chain
 
 
 def test_local_ai_tools_generated_deep_endpoints_expose_professional_shadow_chain() -> None:
@@ -1165,7 +1167,7 @@ def test_local_ai_tools_specialist_preflight_blocks_until_adapters_exist() -> No
 
     assert report["policy"] == "phase3_specialist_adapter_preflight"
     assert report["stage"] == "preflight_only"
-    assert report["live_mutation"] is False
+    assert "live_mutation" not in report
     assert report["all_artifacts_ready"] is True
     assert report["all_required_imports_ready"] is True
     assert report["any_shadow_inference_ready"] is True
@@ -1284,7 +1286,7 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
     assert result["timesfm_shadow_expected_return_pct"] == pytest.approx(0.790514)
     assert result["timesfm_shadow_side"] == "long"
     assert result["model"] != "timesfm-2.5-primary"
-    assert result["live_mutation"] is False
+    assert "live_mutation" not in result
     assert result["shadow_payload"]["specialist_inference_active"] is True
 
 
@@ -1383,7 +1385,6 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
         "confidence": 0.5,
         "horizon_step": 2,
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": False,
     }
 
     result = module.deep_timeseries_predict(
@@ -1414,7 +1415,7 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
     assert shadow["challenger_shadow_result"]["actual_inference"] is True
     assert shadow["activation_blocker"] == "walk_forward_required"
     assert result["fallback_reason"] == "specialist_timeseries_shadow_only"
-    assert result["live_mutation"] is False
+    assert "live_mutation" not in result
 
 
 def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
@@ -1502,7 +1503,6 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
         "actual_inference": False,
         "reason": "disabled_for_test",
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": False,
     }
 
     result = module.deep_timeseries_predict(
@@ -1527,7 +1527,7 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
     assert shadow["expected_return_pct"] == pytest.approx(0.990099)
     assert shadow["adapter"] == "chronos_2_pipeline_adapter"
     assert result["chronos_shadow_expected_return_pct"] == pytest.approx(0.990099)
-    assert result["live_mutation"] is False
+    assert "live_mutation" not in result
 
 
 def test_local_ai_tools_timeseries_shadow_rejects_short_synthetic_sequence() -> None:
@@ -1568,7 +1568,7 @@ def test_local_ai_tools_timeseries_shadow_rejects_short_synthetic_sequence() -> 
     assert shadow["primary_shadow_result"]["model_input_rows"] == 30
     assert shadow["challenger_shadow_result"]["reason"] == "not_enough_real_close_sequence"
     assert result["sequence_input_status"] == "not_enough_real_close_sequence"
-    assert result["live_mutation"] is False
+    assert "live_mutation" not in result
 
 
 def test_local_ai_tools_specialist_preflight_surfaces_missing_imports() -> None:
@@ -1626,7 +1626,6 @@ def test_local_ai_tools_finbert_shadow_adapter_marks_sentiment_shadow_only() -> 
         "disagreement": 0.04,
         "predictions": {},
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
-        "live_mutation": False,
     }
 
     result = module.deep_sentiment_analyze(
@@ -1647,7 +1646,7 @@ def test_local_ai_tools_finbert_shadow_adapter_marks_sentiment_shadow_only() -> 
     assert result["professional_model_shadow"]["baseline_model"] == "local-sentiment-light-v1"
     assert result["professional_model_shadow"]["score"] == 0.72
     assert result["fallback_reason"] == "specialist_sentiment_shadow_only"
-    assert result["live_mutation"] is False
+    assert "live_mutation" not in result
     assert result["shadow_payload"]["specialist_inference_active"] is True
 
 
@@ -2029,16 +2028,16 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
         in SERVICE_CODE
     )
     assert '"promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW' in SERVICE_CODE
-    assert '"live_mutation": live_authorized' in SERVICE_CODE
+    assert '"live_mutation"' not in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_persists_phase3_artifact_policy() -> None:
     assert 'PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"' in SERVICE_CODE
-    assert 'PHASE3_REQUIRED_TRAINING_POLICY = "clean_training_view_only"' in SERVICE_CODE
+    assert 'CURRENT_TRAINING_EPOCH_POLICY = "current_training_epoch_only"' in SERVICE_CODE
     assert '"artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID' in SERVICE_CODE
     assert '"phase": "phase3_model_factory"' in SERVICE_CODE
-    assert '"training_policy": PHASE3_REQUIRED_TRAINING_POLICY' in SERVICE_CODE
-    assert '"trade_sample_cursor_policy": PHASE3_REQUIRED_TRAINING_POLICY' in SERVICE_CODE
+    assert '"training_policy": CURRENT_TRAINING_EPOCH_POLICY' in SERVICE_CODE
+    assert '"trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY' in SERVICE_CODE
     assert '"artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild)' in SERVICE_CODE
     assert '"preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild)' in SERVICE_CODE
     assert '"persist_artifact_requested": bool(req.persist_artifact)' in SERVICE_CODE
@@ -2607,7 +2606,7 @@ def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:
     assert plan["port"] == 8101
     assert plan["health_url"] == "http://127.0.0.1:8101/health"
     assert plan["shadow_only"] is True
-    assert plan["live_mutation"] is False
+    assert "live_mutation" not in plan
     assert plan["legacy_root_used"] is False
 
     assert "WorkingDirectory=/data/BB/services/phase3_quant_api" in service
@@ -2631,16 +2630,14 @@ def test_phase3_quant_api_remote_smoke_checks_governed_activation_contract() -> 
     assert "Authorization" in command
     assert "health.get('service') == 'phase3_quant_api'" in command
     assert "health.get('root') == '/data/BB'" in command
-    assert "health.get('live_mutation') is live" in command
-    assert (
-        "health.get('artifact_lifecycle') in {'shadow', 'canary', 'active'}"
-        in command
-    )
+    assert "live_mutation" not in command
+    assert "lifecycle in {'unregistered', 'shadow', 'canary', 'active'}" in command
     assert "health.get('live_ml_ready') is live" in command
-    assert "profit.get('trained') is True" in command
+    assert "profit.get('trained') is has_artifact" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command
     assert "profit.get('return_distribution_input_version')" in command
     assert "profit.get('return_distribution_inputs')" in command
     assert "profit.get('production_permission') is live" in command
     assert "item.get('production_eligible') is live" in command
-    assert "'loss_probability' in profit" in command
+    assert "if has_artifact:" in command
+    assert "'loss_probability' not in profit" in command

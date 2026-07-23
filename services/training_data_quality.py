@@ -35,11 +35,11 @@ from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_loss_attribution import normalize_losing_exit_attribution
 from services.text_integrity import looks_like_mojibake
 from services.trading_params import DEFAULT_TRADING_PARAMS
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
 DATA_QUALITY_VERSION = "2026-07-21.authoritative-trade-integrity.v5"
 PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
-PHASE3_TRAINING_POLICY = "clean_training_view_only"
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
     "hold_missed_opportunity_downweighted",
@@ -2262,7 +2262,7 @@ def governance_report(
     return {
         "status": status,
         "data_quality_version": quality.get("data_quality_version") or DATA_QUALITY_VERSION,
-        "training_policy": PHASE3_TRAINING_POLICY,
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "raw_records_preserved": True,
         "cleanup_mode": "quarantine_not_delete",
         "quarantine_applied": bool(excluded),

@@ -38,6 +38,7 @@ from services.model_promotion_policy import (
 from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import annotate_training_payload
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 DEFAULT_HISTORICAL_AUDIT_DAYS = 180
@@ -126,7 +127,7 @@ def _training_payload_unavailable(error: Exception) -> dict[str, Any]:
         "trainable_sample_count": 0,
         "excluded_sample_count": 0,
         "cleanup_mode": "quarantine_not_delete",
-        "training_policy": "clean_training_view_only",
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "error": safe_error_text(error, limit=180),
     }
     return {
@@ -140,11 +141,8 @@ def _training_payload_unavailable(error: Exception) -> dict[str, Any]:
         },
         "completed_shadow_sample_count": 0,
         "completed_trade_sample_count": 0,
-        "raw_shadow_sample_count": 0,
-        "trainable_shadow_sample_count": 0,
-        "raw_trade_sample_count": 0,
-        "trainable_trade_sample_count": 0,
-        "quarantined_trade_sample_count": 0,
+        "training_shadow_sample_count": 0,
+        "training_trade_sample_count": 0,
         "sequence_sample_count": 0,
         "text_sentiment_sample_count": 0,
         "collection_error": safe_error_text(error, limit=180),
@@ -173,17 +171,12 @@ async def _collect_training_payload() -> dict[str, Any]:
     )
     completed_shadow_count = await _completed_shadow_sample_count()
     completed_trade_count = await _completed_trade_sample_count()
-    raw_trade_sample_count = len(trade_samples)
-    trainable_trade_sample_count = len(payload["trade_samples"])
     return {
         "payload": payload,
         "completed_shadow_sample_count": int(completed_shadow_count),
         "completed_trade_sample_count": int(completed_trade_count),
-        "raw_shadow_sample_count": len(shadow_samples),
-        "trainable_shadow_sample_count": len(payload["shadow_samples"]),
-        "raw_trade_sample_count": raw_trade_sample_count,
-        "trainable_trade_sample_count": trainable_trade_sample_count,
-        "quarantined_trade_sample_count": max(raw_trade_sample_count - trainable_trade_sample_count, 0),
+        "training_shadow_sample_count": len(payload["shadow_samples"]),
+        "training_trade_sample_count": len(payload["trade_samples"]),
         "sequence_sample_count": len(payload["sequence_samples"]),
         "text_sentiment_sample_count": len(payload["text_sentiment_samples"]),
     }
@@ -268,12 +261,10 @@ async def collect_phase3_rebuild_preflight(
     local_ai_tools = {
         "available": True,
         "status": "preflight_ready",
-        "training_policy": "current_training_epoch_only",
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "pre_epoch_data_training_allowed": False,
-        "training_shadow_sample_count": training["trainable_shadow_sample_count"],
-        "training_trade_sample_count": training["trainable_trade_sample_count"],
-        "raw_trade_sample_count": training["raw_trade_sample_count"],
-        "quarantined_trade_sample_count": training["quarantined_trade_sample_count"],
+        "training_shadow_sample_count": training["training_shadow_sample_count"],
+        "training_trade_sample_count": training["training_trade_sample_count"],
         "sequence_sample_count": training["sequence_sample_count"],
         "text_sentiment_sample_count": training["text_sentiment_sample_count"],
         "quality_report": payload["quality_report"],
@@ -295,7 +286,7 @@ async def collect_phase3_rebuild_preflight(
             "status": "unavailable",
             "read_only": True,
             "audit_only": True,
-            "training_policy": "clean_training_view_only",
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
             "cleanup_mode": "quarantine_not_delete",
             "trainable_closed_positions": 0,
             "quarantined_closed_positions": 0,
