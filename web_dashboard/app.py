@@ -179,6 +179,19 @@ def create_app() -> FastAPI:
             return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
         return HTMLResponse(content=DEFAULT_INDEX_HTML)
 
+    @app.get("/training", response_class=HTMLResponse)
+    async def training_page(request: Request):
+        """Serve the independent training and decision observability page."""
+
+        try:
+            ensure_dashboard_login(request)
+        except HTTPException:
+            return HTMLResponse(content=dashboard_login_page_html(), status_code=401)
+        training_path = static_dir / "training.html"
+        if training_path.exists():
+            return HTMLResponse(content=training_path.read_text(encoding="utf-8"))
+        return HTMLResponse(content="训练看板文件暂不可用。", status_code=503)
+
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket):
         if dashboard_login_required(ws) and not dashboard_session_from_token(
@@ -212,7 +225,11 @@ def _request_needs_dashboard_session(request: Request) -> bool:
     path = request.url.path
     if _is_public_auth_path(path) or path.startswith("/docs") or path.startswith("/openapi"):
         return False
-    return path == "/" or path.startswith("/api") or path.startswith("/static")
+    return (
+        path in {"/", "/training"}
+        or path.startswith("/api")
+        or path.startswith("/static")
+    )
 
 
 def _is_public_auth_path(path: str) -> bool:

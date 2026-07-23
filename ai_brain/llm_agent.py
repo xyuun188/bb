@@ -394,7 +394,7 @@ def _uses_thinking_tags(model: str | None) -> bool:
 def _backup_model_names(model: str | None) -> list[str]:
     """Provider-compatible backups used only when the configured model fails."""
     current = str(model or "").strip()
-    if current.startswith("qwen3-") and current.endswith("-trade"):
+    if _is_qwen3_model(current):
         return []
     candidates = ["qwen3-max", "deepseek-v3", "claude-opus-4-7"]
     return [m for m in candidates if m and m != current][:2]
@@ -659,6 +659,10 @@ _FAST_EXPERT_SYSTEM_PROMPT = """FAST_EXPERT_JSON_V1. Return only one compact JSO
 Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":"positive number, account-capped later","stop_loss_pct":"0-1, derived from current market risk","take_profit_pct":"0-1, derived from current expected move","cross_check_for":null}
 Confidence is diagnostic only. Incomplete fee-after return or provenance => hold."""
 
+_PAPER_FAST_EXPERT_SYSTEM_PROMPT = """PAPER_FAST_EXPERT_JSON_V1. Return one compact JSON object only. No markdown, no prose, no <think>.
+Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"short Chinese text","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0-1,"take_profit_pct":0-1,"suggested_holding_minutes":1-10080,"maximum_holding_minutes":1-20000,"suggested_close_fraction":0-1,"cross_check_for":null}
+Every field is required. Use hold and zero size when evidence is incomplete. Return no extra keys and no long field names."""
+
 _PAPER_MULTIDIMENSIONAL_PLAN_PROMPT = """PAPER_MULTIDIMENSIONAL_PLAN_V1.
 For simulated trading, the earlier exact JSON schema is extended: also return
 suggested_holding_minutes, maximum_holding_minutes, and suggested_close_fraction.
@@ -778,7 +782,7 @@ class LLMAgent(AbstractAIModel):
         )
         requested_tokens = max_completion_tokens_override or configured_max_tokens or 0
         if fast_expert:
-            requested_tokens = min(int(requested_tokens or 0), 220)
+            requested_tokens = min(int(requested_tokens or 0), 320)
         max_completion_tokens = completion_token_limit(
             token_stage,
             int(requested_tokens or 0),
@@ -828,6 +832,7 @@ class LLMAgent(AbstractAIModel):
     async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
         expert_mode = bool(context.get("expert_mode"))
         decision_maker_mode = bool(context.get("decision_maker_mode"))
+        paper_mode = str(context.get("execution_mode") or "").lower() == "paper"
         if (
             expert_mode
             and not decision_maker_mode
@@ -937,15 +942,19 @@ class LLMAgent(AbstractAIModel):
             if decision_maker_mode
             else (
                 _FAST_EXPERT_SYSTEM_PROMPT
-                if fast_expert_mode
+                if fast_expert_mode and not paper_mode
                 else (
-                    get_compact_role_system_prompt(self._role)
-                    if expert_mode
-                    else get_role_system_prompt(self._role)
+                    _PAPER_FAST_EXPERT_SYSTEM_PROMPT
+                    if fast_expert_mode
+                    else (
+                        get_compact_role_system_prompt(self._role)
+                        if expert_mode
+                        else get_role_system_prompt(self._role)
+                    )
                 )
             )
         )
-        if str(context.get("execution_mode") or "").lower() == "paper":
+        if paper_mode and not fast_expert_mode:
             system_prompt = f"{system_prompt}\n{_PAPER_MULTIDIMENSIONAL_PLAN_PROMPT}"
 
         # Retry configured model first. In expert mode, try provider-compatible
@@ -1050,7 +1059,7 @@ class LLMAgent(AbstractAIModel):
                 batch_llm = self._create_llm(
                     self._model_name,
                     max_completion_tokens_override=(
-                        max(settings.ai_batch_expert_max_completion_tokens, 900)
+                        max(settings.ai_batch_expert_max_completion_tokens, 960)
                         if str(context.get("execution_mode") or "").lower() == "paper"
                         else settings.ai_batch_expert_max_completion_tokens
                     ),

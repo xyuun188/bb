@@ -645,8 +645,9 @@ def build_batch_experts_user_prompt(
             "position_expert holds when no matching position. risk_expert holds for hard risk or neutral/insufficient risk evidence, not as a production permission signal."
         ),
     }
+    paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    max_payload_chars = 8_000
+    max_payload_chars = 6_800 if paper_multidimensional else 8_000
     if len(text) > max_payload_chars:
         payload["memory"] = {}
         payload["local_ai_tools"] = {}
@@ -655,7 +656,6 @@ def build_batch_experts_user_prompt(
             name: _short_text(value, 220) for name, value in market_by_expert.items()
         }
         text = json.dumps(payload, ensure_ascii=False, default=str)
-    paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
     expert_schema = (
         '{"action":"long|short|close_long|close_short|hold","confidence":0-1,'
         '"reasoning":"简体中文12-28字，写方向/收益/风险要点",'

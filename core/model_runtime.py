@@ -15,7 +15,7 @@ COMPLETION_TOKEN_CAPS = {
     # prompts use about 3200 input tokens, so 560 leaves explicit transport and
     # tokenizer headroom while still fitting five compact expert JSON objects.
     "batch_expert": 560,
-    "paper_batch_expert": 900,
+    "paper_batch_expert": 960,
     "consultation": 700,
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 700,
@@ -45,13 +45,14 @@ def is_openai_reasoning_model(model: str | None) -> bool:
 
 def is_qwen3_model(model: str | None) -> bool:
     """Return True for Qwen3 model identifiers."""
-    return "qwen3" in str(model or "").lower()
+    name = str(model or "").lower()
+    return "qwen3" in name or name == "bb-finquant-expert-14b"
 
 
 def uses_thinking_tags(model: str | None) -> bool:
     """Return True for models that may emit explicit thinking tags."""
     name = str(model or "").lower()
-    return "qwen3" in name or "deepseek-r1" in name
+    return is_qwen3_model(name) or "deepseek-r1" in name
 
 
 def supports_provider_thinking_disable(model: str | None) -> bool:

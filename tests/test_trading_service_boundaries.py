@@ -4079,11 +4079,11 @@ def test_market_round_budget_reserves_full_analysis_time_per_candidate(
     )
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
-    assert service.market_round_time_budget_seconds(market_symbol_count=2) == 36.0
-    assert service.market_round_time_budget_seconds(market_symbol_count=3) == 54.0
+    assert service.market_round_time_budget_seconds(market_symbol_count=2) == 60.0
+    assert service.market_round_time_budget_seconds(market_symbol_count=3) == 90.0
 
 
-def test_market_symbol_analysis_timeout_fairly_isolates_candidates(
+def test_market_symbol_analysis_timeout_preserves_full_started_model_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
@@ -4102,9 +4102,34 @@ def test_market_symbol_analysis_timeout_fairly_isolates_candidates(
         remaining_round_seconds=30.0,
         remaining_symbol_count=1,
     )
+    after_soft_deadline = service.market_symbol_analysis_timeout_seconds(
+        remaining_round_seconds=0.0,
+        remaining_symbol_count=1,
+    )
 
-    assert trading_service.MARKET_SYMBOL_ANALYSIS_MIN_SECONDS <= shared < 10.5
-    assert last == pytest.approx(18.0)
+    assert shared == service.market_model_inference_timeout_seconds()
+    assert last == service.market_model_inference_timeout_seconds()
+    assert after_soft_deadline == service.market_model_inference_timeout_seconds()
+    assert shared >= 40.0
+
+
+def test_market_symbol_context_and_model_budgets_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
+    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+
+    assert service.market_symbol_context_timeout_seconds() == pytest.approx(11.25)
+    assert service.market_model_inference_timeout_seconds() == pytest.approx(48.0)
+    assert service.market_symbol_total_budget_seconds() == pytest.approx(59.25)
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:

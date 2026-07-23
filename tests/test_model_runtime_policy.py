@@ -16,6 +16,7 @@ from core.model_runtime import (
 
 def test_uses_thinking_tags_for_qwen3_and_deepseek_r1() -> None:
     assert uses_thinking_tags("qwen3-32b-trade")
+    assert uses_thinking_tags("BB-FinQuant-Expert-14B")
     assert uses_thinking_tags("DeepSeek-R1-Distill-Qwen-32B")
     assert not uses_thinking_tags("Qwen2.5-32B-Instruct")
 
@@ -93,7 +94,8 @@ def test_completion_token_limit_enforces_stage_caps() -> None:
     assert completion_token_limit("expert", 999, floor=180) == 360
     assert completion_token_limit("decision_maker", 999, floor=180) == 320
     assert completion_token_limit("batch_expert", 999, floor=180) == 560
-    assert completion_token_limit("paper_batch_expert", 999, floor=180) == 900
+    assert completion_token_limit("paper_batch_expert", 999, floor=180) == 960
+    assert completion_token_limit("paper_batch_expert", 2000, floor=180) == 960
     assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3-14b-trade") == 560
     assert (
         completion_token_limit("batch_expert", 999, floor=180, model="deepseek-r1-14b-risk") == 999

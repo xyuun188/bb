@@ -5,7 +5,12 @@ from typing import Any
 
 import pytest
 
-from ai_brain.llm_agent import LLMAgent, _extract_json, _provider_response_contract
+from ai_brain.llm_agent import (
+    LLMAgent,
+    _backup_model_names,
+    _extract_json,
+    _provider_response_contract,
+)
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
 
@@ -94,7 +99,12 @@ async def test_keyless_loopback_model_uses_process_local_client_placeholder(
     await agent.initialize()
 
     assert captured["api_key"] == "local-loopback"
+    assert captured["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     assert agent._api_key == ""
+
+
+def test_finquant_loopback_does_not_try_unsupported_provider_model_names() -> None:
+    assert _backup_model_names("BB-FinQuant-Expert-14B") == []
 
 
 @pytest.mark.asyncio
@@ -189,16 +199,24 @@ async def test_fast_independent_expert_uses_short_json_runtime(
 
     decision = await agent.decide(
         FeatureVector(symbol="SOL/USDT", current_price=150.0),
-        {"expert_mode": True, "_force_fast_independent_expert": True},
+        {
+            "execution_mode": "paper",
+            "expert_mode": True,
+            "_force_fast_independent_expert": True,
+        },
     )
 
     assert decision.action.value == "hold"
     assert captured_calls
     kwargs = captured_calls[-1]["kwargs"]
     assert kwargs["timeout"] <= 12.0
-    assert kwargs["max_tokens"] <= 220
+    assert kwargs["max_tokens"] <= 320
     assert kwargs["model_kwargs"]["response_format"] == {"type": "json_object"}
     assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    system_prompt = str(captured_calls[-1]["messages"][0].content)
+    assert "PAPER_FAST_EXPERT_JSON_V1" in system_prompt
+    assert "suggested_holding_minutes" in system_prompt
+    assert "PAPER_MULTIDIMENSIONAL_PLAN_V1" not in system_prompt
     prompt_text = str(captured_calls[-1]["messages"][1].content)
     assert "FAST_EXPERT_JSON_V1" not in prompt_text
     assert "Return JSON only" in prompt_text

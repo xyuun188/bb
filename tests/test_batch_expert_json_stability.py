@@ -490,6 +490,8 @@ class _BatchFailingIndividualSuccessExpert(AbstractAIModel):
 class _ProviderBatchExpert(AbstractAIModel):
     batch_calls: list[tuple[str, tuple[str, ...]]] = []
     individual_calls: list[tuple[str, str]] = []
+    running_batch_calls: int = 0
+    peak_batch_calls: int = 0
 
     def __init__(
         self,
@@ -499,6 +501,7 @@ class _ProviderBatchExpert(AbstractAIModel):
         model_name: str,
         fail_batch: bool = False,
         allow_individual: bool = False,
+        batch_delay_seconds: float = 0.0,
     ) -> None:
         self.name = name
         self._llm = object()
@@ -506,6 +509,7 @@ class _ProviderBatchExpert(AbstractAIModel):
         self._model_name = model_name
         self.fail_batch = fail_batch
         self.allow_individual = allow_individual
+        self.batch_delay_seconds = batch_delay_seconds
 
     async def initialize(self) -> None:
         return None
@@ -538,20 +542,30 @@ class _ProviderBatchExpert(AbstractAIModel):
         expert_names: list[str],
     ) -> dict[str, DecisionOutput]:
         type(self).batch_calls.append((self._model_name, tuple(expert_names)))
-        if self.fail_batch:
-            raise RuntimeError('Could not extract valid JSON from: {"experts":')
-        return {
-            name: DecisionOutput(
-                model_name=name,
-                symbol=features.symbol,
-                action=Action.HOLD,
-                confidence=0.42,
-                reasoning=f"{self._model_name} provider batch hold",
-                raw_response={"provider_model": self._model_name, "batch_expert": True},
-                feature_snapshot=features.to_dict(),
-            )
-            for name in expert_names
-        }
+        type(self).running_batch_calls += 1
+        type(self).peak_batch_calls = max(
+            type(self).peak_batch_calls,
+            type(self).running_batch_calls,
+        )
+        try:
+            if self.batch_delay_seconds > 0:
+                await asyncio.sleep(self.batch_delay_seconds)
+            if self.fail_batch:
+                raise RuntimeError('Could not extract valid JSON from: {"experts":')
+            return {
+                name: DecisionOutput(
+                    model_name=name,
+                    symbol=features.symbol,
+                    action=Action.HOLD,
+                    confidence=0.42,
+                    reasoning=f"{self._model_name} provider batch hold",
+                    raw_response={"provider_model": self._model_name, "batch_expert": True},
+                    feature_snapshot=features.to_dict(),
+                )
+                for name in expert_names
+            }
+        finally:
+            type(self).running_batch_calls -= 1
 
     def _local_expert_fallback(
         self,
@@ -940,6 +954,76 @@ async def test_batch_experts_are_grouped_by_provider(
     assert timings_by_name["risk_expert"]["shared_batch_call"] is False
     assert decisions["risk_expert"].raw_response["provider_independent_expert_mode"] is True
     assert not decisions["risk_expert"].raw_response.get("batch_failure_independent_retry")
+
+
+@pytest.mark.asyncio
+async def test_independent_provider_groups_run_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    _ProviderBatchExpert.batch_calls = []
+    _ProviderBatchExpert.running_batch_calls = 0
+    _ProviderBatchExpert.peak_batch_calls = 0
+    registry = ModelRegistry()
+    provider_specs = {
+        "trend_expert": (LOCAL_QWEN_TEST_BASE, "qwen3-14b-trade"),
+        "momentum_expert": (LOCAL_QWEN_TEST_BASE, "qwen3-14b-trade"),
+        "sentiment_expert": (LOCAL_DEEPSEEK_TEST_BASE, "qwen3-14b-risk"),
+        "position_expert": (LOCAL_DEEPSEEK_TEST_BASE, "qwen3-14b-risk"),
+        "risk_expert": (LOCAL_DEEPSEEK_TEST_BASE, "qwen3-14b-risk"),
+    }
+    for name, (base_url, model_name) in provider_specs.items():
+        registry.register(
+            _ProviderBatchExpert(
+                name,
+                base_url=base_url,
+                model_name=model_name,
+                batch_delay_seconds=0.02,
+            )
+        )
+
+    context: dict[str, Any] = {}
+    decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
+
+    assert set(decisions) == set(provider_specs)
+    assert _ProviderBatchExpert.peak_batch_calls == 2
+    assert all(row["provider_groups_concurrent"] for row in context["_model_timings"])
+
+
+@pytest.mark.asyncio
+async def test_paper_complete_plans_skip_oversized_multi_expert_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    _ProviderBatchExpert.batch_calls = []
+    _ProviderBatchExpert.individual_calls = []
+    registry = ModelRegistry()
+    for name in ("trend_expert", "momentum_expert", "sentiment_expert", "position_expert", "risk_expert"):
+        registry.register(
+            _ProviderBatchExpert(
+                name,
+                base_url=LOCAL_QWEN_TEST_BASE,
+                model_name="qwen3-14b-trade",
+                allow_individual=True,
+            )
+        )
+
+    context: dict[str, Any] = {"execution_mode": "paper"}
+    decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
+
+    assert set(decisions) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    }
+    assert _ProviderBatchExpert.batch_calls == []
+    assert len(_ProviderBatchExpert.individual_calls) == 5
+    assert all(row.get("batch_expert", False) is False for row in context["_model_timings"])
+    assert context["_force_independent_expert"] is True
+    assert context["_force_fast_independent_expert"] is True
+    assert context["_provider_independent_expert_mode"] is True
 
 
 @pytest.mark.asyncio

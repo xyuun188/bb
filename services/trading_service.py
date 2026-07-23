@@ -234,14 +234,15 @@ PENDING_FEATURE_CANCEL_DRAIN_SECONDS = 0.25
 MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS = 3.0
 MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS = 1.0
 MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
+MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 12.0
+MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 1.0
 VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
 VECTOR_MEMORY_CONTEXT_CACHE_LIMIT = 128
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
-MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 4.0
-MARKET_SYMBOL_ANALYSIS_MAX_SECONDS = 18.0
+MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 
@@ -962,8 +963,15 @@ class TradingService:
         del strategy_context
         requested_symbols = max(self._safe_int(market_symbol_count, 0), 0)
         target_symbols = min(max(requested_symbols, 1), 8)
-        per_symbol_floor = max(12.0, min(MARKET_SYMBOL_ANALYSIS_MAX_SECONDS, interval * 0.60))
-        market_budget = max(base_budget, target_symbols * per_symbol_floor)
+        per_symbol_floor = max(
+            24.0,
+            min(self.market_symbol_total_budget_seconds(), interval),
+        )
+        market_budget = (
+            max(base_budget, target_symbols * per_symbol_floor)
+            if requested_symbols > 0
+            else base_budget
+        )
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
         return min(market_budget, watchdog_ceiling)
 
@@ -976,14 +984,9 @@ class TradingService:
 
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        batch_timeout = max(8.0, float(settings.ai_batch_expert_timeout_seconds or 18.0))
-        decision_timeout = max(0.0, float(settings.ai_decision_maker_timeout_seconds or 0.0))
-        local_tools_timeout = max(0.0, float(settings.local_ai_tools_timeout_seconds or 0.0))
         model_reserve = max(
-            8.0,
-            batch_timeout * 0.60
-            + min(decision_timeout, 10.0) * 0.15
-            + min(local_tools_timeout, 6.0) * 0.25,
+            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+            min(self.market_symbol_total_budget_seconds(), 45.0),
         )
         budget_seconds = self.market_round_time_budget_seconds(
             strategy_context=strategy_context,
@@ -1000,19 +1003,65 @@ class TradingService:
         remaining_round_seconds: float,
         remaining_symbol_count: int,
     ) -> float:
-        """Give each candidate an independent share of the remaining AI budget."""
+        """Return a full model-stage window once a candidate has started.
+
+        Candidate count controls whether another symbol may start; it must not
+        shrink a started provider call below its normal response time.
+        """
+
+        del remaining_round_seconds, remaining_symbol_count
+        return self.market_model_inference_timeout_seconds()
+
+    def market_symbol_context_timeout_seconds(self) -> float:
+        """Return the independent deadline for memory and local context work."""
 
         settings.refresh_runtime_env(force=True)
-        interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        count = max(int(remaining_symbol_count or 1), 1)
-        remaining = max(float(remaining_round_seconds or 0.0), 0.0)
-        fair_share = remaining / count
-        reserve = min(0.75, max(0.1, fair_share * 0.05))
-        ceiling = max(
-            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
-            min(MARKET_SYMBOL_ANALYSIS_MAX_SECONDS, interval * 0.60),
+        local_tools_timeout = max(
+            float(settings.local_ai_tools_timeout_seconds or 0.0),
+            0.0,
         )
-        return round(max(0.0, min(ceiling, fair_share - reserve)), 3)
+        requested = (
+            max(
+                MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
+                MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS,
+            )
+            + local_tools_timeout
+            + MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS
+        )
+        return round(
+            min(max(requested, 1.0), MARKET_SYMBOL_CONTEXT_MAX_SECONDS),
+            3,
+        )
+
+    def market_model_inference_timeout_seconds(self) -> float:
+        """Return enough time for experts plus optional cross-validation."""
+
+        settings.refresh_runtime_env(force=True)
+        expert_timeout = max(
+            float(settings.ai_batch_expert_timeout_seconds or 0.0),
+            float(settings.ai_expert_timeout_seconds or 0.0),
+            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+        )
+        decision_timeout = max(
+            float(settings.ai_decision_maker_timeout_seconds or 0.0),
+            0.0,
+        )
+        cross_validation_timeout = min(max(decision_timeout * 0.60, 6.0), 12.0)
+        return round(
+            expert_timeout
+            + cross_validation_timeout
+            + MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+            3,
+        )
+
+    def market_symbol_total_budget_seconds(self) -> float:
+        """Return the context plus model budget used for scheduling only."""
+
+        return round(
+            self.market_symbol_context_timeout_seconds()
+            + self.market_model_inference_timeout_seconds(),
+            3,
+        )
 
     def position_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent position-review rounds."""
@@ -6867,17 +6916,9 @@ class TradingService:
                 )
                 feature_vectors[symbol] = fv
                 symbol_started_monotonic = asyncio.get_running_loop().time()
-                symbol_remaining_round_seconds = max(
-                    market_ai_deadline_monotonic - symbol_started_monotonic,
-                    0.0,
-                )
-                symbol_timeout_seconds = self.market_symbol_analysis_timeout_seconds(
-                    remaining_round_seconds=symbol_remaining_round_seconds,
-                    remaining_symbol_count=len(market_feature_items) - market_index,
-                )
-                symbol_deadline_monotonic = min(
-                    market_ai_deadline_monotonic,
-                    symbol_started_monotonic + max(symbol_timeout_seconds, 0.05),
+                context_timeout_seconds = self.market_symbol_context_timeout_seconds()
+                context_deadline_monotonic = (
+                    symbol_started_monotonic + max(context_timeout_seconds, 0.05)
                 )
                 market_analysis_progress = self._market_analysis_progress_snapshot(
                     symbol=symbol,
@@ -6887,15 +6928,14 @@ class TradingService:
                     market_ai_started_at=market_ai_started_at,
                     strategy_context=strategy_mode_context,
                 )
-                market_analysis_progress["symbol_analysis_timeout_seconds"] = round(
-                    symbol_timeout_seconds,
-                    3,
+                market_analysis_progress["context_preparation_timeout_seconds"] = round(
+                    context_timeout_seconds, 3
                 )
                 market_analysis_progress["symbol_timeout_isolated"] = True
                 market_context_timings: list[dict[str, Any]] = []
                 ml_started_monotonic = asyncio.get_running_loop().time()
                 ml_remaining_seconds = max(
-                    symbol_deadline_monotonic - ml_started_monotonic,
+                    context_deadline_monotonic - ml_started_monotonic,
                     0.0,
                 )
                 ml_lock_wait_seconds = min(
@@ -6916,7 +6956,7 @@ class TradingService:
                                 "production_permission": False,
                             }
                         },
-                        deadline_monotonic=symbol_deadline_monotonic,
+                        deadline_monotonic=context_deadline_monotonic,
                         timeout_seconds=MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
                         timings=market_context_timings,
                     ),
@@ -6940,7 +6980,7 @@ class TradingService:
                         "status": "analysis_budget_deferred",
                         "production_permission": False,
                     },
-                    deadline_monotonic=symbol_deadline_monotonic,
+                    deadline_monotonic=context_deadline_monotonic,
                     timeout_seconds=float(settings.local_ai_tools_timeout_seconds or 0.0),
                     timings=market_context_timings,
                 )
@@ -6977,6 +7017,13 @@ class TradingService:
                     else None
                 )
                 if prefilter_reason:
+                    market_analysis_progress["context_preparation_duration_seconds"] = round(
+                        max(
+                            asyncio.get_running_loop().time() - symbol_started_monotonic,
+                            0.0,
+                        ),
+                        3,
+                    )
                     quick_raw = {
                         "analysis_type": "market",
                         "fast_prefilter": {
@@ -7050,6 +7097,28 @@ class TradingService:
                     )
                     continue
                 analysis_started = datetime.now(UTC)
+                model_started_monotonic = asyncio.get_running_loop().time()
+                symbol_timeout_seconds = self.market_symbol_analysis_timeout_seconds(
+                    remaining_round_seconds=max(
+                        market_ai_deadline_monotonic - model_started_monotonic,
+                        0.0,
+                    ),
+                    remaining_symbol_count=len(market_feature_items) - market_index,
+                )
+                symbol_deadline_monotonic = (
+                    model_started_monotonic + max(symbol_timeout_seconds, 0.05)
+                )
+                market_analysis_progress["context_preparation_duration_seconds"] = round(
+                    max(model_started_monotonic - symbol_started_monotonic, 0.0),
+                    3,
+                )
+                market_analysis_progress["model_inference_timeout_seconds"] = round(
+                    symbol_timeout_seconds, 3
+                )
+                market_analysis_progress["symbol_analysis_timeout_seconds"] = round(
+                    context_timeout_seconds + symbol_timeout_seconds,
+                    3,
+                )
                 ensemble_result = await self._bounded_market_context_value(
                     "ensemble_decision",
                     self.ensemble.decide(
@@ -7115,6 +7184,10 @@ class TradingService:
                     _opinions = {}
                 else:
                     decision, _opinions = ensemble_result
+                market_analysis_progress["model_inference_duration_seconds"] = round(
+                    max(asyncio.get_running_loop().time() - model_started_monotonic, 0.0),
+                    3,
+                )
                 if isinstance(decision.raw_response, dict):
                     decision.raw_response.setdefault(
                         "entry_candidate_evidence", entry_candidate_evidence
