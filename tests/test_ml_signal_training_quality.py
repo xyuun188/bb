@@ -46,6 +46,7 @@ from services.profit_supervision import (
     COUNTERFACTUAL_EXECUTION_COST_TASK,
     PROFIT_SUPERVISION_VERSION,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_objective import (
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
@@ -99,6 +100,11 @@ def _with_return_objective(metadata: dict) -> dict:
                     "source_authority": "okx_position_history",
                     "symbol": "*",
                     "side": side,
+                    PROFIT_TRAINING_TARGET: {
+                        "count": 2,
+                        "expected": 0.4,
+                        "lower_hinge": 0.2,
+                    },
                     "net_return_after_cost_pct": {
                         "count": 2,
                         "expected": 0.4,
@@ -569,6 +575,7 @@ def _authoritative_trade_sample() -> dict[str, object]:
                 AUTHORITATIVE_REALIZED_RETURN_TASK: {
                     "eligible": True,
                     "side": "long",
+                    PROFIT_TRAINING_TARGET: 0.4,
                     "realized_net_return_pct": 0.4,
                     "hold_minutes": 30.0,
                 },
@@ -1268,6 +1275,17 @@ async def test_ml_signal_retrains_when_data_quality_contract_changes(
     assert result["training_policy"]["trigger"] == "training_data_contract_changed"
     assert result["training_policy"]["training_data_contract_stale"] is True
     assert len(promotion_evidence) == 2
+
+
+def test_authoritative_trade_return_evidence_prefers_profit_training_target() -> None:
+    sample = _authoritative_trade_sample()
+    task = sample["profit_supervision"]["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
+    task[PROFIT_TRAINING_TARGET] = -1.7
+    task["realized_net_return_pct"] = 99.0
+
+    evidence = ml_signal_module._authoritative_trade_return_evidence([sample])
+
+    assert evidence["sides"]["long"]["avg_return_pct"] == -1.7
 
 
 @pytest.mark.asyncio
