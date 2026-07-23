@@ -10,6 +10,7 @@ from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
 from scripts import run_specialist_shadow_evaluation as runner
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.specialist_shadow_evaluation import (
     SpecialistShadowEvaluationService,
     _regime_stability_report,
@@ -34,7 +35,7 @@ def test_specialist_shadow_evaluation_script_imports_online_runtime_bootstrap() 
     assert "from scripts.runtime_env_bootstrap import" in source
     assert "load_runtime_env_files(project_root=ROOT)" in source
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
-    assert "_load_authoritative_trade_samples" in source
+    assert "_load_trade_samples" in source
     assert "authoritative_trade_samples=authoritative_trade_samples" in source
 
 
@@ -177,7 +178,7 @@ def _authoritative_sample(
         "trade_fact_trusted": True,
         "side": position_side,
         "symbol": "BTC/USDT",
-        "authoritative_pnl_ratio_pct": pnl_ratio_pct,
+        PROFIT_TRAINING_TARGET: pnl_ratio_pct,
         "label_timestamp": (datetime(2026, 7, 1, tzinfo=UTC) + timedelta(hours=index)).isoformat(),
         "raw_llm_response": {
             "market_regime": "trend" if index % 2 else "range",

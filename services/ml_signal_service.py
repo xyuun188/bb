@@ -3797,16 +3797,10 @@ async def count_shadow_training_rows() -> int:
 async def load_authoritative_trade_training_samples() -> list[dict[str, Any]]:
     """Load the clean OKX lifecycle view used only for realized calibration."""
 
-    from scripts.train_local_ai_tools_models import (
-        _load_authoritative_trade_samples,
-        _load_trade_reflection_samples,
-        _merge_trade_samples,
-    )
+    from scripts.train_local_ai_tools_models import _load_trade_samples
 
-    reflections = await _load_trade_reflection_samples()
-    authoritative = await _load_authoritative_trade_samples()
     annotated = annotate_samples(
-        _merge_trade_samples(reflections, authoritative),
+        await _load_trade_samples(),
         "trade",
     )
     return [sample for sample in annotated if not sample.get("exclude_from_training")]

@@ -8,6 +8,7 @@ from typing import Any
 
 from services.execution_cost_model import execution_cost_estimate
 from services.profit_supervision import shadow_fee_after_return_labels
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 DEFAULT_WINDOW_HOURS = 168
 MAX_WORST_SAMPLE_COUNT = 8
@@ -1005,7 +1006,7 @@ def summarize_specialist_shadow_evaluation(
             authoritative_skipped_reasons["missing_authoritative_position_side"] += 1
             continue
         authoritative_return = _safe_float(
-            _row_get(sample, "authoritative_pnl_ratio_pct"), None
+            _row_get(sample, PROFIT_TRAINING_TARGET), None
         )
         if authoritative_return is None:
             authoritative_skipped_reasons["missing_authoritative_after_cost_return"] += 1

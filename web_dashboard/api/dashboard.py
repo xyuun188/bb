@@ -7753,6 +7753,7 @@ async def get_expert_memories(
         AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         load_authoritative_trade_outcomes,
     )
+    from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
     size = max(min(int(page_size or limit or 10), 100), 1)
     memory_page = max(int(memory_page or 1), 1)
@@ -7854,8 +7855,8 @@ async def get_expert_memories(
                     "entry_order_ids": authoritative_outcome.get("entry_order_ids"),
                     "close_order_ids": authoritative_outcome.get("close_order_ids"),
                     "realized_pnl": authoritative_outcome.get("realized_pnl"),
-                    "authoritative_return_pct": authoritative_outcome.get(
-                        "authoritative_pnl_ratio_pct"
+                    PROFIT_TRAINING_TARGET: authoritative_outcome.get(
+                        PROFIT_TRAINING_TARGET
                     ),
                     "attribution": authoritative_outcome.get("attribution"),
                     "counterfactual_evidence": authoritative_outcome.get(

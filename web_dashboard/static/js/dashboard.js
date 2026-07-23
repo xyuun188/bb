@@ -3959,7 +3959,7 @@ function renderExpertMemories(data = {}) {
                     ? authoritative.counterfactual_evidence : [];
                 const actualHtml = authoritative
                     ? `<div class="trade-outcome-cell ${authoritative.complete ? 'ready' : 'blocked'}">
-                        <strong>${distributionPctLabel(authoritative.authoritative_return_pct)}</strong>
+                        <strong>${distributionPctLabel(authoritative.net_return_after_all_cost_pct)}</strong>
                         <span>${escHtml(authoritative.outcome_id || 'Outcome ID 缺失')}</span>
                         <em>${authoritative.complete ? '权威证据完整' : `缺口：${(authoritative.evidence_gaps || []).map(item => escHtml(item)).join(' / ') || '未说明'}`}</em>
                     </div>`

@@ -20,16 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import settings
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text
-from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from core.url_safety import normalize_http_base_url
 from db.session import get_read_session_ctx, get_session_ctx
-from models.learning import ShadowBacktest, TradeReflection
+from models.learning import ShadowBacktest
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
-from services.authoritative_trade_outcome import (
-    AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-    load_authoritative_trade_outcomes,
-)
+from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
 from services.execution_cost_model import round_trip_fee_pct
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
@@ -152,16 +148,6 @@ _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "promotion_flow",
     "live_mutation",
 }
-_TRAINING_REPAIR_SOURCE_MARKERS = ("repair", "correction", "backfill")
-_TRAINING_REPAIR_SOURCES = {
-    "missing_closed_position_repair",
-    "okx_native_full_close_fill_correction",
-    "okx_order_pair_repair",
-    "okx_orphan_position_quarantine",
-    "okx_position_link_repair",
-}
-
-
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -193,19 +179,6 @@ def _snapshot(value: Any) -> dict[str, Any]:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
-
-
-def _trade_reflection_repair_source(reflection: TradeReflection) -> str:
-    reflection_source = _text(getattr(reflection, "source", None)).lower()
-    lessons = _snapshot(getattr(reflection, "expert_lessons", None))
-    lesson_source = _text(lessons.get("source")).lower()
-    for candidate in (lesson_source, reflection_source):
-        if candidate in _TRAINING_REPAIR_SOURCES:
-            return candidate
-    for candidate in (lesson_source, reflection_source):
-        if candidate and any(token in candidate for token in _TRAINING_REPAIR_SOURCE_MARKERS):
-            return candidate
-    return ""
 
 
 def _compact_numeric(value: Any) -> float | None:
@@ -539,60 +512,10 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
     return samples
 
 
-async def _load_trade_reflection_samples() -> list[dict[str, Any]]:
-    async with get_session_ctx() as session:
-        stmt = select(TradeReflection).order_by(TradeReflection.id.desc())
-        result = await session.execute(stmt)
-        rows = list(result.scalars().all())
-
-    samples: list[dict[str, Any]] = []
-    for row in rows:
-        repair_source = _trade_reflection_repair_source(row)
-        samples.append(
-            {
-                "source": "trade_reflection",
-                "id": int(row.id or 0),
-                "position_id": int(row.position_id or 0),
-                "model_name": row.model_name,
-                "execution_mode": row.execution_mode,
-                "symbol": row.symbol,
-                "side": row.side,
-                "entry_price": _as_float(row.entry_price),
-                "exit_price": _as_float(row.exit_price),
-                "quantity": _as_float(row.quantity),
-                "realized_pnl": _as_float(row.realized_pnl),
-                "fee_estimate": _as_float(row.fee_estimate),
-                "hold_minutes": _as_float(row.hold_minutes),
-                "outcome": row.outcome,
-                "reflection_source": _text(row.source),
-                "trade_fact_repair_source": repair_source,
-            }
-        )
-    samples.reverse()
-    return samples
-
-
-async def _load_authoritative_trade_samples() -> list[dict[str, Any]]:
-    """Compatibility name for the canonical outcome loader."""
+async def _load_trade_samples() -> list[dict[str, Any]]:
+    """Load the only trainable realized-trade source."""
 
     return await load_authoritative_trade_outcomes()
-
-
-def _merge_trade_samples(
-    reflection_samples: list[dict[str, Any]],
-    authoritative_samples: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return only versioned real outcomes; reflections are already linked by the owner."""
-
-    del reflection_samples
-    return [
-        dict(sample)
-        for sample in authoritative_samples
-        if str(sample.get("source") or "").strip() in AUTHORITATIVE_TRADE_OUTCOME_SOURCES
-        and str(sample.get("lifecycle_key") or "").strip()
-        and sample.get("event_type") == "AuthoritativeTradeOutcome"
-        and sample.get("outcome_version") == AUTHORITATIVE_TRADE_OUTCOME_VERSION
-    ]
 
 
 async def _completed_shadow_sample_count() -> int:
@@ -616,11 +539,10 @@ async def _completed_trade_sample_count() -> int:
     computed from the same clean view that is sent to the model server.
     """
 
-    reflection_samples = await _load_trade_reflection_samples()
-    authoritative_samples = await _load_authoritative_trade_samples()
+    trade_samples = await _load_trade_samples()
     payload = annotate_training_payload(
         shadow_samples=[],
-        trade_samples=_merge_trade_samples(reflection_samples, authoritative_samples),
+        trade_samples=trade_samples,
         sequence_samples=[],
         text_sentiment_samples=[],
     )
@@ -830,9 +752,7 @@ async def _main() -> None:
         quarantine_result = await quarantine_dirty_shadow_samples()
 
     shadow_samples = await _load_shadow_samples()
-    trade_reflection_samples = await _load_trade_reflection_samples()
-    authoritative_samples = await _load_authoritative_trade_samples()
-    trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
+    trade_samples = await _load_trade_samples()
     sequence_samples = await _load_sequence_samples()
     text_sentiment_samples = await _load_text_sentiment_samples()
     training_payload = annotate_training_payload(

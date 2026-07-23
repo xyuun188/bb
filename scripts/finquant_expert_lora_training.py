@@ -37,10 +37,8 @@ from core.safe_output import safe_error_text, safe_print  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
 from models.learning import ExpertMemory  # noqa: E402
 from scripts.train_local_ai_tools_models import (  # noqa: E402
-    _load_authoritative_trade_samples,
     _load_shadow_samples,
-    _load_trade_reflection_samples,
-    _merge_trade_samples,
+    _load_trade_samples,
 )
 from services.training_data_quality import annotate_training_payload  # noqa: E402
 
@@ -1512,9 +1510,7 @@ async def _assert_training_data_source_ready() -> None:
 
 async def build_dataset() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     await _assert_training_data_source_ready()
-    reflections = await _load_trade_reflection_samples()
-    authoritative = await _load_authoritative_trade_samples()
-    trade_samples = _merge_trade_samples(reflections, authoritative)
+    trade_samples = await _load_trade_samples()
     shadow_samples = await _load_shadow_samples()
     quality = annotate_training_payload(
         shadow_samples=shadow_samples,

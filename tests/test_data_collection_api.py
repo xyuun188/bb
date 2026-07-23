@@ -778,11 +778,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
         fake_shadow,
     )
     monkeypatch.setattr(
-        "scripts.train_local_ai_tools_models._load_trade_reflection_samples",
-        lambda: _async_value([]),
-    )
-    monkeypatch.setattr(
-        "scripts.train_local_ai_tools_models._load_authoritative_trade_samples",
+        "scripts.train_local_ai_tools_models._load_trade_samples",
         lambda: _async_value([]),
     )
     monkeypatch.setattr(
@@ -970,12 +966,8 @@ async def test_data_collection_status_is_read_only_for_training_quarantine(
         lambda _limit: _async_value([]),
     )
     monkeypatch.setattr(
-        "scripts.train_local_ai_tools_models._load_trade_reflection_samples",
-        lambda _limit: _async_value([]),
-    )
-    monkeypatch.setattr(
-        "scripts.train_local_ai_tools_models._load_authoritative_trade_samples",
-        lambda _limit: _async_value([]),
+        "scripts.train_local_ai_tools_models._load_trade_samples",
+        lambda: _async_value([]),
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_sequence_samples",

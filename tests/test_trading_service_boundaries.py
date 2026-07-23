@@ -2199,7 +2199,7 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
             {"id": 2, "features": {"symbol": "ETH/USDT"}},
         ]
 
-    async def load_trade_reflections(_limit: int | None = None) -> list[dict[str, Any]]:
+    async def load_trade_samples(_limit: int | None = None) -> list[dict[str, Any]]:
         assert _limit is None
         return [{"id": 2, "symbol": "BTC/USDT", "side": "long", "pnl": 1.2}]
 
@@ -2246,11 +2246,9 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
         },
     )
     monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)
-    monkeypatch.setattr(train_script, "_load_trade_reflection_samples", load_trade_reflections)
-    monkeypatch.setattr(train_script, "_load_authoritative_trade_samples", load_empty)
+    monkeypatch.setattr(train_script, "_load_trade_samples", load_trade_samples)
     monkeypatch.setattr(train_script, "_load_sequence_samples", load_empty)
     monkeypatch.setattr(train_script, "_load_text_sentiment_samples", load_empty)
-    monkeypatch.setattr(train_script, "_merge_trade_samples", lambda a, b: [*a, *b])
     monkeypatch.setattr(train_script, "_completed_trade_sample_count", completed_trade_count)
     monkeypatch.setattr(
         "services.training_data_quality.annotate_training_payload",

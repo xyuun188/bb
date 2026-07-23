@@ -216,16 +216,7 @@ def _repair_provenance_reason(sample: dict[str, Any]) -> str:
 
 
 def _trade_pnl_source(sample: dict[str, Any]) -> str:
-    for key in ("pnl_source", "settlement_source", "realized_pnl_source"):
-        value = _safe_str(sample.get(key))
-        if value:
-            return value
-    close_raw = _safe_dict(sample.get("close_raw"))
-    for key in ("pnl_source", "settlement_source", "realized_pnl_source"):
-        value = _safe_str(close_raw.get(key))
-        if value:
-            return value
-    return ""
+    return _safe_str(sample.get("pnl_source"))
 
 
 def _trade_pnl_source_trusted(source: str) -> bool:
@@ -238,16 +229,7 @@ def _trade_pnl_source_trusted(source: str) -> bool:
 
 
 def _trade_funding_fee_source(sample: dict[str, Any]) -> str:
-    for key in ("funding_fee_source", "funding_source"):
-        value = _safe_str(sample.get(key))
-        if value:
-            return value
-    close_raw = _safe_dict(sample.get("close_raw"))
-    for key in ("funding_fee_source", "funding_source"):
-        value = _safe_str(close_raw.get(key))
-        if value:
-            return value
-    return ""
+    return _safe_str(sample.get("funding_fee_source"))
 
 
 def _trade_funding_source_trusted(sample: dict[str, Any]) -> bool:
@@ -460,13 +442,6 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             ],
             exclude=True,
         )
-    if sample.get("gross_return_price_consistent") is False:
-        return _final_assessment(
-            0.0,
-            ["gross_return_price_path_mismatch"],
-            exclude=True,
-        )
-
     source = _safe_str(sample.get("source")).lower()
     if source in AUTHORITATIVE_TRADE_OUTCOME_SOURCES:
         if (
@@ -729,15 +704,7 @@ def _trade_fee(sample: dict[str, Any]) -> float | None:
 
 
 def _trade_funding_fee(sample: dict[str, Any]) -> float | None:
-    for value in (
-        sample.get("funding_fee"),
-        _trade_close_raw(sample).get("funding_fee"),
-        _trade_entry_raw(sample).get("funding_fee"),
-    ):
-        fee = _safe_float(value, None)
-        if fee is not None:
-            return fee
-    return None
+    return _safe_float(sample.get("funding_fee"), None)
 
 
 def _trade_notional(sample: dict[str, Any]) -> float | None:

@@ -675,7 +675,7 @@ def _summarize_profit_closed_loop(report: dict) -> dict:
                             "evidence_gaps",
                             "decision_id",
                             "realized_pnl",
-                            "authoritative_return_pct",
+                            "net_return_after_all_cost_pct",
                             "counterfactual_production_weight",
                         )
                     }

@@ -16,11 +16,9 @@ from scripts import train_local_ai_tools_models as train_script
 from scripts.train_local_ai_tools_models import (
     _build_auth_headers,
     _compact_local_ai_tools_features,
-    _merge_trade_samples,
     _normalize_base_url,
     _post_training_payload,
 )
-from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 
 
@@ -209,80 +207,6 @@ def test_local_ai_tools_training_base_url_validation() -> None:
 
     with pytest.raises(RuntimeError, match="LOCAL_AI_TOOLS_API_BASE is empty"):
         _normalize_base_url("")
-
-
-def test_local_ai_tools_training_merges_trade_samples_without_duplicate_positions() -> None:
-    reflection_samples = [
-        {
-            "source": "trade_reflection",
-            "id": 11,
-            "position_id": 7,
-            "realized_pnl": -1.2,
-            "hold_minutes": 3.0,
-        },
-        {"source": "trade_reflection", "id": 12, "position_id": 8, "realized_pnl": 2.4},
-        {
-            "source": "trade_reflection",
-            "id": 13,
-            "position_id": 9,
-            "realized_pnl": 99.0,
-            "trade_fact_repair_source": "okx_position_link_repair",
-        },
-    ]
-    authoritative_samples = [
-        {
-            "source": "okx_position_history",
-            "event_type": "AuthoritativeTradeOutcome",
-            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-            "outcome_id": "ato:7",
-            "id": 7,
-            "lifecycle_key": "paper|AAA-USDT-SWAP|pos-7|long|1",
-            "position_id": 7,
-            "position_ids": [7],
-            "realized_pnl": -1.2,
-            "hold_minutes": 4.0,
-            "raw_llm_response": {
-                "profit_first_trade_plan": {
-                    "decision_lane": "tiny_probe",
-                    "position_size_pct": 0.01,
-                }
-            },
-        },
-        {
-            "source": "okx_position_history",
-            "event_type": "AuthoritativeTradeOutcome",
-            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-            "outcome_id": "ato:9",
-            "id": 9,
-            "lifecycle_key": "paper|BBB-USDT-SWAP|pos-9|long|2",
-            "position_id": 9,
-            "position_ids": [9],
-            "realized_pnl": 0.4,
-        },
-        {
-            "source": "okx_verified_execution_pair",
-            "event_type": "AuthoritativeTradeOutcome",
-            "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-            "outcome_id": "ato:10",
-            "id": 10,
-            "lifecycle_key": "paper|CCC-USDT-SWAP|pos-10|net|3",
-            "position_id": 10,
-            "position_ids": [10],
-            "realized_pnl": -0.2,
-        },
-    ]
-
-    merged = _merge_trade_samples(reflection_samples, authoritative_samples)
-
-    assert [item["source"] for item in merged] == [
-        "okx_position_history",
-        "okx_position_history",
-        "okx_verified_execution_pair",
-    ]
-    assert [item["position_id"] for item in merged] == [7, 9, 10]
-    assert merged[0]["hold_minutes"] == 4.0
-    assert merged[0]["raw_llm_response"]["profit_first_trade_plan"]["decision_lane"] == "tiny_probe"
-    assert merged[1]["realized_pnl"] == 0.4
 
 
 @pytest.mark.asyncio
@@ -582,8 +506,7 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
         ],
     )
     monkeypatch.setattr(train_script, "_load_shadow_samples", load_shadow_samples)
-    monkeypatch.setattr(train_script, "_load_trade_reflection_samples", empty_samples)
-    monkeypatch.setattr(train_script, "_load_authoritative_trade_samples", empty_samples)
+    monkeypatch.setattr(train_script, "_load_trade_samples", empty_samples)
     monkeypatch.setattr(train_script, "_load_sequence_samples", empty_samples)
     monkeypatch.setattr(train_script, "_load_text_sentiment_samples", empty_samples)
     monkeypatch.setattr(train_script, "_completed_shadow_sample_count", completed_shadow_count)

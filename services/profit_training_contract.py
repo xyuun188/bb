@@ -162,15 +162,30 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
     if (_safe_float(sample.get("holding_minutes")) or 0.0) < 0:
         blockers.append("holding_minutes_negative")
 
-    for field in (
-        "notional_source",
-        "entry_fee_source",
-        "close_fee_source",
-        "pnl_source",
-        "funding_fee_source",
+    if _text(sample.get("notional_source")) != (
+        "okx_entry_fill_base_quantity_and_average_price"
     ):
-        if _text(sample.get(field)).lower() in {"", "missing", "estimated", "fallback"}:
+        blockers.append("notional_source_not_authoritative")
+    allowed_fee_sources = {"okx_fills_history", "okx_execution_result"}
+    for field in ("entry_fee_source", "close_fee_source"):
+        sources = {
+            token
+            for token in _text(sample.get(field)).split("+")
+            if token
+        }
+        if not sources or not sources.issubset(allowed_fee_sources):
             blockers.append(f"{field}_not_authoritative")
+    if _text(sample.get("pnl_source")) not in {
+        "okx_position_history_realized_pnl",
+        "okx_verified_execution_pair_settlement",
+    }:
+        blockers.append("pnl_source_not_authoritative")
+    funding_fee_source = _text(sample.get("funding_fee_source"))
+    if not (
+        funding_fee_source.startswith("okx_")
+        or funding_fee_source.startswith("okx_positions_history.")
+    ):
+        blockers.append("funding_fee_source_not_authoritative")
     slippage_source = _text(sample.get("slippage_source"))
     if slippage_source != "okx_configured_stop_trigger_to_fills_vwap":
         blockers.append("slippage_source_not_authoritative")

@@ -19,6 +19,7 @@ from services.authoritative_trade_outcome import (
     load_authoritative_trade_outcomes,
 )
 from services.memory_feedback import MemoryFeedbackPolicy
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.trade_fact_trust import closed_position_trade_fact_trusted
 
 logger = structlog.get_logger(__name__)
@@ -290,12 +291,12 @@ class ExpertMemoryService:
         if position_id <= 0:
             return False
         repo = MemoryRepository(session)
-        net_return_pct = _safe_float(outcome.get("authoritative_pnl_ratio_pct"), 0.0)
+        net_return_pct = _safe_float(outcome.get(PROFIT_TRAINING_TARGET), 0.0)
         realized_pnl = _safe_float(outcome.get("realized_pnl"), 0.0)
         result_label = "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat"
         symbol = str(outcome.get("symbol") or "")
         side = str(outcome.get("side") or "").lower()
-        hold_minutes = _safe_float(outcome.get("hold_minutes"), 0.0)
+        hold_minutes = _safe_float(outcome.get("holding_minutes"), 0.0)
         reflection_data = {
             "position_id": position_id,
             "model_name": str(outcome.get("model_name") or self.ensemble_model_name),
@@ -303,10 +304,11 @@ class ExpertMemoryService:
             "symbol": symbol,
             "side": side,
             "entry_price": _safe_float(outcome.get("entry_price"), 0.0),
-            "exit_price": _safe_float(outcome.get("exit_price"), 0.0),
+            "exit_price": _safe_float(outcome.get("close_price"), 0.0),
             "quantity": _safe_float(outcome.get("quantity"), 0.0),
             "realized_pnl": realized_pnl,
-            "fee_estimate": abs(_safe_float(outcome.get("fee"), 0.0)),
+            "fee_estimate": _safe_float(outcome.get("entry_fee"), 0.0)
+            + _safe_float(outcome.get("close_fee"), 0.0),
             "hold_minutes": hold_minutes,
             "closed_at": _parse_iso_datetime(outcome.get("label_timestamp")),
             "outcome": result_label,

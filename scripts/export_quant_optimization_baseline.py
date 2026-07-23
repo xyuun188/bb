@@ -24,12 +24,10 @@ from models.market_data import Kline, Ticker  # noqa: E402
 from models.news import NewsArticle, SocialPost  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
 from scripts.train_local_ai_tools_models import (  # noqa: E402
-    _load_authoritative_trade_samples,
     _load_sequence_samples,
     _load_shadow_samples,
     _load_text_sentiment_samples,
-    _load_trade_reflection_samples,
-    _merge_trade_samples,
+    _load_trade_samples,
 )
 from services.trade_fact_trust import closed_position_trade_fact_untrusted_reason  # noqa: E402
 from services.training_data_quality import annotate_training_payload  # noqa: E402
@@ -249,9 +247,7 @@ async def _training_source_metrics(
         news_count = int((await session.execute(select(func.count(NewsArticle.id)))).scalar() or 0)
         social_count = int((await session.execute(select(func.count(SocialPost.id)))).scalar() or 0)
     shadow_samples = await _load_shadow_samples()
-    trade_reflection_samples = await _load_trade_reflection_samples()
-    authoritative_samples = await _load_authoritative_trade_samples()
-    trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
+    trade_samples = await _load_trade_samples()
     sequence_samples = await _load_sequence_samples()
     text_sentiment_samples = await _load_text_sentiment_samples()
     payload = annotate_training_payload(

@@ -287,13 +287,6 @@ def _execution_budget_facts(
     }
 
 
-def _official_ratio_pct(raw: dict[str, Any], fallback: Any) -> float | None:
-    ratio = _safe_float(raw.get("pnlRatio"), None)
-    if ratio is None:
-        ratio = _safe_float(fallback, None)
-    return ratio * 100.0 if ratio is not None else None
-
-
 def _has_raw_key(raw: dict[str, Any], *keys: str) -> bool:
     return any(key in raw and raw.get(key) not in (None, "") for key in keys)
 
@@ -323,7 +316,7 @@ def _decision_authority(
         return "system"
     if strategy_training_role != "entry_strategy":
         return "system"
-    return "model"
+    return ""
 
 
 def _model_shadow_prediction(
@@ -371,54 +364,27 @@ def _directional_price_return_pct(
     *,
     side: str,
     entry_price: float,
-    exit_price: float,
+    close_price: float,
 ) -> float | None:
-    if entry_price <= 0 or exit_price <= 0 or side not in {"long", "short"}:
+    if entry_price <= 0 or close_price <= 0 or side not in {"long", "short"}:
         return None
-    raw_return = (exit_price - entry_price) / entry_price * 100.0
+    raw_return = (close_price - entry_price) / entry_price * 100.0
     return raw_return if side == "long" else -raw_return
 
 
-def _authoritative_notional_facts(
+def _return_consistency_facts(
     *,
-    inst_id: str,
     side: str,
     entry_price: float,
-    exit_price: float,
+    close_price: float,
     gross_pnl: float,
-    contract_notional_usdt: float | None,
+    notional: float | None,
 ) -> dict[str, Any]:
-    """Prefer the official gross-PnL price path over stale contract multipliers."""
-
     price_return_pct = _directional_price_return_pct(
         side=side,
         entry_price=entry_price,
-        exit_price=exit_price,
+        close_price=close_price,
     )
-    pnl_implied_notional = None
-    if (
-        inst_id.upper().endswith("-USDT-SWAP")
-        and price_return_pct is not None
-        and abs(price_return_pct) > 1e-9
-        and abs(gross_pnl) > 1e-9
-    ):
-        pnl_implied_notional = abs(gross_pnl) / (abs(price_return_pct) / 100.0)
-    notional = (
-        pnl_implied_notional
-        if pnl_implied_notional is not None and pnl_implied_notional > 0
-        else contract_notional_usdt
-    )
-    relative_error = None
-    if (
-        pnl_implied_notional is not None
-        and pnl_implied_notional > 0
-        and contract_notional_usdt is not None
-        and contract_notional_usdt > 0
-    ):
-        relative_error = abs(contract_notional_usdt - pnl_implied_notional) / max(
-            pnl_implied_notional,
-            1e-9,
-        )
     gross_return_pct = (
         gross_pnl / notional * 100.0
         if notional is not None and notional > 0
@@ -435,18 +401,6 @@ def _authoritative_notional_facts(
         )
     )
     return {
-        "notional_usdt": notional,
-        "notional_source": (
-            "okx_gross_pnl_and_average_price_path"
-            if pnl_implied_notional is not None and pnl_implied_notional > 0
-            else "okx_contract_spec_and_entry_fills"
-        ),
-        "contract_spec_notional_usdt": contract_notional_usdt,
-        "pnl_implied_notional_usdt": pnl_implied_notional,
-        "contract_notional_relative_error": relative_error,
-        "contract_notional_corrected": bool(
-            relative_error is not None and relative_error > 0.05
-        ),
         "gross_price_return_pct": price_return_pct,
         "gross_return_on_notional_pct": gross_return_pct,
         "gross_return_price_consistent": return_consistent,
@@ -518,11 +472,10 @@ def build_okx_history_training_sample(
         else None
     )
     entry_price = _safe_float(_value(history, "open_avg_px"), 0.0) or 0.0
-    exit_price = _safe_float(_value(history, "close_avg_px"), 0.0) or 0.0
+    close_price = _safe_float(_value(history, "close_avg_px"), 0.0) or 0.0
     side = _text(_value(history, "side")).lower()
-    open_contracts = _safe_float(_value(history, "open_max_pos"), 0.0) or 0.0
     fill_contracts = _entry_fill_contracts(entry_orders)
-    contracts = fill_contracts or open_contracts
+    contracts = fill_contracts or 0.0
     spec = _raw_contract_spec(raw)
     public_or_stored_ct_val = _safe_float(spec.get("ctVal"), None)
     ct_mult = _safe_float(spec.get("ctMult"), None)
@@ -566,29 +519,6 @@ def build_okx_history_training_sample(
         if account_values and not account_contract_conflict
         else None
     )
-    pnl_implied_ct_val = None
-    price_delta = abs(exit_price - entry_price)
-    if (
-        contracts > 0
-        and ct_mult is not None
-        and ct_mult > 0
-        and price_delta > 1e-12
-        and abs(gross_pnl) > 1e-12
-        and _text(_value(history, "inst_id")).upper().endswith("-USDT-SWAP")
-    ):
-        pnl_implied_ct_val = abs(gross_pnl) / contracts / price_delta / ct_mult
-    if (
-        verified_account_ct_val is not None
-        and pnl_implied_ct_val is not None
-        and not math.isclose(
-            verified_account_ct_val,
-            pnl_implied_ct_val,
-            rel_tol=0.02,
-            abs_tol=1e-12,
-        )
-    ):
-        account_contract_conflict = True
-
     ct_val = public_or_stored_ct_val
     contract_ct_val_source = "okx_contract_spec"
     contract_ct_val_corrected = False
@@ -608,49 +538,13 @@ def build_okx_history_training_sample(
                 abs_tol=1e-12,
             )
         )
-    elif (
-        execution_mode == "paper"
-        and pnl_implied_ct_val is not None
-        and (
-            public_or_stored_ct_val is None
-            or not math.isclose(
-                public_or_stored_ct_val,
-                pnl_implied_ct_val,
-                rel_tol=0.05,
-                abs_tol=1e-12,
-            )
-        )
-    ):
-        ct_val = pnl_implied_ct_val
-        contract_ct_val_source = "okx_gross_pnl_contract_size_crosscheck"
-        contract_ct_val_corrected = True
-    public_contract_notional = (
-        abs(contracts * public_or_stored_ct_val * ct_mult * entry_price)
-        if contracts > 0
-        and public_or_stored_ct_val
-        and ct_mult
-        and entry_price > 0
-        else None
-    )
-    effective_contract_notional = (
-        abs(contracts * ct_val * ct_mult * entry_price)
-        if contracts > 0 and ct_val and ct_mult and entry_price > 0
-        else None
-    )
-    contract_notional = (
-        effective_contract_notional
-        if verified_account_ct_val is not None
-        else public_contract_notional
-    )
-    notional_facts = _authoritative_notional_facts(
-        inst_id=_text(_value(history, "inst_id")),
+    return_facts = _return_consistency_facts(
         side=side,
         entry_price=entry_price,
-        exit_price=exit_price,
+        close_price=close_price,
         gross_pnl=gross_pnl,
-        contract_notional_usdt=contract_notional,
+        notional=canonical_notional,
     )
-    notional = _safe_float(notional_facts.get("notional_usdt"), None)
     settlement_expected = gross_pnl + fee_signed + funding_fee + liquidation_penalty
     settlement_tolerance = max(1e-6, abs(realized_pnl) * 1e-5)
     gaps: list[str] = []
@@ -666,7 +560,7 @@ def build_okx_history_training_sample(
         gaps.append("missing_position_side")
     if entry_price <= 0:
         gaps.append("missing_open_average_price")
-    if exit_price <= 0:
+    if close_price <= 0:
         gaps.append("missing_close_average_price")
     if not _has_raw_key(raw, "realizedPnl", "realized_pnl"):
         gaps.append("missing_official_realized_pnl")
@@ -684,9 +578,7 @@ def build_okx_history_training_sample(
         gaps.append("missing_fill_or_open_contracts")
     if account_contract_conflict:
         gaps.append("account_contract_size_evidence_conflict")
-    if notional is None or notional <= 0:
-        gaps.append("missing_authoritative_notional")
-    if notional_facts.get("gross_return_price_consistent") is not True:
+    if return_facts.get("gross_return_price_consistent") is not True:
         gaps.append("gross_return_price_path_mismatch")
     if abs(realized_pnl - settlement_expected) > settlement_tolerance:
         gaps.append("settlement_algebra_mismatch")
@@ -704,6 +596,20 @@ def build_okx_history_training_sample(
         gaps.append("missing_authoritative_entry_fee")
     if canonical_close_fee is None:
         gaps.append("missing_authoritative_close_fee")
+    entry_fill_price = _safe_float(entry_fill_group.get("average_price"), None)
+    close_fill_price = _safe_float(close_fill_group.get("average_price"), None)
+    if (
+        entry_fill_price is not None
+        and entry_price > 0
+        and not math.isclose(entry_fill_price, entry_price, rel_tol=0.001, abs_tol=1e-12)
+    ):
+        gaps.append("entry_fill_price_history_mismatch")
+    if (
+        close_fill_price is not None
+        and close_price > 0
+        and not math.isclose(close_fill_price, close_price, rel_tol=0.001, abs_tol=1e-12)
+    ):
+        gaps.append("close_fill_price_history_mismatch")
     if holding_minutes is None:
         gaps.append("missing_authoritative_holding_minutes")
     if canonical_entry_fee is not None and canonical_close_fee is not None:
@@ -792,14 +698,13 @@ def build_okx_history_training_sample(
         protection_execution
         and _text(protection_execution.get("actual_side")).lower() == "sl"
     )
-    stop_loss_slippage_pct = (
+    canonical_slippage = (
         _safe_float(protection_execution.get("stop_loss_slippage_pct"), None)
         if stop_loss_fill_confirmed
         and _text(protection_execution.get("stop_loss_slippage_source"))
         == "okx_configured_stop_trigger_to_fills_vwap"
         else None
     )
-    canonical_slippage = stop_loss_slippage_pct
     canonical_slippage_source = (
         "okx_configured_stop_trigger_to_fills_vwap"
         if canonical_slippage is not None
@@ -880,7 +785,6 @@ def build_okx_history_training_sample(
         lineage_gaps.append("invalid_paper_training_contract")
     lineage_gaps = list(dict.fromkeys(lineage_gaps))
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
-    official_ratio_pct = _official_ratio_pct(raw, _value(history, "pnl_ratio"))
     lifecycle_key = _text(_value(history, "row_identity"))
     history_source = _text(_value(history, "source"))
     verified_execution_pair = history_source == "okx_verified_execution_pair_settlement"
@@ -923,8 +827,7 @@ def build_okx_history_training_sample(
         "side": side,
         "close_status": _text(_value(history, "close_status")).lower(),
         "entry_price": entry_price,
-        "exit_price": exit_price,
-        "close_price": exit_price,
+        "close_price": close_price,
         "quantity": contracts,
         "quantity_unit": "contracts",
         "fill_contracts": fill_contracts,
@@ -932,23 +835,18 @@ def build_okx_history_training_sample(
         "contract_ct_val_source": contract_ct_val_source,
         "contract_ct_val_corrected": contract_ct_val_corrected,
         "public_or_stored_contract_ct_val": public_or_stored_ct_val,
-        "pnl_implied_contract_ct_val": pnl_implied_ct_val,
         "account_contract_size_evidence": account_contract_size,
         "contract_ct_mult": ct_mult,
         "contract_lot_size": lot_size,
-        "notional_usdt": notional,
-        **notional_facts,
         "notional": canonical_notional,
         "notional_source": (
             "okx_entry_fill_base_quantity_and_average_price"
             if canonical_notional is not None and canonical_notional > 0
             else ""
         ),
-        "authoritative_pnl_ratio_pct": official_ratio_pct,
+        **return_facts,
         "realized_pnl": realized_pnl,
         "gross_pnl": gross_pnl,
-        "fee": fee_signed,
-        "fee_estimate": abs(fee_signed),
         "entry_fee": canonical_entry_fee,
         "close_fee": canonical_close_fee,
         "entry_fee_source": _text(entry_fill_group.get("fee_source")),
@@ -956,20 +854,13 @@ def build_okx_history_training_sample(
         "funding_fee": funding_fee,
         "liquidation_penalty": liquidation_penalty,
         "settlement_components_total": settlement_expected,
-        "hold_minutes": holding_minutes,
         "holding_minutes": holding_minutes,
         "leverage": _safe_float(_value(history, "leverage"), 1.0) or 1.0,
         "planned_stop_loss_price": stop_loss_price,
         "planned_take_profit_price": take_profit_price,
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
-        "stop_loss_slippage_pct": stop_loss_slippage_pct,
         "slippage": canonical_slippage,
         "slippage_source": canonical_slippage_source,
-        "stop_loss_slippage_source": (
-            protection_execution.get("stop_loss_slippage_source")
-            if stop_loss_fill_confirmed
-            else "not_authoritatively_confirmed"
-        ),
         "protection_execution_supervision_ready": bool(protection_execution),
         "protection_lifecycle_complete": bool(
             protection_execution and protection_submission
@@ -1120,11 +1011,6 @@ def build_okx_history_training_sample(
             _text(raw.get("_bb_funding_fee_source"))
             if verified_execution_pair
             else "okx_positions_history.fundingFee"
-        ),
-        "fee_source": (
-            _text(raw.get("_bb_fee_source"))
-            if verified_execution_pair
-            else "okx_positions_history.fee"
         ),
         "trade_fact_trusted": not gaps,
         "trade_fact_trust_reason": gaps[0] if gaps else "",

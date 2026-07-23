@@ -33,6 +33,7 @@ from services.continuous_strategy_routing import (
 from services.model_strategy_blueprint import paper_strategy_replay_available
 from services.paper_strategy_champion import PaperStrategyChampionService
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.shadow_backtest_service import shadow_fee_after_outcome
 from services.shadow_training_quarantine import assess_shadow_row
 from services.strategy_historical_replay import (
@@ -1425,7 +1426,7 @@ class StrategyLearningService:
                     quarantine_reasons[reason_text] = quarantine_reasons.get(reason_text, 0) + 1
                 continue
             position_id = _safe_int(outcome.get("position_id"))
-            net_return = _optional_float(outcome.get("authoritative_pnl_ratio_pct"))
+            net_return = _optional_float(outcome.get(PROFIT_TRAINING_TARGET))
             net_pnl = _optional_float(outcome.get("realized_pnl"))
             if net_return is None or net_pnl is None:
                 quarantine_reasons["authoritative_return_missing"] = (

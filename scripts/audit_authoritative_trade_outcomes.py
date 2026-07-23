@@ -23,6 +23,7 @@ from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     load_authoritative_trade_outcomes,
 )
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
 
 LINKAGE_RECOVERY_GAPS = {
@@ -76,10 +77,10 @@ def _outcome_summary(outcome: dict[str, Any]) -> dict[str, Any]:
         "symbol": outcome.get("symbol"),
         "side": outcome.get("side"),
         "realized_pnl": outcome.get("realized_pnl"),
-        "authoritative_pnl_ratio_pct": outcome.get("authoritative_pnl_ratio_pct"),
+        PROFIT_TRAINING_TARGET: outcome.get(PROFIT_TRAINING_TARGET),
         "outcome_complete": outcome.get("outcome_complete"),
         "outcome_evidence_gaps": outcome.get("outcome_evidence_gaps"),
-        "stop_loss_slippage_pct": outcome.get("stop_loss_slippage_pct"),
+        "slippage": outcome.get("slippage"),
         "trigger_to_first_fill_ms": outcome.get("trigger_to_first_fill_ms"),
         "attribution": outcome.get("attribution"),
         "counterfactual_evidence_count": len(outcome.get("counterfactual_evidence") or []),

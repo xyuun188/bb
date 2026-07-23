@@ -23,7 +23,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 from config.settings import settings  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 from scripts.train_local_ai_tools_models import (  # noqa: E402
-    _load_authoritative_trade_samples,
+    _load_trade_samples,
 )
 from services.specialist_shadow_evaluation import (  # noqa: E402
     DEFAULT_WINDOW_HOURS,
@@ -57,7 +57,7 @@ async def _main() -> None:
     parser.add_argument("--json-indent", type=int, default=2)
     args = parser.parse_args()
 
-    authoritative_trade_samples = await _load_authoritative_trade_samples()
+    authoritative_trade_samples = await _load_trade_samples()
     report = await SpecialistShadowEvaluationService().report(
         hours=args.hours,
         authoritative_trade_samples=authoritative_trade_samples,

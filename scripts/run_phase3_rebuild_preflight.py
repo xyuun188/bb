@@ -155,18 +155,14 @@ async def _collect_training_payload() -> dict[str, Any]:
     from scripts.train_local_ai_tools_models import (
         _completed_shadow_sample_count,
         _completed_trade_sample_count,
-        _load_authoritative_trade_samples,
         _load_sequence_samples,
         _load_shadow_samples,
         _load_text_sentiment_samples,
-        _load_trade_reflection_samples,
-        _merge_trade_samples,
+        _load_trade_samples,
     )
 
     shadow_samples = await _load_shadow_samples()
-    trade_reflection_samples = await _load_trade_reflection_samples()
-    authoritative_samples = await _load_authoritative_trade_samples()
-    trade_samples = _merge_trade_samples(trade_reflection_samples, authoritative_samples)
+    trade_samples = await _load_trade_samples()
     sequence_samples = await _load_sequence_samples()
     text_sentiment_samples = await _load_text_sentiment_samples()
     payload = annotate_training_payload(
