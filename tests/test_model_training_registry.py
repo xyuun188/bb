@@ -204,6 +204,8 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
     assert rows["timesfm_2_5"]["training_mode"] == "inference_only"
     assert rows["timesfm_2_5"]["evaluation_mode"] == "shadow_evaluating"
     assert rows["timesfm_2_5"][PROFIT_TRAINING_TARGET] == 0.35
+    assert "net_return_after_cost_pct" not in rows["timesfm_2_5"]
+    assert "avg_net_return_after_cost_pct" not in rows["timesfm_2_5"]
     assert rows["timesfm_2_5"]["fine_tune_available"] is False
     assert rows["chronos_2"]["trainable"] is False
     assert rows["chronos_2"]["model_family"] == "amazon/chronos-2"

@@ -363,18 +363,8 @@ def _specialist_rows(
                 "authoritative_sample_count": _safe_int(
                     report.get("authoritative_direction_aligned_count")
                 ),
-                "evaluation_objective": "fee_after_net_return_profit_factor_tail_loss",
-                "avg_net_return_after_cost_pct": report.get(
-                    "avg_shadow_return_after_cost_pct"
-                ),
-                "authoritative_avg_net_return_after_cost_pct": report.get(
-                    "authoritative_avg_return_after_cost_pct"
-                ),
+                "evaluation_objective": "net_return_after_all_cost_profit_factor_tail_loss",
                 PROFIT_TRAINING_TARGET: _first_present(
-                    report.get("authoritative_avg_return_after_cost_pct"),
-                    report.get("avg_shadow_return_after_cost_pct"),
-                ),
-                "net_return_after_cost_pct": _first_present(
                     report.get("authoritative_avg_return_after_cost_pct"),
                     report.get("avg_shadow_return_after_cost_pct"),
                 ),

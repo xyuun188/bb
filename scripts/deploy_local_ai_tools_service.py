@@ -878,11 +878,7 @@ def _authoritative_trade_return_evidence(
         tasks = supervision.get("tasks") or {}
         realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
         side = str(realized.get("side") or sample.get("side") or "").lower()
-        value = f(
-            realized,
-            PROFIT_TRAINING_TARGET,
-            f(realized, "realized_net_return_pct", float("nan")),
-        )
+        value = f(realized, PROFIT_TRAINING_TARGET, float("nan"))
         if (
             supervision.get("version") != PROFIT_SUPERVISION_VERSION
             or realized.get("eligible") is not True
@@ -2519,22 +2515,13 @@ def _weighted_empirical_distribution(values: list[tuple[Any, Any]]) -> dict[str,
 
 def _return_profile_distribution(profile: dict[str, Any]) -> dict[str, Any]:
     distribution = profile.get(PROFIT_TRAINING_TARGET)
-    if not isinstance(distribution, dict):
-        distribution = profile.get("net_return_after_cost_pct")
     return distribution if isinstance(distribution, dict) else {}
 
 
 def _authoritative_return_target_value(sample: dict[str, Any]) -> Any:
     tasks = ((sample.get("profit_supervision") or {}).get("tasks") or {})
     realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
-    value = realized.get(PROFIT_TRAINING_TARGET)
-    if value is None:
-        value = realized.get("realized_net_return_pct")
-    if value is None:
-        value = sample.get(PROFIT_TRAINING_TARGET)
-    if value is None:
-        value = sample.get("net_return_after_cost_pct")
-    return value
+    return realized.get(PROFIT_TRAINING_TARGET)
 
 
 def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2548,6 +2535,8 @@ def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
         tasks = supervision.get("tasks") or {}
         realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
         if realized.get("eligible") is not True:
+            continue
+        if not math.isfinite(f(realized, PROFIT_TRAINING_TARGET, float("nan"))):
             continue
         symbol = symbol_key(row.get("symbol"))
         side = str(realized.get("side") or row.get("side") or "").lower()
@@ -2575,10 +2564,6 @@ def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
             "side": side,
             PROFIT_TRAINING_TARGET: _weighted_empirical_distribution(
                 task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, PROFIT_TRAINING_TARGET)
-            ),
-            "net_return_after_cost_pct": _weighted_empirical_distribution(
-                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, PROFIT_TRAINING_TARGET)
-                or task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "realized_net_return_pct")
             ),
             "execution_cost_pct": _weighted_empirical_distribution(
                 task_pairs(EXECUTION_COST_TASK, "total_cost_pct")
@@ -4610,7 +4595,6 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 "position_id": sample.get("position_id"),
                 "realized_pnl": sample.get("realized_pnl"),
                 PROFIT_TRAINING_TARGET: _authoritative_return_target_value(sample),
-                "net_return_after_cost_pct": sample.get("net_return_after_cost_pct"),
                 "sample_weight": sample.get("sample_weight"),
                 "profit_supervision": sample.get("profit_supervision") or {},
             }

@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
@@ -1829,7 +1830,7 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
                 "source_authority": "okx_position_history",
                 "symbol": "BTC/USDT",
                 "side": side,
-                "net_return_after_cost_pct": {
+                module.PROFIT_TRAINING_TARGET: {
                     "count": 2,
                     "expected": 0.3,
                     "lower_hinge": 0.1,
@@ -2346,7 +2347,16 @@ def test_local_ai_tools_generated_service_uses_profit_target_distribution(
 
     assert profile[module.PROFIT_TRAINING_TARGET]["count"] == 1
     assert profile[module.PROFIT_TRAINING_TARGET]["expected"] == pytest.approx(1.25)
-    assert profile["net_return_after_cost_pct"]["expected"] == pytest.approx(1.25)
+    assert "net_return_after_cost_pct" not in profile
+
+    old_only = deepcopy(sample)
+    realized = old_only["profit_supervision"]["tasks"][
+        module.AUTHORITATIVE_REALIZED_RETURN_TASK
+    ]
+    del realized[module.PROFIT_TRAINING_TARGET]
+    realized["realized_net_return_pct"] = 9.99
+
+    assert module._train_profiles([old_only]) == {}
 
 
 def test_local_ai_walk_forward_tail_policy_ignores_future_extreme_returns(
