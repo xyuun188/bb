@@ -182,6 +182,21 @@ class EntryPolicy:
         raise RuntimeError("EntryPolicy requires entry_profit_risk_sizing dependency")
 
     @staticmethod
+    def _live_rules_canary_gate(decision: DecisionOutput) -> dict[str, Any]:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        gate = raw.get("production_trade_gate")
+        if not isinstance(gate, dict):
+            return {}
+        if (
+            gate.get("mode") == "live_rules_canary"
+            and gate.get("can_trade") is True
+            and gate.get("decision_authority") == "rules"
+            and gate.get("model_can_influence") is False
+        ):
+            return gate
+        return {}
+
+    @staticmethod
     def _record_execution_cost_sizing_pass(
         decision: DecisionOutput,
         impact_basis_notional: float,
@@ -514,6 +529,16 @@ class EntryPolicy:
                     "pipeline_context": context.public_data(),
                     "paper_training": assessment.to_dict(),
                     "production_permission": False,
+                }
+            )
+        rules_canary_gate = self._live_rules_canary_gate(decision)
+        if rules_canary_gate and str(model_mode or "").lower() != "paper":
+            return PolicyGateResult.allow(
+                {
+                    "intent": "live_rules_canary_entry",
+                    "pipeline_context": context.public_data(),
+                    "production_permission": True,
+                    "production_trade_gate": rules_canary_gate,
                 }
             )
         production_assessment = apply_production_entry_policy(decision)

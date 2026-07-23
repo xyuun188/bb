@@ -349,17 +349,11 @@ def test_prediction_economics_keeps_rules_canary_model_blockers_out_of_trade_blo
     assert evidence["available"] is False
     assert evidence["execution_mode"] == "live_rules_canary"
     assert evidence["blockers"] == []
-    assert evidence["model_live_blockers"] == [
-        "production_return_distribution_missing",
-        "live_execution_cost_missing",
-        "expected_net_breakdown_missing",
-        "production_return_policy_missing",
-    ]
 
 
 def test_prediction_economics_renders_rules_canary_without_trade_blocker_label() -> None:
     assert "规则小仓采样" in SCRIPT
-    assert "模型接管未达标" in SCRIPT
+    assert "模型接管未达标" not in SCRIPT
 
 
 @pytest.mark.asyncio

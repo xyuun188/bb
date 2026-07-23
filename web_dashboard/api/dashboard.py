@@ -768,7 +768,6 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
                 "production_trade_gate": gate,
                 "execution_mode": "live_rules_canary",
                 "blockers": [],
-                "model_live_blockers": ["production_return_distribution_missing"],
             }
         return {
             "available": False,
@@ -789,9 +788,7 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
             if value
         )
     )
-    model_live_blockers: list[str] = []
     if gate_mode == "live_rules_canary":
-        model_live_blockers = blockers
         blockers = []
     elif gate and gate.get("can_trade") is not True:
         blockers = list(
@@ -860,7 +857,6 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
             )
         },
         "blockers": blockers,
-        "model_live_blockers": model_live_blockers,
     }
 
 

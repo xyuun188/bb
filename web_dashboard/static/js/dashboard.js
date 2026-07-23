@@ -4706,7 +4706,6 @@ function mlPredictionEconomicsHtml(record, prediction) {
     const cost = economics.execution_cost || {};
     const breakdown = economics.cost_and_return_breakdown || {};
     const blockers = Array.isArray(economics.blockers) ? economics.blockers : [];
-    const modelLiveBlockers = Array.isArray(economics.model_live_blockers) ? economics.model_live_blockers : [];
     const metric = (label, value) => `
         <div class="ml-prediction-metric">
             <span>${escHtml(label)}</span>
@@ -4755,7 +4754,6 @@ function mlPredictionEconomicsHtml(record, prediction) {
                 <span>成本扣除次数 ${mlSampleCountLabel(mlOptionalNumber(breakdown.cost_deduction_count))}</span>
             </div>
             ${blockers.length ? `<div class="ml-prediction-blockers">阻断：${blockers.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>` : ''}
-            ${rulesCanary && modelLiveBlockers.length ? `<div class="ml-prediction-blockers">模型接管未达标：${modelLiveBlockers.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>` : ''}
         </div>`;
 }
 

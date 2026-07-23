@@ -3158,6 +3158,53 @@ async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
 
 
 @pytest.mark.asyncio
+async def test_entry_policy_allows_live_rules_canary_without_production_return_policy() -> None:
+    async def fake_sizing(
+        decision: DecisionOutput,
+        _model_mode: str,
+        _open_positions: list[dict[str, Any]],
+    ) -> None:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw.setdefault("opportunity_score", {})["execution_cost"] = {
+            "order_size_complete": True,
+            "order_notional_usdt": 8.0,
+        }
+        raw["profit_risk_sizing"] = {
+            "production_eligible": True,
+            "final_notional_usdt": 8.0,
+        }
+        decision.raw_response = raw
+
+    policy = EntryPolicy(
+        entry_opportunity_score=EntryOpportunityScorePolicy(
+            lambda _decision, _strategy: 1.0
+        ),
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+    )
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "production_trade_gate": {
+            "can_trade": True,
+            "mode": "live_rules_canary",
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "risk": {"max_notional_usdt": 10.0},
+        }
+    }
+
+    result = await policy.evaluate(
+        decision,
+        "ensemble_trader",
+        "live",
+        open_positions=[],
+    )
+
+    assert result.passed is True
+    assert result.data["intent"] == "live_rules_canary_entry"
+    assert "production_return_policy" not in decision.raw_response
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_reprices_execution_cost_with_planned_order_notional() -> None:
     events: list[tuple[str, float]] = []
 

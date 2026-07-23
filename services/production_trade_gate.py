@@ -241,7 +241,7 @@ def evaluate_production_trade_gate(
 
     rules_canary_enabled = settings.get("rules_canary_enabled") is not False
     if rules_canary_enabled:
-        evidence["model_live_blockers"] = model_blockers
+        evidence["live_ml_blockers"] = model_blockers
         if limits.max_notional_usdt <= 0:
             return ProductionTradeGateResult(
                 can_trade=False,
@@ -263,7 +263,7 @@ def evaluate_production_trade_gate(
         )
 
     reason = "data_insufficient" if model_blockers else "observe_only"
-    evidence["model_live_blockers"] = model_blockers
+    evidence["live_ml_blockers"] = model_blockers
     return ProductionTradeGateResult(
         can_trade=False,
         mode="observe",

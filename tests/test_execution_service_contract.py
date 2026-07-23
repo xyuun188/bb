@@ -30,6 +30,7 @@ def _test_execution_service(
     okx_executor_provider,
     entry_policy_evaluator=None,
     exit_policy_evaluator=None,
+    production_trade_gate_provider=None,
     raw_updates: list[dict[str, Any] | None] | None = None,
     reasons: list[str | None] | None = None,
     stages: list[tuple[str, str, str]] | None = None,
@@ -96,6 +97,7 @@ def _test_execution_service(
         decision_outcome_marker=_noop_async,
         entry_policy_evaluator=entry_policy_evaluator or allow_entry,
         exit_policy_evaluator=exit_policy_evaluator or allow_entry,
+        production_trade_gate_provider=production_trade_gate_provider,
         execution_skills_provider=lambda **_kwargs: [],
         execution_skills_attacher=lambda *_args, **_kwargs: None,
         execution_skills_block_reason_provider=lambda *_args, **_kwargs: None,
@@ -293,6 +295,64 @@ def test_live_rules_canary_respects_gate_notional_limit() -> None:
     assert "rules_canary_order_notional_above_gate_limit" in result.data[
         "block_reasons"
     ]
+
+
+@pytest.mark.asyncio
+async def test_execution_service_attaches_trade_gate_before_entry_policy() -> None:
+    raw_updates: list[dict[str, Any] | None] = []
+    calls: list[str] = []
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        calls.append("okx")
+        raise AssertionError("entry policy block should happen before OKX submit")
+
+    async def gate_provider(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        calls.append("gate")
+        return {
+            "can_trade": True,
+            "mode": "live_rules_canary",
+            "decision_authority": "rules",
+            "model_can_influence": False,
+            "risk": {"max_notional_usdt": 10.0},
+        }
+
+    async def entry_policy(
+        decision: DecisionOutput,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> PolicyGateResult:
+        calls.append("entry_policy")
+        assert decision.raw_response["production_trade_gate"]["mode"] == (
+            "live_rules_canary"
+        )
+        return PolicyGateResult.block(
+            "stop_after_gate_for_test",
+            "stop after proving gate order",
+            {"stage_status": "blocked"},
+        )
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        entry_policy_evaluator=entry_policy,
+        production_trade_gate_provider=gate_provider,
+        raw_updates=raw_updates,
+    )
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+
+    result = await service.execute_candidate(
+        "SPK/USDT",
+        "ensemble_trader",
+        _entry_decision("SPK/USDT"),
+        SimpleNamespace(warnings=[]),
+        2601,
+        results,
+        open_positions=[],
+    )
+
+    assert calls == ["gate", "entry_policy"]
+    assert result is not None
+    assert result.raw_response["policy_blocker"] == "stop_after_gate_for_test"
+    assert raw_updates[-1]["production_trade_gate"]["mode"] == "live_rules_canary"
 
 
 @pytest.mark.asyncio

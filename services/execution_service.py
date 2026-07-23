@@ -1256,6 +1256,35 @@ class ExecutionService:
 
         if decision.is_entry:
             try:
+                if self.production_trade_gate_provider is not None:
+                    gate_payload = await self.production_trade_gate_provider(
+                        decision,
+                        model_name,
+                        model_mode,
+                        open_positions,
+                    )
+                    if isinstance(gate_payload, dict) and gate_payload:
+                        raw = _safe_dict(decision.raw_response)
+                        raw = dict(raw)
+                        raw["production_trade_gate"] = gate_payload
+                        decision.raw_response = raw
+                        if str(model_mode or "").lower() != "paper" and gate_payload.get(
+                            "can_trade"
+                        ) is not True:
+                            return await block_before_submit(
+                                PolicyGateResult.block(
+                                    "production_trade_gate",
+                                    (
+                                        "生产交易闸门未放行："
+                                        f"{gate_payload.get('reason') or gate_payload.get('mode') or 'unknown'}"
+                                    ),
+                                    {
+                                        "stage_status": "blocked",
+                                        "skip_kind": "production_trade_gate",
+                                        "production_trade_gate": gate_payload,
+                                    },
+                                )
+                            )
                 entry_policy_result = await evaluate_entry_policy(
                     decision,
                     model_name,
@@ -1284,35 +1313,6 @@ class ExecutionService:
                 )
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
-            if self.production_trade_gate_provider is not None:
-                gate_payload = await self.production_trade_gate_provider(
-                    decision,
-                    model_name,
-                    model_mode,
-                    open_positions,
-                )
-                if isinstance(gate_payload, dict) and gate_payload:
-                    raw = _safe_dict(decision.raw_response)
-                    raw = dict(raw)
-                    raw["production_trade_gate"] = gate_payload
-                    decision.raw_response = raw
-                    if str(model_mode or "").lower() != "paper" and gate_payload.get(
-                        "can_trade"
-                    ) is not True:
-                        return await block_before_submit(
-                            PolicyGateResult.block(
-                                "production_trade_gate",
-                                (
-                                    "生产交易闸门未放行："
-                                    f"{gate_payload.get('reason') or gate_payload.get('mode') or 'unknown'}"
-                                ),
-                                {
-                                    "stage_status": "blocked",
-                                    "skip_kind": "production_trade_gate",
-                                    "production_trade_gate": gate_payload,
-                                },
-                            )
-                        )
             return_contract_result = _return_entry_contract_result(decision, model_mode)
             if not return_contract_result.passed:
                 return await block_before_submit(return_contract_result)
