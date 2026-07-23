@@ -190,6 +190,7 @@ from services.position_settlement import (
 )
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
+from services.production_trade_gate import evaluate_production_trade_gate
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.strategy_context_performance import StrategyContextPerformanceService
@@ -466,6 +467,7 @@ class TradingService:
                 self.has_matching_exchange_exit_position_for_execution
             ),
             trade_notional_recorder=self.record_executed_trade_notional,
+            production_trade_gate_provider=self.production_trade_gate_snapshot,
         )
         self._exchange_reconcile_lock = asyncio.Lock()
         self.position_protection_fallback = PositionProtectionFallbackPolicy(self._safe_float)
@@ -3292,6 +3294,76 @@ class TradingService:
             model_mode,
             open_positions,
         )
+
+    async def production_trade_gate_snapshot(
+        self,
+        decision: DecisionOutput,
+        model_name: str,
+        model_mode: str,
+        open_positions: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Build the unified production trade gate snapshot before submit."""
+
+        raw = self._safe_dict(decision.raw_response)
+        candidate = self._safe_dict(raw.get("authoritative_return_candidate"))
+        side_evidence = self._safe_dict(candidate.get("side_evidence"))
+        return_policy = self._safe_dict(raw.get("production_return_policy"))
+        metrics = dict(side_evidence)
+        metrics.update(return_policy)
+        source_count = self._safe_float(
+            metrics.get("production_source_count")
+            or metrics.get("return_source_count")
+            or metrics.get("sample_count"),
+            0.0,
+        )
+        if source_count:
+            metrics["production_sample_count"] = int(source_count)
+            metrics["sample_count"] = int(source_count)
+
+        sync_reason = self._okx_authoritative_sync_entry_block_reason()
+        okx_payload = self._okx_authoritative_sync_status_payload()
+        breaker_state = self.risk_engine.circuit_breaker.get_state()
+        daily_pnl = self._safe_float(breaker_state.get("daily_pnl"), 0.0) or 0.0
+        live_authorized = str(model_mode or "").lower() not in {"", "paper"}
+        gate = evaluate_production_trade_gate(
+            okx={
+                "healthy": sync_reason is None,
+                "ok": sync_reason is None,
+                "can_open_new_entries": sync_reason is None,
+                "status": "blocked" if sync_reason else okx_payload.get("status"),
+                "reason": sync_reason,
+                "authoritative_sync": okx_payload,
+            },
+            risk={
+                "blocked": self.risk_engine.circuit_breaker.is_open,
+                "risk_blocked": self.risk_engine.circuit_breaker.is_open,
+                "reason": breaker_state.get("tripped_reason"),
+                "open_position_count": len(
+                    [
+                        position
+                        for position in (open_positions or [])
+                        if self._safe_dict(position).get("is_open", True) is not False
+                    ]
+                ),
+                "daily_loss_usdt": max(-daily_pnl, 0.0),
+                "breaker": breaker_state,
+            },
+            model={
+                "artifact_lifecycle": "active" if live_authorized else "shadow",
+                "allow_live_position_influence": live_authorized,
+                "production_influence_authorized": live_authorized,
+                "live_ml_ready": live_authorized,
+                "model_name": model_name,
+                "model_mode": model_mode,
+                "metrics": metrics,
+            },
+            training={
+                "source": "decision_raw_response",
+                "quality_report": self._safe_dict(raw.get("quality_report")),
+            },
+            settings={"rules_canary_enabled": True},
+        )
+        return gate.to_dict()
 
     async def log_trade(
         self,

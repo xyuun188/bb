@@ -67,6 +67,76 @@ def _governance_complete(value: dict[str, Any]) -> bool:
     )
 
 
+def _rules_canary_entry_contract_result(
+    decision: DecisionOutput,
+    model_mode: str = "",
+) -> PolicyGateResult | None:
+    """Allow bounded live rules-canary entries before model promotion."""
+
+    if str(model_mode or "").lower() == "paper":
+        return None
+    raw = _safe_dict(decision.raw_response)
+    gate = _safe_dict(raw.get("production_trade_gate"))
+    if gate.get("mode") != "live_rules_canary":
+        return None
+
+    risk = _safe_dict(gate.get("risk"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    max_notional = _safe_float(risk.get("max_notional_usdt"), 0.0)
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    execution_notional = _safe_float(execution_cost.get("order_notional_usdt"), 0.0)
+    order_notional = max(final_notional, execution_notional)
+
+    blockers: list[str] = []
+    if gate.get("can_trade") is not True:
+        blockers.append("production_trade_gate_not_open")
+    if gate.get("decision_authority") != "rules":
+        blockers.append("rules_canary_authority_not_rules")
+    if gate.get("model_can_influence") is not False:
+        blockers.append("rules_canary_model_influence_not_disabled")
+    if max_notional <= 0:
+        blockers.append("rules_canary_max_notional_missing")
+    if order_notional <= 0:
+        blockers.append("rules_canary_order_notional_missing")
+    elif max_notional > 0 and order_notional > max_notional + 1e-8:
+        blockers.append("rules_canary_order_notional_above_gate_limit")
+    if execution_cost.get("order_size_complete") is not True:
+        blockers.append("rules_canary_execution_cost_incomplete")
+
+    contract = {
+        "execution_scope": "live_rules_canary",
+        "production_permission": True,
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "order_notional_usdt": order_notional,
+        "max_notional_usdt": max_notional,
+        "gate_version": gate.get("version"),
+        "gate_reason": gate.get("reason"),
+        "blockers": blockers,
+    }
+    if blockers:
+        return PolicyGateResult.block(
+            "live_rules_canary_contract_incomplete",
+            "Live rules canary contract is incomplete; entry fails closed.",
+            {
+                "stage_status": "blocked",
+                "block_reasons": blockers,
+                "production_trade_gate": gate,
+                "live_rules_canary_contract": contract,
+            },
+        )
+    return PolicyGateResult.allow(
+        {
+            "return_execution_contract": "live_rules_canary",
+            "production_permission": True,
+            "production_trade_gate": gate,
+            "live_rules_canary_contract": contract,
+        }
+    )
+
+
 def _return_entry_contract_result(
     decision: DecisionOutput,
     model_mode: str = "",
@@ -75,6 +145,10 @@ def _return_entry_contract_result(
 
     if not decision.is_entry:
         return PolicyGateResult.allow({"return_execution_contract": "not_entry"})
+
+    rules_canary_result = _rules_canary_entry_contract_result(decision, model_mode)
+    if rules_canary_result is not None:
+        return rules_canary_result
 
     if PaperBootstrapCanaryPolicy.is_claimed(decision):
         assessment = PaperBootstrapCanaryPolicy.assess(decision, model_mode)
@@ -304,6 +378,13 @@ class ExecutionService:
             Callable[[str, DecisionOutput], Awaitable[bool | None]] | None
         ) = None,
         trade_notional_recorder: Callable[[float], None] | None = None,
+        production_trade_gate_provider: (
+            Callable[
+                [DecisionOutput, str, str, list[dict[str, Any]] | None],
+                Awaitable[dict[str, Any] | None],
+            ]
+            | None
+        ) = None,
     ) -> None:
         self.execution_lock = execution_lock
         self.risk_event_logger = risk_event_logger
@@ -343,6 +424,7 @@ class ExecutionService:
         self.matching_exit_local_position_checker = matching_exit_local_position_checker
         self.matching_exit_exchange_position_checker = matching_exit_exchange_position_checker
         self.trade_notional_recorder = trade_notional_recorder
+        self.production_trade_gate_provider = production_trade_gate_provider
 
     def _required_execution_lock(self) -> AbstractAsyncContextManager[Any]:
         if self.execution_lock is None:
@@ -1202,6 +1284,35 @@ class ExecutionService:
                 )
             if not entry_policy_result.passed:
                 return await block_before_submit(entry_policy_result)
+            if self.production_trade_gate_provider is not None:
+                gate_payload = await self.production_trade_gate_provider(
+                    decision,
+                    model_name,
+                    model_mode,
+                    open_positions,
+                )
+                if isinstance(gate_payload, dict) and gate_payload:
+                    raw = _safe_dict(decision.raw_response)
+                    raw = dict(raw)
+                    raw["production_trade_gate"] = gate_payload
+                    decision.raw_response = raw
+                    if str(model_mode or "").lower() != "paper" and gate_payload.get(
+                        "can_trade"
+                    ) is not True:
+                        return await block_before_submit(
+                            PolicyGateResult.block(
+                                "production_trade_gate",
+                                (
+                                    "生产交易闸门未放行："
+                                    f"{gate_payload.get('reason') or gate_payload.get('mode') or 'unknown'}"
+                                ),
+                                {
+                                    "stage_status": "blocked",
+                                    "skip_kind": "production_trade_gate",
+                                    "production_trade_gate": gate_payload,
+                                },
+                            )
+                        )
             return_contract_result = _return_entry_contract_result(decision, model_mode)
             if not return_contract_result.passed:
                 return await block_before_submit(return_contract_result)

@@ -9,6 +9,7 @@ from typing import Any
 
 from services.paper_exploration import paper_exploration_contract_reasons
 from services.paper_training import paper_training_contract_reasons
+from services.profit_training_contract import validate_profit_training_sample
 
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
@@ -221,6 +222,25 @@ def _canonical_execution_mode(value: Any) -> str:
     if mode in {"live", "real", "production"}:
         return "live"
     return ""
+
+
+def _decision_authority(
+    *,
+    raw_llm_response: dict[str, Any],
+    execution_mode: str,
+    valid_paper_exploration: bool,
+    valid_paper_training: bool,
+    strategy_training_role: str,
+ ) -> str:
+    gate = _dict(raw_llm_response.get("production_trade_gate"))
+    authority = _text(gate.get("decision_authority")).lower()
+    if authority in {"rules", "model", "manual", "system"}:
+        return authority
+    if execution_mode == "paper" and (valid_paper_exploration or valid_paper_training):
+        return "system"
+    if strategy_training_role != "entry_strategy":
+        return "system"
+    return "model"
 
 
 def _directional_price_return_pct(
@@ -683,7 +703,18 @@ def build_okx_history_training_sample(
     sample_source = (
         "okx_verified_execution_pair" if verified_execution_pair else "okx_position_history"
     )
-    return {
+    strategy_training_role = (
+        "aggregate_position_research_only"
+        if len(entry_decision_ids) > 1
+        else "obsolete_sampling_research_only"
+        if obsolete_sampling_entry
+        else "invalid_exploration_research_only"
+        if paper_exploration_gaps
+        else "invalid_paper_training_research_only"
+        if paper_training_gaps
+        else "entry_strategy"
+    )
+    sample = {
         "source": sample_source,
         "id": int(_value(history, "id", 0) or 0),
         "lifecycle_key": lifecycle_key,
@@ -908,17 +939,19 @@ def build_okx_history_training_sample(
             and not paper_exploration_gaps
             and not paper_training_gaps
         ),
-        "strategy_training_role": (
-            "aggregate_position_research_only"
-            if len(entry_decision_ids) > 1
-            else "obsolete_sampling_research_only"
-            if obsolete_sampling_entry
-            else "invalid_exploration_research_only"
-            if paper_exploration_gaps
-            else "invalid_paper_training_research_only"
-            if paper_training_gaps
-            else "entry_strategy"
-        ),
+        "strategy_training_role": strategy_training_role,
         "training_evidence_gaps": list(dict.fromkeys([*gaps, *lineage_gaps])),
         "label_timestamp": closed_at.isoformat() if closed_at else None,
     }
+    decision_authority = _decision_authority(
+        raw_llm_response=raw_llm_response,
+        execution_mode=execution_mode,
+        valid_paper_exploration=valid_paper_exploration,
+        valid_paper_training=valid_paper_training,
+        strategy_training_role=strategy_training_role,
+    )
+    sample["decision_authority"] = decision_authority
+    if notional is not None and notional > 0:
+        sample["net_return_after_all_cost_pct"] = realized_pnl / notional * 100.0
+    sample["profit_training_contract"] = validate_profit_training_sample(sample).to_dict()
+    return sample

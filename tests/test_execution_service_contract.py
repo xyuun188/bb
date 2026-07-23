@@ -257,6 +257,44 @@ def test_dynamic_return_contract_accepts_complete_governed_entry() -> None:
     assert result.data["return_execution_contract"] == "complete"
 
 
+def test_live_rules_canary_bypasses_model_promotion_return_distribution() -> None:
+    decision = _dynamic_return_ready_decision()
+    decision.raw_response["production_trade_gate"] = {
+        "version": "test",
+        "mode": "live_rules_canary",
+        "can_trade": True,
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "risk": {"max_notional_usdt": 100.0},
+    }
+
+    result = _return_entry_contract_result(decision, "live")
+
+    assert result.passed is True
+    assert result.data["return_execution_contract"] == "live_rules_canary"
+    assert result.data["production_permission"] is True
+
+
+def test_live_rules_canary_respects_gate_notional_limit() -> None:
+    decision = _dynamic_return_ready_decision()
+    decision.raw_response["production_trade_gate"] = {
+        "version": "test",
+        "mode": "live_rules_canary",
+        "can_trade": True,
+        "decision_authority": "rules",
+        "model_can_influence": False,
+        "risk": {"max_notional_usdt": 50.0},
+    }
+
+    result = _return_entry_contract_result(decision, "live")
+
+    assert result.passed is False
+    assert result.blocker == "live_rules_canary_contract_incomplete"
+    assert "rules_canary_order_notional_above_gate_limit" in result.data[
+        "block_reasons"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_paper_training_entry_close_and_loss_reach_authoritative_training() -> None:
     decision = _paper_training_ready_decision()

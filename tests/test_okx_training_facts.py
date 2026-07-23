@@ -118,6 +118,11 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["trade_fact_trusted"] is True
     assert sample["training_evidence_gaps"] == []
     assert sample["strategy_lineage_complete"] is True
+    assert sample["profit_training_contract"]["eligible"] is True
+    assert sample["profit_training_contract"]["outcome"] == "profit"
+    assert sample["profit_training_contract"]["target_value"] == pytest.approx(
+        8.5 / 2000.0 * 100.0
+    )
 
     outcome = _outcome(sample)
     label = outcome["training_label_contract"]
@@ -223,7 +228,8 @@ def test_paper_training_loss_is_a_normal_authoritative_training_sample() -> None
         "pnlRatio": "-0.0085",
     }
 
-    sample = _outcome(build_okx_history_training_sample(history, **lineage))
+    raw_sample = build_okx_history_training_sample(history, **lineage)
+    sample = _outcome(raw_sample)
     payload = annotate_training_payload(
         shadow_samples=[],
         trade_samples=[sample],
@@ -235,6 +241,8 @@ def test_paper_training_loss_is_a_normal_authoritative_training_sample() -> None
     assert sample["strategy_training_role"] == "entry_strategy"
     assert sample["strategy_entry_kind"] == "loss_tolerant_paper_training"
     assert sample["paper_training_evidence"]["loss_tolerant_for_training"] is True
+    assert raw_sample["profit_training_contract"]["eligible"] is True
+    assert raw_sample["profit_training_contract"]["outcome"] == "loss"
     assert sample["paper_training_evidence"]["sample_target"] is None
     assert sample["paper_training_evidence"]["daily_sample_quota"] is None
     assert len(payload["trade_samples"]) == 1

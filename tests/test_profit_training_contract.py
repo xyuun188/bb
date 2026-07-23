@@ -37,6 +37,29 @@ def test_profit_training_contract_accepts_closed_loss_as_training_label() -> Non
     assert contract.model_shadow_alignment == "avoided_losing_side"
 
 
+def test_profit_training_contract_accepts_okx_lifecycle_aliases() -> None:
+    contract = validate_profit_training_sample(
+        {
+            "symbol": "ETH/USDT",
+            "side": "short",
+            "entry_order_ids": ["entry-okx"],
+            "close_order_ids": ["close-okx"],
+            "entry_price": 100.0,
+            "exit_price": 102.0,
+            "quantity": 3.0,
+            "notional_usdt": 100.0,
+            "fee": -0.1,
+            "funding_fee": -0.05,
+            "realized_pnl": -2.2,
+            "hold_minutes": 45.0,
+            "decision_authority": "system",
+        }
+    )
+
+    assert contract.eligible is True
+    assert contract.outcome == "loss"
+    assert contract.target_value == -2.2
+
 def test_profit_training_contract_rejects_missing_close_order() -> None:
     contract = validate_profit_training_sample(
         _closed_trade_sample(close_order_id="")
@@ -54,4 +77,3 @@ def test_profit_training_contract_marks_model_supporting_losing_side() -> None:
 
     assert contract.eligible is True
     assert contract.model_shadow_alignment == "supported_losing_side"
-

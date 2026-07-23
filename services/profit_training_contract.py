@@ -56,6 +56,56 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _first_list_text(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            text = _text(item)
+            if text:
+                return text
+        return ""
+    return _text(value)
+
+
+def _set_if_missing(sample: dict[str, Any], key: str, value: Any) -> None:
+    if sample.get(key) in (None, "") and value not in (None, ""):
+        sample[key] = value
+
+
+def normalize_profit_training_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical profit-training view without mutating the source."""
+
+    normalized = dict(sample)
+    _set_if_missing(normalized, "entry_order_id", _first_list_text(sample.get("entry_order_ids")))
+    _set_if_missing(normalized, "close_order_id", _first_list_text(sample.get("close_order_ids")))
+    _set_if_missing(normalized, "close_price", sample.get("exit_price"))
+    _set_if_missing(normalized, "notional", sample.get("notional_usdt"))
+    _set_if_missing(normalized, "holding_minutes", sample.get("hold_minutes"))
+
+    fee_total = _safe_float(
+        sample.get("fee")
+        if sample.get("fee") not in (None, "")
+        else sample.get("total_fee")
+        if sample.get("total_fee") not in (None, "")
+        else sample.get("fee_estimate"),
+    )
+    if fee_total is not None:
+        _set_if_missing(normalized, "entry_fee", 0.0)
+        _set_if_missing(normalized, "close_fee", fee_total)
+
+    slippage = _safe_float(sample.get("slippage"))
+    if slippage is None:
+        slippage = _safe_float(sample.get("stop_loss_slippage_pct"))
+    _set_if_missing(normalized, "slippage", 0.0 if slippage is None else slippage)
+
+    target = _safe_float(normalized.get(PROFIT_TRAINING_TARGET))
+    realized_pnl = _safe_float(normalized.get("realized_pnl"))
+    notional = _safe_float(normalized.get("notional"))
+    if target is None and realized_pnl is not None and notional is not None and notional > 0:
+        normalized[PROFIT_TRAINING_TARGET] = realized_pnl / notional * 100.0
+
+    return normalized
+
+
 def _fingerprint_payload(sample: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "symbol",
@@ -132,6 +182,7 @@ def _model_shadow_alignment(sample: dict[str, Any]) -> str:
 
 
 def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingContract:
+    sample = normalize_profit_training_sample(sample)
     blockers: list[str] = []
     for field in REQUIRED_TEXT_FIELDS:
         if not _text(sample.get(field)):
@@ -184,4 +235,3 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
         blockers=unique_blockers,
         model_shadow_alignment=_model_shadow_alignment(sample),
     )
-
