@@ -133,15 +133,7 @@ def _model_profit_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
         ),
         None,
     )
-    expected_net = _safe_float(
-        _first_present(
-            metrics.get(PROFIT_TRAINING_TARGET),
-            metrics.get("expected_net_return_pct"),
-            metrics.get("avg_return_pct"),
-            metrics.get("top_avg_return_pct"),
-        ),
-        None,
-    )
+    expected_net = _safe_float(metrics.get(PROFIT_TRAINING_TARGET), None)
     sample_count = _safe_int(
         _first_present(
             metrics.get("production_sample_count"),
@@ -165,11 +157,7 @@ def _model_profit_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
 
 def _model_live_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
     lifecycle = str(model.get("artifact_lifecycle") or model.get("stage") or "").lower()
-    influence_allowed = bool(
-        model.get("live_ml_ready")
-        or model.get("production_influence_authorized")
-        or model.get("allow_live_position_influence")
-    )
+    influence_allowed = model.get("live_ml_ready") is True
     blockers: list[str] = []
     if lifecycle not in {"active", "live"} and not bool(model.get("live_ml_ready")):
         blockers.append("model_not_promoted_to_live")

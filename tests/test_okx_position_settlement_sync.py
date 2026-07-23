@@ -431,7 +431,11 @@ async def test_settlement_uses_verified_execution_pair_when_position_history_lag
             item for item in outcomes if position_id in item.get("position_ids", [])
         )
         assert outcome["source"] == "okx_verified_execution_pair"
-        assert outcome["outcome_complete"] is True
+        assert outcome["outcome_complete"] is False
+        assert outcome["profit_training_contract"]["eligible"] is False
+        assert "profit_training_contract:slippage_missing_or_invalid" in outcome[
+            "outcome_evidence_gaps"
+        ]
         assert outcome["realized_pnl"] == pytest.approx(8.3)
     finally:
         await close_db()

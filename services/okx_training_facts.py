@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from services.okx_order_fact_sync import authoritative_order_fee_fact_source
 from services.paper_exploration import paper_exploration_contract_reasons
 from services.paper_training import paper_training_contract_reasons
 from services.profit_training_contract import validate_profit_training_sample
@@ -123,14 +124,96 @@ def _account_contract_size_from_orders(orders: Iterable[Any]) -> dict[str, Any]:
         for value, _source in values[1:]
     )
     return {
-        "contract_size": None if conflict else sum(value for value, _source in values) / len(values),
-        "source": values[0][1] if not conflict else "okx_account_position_evidence_conflict",
+        "contract_size": (
+            None
+            if conflict
+            else sum(value for value, _source in values) / len(values)
+        ),
+        "source": (
+            values[0][1]
+            if not conflict
+            else "okx_account_position_evidence_conflict"
+        ),
         "conflict": conflict,
         "reason": "linked_order_account_contract_sizes_disagree" if conflict else "",
         "values": [value for value, _source in values],
     }
 
 
+def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
+    if order is None:
+        return {}
+    source = authoritative_order_fee_fact_source(order, order_id=order_id)
+    raw = _dict(_value(order, "okx_raw_fills", {}))
+    base_quantity = _safe_float(
+        raw.get("base_quantity") or raw.get("filled_base_quantity"),
+        None,
+    )
+    average_price = _safe_float(raw.get("avg_price") or raw.get("average"), None)
+    contracts = _safe_float(
+        raw.get("contracts")
+        or raw.get("filled_contracts")
+        or _value(order, "okx_fill_contracts"),
+        None,
+    )
+    fee = _safe_float(raw.get("fee_abs"), None)
+    if (
+        source is None
+        or base_quantity is None
+        or base_quantity <= 0
+        or average_price is None
+        or average_price <= 0
+        or contracts is None
+        or contracts <= 0
+        or fee is None
+        or fee < 0
+    ):
+        return {}
+    return {
+        "order_id": order_id,
+        "base_quantity": base_quantity,
+        "average_price": average_price,
+        "contracts": contracts,
+        "fee": fee,
+        "fee_source": source,
+    }
+
+
+def _authoritative_fill_group(
+    order_ids: list[str],
+    orders_by_exchange_id: dict[str, Any],
+) -> dict[str, Any]:
+    facts = [
+        _authoritative_fill_fact(orders_by_exchange_id.get(order_id), order_id=order_id)
+        for order_id in order_ids
+    ]
+    complete = bool(order_ids and all(facts) and len(facts) == len(order_ids))
+    if not complete:
+        return {
+            "complete": False,
+            "missing_order_ids": [
+                order_id
+                for order_id, fact in zip(order_ids, facts, strict=True)
+                if not fact
+            ],
+        }
+    base_quantity = sum(float(fact["base_quantity"]) for fact in facts)
+    notional = sum(
+        float(fact["base_quantity"]) * float(fact["average_price"])
+        for fact in facts
+    )
+    sources = sorted({str(fact["fee_source"]) for fact in facts})
+    return {
+        "complete": True,
+        "facts": facts,
+        "base_quantity": base_quantity,
+        "contracts": sum(float(fact["contracts"]) for fact in facts),
+        "average_price": notional / base_quantity,
+        "notional": notional,
+        "fee": sum(float(fact["fee"]) for fact in facts),
+        "fee_source": "+".join(sources),
+        "missing_order_ids": [],
+    }
 def _dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -401,12 +484,38 @@ def build_okx_history_training_sample(
     local_positions = [positions_by_id[value] for value in position_ids if value in positions_by_id]
     local_position = local_positions[0] if local_positions else None
 
+    entry_fill_group = _authoritative_fill_group(
+        entry_order_ids,
+        orders_by_exchange_id,
+    )
+    close_fill_group = _authoritative_fill_group(
+        close_order_ids,
+        orders_by_exchange_id,
+    )
+    canonical_entry_order_id = entry_order_ids[0] if len(entry_order_ids) == 1 else ""
+    canonical_close_order_id = close_order_ids[0] if len(close_order_ids) == 1 else ""
+    canonical_notional = (
+        _safe_float(entry_fill_group.get("notional"), None)
+        if entry_fill_group.get("complete") is True
+        else None
+    )
+    canonical_entry_fee = (
+        _safe_float(entry_fill_group.get("fee"), None)
+        if entry_fill_group.get("complete") is True
+        else None
+    )
+    canonical_close_fee = (
+        _safe_float(close_fill_group.get("fee"), None)
+        if close_fill_group.get("complete") is True
+        else None
+    )
+
     opened_at = _as_utc(_value(history, "opened_at"))
     closed_at = _as_utc(_value(history, "updated_at_okx"))
-    hold_minutes = (
+    holding_minutes = (
         max((closed_at - opened_at).total_seconds() / 60.0, 0.0)
         if opened_at and closed_at
-        else 0.0
+        else None
     )
     entry_price = _safe_float(_value(history, "open_avg_px"), 0.0) or 0.0
     exit_price = _safe_float(_value(history, "close_avg_px"), 0.0) or 0.0
@@ -581,6 +690,31 @@ def build_okx_history_training_sample(
         gaps.append("gross_return_price_path_mismatch")
     if abs(realized_pnl - settlement_expected) > settlement_tolerance:
         gaps.append("settlement_algebra_mismatch")
+    if len(entry_order_ids) != 1:
+        gaps.append("profit_contract_requires_one_entry_order")
+    if len(close_order_ids) != 1:
+        gaps.append("profit_contract_requires_one_close_order")
+    if entry_fill_group.get("complete") is not True:
+        gaps.append("missing_authoritative_entry_fill_facts")
+    if close_fill_group.get("complete") is not True:
+        gaps.append("missing_authoritative_close_fill_facts")
+    if canonical_notional is None or canonical_notional <= 0:
+        gaps.append("missing_authoritative_entry_notional")
+    if canonical_entry_fee is None:
+        gaps.append("missing_authoritative_entry_fee")
+    if canonical_close_fee is None:
+        gaps.append("missing_authoritative_close_fee")
+    if holding_minutes is None:
+        gaps.append("missing_authoritative_holding_minutes")
+    if canonical_entry_fee is not None and canonical_close_fee is not None:
+        order_fee_total = canonical_entry_fee + canonical_close_fee
+        if not math.isclose(
+            order_fee_total,
+            abs(fee_signed),
+            rel_tol=1e-6,
+            abs_tol=1e-8,
+        ):
+            gaps.append("order_fee_total_mismatch")
     gaps = list(dict.fromkeys(gaps))
 
     position_id = position_ids[0] if position_ids else 0
@@ -665,6 +799,15 @@ def build_okx_history_training_sample(
         == "okx_configured_stop_trigger_to_fills_vwap"
         else None
     )
+    canonical_slippage = stop_loss_slippage_pct
+    canonical_slippage_source = (
+        "okx_configured_stop_trigger_to_fills_vwap"
+        if canonical_slippage is not None
+        else ""
+    )
+    if canonical_slippage is None:
+        gaps.append("missing_authoritative_slippage")
+    gaps = list(dict.fromkeys(gaps))
     protection_execution_gaps: list[str] = []
     if protection_execution:
         if not protection_submission:
@@ -768,6 +911,8 @@ def build_okx_history_training_sample(
         "okx_pos_id": _text(_value(history, "pos_id")),
         "entry_order_ids": entry_order_ids,
         "close_order_ids": close_order_ids,
+        "entry_order_id": canonical_entry_order_id,
+        "close_order_id": canonical_close_order_id,
         "linked_order_ids": linked_order_ids,
         "okx_trade_ids": _order_trade_ids(linked_orders),
         "model_name": model_name,
@@ -779,6 +924,7 @@ def build_okx_history_training_sample(
         "close_status": _text(_value(history, "close_status")).lower(),
         "entry_price": entry_price,
         "exit_price": exit_price,
+        "close_price": exit_price,
         "quantity": contracts,
         "quantity_unit": "contracts",
         "fill_contracts": fill_contracts,
@@ -792,20 +938,33 @@ def build_okx_history_training_sample(
         "contract_lot_size": lot_size,
         "notional_usdt": notional,
         **notional_facts,
+        "notional": canonical_notional,
+        "notional_source": (
+            "okx_entry_fill_base_quantity_and_average_price"
+            if canonical_notional is not None and canonical_notional > 0
+            else ""
+        ),
         "authoritative_pnl_ratio_pct": official_ratio_pct,
         "realized_pnl": realized_pnl,
         "gross_pnl": gross_pnl,
         "fee": fee_signed,
         "fee_estimate": abs(fee_signed),
+        "entry_fee": canonical_entry_fee,
+        "close_fee": canonical_close_fee,
+        "entry_fee_source": _text(entry_fill_group.get("fee_source")),
+        "close_fee_source": _text(close_fill_group.get("fee_source")),
         "funding_fee": funding_fee,
         "liquidation_penalty": liquidation_penalty,
         "settlement_components_total": settlement_expected,
-        "hold_minutes": hold_minutes,
+        "hold_minutes": holding_minutes,
+        "holding_minutes": holding_minutes,
         "leverage": _safe_float(_value(history, "leverage"), 1.0) or 1.0,
         "planned_stop_loss_price": stop_loss_price,
         "planned_take_profit_price": take_profit_price,
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
         "stop_loss_slippage_pct": stop_loss_slippage_pct,
+        "slippage": canonical_slippage,
+        "slippage_source": canonical_slippage_source,
         "stop_loss_slippage_source": (
             protection_execution.get("stop_loss_slippage_source")
             if stop_loss_fill_confirmed
@@ -891,10 +1050,7 @@ def build_okx_history_training_sample(
             if valid_paper_training
             else _text(paper_exploration.get("selection_reason"))
             if valid_paper_exploration
-            else _text(
-                _dict(raw_llm_response.get("entry_permission_policy")).get("source")
-            )
-            or "governed_fee_after_return_strategy"
+            else "governed_fee_after_return_strategy"
         ),
         "paper_exploration_evidence": (
             {
@@ -998,7 +1154,9 @@ def build_okx_history_training_sample(
     )
     if model_shadow_prediction:
         sample["model_shadow_prediction"] = model_shadow_prediction
-    if notional is not None and notional > 0:
-        sample["net_return_after_all_cost_pct"] = realized_pnl / notional * 100.0
+    if canonical_notional is not None and canonical_notional > 0:
+        sample["net_return_after_all_cost_pct"] = (
+            realized_pnl / canonical_notional * 100.0
+        )
     sample["profit_training_contract"] = validate_profit_training_sample(sample).to_dict()
     return sample

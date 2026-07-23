@@ -9,6 +9,7 @@ from services.authoritative_trade_outcome import build_authoritative_trade_outco
 from services.okx_training_facts import build_okx_history_training_sample
 from services.paper_exploration import build_paper_exploration_contract
 from services.paper_training import build_paper_training_contract
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
 
 
@@ -72,14 +73,64 @@ def _complete_lineage() -> dict:
         },
         "orders_by_exchange_id": {
             "entry-1": SimpleNamespace(
+                exchange_order_id="entry-1",
+                okx_inst_id="BTC-USDT-SWAP",
+                quantity=0.02,
+                price=100_000.0,
+                fee=0.4,
                 okx_fill_contracts=2.0,
                 okx_trade_ids="trade-entry",
                 decision_id=91,
+                order_type="market",
+                okx_raw_fills={
+                    "fills_history_confirmed": True,
+                    "order_id": "entry-1",
+                    "inst_id": "BTC-USDT-SWAP",
+                    "contracts": 2.0,
+                    "base_quantity": 0.02,
+                    "avg_price": 100_000.0,
+                    "fee_abs": 0.4,
+                    "contract_size": 0.01,
+                    "contract_size_verified": True,
+                    "contract_size_source": "okx_public_instruments",
+                    "protection_submission": {
+                        "exchange_confirmation_recorded": True,
+                        "source_authority": "local_submit_plus_okx_create_order_response",
+                        "exchange_confirmed_at": "2026-07-11T01:00:00+00:00",
+                    },
+                },
             ),
             "close-1": SimpleNamespace(
+                exchange_order_id="close-1",
+                okx_inst_id="BTC-USDT-SWAP",
+                quantity=0.02,
+                price=100_500.0,
+                fee=0.6,
                 okx_fill_contracts=2.0,
                 okx_trade_ids="trade-close",
                 decision_id=92,
+                order_type="market",
+                okx_raw_fills={
+                    "fills_history_confirmed": True,
+                    "order_id": "close-1",
+                    "inst_id": "BTC-USDT-SWAP",
+                    "contracts": 2.0,
+                    "base_quantity": 0.02,
+                    "avg_price": 100_500.0,
+                    "fee_abs": 0.6,
+                    "contract_size": 0.01,
+                    "contract_size_verified": True,
+                    "contract_size_source": "okx_public_instruments",
+                    "protection_execution": {
+                        "lifecycle_complete": True,
+                        "source_authority": "okx_algo_history_plus_fills_history",
+                        "actual_side": "sl",
+                        "stop_loss_slippage_pct": 0.1,
+                        "stop_loss_slippage_source": (
+                            "okx_configured_stop_trigger_to_fills_vwap"
+                        ),
+                    },
+                },
             ),
         },
         "decision_raw_by_order_id": {
@@ -110,8 +161,10 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["source"] == "okx_position_history"
     assert sample["quantity"] == 2.0
     assert sample["quantity_unit"] == "contracts"
-    assert sample["notional_usdt"] == 2000.0
-    assert sample["notional_source"] == "okx_gross_pnl_and_average_price_path"
+    assert sample["notional"] == 2000.0
+    assert sample["notional_source"] == (
+        "okx_entry_fill_base_quantity_and_average_price"
+    )
     assert sample["gross_return_price_consistent"] is True
     assert sample["authoritative_pnl_ratio_pct"] == pytest.approx(0.85)
     assert sample["okx_trade_ids"] == ["trade-entry", "trade-close"]
@@ -127,7 +180,9 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     outcome = _outcome(sample)
     label = outcome["training_label_contract"]
     assert label["execution_mode"] == "paper"
-    assert label["realized_fee_after_return_pct"] == pytest.approx(8.5 / 2000.0 * 100.0)
+    assert label["net_return_after_all_cost_pct"] == pytest.approx(
+        8.5 / 2000.0 * 100.0
+    )
     assert label["realized_net_pnl_usdt"] == 8.5
 
 
@@ -183,17 +238,24 @@ def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> Non
 def test_paper_training_prefers_verified_account_contract_size_over_public_spec() -> None:
     history = _history(pnl=100.0, realized_pnl=98.5)
     lineage = _complete_lineage()
-    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills = {
-        "contract_size": 0.1,
-        "contract_size_verified": True,
-        "contract_size_source": "okx_account_position_margin_notional_crosscheck",
-    }
+    entry_order = lineage["orders_by_exchange_id"]["entry-1"]
+    entry_order.quantity = 0.2
+    entry_order.okx_raw_fills.update(
+        {
+            "base_quantity": 0.2,
+            "contract_size": 0.1,
+            "contract_size_verified": True,
+            "contract_size_source": (
+                "okx_account_position_margin_notional_crosscheck"
+            ),
+        }
+    )
     sample = build_okx_history_training_sample(history, **lineage)
 
     assert sample["contract_ct_val"] == pytest.approx(0.1)
     assert sample["contract_ct_val_source"].startswith("okx_account_position_")
     assert sample["contract_ct_val_corrected"] is True
-    assert sample["notional_usdt"] == pytest.approx(20_000.0)
+    assert sample["notional"] == pytest.approx(20_000.0)
     assert "account_contract_size_evidence_conflict" not in sample["training_evidence_gaps"]
     assert sample["trade_fact_trusted"] is True
 
@@ -486,7 +548,7 @@ def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons
 
 def test_training_report_blocks_pnl_return_sign_mismatch() -> None:
     sample = _outcome(build_okx_history_training_sample(_history(), **_complete_lineage()))
-    sample["authoritative_pnl_ratio_pct"] = -8.5
+    sample[PROFIT_TRAINING_TARGET] = -8.5
     payload = annotate_training_payload(
         shadow_samples=[],
         trade_samples=[sample],
@@ -632,9 +694,11 @@ def test_stop_slippage_uses_exchange_algo_trigger_not_local_planned_stop() -> No
     assert "actual_trigger_market_price_unavailable" in sample["protection_execution_gaps"]
 
 
-def test_legacy_stop_order_type_cannot_recreate_planned_price_slippage() -> None:
+def test_missing_protection_execution_cannot_create_slippage_label() -> None:
     lineage = _complete_lineage()
-    lineage["orders_by_exchange_id"]["close-1"].order_type = "stop_loss"
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop(
+        "protection_execution"
+    )
 
     sample = build_okx_history_training_sample(
         _history(close_avg_px=97_000.0),
@@ -644,3 +708,7 @@ def test_legacy_stop_order_type_cannot_recreate_planned_price_slippage() -> None
     assert sample["stop_loss_fill_confirmed"] is False
     assert sample["stop_loss_slippage_pct"] is None
     assert sample["stop_loss_slippage_source"] == "not_authoritatively_confirmed"
+    assert sample["profit_training_contract"]["eligible"] is False
+    assert "slippage_missing_or_invalid" in sample["profit_training_contract"][
+        "blockers"
+    ]

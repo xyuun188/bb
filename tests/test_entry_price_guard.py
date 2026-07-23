@@ -86,6 +86,24 @@ async def test_every_entry_requires_a_fresh_native_market_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_rules_canary_does_not_require_model_return_budget() -> None:
+    decision = _decision()
+    decision.raw_response = {
+        "production_trade_gate": {
+            "mode": "live_rules_canary",
+            "can_trade": True,
+            "decision_authority": "rules",
+            "model_can_influence": False,
+        }
+    }
+
+    assert await _policy(latest=101.0).guard_reason(decision, "live") is None
+    assert decision.raw_response["pre_execution_price_check"][
+        "contract_lifecycle"
+    ] == "live_rules_canary"
+
+
+@pytest.mark.asyncio
 async def test_invalid_analysis_fact_cannot_be_rescued_by_a_fresh_snapshot() -> None:
     async def fresh_feature(_symbol: str) -> Any:
         raise AssertionError("dirty analysis must be blocked before refresh")

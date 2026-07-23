@@ -964,19 +964,6 @@ class EnsembleCoordinator:
                     training_raw["direction_competition"] = (
                         context.get("direction_competition") or {}
                     )
-                    training_raw["entry_permission_policy"] = {
-                        "source": "paper_training_bootstrap_without_profit_gate",
-                        "execution_scope": "paper_only",
-                        "production_permission": False,
-                        "sample_target": None,
-                        "daily_sample_quota": None,
-                        "valid_for_seconds": training_contract.get("valid_for_seconds"),
-                        "prediction_horizon_minutes": training_contract.get(
-                            "prediction_horizon_minutes"
-                        ),
-                        "generated_at": datetime.now(UTC).isoformat(),
-                        "strategy_version": training_contract.get("version"),
-                    }
                     action = Action.LONG if training_side == "long" else Action.SHORT
                     return self._entry_decision(
                         features=features,
@@ -1047,15 +1034,6 @@ class EnsembleCoordinator:
                 exploration_raw["direction_competition"] = (
                     context.get("direction_competition") or {}
                 )
-                exploration_raw["entry_permission_policy"] = {
-                    "source": "bounded_positive_mean_paper_exploration",
-                    "execution_scope": "paper_only",
-                    "production_permission": False,
-                    "sample_target": None,
-                    "daily_sample_quota": None,
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    "strategy_version": exploration_contract.get("version"),
-                }
                 return self._entry_decision(
                     features=features,
                     context=context,
@@ -1110,16 +1088,6 @@ class EnsembleCoordinator:
         raw_response["ml_signal"] = context.get("ml_signal") or {}
         raw_response["local_ai_tools"] = context.get("local_ai_tools") or {}
         raw_response["direction_competition"] = context.get("direction_competition") or {}
-        raw_response["entry_permission_policy"] = {
-            "source": "authoritative_fee_after_return_candidate",
-            "observation_window": "current_pre_ai_candidate_round",
-            "sample_count": int(
-                self._safe_float(side_evidence.get("production_source_count"), 0.0)
-            ),
-            "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-07-12.ensemble-return-candidate.v1",
-            "fallback_reason": "",
-        }
         return self._entry_decision(
             features=features,
             context=context,

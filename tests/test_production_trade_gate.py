@@ -29,10 +29,10 @@ def test_gate_allows_live_ml_only_after_profit_and_authorization() -> None:
         risk={"open_position_count": 0},
         model={
             "artifact_lifecycle": "active",
-            "allow_live_position_influence": True,
+            "live_ml_ready": True,
             "metrics": {
                 "sample_count": 50,
-                "expected_net_return_pct": 0.18,
+                PROFIT_TRAINING_TARGET: 0.18,
                 "return_lcb_pct": 0.04,
                 "profit_factor": 1.35,
             },
@@ -51,7 +51,7 @@ def test_gate_uses_profit_training_target_for_live_ml() -> None:
         risk={"open_position_count": 0},
         model={
             "artifact_lifecycle": "active",
-            "allow_live_position_influence": True,
+            "live_ml_ready": True,
             "metrics": {
                 "sample_count": 50,
                 PROFIT_TRAINING_TARGET: 0.18,

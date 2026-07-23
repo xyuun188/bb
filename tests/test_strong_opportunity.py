@@ -67,7 +67,7 @@ async def test_report_identifies_complete_positive_return_contract(tmp_path, mon
             session.add(AIDecision(model_name="ensemble_trader", symbol="BTC/USDT", action="long", confidence=0.2, raw_llm_response=_raw(), was_executed=True, created_at=datetime.now(UTC) - timedelta(hours=1)))
         report = await StrongOpportunityService().report()
         assert report["strong_candidate_count"] == 1
-        assert report["strong_candidates"][0]["stage"] == "production_return_ready"
+        assert report["strong_candidates"][0]["stage"] == "live_ml_ready"
         assert report["contract"]["fixed_strategy_thresholds"] == []
     finally:
         await close_db()

@@ -112,12 +112,19 @@ class EntryPriceGuardPolicy:
             str(model_mode or "").lower() == "paper"
             and is_paper_training_decision(decision)
         )
-        return_budget = None if paper_training else (
+        trade_gate = _safe_dict(_safe_dict(decision.raw_response).get("production_trade_gate"))
+        live_rules_canary = (
+            str(model_mode or "").lower() != "paper"
+            and trade_gate.get("mode") == "live_rules_canary"
+        )
+        return_budget = None if paper_training or live_rules_canary else (
             self._paper_canary_price_budget_fraction(decision)
             if paper_canary
             else self._return_budget_fraction(decision)
         )
-        if not paper_training and (return_budget is None or return_budget <= 0):
+        if not paper_training and not live_rules_canary and (
+            return_budget is None or return_budget <= 0
+        ):
             return (
                 "Authoritative paper bootstrap distribution drift budget is missing; "
                 "entry fails closed."
@@ -127,7 +134,7 @@ class EntryPriceGuardPolicy:
 
         move = (latest_price - snapshot_price) / snapshot_price
         adverse = self._adverse_move(decision.action, move)
-        allowed = None if paper_training else return_budget
+        allowed = None if paper_training or live_rules_canary else return_budget
         raw = _safe_dict(decision.raw_response)
         analysis_fact = _safe_dict(snapshot.get("market_fact"))
         fresh_fact = _safe_dict(fresh.get("market_fact"))
@@ -147,13 +154,15 @@ class EntryPriceGuardPolicy:
                 if paper_training
                 else "paper_bootstrap_canary"
                 if paper_canary
-                else "production_return"
+                else "live_rules_canary"
+                if live_rules_canary
+                else "live_ml"
             ),
             "production_permission": False if paper_canary or paper_training else True,
-            "profitability_gate_applied": not paper_training,
+            "profitability_gate_applied": not paper_training and not live_rules_canary,
             "safety_scope": (
                 "market_integrity_only"
-                if paper_training
+                if paper_training or live_rules_canary
                 else "market_integrity_and_return_budget"
             ),
             "policy_provenance": {
@@ -163,6 +172,8 @@ class EntryPriceGuardPolicy:
                     else
                     "paper_bootstrap_empirical_distribution_uncertainty"
                     if paper_canary
+                    else "live_rules_canary_market_integrity"
+                    if live_rules_canary
                     else "authoritative_fee_after_return_lcb"
                 ),
                 "observation_window": "current_pre_order_refresh",
@@ -193,7 +204,7 @@ class EntryPriceGuardPolicy:
                 or _safe_dict(execution_facts.get("policy_provenance")).get("source"),
             },
         }
-        if paper_training or (allowed is not None and adverse <= allowed):
+        if paper_training or live_rules_canary or (allowed is not None and adverse <= allowed):
             public_execution_facts = {
                 key: value
                 for key, value in execution_facts.items()

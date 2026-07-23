@@ -987,7 +987,7 @@ class EntryProfitRiskSizingPolicy:
                 PAPER_EXPLORATION_SIZING_VERSION if paper_exploration else RISK_SIZING_VERSION
             ),
             "contract_lifecycle": (
-                "paper_exploration" if paper_exploration else "production_return"
+                "paper_exploration" if paper_exploration else "live_ml"
             ),
             "execution_scope": "paper_only" if paper_exploration else "mode_authoritative",
             "production_permission": False if paper_exploration else None,

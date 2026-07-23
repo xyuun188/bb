@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from math import isfinite
+from math import isclose, isfinite
 from typing import Any, Literal
 
 PROFIT_TRAINING_CONTRACT_VERSION = "2026-07-23.profit-loop-training.v1"
@@ -22,6 +22,12 @@ REQUIRED_TEXT_FIELDS = (
     "side",
     "entry_order_id",
     "close_order_id",
+    "notional_source",
+    "entry_fee_source",
+    "close_fee_source",
+    "pnl_source",
+    "funding_fee_source",
+    "slippage_source",
 )
 REQUIRED_NUMERIC_FIELDS = (
     "entry_price",
@@ -54,56 +60,6 @@ def _safe_float(value: Any) -> float | None:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
-
-
-def _first_list_text(value: Any) -> str:
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            text = _text(item)
-            if text:
-                return text
-        return ""
-    return _text(value)
-
-
-def _set_if_missing(sample: dict[str, Any], key: str, value: Any) -> None:
-    if sample.get(key) in (None, "") and value not in (None, ""):
-        sample[key] = value
-
-
-def normalize_profit_training_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Return a canonical profit-training view without mutating the source."""
-
-    normalized = dict(sample)
-    _set_if_missing(normalized, "entry_order_id", _first_list_text(sample.get("entry_order_ids")))
-    _set_if_missing(normalized, "close_order_id", _first_list_text(sample.get("close_order_ids")))
-    _set_if_missing(normalized, "close_price", sample.get("exit_price"))
-    _set_if_missing(normalized, "notional", sample.get("notional_usdt"))
-    _set_if_missing(normalized, "holding_minutes", sample.get("hold_minutes"))
-
-    fee_total = _safe_float(
-        sample.get("fee")
-        if sample.get("fee") not in (None, "")
-        else sample.get("total_fee")
-        if sample.get("total_fee") not in (None, "")
-        else sample.get("fee_estimate"),
-    )
-    if fee_total is not None:
-        _set_if_missing(normalized, "entry_fee", 0.0)
-        _set_if_missing(normalized, "close_fee", fee_total)
-
-    slippage = _safe_float(sample.get("slippage"))
-    if slippage is None:
-        slippage = _safe_float(sample.get("stop_loss_slippage_pct"))
-    _set_if_missing(normalized, "slippage", 0.0 if slippage is None else slippage)
-
-    target = _safe_float(normalized.get(PROFIT_TRAINING_TARGET))
-    realized_pnl = _safe_float(normalized.get("realized_pnl"))
-    notional = _safe_float(normalized.get("notional"))
-    if target is None and realized_pnl is not None and notional is not None and notional > 0:
-        normalized[PROFIT_TRAINING_TARGET] = realized_pnl / notional * 100.0
-
-    return normalized
 
 
 def _fingerprint_payload(sample: dict[str, Any]) -> dict[str, Any]:
@@ -182,7 +138,7 @@ def _model_shadow_alignment(sample: dict[str, Any]) -> str:
 
 
 def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingContract:
-    sample = normalize_profit_training_sample(sample)
+    sample = dict(sample)
     blockers: list[str] = []
     for field in REQUIRED_TEXT_FIELDS:
         if not _text(sample.get(field)):
@@ -206,6 +162,29 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
     if (_safe_float(sample.get("holding_minutes")) or 0.0) < 0:
         blockers.append("holding_minutes_negative")
 
+    for field in (
+        "notional_source",
+        "entry_fee_source",
+        "close_fee_source",
+        "pnl_source",
+        "funding_fee_source",
+    ):
+        if _text(sample.get(field)).lower() in {"", "missing", "estimated", "fallback"}:
+            blockers.append(f"{field}_not_authoritative")
+    slippage_source = _text(sample.get("slippage_source"))
+    if slippage_source != "okx_configured_stop_trigger_to_fills_vwap":
+        blockers.append("slippage_source_not_authoritative")
+
+    entry_fee = _safe_float(sample.get("entry_fee"))
+    close_fee = _safe_float(sample.get("close_fee"))
+    slippage = _safe_float(sample.get("slippage"))
+    if entry_fee is not None and entry_fee < 0:
+        blockers.append("entry_fee_negative")
+    if close_fee is not None and close_fee < 0:
+        blockers.append("close_fee_negative")
+    if slippage is not None and slippage < 0:
+        blockers.append("slippage_negative")
+
     authority = _text(sample.get("decision_authority")).lower()
     if authority not in {"rules", "model", "manual", "system"}:
         blockers.append("decision_authority_invalid")
@@ -219,6 +198,22 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
         outcome = "loss"
     else:
         outcome = "flat"
+
+    realized_pnl = _safe_float(sample.get("realized_pnl"))
+    notional = _safe_float(sample.get("notional"))
+    if (
+        target_value is not None
+        and realized_pnl is not None
+        and notional is not None
+        and notional > 0
+        and not isclose(
+            target_value,
+            realized_pnl / notional * 100.0,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        blockers.append("net_return_target_algebra_mismatch")
 
     fingerprint = _text(sample.get("evidence_fingerprint")) or profit_sample_fingerprint(
         sample

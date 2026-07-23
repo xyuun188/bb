@@ -97,42 +97,39 @@ def _canonical_execution_mode(value: Any) -> str:
     return ""
 
 
-def _fee_after_label_contract(
+def _profit_label_contract(
     sample: dict[str, Any],
     *,
     evidence_gaps: list[str],
 ) -> dict[str, Any]:
-    notional = _safe_float(sample.get("notional_usdt"), None)
+    notional = _safe_float(sample.get("notional"), None)
     realized_pnl = _safe_float(sample.get("realized_pnl"), None)
-    fee_after_return = None
-    if realized_pnl is not None and notional is not None and notional > 0:
-        fee_after_return = realized_pnl / notional * 100.0
-    if fee_after_return is None:
-        fee_after_return = _safe_float(sample.get("authoritative_pnl_ratio_pct"), None)
+    net_return = _safe_float(sample.get(PROFIT_TRAINING_TARGET), None)
     payload = {
         "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
-        "label_name": "realized_fee_after_return_pct",
+        "label_name": PROFIT_TRAINING_TARGET,
         "execution_mode": sample.get("execution_mode"),
         "lifecycle_key": sample.get("lifecycle_key"),
         "decision_id": int(sample.get("decision_id") or 0),
-        "entry_order_ids": list(sample.get("entry_order_ids") or []),
-        "close_order_ids": list(sample.get("close_order_ids") or []),
+        "entry_order_id": sample.get("entry_order_id"),
+        "close_order_id": sample.get("close_order_id"),
         "label_timestamp": sample.get("label_timestamp"),
-        "realized_fee_after_return_pct": fee_after_return,
-        "okx_pnl_ratio_pct": _safe_float(
-            sample.get("authoritative_pnl_ratio_pct"), None
-        ),
+        PROFIT_TRAINING_TARGET: net_return,
         "realized_net_pnl_usdt": realized_pnl,
         "gross_pnl_usdt": _safe_float(sample.get("gross_pnl"), None),
-        "fee_usdt": _safe_float(sample.get("fee"), None),
+        "entry_fee_usdt": _safe_float(sample.get("entry_fee"), None),
+        "close_fee_usdt": _safe_float(sample.get("close_fee"), None),
         "funding_fee_usdt": _safe_float(sample.get("funding_fee"), None),
         "liquidation_penalty_usdt": _safe_float(
             sample.get("liquidation_penalty"), None
         ),
-        "notional_usdt": notional,
+        "notional": notional,
+        "slippage_pct": _safe_float(sample.get("slippage"), None),
         "settlement_source": sample.get("settlement_source"),
-        "fee_source": sample.get("fee_source"),
+        "entry_fee_source": sample.get("entry_fee_source"),
+        "close_fee_source": sample.get("close_fee_source"),
         "funding_fee_source": sample.get("funding_fee_source"),
+        "slippage_source": sample.get("slippage_source"),
         "complete": not evidence_gaps,
         "evidence_gaps": list(evidence_gaps),
     }
@@ -195,9 +192,9 @@ def _unavailable_attribution(reason: str) -> dict[str, Any]:
 
 
 def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
-    notional = _safe_float(sample.get("notional_usdt"), None)
+    notional = _safe_float(sample.get("notional"), None)
     over_budget = _safe_float(sample.get("execution_actual_over_budget_loss_usdt"), None)
-    stop_slippage_pct = _safe_float(sample.get("stop_loss_slippage_pct"), None)
+    stop_slippage_pct = _safe_float(sample.get("slippage"), None)
     stop_slippage_usdt = (
         abs(notional) * abs(stop_slippage_pct) / 100.0
         if notional is not None and notional > 0 and stop_slippage_pct is not None
@@ -238,7 +235,7 @@ def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
             "status": "measured" if stop_slippage_usdt is not None else "unavailable",
             "contribution_usdt": -stop_slippage_usdt if stop_slippage_usdt is not None else None,
             "contribution_return_pct": -abs(stop_slippage_pct) if stop_slippage_pct is not None else None,
-            "source": sample.get("stop_loss_slippage_source"),
+            "source": sample.get("slippage_source"),
             "trigger_to_first_fill_ms": sample.get("trigger_to_first_fill_ms"),
         },
         "holding_duration_error": _unavailable_attribution(
@@ -249,10 +246,12 @@ def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
         ),
         "realized_costs": {
             "status": "measured",
-            "fee_usdt": _safe_float(sample.get("fee"), 0.0),
+            "entry_fee_usdt": _safe_float(sample.get("entry_fee"), None),
+            "close_fee_usdt": _safe_float(sample.get("close_fee"), None),
             "funding_usdt": _safe_float(sample.get("funding_fee"), 0.0),
             "liquidation_penalty_usdt": _safe_float(sample.get("liquidation_penalty"), 0.0),
-            "source": str(sample.get("fee_source") or "okx_positions_history"),
+            "entry_fee_source": sample.get("entry_fee_source"),
+            "close_fee_source": sample.get("close_fee_source"),
         },
         "causal_decomposition_complete": False,
         "unknown_components_are_zero": False,
@@ -297,19 +296,16 @@ def build_authoritative_trade_outcome(
     if not decision_id:
         gaps.append("missing_exact_entry_order_decision_link")
     gaps = list(dict.fromkeys(gaps))
-    label_contract = _fee_after_label_contract(sample, evidence_gaps=gaps)
-    sample["training_label_contract"] = label_contract
-    notional = _safe_float(sample.get("notional_usdt"), None)
-    realized_pnl = _safe_float(sample.get("realized_pnl"), None)
-    if notional is not None and notional > 0 and realized_pnl is not None:
-        sample[PROFIT_TRAINING_TARGET] = realized_pnl / notional * 100.0
     authority = str(sample.get("decision_authority") or "").strip().lower()
-    if authority not in {"rules", "model", "manual", "system"}:
-        authority = "model" if str(sample.get("model_name") or "").strip() else "system"
     sample["decision_authority"] = authority
-    sample["profit_training_contract"] = validate_profit_training_sample(
-        sample
-    ).to_dict()
+    profit_contract = validate_profit_training_sample(sample)
+    sample["profit_training_contract"] = profit_contract.to_dict()
+    gaps.extend(
+        f"profit_training_contract:{blocker}" for blocker in profit_contract.blockers
+    )
+    gaps = list(dict.fromkeys(gaps))
+    label_contract = _profit_label_contract(sample, evidence_gaps=gaps)
+    sample["training_label_contract"] = label_contract
 
     identity = {
         "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
@@ -366,10 +362,8 @@ def build_authoritative_trade_outcome(
             "learning_summary": {
                 "objective": "maximize_expected_realized_net_return_after_cost",
                 "realized_net_pnl_usdt": sample.get("realized_pnl"),
-                "authoritative_return_pct": label_contract.get(
-                    "realized_fee_after_return_pct"
-                ),
-                "stop_execution_slippage_pct": sample.get("stop_loss_slippage_pct"),
+                PROFIT_TRAINING_TARGET: label_contract.get(PROFIT_TRAINING_TARGET),
+                "stop_execution_slippage_pct": sample.get("slippage"),
                 "actual_over_budget_loss_usdt": sample.get(
                     "execution_actual_over_budget_loss_usdt"
                 ),

@@ -3321,8 +3321,6 @@ class TradingService:
         ml_status: dict[str, Any],
     ) -> dict[str, Any]:
         activation = self._safe_dict(ml_status.get("artifact_activation_manifest"))
-        readiness = self._safe_dict(ml_status.get("readiness"))
-        influence_policy = self._safe_dict(ml_status.get("influence_policy"))
         metrics = dict(self._safe_dict(ml_status.get("metrics")))
         for key in (
             "sample_count",
@@ -3343,15 +3341,7 @@ class TradingService:
         ):
             if key not in metrics and ml_status.get(key) not in (None, ""):
                 metrics[key] = ml_status.get(key)
-        allow_live = readiness.get("allow_live_position_influence") is True or ml_status.get(
-            "allow_live_position_influence"
-        ) is True
-        production_authorized = (
-            activation.get("production_influence_authorized") is True
-            or ml_status.get("production_influence_authorized") is True
-            or influence_policy.get("production_influence_authorized") is True
-        )
-        live_ml_authorized = allow_live and production_authorized
+        live_ml_authorized = ml_status.get("live_ml_ready") is True
         return {
             "artifact_lifecycle": (
                 activation.get("activation_stage")

@@ -52,9 +52,9 @@ def _trade_sample() -> dict:
         "trade_fact_trusted": True,
         "symbol": "BTC/USDT",
         "side": "long",
-        "hold_minutes": 45.0,
-        "stop_loss_slippage_pct": 0.03,
-        "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "holding_minutes": 45.0,
+        "slippage": 0.03,
+        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
         "protection_execution_supervision_ready": True,
         "sample_weight": 1.0,
         "exclude_from_training": False,
@@ -217,4 +217,4 @@ def test_confirmed_stop_fill_slippage_can_supervise_actual_execution_cost() -> N
 
     assert cost["eligible"] is True
     assert cost["slippage_pct"] == pytest.approx(0.03)
-    assert cost["slippage_source"] == "okx_stop_trigger_to_fill_slippage"
+    assert cost["slippage_source"] == "okx_configured_stop_trigger_to_fills_vwap"

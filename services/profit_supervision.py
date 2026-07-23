@@ -203,18 +203,15 @@ def _trade_cost_labels(
     sample: dict[str, Any],
 ) -> dict[str, Any]:
     fee = _safe_float(labels.get("fee_return_pct"))
-    slippage = _safe_float(labels.get("slippage_return_pct"))
-    slippage_source = "okx_entry_and_exit_fill_slippage"
-    if (
-        slippage is None
-        and sample.get("protection_execution_supervision_ready") is True
-        and _safe_text(sample.get("stop_loss_slippage_source"))
-        == "okx_configured_stop_trigger_to_fills_vwap"
-    ):
-        slippage = _safe_float(sample.get("stop_loss_slippage_pct"))
-        slippage_source = "okx_stop_trigger_to_fill_slippage"
+    slippage = _safe_float(sample.get("slippage"))
+    slippage_source = _safe_text(sample.get("slippage_source"))
     funding = _safe_float(labels.get("funding_return_pct"))
-    eligible = fee is not None and slippage is not None and funding is not None
+    eligible = bool(
+        fee is not None
+        and slippage is not None
+        and funding is not None
+        and slippage_source == "okx_configured_stop_trigger_to_fills_vwap"
+    )
     # Positive funding is income and therefore reduces realized execution cost.
     total_cost = fee + slippage - funding if eligible else None
     return {
@@ -222,7 +219,7 @@ def _trade_cost_labels(
         "source_authority": "okx_fills_fees_funding",
         "fee_pct": fee,
         "slippage_pct": slippage,
-        "slippage_source": slippage_source if slippage is not None else "missing",
+        "slippage_source": slippage_source,
         "funding_return_pct": funding,
         "total_cost_pct": total_cost,
         "reason": "" if eligible else "authoritative_execution_cost_incomplete",
@@ -317,14 +314,8 @@ def build_profit_supervision_contract(
             "gross_market_return_pct": _safe_float(
                 labels.get("gross_return_on_notional_pct")
             ),
-            "hold_minutes": _safe_float(sample.get("hold_minutes")),
-            "stop_loss_slippage_pct": (
-                _safe_float(sample.get("stop_loss_slippage_pct"))
-                if sample.get("protection_execution_supervision_ready") is True
-                and _safe_text(sample.get("stop_loss_slippage_source"))
-                == "okx_configured_stop_trigger_to_fills_vwap"
-                else None
-            ),
+            "holding_minutes": _safe_float(sample.get("holding_minutes")),
+            "slippage_pct": _safe_float(sample.get("slippage")),
             "protection_actual_side": _safe_text(
                 sample.get("protection_actual_side")
             ),
@@ -549,18 +540,18 @@ def profit_supervision_report(
                     PROFIT_TRAINING_TARGET,
                 )
             ),
-            "hold_minutes": weighted_distribution(
+            "holding_minutes": weighted_distribution(
                 _task_pairs(
                     trade_samples,
                     AUTHORITATIVE_REALIZED_RETURN_TASK,
-                    "hold_minutes",
+                    "holding_minutes",
                 )
             ),
-            "stop_loss_slippage_pct": weighted_distribution(
+            "slippage_pct": weighted_distribution(
                 _task_pairs(
                     trade_samples,
                     AUTHORITATIVE_REALIZED_RETURN_TASK,
-                    "stop_loss_slippage_pct",
+                    "slippage_pct",
                 )
             ),
         },
@@ -641,11 +632,6 @@ def authoritative_trade_calibration(
             COUNTERFACTUAL_EXECUTION_COST_TASK,
             "slippage_pct",
         )
-        stop_pairs = _task_pairs(
-            samples,
-            AUTHORITATIVE_REALIZED_RETURN_TASK,
-            "stop_loss_slippage_pct",
-        )
         profiles[key] = {
             "source_authority": "okx_position_history",
             "symbol": key.rsplit("|", 1)[0],
@@ -653,12 +639,11 @@ def authoritative_trade_calibration(
             PROFIT_TRAINING_TARGET: weighted_distribution(net_pairs),
             "execution_cost_pct": weighted_distribution(cost_pairs),
             "slippage_pct": weighted_distribution(slippage_pairs),
-            "stop_loss_slippage_pct": weighted_distribution(stop_pairs),
-            "hold_minutes": weighted_distribution(
+            "holding_minutes": weighted_distribution(
                 _task_pairs(
                     samples,
                     AUTHORITATIVE_REALIZED_RETURN_TASK,
-                    "hold_minutes",
+                    "holding_minutes",
                 )
             ),
             "exit_quality_counts": dict(

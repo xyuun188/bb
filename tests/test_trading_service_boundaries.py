@@ -47,6 +47,7 @@ from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.sync_service import OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND, OkxSyncService
@@ -1957,6 +1958,7 @@ async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_m
     service.ml_signal_service = SimpleNamespace(
         status=lambda: {
             "available": True,
+            "live_ml_ready": True,
             "allow_live_position_influence": True,
             "artifact_activation_manifest": {
                 "activation_stage": "active",
@@ -1964,7 +1966,7 @@ async def test_production_trade_gate_uses_profit_authorized_ml_status_for_live_m
             },
             "metrics": {
                 "sample_count": 50,
-                "expected_net_return_pct": 0.2,
+                PROFIT_TRAINING_TARGET: 0.2,
                 "return_lcb_pct": 0.05,
                 "profit_factor": 1.4,
             },

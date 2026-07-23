@@ -13,13 +13,19 @@ def _closed_trade_sample(**overrides):
         "close_price": 99.0,
         "quantity": 0.01,
         "notional": 1.0,
-        "entry_fee": -0.001,
-        "close_fee": -0.001,
+        "notional_source": "okx_entry_fill_base_quantity_and_average_price",
+        "entry_fee": 0.001,
+        "close_fee": 0.001,
+        "entry_fee_source": "okx_fills_history",
+        "close_fee_source": "okx_fills_history",
         "funding_fee": 0.0,
         "slippage": 0.002,
+        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
         "realized_pnl": -0.012,
         "net_return_after_all_cost_pct": -1.2,
         "holding_minutes": 30.0,
+        "pnl_source": "okx_position_history_realized_pnl",
+        "funding_fee_source": "okx_positions_history.fundingFee",
         "decision_authority": "rules",
         "model_shadow_prediction": {"side": "short"},
     }
@@ -37,7 +43,7 @@ def test_profit_training_contract_accepts_closed_loss_as_training_label() -> Non
     assert contract.model_shadow_alignment == "avoided_losing_side"
 
 
-def test_profit_training_contract_accepts_okx_lifecycle_aliases() -> None:
+def test_profit_training_contract_rejects_legacy_lifecycle_aliases() -> None:
     contract = validate_profit_training_sample(
         {
             "symbol": "ETH/USDT",
@@ -56,9 +62,27 @@ def test_profit_training_contract_accepts_okx_lifecycle_aliases() -> None:
         }
     )
 
-    assert contract.eligible is True
-    assert contract.outcome == "loss"
-    assert contract.target_value == -2.2
+    assert contract.eligible is False
+    assert contract.outcome == "invalid"
+    assert "entry_order_id_missing" in contract.blockers
+    assert "close_order_id_missing" in contract.blockers
+    assert "close_price_missing_or_invalid" in contract.blockers
+    assert "notional_missing_or_invalid" in contract.blockers
+    assert "entry_fee_missing_or_invalid" in contract.blockers
+    assert "close_fee_missing_or_invalid" in contract.blockers
+    assert "slippage_missing_or_invalid" in contract.blockers
+    assert "holding_minutes_missing_or_invalid" in contract.blockers
+    assert "net_return_after_all_cost_pct_missing_or_invalid" in contract.blockers
+
+
+def test_profit_training_contract_rejects_mismatched_profit_target() -> None:
+    contract = validate_profit_training_sample(
+        _closed_trade_sample(net_return_after_all_cost_pct=-0.5)
+    )
+
+    assert contract.eligible is False
+    assert "net_return_target_algebra_mismatch" in contract.blockers
+
 
 def test_profit_training_contract_rejects_missing_close_order() -> None:
     contract = validate_profit_training_sample(

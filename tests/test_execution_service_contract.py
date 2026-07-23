@@ -595,14 +595,63 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
     )
     orders = {
         entry_result.exchange_order_id: SimpleNamespace(
+            exchange_order_id=entry_result.exchange_order_id,
+            okx_inst_id="BTC-USDT-SWAP",
+            quantity=1.0,
+            price=entry_result.price,
+            fee=0.04,
             okx_fill_contracts=entry_result.quantity,
             okx_trade_ids="trade-entry",
             decision_id=321,
+            okx_raw_fills={
+                "fills_history_confirmed": True,
+                "order_id": entry_result.exchange_order_id,
+                "inst_id": "BTC-USDT-SWAP",
+                "contracts": 1.0,
+                "base_quantity": 1.0,
+                "avg_price": entry_result.price,
+                "fee_abs": 0.04,
+                "contract_size": 1.0,
+                "contract_size_verified": True,
+                "contract_size_source": "okx_public_instruments",
+                "protection_submission": {
+                    "exchange_confirmation_recorded": True,
+                    "source_authority": (
+                        "local_submit_plus_okx_create_order_response"
+                    ),
+                },
+            },
         ),
         close_result.exchange_order_id: SimpleNamespace(
+            exchange_order_id=close_result.exchange_order_id,
+            okx_inst_id="BTC-USDT-SWAP",
+            quantity=1.0,
+            price=close_result.price,
+            fee=0.06,
             okx_fill_contracts=close_result.quantity,
             okx_trade_ids="trade-close",
             decision_id=322,
+            okx_raw_fills={
+                "fills_history_confirmed": True,
+                "order_id": close_result.exchange_order_id,
+                "inst_id": "BTC-USDT-SWAP",
+                "contracts": 1.0,
+                "base_quantity": 1.0,
+                "avg_price": close_result.price,
+                "fee_abs": 0.06,
+                "contract_size": 1.0,
+                "contract_size_verified": True,
+                "contract_size_source": "okx_public_instruments",
+                "protection_execution": {
+                    "lifecycle_complete": True,
+                    "source_authority": "okx_algo_history_plus_fills_history",
+                    "actual_side": "sl",
+                    "stop_loss_slippage_pct": 3.061224489795918,
+                    "stop_loss_slippage_source": (
+                        "okx_configured_stop_trigger_to_fills_vwap"
+                    ),
+                },
+            },
         ),
     }
     sample = build_okx_history_training_sample(

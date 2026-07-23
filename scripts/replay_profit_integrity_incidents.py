@@ -23,6 +23,7 @@ from services.authoritative_trade_outcome import (  # noqa: E402
     build_authoritative_trade_outcome,
 )
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION  # noqa: E402
+from services.profit_training_contract import PROFIT_TRAINING_TARGET  # noqa: E402
 from services.return_objective import standardized_return_distribution  # noqa: E402
 
 REPLAY_VERSION = "2026-07-15.profit-integrity-incident-replay.v1"
@@ -168,17 +169,19 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
             "symbol": "ICP/USDT",
             "side": "short",
             "entry_price": entry_price,
-            "exit_price": exit_price,
+            "close_price": exit_price,
             "quantity": quantity,
-            "notional_usdt": notional,
-            "authoritative_pnl_ratio_pct": -5.51319027,
+            "notional": notional,
+            "notional_source": "incident_replay_immutable_fixture",
             "realized_pnl": float(position["realized_pnl"]),
-            "fee": -abs(float(reflection["fee_estimate"])),
             "funding_fee": float(position.get("funding_fee") or 0.0),
             "planned_stop_loss_price": stop_price,
             "stop_loss_fill_confirmed": True,
-            "stop_loss_slippage_pct": stop_slippage_pct,
-            "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+            "slippage": stop_slippage_pct,
+            "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+            PROFIT_TRAINING_TARGET: (
+                float(position["realized_pnl"]) / notional * 100.0
+            ),
             "training_evidence_gaps": [],
         },
         reflection=SimpleNamespace(
@@ -205,7 +208,7 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
             "distribution_blockers": distribution["blockers"],
             "production_contribution": 0.0 if distribution["blockers"] else 1.0,
             "authoritative_return_after_all_cost_pct": authoritative[
-                "authoritative_pnl_ratio_pct"
+                PROFIT_TRAINING_TARGET
             ],
             "outcome_complete": authoritative["outcome_complete"],
             "stop_execution_slippage": slippage,
@@ -263,7 +266,7 @@ def build_replay_report() -> dict[str, Any]:
     baseline = _load_json(BASELINE_PATH)
     report = {
         "replay_version": REPLAY_VERSION,
-        "optimization_target": "authoritative_fee_after_return_and_left_tail_loss",
+        "optimization_target": PROFIT_TRAINING_TARGET,
         "win_rate_used_for_acceptance": False,
         "inputs": {
             "baseline_fixture": BASELINE_PATH.relative_to(ROOT).as_posix(),

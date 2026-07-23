@@ -139,7 +139,7 @@ def _finquant_specialization_verified(
 
 def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     available = bool(status.get("available"))
-    live = bool(status.get("allow_live_position_influence") or status.get("influence_enabled"))
+    live = status.get("live_ml_ready") is True
     readiness = str(status.get("readiness_state") or status.get("status") or "unknown")
     if live:
         lifecycle = "live"

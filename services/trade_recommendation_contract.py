@@ -164,7 +164,6 @@ def _holding_plan(
     valid_for_seconds = _positive(
         training.get("valid_for_seconds"),
         exploration.get("valid_for_seconds"),
-        _dict(raw.get("entry_permission_policy")).get("valid_for_seconds"),
         min(target * 60.0, 300.0) if target is not None else None,
     )
     return {

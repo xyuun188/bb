@@ -2127,6 +2127,7 @@ class MLSignalService:
                 "status": "no_model",
                 "readiness_state": readiness["state"],
                 "readiness": readiness,
+                "live_ml_ready": False,
                 "allow_live_position_influence": False,
                 "model_path": str(self.model_path),
                 "artifact_registry": self._artifact_registry_status(),
@@ -2194,6 +2195,7 @@ class MLSignalService:
             ),
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
+            "live_ml_ready": allow_live_position_influence,
             "allow_live_position_influence": allow_live_position_influence,
             "influence_enabled": allow_live_position_influence,
             "advisory_enabled": advisory_enabled,
@@ -3415,6 +3417,7 @@ class MLSignalService:
                 "live" if live_prediction_influence else "shadow_observation"
             ),
             "live_influence": live_prediction_influence,
+            "live_ml_ready": allow_live_position_influence,
             "promotion_ready": allow_live_position_influence,
             "objective_name": metadata.get("objective_name"),
             "objective_version": metadata.get("objective_version"),

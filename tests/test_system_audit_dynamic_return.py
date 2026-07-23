@@ -347,7 +347,7 @@ async def test_strategy_closed_loop_is_critical_for_execution_contract_gap(
 ) -> None:
     class FakeRootService:
         async def report(self) -> dict[str, Any]:
-            return {"production_return_blocked_count": 0}
+            return {"live_ml_blocked_count": 0}
 
     class FakeContractService:
         async def report(self, **_kwargs: Any) -> dict[str, Any]:

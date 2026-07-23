@@ -494,24 +494,23 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         label_contract = _safe_dict(sample.get("training_label_contract"))
         if (
             label_contract.get("version") != AUTHORITATIVE_TRADE_LABEL_VERSION
-            or label_contract.get("label_name") != "realized_fee_after_return_pct"
+            or label_contract.get("label_name") != PROFIT_TRAINING_TARGET
             or label_contract.get("execution_mode") not in {"paper", "live"}
             or label_contract.get("complete") is not True
             or not _safe_str(label_contract.get("fingerprint"))
             or int(_safe_float(label_contract.get("decision_id"), 0.0) or 0) <= 0
             or not _safe_str(label_contract.get("lifecycle_key"))
-            or not _safe_list(label_contract.get("entry_order_ids"))
-            or not _safe_list(label_contract.get("close_order_ids"))
-            or _safe_float(label_contract.get("fee_usdt"), None) is None
+            or not _safe_str(label_contract.get("entry_order_id"))
+            or not _safe_str(label_contract.get("close_order_id"))
+            or _safe_float(label_contract.get("entry_fee_usdt"), None) is None
+            or _safe_float(label_contract.get("close_fee_usdt"), None) is None
             or _safe_float(label_contract.get("funding_fee_usdt"), None) is None
-            or _safe_float(
-                label_contract.get("realized_fee_after_return_pct"), None
-            )
-            is None
+            or _safe_float(label_contract.get("slippage_pct"), None) is None
+            or _safe_float(label_contract.get(PROFIT_TRAINING_TARGET), None) is None
         ):
             return _final_assessment(
                 0.0,
-                ["missing_authoritative_fee_after_label_contract"],
+                ["missing_authoritative_profit_label_contract"],
                 exclude=True,
             )
         profit_contract = _safe_dict(sample.get("profit_training_contract"))
@@ -561,11 +560,8 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if close_status in {"failed", "rejected", "cancelled", "canceled", "error"}:
         return _final_assessment(0.0, ["failed_close_status"], exclude=True)
 
-    fee_source = sample.get("fee_estimate")
-    if fee_source is None:
-        fee_source = sample.get("fee")
-    if fee_source is None:
-        return _final_assessment(0.0, ["missing_fee_estimate"], exclude=True)
+    if _trade_fee(sample) is None:
+        return _final_assessment(0.0, ["missing_authoritative_trade_fee"], exclude=True)
     if source in {"closed_position", *AUTHORITATIVE_TRADE_OUTCOME_SOURCES}:
         pnl_source = _trade_pnl_source(sample)
         if not _trade_pnl_source_trusted(pnl_source):
@@ -590,13 +586,13 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         return _final_assessment(0.0, ["non_positive_quantity"], exclude=True)
 
     entry_price = _safe_float(sample.get("entry_price"), 0.0) or 0.0
-    exit_price = _safe_float(sample.get("exit_price"), 0.0) or 0.0
-    if entry_price <= 0 or exit_price < 0:
+    close_price = _safe_float(sample.get("close_price"), 0.0) or 0.0
+    if entry_price <= 0 or close_price <= 0:
         return _final_assessment(0.0, ["invalid_trade_price"], exclude=True)
 
-    hold_minutes = _safe_float(sample.get("hold_minutes"), 0.0) or 0.0
+    holding_minutes = _safe_float(sample.get("holding_minutes"), 0.0) or 0.0
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
-    if hold_minutes <= 0:
+    if holding_minutes <= 0:
         return _final_assessment(0.0, ["missing_hold_duration"], exclude=True)
 
     outcome = _safe_str(sample.get("outcome")).lower()
@@ -725,11 +721,11 @@ def _trade_close_evidence(sample: dict[str, Any]) -> dict[str, Any]:
 
 
 def _trade_fee(sample: dict[str, Any]) -> float | None:
-    fee_source = sample.get("fee_estimate")
-    if fee_source is None:
-        fee_source = sample.get("fee")
-    fee = _safe_float(fee_source, None)
-    return None if fee is None else abs(fee)
+    entry_fee = _safe_float(sample.get("entry_fee"), None)
+    close_fee = _safe_float(sample.get("close_fee"), None)
+    if entry_fee is None or close_fee is None or entry_fee < 0 or close_fee < 0:
+        return None
+    return entry_fee + close_fee
 
 
 def _trade_funding_fee(sample: dict[str, Any]) -> float | None:
@@ -744,40 +740,13 @@ def _trade_funding_fee(sample: dict[str, Any]) -> float | None:
     return None
 
 
-def _trade_notional_usdt(sample: dict[str, Any]) -> float | None:
-    quantity = _safe_float(sample.get("quantity"), None)
-    entry_price = _safe_float(sample.get("entry_price"), None)
-    explicit = _first_float(
-        sample.get("notional_usdt"),
-        _trade_sizing(sample).get("final_notional_usdt"),
-        _trade_sizing(sample).get("target_min_notional_usdt"),
-    )
-    quantity_is_contracts = _safe_str(sample.get("quantity_unit")).lower() == "contracts"
-    derived = (
-        abs(quantity * entry_price)
-        if not quantity_is_contracts and quantity is not None and entry_price is not None
-        else None
-    )
-    # Historical rows can contain contract-count placeholders in notional_usdt.
-    # Prefer the largest internally valid candidate so a tiny malformed denominator
-    # cannot turn an ordinary perpetual PnL into a million-percent training return.
-    candidates = [
-        abs(value)
-        for value in (explicit, derived)
-        if value is not None and math.isfinite(value) and abs(value) > 0
-    ]
-    return max(candidates) if candidates else None
+def _trade_notional(sample: dict[str, Any]) -> float | None:
+    notional = _safe_float(sample.get("notional"), None)
+    return notional if notional is not None and notional > 0 else None
 
 
-def _trade_return_after_all_cost_pct(
-    sample: dict[str, Any], *, pnl: float, notional: float | None
-) -> float | None:
-    authoritative = _safe_float(sample.get("authoritative_pnl_ratio_pct"), None)
-    if authoritative is not None:
-        return authoritative
-    if notional is None or notional <= 0:
-        return None
-    return pnl / max(notional, 1e-9) * 100.0
+def _trade_return_after_all_cost_pct(sample: dict[str, Any]) -> float | None:
+    return _safe_float(sample.get(PROFIT_TRAINING_TARGET), None)
 
 
 def _trade_actual_leverage(sample: dict[str, Any]) -> float | None:
@@ -901,12 +870,8 @@ def _trade_profit_learning_labels(
     cost_basis_label = _trade_cost_basis_label(sample, fee=fee)
     pnl = _safe_float(sample.get("realized_pnl"), 0.0) or 0.0
     fee_dominated = bool(fee and abs(pnl) <= fee)
-    notional = _trade_notional_usdt(sample)
-    net_return_after_all_cost_pct = _trade_return_after_all_cost_pct(
-        sample,
-        pnl=pnl,
-        notional=notional,
-    )
+    notional = _trade_notional(sample)
+    net_return_after_all_cost_pct = _trade_return_after_all_cost_pct(sample)
     gross_pnl = _safe_float(sample.get("gross_pnl"), None)
     gross_return_on_notional_pct = (
         gross_pnl / notional * 100.0
@@ -969,9 +934,10 @@ def _trade_profit_learning_labels(
         "funding_return_pct": funding_return_pct,
         PROFIT_TRAINING_TARGET: net_return_after_all_cost_pct,
         "return_on_margin_pct": return_on_margin_pct,
-        "fee_estimate_usdt": fee,
+        "entry_fee_usdt": _safe_float(sample.get("entry_fee"), None),
+        "close_fee_usdt": _safe_float(sample.get("close_fee"), None),
         "funding_fee_usdt": funding_fee,
-        "notional_usdt": notional,
+        "notional": notional,
         "strategy_context": _trade_strategy_context(sample),
     }
 
@@ -1400,9 +1366,10 @@ def _profit_learning_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 "training_supervision_ready",
                 "strategy_context",
                 "realized_net_pnl_usdt",
-                "fee_estimate_usdt",
+                "entry_fee_usdt",
+                "close_fee_usdt",
                 "funding_fee_usdt",
-                "notional_usdt",
+                "notional",
                 "fee_dominated",
             }:
                 continue

@@ -1221,17 +1221,22 @@ def _json_object_from_remote_output(raw: str) -> dict[str, Any]:
 
 def _trade_response(sample: dict[str, Any]) -> dict[str, Any]:
     realized = _safe_float(sample.get("realized_pnl"))
-    fee_signed = _safe_float(sample.get("fee"), -_safe_float(sample.get("fee_estimate")))
+    entry_fee = _safe_float(sample.get("entry_fee"))
+    close_fee = _safe_float(sample.get("close_fee"))
     funding_signed = _safe_float(sample.get("funding_fee"))
     liquidation_signed = _safe_float(sample.get("liquidation_penalty"))
-    cost_drag = -sum(min(value, 0.0) for value in (fee_signed, funding_signed, liquidation_signed))
+    cost_drag = entry_fee + close_fee - min(funding_signed, 0.0) - min(
+        liquidation_signed,
+        0.0,
+    )
     side = str(sample.get("side") or "").lower()
     return {
         "verdict": "good_trade" if realized > 0 else "bad_trade" if realized < 0 else "flat_trade",
         "side": side,
         "net_pnl_after_all_costs_usdt": round(realized, 6),
         "gross_pnl_usdt": round(_safe_float(sample.get("gross_pnl")), 6),
-        "fee_usdt_signed": round(fee_signed, 6),
+        "entry_fee_usdt": round(entry_fee, 6),
+        "close_fee_usdt": round(close_fee, 6),
         "funding_fee_usdt_signed": round(funding_signed, 6),
         "liquidation_penalty_usdt_signed": round(liquidation_signed, 6),
         "total_cost_drag_usdt": round(cost_drag, 6),
@@ -1243,7 +1248,9 @@ def _trade_response(sample: dict[str, Any]) -> dict[str, Any]:
             else "This setup had positive after-fee outcome; reuse only with comparable evidence and risk control."
         ),
         "risk_guidance": {
-            "increase_size": bool(realized > 0 and _safe_float(sample.get("hold_minutes")) > 0),
+            "increase_size": bool(
+                realized > 0 and _safe_float(sample.get("holding_minutes")) > 0
+            ),
             "avoid_tiny_fee_drag": bool(cost_drag > abs(realized) and realized <= 0),
             "requires_after_fee_positive_expectancy": True,
         },
@@ -1533,19 +1540,27 @@ async def build_dataset() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "position_id",
                 "symbol",
                 "side",
+                "entry_order_id",
+                "close_order_id",
                 "entry_price",
-                "exit_price",
+                "close_price",
                 "quantity",
-                "notional_usdt",
-                "authoritative_pnl_ratio_pct",
+                "notional",
+                "notional_source",
                 "realized_pnl",
                 "gross_pnl",
-                "fee",
-                "fee_estimate",
+                "entry_fee",
+                "close_fee",
+                "entry_fee_source",
+                "close_fee_source",
                 "funding_fee",
+                "funding_fee_source",
                 "liquidation_penalty",
                 "settlement_components_total",
-                "hold_minutes",
+                "slippage",
+                "slippage_source",
+                "holding_minutes",
+                "net_return_after_all_cost_pct",
                 "leverage",
                 "outcome",
                 "raw_llm_response",

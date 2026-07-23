@@ -153,7 +153,7 @@ class StrongOpportunityService:
             stage=(
                 "live_rules_canary_ready"
                 if strong and lifecycle == "live_rules_canary"
-                else "production_return_ready"
+                else "live_ml_ready"
                 if strong
                 else "observe_only"
             ),

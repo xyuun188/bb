@@ -2943,7 +2943,7 @@ async def _strategy_quality_audit() -> dict[str, Any]:
             details={"error": safe_error_text(exc, limit=180), "audit_only": True},
             owner_path="services/strategy_signal_root_cause_audit.py",
         )
-    blocked = int(report.get("production_return_blocked_count") or 0)
+    blocked = int(report.get("live_ml_blocked_count") or 0)
     return _audit_card(
         "strategy_quality",
         "动态费后收益策略质量",
@@ -2954,7 +2954,7 @@ async def _strategy_quality_audit() -> dict[str, Any]:
             {"label": "开仓决策", "value": int(report.get("entry_decision_count") or 0)},
             {
                 "label": "收益契约完整",
-                "value": int(report.get("production_return_ready_count") or 0),
+                "value": int(report.get("live_ml_ready_count") or 0),
             },
             {"label": "收益契约阻断", "value": blocked},
         ],
@@ -3050,7 +3050,7 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         )
     contract_summary = _safe_dict(contract_report.get("summary"))
     violations = int(contract_summary.get("contract_violation_count") or 0)
-    blocked = int(root_report.get("production_return_blocked_count") or 0)
+    blocked = int(root_report.get("live_ml_blocked_count") or 0)
     status = "critical" if violations else "warning" if blocked else "ok"
     return _audit_card(
         "strategy_closed_loop",

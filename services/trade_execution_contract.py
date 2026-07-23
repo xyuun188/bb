@@ -304,7 +304,7 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
         or sizing.get("execution_scope") == "live_rules_canary"
     ):
         return "live_rules_canary"
-    return "production_return"
+    return "live_ml"
 
 
 def entry_opportunity_evidence_score(raw: dict[str, Any]) -> float | None:
@@ -1296,7 +1296,7 @@ def validate_production_entry_contract(
     if executed and filled_order_present is not True:
         reasons.append("executed_entry_without_filled_order")
     contract = {
-        "contract_lifecycle": "production_return",
+        "contract_lifecycle": "live_ml",
         "contract_complete": not reasons,
         "expected_net_return_pct": _safe_float(policy.get("expected_net_return_pct")),
         "return_lcb_pct": _safe_float(policy.get("return_lcb_pct")),

@@ -113,9 +113,7 @@ class EntryOpportunityScoringPolicy:
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
         live_claimed = bool(
-            signal.get("allow_live_position_influence") is True
-            and signal.get("influence_enabled") is True
-            and side_policy.get("enabled") is True
+            signal.get("live_ml_ready") is True and side_policy.get("enabled") is True
         )
         paper_authorization = paper_strategy_authorization(
             strategy,
@@ -203,15 +201,7 @@ class EntryOpportunityScoringPolicy:
         production_claimed = bool(
             signal_available(payload)
             and str(payload.get("route_mode") or "").lower() == "live"
-            and any(
-                payload.get(field) is True
-                for field in (
-                    "live_mutation",
-                    "live_influence",
-                    "influence_enabled",
-                    "allow_live_position_influence",
-                )
-            )
+            and payload.get("live_ml_ready") is True
         )
         production_eligible = bool(
             production_claimed

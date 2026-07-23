@@ -150,7 +150,8 @@ def test_trade_response_uses_authoritative_net_pnl_without_double_deducting_cost
             "side": "long",
             "realized_pnl": 8.5,
             "gross_pnl": 10.0,
-            "fee": -1.0,
+            "entry_fee": 0.4,
+            "close_fee": 0.6,
             "funding_fee": -0.5,
             "liquidation_penalty": 0.0,
         }
@@ -158,7 +159,8 @@ def test_trade_response_uses_authoritative_net_pnl_without_double_deducting_cost
 
     assert response["net_pnl_after_all_costs_usdt"] == 8.5
     assert response["gross_pnl_usdt"] == 10.0
-    assert response["fee_usdt_signed"] == -1.0
+    assert response["entry_fee_usdt"] == 0.4
+    assert response["close_fee_usdt"] == 0.6
     assert response["funding_fee_usdt_signed"] == -0.5
     assert response["total_cost_drag_usdt"] == 1.5
     assert "after_fee_pnl_usdt" not in response

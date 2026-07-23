@@ -101,7 +101,7 @@ class StrategySignalRootCauseAuditService:
             raw = _safe_dict(getattr(row, "raw_llm_response", None))
             lifecycle = entry_contract_lifecycle(raw)
             lifecycle_counts[lifecycle] += 1
-            if lifecycle == "production_return":
+            if lifecycle == "live_ml":
                 policy = _safe_dict(raw.get("live_ml_profit_contract"))
                 expected = _maybe_float(policy.get("expected_net_return_pct"))
                 lcb = _maybe_float(policy.get("return_lcb_pct"))
@@ -144,11 +144,11 @@ class StrategySignalRootCauseAuditService:
             "can_bypass_risk_controls": False,
             "entry_decision_count": len(entries),
             "entry_contract_ready_count": ready_count,
-            "high_quality_entry_count": lifecycle_ready_counts["production_return"],
-            "production_return_ready_count": lifecycle_ready_counts["production_return"],
-            "production_return_blocked_count": (
-                lifecycle_counts["production_return"]
-                - lifecycle_ready_counts["production_return"]
+            "high_quality_entry_count": lifecycle_ready_counts["live_ml"],
+            "live_ml_ready_count": lifecycle_ready_counts["live_ml"],
+            "live_ml_blocked_count": (
+                lifecycle_counts["live_ml"]
+                - lifecycle_ready_counts["live_ml"]
             ),
             "live_rules_canary_entry_count": lifecycle_counts[
                 "live_rules_canary"

@@ -99,17 +99,24 @@ def _trade_sample(**overrides):
         "symbol": "BTC/USDT",
         "side": "long",
         "entry_price": 100.0,
-        "exit_price": 101.0,
+        "close_price": 101.0,
         "quantity": 0.1,
+        "notional": 10.0,
         "realized_pnl": 1.0,
-        "fee_estimate": 0.05,
+        "entry_fee": 0.02,
+        "close_fee": 0.03,
+        "entry_fee_source": "okx_fills_history",
+        "close_fee_source": "okx_fills_history",
         "funding_fee": 0.0,
         "funding_fee_source": "okx_positions_history.fundingFee",
+        "slippage": 0.01,
+        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "net_return_after_all_cost_pct": 10.0,
         "pnl_source": "okx_position_history_realized_pnl",
         "settlement_source": "okx_position_history_settlement",
         "settlement_status": "reconciled",
         "position_size_pct": 0.03,
-        "hold_minutes": 35.0,
+        "holding_minutes": 35.0,
         "outcome": "profit",
     }
     sample.update(overrides)
@@ -183,7 +190,9 @@ def test_duplicate_training_sample_is_excluded() -> None:
 
 
 def test_trade_hold_duration_does_not_apply_fixed_fast_loss_penalty() -> None:
-    assessment = assess_trade_sample(_trade_sample(realized_pnl=-0.8, hold_minutes=1.5))
+    assessment = assess_trade_sample(
+        _trade_sample(realized_pnl=-0.8, holding_minutes=1.5)
+    )
 
     assert "fast_loss_exit_requires_review" not in assessment.reasons
 
@@ -196,13 +205,13 @@ def test_manual_trade_samples_are_excluded() -> None:
 
 
 def test_trade_missing_fee_is_excluded_but_size_and_old_tier_are_not_gates() -> None:
-    no_fee = assess_trade_sample(_trade_sample(fee_estimate=None))
+    no_fee = assess_trade_sample(_trade_sample(entry_fee=None))
     micro_probe = assess_trade_sample(
         _trade_sample(position_size_pct=0.0003, evidence_tier="weak_conflict_probe")
     )
 
     assert no_fee.status == "excluded"
-    assert "missing_fee_estimate" in no_fee.reasons
+    assert "missing_authoritative_trade_fee" in no_fee.reasons
     assert micro_probe.status == "included"
     assert "weak_evidence_micro_probe" not in micro_probe.reasons
 
@@ -276,8 +285,9 @@ def test_trade_unknown_losing_exit_attribution_is_excluded() -> None:
     assessment = assess_trade_sample(
         _trade_sample(
             realized_pnl=-0.7,
-            hold_minutes=16.0,
-            fee_estimate=0.02,
+            holding_minutes=16.0,
+            entry_fee=0.01,
+            close_fee=0.01,
             raw_llm_response={},
         )
     )
@@ -426,8 +436,11 @@ def test_training_payload_enriches_trade_profit_learning_labels() -> None:
             _trade_sample(
                 source="closed_position",
                 realized_pnl=-0.12,
-                fee_estimate=0.08,
-                hold_minutes=18.0,
+                entry_fee=0.03,
+                close_fee=0.05,
+                holding_minutes=18.0,
+                notional=12.0,
+                net_return_after_all_cost_pct=-1.0,
                 leverage=1.0,
                 loss_attribution="position_too_small_fee_drag",
                 raw_llm_response={
@@ -512,15 +525,17 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
                 ),
                 training_label_contract={
                     "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
-                    "label_name": "realized_fee_after_return_pct",
+                    "label_name": PROFIT_TRAINING_TARGET,
                     "execution_mode": "paper",
                     "lifecycle_key": f"okx-position:test-{index}",
                     "decision_id": 1001,
-                    "entry_order_ids": [f"entry-test-{index}"],
-                    "close_order_ids": [f"close-test-{index}"],
-                    "realized_fee_after_return_pct": 10.0,
-                    "fee_usdt": -0.05,
+                    "entry_order_id": f"entry-test-{index}",
+                    "close_order_id": f"close-test-{index}",
+                    PROFIT_TRAINING_TARGET: 10.0,
+                    "entry_fee_usdt": 0.02,
+                    "close_fee_usdt": 0.03,
                     "funding_fee_usdt": 0.0,
+                    "slippage_pct": 0.01,
                     "complete": True,
                     "fingerprint": f"fee-after-label-test-{index}",
                 },
@@ -571,15 +586,17 @@ def test_authoritative_trade_sample_requires_profit_training_contract() -> None:
         pnl_source="okx_position_history_realized_pnl",
         training_label_contract={
             "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
-            "label_name": "realized_fee_after_return_pct",
+            "label_name": PROFIT_TRAINING_TARGET,
             "execution_mode": "paper",
             "lifecycle_key": "okx-position:test-missing-profit-contract",
             "decision_id": 1001,
-            "entry_order_ids": ["entry-test-missing-profit-contract"],
-            "close_order_ids": ["close-test-missing-profit-contract"],
-            "realized_fee_after_return_pct": 10.0,
-            "fee_usdt": -0.05,
+            "entry_order_id": "entry-test-missing-profit-contract",
+            "close_order_id": "close-test-missing-profit-contract",
+            PROFIT_TRAINING_TARGET: 10.0,
+            "entry_fee_usdt": 0.02,
+            "close_fee_usdt": 0.03,
             "funding_fee_usdt": 0.0,
+            "slippage_pct": 0.01,
             "complete": True,
             "fingerprint": "fee-after-label-test-missing-profit-contract",
         },
@@ -1153,30 +1170,14 @@ def test_artifact_bound_governance_report_marks_new_artifact_current() -> None:
     assert report["contamination_risk"] == "high"
 
 
-def test_trade_return_uses_valid_derived_notional_over_tiny_placeholder() -> None:
-    payload = annotate_training_payload(
-        trade_samples=[
-            _trade_sample(
-                quantity=2.0,
-                entry_price=100.0,
-                realized_pnl=4.0,
-                notional_usdt=0.000001,
-            )
-        ],
-        shadow_samples=[],
-        sequence_samples=[],
-        text_sentiment_samples=[],
-    )
-
-    labels = payload["trade_samples"][0]["profit_learning_labels"]
-    assert labels["notional_usdt"] == 200.0
-    assert labels[PROFIT_TRAINING_TARGET] == 2.0
-    assert "return_after_all_cost_pct" not in labels
+def test_trade_notional_uses_only_canonical_authoritative_value() -> None:
+    assert training_data_quality._trade_notional({"notional": 200.0}) == 200.0
+    assert training_data_quality._trade_notional({"notional_usdt": 200.0}) is None
 
 
 def test_trade_return_is_missing_for_zero_or_malformed_notional() -> None:
     assert (
-        training_data_quality._trade_notional_usdt(
+        training_data_quality._trade_notional(
             {"quantity": "bad", "entry_price": "bad", "notional_usdt": 0}
         )
         is None

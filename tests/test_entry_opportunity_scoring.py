@@ -58,6 +58,7 @@ def _live_payload(*, side: str, long_return: float, short_return: float) -> dict
     return {
         "available": True,
         "route_mode": "live",
+        "live_ml_ready": True,
         "live_influence": True,
         "promotion_ready": True,
         "horizon_minutes": 30,
@@ -133,6 +134,7 @@ def _live_ml() -> dict:
     return {
         "available": True,
         "route_mode": "live",
+        "live_ml_ready": True,
         "live_influence": True,
         "allow_live_position_influence": True,
         "influence_enabled": True,
@@ -334,6 +336,7 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"].update(
         {
+            "live_ml_ready": False,
             "allow_live_position_influence": False,
             "influence_enabled": False,
             "advisory_enabled": True,

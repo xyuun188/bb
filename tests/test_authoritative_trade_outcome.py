@@ -29,6 +29,8 @@ def _sample(**overrides):
         "okx_pos_id": "pos-icp",
         "entry_order_ids": ["entry-icp"],
         "close_order_ids": ["close-icp"],
+        "entry_order_id": "entry-icp",
+        "close_order_id": "close-icp",
         "linked_order_ids": ["entry-icp", "close-icp"],
         "model_name": "ensemble_trader",
         "execution_mode": "paper",
@@ -37,21 +39,31 @@ def _sample(**overrides):
         "close_status": "full",
         "entry_price": 2.167,
         "exit_price": 2.285,
+        "close_price": 2.285,
         "quantity": 60194.1,
         "quantity_unit": "contracts",
         "notional_usdt": 1304.5,
+        "notional": 1304.5,
+        "notional_source": "okx_entry_fill_base_quantity_and_average_price",
         "authoritative_pnl_ratio_pct": -5.51319027,
         "realized_pnl": -71.83582759,
         "gross_pnl": -70.0,
         "fee": -1.2,
         "fee_estimate": 1.2,
+        "entry_fee": 0.5,
+        "close_fee": 0.7,
+        "entry_fee_source": "okx_fills_history",
+        "close_fee_source": "okx_fills_history",
         "funding_fee": -0.63582759,
         "liquidation_penalty": 0.0,
         "hold_minutes": 292.4,
+        "holding_minutes": 292.4,
         "planned_stop_loss_price": 2.21,
         "stop_loss_fill_confirmed": True,
         "stop_loss_slippage_pct": 3.393665,
         "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "slippage": 3.393665,
+        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
         "trigger_to_first_fill_ms": 1060.0,
         "execution_actual_over_budget_loss_usdt": 14.0,
         "outcome": "loss",
@@ -59,6 +71,8 @@ def _sample(**overrides):
         "settlement_source": "okx_position_history_realized_pnl",
         "funding_fee_source": "okx_positions_history.fundingFee",
         "fee_source": "okx_positions_history.fee",
+        "decision_authority": "model",
+        "net_return_after_all_cost_pct": -71.83582759 / 1304.5 * 100.0,
         "trade_fact_trusted": True,
         "trade_fact_trust_reason": "",
         "training_evidence_gaps": [],
@@ -158,8 +172,8 @@ def test_demo_and_live_share_one_fee_after_label_schema() -> None:
     assert live["execution_mode"] == "live"
     assert paper_label["version"] == AUTHORITATIVE_TRADE_LABEL_VERSION
     assert set(paper_label) == set(live_label)
-    assert paper_label["realized_fee_after_return_pct"] == live_label[
-        "realized_fee_after_return_pct"
+    assert paper_label["net_return_after_all_cost_pct"] == live_label[
+        "net_return_after_all_cost_pct"
     ]
     assert paper_label["realized_net_pnl_usdt"] == live_label[
         "realized_net_pnl_usdt"
