@@ -191,6 +191,7 @@ from services.position_settlement import (
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.production_trade_gate import evaluate_production_trade_gate
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.strategy_context_performance import StrategyContextPerformanceService
@@ -3326,6 +3327,7 @@ class TradingService:
             "sample_count",
             "production_sample_count",
             "closed_trade_sample_count",
+            PROFIT_TRAINING_TARGET,
             "expected_net_return_pct",
             "avg_return_pct",
             "top_avg_return_pct",

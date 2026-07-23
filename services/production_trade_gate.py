@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 from math import isfinite
 from typing import Any, Literal
 
+from services.profit_training_contract import PROFIT_TRAINING_TARGET
+
 TradeGateMode = Literal["observe", "live_rules_canary", "live_ml", "blocked"]
 DecisionAuthority = Literal["none", "rules", "model"]
 
@@ -36,6 +38,13 @@ def _safe_int(value: Any, default: int = 0) -> int:
     if number is None:
         return default
     return int(number)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,19 +78,13 @@ def _risk_limits(settings: dict[str, Any], risk: dict[str, Any]) -> TradeGateRis
     source = _safe_dict(settings.get("rules_canary_risk")) or _safe_dict(
         risk.get("rules_canary_risk")
     )
+    max_notional = _safe_float(source.get("max_notional_usdt"), None)
+    max_open_positions = _safe_int(source.get("max_open_positions"), 1)
+    max_daily_loss = _safe_float(source.get("max_daily_loss_usdt"), None)
     return TradeGateRiskLimits(
-        max_notional_usdt=max(
-            _safe_float(source.get("max_notional_usdt"), 10.0) or 10.0,
-            0.0,
-        ),
-        max_open_positions=max(
-            _safe_int(source.get("max_open_positions"), 1),
-            0,
-        ),
-        max_daily_loss_usdt=max(
-            _safe_float(source.get("max_daily_loss_usdt"), 3.0) or 3.0,
-            0.0,
-        ),
+        max_notional_usdt=max(10.0 if max_notional is None else max_notional, 0.0),
+        max_open_positions=max(max_open_positions, 0),
+        max_daily_loss_usdt=max(3.0 if max_daily_loss is None else max_daily_loss, 0.0),
     )
 
 
@@ -113,29 +116,38 @@ def _model_profit_ready(model: dict[str, Any]) -> tuple[bool, list[str]]:
         metrics = model
     blockers: list[str] = []
     return_lcb = _safe_float(
-        metrics.get("return_lcb_pct")
-        or metrics.get("top_return_lcb_pct")
-        or metrics.get("top_long_return_lcb_pct")
-        or metrics.get("top_short_return_lcb_pct"),
+        _first_present(
+            metrics.get("return_lcb_pct"),
+            metrics.get("top_return_lcb_pct"),
+            metrics.get("top_long_return_lcb_pct"),
+            metrics.get("top_short_return_lcb_pct"),
+        ),
         None,
     )
     profit_factor = _safe_float(
-        metrics.get("profit_factor")
-        or metrics.get("top_profit_factor")
-        or metrics.get("top_long_profit_factor")
-        or metrics.get("top_short_profit_factor"),
+        _first_present(
+            metrics.get("profit_factor"),
+            metrics.get("top_profit_factor"),
+            metrics.get("top_long_profit_factor"),
+            metrics.get("top_short_profit_factor"),
+        ),
         None,
     )
     expected_net = _safe_float(
-        metrics.get("expected_net_return_pct")
-        or metrics.get("avg_return_pct")
-        or metrics.get("top_avg_return_pct"),
+        _first_present(
+            metrics.get(PROFIT_TRAINING_TARGET),
+            metrics.get("expected_net_return_pct"),
+            metrics.get("avg_return_pct"),
+            metrics.get("top_avg_return_pct"),
+        ),
         None,
     )
     sample_count = _safe_int(
-        metrics.get("production_sample_count")
-        or metrics.get("closed_trade_sample_count")
-        or metrics.get("sample_count"),
+        _first_present(
+            metrics.get("production_sample_count"),
+            metrics.get("closed_trade_sample_count"),
+            metrics.get("sample_count"),
+        ),
         0,
     )
     min_samples = _safe_int(model.get("min_live_ml_samples"), 30)
@@ -230,6 +242,16 @@ def evaluate_production_trade_gate(
     rules_canary_enabled = settings.get("rules_canary_enabled") is not False
     if rules_canary_enabled:
         evidence["model_live_blockers"] = model_blockers
+        if limits.max_notional_usdt <= 0:
+            return ProductionTradeGateResult(
+                can_trade=False,
+                mode="blocked",
+                decision_authority="none",
+                model_can_influence=False,
+                reason="rules_canary_notional_limit_closed",
+                risk=limits,
+                evidence=evidence,
+            )
         return ProductionTradeGateResult(
             can_trade=True,
             mode="live_rules_canary",
@@ -251,4 +273,3 @@ def evaluate_production_trade_gate(
         risk=limits,
         evidence=evidence,
     )
-
