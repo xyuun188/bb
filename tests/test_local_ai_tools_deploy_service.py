@@ -13,6 +13,7 @@ import pytest
 
 from scripts import deploy_local_ai_tools_service as deploy
 from scripts.deploy_local_ai_tools_service import SERVICE_CODE
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -2141,7 +2142,7 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
                     "correlation_group": f"shadow_decision:{index + 1}",
                 },
                 "profit_supervision": {
-                    "version": "2026-07-14.separated-profit-supervision.v1",
+                    "version": PROFIT_SUPERVISION_VERSION,
                     "tasks": {
                         "market_opportunity_distribution": {
                             "eligible": True,

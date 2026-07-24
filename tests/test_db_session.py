@@ -5,6 +5,7 @@ from sqlalchemy import Text, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import db.session as session_module
+from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_VERSION
 from models.trade import Order
 
 
@@ -225,7 +226,7 @@ async def test_sqlite_physically_deletes_non_authoritative_expert_memories(
     valid = {
         "source": "authoritative_trade_outcome",
         "authority_level": "okx_settlement_and_execution",
-        "outcome_version": "2026-07-19.authoritative-trade-outcome.v2",
+        "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         "production_evidence_eligible": True,
         "cost_complete": True,
         "outcome_id": "ato:valid",

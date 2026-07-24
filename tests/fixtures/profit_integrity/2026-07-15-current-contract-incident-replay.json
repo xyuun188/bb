@@ -26,20 +26,21 @@
           "lower_quantile_above_median"
         ],
         "distribution_production_eligible": false,
+        "execution_slippage": {
+          "close_slippage_usdt": null,
+          "contribution_return_pct": null,
+          "contribution_usdt": null,
+          "entry_slippage_usdt": null,
+          "source": "",
+          "status": "unavailable"
+        },
         "outcome_complete": false,
-        "production_contribution": 0.0,
-        "stop_execution_slippage": {
-          "contribution_return_pct": -3.3936651583710487,
-          "contribution_usdt": -44.268539728506894,
-          "source": "okx_configured_stop_trigger_to_fills_vwap",
-          "status": "measured",
-          "trigger_to_first_fill_ms": null
-        }
+        "production_contribution": 0.0
       },
       "before": {
         "expected_return_pct": 0.4603,
-        "lower_quantile_return_pct": 0.496,
-      "live_ml_ready": true
+        "live_ml_ready": true,
+        "lower_quantile_return_pct": 0.496
       },
       "decision_id": 79318,
       "symbol": "ICP/USDT"

@@ -14,6 +14,7 @@ from services.authoritative_trade_outcome import build_authoritative_trade_outco
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
+from services.okx_execution_slippage import build_okx_fill_mark_slippage
 from services.okx_training_facts import build_okx_history_training_sample
 from services.paper_training import build_paper_training_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
@@ -687,6 +688,7 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
         entry_result.exchange_order_id: SimpleNamespace(
             exchange_order_id=entry_result.exchange_order_id,
             okx_inst_id="BTC-USDT-SWAP",
+            side="buy",
             quantity=1.0,
             price=entry_result.price,
             fee=0.04,
@@ -696,6 +698,7 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
             okx_raw_fills={
                 "fills_history_confirmed": True,
                 "order_id": entry_result.exchange_order_id,
+                "trade_ids": ["trade-entry"],
                 "inst_id": "BTC-USDT-SWAP",
                 "contracts": 1.0,
                 "base_quantity": 1.0,
@@ -704,6 +707,25 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
                 "contract_size": 1.0,
                 "contract_size_verified": True,
                 "contract_size_source": "okx_public_instruments",
+                "execution_slippage": build_okx_fill_mark_slippage(
+                    order_id=entry_result.exchange_order_id,
+                    inst_id="BTC-USDT-SWAP",
+                    side="buy",
+                    contracts=1.0,
+                    average_price=entry_result.price,
+                    contract_size=1.0,
+                    rows=[
+                        {
+                            "ordId": entry_result.exchange_order_id,
+                            "instId": "BTC-USDT-SWAP",
+                            "tradeId": "trade-entry",
+                            "side": "buy",
+                            "fillSz": "1",
+                            "fillPx": str(entry_result.price),
+                            "fillMarkPx": str(entry_result.price - 0.02),
+                        }
+                    ],
+                ),
                 "protection_submission": {
                     "exchange_confirmation_recorded": True,
                     "source_authority": (
@@ -715,6 +737,7 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
         close_result.exchange_order_id: SimpleNamespace(
             exchange_order_id=close_result.exchange_order_id,
             okx_inst_id="BTC-USDT-SWAP",
+            side="sell",
             quantity=1.0,
             price=close_result.price,
             fee=0.06,
@@ -724,6 +747,7 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
             okx_raw_fills={
                 "fills_history_confirmed": True,
                 "order_id": close_result.exchange_order_id,
+                "trade_ids": ["trade-close"],
                 "inst_id": "BTC-USDT-SWAP",
                 "contracts": 1.0,
                 "base_quantity": 1.0,
@@ -732,6 +756,25 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
                 "contract_size": 1.0,
                 "contract_size_verified": True,
                 "contract_size_source": "okx_public_instruments",
+                "execution_slippage": build_okx_fill_mark_slippage(
+                    order_id=close_result.exchange_order_id,
+                    inst_id="BTC-USDT-SWAP",
+                    side="sell",
+                    contracts=1.0,
+                    average_price=close_result.price,
+                    contract_size=1.0,
+                    rows=[
+                        {
+                            "ordId": close_result.exchange_order_id,
+                            "instId": "BTC-USDT-SWAP",
+                            "tradeId": "trade-close",
+                            "side": "sell",
+                            "fillSz": "1",
+                            "fillPx": str(close_result.price),
+                            "fillMarkPx": str(close_result.price + 0.03),
+                        }
+                    ],
+                ),
                 "protection_execution": {
                     "lifecycle_complete": True,
                     "source_authority": "okx_algo_history_plus_fills_history",

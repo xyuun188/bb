@@ -377,3 +377,18 @@
 - 2026-07-24 最终本地验收：Ruff 全库通过，完整测试 `2744 passed, 4 skipped`。线上订单事实同步检查 455 条本地订单，`contract_size_deferred_count=0`、`stage_errors=[]`；唯一延期阶段为独立的 `protection_algo_history` 拉取预算，不再出现公开规格缺失误报。
 - 同一线上 8 小时交易契约验收为入口执行 `31/31`、退出执行 `12/12`、合同违规 `0`、废弃策略字段 `0`；20 个已平仓持仓的真实净 PnL 合计 `+0.34229212 USDT`。该结果证明交易执行事实合同已闭合，但不代表训练收益闭环已经完成。
 - 下一批硬任务是补齐权威执行成本和滑点结算：当前权威结果加载 376 条但 `complete_count=0`，训练治理明确报告缺少 `authoritative_execution_cost_distribution` 和 `authoritative_slippage_distribution`。在完整 OKX 成交、手续费、资金费和滑点进入 `authoritative_trade_outcome` 前，必须保持 `live_ml_ready=false`，不得用影子收益、execution result 或默认成本绕过晋升。
+
+## 27. 真实双边成交滑点与训练合同闭环
+
+- 训练滑点唯一口径改为入口和退出全部 OKX `fills-history` 成交行相对各自 `fillMarkPx` 的不利滑点总和，再除以入口权威名义金额；保护单配置触发价只保留为退出诊断，不再冒充整笔交易滑点。
+- 每个订单的滑点事实严格绑定当前版本、`ordId`、`instId`、方向、完整 `tradeId` 集、成交合约总数、公开合约规格、成交 VWAP 和实际名义金额。任一字段不完整时失败关闭，不生成训练标签。
+- 删除成交行 20 条截断，持久化全部成交行的精简官方字段投影。线上已有单笔 57 个成交 ID 的事实可以完整参与数量、费用和 VWAP 核对。
+- OKX 订单事实同步按 paper/live 分别使用 PostgreSQL advisory lock 保证单写者；拿不到锁立即延期。写事务对订单行加 `FOR UPDATE`，禁止两个同步轮次用旧 JSON 快照互相覆盖。
+- 删除“当前成交与旧事实相同就跳过”的错误短路。即使成交数量和价格没有变化，只要旧滑点事实缺失或版本过期，仍会从完整官方成交行重建。
+- 滑点恢复队列优先处理缺少当前滑点事实的订单，避免被普通 execution-result 订单长期挤占。已完成 16 个线上可恢复候选的定向查询。
+- `okx_execution_result` 只保留为运行态恢复线索，已从训练费用来源和训练合同白名单彻底删除；可训练费用只接受完整 `okx_fills_history` 或 `okx_order_detail`。
+- 缺少 `fillMarkPx` 时仍核对并保留真实 `fillSz`、`fillPx`、合约总数、成交 VWAP 和名义金额，只报告 `fill_row_mark_price_invalid`，不再附带虚假的合约数或 VWAP 不一致。
+- 新合同版本固定为 `okx-fill-mark-slippage.v2`、`authoritative-trade-outcome.v3`、`net-return-after-all-cost.v2`、`profit-loop-training.v2` 和 `separated-profit-supervision.v2`；旧格式不能与真实双边滑点样本混训或授权模型晋升。
+- 滑点合同升级在订单同步取得单写者锁后、访问 OKX 前执行：优先使用数据库中已验证的完整 `fills-history` 行批量重建当前版本，旧事实已确认官方缺标记价时保留终止恢复状态。线上升级后 `invalid_version_order_count=0`，版本切换期间完整样本最终稳定保持 `7` 条，不依赖慢速逐单私有 API 恢复。
+- 2026-07-24 线上恢复验收从 `381` 条权威结果、完整 `0` 条、可训练 `0` 条提升到完整 `7` 条、可训练 `7` 条，7 条均为 `loss_tolerant_paper_training`，且 `stage_errors=[]`。这证明规则交易产生的真实成交已经能闭合到亏损可学习样本，模型未晋升前交易与训练仍相互独立。
+- 剩余历史缺口不能通过清库或重训修复：入口旧 execution-result `233` 条、退出旧 execution-result `227` 条、退出权威订单事实缺失 `14` 条，以及官方 `fillMarkPx` 缺失的入口 `1` 条、退出 `2` 条。系统必须保留这些原始事实并隔离，不得补造滑点或默认成本。

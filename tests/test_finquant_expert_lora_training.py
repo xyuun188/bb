@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_VERSION
 from scripts import finquant_expert_lora_training as training
 
 
@@ -196,7 +197,7 @@ async def test_expert_memory_training_rejects_forged_non_authoritative_source(
 ) -> None:
     common_extra = {
         "authority_level": "okx_settlement_and_execution",
-        "outcome_version": "2026-07-19.authoritative-trade-outcome.v2",
+        "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         "outcome_id": "ato:1",
         "outcome_fingerprint": "fingerprint-1",
         "production_evidence_eligible": True,

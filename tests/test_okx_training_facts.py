@@ -6,6 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
+from services.okx_execution_slippage import (
+    OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+    build_okx_fill_mark_slippage,
+)
 from services.okx_training_facts import build_okx_history_training_sample
 from services.paper_exploration import build_paper_exploration_contract
 from services.paper_training import build_paper_training_contract
@@ -65,6 +69,35 @@ def _history(**overrides):
     return SimpleNamespace(**values)
 
 
+def _slippage_fact(
+    *,
+    order_id: str,
+    trade_id: str,
+    side: str,
+    average_price: float,
+    mark_price: float,
+) -> dict:
+    return build_okx_fill_mark_slippage(
+        order_id=order_id,
+        inst_id="BTC-USDT-SWAP",
+        side=side,
+        contracts=2.0,
+        average_price=average_price,
+        contract_size=0.01,
+        rows=[
+            {
+                "ordId": order_id,
+                "instId": "BTC-USDT-SWAP",
+                "tradeId": trade_id,
+                "side": side,
+                "fillSz": "2",
+                "fillPx": str(average_price),
+                "fillMarkPx": str(mark_price),
+            }
+        ],
+    )
+
+
 def _complete_lineage() -> dict:
     return {
         "positions_by_id": {
@@ -78,6 +111,7 @@ def _complete_lineage() -> dict:
             "entry-1": SimpleNamespace(
                 exchange_order_id="entry-1",
                 okx_inst_id="BTC-USDT-SWAP",
+                side="buy",
                 quantity=0.02,
                 price=100_000.0,
                 fee=0.4,
@@ -88,6 +122,7 @@ def _complete_lineage() -> dict:
                 okx_raw_fills={
                     "fills_history_confirmed": True,
                     "order_id": "entry-1",
+                    "trade_ids": ["trade-entry"],
                     "inst_id": "BTC-USDT-SWAP",
                     "contracts": 2.0,
                     "base_quantity": 0.02,
@@ -96,6 +131,13 @@ def _complete_lineage() -> dict:
                     "contract_size": 0.01,
                     "contract_size_verified": True,
                     "contract_size_source": "okx_public_instruments",
+                    "execution_slippage": _slippage_fact(
+                        order_id="entry-1",
+                        trade_id="trade-entry",
+                        side="buy",
+                        average_price=100_000.0,
+                        mark_price=99_980.0,
+                    ),
                     "protection_submission": {
                         "exchange_confirmation_recorded": True,
                         "source_authority": "local_submit_plus_okx_create_order_response",
@@ -106,6 +148,7 @@ def _complete_lineage() -> dict:
             "close-1": SimpleNamespace(
                 exchange_order_id="close-1",
                 okx_inst_id="BTC-USDT-SWAP",
+                side="sell",
                 quantity=0.02,
                 price=100_500.0,
                 fee=0.6,
@@ -116,6 +159,7 @@ def _complete_lineage() -> dict:
                 okx_raw_fills={
                     "fills_history_confirmed": True,
                     "order_id": "close-1",
+                    "trade_ids": ["trade-close"],
                     "inst_id": "BTC-USDT-SWAP",
                     "contracts": 2.0,
                     "base_quantity": 0.02,
@@ -124,6 +168,13 @@ def _complete_lineage() -> dict:
                     "contract_size": 0.01,
                     "contract_size_verified": True,
                     "contract_size_source": "okx_public_instruments",
+                    "execution_slippage": _slippage_fact(
+                        order_id="close-1",
+                        trade_id="trade-close",
+                        side="sell",
+                        average_price=100_500.0,
+                        mark_price=100_580.0,
+                    ),
                     "protection_execution": {
                         "lifecycle_complete": True,
                         "source_authority": "okx_algo_history_plus_fills_history",
@@ -155,6 +206,13 @@ def _set_close_fill_price(lineage: dict, price: float) -> None:
     order = lineage["orders_by_exchange_id"]["close-1"]
     order.price = price
     order.okx_raw_fills["avg_price"] = price
+    order.okx_raw_fills["execution_slippage"] = _slippage_fact(
+        order_id="close-1",
+        trade_id="trade-close",
+        side="sell",
+        average_price=price,
+        mark_price=price + 80.0,
+    )
 
 
 def _outcome(sample: dict) -> dict:
@@ -671,19 +729,20 @@ def test_position_fallback_payload_is_not_misreported_as_exact_entry_lineage() -
     assert "missing_exact_entry_order_decision_link" in sample["strategy_lineage_gaps"]
 
 
-def test_stop_slippage_uses_exchange_algo_trigger_not_local_planned_stop() -> None:
+def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> None:
     lineage = _complete_lineage()
     _set_close_fill_price(lineage, 97_000.0)
-    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills = {
-        "protection_submission": {
-            "source_authority": "local_submit_plus_okx_create_order_response",
-            "exchange_confirmation_recorded": True,
-            "exchange_confirmed_at": "2026-07-11T01:00:01+00:00",
-            "algo_ids": ["algo-stop-1"],
-        }
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills[
+        "protection_submission"
+    ] = {
+        "source_authority": "local_submit_plus_okx_create_order_response",
+        "exchange_confirmation_recorded": True,
+        "exchange_confirmed_at": "2026-07-11T01:00:01+00:00",
+        "algo_ids": ["algo-stop-1"],
     }
-    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills = {
-        "protection_execution": {
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills[
+        "protection_execution"
+    ] = {
             "source_authority": "okx_algo_history_plus_fills_history",
             "lifecycle_complete": True,
             "algo_id": "algo-stop-1",
@@ -706,7 +765,6 @@ def test_stop_slippage_uses_exchange_algo_trigger_not_local_planned_stop() -> No
             "trigger_orderbook_snapshot_available": False,
             "stop_loss_slippage_pct": (97_500.0 - 97_000.0) / 97_500.0 * 100.0,
             "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
-        }
     }
     lineage["decision_raw_by_order_id"]["entry-1"] = {
         "profit_risk_sizing": {
@@ -730,15 +788,12 @@ def test_stop_slippage_uses_exchange_algo_trigger_not_local_planned_stop() -> No
     sample = build_okx_history_training_sample(history, **lineage)
 
     assert sample["stop_loss_fill_confirmed"] is True
-    assert sample["slippage"] == pytest.approx(
+    assert sample["slippage"] == pytest.approx((0.4 + 1.6) / 2_000.0 * 100.0)
+    assert sample["slippage"] != pytest.approx(
         (97_500.0 - 97_000.0) / 97_500.0 * 100.0
     )
-    assert sample["slippage"] != pytest.approx(
-        (98_000.0 - 97_000.0) / 98_000.0 * 100.0
-    )
-    assert sample["slippage_source"] == (
-        "okx_configured_stop_trigger_to_fills_vwap"
-    )
+    assert sample["slippage_source"] == OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+    assert sample["execution_slippage_usdt"] == pytest.approx(2.0)
     assert sample["actual_trigger_market_price"] is None
     assert sample["protection_lifecycle_complete"] is True
     assert sample["trigger_to_first_fill_ms"] == pytest.approx(25.0)
@@ -746,7 +801,7 @@ def test_stop_slippage_uses_exchange_algo_trigger_not_local_planned_stop() -> No
     assert "actual_trigger_market_price_unavailable" in sample["protection_execution_gaps"]
 
 
-def test_missing_protection_execution_cannot_create_slippage_label() -> None:
+def test_protection_execution_is_not_required_for_round_trip_slippage() -> None:
     lineage = _complete_lineage()
     _set_close_fill_price(lineage, 97_000.0)
     lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop(
@@ -759,9 +814,69 @@ def test_missing_protection_execution_cannot_create_slippage_label() -> None:
     )
 
     assert sample["stop_loss_fill_confirmed"] is False
+    assert sample["slippage"] == pytest.approx(0.1)
+    assert sample["slippage_source"] == OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+    assert sample["profit_training_contract"]["eligible"] is True
+
+
+def test_missing_fill_mark_fact_cannot_create_slippage_label() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop(
+        "execution_slippage"
+    )
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
     assert sample["slippage"] is None
     assert sample["slippage_source"] == ""
+    assert sample["close_execution_slippage_complete"] is False
+    assert sample["execution_slippage_failures"] == {
+        "entry": {},
+        "close": {"close-1": ["stored_slippage:fact_missing:fills_history"]},
+    }
     assert sample["profit_training_contract"]["eligible"] is False
     assert "slippage_missing_or_invalid" in sample["profit_training_contract"][
         "blockers"
+    ]
+
+
+def test_legacy_fill_aliases_and_local_contract_count_cannot_authorize_training() -> None:
+    lineage = _complete_lineage()
+    entry = lineage["orders_by_exchange_id"]["entry-1"]
+    raw = entry.okx_raw_fills
+    raw["filled_base_quantity"] = raw.pop("base_quantity")
+    raw["average"] = raw.pop("avg_price")
+    raw["filled_contracts"] = raw.pop("contracts")
+    entry.okx_fill_contracts = 2.0
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert sample["entry_fee"] is None
+    assert sample["notional"] is None
+    assert sample["fill_contracts"] is None
+    assert "missing_authoritative_entry_fill_facts" in sample[
+        "training_evidence_gaps"
+    ]
+    assert sample["execution_slippage_failures"]["entry"] == {
+        "entry-1": ["authoritative_fill_fact_missing"]
+    }
+
+
+def test_execution_result_fill_fact_cannot_authorize_training() -> None:
+    lineage = _complete_lineage()
+    entry = lineage["orders_by_exchange_id"]["entry-1"]
+    entry.okx_raw_fills.update(
+        {
+            "fills_history_confirmed": False,
+            "execution_result_confirmed": True,
+            "source": "okx_execution_result",
+        }
+    )
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert sample["entry_fee"] is None
+    assert sample["notional"] is None
+    assert "missing_authoritative_entry_fill_facts" in sample[
+        "training_evidence_gaps"
     ]

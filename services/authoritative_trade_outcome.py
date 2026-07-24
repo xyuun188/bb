@@ -192,13 +192,11 @@ def _unavailable_attribution(reason: str) -> dict[str, Any]:
 
 
 def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
-    notional = _safe_float(sample.get("notional"), None)
     over_budget = _safe_float(sample.get("execution_actual_over_budget_loss_usdt"), None)
-    stop_slippage_pct = _safe_float(sample.get("slippage"), None)
-    stop_slippage_usdt = (
-        abs(notional) * abs(stop_slippage_pct) / 100.0
-        if notional is not None and notional > 0 and stop_slippage_pct is not None
-        else None
+    execution_slippage_pct = _safe_float(sample.get("slippage"), None)
+    execution_slippage_usdt = _safe_float(
+        sample.get("execution_slippage_usdt"),
+        None,
     )
     planned_stop = _safe_float(sample.get("planned_stop_loss_price"), None)
     entry_price = _safe_float(sample.get("entry_price"), None)
@@ -231,12 +229,21 @@ def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
             "planned_stop_distance_pct": planned_stop_distance_pct,
             "reason": "Stop distance is observed but is not assigned a fabricated causal PnL value.",
         },
-        "stop_execution_slippage": {
-            "status": "measured" if stop_slippage_usdt is not None else "unavailable",
-            "contribution_usdt": -stop_slippage_usdt if stop_slippage_usdt is not None else None,
-            "contribution_return_pct": -abs(stop_slippage_pct) if stop_slippage_pct is not None else None,
+        "execution_slippage": {
+            "status": "measured" if execution_slippage_usdt is not None else "unavailable",
+            "contribution_usdt": (
+                -execution_slippage_usdt
+                if execution_slippage_usdt is not None
+                else None
+            ),
+            "contribution_return_pct": (
+                -abs(execution_slippage_pct)
+                if execution_slippage_pct is not None
+                else None
+            ),
             "source": sample.get("slippage_source"),
-            "trigger_to_first_fill_ms": sample.get("trigger_to_first_fill_ms"),
+            "entry_slippage_usdt": sample.get("entry_execution_slippage_usdt"),
+            "close_slippage_usdt": sample.get("close_execution_slippage_usdt"),
         },
         "holding_duration_error": _unavailable_attribution(
             "A holding-duration contribution needs an authoritative path after alternative exits."
@@ -363,7 +370,7 @@ def build_authoritative_trade_outcome(
                 "objective": "maximize_expected_realized_net_return_after_cost",
                 "realized_net_pnl_usdt": sample.get("realized_pnl"),
                 PROFIT_TRAINING_TARGET: label_contract.get(PROFIT_TRAINING_TARGET),
-                "stop_execution_slippage_pct": sample.get("slippage"),
+                "execution_slippage_pct": sample.get("slippage"),
                 "actual_over_budget_loss_usdt": sample.get(
                     "execution_actual_over_budget_loss_usdt"
                 ),

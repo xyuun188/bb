@@ -16,7 +16,10 @@ from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
 from services.model_promotion_policy import build_return_objective_report
-from services.profit_training_contract import PROFIT_TRAINING_TARGET
+from services.profit_training_contract import (
+    PROFIT_TRAINING_CONTRACT_VERSION,
+    PROFIT_TRAINING_TARGET,
+)
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
     annotate_training_payload,
@@ -110,7 +113,7 @@ def _trade_sample(**overrides):
         "funding_fee": 0.0,
         "funding_fee_source": "okx_positions_history.fundingFee",
         "slippage": 0.01,
-        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "slippage_source": "okx_fills_history_fill_mark_round_trip",
         "net_return_after_all_cost_pct": 10.0,
         "pnl_source": "okx_position_history_realized_pnl",
         "settlement_source": "okx_position_history_settlement",
@@ -560,7 +563,7 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
                     "evidence_fingerprint": f"profit-contract-test-{index}",
                     "blockers": [],
                     "model_shadow_alignment": "no_model_shadow_prediction",
-                    "version": "2026-07-23.profit-loop-training.v1",
+                    "version": PROFIT_TRAINING_CONTRACT_VERSION,
                 },
             )
             for index, source in enumerate(

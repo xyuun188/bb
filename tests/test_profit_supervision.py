@@ -1,5 +1,6 @@
 import pytest
 
+from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
     COUNTERFACTUAL_EXECUTION_COST_TASK,
@@ -54,7 +55,7 @@ def _trade_sample() -> dict:
         "side": "long",
         "holding_minutes": 45.0,
         "slippage": 0.03,
-        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "slippage_source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
         "protection_execution_supervision_ready": True,
         "sample_weight": 1.0,
         "exclude_from_training": False,
@@ -203,7 +204,7 @@ def test_authoritative_return_rejects_old_net_return_label_without_contract() ->
     assert task["return_target"] == PROFIT_TRAINING_TARGET
 
 
-def test_confirmed_stop_fill_slippage_can_supervise_actual_execution_cost() -> None:
+def test_confirmed_round_trip_slippage_can_supervise_actual_execution_cost() -> None:
     trade = _trade_sample()
     trade["profit_learning_labels"]["slippage_return_pct"] = None
     trade["profit_supervision"] = build_profit_supervision_contract(
@@ -217,4 +218,4 @@ def test_confirmed_stop_fill_slippage_can_supervise_actual_execution_cost() -> N
 
     assert cost["eligible"] is True
     assert cost["slippage_pct"] == pytest.approx(0.03)
-    assert cost["slippage_source"] == "okx_configured_stop_trigger_to_fills_vwap"
+    assert cost["slippage_source"] == OKX_ROUND_TRIP_SLIPPAGE_SOURCE

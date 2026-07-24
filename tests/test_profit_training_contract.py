@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_training_contract import validate_profit_training_sample
 
 
@@ -20,7 +21,7 @@ def _closed_trade_sample(**overrides):
         "close_fee_source": "okx_fills_history",
         "funding_fee": 0.0,
         "slippage": 0.002,
-        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "slippage_source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
         "realized_pnl": -0.012,
         "net_return_after_all_cost_pct": -1.2,
         "holding_minutes": 30.0,
@@ -92,6 +93,15 @@ def test_profit_training_contract_rejects_missing_close_order() -> None:
     assert contract.eligible is False
     assert contract.reason == "close_order_id_missing"
     assert "close_order_id_missing" in contract.blockers
+
+
+def test_profit_training_contract_rejects_execution_result_fee_source() -> None:
+    contract = validate_profit_training_sample(
+        _closed_trade_sample(entry_fee_source="okx_execution_result")
+    )
+
+    assert contract.eligible is False
+    assert "entry_fee_source_not_authoritative" in contract.blockers
 
 
 def test_profit_training_contract_marks_model_supporting_losing_side() -> None:

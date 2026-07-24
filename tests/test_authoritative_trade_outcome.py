@@ -14,6 +14,7 @@ from services.authoritative_trade_outcome import (
     build_authoritative_trade_outcome,
     load_authoritative_trade_outcomes,
 )
+from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.training_data_quality import annotate_training_payload
 
 
@@ -55,7 +56,10 @@ def _sample(**overrides):
         "planned_stop_loss_price": 2.21,
         "stop_loss_fill_confirmed": True,
         "slippage": 3.393665,
-        "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "slippage_source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+        "entry_execution_slippage_usdt": 18.0,
+        "close_execution_slippage_usdt": 26.270858925,
+        "execution_slippage_usdt": 44.270858925,
         "trigger_to_first_fill_ms": 1060.0,
         "execution_actual_over_budget_loss_usdt": 14.0,
         "outcome": "loss",
@@ -125,8 +129,8 @@ def test_outcome_attribution_preserves_unknowns_and_measures_tail_execution() ->
     assert attribution["direction_error"]["contribution_usdt"] is None
     assert attribution["unknown_components_are_zero"] is False
     assert attribution["position_size_excess"]["contribution_usdt"] == -14.0
-    assert attribution["stop_execution_slippage"]["contribution_usdt"] == pytest.approx(
-        -1304.5 * 3.393665 / 100.0
+    assert attribution["execution_slippage"]["contribution_usdt"] == pytest.approx(
+        -44.270858925
     )
 
 

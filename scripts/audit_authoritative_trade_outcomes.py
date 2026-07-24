@@ -19,10 +19,12 @@ from core.remote_ssh import connect_remote_ssh, run_remote_text
 from core.safe_output import safe_print
 from db.session import get_read_session_ctx
 from models.learning import ExpertMemory
+from models.trade import Order
 from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     load_authoritative_trade_outcomes,
 )
+from services.okx_execution_slippage import OKX_FILL_MARK_SLIPPAGE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
 
@@ -143,6 +145,138 @@ def _gap_summary(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _compact_gap_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "gap_counts": dict(summary.get("gap_counts") or {}),
+        "recovery_class_counts": dict(
+            summary.get("recovery_class_counts") or {}
+        ),
+    }
+
+
+def _slippage_integrity_summary(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+    incomplete = [
+        outcome
+        for outcome in outcomes
+        if "missing_authoritative_slippage"
+        in set(outcome.get("outcome_evidence_gaps") or [])
+    ]
+    failed_orders: set[tuple[str, str]] = set()
+    failed_order_reasons: set[tuple[str, str, str]] = set()
+    reason_counts: Counter[str] = Counter()
+    samples: list[dict[str, Any]] = []
+    sampled_reason_keys: set[str] = set()
+    for outcome in incomplete:
+        failures = outcome.get("execution_slippage_failures") or {}
+        normalized_failures: dict[str, dict[str, list[str]]] = {}
+        for side in ("entry", "close"):
+            side_failures = failures.get(side) or {}
+            normalized_side: dict[str, list[str]] = {}
+            for order_id, values in side_failures.items():
+                reasons = [str(value) for value in values or [] if str(value)]
+                normalized_side[str(order_id)] = reasons
+                failed_orders.add((side, str(order_id)))
+                for reason in reasons:
+                    key = (side, str(order_id), reason)
+                    if key in failed_order_reasons:
+                        continue
+                    failed_order_reasons.add(key)
+                    reason_counts[f"{side}:{reason}"] += 1
+            normalized_failures[side] = normalized_side
+        sample_reason_keys = {
+            f"{side}:{reason}"
+            for side, side_failures in normalized_failures.items()
+            for reasons in side_failures.values()
+            for reason in reasons
+        }
+        if not sample_reason_keys:
+            sample_reason_keys = {"position_history_order_ids_missing"}
+        if len(samples) < 12 and not sample_reason_keys <= sampled_reason_keys:
+            sampled_reason_keys.update(sample_reason_keys)
+            samples.append(
+                {
+                    "outcome_id": outcome.get("outcome_id"),
+                    "position_ids": sorted(_position_ids(outcome)),
+                    "entry_order_ids": list(outcome.get("entry_order_ids") or []),
+                    "close_order_ids": list(outcome.get("close_order_ids") or []),
+                    "entry_complete": (
+                        outcome.get("entry_execution_slippage_complete") is True
+                    ),
+                    "close_complete": (
+                        outcome.get("close_execution_slippage_complete") is True
+                    ),
+                    "failures": normalized_failures,
+                }
+            )
+    return {
+        "missing_outcome_count": len(incomplete),
+        "entry_incomplete_outcome_count": sum(
+            outcome.get("entry_execution_slippage_complete") is not True
+            for outcome in incomplete
+        ),
+        "close_incomplete_outcome_count": sum(
+            outcome.get("close_execution_slippage_complete") is not True
+            for outcome in incomplete
+        ),
+        "unique_failed_order_count": len(failed_orders),
+        "failed_order_reason_counts": dict(reason_counts.most_common()),
+        "samples": samples,
+    }
+
+
+def _slippage_storage_summary(orders: list[Any]) -> dict[str, Any]:
+    invalid_rows: list[dict[str, Any]] = []
+    classification_counts: Counter[str] = Counter()
+    for order in orders:
+        raw = getattr(order, "okx_raw_fills", None)
+        raw = raw if isinstance(raw, dict) else {}
+        slippage = raw.get("execution_slippage")
+        slippage = slippage if isinstance(slippage, dict) else {}
+        if not slippage or slippage.get("version") == OKX_FILL_MARK_SLIPPAGE_VERSION:
+            continue
+        if raw.get("fills_history_confirmed") is True:
+            origin = "fills_history"
+        elif raw.get("order_detail_confirmed") is True:
+            origin = "order_detail"
+        elif raw.get("execution_result_confirmed") is True:
+            origin = "execution_result"
+        else:
+            origin = "unconfirmed"
+        rows = raw.get("rows")
+        rows_available = isinstance(rows, list) and bool(rows)
+        public_contract_size = bool(
+            raw.get("contract_size_verified") is True
+            and str(raw.get("contract_size_source") or "").strip()
+            == "okx_public_instruments"
+        )
+        classification = ":".join(
+            (
+                origin,
+                "rows_available" if rows_available else "rows_missing",
+                "public_spec" if public_contract_size else "public_spec_missing",
+            )
+        )
+        classification_counts[classification] += 1
+        if len(invalid_rows) < 12:
+            invalid_rows.append(
+                {
+                    "order_id": str(getattr(order, "exchange_order_id", "") or ""),
+                    "origin": origin,
+                    "rows_available": rows_available,
+                    "row_count": len(rows) if isinstance(rows, list) else 0,
+                    "public_contract_size": public_contract_size,
+                    "stored_version": slippage.get("version"),
+                    "stored_complete": slippage.get("complete"),
+                }
+            )
+    return {
+        "required_version": OKX_FILL_MARK_SLIPPAGE_VERSION,
+        "invalid_version_order_count": sum(classification_counts.values()),
+        "classification_counts": dict(classification_counts.most_common()),
+        "samples": invalid_rows,
+    }
+
+
 async def audit(
     *,
     mode: str,
@@ -150,6 +284,14 @@ async def audit(
     summary_only: bool = False,
 ) -> dict[str, Any]:
     outcomes = await load_authoritative_trade_outcomes(mode=mode)
+    async with get_read_session_ctx() as session:
+        order_rows = list(
+            (
+                await session.execute(
+                    select(Order).where(Order.execution_mode == mode)
+                )
+            ).scalars().all()
+        )
     annotated = annotate_training_payload(
         shadow_samples=[],
         trade_samples=outcomes,
@@ -212,6 +354,10 @@ async def audit(
     if position_id is not None and not selected:
         violations.append("requested_position_outcome_missing")
     gap_summary = _gap_summary(outcomes)
+    slippage_integrity = _slippage_integrity_summary(outcomes)
+    slippage_integrity["storage"] = _slippage_storage_summary(order_rows)
+    if summary_only:
+        gap_summary = _compact_gap_summary(gap_summary)
     return {
         "status": "ok" if not violations else "blocked",
         "mode": mode,
@@ -251,6 +397,7 @@ async def audit(
             ),
         },
         "evidence_gap_summary": gap_summary,
+        "slippage_integrity": slippage_integrity,
         "violations": violations,
         "manifest": {
             key: value for key, value in manifest.items() if key != "records"

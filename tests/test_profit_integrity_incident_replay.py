@@ -28,8 +28,9 @@ def test_incident_replay_fails_old_profit_evidence_at_current_boundaries() -> No
     assert "lower_quantile_above_raw_expected" in icp["after"]["distribution_blockers"]
     assert icp["after"]["production_contribution"] == 0.0
     assert icp["after"]["authoritative_return_after_all_cost_pct"] < 0.0
-    assert icp["after"]["stop_execution_slippage"]["status"] == "measured"
-    assert icp["after"]["stop_execution_slippage"]["contribution_usdt"] < 0.0
+    assert icp["after"]["outcome_complete"] is False
+    assert icp["after"]["execution_slippage"]["status"] == "unavailable"
+    assert icp["after"]["execution_slippage"]["contribution_usdt"] is None
 
     doge = report["incidents"]["DOGE"]
     assert doge["before"]["return_uncertainty_pct"] == 0.0

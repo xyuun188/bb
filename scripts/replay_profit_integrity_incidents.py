@@ -156,7 +156,6 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
     stop_price = float(position["stop_loss_price"])
     quantity = float(position["quantity"])
     notional = abs(entry_price * quantity)
-    stop_slippage_pct = abs(exit_price - stop_price) / stop_price * 100.0
     authoritative = build_authoritative_trade_outcome(
         {
             "source": "okx_position_history",
@@ -177,12 +176,12 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
             "funding_fee": float(position.get("funding_fee") or 0.0),
             "planned_stop_loss_price": stop_price,
             "stop_loss_fill_confirmed": True,
-            "slippage": stop_slippage_pct,
-            "slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+            "slippage": None,
+            "slippage_source": "",
             PROFIT_TRAINING_TARGET: (
                 float(position["realized_pnl"]) / notional * 100.0
             ),
-            "training_evidence_gaps": [],
+            "training_evidence_gaps": ["missing_authoritative_slippage"],
         },
         reflection=SimpleNamespace(
             id=reflection["id"],
@@ -194,7 +193,7 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
             created_at=None,
         ),
     )
-    slippage = authoritative["attribution"]["stop_execution_slippage"]
+    slippage = authoritative["attribution"]["execution_slippage"]
     return {
         "symbol": "ICP/USDT",
         "decision_id": 79318,
@@ -211,7 +210,7 @@ def _icp_replay(baseline: dict[str, Any]) -> dict[str, Any]:
                 PROFIT_TRAINING_TARGET
             ],
             "outcome_complete": authoritative["outcome_complete"],
-            "stop_execution_slippage": slippage,
+            "execution_slippage": slippage,
         },
     }
 
@@ -283,7 +282,9 @@ def build_replay_report() -> dict[str, Any]:
         "passed"
         if incidents["ROBO"]["all_invalid_entries_quarantined"]
         and incidents["ICP"]["after"]["production_contribution"] == 0.0
-        and incidents["ICP"]["after"]["stop_execution_slippage"]["status"] == "measured"
+        and incidents["ICP"]["after"]["outcome_complete"] is False
+        and incidents["ICP"]["after"]["execution_slippage"]["status"]
+        == "unavailable"
         and incidents["DOGE"]["after"]["uncertainty_penalty_pct"] > 0.0
         else "blocked"
     )

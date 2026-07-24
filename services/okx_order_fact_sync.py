@@ -16,8 +16,9 @@ from math import isclose
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select, text
 
+from config.settings import settings
 from core.safe_output import safe_error_text
 from core.symbols import (
     normalize_trading_symbol,
@@ -29,6 +30,10 @@ from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
 from models.trade import Order
+from services.okx_execution_slippage import (
+    OKX_FILL_MARK_SLIPPAGE_VERSION,
+    build_okx_fill_mark_slippage,
+)
 from services.okx_native_facts import (
     OkxNativeFactsClient,
     OkxNativeFillGroup,
@@ -59,6 +64,24 @@ OKX_SYNC_EXECUTION_RESULT_CONFIRMED = "okx_execution_result_confirmed"
 OKX_SYNC_ORDER_DETAIL_CONFIRMED = "okx_order_detail_confirmed"
 OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING = "okx_native_full_close_pending_backfill"
 NATIVE_FULL_CLOSE_BACKFILL_WINDOW_SECONDS = 20 * 60
+ORDER_FACT_SYNC_ADVISORY_LOCK_BASE = 0x42424F5244455200
+AUTHORITATIVE_FILL_ROW_FIELDS = (
+    "ordId",
+    "instId",
+    "tradeId",
+    "billId",
+    "clOrdId",
+    "side",
+    "posSide",
+    "fillSz",
+    "fillPx",
+    "fillMarkPx",
+    "fee",
+    "feeCcy",
+    "fillPnl",
+    "ts",
+    "fillTime",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +148,29 @@ def _build_contract_size_catalog(
     }
 
 
+def _authoritative_fill_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {field: row.get(field) for field in AUTHORITATIVE_FILL_ROW_FIELDS}
+
+
+def _authoritative_pull_slippage_fact(
+    *,
+    fill: OkxNativeFillGroup,
+    contract_size: float,
+) -> dict[str, Any]:
+    fact = build_okx_fill_mark_slippage(
+        order_id=fill.order_id,
+        inst_id=fill.inst_id,
+        side=fill.side,
+        contracts=fill.contracts,
+        average_price=fill.avg_price,
+        contract_size=contract_size,
+        rows=fill.rows,
+    )
+    fact["recovery_terminal"] = fact.get("complete") is not True
+    fact["recovery_source"] = "okx_fills_history_current_pull"
+    return fact
+
+
 class OkxOrderFactSyncService:
     """Synchronize local orders from OKX native fill facts."""
 
@@ -148,9 +194,51 @@ class OkxOrderFactSyncService:
         )
 
     async def sync(self) -> dict[str, Any]:
+        if not str(settings.database_url or "").startswith("postgresql"):
+            return await self._sync_single_writer()
+
+        lock_key = ORDER_FACT_SYNC_ADVISORY_LOCK_BASE + (1 if self.mode == "live" else 0)
+        async with get_session_ctx() as lock_session:
+            acquired = bool(
+                (
+                    await lock_session.execute(
+                        text("SELECT pg_try_advisory_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
+                ).scalar()
+            )
+            if not acquired:
+                return OkxOrderFactSyncSummary(
+                    status="deferred",
+                    mode=self.mode,
+                    source="okx_native_orders_and_fills",
+                    phase3_order_sync_start=self.phase3_order_sync_start,
+                    checked_at=datetime.now(UTC),
+                    okx_pull_available=True,
+                    deferred_stages=("single_writer_lock",),
+                    samples=(
+                        {
+                            "kind": "order_fact_sync_writer_busy",
+                            "mode": self.mode,
+                        },
+                    ),
+                ).as_dict()
+            try:
+                return await self._sync_single_writer()
+            finally:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": lock_key},
+                )
+
+    async def _sync_single_writer(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         since = self._effective_since(started_at)
         since_naive = _db_naive_since(since)
+        (
+            stored_slippage_refresh_count,
+            stored_slippage_refresh_samples,
+        ) = await self._refresh_stored_slippage_from_rows()
         local_orders = await self._load_local_orders(since_naive)
         external_refresh_orders = [
             order for order in local_orders if _order_needs_okx_pull(order)
@@ -180,6 +268,8 @@ class OkxOrderFactSyncService:
         executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
         deadline = asyncio.get_running_loop().time() + self.timeout_seconds
         completed_stages: list[str] = []
+        if stored_slippage_refresh_count:
+            completed_stages.append("stored_slippage_contract_upgrade")
         deferred_stages: list[str] = []
         stage_errors: list[str] = []
         initialized = False
@@ -253,6 +343,8 @@ class OkxOrderFactSyncService:
                     deferred_stages=deferred_stages,
                     stage_errors=stage_errors,
                     pull_error=pull_error,
+                    initial_confirmed_count=stored_slippage_refresh_count,
+                    initial_samples=stored_slippage_refresh_samples,
                 )
 
             okx_pull_available = True
@@ -442,10 +534,10 @@ class OkxOrderFactSyncService:
                 decisions_by_id = {
                     int(decision.id): decision for decision in decision_rows.scalars().all()
                 }
-            confirmed_count = 0
+            confirmed_count = stored_slippage_refresh_count
             unverified_count = 0
             skipped_old_count = 0
-            samples: list[dict[str, Any]] = []
+            samples: list[dict[str, Any]] = list(stored_slippage_refresh_samples)
             contract_sizes = _build_contract_size_catalog(
                 public_sizes=contract_sizes,
             )
@@ -454,11 +546,11 @@ class OkxOrderFactSyncService:
             contract_size_deferred_count = 0
             if okx_pull_available:
                 (
-                    confirmed_count,
+                    local_confirmed_count,
                     unverified_count,
                     skipped_old_count,
                     local_contract_size_deferred_count,
-                    samples,
+                    local_samples,
                 ) = self._apply_local_order_facts(
                     writable_orders,
                     fills=fills,
@@ -484,6 +576,8 @@ class OkxOrderFactSyncService:
                         }
                     ),
                 )
+                confirmed_count += local_confirmed_count
+                samples.extend(local_samples)
                 (
                     backfilled_count,
                     order_history_backfilled_count,
@@ -506,7 +600,7 @@ class OkxOrderFactSyncService:
                 if contract_size_deferred_count:
                     deferred_stages.append("order_facts_missing_public_contract_size")
             else:
-                confirmed_count = self._recover_local_stored_order_facts(
+                confirmed_count += self._recover_local_stored_order_facts(
                     stored_repair_orders,
                     decisions_by_id=decisions_by_id,
                     now=datetime.now(UTC),
@@ -556,6 +650,8 @@ class OkxOrderFactSyncService:
         deferred_stages: list[str],
         stage_errors: list[str],
         pull_error: str,
+        initial_confirmed_count: int,
+        initial_samples: list[dict[str, Any]],
     ) -> dict[str, Any]:
         async with get_session_ctx() as session:
             writable_orders = await self._load_writable_refresh_orders(
@@ -581,12 +677,15 @@ class OkxOrderFactSyncService:
                 decisions_by_id = {
                     int(decision.id): decision for decision in rows.scalars().all()
                 }
-            samples: list[dict[str, Any]] = []
-            confirmed_count = self._recover_local_stored_order_facts(
-                stored_repair_orders,
-                decisions_by_id=decisions_by_id,
-                now=datetime.now(UTC),
-                samples=samples,
+            samples: list[dict[str, Any]] = list(initial_samples)
+            confirmed_count = (
+                initial_confirmed_count
+                + self._recover_local_stored_order_facts(
+                    stored_repair_orders,
+                    decisions_by_id=decisions_by_id,
+                    now=datetime.now(UTC),
+                    samples=samples,
+                )
             )
             if confirmed_count:
                 await session.flush()
@@ -605,6 +704,25 @@ class OkxOrderFactSyncService:
             error=pull_error,
             samples=tuple(samples[:8]),
         ).as_dict()
+
+    async def _refresh_stored_slippage_from_rows(
+        self,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        async with get_session_ctx() as session:
+            orders = await self._load_stored_slippage_refresh_orders(session)
+            samples: list[dict[str, Any]] = []
+            refreshed_count = 0
+            now = datetime.now(UTC)
+            for order in orders:
+                if not _rebuild_stored_slippage_fact(order, now=now):
+                    continue
+                refreshed_count += 1
+                samples.append(
+                    _sample(order, kind="stored_slippage_contract_upgraded")
+                )
+            if refreshed_count:
+                await session.flush()
+        return refreshed_count, samples
 
     def _effective_since(self, now: datetime) -> datetime:
         """Return the Phase 3 clean-order boundary.
@@ -630,7 +748,50 @@ class OkxOrderFactSyncService:
                 .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
                 .limit(self.limit)
             )
-            return list(rows.scalars().all())
+            recent = list(rows.scalars().all())
+            stored_slippage_refresh = await self._load_stored_slippage_refresh_orders(
+                session
+            )
+            return _merge_local_order_rows(recent, stored_slippage_refresh)
+
+    async def _load_stored_slippage_refresh_orders(
+        self,
+        session: Any,
+    ) -> list[Order]:
+        slippage_version = Order.okx_raw_fills["execution_slippage"][
+            "version"
+        ].as_string()
+        slippage_complete = Order.okx_raw_fills["execution_slippage"][
+            "complete"
+        ].as_boolean()
+        slippage_recovery_terminal = Order.okx_raw_fills["execution_slippage"][
+            "recovery_terminal"
+        ].as_boolean()
+        rows = await session.execute(
+            select(Order)
+            .where(
+                Order.execution_mode == self.mode,
+                Order.okx_raw_fills["fills_history_confirmed"]
+                .as_boolean()
+                .is_(True),
+                or_(
+                    slippage_version.is_(None),
+                    slippage_version != OKX_FILL_MARK_SLIPPAGE_VERSION,
+                    and_(
+                        slippage_complete.is_not(True),
+                        slippage_recovery_terminal.is_not(True),
+                    ),
+                ),
+            )
+            .order_by(Order.id.desc())
+            .limit(max(self.limit * 4, self.limit))
+            .with_for_update()
+        )
+        return [
+            order
+            for order in rows.scalars().all()
+            if _order_has_authoritative_stored_okx_fill_fact(order)
+        ][: self.limit]
 
     async def _load_writable_refresh_orders(
         self,
@@ -652,21 +813,30 @@ class OkxOrderFactSyncService:
             )
             .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
             .limit(self.limit)
+            .with_for_update()
         )
         recent = list(rows.scalars().all())
+        stored_slippage_refresh = await self._load_stored_slippage_refresh_orders(
+            session
+        )
         matched_fills: list[Order] = []
         if fill_order_ids:
             matched_fill_rows = await session.execute(
                 select(Order).where(
                     Order.execution_mode == self.mode,
                     Order.exchange_order_id.in_(sorted(fill_order_ids)),
-                )
+                ).with_for_update()
             )
             matched_fills = list(matched_fill_rows.scalars().all())
         return [
             order
-            for order in _merge_local_order_rows(recent, matched_fills)
+            for order in _merge_local_order_rows(
+                recent,
+                matched_fills,
+                stored_slippage_refresh,
+            )
             if _order_needs_okx_fact_refresh(order)
+            or _stored_slippage_fact_needs_refresh(order)
             or bool(
                 _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
                 & fill_order_ids
@@ -695,6 +865,18 @@ class OkxOrderFactSyncService:
         for order in orders:
             order_time = _order_time(order)
             if order_time is not None and order_time < since:
+                if _stored_slippage_fact_needs_refresh(
+                    order
+                ) and _repair_stored_fill_contract_size_from_instruments(
+                    order,
+                    contract_sizes=contract_sizes,
+                    now=now,
+                ):
+                    confirmed_count += 1
+                    samples.append(
+                        _sample(order, kind="stored_fill_slippage_fact_refreshed")
+                    )
+                    continue
                 skipped_old_count += 1
                 continue
             exchange_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
@@ -892,6 +1074,23 @@ class OkxOrderFactSyncService:
                 contract_size=contract_size,
                 contract_size_source=contract_size_source,
             ):
+                if _stored_slippage_fact_needs_refresh(order):
+                    self._apply_fill_to_order(
+                        order,
+                        fill,
+                        now=now,
+                        sync_status=OKX_SYNC_CONFIRMED,
+                        contract_size=contract_size,
+                        contract_size_source=contract_size_source,
+                        order_row=order_row,
+                        protection_execution=protection_execution_by_order_id.get(
+                            fill.order_id
+                        ),
+                    )
+                    confirmed_count += 1
+                    samples.append(
+                        _sample(order, kind="local_order_slippage_fact_refreshed")
+                    )
                 continue
             self._apply_fill_to_order(
                 order,
@@ -1119,8 +1318,12 @@ class OkxOrderFactSyncService:
             "fee_abs": fill.fee_abs,
             "fill_pnl": fill.fill_pnl,
             "timestamp": fill.timestamp.isoformat() if fill.timestamp else None,
-            "rows": list(fill.rows[:20]),
+            "rows": [_authoritative_fill_row(row) for row in fill.rows],
             "order_rows": [dict(order_row)] if isinstance(order_row, dict) and order_row else [],
+            "execution_slippage": _authoritative_pull_slippage_fact(
+                fill=fill,
+                contract_size=contract_size,
+            ),
         }
         protection_submission = existing_raw.get("protection_submission")
         if isinstance(protection_submission, dict) and protection_submission:
@@ -1485,13 +1688,13 @@ def _repair_stored_fill_contract_size_from_instruments(
     if not _order_has_authoritative_stored_okx_fill_fact(order):
         return False
     raw = dict(getattr(order, "okx_raw_fills", None) or {})
-    inst_id = str(raw.get("inst_id") or _order_inst_id(order)).strip().upper()
+    inst_id = str(raw.get("inst_id") or "").strip().upper()
     if not inst_id:
         return False
     contract_size = _safe_float(contract_sizes.get(inst_id), 0.0)
     if contract_size <= 0:
         return False
-    contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
+    contracts = _safe_float(raw.get("contracts"), 0.0)
     if contracts <= 0:
         return False
     base_quantity = contracts * contract_size
@@ -1508,8 +1711,35 @@ def _repair_stored_fill_contract_size_from_instruments(
         and _relative_close_enough(local_quantity, base_quantity, 0.000001)
     )
     contract_size_source = "okx_public_instruments"
+    stored_rows = raw.get("rows")
+    execution_slippage = (
+        build_okx_fill_mark_slippage(
+            order_id=raw.get("order_id"),
+            inst_id=raw.get("inst_id"),
+            side=getattr(order, "side", None),
+            contracts=contracts,
+            average_price=raw.get("avg_price"),
+            contract_size=contract_size,
+            rows=stored_rows,
+        )
+        if _stored_slippage_fact_needs_refresh(order)
+        and isinstance(stored_rows, list)
+        and stored_rows
+        else None
+    )
+    if execution_slippage is not None:
+        execution_slippage["recovery_terminal"] = False
+        execution_slippage["recovery_source"] = "stored_okx_fill_rows"
+    execution_slippage_changed = bool(
+        execution_slippage is not None
+        and raw.get("execution_slippage") != execution_slippage
+    )
     if already_verified:
-        if str(raw.get("contract_size_source") or "").strip() != contract_size_source:
+        if (
+            str(raw.get("contract_size_source") or "").strip()
+            != contract_size_source
+            or execution_slippage_changed
+        ):
             order.okx_inst_id = inst_id
             order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
             order.okx_synced_at = now
@@ -1517,6 +1747,8 @@ def _repair_stored_fill_contract_size_from_instruments(
             raw["contract_size_source"] = contract_size_source
             raw["contract_size_verified"] = True
             raw["fills_history_confirmed"] = True
+            if execution_slippage is not None:
+                raw["execution_slippage"] = execution_slippage
             order.okx_raw_fills = raw
             return True
         return False
@@ -1540,6 +1772,8 @@ def _repair_stored_fill_contract_size_from_instruments(
     raw["contract_size_source"] = contract_size_source
     raw["base_quantity"] = base_quantity
     raw["fills_history_confirmed"] = True
+    if execution_slippage is not None:
+        raw["execution_slippage"] = execution_slippage
     order.okx_raw_fills = raw
     return True
 
@@ -1786,6 +2020,8 @@ def _order_needs_okx_pull(order: Order) -> bool:
         return False
     if _order_has_protection_fill_hint_without_execution(order):
         return True
+    if _stored_slippage_fact_needs_refresh(order):
+        return True
     if _order_has_authoritative_stored_okx_fill_fact(order):
         return False
     if _order_has_okx_order_detail_fact(order):
@@ -1862,15 +2098,7 @@ def authoritative_order_fee_fact_source(
         and _order_fill_fact_matches_local(order, raw)
     ):
         return "okx_order_detail"
-    if (
-        not _order_has_okx_execution_result_fact(order)
-        or raw.get("contract_size_verified") is not True
-        or str(raw.get("contract_size_source") or "").strip()
-        != "okx_public_instruments"
-        or not _order_fill_fact_matches_local(order, raw)
-    ):
-        return None
-    return "okx_execution_result"
+    return None
 
 
 def _order_fill_fact_matches_local(order: Order, raw: dict[str, Any]) -> bool:
@@ -1922,12 +2150,76 @@ def _order_has_authoritative_stored_okx_fill_fact(order: Order) -> bool:
     raw_order_id = str(raw.get("order_id") or "").strip()
     if not order_id or not raw_order_id or order_id != raw_order_id:
         return False
-    if not str(getattr(order, "okx_inst_id", "") or raw.get("inst_id") or "").strip():
+    raw_inst_id = str(raw.get("inst_id") or "").strip().upper()
+    order_inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+    if not raw_inst_id or (order_inst_id and order_inst_id != raw_inst_id):
         return False
-    if _safe_float(getattr(order, "okx_fill_contracts", None) or raw.get("contracts"), 0.0) <= 0:
+    if not _trade_id_set(raw.get("trade_ids")):
         return False
-    if _safe_float(raw.get("avg_price") or raw.get("average") or getattr(order, "price", None), 0.0) <= 0:
+    if _safe_float(raw.get("contracts"), 0.0) <= 0:
         return False
+    if _safe_float(raw.get("avg_price"), 0.0) <= 0:
+        return False
+    return True
+
+
+def _stored_slippage_fact_needs_refresh(order: Order) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    execution_slippage = raw.get("execution_slippage")
+    execution_slippage = (
+        execution_slippage if isinstance(execution_slippage, dict) else {}
+    )
+    return bool(
+        raw.get("fills_history_confirmed") is True
+        and (
+            execution_slippage.get("version") != OKX_FILL_MARK_SLIPPAGE_VERSION
+            or (
+                execution_slippage.get("complete") is not True
+                and execution_slippage.get("recovery_terminal") is not True
+            )
+        )
+    )
+
+
+def _rebuild_stored_slippage_fact(order: Order, *, now: datetime) -> bool:
+    if (
+        not _stored_slippage_fact_needs_refresh(order)
+        or not _order_has_authoritative_stored_okx_fill_fact(order)
+    ):
+        return False
+    raw = dict(getattr(order, "okx_raw_fills", None) or {})
+    if (
+        raw.get("contract_size_verified") is not True
+        or str(raw.get("contract_size_source") or "").strip()
+        != "okx_public_instruments"
+    ):
+        return False
+    rows = raw.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return False
+    previous = raw.get("execution_slippage")
+    previous = previous if isinstance(previous, dict) else {}
+    fact = build_okx_fill_mark_slippage(
+        order_id=raw.get("order_id"),
+        inst_id=raw.get("inst_id"),
+        side=getattr(order, "side", None),
+        contracts=raw.get("contracts"),
+        average_price=raw.get("avg_price"),
+        contract_size=raw.get("contract_size"),
+        rows=rows,
+    )
+    fact["recovery_terminal"] = bool(
+        fact.get("complete") is not True
+        and previous.get("recovery_terminal") is True
+    )
+    fact["recovery_source"] = "stored_okx_fill_rows_contract_upgrade"
+    if fact == previous:
+        return False
+    raw["execution_slippage"] = fact
+    order.okx_raw_fills = raw
+    order.okx_synced_at = now
+    order.okx_last_error = None
     return True
 
 
@@ -2296,6 +2588,7 @@ def _clear_unconfirmed_fill_fact(order: Order) -> None:
         "fee_abs",
         "fill_pnl",
         "rows",
+        "execution_slippage",
     ):
         raw.pop(key, None)
     raw["fills_history_confirmed"] = False
@@ -2444,7 +2737,10 @@ def _prioritized_exchange_order_ids(orders: Iterable[Order], *, limit: int) -> l
     seen: set[str] = set()
     ordered = sorted(
         list(orders or []),
-        key=lambda order: _order_time(order) or datetime.min.replace(tzinfo=UTC),
+        key=lambda order: (
+            _stored_slippage_fact_needs_refresh(order),
+            _order_time(order) or datetime.min.replace(tzinfo=UTC),
+        ),
         reverse=True,
     )
     for order in ordered:

@@ -12,7 +12,9 @@ from dataclasses import asdict, dataclass
 from math import isclose, isfinite
 from typing import Any, Literal
 
-PROFIT_TRAINING_CONTRACT_VERSION = "2026-07-23.profit-loop-training.v1"
+from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+
+PROFIT_TRAINING_CONTRACT_VERSION = "2026-07-24.profit-loop-training.v2"
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 
 DecisionAuthority = Literal["rules", "model", "manual", "system"]
@@ -169,7 +171,6 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
     allowed_fee_sources = {
         "okx_fills_history",
         "okx_order_detail",
-        "okx_execution_result",
     }
     for field in ("entry_fee_source", "close_fee_source"):
         sources = {
@@ -190,7 +191,7 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
     ):
         blockers.append("funding_fee_source_not_authoritative")
     slippage_source = _text(sample.get("slippage_source"))
-    if slippage_source != "okx_configured_stop_trigger_to_fills_vwap":
+    if slippage_source != OKX_ROUND_TRIP_SLIPPAGE_SOURCE:
         blockers.append("slippage_source_not_authoritative")
 
     entry_fee = _safe_float(sample.get("entry_fee"))

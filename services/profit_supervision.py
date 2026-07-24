@@ -22,9 +22,10 @@ from core.training_contracts import (
     SHADOW_FEE_AFTER_LABEL_VERSION,
 )
 from services.execution_cost_model import execution_cost_estimate
+from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
-PROFIT_SUPERVISION_VERSION = "2026-07-14.separated-profit-supervision.v1"
+PROFIT_SUPERVISION_VERSION = "2026-07-24.separated-profit-supervision.v2"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 COUNTERFACTUAL_EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
@@ -210,7 +211,7 @@ def _trade_cost_labels(
         fee is not None
         and slippage is not None
         and funding is not None
-        and slippage_source == "okx_configured_stop_trigger_to_fills_vwap"
+        and slippage_source == OKX_ROUND_TRIP_SLIPPAGE_SOURCE
     )
     # Positive funding is income and therefore reduces realized execution cost.
     total_cost = fee + slippage - funding if eligible else None

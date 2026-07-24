@@ -7,6 +7,11 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from services.okx_execution_slippage import (
+    OKX_FILL_MARK_SLIPPAGE_SOURCE,
+    OKX_FILL_MARK_SLIPPAGE_VERSION,
+    OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+)
 from services.okx_order_fact_sync import authoritative_order_fee_fact_source
 from services.paper_exploration import paper_exploration_contract_reasons
 from services.paper_training import paper_training_contract_reasons
@@ -76,31 +81,64 @@ def _order_trade_ids(orders: Iterable[Any]) -> list[str]:
     )
 
 
-def _entry_fill_contracts(entry_orders: Iterable[Any]) -> float | None:
-    values = [
-        _safe_float(_value(order, "okx_fill_contracts"), None) for order in entry_orders
-    ]
-    valid = [value for value in values if value is not None and value > 0]
-    return sum(valid) if valid else None
-
-
 def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
     if order is None:
         return {}
     source = authoritative_order_fee_fact_source(order, order_id=order_id)
     raw = _dict(_value(order, "okx_raw_fills", {}))
-    base_quantity = _safe_float(
-        raw.get("base_quantity") or raw.get("filled_base_quantity"),
-        None,
-    )
-    average_price = _safe_float(raw.get("avg_price") or raw.get("average"), None)
-    contracts = _safe_float(
-        raw.get("contracts")
-        or raw.get("filled_contracts")
-        or _value(order, "okx_fill_contracts"),
-        None,
-    )
+    base_quantity = _safe_float(raw.get("base_quantity"), None)
+    average_price = _safe_float(raw.get("avg_price"), None)
+    contracts = _safe_float(raw.get("contracts"), None)
     fee = _safe_float(raw.get("fee_abs"), None)
+    execution_slippage = _dict(raw.get("execution_slippage"))
+    execution_slippage_usdt = _safe_float(
+        execution_slippage.get("adverse_slippage_usdt"),
+        None,
+    )
+    execution_slippage_contracts = _safe_float(
+        execution_slippage.get("contracts"),
+        None,
+    )
+    execution_slippage_contract_size = _safe_float(
+        execution_slippage.get("contract_size"),
+        None,
+    )
+    execution_slippage_fill_vwap = _safe_float(
+        execution_slippage.get("fill_vwap"),
+        None,
+    )
+    execution_slippage_actual_notional = _safe_float(
+        execution_slippage.get("actual_notional_usdt"),
+        None,
+    )
+    raw_contract_size = _safe_float(raw.get("contract_size"), None)
+    raw_trade_ids = set(_list(raw.get("trade_ids")))
+    execution_slippage_trade_ids = set(
+        _list(execution_slippage.get("trade_ids"))
+    )
+    execution_slippage_reasons = _execution_slippage_validation_reasons(
+        execution_slippage=execution_slippage,
+        fill_fact_origin=_fill_fact_origin(raw),
+        expected_order_id=order_id,
+        expected_inst_id=_text(raw.get("inst_id")).upper(),
+        expected_side=_text(_value(order, "side")).lower(),
+        expected_trade_ids=raw_trade_ids,
+        expected_contracts=contracts,
+        expected_contract_size=raw_contract_size,
+        expected_fill_vwap=average_price,
+        expected_actual_notional=(
+            base_quantity * average_price
+            if base_quantity is not None and average_price is not None
+            else None
+        ),
+        actual_trade_ids=execution_slippage_trade_ids,
+        actual_contracts=execution_slippage_contracts,
+        actual_contract_size=execution_slippage_contract_size,
+        actual_fill_vwap=execution_slippage_fill_vwap,
+        actual_notional=execution_slippage_actual_notional,
+        adverse_slippage_usdt=execution_slippage_usdt,
+    )
+    execution_slippage_complete = not execution_slippage_reasons
     if (
         source is None
         or base_quantity is None
@@ -120,7 +158,81 @@ def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
         "contracts": contracts,
         "fee": fee,
         "fee_source": source,
+        "execution_slippage_complete": execution_slippage_complete,
+        "execution_slippage_usdt": (
+            execution_slippage_usdt if execution_slippage_complete else None
+        ),
+        "execution_slippage_source": (
+            OKX_FILL_MARK_SLIPPAGE_SOURCE if execution_slippage_complete else ""
+        ),
+        "execution_slippage_reasons": execution_slippage_reasons,
     }
+
+
+def _execution_slippage_validation_reasons(
+    *,
+    execution_slippage: dict[str, Any],
+    fill_fact_origin: str,
+    expected_order_id: str,
+    expected_inst_id: str,
+    expected_side: str,
+    expected_trade_ids: set[str],
+    expected_contracts: float | None,
+    expected_contract_size: float | None,
+    expected_fill_vwap: float | None,
+    expected_actual_notional: float | None,
+    actual_trade_ids: set[str],
+    actual_contracts: float | None,
+    actual_contract_size: float | None,
+    actual_fill_vwap: float | None,
+    actual_notional: float | None,
+    adverse_slippage_usdt: float | None,
+) -> list[str]:
+    if execution_slippage.get("complete") is not True:
+        stored_reasons = _list(execution_slippage.get("reasons"))
+        if stored_reasons:
+            return [f"stored_slippage:{reason}" for reason in stored_reasons]
+        state = "incomplete_without_reason" if execution_slippage else "fact_missing"
+        return [f"stored_slippage:{state}:{fill_fact_origin}"]
+
+    reasons: list[str] = []
+    if execution_slippage.get("version") != OKX_FILL_MARK_SLIPPAGE_VERSION:
+        reasons.append("slippage_version_invalid")
+    if execution_slippage.get("source") != OKX_FILL_MARK_SLIPPAGE_SOURCE:
+        reasons.append("slippage_source_invalid")
+    if _text(execution_slippage.get("order_id")) != expected_order_id:
+        reasons.append("slippage_order_id_mismatch")
+    if _text(execution_slippage.get("inst_id")).upper() != expected_inst_id:
+        reasons.append("slippage_instrument_id_mismatch")
+    if _text(execution_slippage.get("side")).lower() != expected_side:
+        reasons.append("slippage_side_mismatch")
+    if not expected_trade_ids:
+        reasons.append("fill_trade_ids_missing")
+    elif actual_trade_ids != expected_trade_ids:
+        reasons.append("slippage_trade_ids_mismatch")
+    for name, actual, expected, abs_tol in (
+        ("contracts", actual_contracts, expected_contracts, 1e-12),
+        ("contract_size", actual_contract_size, expected_contract_size, 1e-12),
+        ("fill_vwap", actual_fill_vwap, expected_fill_vwap, 1e-12),
+        ("actual_notional", actual_notional, expected_actual_notional, 1e-8),
+    ):
+        if actual is None or expected is None:
+            reasons.append(f"slippage_{name}_missing")
+        elif not math.isclose(actual, expected, rel_tol=1e-9, abs_tol=abs_tol):
+            reasons.append(f"slippage_{name}_mismatch")
+    if adverse_slippage_usdt is None or adverse_slippage_usdt < 0:
+        reasons.append("slippage_adverse_usdt_invalid")
+    return reasons
+
+
+def _fill_fact_origin(raw: dict[str, Any]) -> str:
+    if raw.get("fills_history_confirmed") is True:
+        return "fills_history"
+    if raw.get("order_detail_confirmed") is True:
+        return "order_detail"
+    if raw.get("execution_result_confirmed") is True:
+        return "execution_result"
+    return "unconfirmed"
 
 
 def _authoritative_fill_group(
@@ -131,6 +243,15 @@ def _authoritative_fill_group(
         _authoritative_fill_fact(orders_by_exchange_id.get(order_id), order_id=order_id)
         for order_id in order_ids
     ]
+    execution_slippage_failures = {
+        order_id: (
+            list(fact.get("execution_slippage_reasons") or [])
+            if fact
+            else ["authoritative_fill_fact_missing"]
+        )
+        for order_id, fact in zip(order_ids, facts, strict=True)
+        if not fact or fact.get("execution_slippage_complete") is not True
+    }
     complete = bool(order_ids and all(facts) and len(facts) == len(order_ids))
     if not complete:
         return {
@@ -140,6 +261,8 @@ def _authoritative_fill_group(
                 for order_id, fact in zip(order_ids, facts, strict=True)
                 if not fact
             ],
+            "execution_slippage_complete": False,
+            "execution_slippage_failures": execution_slippage_failures,
         }
     base_quantity = sum(float(fact["base_quantity"]) for fact in facts)
     notional = sum(
@@ -147,6 +270,9 @@ def _authoritative_fill_group(
         for fact in facts
     )
     sources = sorted({str(fact["fee_source"]) for fact in facts})
+    execution_slippage_complete = all(
+        fact.get("execution_slippage_complete") is True for fact in facts
+    )
     return {
         "complete": True,
         "facts": facts,
@@ -156,6 +282,16 @@ def _authoritative_fill_group(
         "notional": notional,
         "fee": sum(float(fact["fee"]) for fact in facts),
         "fee_source": "+".join(sources),
+        "execution_slippage_complete": execution_slippage_complete,
+        "execution_slippage_usdt": (
+            sum(float(fact["execution_slippage_usdt"]) for fact in facts)
+            if execution_slippage_complete
+            else None
+        ),
+        "execution_slippage_source": (
+            OKX_FILL_MARK_SLIPPAGE_SOURCE if execution_slippage_complete else ""
+        ),
+        "execution_slippage_failures": execution_slippage_failures,
         "missing_order_ids": [],
     }
 def _dict(value: Any) -> dict[str, Any]:
@@ -420,7 +556,11 @@ def build_okx_history_training_sample(
     entry_price = _safe_float(_value(history, "open_avg_px"), 0.0) or 0.0
     close_price = _safe_float(_value(history, "close_avg_px"), 0.0) or 0.0
     side = _text(_value(history, "side")).lower()
-    fill_contracts = _entry_fill_contracts(entry_orders)
+    fill_contracts = (
+        _safe_float(entry_fill_group.get("contracts"), None)
+        if entry_fill_group.get("complete") is True
+        else None
+    )
     contracts = fill_contracts or 0.0
     spec = _raw_contract_spec(raw)
     public_or_stored_ct_val = _safe_float(spec.get("ctVal"), None)
@@ -631,15 +771,31 @@ def build_okx_history_training_sample(
         protection_execution
         and _text(protection_execution.get("actual_side")).lower() == "sl"
     )
+    entry_execution_slippage_usdt = _safe_float(
+        entry_fill_group.get("execution_slippage_usdt"),
+        None,
+    )
+    close_execution_slippage_usdt = _safe_float(
+        close_fill_group.get("execution_slippage_usdt"),
+        None,
+    )
+    execution_slippage_usdt = (
+        entry_execution_slippage_usdt + close_execution_slippage_usdt
+        if entry_fill_group.get("execution_slippage_complete") is True
+        and close_fill_group.get("execution_slippage_complete") is True
+        and entry_execution_slippage_usdt is not None
+        and close_execution_slippage_usdt is not None
+        else None
+    )
     canonical_slippage = (
-        _safe_float(protection_execution.get("stop_loss_slippage_pct"), None)
-        if stop_loss_fill_confirmed
-        and _text(protection_execution.get("stop_loss_slippage_source"))
-        == "okx_configured_stop_trigger_to_fills_vwap"
+        execution_slippage_usdt / canonical_notional * 100.0
+        if execution_slippage_usdt is not None
+        and canonical_notional is not None
+        and canonical_notional > 0
         else None
     )
     canonical_slippage_source = (
-        "okx_configured_stop_trigger_to_fills_vwap"
+        OKX_ROUND_TRIP_SLIPPAGE_SOURCE
         if canonical_slippage is not None
         else ""
     )
@@ -788,6 +944,23 @@ def build_okx_history_training_sample(
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
         "slippage": canonical_slippage,
         "slippage_source": canonical_slippage_source,
+        "entry_execution_slippage_usdt": entry_execution_slippage_usdt,
+        "close_execution_slippage_usdt": close_execution_slippage_usdt,
+        "execution_slippage_usdt": execution_slippage_usdt,
+        "entry_execution_slippage_complete": (
+            entry_fill_group.get("execution_slippage_complete") is True
+        ),
+        "close_execution_slippage_complete": (
+            close_fill_group.get("execution_slippage_complete") is True
+        ),
+        "execution_slippage_failures": {
+            "entry": dict(
+                entry_fill_group.get("execution_slippage_failures") or {}
+            ),
+            "close": dict(
+                close_fill_group.get("execution_slippage_failures") or {}
+            ),
+        },
         "protection_execution_supervision_ready": bool(protection_execution),
         "protection_lifecycle_complete": bool(
             protection_execution and protection_submission
