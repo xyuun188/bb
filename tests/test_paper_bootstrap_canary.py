@@ -28,6 +28,11 @@ from services.paper_bootstrap_canary import (
 from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
+def _utc_today_start() -> datetime:
+    now = datetime.now(UTC)
+    return datetime(now.year, now.month, now.day, tzinfo=UTC)
+
+
 def _context() -> dict[str, Any]:
     def distribution(side: str, objective: float) -> dict[str, Any]:
         return {
@@ -570,7 +575,7 @@ async def test_recent_different_stratum_does_not_trigger_global_cooldown() -> No
 
 @pytest.mark.asyncio
 async def test_overrepresented_stratum_is_diagnostic_and_does_not_block_sampling() -> None:
-    old = datetime.now(UTC) - timedelta(minutes=20)
+    old = _utc_today_start()
 
     async def history() -> list[Any]:
         return [
@@ -582,8 +587,8 @@ async def test_overrepresented_stratum_is_diagnostic_and_does_not_block_sampling
                 canary_volatility_bucket="medium",
                 canary_market_regime="trending",
                 outcome="profit",
-                executed_at=old - timedelta(seconds=index),
-                created_at=old - timedelta(seconds=index),
+                executed_at=old + timedelta(seconds=index),
+                created_at=old + timedelta(seconds=index),
             )
             for index in range(4)
         ]
@@ -671,7 +676,7 @@ async def test_paper_canary_blocks_after_daily_cumulative_loss_budget() -> None:
     ) -> dict[str, Any]:
         raise AssertionError("loss circuit must block before exchange calls")
 
-    now = datetime.now(UTC)
+    today_start = _utc_today_start()
 
     async def history() -> list[Any]:
         raw = {"paper_bootstrap_canary": {"authorized": True}}
@@ -680,8 +685,8 @@ async def test_paper_canary_blocks_after_daily_cumulative_loss_budget() -> None:
                 raw_llm_response=raw,
                 outcome="loss",
                 outcome_pnl_pct=None,
-                executed_at=now - timedelta(minutes=20, seconds=index),
-                created_at=now - timedelta(minutes=20, seconds=index),
+                executed_at=today_start + timedelta(seconds=index),
+                created_at=today_start + timedelta(seconds=index),
             )
             for index in range(
                 int(
@@ -706,7 +711,7 @@ async def test_paper_canary_blocks_after_daily_cumulative_loss_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_two_losses_do_not_open_a_fixed_six_hour_circuit() -> None:
-    old_loss_at = datetime.now(UTC) - timedelta(minutes=20)
+    old_loss_at = _utc_today_start()
 
     async def history() -> list[Any]:
         raw = {"paper_bootstrap_canary": {"authorized": True}}
@@ -717,12 +722,12 @@ async def test_two_losses_do_not_open_a_fixed_six_hour_circuit() -> None:
                 executed_at=old_loss_at,
                 created_at=old_loss_at,
             ),
-            SimpleNamespace(
-                raw_llm_response=raw,
-                outcome="loss",
-                executed_at=old_loss_at - timedelta(minutes=10),
-                created_at=old_loss_at - timedelta(minutes=10),
-            ),
+                SimpleNamespace(
+                    raw_llm_response=raw,
+                    outcome="loss",
+                    executed_at=old_loss_at + timedelta(seconds=1),
+                    created_at=old_loss_at + timedelta(seconds=1),
+                ),
         ]
 
     decision = _decision()

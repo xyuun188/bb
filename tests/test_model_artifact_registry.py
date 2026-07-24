@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -10,6 +11,7 @@ from services.artifact_retirement_audit import (
     ArtifactRetirementAuditService,
 )
 from services.ml_signal_service import MLSignalService
+from services.ml_training_contract import DECISION_GROUP_PARTITION_VERSION
 from services.model_artifact_registry import (
     ARTIFACT_REGISTRY_VERSION,
     ModelArtifactRegistry,
@@ -50,6 +52,26 @@ def _metadata() -> dict:
         "evaluation_group_policy": "chronological_disjoint_decision_groups",
         "train_decision_group_count": 64,
         "test_decision_group_count": 64,
+        "decision_group_partition": {
+            "version": DECISION_GROUP_PARTITION_VERSION,
+            "ready": True,
+            "reason": "ready",
+            "sample_count": 256,
+            "decision_group_count": 128,
+            "candidate_training_decision_group_count": 64,
+            "purged_training_decision_group_count": 0,
+            "purged_training_sample_count": 0,
+            "train_sample_count": 128,
+            "train_decision_group_count": 64,
+            "holdout_sample_count": 128,
+            "holdout_decision_group_count": 64,
+            "minimum_train_sample_count": 16,
+            "minimum_train_decision_group_count": 2,
+            "holdout_decision_start": "2026-07-14T02:00:00+00:00",
+            "training_label_end": "2026-07-14T01:00:00+00:00",
+            "decision_group_overlap_count": 0,
+            "chronological_label_disjoint": True,
+        },
         "training_data_sha256": "a" * 64,
         "source_code_sha256": SOURCE_CODE_SHA256,
         "walk_forward_report": {
@@ -287,6 +309,81 @@ def test_candidate_does_not_replace_current_until_atomic_promotion(tmp_path) -> 
     assert registry.resolve_rollback().version == second.version
 
 
+def test_current_without_partition_contract_is_replaced_without_rollback_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    first = registry.persist_candidate_joblib(
+        {"weights": [1]},
+        _metadata(),
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    first = registry.promote_candidate(_shadow_activation())
+    second = registry.persist_candidate_joblib(
+        {"weights": [2]},
+        _metadata(),
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    invalid_current = replace(
+        first,
+        manifest={**first.manifest, "decision_group_partition": None},
+    )
+    original_resolve_current = ModelArtifactRegistry.resolve_current
+    calls = 0
+
+    def resolve_current_once_as_invalid(self):
+        nonlocal calls
+        assert self is registry
+        calls += 1
+        return invalid_current if calls == 1 else original_resolve_current(self)
+
+    monkeypatch.setattr(
+        ModelArtifactRegistry,
+        "resolve_current",
+        resolve_current_once_as_invalid,
+    )
+
+    current = registry.promote_candidate(_shadow_activation())
+
+    assert current.version == second.version
+    assert registry.resolve_rollback() is None
+    assert first.model_path.exists()
+
+
+def test_rollback_rejects_artifact_without_current_partition_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    artifact = registry.persist_candidate_joblib(
+        {"weights": [1]},
+        _metadata(),
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    invalid = replace(
+        artifact,
+        manifest={**artifact.manifest, "decision_group_partition": None},
+    )
+    monkeypatch.setattr(
+        ModelArtifactRegistry,
+        "resolve_rollback",
+        lambda self: invalid if self is registry else None,
+    )
+
+    with pytest.raises(ValueError, match="rollback artifact violates"):
+        registry.rollback_current()
+
+
 def test_rejected_candidate_is_preserved_as_challenger_without_replacing_champion(
     tmp_path,
 ) -> None:
@@ -448,6 +545,23 @@ def test_candidate_rejects_invalid_training_or_source_fingerprint(tmp_path) -> N
             _metadata(),
             parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
             code_version=f"source-sha256:{'c' * 64}",
+        )
+
+
+def test_candidate_rejects_old_partition_metadata_without_compatibility(tmp_path) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    metadata = _metadata()
+    metadata.pop("decision_group_partition")
+
+    with pytest.raises(ValueError, match="decision_group_partition is required"):
+        registry.persist_candidate_joblib(
+            {"weights": [1]},
+            metadata,
+            parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+            code_version=SOURCE_CODE_VERSION,
         )
 
 

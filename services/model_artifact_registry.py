@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
+from services.ml_training_contract import decision_group_partition_errors
 
 ARTIFACT_REGISTRY_VERSION = "2026-07-24.v3"
 ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-24.v2"
@@ -250,13 +251,24 @@ class ModelArtifactRegistry:
         previous = self.resolve_current() if previous_pointer is not None else None
         if previous_pointer is not None and previous is None:
             raise ValueError("current artifact pointer disappeared during promotion")
+        previous_partition_errors = (
+            decision_group_partition_errors(
+                previous.manifest.get("decision_group_partition")
+            )
+            if previous is not None
+            else []
+        )
         activation = self._build_activation_manifest(candidate, activation_evidence)
         activation_root = candidate.manifest_path.parent / "activations"
         activation_path = activation_root / f"a-{uuid.uuid4().hex[:8]}.json"
         _write_json_once(activation_path, activation)
         activation_hash = _sha256(activation_path)
 
-        if previous_pointer is not None and previous is not None:
+        if (
+            previous_pointer is not None
+            and previous is not None
+            and not previous_partition_errors
+        ):
             _write_json_atomic(
                 self.rollback_path,
                 {
@@ -266,6 +278,8 @@ class ModelArtifactRegistry:
                 },
             )
             self.resolve_rollback()
+        elif previous_partition_errors:
+            self.rollback_path.unlink(missing_ok=True)
 
         candidate_pointer = _read_json(self.candidate_path)
         _write_json_atomic(
@@ -374,6 +388,14 @@ class ModelArtifactRegistry:
         rollback = self.resolve_rollback()
         if rollback is None:
             raise ValueError("rollback artifact is not registered")
+        partition_errors = decision_group_partition_errors(
+            rollback.manifest.get("decision_group_partition")
+        )
+        if partition_errors:
+            raise ValueError(
+                "rollback artifact violates the current decision-group partition contract: "
+                + ", ".join(sorted(set(partition_errors)))
+            )
         current_pointer = _read_json(self.current_path) if self.current_path.exists() else None
         rollback_pointer = _read_json(self.rollback_path)
         _write_json_atomic(
@@ -414,6 +436,7 @@ class ModelArtifactRegistry:
             "training_data_sha256",
             "source_code_sha256",
             "evaluation_group_policy",
+            "decision_group_partition",
             "model_stage",
         ):
             _required_text(metadata, field)
@@ -427,13 +450,22 @@ class ModelArtifactRegistry:
             raise ValueError("source_code_sha256 must be a SHA-256 digest")
         if code_version != f"source-sha256:{source_hash}":
             raise ValueError("code_version does not match source_code_sha256")
-        for field in ("train_decision_group_count", "test_decision_group_count"):
-            try:
-                value = int(metadata.get(field) or 0)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{field} must be an integer") from exc
-            if value <= 0:
-                raise ValueError(f"{field} must describe a non-empty decision partition")
+        partition = metadata.get("decision_group_partition")
+        partition_errors = decision_group_partition_errors(partition)
+        if isinstance(partition, dict):
+            if int(metadata.get("train_decision_group_count") or 0) != int(
+                partition.get("train_decision_group_count") or 0
+            ):
+                partition_errors.append("top_level_train_group_count_mismatch")
+            if int(metadata.get("test_decision_group_count") or 0) != int(
+                partition.get("holdout_decision_group_count") or 0
+            ):
+                partition_errors.append("top_level_holdout_group_count_mismatch")
+        if partition_errors:
+            raise ValueError(
+                "decision_group_partition violates the artifact contract: "
+                + ", ".join(sorted(set(partition_errors)))
+            )
         walk_forward = metadata.get("walk_forward_report")
         if not isinstance(walk_forward, dict) or (
             walk_forward.get("status") != "complete"
@@ -780,6 +812,7 @@ class ModelArtifactRegistry:
             "objective_version",
             "label_version",
             "profit_supervision_version",
+            "decision_group_partition",
         )
         for field in identity_fields:
             if embedded.get(field) != metadata.get(field):

@@ -38,6 +38,13 @@ from services.artifact_retirement_audit import (
 )
 from services.dynamic_policy_values import empirical_policy_value
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
+from services.ml_training_contract import (
+    DECISION_GROUP_PARTITION_VERSION,
+    MIN_TRAINING_DECISION_GROUP_COUNT,
+    MIN_TRAINING_SAMPLE_COUNT,
+    RANDOM_FOREST_MIN_SAMPLES_LEAF,
+    decision_group_partition_errors,
+)
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
 from services.model_champion_policy import compare_candidate_to_champion
 from services.model_strategy_blueprint import build_model_strategy_blueprint
@@ -316,7 +323,7 @@ def _make_classifier(y: pd.Series) -> Pipeline:
         estimator = RandomForestClassifier(
             n_estimators=220,
             max_depth=8,
-            min_samples_leaf=8,
+            min_samples_leaf=RANDOM_FOREST_MIN_SAMPLES_LEAF,
             class_weight="balanced_subsample",
             random_state=42,
             n_jobs=1,
@@ -336,7 +343,7 @@ def _make_regressor(y: pd.Series) -> Pipeline:
         estimator = RandomForestRegressor(
             n_estimators=220,
             max_depth=8,
-            min_samples_leaf=8,
+            min_samples_leaf=RANDOM_FOREST_MIN_SAMPLES_LEAF,
             random_state=42,
             n_jobs=1,
         )
@@ -1568,31 +1575,128 @@ def _walk_forward_return_report(
     }
 
 
-def _decision_group_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Chronologically split complete decision groups without horizon leakage."""
+@dataclass(frozen=True)
+class DecisionGroupPartition:
+    train: pd.DataFrame
+    holdout: pd.DataFrame
+    report: dict[str, Any]
+
+
+def _champion_comparison_inputs(
+    current_artifact: ResolvedModelArtifact | None,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    if not isinstance(current_artifact, ResolvedModelArtifact):
+        return None, None, []
+    manifest = current_artifact.manifest
+    partition_errors = decision_group_partition_errors(
+        manifest.get("decision_group_partition")
+    )
+    if partition_errors:
+        return None, None, partition_errors
+    stage = str(
+        _safe_dict(current_artifact.activation_manifest).get("activation_stage") or ""
+    )
+    return manifest, stage or None, []
+
+
+def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
+    """Build the only valid chronological train/holdout partition."""
+
+    if frame.empty:
+        report = {
+            "version": DECISION_GROUP_PARTITION_VERSION,
+            "ready": False,
+            "reason": "cost_complete_training_distribution_unavailable",
+            "sample_count": 0,
+            "decision_group_count": 0,
+            "candidate_training_decision_group_count": 0,
+            "purged_training_decision_group_count": 0,
+            "purged_training_sample_count": 0,
+            "train_sample_count": 0,
+            "train_decision_group_count": 0,
+            "holdout_sample_count": 0,
+            "holdout_decision_group_count": 0,
+            "minimum_train_sample_count": MIN_TRAINING_SAMPLE_COUNT,
+            "minimum_train_decision_group_count": MIN_TRAINING_DECISION_GROUP_COUNT,
+            "holdout_decision_start": None,
+            "training_label_end": None,
+            "decision_group_overlap_count": 0,
+            "chronological_label_disjoint": False,
+        }
+        return DecisionGroupPartition(frame.copy(), frame.copy(), report)
 
     group_column = "decision_group"
     if group_column not in frame:
         raise ValueError("decision_group is required for leakage-free evaluation")
-    frame = _chronological_frame(frame)
-    ordered_groups, group_bounds = _decision_group_availability(frame)
-    if len(ordered_groups) <= 1:
-        raise ValueError("at least two decision groups are required for holdout evaluation")
+    ordered = _chronological_frame(frame).reset_index(drop=True)
+    ordered_groups, group_bounds = _decision_group_availability(ordered)
     boundary = len(ordered_groups) // 2
-    test_groups = set(ordered_groups[boundary:])
-    holdout_decision_start = min(
-        group_bounds[group]["decision_start"] for group in test_groups
+    candidate_train_groups = set(ordered_groups[:boundary])
+    holdout_groups = set(ordered_groups[boundary:])
+    holdout_decision_start = (
+        min(group_bounds[group]["decision_start"] for group in holdout_groups)
+        if holdout_groups
+        else None
     )
     train_groups = {
         group
-        for group in ordered_groups[:boundary]
-        if group_bounds[group]["end"] < holdout_decision_start
+        for group in candidate_train_groups
+        if holdout_decision_start is not None
+        and group_bounds[group]["end"] < holdout_decision_start
     }
-    train = frame[frame[group_column].astype(str).isin(train_groups)].copy()
-    test = frame[frame[group_column].astype(str).isin(test_groups)].copy()
-    if train.empty or test.empty or train_groups & test_groups:
-        raise ValueError("decision-group split could not form disjoint train and holdout sets")
-    return train, test
+    train = ordered[ordered[group_column].astype(str).isin(train_groups)].copy()
+    holdout = ordered[ordered[group_column].astype(str).isin(holdout_groups)].copy()
+    purged_training_groups = candidate_train_groups - train_groups
+    purged_training_sample_count = int(
+        ordered[group_column].astype(str).isin(purged_training_groups).sum()
+    )
+    overlap_count = len(train_groups & holdout_groups)
+    training_label_end = (
+        max(group_bounds[group]["end"] for group in train_groups)
+        if train_groups
+        else None
+    )
+    chronological_label_disjoint = bool(
+        training_label_end is not None
+        and holdout_decision_start is not None
+        and training_label_end < holdout_decision_start
+    )
+    if not holdout_groups or holdout.empty:
+        reason = "decision_group_holdout_unavailable"
+    elif (
+        len(train_groups) < MIN_TRAINING_DECISION_GROUP_COUNT
+        or len(train) < MIN_TRAINING_SAMPLE_COUNT
+    ):
+        reason = "decision_group_training_partition_immature"
+    elif overlap_count or not chronological_label_disjoint:
+        reason = "decision_group_partition_overlap"
+    else:
+        reason = "ready"
+    report = {
+        "version": DECISION_GROUP_PARTITION_VERSION,
+        "ready": reason == "ready",
+        "reason": reason,
+        "sample_count": int(len(ordered)),
+        "decision_group_count": len(ordered_groups),
+        "candidate_training_decision_group_count": len(candidate_train_groups),
+        "purged_training_decision_group_count": len(
+            purged_training_groups
+        ),
+        "purged_training_sample_count": purged_training_sample_count,
+        "train_sample_count": int(len(train)),
+        "train_decision_group_count": len(train_groups),
+        "holdout_sample_count": int(len(holdout)),
+        "holdout_decision_group_count": len(holdout_groups),
+        "minimum_train_sample_count": MIN_TRAINING_SAMPLE_COUNT,
+        "minimum_train_decision_group_count": MIN_TRAINING_DECISION_GROUP_COUNT,
+        "holdout_decision_start": _fingerprint_value(holdout_decision_start),
+        "training_label_end": _fingerprint_value(training_label_end),
+        "decision_group_overlap_count": overlap_count,
+        "chronological_label_disjoint": chronological_label_disjoint,
+    }
+    if report["ready"] and decision_group_partition_errors(report):
+        raise ValueError("ready decision-group partition violates its training contract")
+    return DecisionGroupPartition(train, holdout, report)
 
 
 def build_training_frame(rows: list[Any]) -> pd.DataFrame:
@@ -1739,17 +1843,22 @@ def train_from_frame(
     trade_samples: list[dict[str, Any]] | None = None,
     persist_artifact: bool = True,
 ) -> dict[str, Any]:
-    if len(frame) <= 1:
-        raise ValueError("训练收益分布不足，无法形成非空训练集和留出集")
-
+    partition = decision_group_partition(frame)
+    if not partition.report["ready"]:
+        raise ValueError(
+            f"{partition.report['reason']}: "
+            f"train_groups={partition.report['train_decision_group_count']}, "
+            f"train_samples={partition.report['train_sample_count']}, "
+            f"holdout_groups={partition.report['holdout_decision_group_count']}, "
+            f"holdout_samples={partition.report['holdout_sample_count']}"
+        )
     frame = _chronological_frame(frame).reset_index(drop=True)
-    training_partition, _ = _decision_group_split(frame)
     tail_policy: dict[str, Any] = {}
     tail_scales: dict[str, float] = {}
     for side in ("long", "short"):
         training_net_returns = (
-            training_partition[f"{side}_return_pct"].astype(float)
-            - training_partition[f"{side}_execution_cost_pct"].astype(float)
+            partition.train[f"{side}_return_pct"].astype(float)
+            - partition.train[f"{side}_execution_cost_pct"].astype(float)
         )
         negatives = training_net_returns[training_net_returns < 0].tolist()
         generated = empirical_policy_value(
@@ -1767,11 +1876,12 @@ def train_from_frame(
         frame[f"{side}_tail_loss"] = (net_returns < boundary).astype(int)
         frame[f"{side}_win"] = (net_returns > 0.0).astype(int)
         tail_scales[side] = max(abs(boundary), float(np.finfo(float).eps))
+    train = frame.loc[partition.train.index].copy()
+    test = frame.loc[partition.holdout.index].copy()
     training_data_sha256 = _training_data_sha256(frame)
     source_code_version = _training_source_code_version()
     source_code_sha256 = source_code_version.removeprefix("source-sha256:")
     walk_forward_report = _walk_forward_return_report(frame)
-    train, test = _decision_group_split(frame)
     strategy_replay_holdout = {
         "version": "2026-07-21.strategy-replay-holdout.v1",
         "source": "artifact_disjoint_test_partition",
@@ -1910,14 +2020,14 @@ def train_from_frame(
         "trained_at": now,
         "training_epoch_started_at": load_training_epoch_start().isoformat(),
         "pre_epoch_data_training_allowed": False,
-        "sample_count": int(len(frame)),
+        "sample_count": int(len(train)),
         "completed_shadow_sample_count": completed_count,
         "last_trained_completed_shadow_sample_count": completed_count,
-        "training_shadow_sample_count": int(len(frame)),
+        "training_shadow_sample_count": int(len(train)),
         "training_trade_sample_count": len(trade_samples or []),
         "completed_trade_sample_count": len(trade_samples or []),
         "last_trained_completed_trade_sample_count": len(trade_samples or []),
-        "training_window_composition": _training_window_composition(frame),
+        "training_window_composition": _training_window_composition(train),
         "quality_report": frame_quality_report,
         "market_fact_contract": _safe_dict(
             frame_quality_report.get("market_fact_contract")
@@ -1928,7 +2038,6 @@ def train_from_frame(
         ),
         "training_window_policy": "all_current_clean_separated_supervision_samples",
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
-        "train_count": int(len(train)),
         "test_count": int(len(test)),
         "feature_count": len(FEATURE_KEYS),
         "horizons": sorted(int(v) for v in frame["horizon_minutes"].dropna().unique().tolist()),
@@ -1947,6 +2056,7 @@ def train_from_frame(
         "tail_loss_scale_pct": tail_scales,
         "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
         "evaluation_group_policy": "chronological_disjoint_decision_groups",
+        "decision_group_partition": partition.report,
         "strategy_replay_holdout": strategy_replay_holdout,
         "training_data_sha256": training_data_sha256,
         "source_code_sha256": source_code_sha256,
@@ -2469,22 +2579,6 @@ class MLSignalService:
                     "persist_artifact_only_when_readiness_allows_live_influence": False,
                     "persist_latest_artifact_even_when_readiness_blocks_live_influence": True,
                 }
-                if completed_count <= 1:
-                    result = {
-                        "trained": False,
-                        "reason": "training_distribution_unavailable",
-                        "completed_sample_count": completed_count,
-                        "last_trained_sample_count": last_sample_count,
-                        "last_trained_completed_sample_count": last_completed_count,
-                        "new_sample_count": new_samples,
-                        "completed_trade_sample_count": completed_trade_count,
-                        "new_trade_sample_count": new_trade_samples,
-                        "training_policy": training_policy,
-                        "message": "本地 ML 尚无法形成非空训练集和留出集，继续收集成本完整样本。",
-                    }
-                    self._last_train_result = result
-                    return result
-
                 should_train = (
                     force
                     or not metadata
@@ -2533,32 +2627,54 @@ class MLSignalService:
                 quarantine_result = await self._quarantine_dirty_training_samples()
                 completed_count = await self._completed_shadow_sample_count()
                 new_samples = max(completed_count - last_completed_count, 0)
-                if completed_count <= 1:
-                    result = {
-                        "trained": False,
-                        "reason": "clean_training_distribution_unavailable",
-                        "completed_sample_count": completed_count,
-                        "last_trained_sample_count": last_sample_count,
-                        "last_trained_completed_sample_count": last_completed_count,
-                        "new_sample_count": new_samples,
-                        "training_policy": training_policy,
-                        "training_quarantine": quarantine_result,
-                        "message": "自动隔离后无法形成非空训练集和留出集，继续累计成本完整样本。",
-                    }
-                    self._last_train_result = result
-                    return result
                 rows = await load_shadow_training_rows()
                 quality_state = shadow_training_quality_report(rows)
                 frame = build_training_frame(rows)
-                if len(frame) <= 1:
+                partition = decision_group_partition(frame)
+                if not partition.report["ready"]:
+                    partition_report = partition.report
                     result = {
                         "trained": False,
-                        "reason": "cost_complete_training_distribution_unavailable",
+                        "reason": partition_report["reason"],
                         "completed_sample_count": completed_count,
                         "cost_complete_sample_count": int(len(frame)),
+                        "decision_group_count": partition_report[
+                            "decision_group_count"
+                        ],
+                        "train_sample_count": partition_report["train_sample_count"],
+                        "train_decision_group_count": partition_report[
+                            "train_decision_group_count"
+                        ],
+                        "holdout_sample_count": partition_report[
+                            "holdout_sample_count"
+                        ],
+                        "holdout_decision_group_count": partition_report[
+                            "holdout_decision_group_count"
+                        ],
+                        "purged_training_decision_group_count": partition_report[
+                            "purged_training_decision_group_count"
+                        ],
+                        "purged_training_sample_count": partition_report[
+                            "purged_training_sample_count"
+                        ],
+                        "minimum_train_sample_count": partition_report[
+                            "minimum_train_sample_count"
+                        ],
+                        "minimum_train_decision_group_count": partition_report[
+                            "minimum_train_decision_group_count"
+                        ],
+                        "last_trained_sample_count": last_sample_count,
+                        "last_trained_completed_sample_count": last_completed_count,
+                        "new_sample_count": new_samples,
+                        "completed_trade_sample_count": completed_trade_count,
+                        "new_trade_sample_count": new_trade_samples,
                         "training_policy": training_policy,
                         "training_quarantine": quarantine_result,
-                        "message": "成本完整样本无法形成训练集和留出集，本轮不训练也不回退旧成本。",
+                        "decision_group_partition": partition_report,
+                        "message": (
+                            "成本完整样本尚未形成满足时间隔离和最低拟合要求的训练/留出分区；"
+                            "本轮按等待数据成熟处理，不写模型产物。"
+                        ),
                     }
                     self._last_train_result = result
                     return result
@@ -2634,17 +2750,12 @@ class MLSignalService:
                 resolve_current = getattr(self.artifact_registry, "resolve_current", None)
                 if callable(resolve_current):
                     current_artifact = resolve_current()
-                champion_manifest = (
-                    current_artifact.manifest
-                    if isinstance(current_artifact, ResolvedModelArtifact)
-                    else None
-                )
-                champion_stage = (
-                    str(
-                        _safe_dict(current_artifact.activation_manifest).get(
-                            "activation_stage"
-                        )
-                    )
+                (
+                    champion_manifest,
+                    champion_stage,
+                    champion_partition_errors,
+                ) = _champion_comparison_inputs(
+                    current_artifact
                     if isinstance(current_artifact, ResolvedModelArtifact)
                     else None
                 )
@@ -2654,6 +2765,15 @@ class MLSignalService:
                     candidate_stage=activation_stage,
                     champion_stage=champion_stage,
                 )
+                if champion_partition_errors:
+                    champion_comparison = {
+                        **champion_comparison,
+                        "replaced_ineligible_champion": True,
+                        "ineligible_champion_version": current_artifact.version,
+                        "ineligible_champion_partition_errors": sorted(
+                            set(champion_partition_errors)
+                        ),
+                    }
                 if champion_comparison.get("accepted") is not True:
                     reject_candidate = getattr(
                         self.artifact_registry, "reject_candidate", None
@@ -3599,7 +3719,7 @@ class MLSignalService:
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
             "auto_train_trigger": "new_cost_complete_authoritative_sample_or_forced_rebuild",
             "auto_train_distribution_requirement": (
-                "non_empty_train_and_holdout_from_cost_complete_samples"
+                "chronological_purged_holdout_with_minimum_fit_distribution"
             ),
             "auto_training": row.get("state") == "running",
             "auto_train_last_check_at": row.get("last_check_at") or self._last_check_at,

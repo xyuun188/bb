@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from services.ml_training_contract import decision_group_partition_errors
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     RETURN_LABEL_VERSION,
@@ -272,14 +273,24 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
                 required="chronological_disjoint_decision_groups",
             )
         )
-    for field in ("train_decision_group_count", "test_decision_group_count"):
-        if int(_safe_float(metadata.get(field), 0.0) or 0) <= 0:
-            blockers.append(
-                _reason(
-                    f"artifact_{field}_missing",
-                    f"模型产物字段 {field} 没有提供非空数据分组。",
-                )
+    partition = _safe_dict(metadata.get("decision_group_partition"))
+    partition_errors = decision_group_partition_errors(partition)
+    if (
+        int(_safe_float(metadata.get("train_decision_group_count"), 0.0) or 0)
+        != int(partition.get("train_decision_group_count") or 0)
+        or int(_safe_float(metadata.get("test_decision_group_count"), 0.0) or 0)
+        != int(partition.get("holdout_decision_group_count") or 0)
+    ):
+        partition_errors.append("top_level_partition_counts_mismatch")
+    if partition_errors:
+        blockers.append(
+            _reason(
+                "artifact_decision_group_partition_invalid",
+                "模型产物没有绑定满足最低拟合要求的时间隔离训练/留出分区。",
+                actual=sorted(set(partition_errors)),
+                required="current ready chronological purged decision-group partition",
             )
+        )
     governance = _safe_dict(metadata.get("governance_report"))
     if (
         not governance.get("quality_fingerprint")

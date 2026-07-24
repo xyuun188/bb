@@ -88,7 +88,7 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
         "artifact_version": "model-v1",
         "training_data_sha256": "a" * 64,
         "training_shadow_sample_count": 24,
-        "train_count": 12,
+        "sample_count": 12,
         "test_count": 12,
         "horizons": [10, 30, 60],
         "evaluation_group_policy": "chronological_disjoint_decision_groups",

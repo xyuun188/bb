@@ -342,3 +342,17 @@
 - 修复后新进程自动轮次恢复为 `paper + paused=false`，扫描 240 个标的、34 个特征有效、3 个候选入选；私有标的探测 4 个中 3 个成功，另 1 个由 OKX 明确返回 `51001`，没有再出现 `fetch_leverage` 三连超时。
 - DNS 修复后先产生 16 条市场决策并实际执行 `ETH/USDT long` 决策 `107659`；防复发代码部署后的观察窗口又新增 10 条决策、1 条实际执行，运行摘要为 `decision_count=1`、`execution_count=1`。因此模型未晋升前的 OKX demo 规则交易已经恢复到真实下单，不再只是服务心跳或候选分析。
 - 本地 Ruff 全通过，完整测试为 `2786 passed, 4 skipped`。当前仍有两个独立待处理问题：本地 ML 因无法形成互斥 decision-group 训练/留出集而跳过，以及订单事实同步的少数可选阶段仍有内部预算 `TimeoutError`；它们不再阻断本轮候选和 demo 下单，但必须在后续批次分别治理。
+
+## 25. Local ML 时间隔离分区单一合同
+
+- 原自动训练只判断总 frame 行数是否大于 1，真正分割时才按决策组执行多周期标签 purge。线上 46 行成本完整样本包含 30 个决策组，前 15 个候选训练组中 14 个因标签结束时间晚于留出决策起点被清除，旧逻辑因此要么抛出 `decision-group split could not form disjoint train and holdout sets`，要么在样本稍增后用仅 1 个决策组拟合无意义 artifact。
+- 唯一分区合同为 `2026-07-24.chronological-purged-holdout.v1`。训练与留出继续按决策发生时间排序并以决策组为单位切分，训练标签结束时间必须严格早于留出决策开始时间；禁止随机行切分、禁止放宽 purge、禁止回退旧成本字段。
+- 随机森林叶节点下限只保留 `RANDOM_FOREST_MIN_SAMPLES_LEAF=8` 一个来源，最低拟合样本由其确定为 `16`，同时至少需要 `2` 个训练决策组。未达到任一条件时只返回 `decision_group_training_partition_immature`，不能进入拟合和 artifact registry。
+- `decision_group_partition` 完整记录总样本/组、候选训练组、purge 样本/组、实际训练样本/组、留出样本/组、时间边界、重叠数和最低要求；总样本必须严格等于训练 + 留出 + purge，任何计数不一致、版本缺失或时间重叠都由共享合同拒绝。
+- 删除 `_decision_group_split`、训练函数的重复二次分割、自动训练前后三处 `<=1` 分散判断及其旧失败原因。自动调度数据未成熟时写入 `skipped`、`retry_count=0`，按正常 30 分钟周期检查；只有代码异常、加载错误或真实超时才进入 5 分钟失败重试。
+- artifact 的 `sample_count` 和 `training_shadow_sample_count` 只表示真正参与拟合的训练行；`test_count` 单独表示留出行，累计采集游标继续使用 `completed_shadow_sample_count`。删除重复且会掩盖真实拟合规模的 `train_count` 及其策略蓝图读取，不保留双读。
+- 新 artifact 必须携带当前 ready 分区报告，registry 会在落盘前核对顶层组数和分区报告；readiness 对缺少新合同的旧 artifact 返回 `artifact_decision_group_partition_invalid` 并关闭 ML 影响，不提供旧格式兼容路径。缺少当前分区合同的旧 champion 不再参与候选比较；新合同 artifact 接管 current 时不为旧 champion 建立 rollback，并删除已有旧 rollback 指针，旧版本文件只保留为不可执行审计材料。
+- 正常数据等待不再写 warning：`decision_group_training_partition_immature` 等非失败结果记录为 info，继续使用 30 分钟周期；只有 `error`、`load_samples_error` 和 `timeout` 写 warning 并进入 5 分钟重试。
+- 回归覆盖 purge 后训练集不足、仅 1 个训练决策组、严格时间互斥、成熟分区、拟合样本计数、自动训练跳过且不写 artifact、旧 artifact/候选拒绝、旧 champion 退出比较及禁止回滚。定向验证为 `90 passed`，Ruff 全通过，完整测试为 `2797 passed, 4 skipped`；完整测试跨过 UTC 午夜时还发现并修复 3 个纸面 canary 自然日夹具错误，生产的 UTC 自然日损失预算重置语义保持不变。
+- 线上首次部署时 78 行/52 组成本完整样本被严格拆为训练 5 行/5 组、留出 36 行/26 组、purge 37 行/21 组，调度状态为 `skipped`、`retry_count=0`、下次检查 30 分钟后且未写 artifact。标签继续成熟后自动恢复训练，证明等待状态不会阻断后续训练。
+- 最终强制验收使用正式 `run_local_ml_auto_train.py --force` 路径完成：current 已替换为 `2026-07-24.chronological-purged-holdout.v1` 的 ready shadow artifact，108 行严格闭合为训练 25、留出 55、purge 28；旧 current 不再参与 champion 比较，rollback 指针为空。后续同数据 challenger 按费后收益比较正常拒绝，current 保持 shadow，`live_ml_ready=false`、paper canary 未授权、Local ML warning 数为 0，模型晋升前规则交易继续独立运行。

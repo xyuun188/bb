@@ -28,17 +28,24 @@ from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
     FEATURE_KEYS,
     MLSignalService,
+    _champion_comparison_inputs,
     _configure_single_row_inference,
     _leave_one_symbol_out_stability,
     _training_data_sha256,
     build_training_frame,
     count_shadow_training_rows,
+    decision_group_partition,
     load_shadow_training_rows,
     select_shadow_training_rows,
     shadow_training_quality_report,
     train_from_frame,
 )
-from services.model_artifact_registry import ARTIFACT_REGISTRY_VERSION, ModelArtifactRegistry
+from services.model_artifact_registry import (
+    ARTIFACT_REGISTRY_VERSION,
+    ModelArtifactRegistry,
+    ResolvedModelArtifact,
+)
+from services.model_training_state import LOCAL_ML_MODEL_IDS, ModelTrainingStateStore
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
@@ -170,6 +177,29 @@ def _with_return_objective(metadata: dict) -> dict:
     )
     metadata.setdefault("train_decision_group_count", 2)
     metadata.setdefault("test_decision_group_count", 2)
+    metadata.setdefault(
+        "decision_group_partition",
+        {
+            "version": ml_signal_module.DECISION_GROUP_PARTITION_VERSION,
+            "ready": True,
+            "reason": "ready",
+            "sample_count": 32,
+            "decision_group_count": 4,
+            "candidate_training_decision_group_count": 2,
+            "purged_training_decision_group_count": 0,
+            "purged_training_sample_count": 0,
+            "train_sample_count": 16,
+            "train_decision_group_count": 2,
+            "holdout_sample_count": 16,
+            "holdout_decision_group_count": 2,
+            "minimum_train_sample_count": 16,
+            "minimum_train_decision_group_count": 2,
+            "holdout_decision_start": "2026-07-14T02:00:00+00:00",
+            "training_label_end": "2026-07-14T01:00:00+00:00",
+            "decision_group_overlap_count": 0,
+            "chronological_label_disjoint": True,
+        },
+    )
     metadata.setdefault(
         "governance_report",
         {
@@ -563,6 +593,35 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _multi_horizon_partition_frame(
+    decision_count: int,
+    *,
+    spacing_minutes: int = 5,
+    horizons: tuple[int, ...] = (10, 60),
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    decision_start = datetime(2026, 7, 24, tzinfo=UTC)
+    row_id = 0
+    for decision_index in range(decision_count):
+        decision_at = decision_start + timedelta(
+            minutes=decision_index * spacing_minutes
+        )
+        for horizon in horizons:
+            row_id += 1
+            rows.append(
+                {
+                    "id": row_id,
+                    "decision_group": f"shadow_decision:{decision_index + 1}",
+                    "decision_timestamp": decision_at.isoformat(),
+                    "label_timestamp": (
+                        decision_at + timedelta(minutes=horizon)
+                    ).isoformat(),
+                    "horizon_minutes": horizon,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _authoritative_trade_sample() -> dict[str, object]:
     return {
         "symbol": "BTC/USDT",
@@ -817,10 +876,10 @@ def test_training_data_fingerprint_is_order_independent_and_content_bound() -> N
 
 
 def test_tail_policy_is_derived_only_from_chronological_training_partition() -> None:
-    baseline = _training_frame(20)
+    baseline = _training_frame(40)
     changed_holdout = baseline.copy()
-    changed_holdout.loc[10:, "long_return_pct"] = -999.0
-    changed_holdout.loc[10:, "short_return_pct"] = -777.0
+    changed_holdout.loc[20:, "long_return_pct"] = -999.0
+    changed_holdout.loc[20:, "short_return_pct"] = -777.0
 
     baseline_metadata = train_from_frame(baseline, persist_artifact=False)
     changed_metadata = train_from_frame(changed_holdout, persist_artifact=False)
@@ -884,6 +943,73 @@ def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None
         and fold["decision_group_overlap_count"] == 0
         for fold in report["folds"]
     )
+
+
+def test_decision_group_partition_reports_purged_immature_training_data() -> None:
+    partition = decision_group_partition(_multi_horizon_partition_frame(30))
+
+    assert partition.report["ready"] is False
+    assert partition.report["reason"] == "decision_group_training_partition_immature"
+    assert partition.report["decision_group_count"] == 30
+    assert partition.report["candidate_training_decision_group_count"] == 15
+    assert partition.report["train_decision_group_count"] == 3
+    assert partition.report["train_sample_count"] == 6
+    assert partition.report["purged_training_decision_group_count"] == 12
+    assert partition.report["purged_training_sample_count"] == 24
+    assert partition.report["holdout_decision_group_count"] == 15
+
+
+def test_decision_group_partition_rejects_single_training_decision_group() -> None:
+    partition = decision_group_partition(
+        _multi_horizon_partition_frame(
+            4,
+            spacing_minutes=20,
+            horizons=(30,),
+        )
+    )
+
+    assert partition.report["ready"] is False
+    assert partition.report["reason"] == "decision_group_training_partition_immature"
+    assert partition.report["train_decision_group_count"] == 1
+    assert partition.report["train_sample_count"] == 1
+    assert partition.report["purged_training_decision_group_count"] == 1
+
+
+def test_decision_group_partition_is_strictly_time_disjoint_when_ready() -> None:
+    partition = decision_group_partition(_training_frame(40))
+
+    assert partition.report["ready"] is True
+    assert partition.report["train_sample_count"] == 20
+    assert partition.report["holdout_sample_count"] == 20
+    assert partition.report["decision_group_overlap_count"] == 0
+    assert partition.report["chronological_label_disjoint"] is True
+    assert (
+        partition.report["training_label_end"]
+        < partition.report["holdout_decision_start"]
+    )
+
+
+def test_old_champion_without_partition_contract_cannot_enter_comparison(
+    tmp_path: Path,
+) -> None:
+    old_champion = ResolvedModelArtifact(
+        model_id="local_ml_profit_quality",
+        version="old-canary",
+        model_path=tmp_path / "model.joblib",
+        metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json",
+        sha256="a" * 64,
+        manifest={"sample_count": 46},
+        pointer_role="current",
+        pointer_path=tmp_path / "current.json",
+        activation_manifest={"activation_stage": "canary"},
+    )
+
+    manifest, stage, errors = _champion_comparison_inputs(old_champion)
+
+    assert manifest is None
+    assert stage is None
+    assert "partition_report_missing" in errors
 
 
 def test_leave_one_symbol_out_detects_single_symbol_profit_support() -> None:
@@ -1118,6 +1244,70 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
     assert result["persist_artifact_requested"] is True
     assert result["confirm_phase3_rebuild"] is True
     assert result["metadata"] == {"artifact_persisted": True}
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_store = ModelTrainingStateStore(tmp_path / "model_training_state.json")
+    service = MLSignalService(
+        artifact_registry=ModelArtifactRegistry(
+            root=tmp_path / "model_artifacts",
+            model_id=LOCAL_ML_MODEL_IDS[0],
+        ),
+        training_state_store=state_store,
+    )
+    train_calls: list[bool] = []
+
+    async def completed_shadow_sample_count() -> int:
+        return 46
+
+    async def quarantine_dirty_training_samples(**_kwargs: object) -> dict[str, object]:
+        return {"scanned": 46, "quarantined": 0}
+
+    async def load_rows() -> list[object]:
+        return [object()]
+
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: {}  # type: ignore[method-assign]
+    service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(
+        "services.ml_signal_service.shadow_training_quality_report",
+        lambda _rows: {"quality_report": {"totals": {"total": 46}}},
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.build_training_frame",
+        lambda _rows: _multi_horizon_partition_frame(30),
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.train_from_frame",
+        lambda _frame, **kwargs: train_calls.append(bool(kwargs["persist_artifact"])),
+    )
+
+    result = await service.maybe_auto_train(force=True)
+    state = state_store.read()["models"][LOCAL_ML_MODEL_IDS[0]]
+
+    assert result["trained"] is False
+    assert result["reason"] == "decision_group_training_partition_immature"
+    assert result["train_decision_group_count"] == 3
+    assert result["train_sample_count"] == 6
+    assert result["purged_training_decision_group_count"] == 12
+    assert result["purged_training_sample_count"] == 24
+    assert train_calls == []
+    assert state["state"] == "skipped"
+    assert state["retry_count"] == 0
+    assert state["last_result"]["reason"] == result["reason"]
+    assert state["last_result"]["train_sample_count"] == 6
 
 
 @pytest.mark.asyncio
@@ -1594,11 +1784,11 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     )
 
     composition = metadata["training_window_composition"]
-    assert composition["sample_count"] == 120
-    assert composition["decision_action_counts"] == {"hold": 40, "long": 40, "short": 40}
-    assert composition["best_action_counts"] == {"short": 80, "long": 40}
-    assert composition["data_quality_status_counts"] == {"downweighted": 40, "included": 80}
-    assert composition["effective_weight_ratio"] == pytest.approx((40 * 0.25 + 80) / 120)
+    assert composition["sample_count"] == 60
+    assert composition["decision_action_counts"] == {"hold": 20, "long": 20, "short": 20}
+    assert composition["best_action_counts"] == {"short": 40, "long": 20}
+    assert composition["data_quality_status_counts"] == {"included": 40, "downweighted": 20}
+    assert composition["effective_weight_ratio"] == pytest.approx((20 * 0.25 + 40) / 60)
     assert "top_long_tail_loss_rate" in metadata["metrics"]
     assert "top_short_tail_loss_rate" in metadata["metrics"]
     assert metadata["objective_name"] == RETURN_OBJECTIVE_NAME
@@ -1619,6 +1809,17 @@ def test_train_from_frame_reports_training_window_composition() -> None:
         "test_decision_group_count"
     ]
     assert replay_holdout["shadow_source_id_ranges"]
+
+
+def test_train_from_frame_counts_only_rows_used_for_fitting() -> None:
+    metadata = train_from_frame(_training_frame(80), persist_artifact=False)
+
+    assert metadata["sample_count"] == 40
+    assert metadata["training_shadow_sample_count"] == 40
+    assert metadata["test_count"] == 40
+    assert "train_count" not in metadata
+    assert metadata["training_window_composition"]["sample_count"] == 40
+    assert metadata["decision_group_partition"]["ready"] is True
 
 
 def test_quality_report_separates_missed_opportunity_downweight_from_contamination() -> None:
@@ -1732,6 +1933,18 @@ def test_ml_readiness_blocks_artifact_without_native_market_fact_contract() -> N
     assert readiness["state"] == "degraded"
     assert readiness["live_ml_ready"] is False
     assert "artifact_market_fact_contract_missing_or_stale" in codes
+
+
+def test_ml_readiness_blocks_old_artifact_without_partition_contract() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metadata.pop("decision_group_partition")
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    codes = {item["code"] for item in readiness["blocking_reasons"]}
+
+    assert readiness["state"] == "degraded"
+    assert readiness["live_ml_ready"] is False
+    assert "artifact_decision_group_partition_invalid" in codes
 
 
 def test_ml_readiness_blocks_artifact_with_market_fact_contract_violation() -> None:

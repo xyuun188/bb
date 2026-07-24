@@ -147,7 +147,7 @@ def build_model_strategy_blueprint(
         },
         "training_evidence": {
             "shadow_sample_count": model.get("training_shadow_sample_count"),
-            "fit_sample_count": model.get("train_count"),
+            "fit_sample_count": model.get("sample_count"),
             "holdout_sample_count": model.get("test_count"),
             "horizons": _safe_list(model.get("horizons")),
             "partition_policy": model.get("evaluation_group_policy"),

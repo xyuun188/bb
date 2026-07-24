@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pandas as pd
 import pytest
 
 import services.sync_service as sync_module
@@ -2183,6 +2184,46 @@ async def test_local_ml_auto_train_failure_uses_retry_interval(
     await service._ml_auto_train_loop()
 
     assert delays == [trading_service.AUTO_TRAIN_RETRY_INTERVAL_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_local_ml_immature_partition_is_info_and_uses_normal_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    delays: list[float] = []
+    logs: list[tuple[str, str, dict[str, Any]]] = []
+    service._run_local_ml_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "trained": False,
+            "reason": "decision_group_training_partition_immature",
+            "train_sample_count": 5,
+            "train_decision_group_count": 5,
+            "purged_training_sample_count": 37,
+        }
+    )
+    service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
+        {"trained": False, "reason": "not_due"}
+    )
+
+    async def stop_after_sleep(delay: float) -> None:
+        delays.append(delay)
+        service._running = False
+
+    logger = SimpleNamespace(
+        info=lambda event, **kwargs: logs.append(("info", event, kwargs)),
+        warning=lambda event, **kwargs: logs.append(("warning", event, kwargs)),
+    )
+    monkeypatch.setattr(trading_service, "logger", logger)
+    monkeypatch.setattr(trading_service.asyncio, "sleep", stop_after_sleep)
+
+    await service._ml_auto_train_loop()
+
+    assert delays == [trading_service.AUTO_TRAIN_CHECK_INTERVAL_SECONDS]
+    assert [level for level, _event, _kwargs in logs] == ["info"]
+    assert logs[0][1] == "local ML signal auto-train waiting for mature data"
+    assert logs[0][2]["purged_training_sample_count"] == 37
 
 
 @pytest.mark.asyncio
@@ -5166,11 +5207,24 @@ async def test_ml_signal_auto_train_quarantines_before_training(
         calls.append("quality_report")
         return {"quality_report": {"totals": {"total": 1}}}
 
-    def build_frame(_rows: list[Any]) -> list[Any]:
+    def build_frame(_rows: list[Any]) -> pd.DataFrame:
         calls.append("build_frame")
-        return [object(), object()]
+        start = datetime(2026, 7, 24, tzinfo=UTC)
+        return pd.DataFrame(
+            [
+                {
+                    "id": index + 1,
+                    "decision_group": f"shadow_decision:{index + 1}",
+                    "label_timestamp": (
+                        start + timedelta(minutes=index * 61)
+                    ).isoformat(),
+                    "horizon_minutes": 30,
+                }
+                for index in range(40)
+            ]
+        )
 
-    def train_frame(_frame: list[Any], **kwargs: Any) -> dict[str, Any]:
+    def train_frame(_frame: pd.DataFrame, **kwargs: Any) -> dict[str, Any]:
         calls.append(f"train_frame:{bool(kwargs['persist_artifact'])}")
         assert kwargs["completed_sample_count"] == 318
         now = datetime.now(UTC).isoformat()

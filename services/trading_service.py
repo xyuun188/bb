@@ -8116,11 +8116,27 @@ class TradingService:
                         sample_count=ml_result.get("sample_count"),
                         new_sample_count=ml_result.get("new_sample_count"),
                     )
-                elif ml_result.get("reason") not in {"not_due", "training_in_progress"}:
+                elif str(ml_result.get("reason") or "") in {
+                    "error",
+                    "load_samples_error",
+                    "timeout",
+                }:
                     logger.warning(
-                        "local ML signal auto-train skipped",
+                        "local ML signal auto-train failed",
                         reason=ml_result.get("reason"),
                         error=ml_result.get("error"),
+                    )
+                elif ml_result.get("reason") not in {"not_due", "training_in_progress"}:
+                    logger.info(
+                        "local ML signal auto-train waiting for mature data",
+                        reason=ml_result.get("reason"),
+                        train_sample_count=ml_result.get("train_sample_count"),
+                        train_decision_group_count=ml_result.get(
+                            "train_decision_group_count"
+                        ),
+                        purged_training_sample_count=ml_result.get(
+                            "purged_training_sample_count"
+                        ),
                     )
             except asyncio.CancelledError:
                 raise
