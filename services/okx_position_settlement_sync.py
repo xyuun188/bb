@@ -8,7 +8,6 @@ official realized PnL and funding fee.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -18,23 +17,22 @@ from typing import Any
 import structlog
 from sqlalchemy import or_, select
 
-from core.safe_output import safe_error_text
 from core.symbols import (
     normalize_trading_symbol,
     okx_inst_id_from_symbol,
     symbol_from_okx_inst_id,
 )
 from db.session import get_session_ctx
-from executor.okx_executor import OKXExecutor
-from models.decision import AIDecision
-from models.trade import Order, Position
+from models.account import OkxAccountBill
+from models.trade import OkxPositionHistory, Position
 from services.entry_decision_settlement import (
     backfill_settled_entry_decision_outcomes,
     sync_settled_entry_decision_outcome,
 )
-from services.okx_native_facts import OkxNativeAccountBill, OkxNativeFactsClient
-from services.okx_order_fact_sync import authoritative_order_fee_fact_source
-from services.okx_position_history_store import upsert_okx_position_history_row
+from services.okx_position_history_store import (
+    load_okx_position_history_records,
+    okx_position_history_records_to_rows,
+)
 from services.position_settlement import (
     SETTLEMENT_FORMULA,
     SETTLEMENT_STATUS_EXCEPTION,
@@ -49,14 +47,19 @@ logger = structlog.get_logger(__name__)
 DEFAULT_SETTLEMENT_LOOKBACK_HOURS = 72
 DEFAULT_SETTLEMENT_LIMIT = 20
 DEFAULT_SETTLEMENT_RETRY_SECONDS = 10.0
-DEFAULT_SETTLEMENT_TIMEOUT_SECONDS = 6.0
 POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS = 45 * 60
 POSITION_HISTORY_OPEN_MATCH_WINDOW_SECONDS = 24 * 60 * 60
+POSITION_HISTORY_MATCH_MAX_ATTEMPTS = 30
+POSITION_HISTORY_MATCH_MAX_AGE_HOURS = 6.0
 SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_SOURCE = "okx_current_position_deduplication"
 SUPERSEDED_POSITION_REASON = "duplicate_local_open_position_for_same_okx_pos_id"
 DUPLICATE_CLOSED_POSITION_REASON = "duplicate_local_closed_position_for_same_okx_lifecycle"
-VERIFIED_EXECUTION_PAIR_HISTORY_SOURCE = "okx_verified_execution_pair_settlement"
+SETTLEMENT_STATUS_QUARANTINED = "settlement_quarantined"
+SETTLEMENT_QUARANTINE_SOURCE = "okx_position_history_identity_quarantine"
+NON_RETRYABLE_SETTLEMENT_STATUSES = frozenset(
+    {SUPERSEDED_POSITION_STATUS, SETTLEMENT_STATUS_QUARANTINED}
+)
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 
@@ -96,7 +99,6 @@ class SettlementSuccess:
     match_reason: str
     fee_source: str
     funding_fee_source: str
-    history_source: str = "okx_position_settlement_sync"
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +137,6 @@ class OkxPositionSettlementSyncService:
         lookback_hours: int = DEFAULT_SETTLEMENT_LOOKBACK_HOURS,
         limit: int = DEFAULT_SETTLEMENT_LIMIT,
         retry_seconds: float = DEFAULT_SETTLEMENT_RETRY_SECONDS,
-        timeout_seconds: float = DEFAULT_SETTLEMENT_TIMEOUT_SECONDS,
-        executor_factory: Any | None = None,
         session_context_factory: SessionContextFactory = get_session_ctx,
     ) -> None:
         self.mode = "live" if str(mode or "").lower() == "live" else "paper"
@@ -145,10 +145,6 @@ class OkxPositionSettlementSyncService:
         )
         self.limit = max(1, min(int(limit or DEFAULT_SETTLEMENT_LIMIT), 100))
         self.retry_seconds = max(1.0, float(retry_seconds or DEFAULT_SETTLEMENT_RETRY_SECONDS))
-        self.timeout_seconds = max(
-            1.0, float(timeout_seconds or DEFAULT_SETTLEMENT_TIMEOUT_SECONDS)
-        )
-        self.executor_factory = executor_factory or OKXExecutor
         self.session_context_factory = session_context_factory
 
     async def sync_once(self) -> dict[str, Any]:
@@ -167,7 +163,6 @@ class OkxPositionSettlementSyncService:
                 samples=tuple(decision_outcome_changes[-10:]),
             ).as_dict()
 
-        executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
         samples: list[dict[str, Any]] = []
         checked = 0
         reconciled = 0
@@ -175,74 +170,55 @@ class OkxPositionSettlementSyncService:
         exceptions = 0
         skipped = 0
         samples.extend(decision_outcome_changes[-10:])
-        fatal_error: str | None = None
-        try:
-            await asyncio.wait_for(executor.initialize(), timeout=min(self.timeout_seconds, 3.0))
-            native_facts = OkxNativeFactsClient(executor)
-            for candidate in candidates:
-                checked += 1
-                result = await self._settle_candidate(candidate, native_facts, started_at)
-                if isinstance(result, SettlementSuccess):
-                    changed, outcome_change = await self._apply_success(
-                        candidate,
-                        result,
-                        started_at,
+        for candidate in candidates:
+            checked += 1
+            result = await self._settle_candidate(candidate, started_at)
+            if isinstance(result, SettlementSuccess):
+                changed, outcome_change = await self._apply_success(
+                    candidate,
+                    result,
+                    started_at,
+                )
+                if outcome_change:
+                    decision_outcome_count += 1
+                    samples.append(outcome_change)
+                if changed:
+                    reconciled += 1
+                    samples.append(
+                        {
+                            "kind": "okx_position_settlement_reconciled",
+                            "position_id": candidate.position_id,
+                            "symbol": candidate.symbol,
+                            "side": candidate.side,
+                            "okx_pos_id": _position_history_pos_id(result.row),
+                            "realized_pnl": result.snapshot.realized_pnl,
+                            "funding_fee": result.snapshot.funding_fee,
+                            "funding_fee_source": result.funding_fee_source,
+                            "match_reason": result.match_reason,
+                        }
                     )
-                    if outcome_change:
-                        decision_outcome_count += 1
-                        samples.append(outcome_change)
-                    if changed:
-                        reconciled += 1
-                        samples.append(
-                            {
-                                "kind": "okx_position_settlement_reconciled",
-                                "position_id": candidate.position_id,
-                                "symbol": candidate.symbol,
-                                "side": candidate.side,
-                                "okx_pos_id": _position_history_pos_id(result.row),
-                                "realized_pnl": result.snapshot.realized_pnl,
-                                "funding_fee": result.snapshot.funding_fee,
-                                "funding_fee_source": result.funding_fee_source,
-                                "match_reason": result.match_reason,
-                            }
-                        )
-                    else:
-                        skipped += 1
-                    continue
-                await self._apply_failure(candidate, result, started_at)
-                exceptions += 1
-                samples.append(
-                    {
-                        "kind": "okx_position_settlement_exception",
-                        "position_id": candidate.position_id,
-                        "symbol": candidate.symbol,
-                        "side": candidate.side,
-                        "error_code": result.code,
-                        "error_message": result.message,
-                        "next_retry_seconds": self.retry_seconds,
-                    }
-                )
-        except Exception as exc:
-            fatal_error = safe_error_text(exc, limit=220)
-            logger.warning(
-                "OKX position settlement sync failed",
-                mode=self.mode,
-                error=fatal_error,
-            )
-        finally:
-            try:
-                await executor.shutdown()
-            except Exception as exc:
-                logger.debug(
-                    "OKX position settlement executor shutdown failed",
-                    error=safe_error_text(exc, limit=120),
-                )
+                else:
+                    skipped += 1
+                continue
+            quarantined = await self._apply_failure(candidate, result, started_at)
+            exceptions += 1
+            sample = {
+                "kind": (
+                    "okx_position_settlement_quarantined"
+                    if quarantined
+                    else "okx_position_settlement_exception"
+                ),
+                "position_id": candidate.position_id,
+                "symbol": candidate.symbol,
+                "side": candidate.side,
+                "error_code": result.code,
+                "error_message": result.message,
+            }
+            if not quarantined:
+                sample["next_retry_seconds"] = self.retry_seconds
+            samples.append(sample)
 
-        status = "ok"
-        if fatal_error:
-            status = "degraded"
-        elif exceptions:
-            status = "warning"
+        status = "warning" if exceptions else "ok"
         return OkxPositionSettlementSyncSummary(
             status=status,
             mode=self.mode,
@@ -252,7 +228,7 @@ class OkxPositionSettlementSyncService:
             exception_count=exceptions,
             skipped_count=skipped,
             samples=tuple(samples[-10:]),
-            error=fatal_error,
+            error=None,
         ).as_dict()
 
     async def _backfill_decision_outcomes(self, now: datetime) -> list[dict[str, Any]]:
@@ -277,7 +253,9 @@ class OkxPositionSettlementSyncService:
                     Position.closed_at >= _db_naive(since),
                     or_(
                         Position.settlement_status.is_(None),
-                        Position.settlement_status != "superseded_position_residual",
+                        Position.settlement_status.not_in(
+                            tuple(sorted(NON_RETRYABLE_SETTLEMENT_STATUSES))
+                        ),
                     ),
                     or_(
                         Position.settlement_status.is_(None),
@@ -310,7 +288,6 @@ class OkxPositionSettlementSyncService:
     async def _settle_candidate(
         self,
         candidate: SettlementCandidate,
-        native_facts: OkxNativeFactsClient,
         now: datetime,
     ) -> SettlementSuccess | SettlementFailure:
         inst_id = candidate.okx_inst_id or okx_inst_id_from_symbol(candidate.symbol)
@@ -323,55 +300,22 @@ class OkxPositionSettlementSyncService:
         closed_at = _aware_utc(candidate.closed_at) or now
         created_at = _aware_utc(candidate.created_at) or closed_at
         since = min(created_at, closed_at) - timedelta(hours=1)
-        try:
-            rows = await asyncio.wait_for(
-                native_facts.fetch_position_history_rows(
-                    inst_ids=[inst_id],
-                    pos_ids=[candidate.okx_pos_id] if candidate.okx_pos_id else None,
-                    since=since,
-                    limit=100,
-                    max_pages=2,
-                    strict=True,
-                ),
-                timeout=max(1.0, min(self.timeout_seconds * 0.65, 4.0)),
+        async with self.session_context_factory() as session:
+            records = await load_okx_position_history_records(
+                session,
+                mode=self.mode,
+                limit=5000,
             )
-        except Exception as exc:
-            return SettlementFailure(
-                code="positions_history_api_error",
-                message=safe_error_text(exc, limit=240),
-                context={
-                    "position_id": candidate.position_id,
-                    "inst_id": inst_id,
-                    "okx_pos_id": candidate.okx_pos_id,
-                    "api": "privateGetAccountPositionsHistory",
-                },
-            )
+        rows = okx_position_history_records_to_rows(records)
         if not rows:
-            execution_pair = await self._success_from_verified_execution_pair(
-                candidate,
-                native_facts,
-                now=now,
-                inst_id=inst_id,
-                created_at=created_at,
-                closed_at=closed_at,
-            )
-            if isinstance(execution_pair, SettlementSuccess):
-                return execution_pair
-            if execution_pair.code in {
-                "current_positions_api_error",
-                "funding_fee_api_error",
-            }:
-                return execution_pair
             return SettlementFailure(
-                code="positions_history_no_rows",
-                message="OKX positions-history returned no rows for the position identity yet.",
+                code="position_history_mirror_no_rows",
+                message="The local OKX settlement-fact mirror has no position-history rows yet.",
                 context={
                     "position_id": candidate.position_id,
                     "inst_id": inst_id,
                     "okx_pos_id": candidate.okx_pos_id,
                     "since": since.isoformat(),
-                    "execution_pair_fallback_code": execution_pair.code,
-                    "execution_pair_fallback_message": execution_pair.message,
                 },
             )
         match = _match_position_history_row(candidate, rows, inst_id=inst_id)
@@ -381,7 +325,6 @@ class OkxPositionSettlementSyncService:
         return await self._success_from_position_history_row(
             candidate,
             row,
-            native_facts,
             now=now,
             match_reason=match_reason,
             inst_id=inst_id,
@@ -389,284 +332,10 @@ class OkxPositionSettlementSyncService:
             closed_at=closed_at,
         )
 
-    async def _success_from_verified_execution_pair(
-        self,
-        candidate: SettlementCandidate,
-        native_facts: OkxNativeFactsClient,
-        *,
-        now: datetime,
-        inst_id: str,
-        created_at: datetime,
-        closed_at: datetime,
-    ) -> SettlementSuccess | SettlementFailure:
-        entry_ids = sorted(_split_exchange_order_ids(candidate.entry_exchange_order_id))
-        close_ids = sorted(_split_exchange_order_ids(candidate.close_exchange_order_id))
-        if not entry_ids or not close_ids:
-            return SettlementFailure(
-                code="execution_pair_lineage_incomplete",
-                message="Verified execution-pair settlement requires entry and close order IDs.",
-                context={"position_id": candidate.position_id},
-            )
-        if not candidate.okx_pos_id:
-            return SettlementFailure(
-                code="execution_pair_position_identity_incomplete",
-                message="Verified execution-pair settlement requires the OKX position ID.",
-                context={"position_id": candidate.position_id, "inst_id": inst_id},
-            )
-        all_ids = sorted({*entry_ids, *close_ids})
-        async with self.session_context_factory() as session:
-            order_result = await session.execute(
-                select(Order).where(
-                    Order.execution_mode == self.mode,
-                    Order.exchange_order_id.in_(all_ids),
-                )
-            )
-            orders = list(order_result.scalars().all())
-            decision_ids = {
-                int(order.decision_id or 0)
-                for order in orders
-                if int(order.decision_id or 0) > 0
-            }
-            decision_result = (
-                await session.execute(
-                    select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
-                )
-                if decision_ids
-                else None
-            )
-            decisions = (
-                list(decision_result.scalars().all())
-                if decision_result is not None
-                else []
-            )
-        orders_by_id = {
-            str(order.exchange_order_id or "").strip(): order
-            for order in orders
-            if str(order.exchange_order_id or "").strip()
-        }
-        if any(order_id not in orders_by_id for order_id in all_ids):
-            return SettlementFailure(
-                code="execution_pair_order_missing",
-                message="One or more linked execution-pair orders are missing.",
-                context={"position_id": candidate.position_id, "order_ids": all_ids},
-            )
-        entry_orders = [orders_by_id[order_id] for order_id in entry_ids]
-        close_orders = [orders_by_id[order_id] for order_id in close_ids]
-        order_fee_sources: dict[str, str] = {}
-        for order_id in all_ids:
-            source = authoritative_order_fee_fact_source(
-                orders_by_id[order_id],
-                order_id=order_id,
-            )
-            if source is None:
-                return SettlementFailure(
-                    code="execution_pair_order_fact_incomplete",
-                    message="A linked order lacks verified OKX quantity, price, or fee facts.",
-                    context={"position_id": candidate.position_id, "order_id": order_id},
-                )
-            order_fee_sources[order_id] = source
-
-        entry_fill_times = [
-            _aware_utc(getattr(order, "filled_at", None)) for order in entry_orders
-        ]
-        close_fill_times = [
-            _aware_utc(getattr(order, "filled_at", None)) for order in close_orders
-        ]
-        if any(value is None for value in (*entry_fill_times, *close_fill_times)):
-            return SettlementFailure(
-                code="execution_pair_order_timestamp_incomplete",
-                message="A linked order lacks its OKX-confirmed fill timestamp.",
-                context={"position_id": candidate.position_id, "order_ids": all_ids},
-            )
-        settlement_opened_at = min(value for value in entry_fill_times if value is not None)
-        settlement_closed_at = max(value for value in close_fill_times if value is not None)
-        if settlement_closed_at < settlement_opened_at:
-            return SettlementFailure(
-                code="execution_pair_timestamp_order_invalid",
-                message="Verified close fill time precedes the entry fill time.",
-                context={
-                    "position_id": candidate.position_id,
-                    "opened_at": settlement_opened_at.isoformat(),
-                    "closed_at": settlement_closed_at.isoformat(),
-                },
-            )
-
-        try:
-            current_positions = await asyncio.wait_for(
-                native_facts.fetch_positions(inst_ids=[inst_id]),
-                timeout=max(1.0, min(self.timeout_seconds * 0.25, 2.0)),
-            )
-        except Exception as exc:
-            return SettlementFailure(
-                code="current_positions_api_error",
-                message=safe_error_text(exc, limit=240),
-                context={
-                    "position_id": candidate.position_id,
-                    "inst_id": inst_id,
-                    "okx_pos_id": candidate.okx_pos_id,
-                    "api": "privateGetAccountPositions",
-                },
-            )
-        if _has_matching_current_position(
-            current_positions,
-            inst_id=inst_id,
-            okx_pos_id=candidate.okx_pos_id,
-        ):
-            return SettlementFailure(
-                code="execution_pair_lifecycle_still_open",
-                message="The linked OKX position lifecycle is still open.",
-                context={
-                    "position_id": candidate.position_id,
-                    "inst_id": inst_id,
-                    "okx_pos_id": candidate.okx_pos_id,
-                },
-            )
-
-        decisions_by_id = {int(decision.id): decision for decision in decisions}
-        entry_decision = next(
-            (
-                decisions_by_id.get(int(order.decision_id or 0))
-                for order in entry_orders
-                if int(order.decision_id or 0) > 0
-            ),
-            None,
-        )
-        contract_spec = _verified_entry_contract_spec(entry_decision, inst_id=inst_id)
-        if not contract_spec:
-            return SettlementFailure(
-                code="execution_pair_contract_spec_incomplete",
-                message="Entry decision lacks the verified OKX public contract specification.",
-                context={"position_id": candidate.position_id, "inst_id": inst_id},
-            )
-
-        entry_quantity = sum(_order_base_quantity(order) for order in entry_orders)
-        close_quantity = sum(_order_base_quantity(order) for order in close_orders)
-        quantity_tolerance = max(abs(candidate.quantity) * 0.001, 1e-9)
-        if (
-            candidate.quantity <= 0
-            or entry_quantity + quantity_tolerance < candidate.quantity
-            or abs(close_quantity - candidate.quantity) > quantity_tolerance
-        ):
-            return SettlementFailure(
-                code="execution_pair_quantity_mismatch",
-                message="Verified entry/close quantities do not cover the closed position.",
-                context={
-                    "position_id": candidate.position_id,
-                    "position_quantity": candidate.quantity,
-                    "entry_quantity": entry_quantity,
-                    "close_quantity": close_quantity,
-                },
-            )
-        close_gross_pnl = 0.0
-        close_notional = 0.0
-        close_fee = 0.0
-        for order in close_orders:
-            raw = _safe_dict(getattr(order, "okx_raw_fills", None))
-            if raw.get("fill_pnl") is None and getattr(order, "okx_fill_pnl", None) is None:
-                return SettlementFailure(
-                    code="execution_pair_close_pnl_missing",
-                    message="Verified close execution lacks exchange fill PnL.",
-                    context={
-                        "position_id": candidate.position_id,
-                        "order_id": getattr(order, "exchange_order_id", None),
-                    },
-                )
-            quantity = _order_base_quantity(order)
-            price = _safe_float(getattr(order, "price", None), 0.0)
-            close_notional += quantity * price
-            close_gross_pnl += _safe_float(
-                raw.get("fill_pnl")
-                if raw.get("fill_pnl") is not None
-                else getattr(order, "okx_fill_pnl", None),
-                0.0,
-            )
-            close_fee += abs(_safe_float(raw.get("fee_abs"), 0.0))
-        total_entry_fee = sum(
-            abs(_safe_float(_safe_dict(order.okx_raw_fills).get("fee_abs"), 0.0))
-            for order in entry_orders
-        )
-        entry_allocation_ratio = min(candidate.quantity / entry_quantity, 1.0)
-        entry_fee = total_entry_fee * entry_allocation_ratio
-        funding_result = await self._funding_fee_from_account_bills(
-            candidate,
-            native_facts,
-            inst_id=inst_id,
-            created_at=settlement_opened_at,
-            closed_at=settlement_closed_at,
-        )
-        if isinstance(funding_result, SettlementFailure):
-            return funding_result
-        funding_fee, funding_source = funding_result
-        snapshot = build_position_settlement_snapshot(
-            close_fill_pnl=close_gross_pnl,
-            entry_fee=entry_fee,
-            close_fee=close_fee,
-            funding_fee=funding_fee,
-            status="reconciled",
-            source=VERIFIED_EXECUTION_PAIR_HISTORY_SOURCE,
-            synced_at=now,
-            raw={
-                "formula": SETTLEMENT_FORMULA,
-                "authority": "okx_verified_execution_pair_plus_account_bills",
-                "entry_order_ids": entry_ids,
-                "close_order_ids": close_ids,
-                "order_fee_sources": order_fee_sources,
-                "funding_fee_source": funding_source,
-                "contract_spec": contract_spec,
-            },
-        )
-        entry_contracts = (
-            sum(_order_contracts(order) for order in entry_orders) * entry_allocation_ratio
-        )
-        close_contracts = sum(_order_contracts(order) for order in close_orders)
-        close_price = close_notional / close_quantity if close_quantity > 0 else 0.0
-        ct_val = _safe_float(contract_spec.get("ctVal"), 0.0)
-        ct_mult = _safe_float(contract_spec.get("ctMult"), 0.0)
-        entry_notional = entry_contracts * ct_val * ct_mult * candidate.entry_price
-        pnl_ratio = (
-            snapshot.realized_pnl / max(entry_notional / max(candidate.leverage, 1.0), 1e-12)
-            if entry_notional > 0
-            else None
-        )
-        row = {
-            "instId": inst_id,
-            "posId": candidate.okx_pos_id,
-            "posSide": "net",
-            "direction": candidate.side,
-            "openSide": "buy" if candidate.side == "long" else "sell",
-            "type": "2",
-            "cTime": str(int(settlement_opened_at.timestamp() * 1000)),
-            "uTime": str(int(settlement_closed_at.timestamp() * 1000)),
-            "openAvgPx": str(candidate.entry_price),
-            "closeAvgPx": str(close_price),
-            "openMaxPos": str(entry_contracts),
-            "closeTotalPos": str(close_contracts),
-            "lever": str(candidate.leverage),
-            "realizedPnl": str(snapshot.realized_pnl),
-            "pnl": str(snapshot.close_fill_pnl),
-            "fee": str(-(snapshot.entry_fee + snapshot.close_fee)),
-            "fundingFee": str(snapshot.funding_fee),
-            "pnlRatio": str(pnl_ratio) if pnl_ratio is not None else "",
-            "_bb_contract_spec": contract_spec,
-            "_bb_source_authority": "okx_verified_execution_pair_plus_account_bills",
-            "_bb_pnl_source": VERIFIED_EXECUTION_PAIR_HISTORY_SOURCE,
-            "_bb_fee_source": "+".join(sorted(set(order_fee_sources.values()))),
-            "_bb_funding_fee_source": funding_source,
-        }
-        return SettlementSuccess(
-            row=row,
-            snapshot=snapshot,
-            match_reason="verified_okx_execution_pair",
-            fee_source=row["_bb_fee_source"],
-            funding_fee_source=funding_source,
-            history_source=VERIFIED_EXECUTION_PAIR_HISTORY_SOURCE,
-        )
-
     async def _success_from_position_history_row(
         self,
         candidate: SettlementCandidate,
         row: dict[str, Any],
-        native_facts: OkxNativeFactsClient,
         *,
         now: datetime,
         match_reason: str,
@@ -689,7 +358,6 @@ class OkxPositionSettlementSyncService:
         if funding_key is None:
             funding_result = await self._funding_fee_from_account_bills(
                 candidate,
-                native_facts,
                 inst_id=inst_id,
                 created_at=created_at,
                 closed_at=closed_at,
@@ -760,36 +428,23 @@ class OkxPositionSettlementSyncService:
     async def _funding_fee_from_account_bills(
         self,
         candidate: SettlementCandidate,
-        native_facts: OkxNativeFactsClient,
         *,
         inst_id: str,
         created_at: datetime,
         closed_at: datetime,
     ) -> tuple[float, str] | SettlementFailure:
-        since = created_at - timedelta(hours=1)
-        try:
-            bills = await asyncio.wait_for(
-                native_facts.fetch_account_bills(
-                    inst_ids=[inst_id],
-                    since=since,
-                    limit=100,
-                    max_pages=3,
-                    funding_only=True,
-                    strict=True,
-                ),
-                timeout=max(1.0, min(self.timeout_seconds * 0.35, 3.0)),
+        window_start = created_at - timedelta(minutes=10)
+        window_end = closed_at + timedelta(minutes=10)
+        async with self.session_context_factory() as session:
+            result = await session.execute(
+                select(OkxAccountBill).where(
+                    OkxAccountBill.mode == self.mode,
+                    OkxAccountBill.inst_id == inst_id,
+                    OkxAccountBill.bill_ts >= _db_naive(window_start),
+                    OkxAccountBill.bill_ts <= _db_naive(window_end),
+                )
             )
-        except Exception as exc:
-            return SettlementFailure(
-                code="funding_fee_api_error",
-                message=safe_error_text(exc, limit=240),
-                context={
-                    "position_id": candidate.position_id,
-                    "inst_id": inst_id,
-                    "api": "privateGetAccountBills",
-                    "since": since.isoformat(),
-                },
-            )
+            bills = list(result.scalars().all())
         funding_fee = _sum_matching_funding_bills(
             bills,
             inst_id=inst_id,
@@ -797,7 +452,7 @@ class OkxPositionSettlementSyncService:
             opened_at=created_at,
             closed_at=closed_at,
         )
-        return funding_fee, "okx_account_bills.funding_only"
+        return funding_fee, "okx_settlement_fact_mirror.account_bills"
 
     async def _apply_success(
         self,
@@ -817,6 +472,8 @@ class OkxPositionSettlementSyncService:
                 return False, None
             if is_final_settlement_status(getattr(position, "settlement_status", None)):
                 return False, None
+            if _is_non_retryable_settlement_status(position):
+                return False, None
             apply_position_settlement_snapshot(position, success.snapshot)
             row_inst_id = _position_history_inst_id(success.row)
             row_pos_id = _position_history_pos_id(success.row)
@@ -828,16 +485,14 @@ class OkxPositionSettlementSyncService:
             row_side = _position_history_side(success.row)
             if row_side in {"long", "short"}:
                 position.side = row_side
-            history = await upsert_okx_position_history_row(
-                session,
-                success.row,
-                mode=self.mode,
-                source=success.history_source,
-                entry_order_ids=[candidate.entry_exchange_order_id],
-                close_order_ids=[candidate.close_exchange_order_id],
-                position_ids=[candidate.position_id],
-                match_status=success.match_reason,
-                synced_at=now,
+            history_record_id = _safe_int(
+                success.row.get("_dashboard_history_record_id"),
+                0,
+            )
+            history = (
+                await session.get(OkxPositionHistory, history_record_id)
+                if history_record_id > 0
+                else None
             )
             outcome_change = await sync_settled_entry_decision_outcome(
                 session,
@@ -857,40 +512,93 @@ class OkxPositionSettlementSyncService:
         candidate: SettlementCandidate,
         failure: SettlementFailure,
         now: datetime,
-    ) -> None:
+    ) -> bool:
         next_retry_at = now + timedelta(seconds=self.retry_seconds)
         async with self.session_context_factory() as session:
             position = await session.get(Position, candidate.position_id)
             if position is None or bool(position.is_open):
-                return
+                return False
             raw = getattr(position, "settlement_raw", None)
             raw = raw if isinstance(raw, dict) else {}
             if _has_superseded_position_metadata(position, raw):
                 _restore_superseded_position_status(position, raw, now=now)
                 await session.flush()
-                return
+                return False
             if is_final_settlement_status(getattr(position, "settlement_status", None)):
-                return
+                return False
+            if _is_non_retryable_settlement_status(position):
+                return False
             attempts = _safe_int(raw.get("settlement_attempt_count"), 0) + 1
-            position.settlement_status = SETTLEMENT_STATUS_EXCEPTION
-            position.settlement_source = "okx_position_history_settlement"
+            closed_at = _aware_utc(candidate.closed_at)
+            closed_age_hours = (
+                max((now - closed_at).total_seconds() / 3600.0, 0.0)
+                if closed_at is not None
+                else 0.0
+            )
+            quarantine_triggers: list[str] = []
+            if attempts >= POSITION_HISTORY_MATCH_MAX_ATTEMPTS:
+                quarantine_triggers.append("attempt_limit")
+            if closed_age_hours >= POSITION_HISTORY_MATCH_MAX_AGE_HOURS:
+                quarantine_triggers.append("closed_age_limit")
+            quarantined = bool(
+                failure.code == "positions_history_no_matching_row" and quarantine_triggers
+            )
+            status = (
+                SETTLEMENT_STATUS_QUARANTINED
+                if quarantined
+                else SETTLEMENT_STATUS_EXCEPTION
+            )
+            source = (
+                SETTLEMENT_QUARANTINE_SOURCE
+                if quarantined
+                else "okx_position_history_settlement"
+            )
+            position.settlement_status = status
+            position.settlement_source = source
             position.settlement_synced_at = now
-            position.settlement_raw = {
+            updated_raw = {
                 **raw,
-                "status": SETTLEMENT_STATUS_EXCEPTION,
-                "source": "okx_position_history_settlement",
+                "status": status,
+                "source": source,
                 "formula": SETTLEMENT_FORMULA,
                 "funding_fee_status": "unknown_until_official_settlement",
                 "last_error_code": failure.code,
                 "last_error_message": failure.message,
                 "last_error_context": failure.context,
                 "last_settlement_attempt_at": now.isoformat(),
-                "next_settlement_retry_at": next_retry_at.isoformat(),
                 "settlement_attempt_count": attempts,
-                "retry_policy": f"retry every {self.retry_seconds:g}s until OKX official settlement is available",
             }
+            if quarantined:
+                updated_raw.pop("next_settlement_retry_at", None)
+                updated_raw.update(
+                    {
+                        "quarantine_reason": "official_position_history_identity_unresolved",
+                        "quarantined_at": now.isoformat(),
+                        "quarantine_evidence": {
+                            "triggers": quarantine_triggers,
+                            "attempt_count": attempts,
+                            "max_attempts": POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
+                            "closed_at": _iso(closed_at),
+                            "closed_age_hours": closed_age_hours,
+                            "max_age_hours": POSITION_HISTORY_MATCH_MAX_AGE_HOURS,
+                        },
+                        "retry_policy": "permanent_no_retry",
+                    }
+                )
+            else:
+                updated_raw.update(
+                    {
+                        "next_settlement_retry_at": next_retry_at.isoformat(),
+                        "retry_policy": (
+                            f"retry every {self.retry_seconds:g}s until OKX official "
+                            "settlement is available"
+                        ),
+                    }
+                )
+            position.settlement_raw = updated_raw
             position.updated_at = now
             await session.flush()
+            return quarantined
 
 
 def _deduplicate_closed_lifecycle_rows(
@@ -961,77 +669,6 @@ def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
         created_at.isoformat(),
         closed_at.isoformat(),
     )
-
-
-def _verified_entry_contract_spec(
-    decision: AIDecision | None,
-    *,
-    inst_id: str,
-) -> dict[str, Any]:
-    raw = _safe_dict(getattr(decision, "raw_llm_response", None))
-    pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
-    spec = _safe_dict(pre_order.get("contract_spec"))
-    if (
-        str(spec.get("instId") or "").strip().upper() != inst_id
-        or str(spec.get("source") or "").strip() != "okx_public_instruments"
-        or _safe_float(spec.get("ctVal"), 0.0) <= 0
-        or _safe_float(spec.get("ctMult"), 0.0) <= 0
-        or _safe_float(spec.get("lotSz"), 0.0) <= 0
-    ):
-        return {}
-    return dict(spec)
-
-
-def _order_base_quantity(order: Order) -> float:
-    raw = _safe_dict(getattr(order, "okx_raw_fills", None))
-    return abs(
-        _safe_float(
-            raw.get("base_quantity")
-            or raw.get("filled_base_quantity")
-            or getattr(order, "quantity", None),
-            0.0,
-        )
-    )
-
-
-def _order_contracts(order: Order) -> float:
-    raw = _safe_dict(getattr(order, "okx_raw_fills", None))
-    return abs(
-        _safe_float(
-            raw.get("contracts")
-            or raw.get("filled_contracts")
-            or getattr(order, "okx_fill_contracts", None),
-            0.0,
-        )
-    )
-
-
-def _has_matching_current_position(
-    rows: list[dict[str, Any]],
-    *,
-    inst_id: str,
-    okx_pos_id: str,
-) -> bool:
-    target_inst_id = str(inst_id or "").strip().upper()
-    target_pos_id = str(okx_pos_id or "").strip()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        info = _safe_dict(row.get("info"))
-        row_inst_id = str(
-            info.get("instId")
-            or row.get("instId")
-            or okx_inst_id_from_symbol(row.get("symbol"))
-            or ""
-        ).strip().upper()
-        if row_inst_id != target_inst_id:
-            continue
-        row_pos_id = str(
-            info.get("posId") or row.get("posId") or row.get("position_id") or ""
-        ).strip()
-        if not row_pos_id or row_pos_id == target_pos_id:
-            return True
-    return False
 
 
 def _candidate_from_position(position: Position, raw: dict[str, Any]) -> SettlementCandidate:
@@ -1140,7 +777,7 @@ def _match_position_history_row(
 
 
 def _sum_matching_funding_bills(
-    bills: list[OkxNativeAccountBill],
+    bills: list[Any],
     *,
     inst_id: str,
     side: str,
@@ -1157,7 +794,9 @@ def _sum_matching_funding_bills(
         bill_side = str(getattr(bill, "pos_side", "") or "").lower().strip()
         if bill_side in {"long", "short"} and side and bill_side != side:
             continue
-        bill_time = _aware_utc(getattr(bill, "timestamp", None))
+        bill_time = _aware_utc(
+            getattr(bill, "bill_ts", None) or getattr(bill, "timestamp", None)
+        )
         if bill_time is None or bill_time < window_start or bill_time > window_end:
             continue
         total += _safe_float(getattr(bill, "funding_fee", None), 0.0)
@@ -1185,6 +824,13 @@ def _allocate_total_fee(
 def _retry_after(raw: dict[str, Any], now: datetime) -> bool:
     next_retry = _parse_datetime(raw.get("next_settlement_retry_at"))
     return next_retry is not None and next_retry > now
+
+
+def _is_non_retryable_settlement_status(position: Position) -> bool:
+    return (
+        str(getattr(position, "settlement_status", "") or "").strip()
+        in NON_RETRYABLE_SETTLEMENT_STATUSES
+    )
 
 
 def _has_superseded_position_metadata(position: Position, raw: dict[str, Any]) -> bool:

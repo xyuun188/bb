@@ -7,102 +7,9 @@ import pytest
 
 from services.okx_native_facts import (
     OkxNativeFactsClient,
-    OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
-    derive_okx_account_contract_size_evidence,
-    derive_okx_account_history_contract_size_evidence,
     group_okx_native_fill_rows,
 )
-
-
-def test_account_contract_size_uses_private_margin_and_notional_crosscheck() -> None:
-    evidence = derive_okx_account_contract_size_evidence(
-        {
-            "instId": "ZAMA-USDT-SWAP",
-            "pos": "24",
-            "avgPx": "0.04122",
-            "markPx": "0.04112",
-            "lever": "1",
-            "imr": "98.688",
-            "notionalUsd": "98.688",
-        }
-    )
-
-    assert evidence.verified is True
-    assert evidence.contract_size == pytest.approx(100.0, rel=0.001)
-    assert evidence.source == "okx_account_position_margin_notional_crosscheck"
-
-
-def test_account_contract_size_conflict_is_quarantined() -> None:
-    evidence = derive_okx_account_contract_size_evidence(
-        {
-            "instId": "ZAMA-USDT-SWAP",
-            "pos": "24",
-            "avgPx": "0.04122",
-            "markPx": "0.04112",
-            "lever": "1",
-            "imr": "98.688",
-            "notionalUsd": "9.8688",
-        }
-    )
-
-    assert evidence.verified is False
-    assert evidence.contract_size == 0
-    assert evidence.source == "okx_account_position_evidence_conflict"
-
-
-def test_closed_account_history_recovers_contract_size_from_two_official_paths() -> None:
-    opened = datetime(2026, 7, 22, 9, 48, 44, tzinfo=UTC)
-    fills = (
-        OkxNativeFillGroup(
-            order_id="close-1",
-            trade_ids=("trade-1",),
-            inst_id="ZAMA-USDT-SWAP",
-            symbol="ZAMA/USDT",
-            side="sell",
-            pos_side="net",
-            contracts=38.0,
-            avg_price=0.04115,
-            fee_abs=0.078185,
-            fill_pnl=-0.266,
-            timestamp_ms=(opened + timedelta(minutes=2)).timestamp() * 1000,
-            timestamp=opened + timedelta(minutes=2),
-            raw_count=1,
-        ),
-        OkxNativeFillGroup(
-            order_id="close-2",
-            trade_ids=("trade-2",),
-            inst_id="ZAMA-USDT-SWAP",
-            symbol="ZAMA/USDT",
-            side="sell",
-            pos_side="net",
-            contracts=24.0,
-            avg_price=0.04119,
-            fee_abs=0.049428,
-            fill_pnl=-0.072,
-            timestamp_ms=(opened + timedelta(minutes=11)).timestamp() * 1000,
-            timestamp=opened + timedelta(minutes=11),
-            raw_count=1,
-        ),
-    )
-    evidence = derive_okx_account_history_contract_size_evidence(
-        {
-            "instId": "ZAMA-USDT-SWAP",
-            "direction": "long",
-            "openMaxPos": "62",
-            "closeTotalPos": "62",
-            "openAvgPx": "0.04122",
-            "closeAvgPx": "0.0411654838709677",
-            "pnl": "-0.338",
-            "cTime": str(int(opened.timestamp() * 1000)),
-            "uTime": str(int((opened + timedelta(minutes=11)).timestamp() * 1000)),
-        },
-        fills=fills,
-    )
-
-    assert evidence.verified is True
-    assert evidence.contract_size == pytest.approx(100.0)
-    assert evidence.source == "okx_account_position_history_pnl_fill_crosscheck"
 
 
 class _FakeCcxt:
@@ -110,6 +17,7 @@ class _FakeCcxt:
         self.rows = rows
         self.fail_instrument = fail_instrument
         self.params: list[dict[str, Any]] = []
+        self.recent_params: list[dict[str, Any]] = []
         self.instrument_params: list[dict[str, Any]] = []
 
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -117,6 +25,10 @@ class _FakeCcxt:
         if self.fail_instrument and params.get("instId"):
             raise RuntimeError("51001 instrument does not exist")
         return {"data": self.rows}
+
+    async def privateGetTradeFills(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.recent_params.append(dict(params))
+        return {"data": []}
 
     async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
         self.instrument_params.append(dict(params))
@@ -305,6 +217,7 @@ class _PagedFillCcxt:
     def __init__(self, pages: dict[str, list[dict[str, Any]]]) -> None:
         self.pages = pages
         self.params: list[dict[str, Any]] = []
+        self.recent_params: list[dict[str, Any]] = []
 
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         self.params.append(dict(params))
@@ -312,6 +225,34 @@ class _PagedFillCcxt:
             return {"data": self.pages.get(str(params.get("ordId")), [])}
         cursor = str(params.get("after") or "")
         return {"data": self.pages.get(cursor, [])}
+
+    async def privateGetTradeFills(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.recent_params.append(dict(params))
+        return {"data": []}
+
+
+class _SplitFillCcxt:
+    def __init__(
+        self,
+        *,
+        recent_rows: list[dict[str, Any]],
+        historical_rows: list[dict[str, Any]],
+    ) -> None:
+        self.recent_rows = recent_rows
+        self.historical_rows = historical_rows
+        self.recent_calls = 0
+        self.historical_calls = 0
+
+    async def privateGetTradeFills(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.recent_calls += 1
+        return {"data": self.recent_rows}
+
+    async def privateGetTradeFillsHistory(
+        self,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.historical_calls += 1
+        return {"data": self.historical_rows}
 
 
 class _OrderHistoryCcxt(_FakeCcxt):
@@ -550,6 +491,47 @@ def test_group_okx_native_fill_rows_uses_inst_id_not_ccxt_alias() -> None:
     assert group.avg_price == pytest.approx(((120 * 0.017) + (80 * 0.018)) / 200)
     assert group.fee_abs == pytest.approx(0.03)
     assert group.fill_pnl == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_native_facts_merge_recent_and_historical_okx_fill_ledgers() -> None:
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    ccxt = _SplitFillCcxt(
+        recent_rows=[
+            {
+                "instId": "ACT-USDT-SWAP",
+                "ordId": "recent-order",
+                "tradeId": "recent-trade",
+                "side": "buy",
+                "fillSz": "4",
+                "fillPx": "0.00895",
+                "ts": str(now_ms),
+            }
+        ],
+        historical_rows=[
+            {
+                "instId": "ACT-USDT-SWAP",
+                "ordId": "historical-order",
+                "tradeId": "historical-trade",
+                "side": "sell",
+                "fillSz": "3",
+                "fillPx": "0.0091",
+                "ts": str(now_ms - 1000),
+            }
+        ],
+    )
+
+    groups = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_fill_groups(
+        inst_ids=["ACT-USDT-SWAP"],
+        strict=True,
+    )
+
+    assert {group.order_id for group in groups} == {
+        "recent-order",
+        "historical-order",
+    }
+    assert ccxt.recent_calls == 1
+    assert ccxt.historical_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1201,7 +1183,7 @@ async def test_native_facts_client_fetch_positions_uses_signed_okx_net_position(
     assert positions[0]["symbol"] == "SPK-USDT-SWAP"
     assert positions[0]["side"] == "short"
     assert positions[0]["contracts"] == pytest.approx(200.0)
-    assert positions[0]["contractSize"] == pytest.approx(1.0)
+    assert positions[0]["contractSize"] is None
     assert positions[0]["info"]["instId"] == "SPK-USDT-SWAP"
     assert positions[0]["info"]["posId"] == "spk-pos-1"
     assert positions[0]["info"]["tradeId"] == "spk-trade-1"

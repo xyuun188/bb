@@ -261,7 +261,12 @@ def _instrument_to_market(instrument: Mapping[str, Any]) -> dict[str, Any]:
     inst_id = str(instrument.get("instId") or "").strip().upper()
     symbol = symbol_from_okx_inst_id(inst_id)
     base = symbol.split("/")[0] if "/" in symbol else inst_id.split("-")[0]
-    contract_size = _safe_float(instrument.get("ctVal"), 1.0) or 1.0
+    contract_size = _safe_float(instrument.get("ctVal"), 0.0) * _safe_float(
+        instrument.get("ctMult"),
+        1.0,
+    )
+    if contract_size <= 0:
+        raise ExchangeAPIError(f"OKX public instrument contract size is missing for {inst_id!r}")
     amount_step = _safe_float(instrument.get("lotSz"), 0.0)
     min_size = _safe_float(instrument.get("minSz"), 0.0)
     max_market_size = _safe_float(instrument.get("maxMktSz"), 0.0)
@@ -662,6 +667,23 @@ class OkxPerpetualSdkExchange:
             limit=str(params.get("limit") or ""),
             uly=str(params.get("uly") or ""),
             instFamily=str(params.get("instFamily") or ""),
+        )
+
+    async def privateGetTradeFills(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.trade_api,
+            "get_fills",
+            instType=OKX_SWAP_INST_TYPE,
+            instId=str(params.get("instId") or ""),
+            ordId=str(params.get("ordId") or ""),
+            after=str(params.get("after") or ""),
+            before=str(params.get("before") or ""),
+            limit=str(params.get("limit") or ""),
+            uly=str(params.get("uly") or ""),
+            instFamily=str(params.get("instFamily") or ""),
+            begin=str(params.get("begin") or ""),
+            end=str(params.get("end") or ""),
         )
 
     async def privateGetTradeOrder(self, params: Mapping[str, Any]) -> dict[str, Any]:

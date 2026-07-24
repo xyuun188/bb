@@ -248,10 +248,13 @@ def _entry_contract_row(
     orders: list[Any],
     executed: bool,
 ) -> tuple[dict[str, Any], list[str]]:
-    filled_notional = sum(
-        abs(_safe_float(_row_get(order, "quantity")) * _safe_float(_row_get(order, "price")))
-        for order in orders
-        if _order_status(order) in FILLED_STATUSES
+    (
+        filled_notional,
+        fill_fact_reasons,
+        filled_notional_source,
+    ) = _okx_filled_order_notional_usdt(
+        raw,
+        orders,
     )
     contract, reasons = validate_entry_execution_contract(
         raw,
@@ -260,6 +263,10 @@ def _entry_contract_row(
         executed=executed,
         filled_order_present=_has_filled_order(orders),
     )
+    reasons = list(dict.fromkeys([*reasons, *fill_fact_reasons]))
+    contract["contract_complete"] = not reasons
+    contract["filled_order_notional_usdt"] = filled_notional
+    contract["filled_order_notional_source"] = filled_notional_source
     row = {
         "decision_id": _row_get(decision, "id"),
         "symbol": _row_get(decision, "symbol"),
@@ -272,6 +279,129 @@ def _entry_contract_row(
         "reasons": reasons,
     }
     return row, reasons
+
+
+def _okx_filled_order_notional_usdt(
+    raw: dict[str, Any],
+    orders: list[Any],
+) -> tuple[float, list[str], str | None]:
+    filled_orders = [
+        order for order in orders if _order_status(order) in FILLED_STATUSES
+    ]
+    if not filled_orders:
+        return 0.0, [], None
+
+    pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
+    spec = _safe_dict(pre_order.get("contract_spec"))
+    spec_source = str(spec.get("source") or "").strip()
+    ct_val = _safe_float(spec.get("ctVal"), 0.0)
+    ct_mult = _safe_float(spec.get("ctMult"), 0.0)
+    contract_value_base = ct_val * ct_mult
+    pre_order_inst_id = str(pre_order.get("inst_id") or "").strip().upper()
+    reasons: list[str] = []
+    if spec_source != "okx_public_instruments":
+        reasons.append("filled_order_contract_spec_source_not_okx_public_instruments")
+    if contract_value_base <= 0:
+        reasons.append("filled_order_public_contract_spec_incomplete")
+    if not pre_order_inst_id:
+        reasons.append("filled_order_pre_order_instrument_missing")
+    if reasons:
+        return 0.0, reasons, None
+
+    total = 0.0
+    execution_sources: set[str] = set()
+    for order in filled_orders:
+        fact = _safe_dict(_row_get(order, "okx_raw_fills"))
+        exchange_order_id = str(_row_get(order, "exchange_order_id") or "").strip()
+        fact_order_id = str(fact.get("order_id") or "").strip()
+        fact_inst_id = str(fact.get("inst_id") or "").strip().upper()
+        contracts = _safe_float(fact.get("contracts"), 0.0)
+        stored_contracts = _safe_float(_row_get(order, "okx_fill_contracts"), 0.0)
+        fill_price = _safe_float(fact.get("avg_price"), 0.0)
+        fact_contract_size = _safe_float(fact.get("contract_size"), 0.0)
+        expected_base_quantity = contracts * contract_value_base
+        fact_base_quantity = _safe_float(fact.get("base_quantity"), 0.0)
+        stored_base_quantity = _safe_float(_row_get(order, "quantity"), 0.0)
+        trade_ids = _safe_list(fact.get("trade_ids"))
+        execution_source = _okx_execution_confirmation_source(fact)
+
+        identity_complete = bool(
+            execution_source
+            and exchange_order_id
+            and fact_order_id == exchange_order_id
+            and fact_inst_id
+            and fact_inst_id == pre_order_inst_id
+            and any(str(trade_id or "").strip() for trade_id in trade_ids)
+            and contracts > 0
+            and fill_price > 0
+        )
+        if not identity_complete:
+            reasons.append("filled_order_okx_fill_identity_incomplete")
+            continue
+        execution_sources.add(execution_source)
+        if (
+            fact.get("contract_size_verified") is not True
+            or str(fact.get("contract_size_source") or "").strip()
+            != "okx_public_instruments"
+        ):
+            reasons.append("filled_order_contract_size_not_okx_public_instruments")
+            continue
+        if not isclose(
+            fact_contract_size,
+            contract_value_base,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            reasons.append("filled_order_contract_size_differs_from_pre_order_spec")
+        if (
+            stored_contracts <= 0
+            or not isclose(
+                stored_contracts,
+                contracts,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            reasons.append("filled_order_contract_count_mismatch")
+        if (
+            fact_base_quantity <= 0
+            or stored_base_quantity <= 0
+            or not isclose(
+                fact_base_quantity,
+                expected_base_quantity,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            or not isclose(
+                stored_base_quantity,
+                expected_base_quantity,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            reasons.append("filled_order_contract_quantity_mismatch")
+        total += abs(contracts * contract_value_base * fill_price)
+    notional_source = None
+    if total > 0 and execution_sources == {"okx_fills_history"}:
+        notional_source = "okx_fill_contracts_x_pre_order_public_contract_spec_x_fill_price"
+    elif total > 0 and execution_sources == {"okx_order_detail"}:
+        notional_source = "okx_order_detail_contracts_x_pre_order_public_contract_spec_x_fill_price"
+    elif total > 0:
+        notional_source = "okx_official_execution_contracts_x_pre_order_public_contract_spec_x_fill_price"
+    return total, list(dict.fromkeys(reasons)), notional_source
+
+
+def _okx_execution_confirmation_source(fact: dict[str, Any]) -> str | None:
+    if fact.get("fills_history_confirmed") is True:
+        return "okx_fills_history"
+    if (
+        fact.get("order_detail_confirmed") is True
+        and fact.get("fills_history_confirmed") is False
+        and fact.get("execution_result_confirmed") is False
+        and str(fact.get("source") or "").strip() == "okx_order_detail"
+    ):
+        return "okx_order_detail"
+    return None
 
 
 def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
@@ -1492,12 +1622,17 @@ def _external_okx_reconcile_exit_contract(
         fact_order_id = str(fact.get("order_id") or "").strip()
         complete = bool(
             _order_status(order) in FILLED_STATUSES
-            and fact.get("fills_history_confirmed") is True
+            and _okx_execution_confirmation_source(fact)
             and exchange_order_id
             and fact_order_id == exchange_order_id
             and str(fact.get("inst_id") or "").strip()
+            and any(
+                str(trade_id or "").strip()
+                for trade_id in _safe_list(fact.get("trade_ids"))
+            )
             and _safe_float(fact.get("contracts"), 0.0) > 0
             and fact.get("contract_size_verified") is True
+            and fact.get("contract_size_source") == "okx_public_instruments"
             and _safe_float(fact.get("base_quantity"), 0.0) > 0
             and _safe_float(fact.get("avg_price"), 0.0) > 0
             and fact.get("fee_abs") is not None

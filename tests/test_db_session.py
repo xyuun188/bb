@@ -486,6 +486,10 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
         for statement in fake_conn.statements
     )
     assert any(
+        "CREATE OR REPLACE FUNCTION bb_compact_ai_decision_learning_value" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
         "trg_ai_decisions_model_health_snapshot" in statement
         for statement in fake_conn.statements
     )
@@ -500,6 +504,8 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     )
     assert "preserve_ai_decision_projections" in retention_trigger
     assert "runtime_data_retention" in retention_trigger
+    assert "bb_compact_ai_decision_learning_value" in retention_trigger
+    assert "profit_risk_sizing" in retention_trigger
 
 
 @pytest.mark.asyncio

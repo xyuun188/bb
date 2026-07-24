@@ -92,9 +92,23 @@ class _MissingLabMarketExchange:
                     "state": "live",
                     "ctType": "linear",
                     "settleCcy": "USDT",
+                    "instId": "LAB-USDT-SWAP",
+                    "ctVal": "0.1",
+                    "ctMult": "1",
+                    "minSz": "1",
+                    "lotSz": "1",
+                    "tickSz": "0.001",
+                },
+                {
+                    "instType": "SWAP",
+                    "state": "live",
+                    "ctType": "linear",
+                    "settleCcy": "USDT",
                     "instId": "BTC-USDT-SWAP",
                     "ctVal": "0.01",
+                    "ctMult": "1",
                     "minSz": "1",
+                    "lotSz": "1",
                     "tickSz": "0.1",
                 }
             ]

@@ -25,7 +25,12 @@ def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-class _FakeCcxt:
+class _RecentFillLedgerEmpty:
+    async def privateGetTradeFills(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+
+class _FakeCcxt(_RecentFillLedgerEmpty):
     def __init__(self, *, timestamp_ms: int | None = None) -> None:
         self.timestamp_ms = timestamp_ms or int(datetime.now(UTC).timestamp() * 1000)
 
@@ -95,7 +100,38 @@ class _FakeExecutor:
         self.shutdown_called = True
 
 
-def test_verified_order_contract_size_wins_over_stale_public_contract_size() -> None:
+def test_verified_public_order_contract_size_wins_over_current_catalog() -> None:
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=6200.0,
+        price=0.04122,
+        status="filled",
+        exchange_order_id="3765187269268054016",
+        okx_inst_id="ZAMA-USDT-SWAP",
+        okx_fill_contracts=62.0,
+        okx_raw_fills={
+            "order_id": "3765187269268054016",
+            "inst_id": "ZAMA-USDT-SWAP",
+            "contracts": 62.0,
+            "contract_size": 100.0,
+            "base_quantity": 6200.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "fills_history_confirmed": True,
+        },
+    )
+
+    assert _local_order_verified_okx_raw_contract_size(order) == pytest.approx(100.0)
+
+    order.okx_raw_fills["contract_size_verified"] = False
+    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
+
+
+def test_order_contract_size_rejects_non_public_or_incomplete_fill_fact() -> None:
     order = Order(
         model_name="ensemble_trader",
         execution_mode="paper",
@@ -116,51 +152,16 @@ def test_verified_order_contract_size_wins_over_stale_public_contract_size() -> 
             "base_quantity": 6200.0,
             "contract_size_verified": True,
             "contract_size_source": "okx_account_position_history_pnl_fill_crosscheck",
-            "fills_history_confirmed": True,
-        },
-    )
-
-    assert _local_order_verified_okx_raw_contract_size(order) == pytest.approx(100.0)
-
-    order.okx_raw_fills["contract_size_verified"] = False
-    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
-
-
-def test_account_verified_order_contract_size_does_not_require_fill_history_flag() -> None:
-    order = Order(
-        model_name="ensemble_trader",
-        execution_mode="paper",
-        symbol="ZAMA/USDT",
-        side="buy",
-        order_type="market",
-        quantity=6200.0,
-        price=0.04122,
-        status="filled",
-        exchange_order_id="3765187269268054016",
-        okx_inst_id="ZAMA-USDT-SWAP",
-        okx_fill_contracts=62.0,
-        okx_raw_fills={
-            "order_id": "3765187269268054016",
-            "inst_id": "ZAMA-USDT-SWAP",
-            "contracts": 62.0,
-            "contract_size": 100.0,
-            "base_quantity": 6200.0,
-            "contract_size_verified": True,
-            "contract_size_source": (
-                "okx_account_position_history_pnl_fill_crosscheck"
-            ),
             "fills_history_confirmed": False,
         },
     )
 
-    assert _local_order_verified_okx_raw_contract_size(order) == pytest.approx(100.0)
+    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
     order.okx_raw_fills["contract_size_source"] = "okx_public_instruments"
     assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
-    order.okx_raw_fills["contract_size_source"] = (
-        "okx_account_position_history_pnl_fill_crosscheck"
-    )
+    order.okx_raw_fills["fills_history_confirmed"] = True
     order.okx_raw_fills["base_quantity"] = 620.0
     assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
@@ -645,7 +646,7 @@ class _SpkPositionExecutor(_FakeExecutor):
         return _FakeCcxt(timestamp_ms=old_timestamp_ms)
 
 
-class _SpkFillCcxt:
+class _SpkFillCcxt(_RecentFillLedgerEmpty):
     def __init__(self) -> None:
         self.params: list[dict[str, Any]] = []
 
@@ -686,7 +687,7 @@ class _SpkFillExecutor(_FakeExecutor):
         return self.ccxt
 
 
-class _NearFillCcxt:
+class _NearFillCcxt(_RecentFillLedgerEmpty):
     def __init__(self) -> None:
         self.params: list[dict[str, Any]] = []
         self.instrument_params: list[dict[str, Any]] = []
@@ -729,7 +730,7 @@ class _NearFillExecutor(_FakeExecutor):
         return self.ccxt
 
 
-class _LabFillNoInstrumentCcxt:
+class _LabFillNoInstrumentCcxt(_RecentFillLedgerEmpty):
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         if params.get("instId") and params.get("instId") != "LAB-USDT-SWAP":
             return {"data": []}
@@ -766,7 +767,7 @@ class _LabFillNoInstrumentExecutor(_FakeExecutor):
         return self.ccxt
 
 
-class _FlokiPositionOnlyCcxt:
+class _FlokiPositionOnlyCcxt(_RecentFillLedgerEmpty):
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         assert params["instType"] == "SWAP"
         return {"data": []}
@@ -809,7 +810,7 @@ class _FlokiPositionOnlyExecutor(_FakeExecutor):
         return self.ccxt
 
 
-class _TargetOrderFillCcxt:
+class _TargetOrderFillCcxt(_RecentFillLedgerEmpty):
     def __init__(self) -> None:
         self.params: list[dict[str, Any]] = []
         self.instrument_params: list[dict[str, Any]] = []
@@ -866,7 +867,7 @@ class _TargetOrderFillExecutor(_FakeExecutor):
         return self.ccxt
 
 
-class _LinkedProtectionFillCcxt:
+class _LinkedProtectionFillCcxt(_RecentFillLedgerEmpty):
     def __init__(self) -> None:
         self.fill_params: list[dict[str, Any]] = []
         self.order_history_params: list[dict[str, Any]] = []

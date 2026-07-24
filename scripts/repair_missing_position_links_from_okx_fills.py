@@ -2006,13 +2006,7 @@ def _contract_size_for_open_close(
     inst_id = str(getattr(fill, "inst_id", "") or _position_okx_inst_id(position)).strip().upper()
     contract_size = _safe_float(contract_sizes.get(inst_id), 0.0)
     if contract_size > 0:
-        return contract_size, "okx_public_instruments_ctVal"
-
-    contracts = _safe_float(getattr(fill, "contracts", None), 0.0)
-    if target_quantity > 0 and contracts > 0:
-        inferred = target_quantity / contracts
-        if inferred > 0:
-            return inferred, "inferred_from_local_quantity_and_fill_contracts"
+        return contract_size, "okx_public_instruments"
     return 0.0, "missing"
 
 

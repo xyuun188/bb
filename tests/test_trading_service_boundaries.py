@@ -565,7 +565,7 @@ async def test_okx_order_fact_sync_background_backs_off_after_degraded_result() 
 
 
 @pytest.mark.asyncio
-async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gate() -> None:
+async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -> None:
     service = TradingService.__new__(TradingService)
     service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
 
@@ -575,11 +575,9 @@ async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gat
                 "status": "ok",
                 "okx_pull_available": True,
                 "confirmed_count": 96,
-                "position_confirmed_count": 1,
-                "unverified_count": 0,
-                "backfilled_count": 0,
-                "position_history_backfilled_count": 2,
-                "position_history_updated_count": 3,
+                    "unverified_count": 0,
+                    "backfilled_count": 0,
+                    "deferred_stages": ["contract_sizes"],
             }
 
     def factory(**_kwargs: Any) -> FakeOrderFactSyncService:
@@ -591,8 +589,7 @@ async def test_okx_order_fact_sync_position_confirmed_does_not_block_runtime_gat
 
     assert row["kind"] == "order_fact_sync"
     assert row["requires_attention"] is False
-    assert "position_confirmed=1" in row["note"]
-    assert "position_history=2+3" in row["note"]
+    assert "deferred_stages=1" in row["note"]
     assert row["order_fact_sync"]["unverified_count"] == 0
 
 
@@ -608,11 +605,8 @@ async def test_okx_order_fact_sync_pull_degraded_does_not_create_state_differenc
                 "okx_pull_available": False,
                 "local_checked": 231,
                 "confirmed_count": 0,
-                "position_confirmed_count": 0,
                 "unverified_count": 0,
                 "backfilled_count": 0,
-                "position_history_backfilled_count": 0,
-                "position_history_updated_count": 0,
                 "error": "TimeoutError",
             }
 
@@ -647,11 +641,8 @@ async def test_okx_order_fact_sync_unverified_still_blocks_runtime_gate() -> Non
                 "okx_pull_available": True,
                 "local_checked": 3,
                 "confirmed_count": 2,
-                "position_confirmed_count": 0,
                 "unverified_count": 1,
                 "backfilled_count": 0,
-                "position_history_backfilled_count": 0,
-                "position_history_updated_count": 0,
             }
 
     def factory(**_kwargs: Any) -> FakeOrderFactSyncService:
@@ -6267,6 +6258,7 @@ async def test_sync_service_reconcile_exchange_positions_matches_okx_net_mode_po
         async def get_positions_strict(self):
             return [
                 {
+                    "contractSize": 1.0,
                     "info": {
                         "instId": "SPK-USDT-SWAP",
                         "posSide": "net",
@@ -6865,6 +6857,7 @@ async def test_sync_service_created_missing_position_uses_okx_inst_id_over_alias
             return [
                 {
                     "symbol": "SAHARA/USDT:USDT",
+                    "contractSize": 1.0,
                     "info": {
                         "instId": "SPK-USDT-SWAP",
                         "posSide": "long",
@@ -7861,6 +7854,7 @@ async def test_open_positions_context_matches_okx_net_mode_position(
         async def get_positions_strict(self):
             return [
                 {
+                    "contractSize": 1.0,
                     "info": {
                         "instId": "SPK-USDT-SWAP",
                         "posSide": "net",

@@ -837,7 +837,6 @@ class OkxAuthoritativeSyncService:
         fills_by_order_id = {fill.order_id: fill for fill in exchange_fills}
         exchange_order_contexts = exchange_order_contexts or {}
         protection_algo_rows = protection_algo_rows or []
-        contract_sizes_by_symbol = _contract_sizes_from_exchange_positions(exchange_positions)
         instrument_contract_sizes = instrument_contract_sizes or {}
         context_local_orders = context_local_orders or []
         all_context_orders = [*local_orders, *context_local_orders]
@@ -966,19 +965,12 @@ class OkxAuthoritativeSyncService:
                         )
                     )
                     continue
-                decision = local_decisions.get(int(order.decision_id or 0))
                 contract_size = _local_order_verified_okx_raw_contract_size(order)
                 if contract_size <= 0:
                     contract_size = instrument_contract_sizes.get(fill.inst_id, 0.0)
                 if contract_size <= 0:
                     fill_inst_id = okx_inst_id_from_symbol(fill.symbol)
                     contract_size = instrument_contract_sizes.get(fill_inst_id, 0.0)
-                if contract_size <= 0:
-                    contract_size = contract_sizes_by_symbol.get(fill.symbol, 0.0)
-                if contract_size <= 0:
-                    contract_size = _local_order_okx_raw_contract_size(order)
-                if contract_size <= 0:
-                    contract_size = _local_order_contract_size(order, decision)
                 if not contract_size:
                     continue
                 expected_quantity = fill.contracts * contract_size
@@ -1550,175 +1542,69 @@ def _local_position_key(position: Position) -> tuple[str, str]:
     )
 
 
-def _contract_sizes_from_exchange_positions(
-    exchange_positions: list[dict[str, Any]],
-) -> dict[str, float]:
-    sizes: dict[str, float] = {}
-    for row in exchange_positions:
-        snapshot = parse_exchange_position_snapshot(
-            row,
-            symbol_normalizer=normalize_trading_symbol,
-        )
-        if not snapshot:
-            continue
-        symbol = str(snapshot.get("symbol") or "")
-        contract_size = _safe_float(snapshot.get("contract_size"))
-        if symbol and contract_size > 0:
-            sizes[symbol] = contract_size
-    return sizes
-
-
-def _local_order_contract_size(order: Order, decision: AIDecision | None) -> float:
-    payloads = _local_order_execution_payloads(decision)
-    for payload in payloads:
-        contract_size = _first_positive(
-            payload.get("contract_size"),
-            payload.get("contractSize"),
-            _nested(payload, "info", "ctVal"),
-            _nested(payload, "info", "contractSize"),
-            default=0.0,
-        )
-        if contract_size > 0:
-            return contract_size
-
-    local_quantity = _safe_float(getattr(order, "quantity", None))
-    for payload in payloads:
-        contracts = _first_positive(
-            payload.get("filled_contracts"),
-            payload.get("order_contracts"),
-            payload.get("filled"),
-            payload.get("amount"),
-            _nested(payload, "info", "accFillSz"),
-            _nested(payload, "info", "fillSz"),
-            _nested(payload, "info", "sz"),
-            default=0.0,
-        )
-        base_quantity = _first_positive(
-            payload.get("base_quantity"),
-            payload.get("planned_base_quantity"),
-            payload.get("quantity"),
-            default=0.0,
-        )
-        if base_quantity <= 0:
-            base_quantity = local_quantity
-        if contracts > 0 and base_quantity > 0:
-            return base_quantity / contracts
-    return 0.0
-
-
-def _local_order_okx_raw_contract_size(order: Order) -> float:
-    raw = _safe_dict(getattr(order, "okx_raw_fills", None))
-    if not raw:
-        return 0.0
-    raw_order_id = str(raw.get("order_id") or "").strip()
-    exchange_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-    if raw_order_id and exchange_ids and raw_order_id not in exchange_ids:
-        return 0.0
-    contract_size = _first_positive(
-        raw.get("contract_size"),
-        raw.get("contractSize"),
-        _nested(raw, "info", "ctVal"),
-        _nested(raw, "info", "contractSize"),
-        default=0.0,
-    )
-    if contract_size > 0:
-        return contract_size
-    contracts = _first_positive(
-        raw.get("contracts"),
-        raw.get("filled_contracts"),
-        raw.get("fillSz"),
-        raw.get("sz"),
-        default=0.0,
-    )
-    if contracts <= 0:
-        contracts = _safe_float(getattr(order, "okx_fill_contracts", None))
-    base_quantity = _first_positive(
-        raw.get("base_quantity"),
-        raw.get("filled_base_quantity"),
-        raw.get("quantity"),
-        default=0.0,
-    )
-    if contracts > 0 and base_quantity > 0:
-        return base_quantity / contracts
-    return 0.0
-
-
 def _local_order_verified_okx_raw_contract_size(order: Order) -> float:
-    """Return the order-specific contract size only when sync verified it."""
+    """Return an OKX public instrument size with exact stored fill identity."""
 
     raw = _safe_dict(getattr(order, "okx_raw_fills", None))
-    if raw.get("contract_size_verified") is not True:
+    exchange_execution_confirmed = bool(
+        raw.get("fills_history_confirmed") is True
+        or (
+            raw.get("order_detail_confirmed") is True
+            and str(raw.get("source") or "").strip() == "okx_order_detail"
+        )
+    )
+    if (
+        not exchange_execution_confirmed
+        or raw.get("contract_size_verified") is not True
+        or str(raw.get("contract_size_source") or "").strip()
+        != "okx_public_instruments"
+    ):
         return 0.0
-    contract_size = _local_order_okx_raw_contract_size(order)
+    contract_size = _safe_float(raw.get("contract_size"), 0.0)
     if contract_size <= 0:
         return 0.0
-    if raw.get("fills_history_confirmed") is True:
-        return contract_size
-
-    source = str(raw.get("contract_size_source") or "").strip()
-    exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    exchange_order_ids = _split_exchange_order_ids(
+        getattr(order, "exchange_order_id", None)
+    )
     raw_order_id = str(raw.get("order_id") or "").strip()
-    contracts = _first_positive(
-        raw.get("contracts"),
-        getattr(order, "okx_fill_contracts", None),
-        default=0.0,
+    raw_inst_id = str(raw.get("inst_id") or "").strip().upper()
+    order_inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+    raw_contracts = _safe_float(raw.get("contracts"), 0.0)
+    order_contracts = _safe_float(getattr(order, "okx_fill_contracts", None), 0.0)
+    raw_base_quantity = _safe_float(raw.get("base_quantity"), 0.0)
+    order_base_quantity = _safe_float(getattr(order, "quantity", None), 0.0)
+    expected_base_quantity = raw_contracts * contract_size
+    identity_complete = bool(
+        raw_order_id
+        and raw_order_id in exchange_order_ids
+        and raw_inst_id
+        and order_inst_id == raw_inst_id
     )
-    base_quantity = _first_positive(
-        raw.get("base_quantity"),
-        raw.get("filled_base_quantity"),
-        getattr(order, "quantity", None),
-        default=0.0,
-    )
-    expected_base_quantity = contracts * contract_size
-    account_verified = source.startswith("okx_account_position_")
-    order_identity_matches = bool(
-        exchange_order_id and raw_order_id and exchange_order_id == raw_order_id
-    )
-    quantity_matches = bool(
-        expected_base_quantity > 0
-        and base_quantity > 0
+    contracts_match = bool(
+        raw_contracts > 0
+        and order_contracts > 0
         and _relative_close_enough(
-            base_quantity,
+            order_contracts,
+            raw_contracts,
+            QUANTITY_TOLERANCE_RATIO,
+        )
+    )
+    quantities_match = bool(
+        expected_base_quantity > 0
+        and raw_base_quantity > 0
+        and order_base_quantity > 0
+        and _relative_close_enough(
+            raw_base_quantity,
+            expected_base_quantity,
+            QUANTITY_TOLERANCE_RATIO,
+        )
+        and _relative_close_enough(
+            order_base_quantity,
             expected_base_quantity,
             QUANTITY_TOLERANCE_RATIO,
         )
     )
-    return (
-        contract_size
-        if account_verified and order_identity_matches and quantity_matches
-        else 0.0
-    )
-
-
-def _local_order_execution_payloads(decision: AIDecision | None) -> list[dict[str, Any]]:
-    raw = getattr(decision, "raw_llm_response", None) if decision is not None else None
-    payloads: list[dict[str, Any]] = []
-    if isinstance(raw, dict):
-        payloads.append(raw)
-        execution_result = raw.get("execution_result")
-        if isinstance(execution_result, dict):
-            payloads.append(execution_result)
-            raw_response = execution_result.get("raw_response")
-            if isinstance(raw_response, dict):
-                payloads.append(raw_response)
-    return payloads
-
-
-def _nested(value: dict[str, Any], *keys: str) -> Any:
-    current: Any = value
-    for key in keys:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
-
-
-def _first_positive(*values: Any, default: float = 0.0) -> float:
-    for value in values:
-        number = _safe_float(value, 0.0)
-        if number > 0:
-            return number
-    return default
+    return contract_size if identity_complete and contracts_match and quantities_match else 0.0
 
 
 def _split_exchange_order_ids(value: Any) -> set[str]:

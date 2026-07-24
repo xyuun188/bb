@@ -14,7 +14,7 @@ from services.exchange_position_state import (
 )
 
 
-def test_parse_position_prefers_notional_contract_size_when_ccxt_omits_ctval() -> None:
+def test_parse_position_does_not_infer_contract_size_from_notional() -> None:
     snapshot = parse_exchange_position_snapshot(
         {
             "symbol": "INJ-USDT-SWAP",
@@ -38,16 +38,17 @@ def test_parse_position_prefers_notional_contract_size_when_ccxt_omits_ctval() -
     )
 
     assert snapshot is not None
-    assert snapshot["contract_size"] == pytest.approx(0.1, rel=0.002)
-    assert snapshot["quantity"] == pytest.approx(7.7, rel=0.002)
+    assert snapshot["contract_size"] == 0.0
+    assert snapshot["quantity"] == 0.0
 
 
-def test_parse_okx_position_snapshot_prefers_info_markpx_upl_and_ctval() -> None:
+def test_parse_okx_position_snapshot_uses_explicit_public_contract_size() -> None:
     snapshot = parse_exchange_position_snapshot(
         {
             "symbol": "PROS/USDT:USDT",
             "side": "long",
             "contracts": 0,
+            "contractSize": 1.0,
             "markPrice": 0,
             "entryPrice": 0,
             "info": {
@@ -81,6 +82,7 @@ def test_parse_okx_position_snapshot_prefers_inst_id_over_ccxt_alias_symbol() ->
             "symbol": "SAHARA/USDT:USDT",
             "side": "short",
             "contracts": 100,
+            "contractSize": 1.0,
             "markPrice": 0.01751,
             "entryPrice": 0.0179,
             "info": {
@@ -109,6 +111,7 @@ def test_parse_okx_net_position_snapshot_infers_side_from_signed_pos() -> None:
     snapshot = parse_exchange_position_snapshot(
         {
             "contracts": 200,
+            "contractSize": 1.0,
             "info": {
                 "instId": "SPK-USDT-SWAP",
                 "posSide": "net",
@@ -166,6 +169,7 @@ def test_parse_okx_position_snapshot_treats_quantity_as_contracts_when_contracts
             "side": "short",
             "quantity": 99.5,
             "contracts": 99.5,
+            "contractSize": 0.1,
             "entryPrice": 3.532,
             "markPrice": 3.528,
             "info": {
@@ -187,7 +191,7 @@ def test_parse_okx_position_snapshot_treats_quantity_as_contracts_when_contracts
     assert snapshot["raw_quantity"] == pytest.approx(99.5)
 
 
-def test_parse_okx_position_snapshot_infers_missing_contract_size_from_upl() -> None:
+def test_parse_okx_position_snapshot_does_not_infer_contract_size_from_upl() -> None:
     snapshot = parse_exchange_position_snapshot(
         {
             "symbol": "LAB-USDT-SWAP",
@@ -210,8 +214,8 @@ def test_parse_okx_position_snapshot_infers_missing_contract_size_from_upl() -> 
     assert snapshot is not None
     assert snapshot["symbol"] == "LAB/USDT"
     assert snapshot["contracts"] == pytest.approx(9.0)
-    assert snapshot["contract_size"] == pytest.approx(0.1)
-    assert snapshot["quantity"] == pytest.approx(0.9)
+    assert snapshot["contract_size"] == 0.0
+    assert snapshot["quantity"] == 0.0
 
 
 def test_exchange_position_display_valuation_does_not_use_stale_local_profit() -> None:

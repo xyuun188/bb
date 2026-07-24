@@ -119,6 +119,34 @@ async def test_entry_fee_provider_accepts_verified_okx_execution_result():
 
 
 @pytest.mark.asyncio
+async def test_entry_fee_provider_accepts_verified_okx_order_detail():
+    session = _FakeSession(
+        _order(
+            fee=3.0,
+            quantity=6.0,
+            okx_raw_fills={
+                "source": "okx_order_detail",
+                "fills_history_confirmed": False,
+                "execution_result_confirmed": False,
+                "order_detail_confirmed": True,
+                "contract_size_verified": True,
+                "contract_size_source": "okx_public_instruments",
+                "order_id": "entry-1",
+                "fee_abs": 3.0,
+            },
+        )
+    )
+
+    fee = await EntryFeeProvider().entry_fee_for_position(
+        session,
+        _position(),
+        close_qty=2.0,
+    )
+
+    assert fee == 1.0
+
+
+@pytest.mark.asyncio
 async def test_entry_fee_provider_rejects_unverified_execution_result():
     session = _FakeSession(
         _order(

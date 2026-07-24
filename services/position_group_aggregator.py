@@ -32,15 +32,6 @@ def _default_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _position_contract_size(position: dict[str, Any], float_parser: FloatParser) -> float:
-    info = position.get("info") if isinstance(position.get("info"), dict) else {}
-    contract_size = float_parser(
-        position.get("contract_size") or position.get("contractSize") or info.get("ctVal"),
-        1.0,
-    )
-    return contract_size if contract_size > 0 else 1.0
-
-
 def _derived_unrealized_pnl(
     position: dict[str, Any],
     *,
@@ -52,11 +43,10 @@ def _derived_unrealized_pnl(
 ) -> float:
     if quantity <= 0 or entry <= 0 or current <= 0:
         return 0.0
-    contract_size = _position_contract_size(position, float_parser)
     if side == "short":
-        return (entry - current) * quantity * contract_size
+        return (entry - current) * quantity
     if side == "long":
-        return (current - entry) * quantity * contract_size
+        return (current - entry) * quantity
     return 0.0
 
 

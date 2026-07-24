@@ -84,63 +84,6 @@ def _entry_fill_contracts(entry_orders: Iterable[Any]) -> float | None:
     return sum(valid) if valid else None
 
 
-def _account_contract_size_from_orders(orders: Iterable[Any]) -> dict[str, Any]:
-    values: list[tuple[float, str]] = []
-    quarantined_reasons: list[str] = []
-    for order in orders:
-        raw = _dict(_value(order, "okx_raw_fills", {}))
-        source = _text(raw.get("contract_size_source"))
-        if source == "okx_account_position_evidence_quarantined":
-            quarantined_reasons.append(
-                _text(raw.get("contract_size_evidence_gap"))
-                or "account_contract_size_evidence_quarantined"
-            )
-            continue
-        if (
-            raw.get("contract_size_verified") is True
-            and source.startswith("okx_account_position_")
-        ):
-            size = _safe_float(raw.get("contract_size") or raw.get("contractSize"), None)
-            if size is not None and size > 0:
-                values.append((size, source))
-    if quarantined_reasons:
-        return {
-            "contract_size": None,
-            "source": "okx_account_position_evidence_quarantined",
-            "conflict": True,
-            "reason": quarantined_reasons[0],
-            "values": [value for value, _source in values],
-        }
-    if not values:
-        return {
-            "contract_size": None,
-            "source": "",
-            "conflict": False,
-            "reason": "",
-            "values": [],
-        }
-    reference = values[0][0]
-    conflict = any(
-        not math.isclose(value, reference, rel_tol=0.02, abs_tol=1e-12)
-        for value, _source in values[1:]
-    )
-    return {
-        "contract_size": (
-            None
-            if conflict
-            else sum(value for value, _source in values) / len(values)
-        ),
-        "source": (
-            values[0][1]
-            if not conflict
-            else "okx_account_position_evidence_conflict"
-        ),
-        "conflict": conflict,
-        "reason": "linked_order_account_contract_sizes_disagree" if conflict else "",
-        "values": [value for value, _source in values],
-    }
-
-
 def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
     if order is None:
         return {}
@@ -493,54 +436,9 @@ def build_okx_history_training_sample(
     ) or 0.0
     source_execution_mode = _text(_value(history, "mode")).lower()
     execution_mode = _canonical_execution_mode(source_execution_mode)
-    account_contract_size = _account_contract_size_from_orders(entry_orders)
     history_contract_source = _text(raw.get("_bb_contract_spec_source"))
-    history_account_ct_val = (
-        public_or_stored_ct_val
-        if history_contract_source.startswith("okx_account_position_")
-        else None
-    )
-    linked_account_ct_val = _safe_float(
-        account_contract_size.get("contract_size"),
-        None,
-    )
-    account_values = [
-        value
-        for value in (history_account_ct_val, linked_account_ct_val)
-        if value is not None and value > 0
-    ]
-    account_contract_conflict = bool(account_contract_size.get("conflict"))
-    if len(account_values) > 1 and not math.isclose(
-        account_values[0],
-        account_values[1],
-        rel_tol=0.02,
-        abs_tol=1e-12,
-    ):
-        account_contract_conflict = True
-    verified_account_ct_val = (
-        sum(account_values) / len(account_values)
-        if account_values and not account_contract_conflict
-        else None
-    )
     ct_val = public_or_stored_ct_val
-    contract_ct_val_source = "okx_contract_spec"
-    contract_ct_val_corrected = False
-    if verified_account_ct_val is not None:
-        ct_val = verified_account_ct_val
-        contract_ct_val_source = (
-            history_contract_source
-            or _text(account_contract_size.get("source"))
-            or "okx_account_position_verified"
-        )
-        contract_ct_val_corrected = bool(
-            public_or_stored_ct_val is not None
-            and not math.isclose(
-                public_or_stored_ct_val,
-                verified_account_ct_val,
-                rel_tol=0.02,
-                abs_tol=1e-12,
-            )
-        )
+    contract_ct_val_source = history_contract_source
     return_facts = _return_consistency_facts(
         side=side,
         entry_price=entry_price,
@@ -579,8 +477,8 @@ def build_okx_history_training_sample(
         gaps.append("missing_contract_lot_size")
     if contracts <= 0:
         gaps.append("missing_fill_or_open_contracts")
-    if account_contract_conflict:
-        gaps.append("account_contract_size_evidence_conflict")
+    if history_contract_source != "okx_public_instruments":
+        gaps.append("contract_spec_source_not_okx_public_instruments")
     if return_facts.get("gross_return_price_consistent") is not True:
         gaps.append("gross_return_price_path_mismatch")
     if abs(realized_pnl - settlement_expected) > settlement_tolerance:
@@ -593,6 +491,38 @@ def build_okx_history_training_sample(
         gaps.append("missing_authoritative_entry_fill_facts")
     if close_fill_group.get("complete") is not True:
         gaps.append("missing_authoritative_close_fill_facts")
+    if (
+        entry_fill_group.get("complete") is True
+        and ct_val is not None
+        and ct_val > 0
+        and ct_mult is not None
+        and ct_mult > 0
+        and not math.isclose(
+            _safe_float(entry_fill_group.get("base_quantity"), 0.0) or 0.0,
+            (_safe_float(entry_fill_group.get("contracts"), 0.0) or 0.0)
+            * ct_val
+            * ct_mult,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        gaps.append("entry_fill_contract_quantity_mismatch")
+    if (
+        close_fill_group.get("complete") is True
+        and ct_val is not None
+        and ct_val > 0
+        and ct_mult is not None
+        and ct_mult > 0
+        and not math.isclose(
+            _safe_float(close_fill_group.get("base_quantity"), 0.0) or 0.0,
+            (_safe_float(close_fill_group.get("contracts"), 0.0) or 0.0)
+            * ct_val
+            * ct_mult,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        gaps.append("close_fill_contract_quantity_mismatch")
     if canonical_notional is None or canonical_notional <= 0:
         gaps.append("missing_authoritative_entry_notional")
     if canonical_entry_fee is None:
@@ -789,11 +719,7 @@ def build_okx_history_training_sample(
     lineage_gaps = list(dict.fromkeys(lineage_gaps))
     model_name = _text(_value(local_position, "model_name")) if local_position else ""
     lifecycle_key = _text(_value(history, "row_identity"))
-    history_source = _text(_value(history, "source"))
-    verified_execution_pair = history_source == "okx_verified_execution_pair_settlement"
-    sample_source = (
-        "okx_verified_execution_pair" if verified_execution_pair else "okx_position_history"
-    )
+    sample_source = "okx_position_history"
     strategy_training_role = (
         "aggregate_position_research_only"
         if len(entry_decision_ids) > 1
@@ -836,9 +762,7 @@ def build_okx_history_training_sample(
         "fill_contracts": fill_contracts,
         "contract_ct_val": ct_val,
         "contract_ct_val_source": contract_ct_val_source,
-        "contract_ct_val_corrected": contract_ct_val_corrected,
         "public_or_stored_contract_ct_val": public_or_stored_ct_val,
-        "account_contract_size_evidence": account_contract_size,
         "contract_ct_mult": ct_mult,
         "contract_lot_size": lot_size,
         "notional": canonical_notional,
@@ -1000,21 +924,9 @@ def build_okx_history_training_sample(
         ),
         "raw_llm_response": raw_llm_response,
         "outcome": "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat",
-        "pnl_source": (
-            _text(raw.get("_bb_pnl_source"))
-            if verified_execution_pair
-            else "okx_position_history_realized_pnl"
-        ),
-        "settlement_source": (
-            "okx_verified_execution_pair_settlement"
-            if verified_execution_pair
-            else "okx_position_history_realized_pnl"
-        ),
-        "funding_fee_source": (
-            _text(raw.get("_bb_funding_fee_source"))
-            if verified_execution_pair
-            else "okx_positions_history.fundingFee"
-        ),
+        "pnl_source": "okx_position_history_realized_pnl",
+        "settlement_source": "okx_position_history_realized_pnl",
+        "funding_fee_source": "okx_positions_history.fundingFee",
         "trade_fact_trusted": not gaps,
         "trade_fact_trust_reason": gaps[0] if gaps else "",
         "strategy_lineage_complete": not lineage_gaps,

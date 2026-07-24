@@ -257,7 +257,7 @@ async def test_authoritative_loader_deduplicates_legacy_and_canonical_history_ro
                 "pnl": 1.0,
                 "fee": -0.1,
                 "funding_fee": 0.0,
-                "source": "okx_order_fact_sync",
+                "source": "okx_position_history_settlement",
                 "raw_row": raw_row,
                 "sync_status": "synced",
             }

@@ -34,6 +34,16 @@ def complete_paper_canary_raw() -> dict[str, Any]:
         "contract_fingerprint": "canary-contract-fingerprint",
     }
     return {
+        "pre_order_execution_facts": {
+            "production_eligible": True,
+            "input_fingerprint": "paper-canary-pre-order-fingerprint",
+            "inst_id": "BTC-USDT-SWAP",
+            "contract_spec": {
+                "ctVal": "0.01",
+                "ctMult": "1",
+                "source": "okx_public_instruments",
+            },
+        },
         "paper_bootstrap_canary": {
             "version": PAPER_BOOTSTRAP_CANARY_VERSION,
             "authorized": True,

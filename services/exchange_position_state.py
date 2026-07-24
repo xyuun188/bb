@@ -39,45 +39,6 @@ def _first_nonzero_float(*values: Any, default: float = 0.0) -> float:
     return default
 
 
-def _infer_contract_size_from_pnl(
-    *,
-    side: str,
-    contracts: float,
-    mark_price: float,
-    entry_price: float,
-    upl: float | None,
-) -> float:
-    """Infer missing OKX ctVal from exchange UPL when CCXT omits contractSize."""
-
-    if contracts <= 0 or mark_price <= 0 or entry_price <= 0 or upl is None:
-        return 0.0
-    price_delta = entry_price - mark_price if side == "short" else mark_price - entry_price
-    denominator = price_delta * contracts
-    if abs(denominator) <= 1e-12:
-        return 0.0
-    inferred = abs(upl / denominator)
-    if inferred <= 0 or inferred > 100000:
-        return 0.0
-    return inferred
-
-
-def _infer_contract_size_from_notional(
-    *,
-    contracts: float,
-    mark_price: float,
-    notional: float,
-) -> float:
-    """Infer OKX ctVal from the stable quote notional of a USDT swap position."""
-
-    denominator = abs(contracts) * abs(mark_price)
-    if denominator <= 1e-12 or notional <= 0:
-        return 0.0
-    inferred = abs(notional) / denominator
-    if inferred <= 0 or inferred > 100000:
-        return 0.0
-    return inferred
-
-
 def exchange_snapshot_price(snapshot: dict[str, Any]) -> float:
     return (
         _first_positive_float(
@@ -92,9 +53,11 @@ def exchange_snapshot_price(snapshot: dict[str, Any]) -> float:
 
 def exchange_snapshot_quantity(snapshot: dict[str, Any]) -> float:
     contracts = abs(_first_nonzero_float(snapshot.get("contracts"), default=0.0))
-    contract_size = abs(_first_positive_float(snapshot.get("contract_size"), default=1.0) or 1.0)
+    contract_size = abs(
+        _first_positive_float(snapshot.get("contract_size"), default=0.0) or 0.0
+    )
     if contracts > 0:
-        return contracts * contract_size
+        return contracts * contract_size if contract_size > 0 else 0.0
     quantity = _first_positive_float(snapshot.get("quantity"), default=0.0)
     return quantity if quantity > 0 else 0.0
 
@@ -237,8 +200,6 @@ def parse_exchange_position_snapshot(
         _first_positive_float(
             position.get("contractSize"),
             position.get("contract_size"),
-            info.get("ctVal"),
-            info.get("contractSize"),
             default=0.0,
         )
         or 0.0
@@ -268,24 +229,14 @@ def parse_exchange_position_snapshot(
             default=0.0,
         )
     )
-    contract_size = (
-        explicit_contract_size
-        or _infer_contract_size_from_notional(
-            contracts=contracts,
-            mark_price=mark_price or last_price or index_price,
-            notional=notional,
-        )
-        or _infer_contract_size_from_pnl(
-            side=side,
-            contracts=contracts,
-            mark_price=mark_price,
-            entry_price=entry_price,
-            upl=upl,
-        )
+    contract_size = explicit_contract_size
+    quantity = (
+        contracts * contract_size
+        if contracts > 0 and contract_size > 0
+        else raw_quantity
+        if contracts <= 0
+        else 0.0
     )
-    if contract_size <= 0:
-        contract_size = 1.0
-    quantity = contracts * contract_size if contracts > 0 else raw_quantity
     margin_used = (
         _first_positive_float(position.get("initialMargin"), default=0.0)
         or _first_positive_float(position.get("margin"), default=0.0)

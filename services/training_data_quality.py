@@ -63,17 +63,8 @@ _TRADE_REPAIR_SOURCES = {
 }
 _TRUSTED_TRADE_PNL_SOURCES = {
     "okx_position_history_realized_pnl",
-    "okx_linked_order_net_pnl",
-    "okx_close_fill_net_pnl_partial",
-    "okx_fill_pnl",
-    "okx_order_fact_sync",
     "okx_position_history_settlement",
-    "okx_verified_execution_pair_settlement",
-    "okx_authoritative_reconcile",
-    "position_settlement_snapshot",
-    "position_settlement_snapshot:okx_order_fact_sync",
     "position_settlement_snapshot:okx_position_history_settlement",
-    "position_settlement_snapshot:okx_authoritative_reconcile",
 }
 _UNTRUSTED_TRADE_PNL_SOURCES = {
     "",
@@ -223,9 +214,7 @@ def _trade_pnl_source_trusted(source: str) -> bool:
     normalized = _safe_str(source)
     if normalized in _UNTRUSTED_TRADE_PNL_SOURCES:
         return False
-    if normalized in _TRUSTED_TRADE_PNL_SOURCES:
-        return True
-    return bool(normalized.startswith("position_settlement_snapshot:okx_"))
+    return normalized in _TRUSTED_TRADE_PNL_SOURCES
 
 
 def _trade_funding_fee_source(sample: dict[str, Any]) -> str:

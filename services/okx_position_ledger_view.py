@@ -18,6 +18,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_OKX_ONLY,
+    OKX_SYNC_ORDER_DETAIL_CONFIRMED,
 )
 
 NON_EXCHANGE_ORDER_TOKENS = {
@@ -542,13 +543,18 @@ def _order_is_okx_confirmed(order: Order) -> bool:
         OKX_SYNC_CONFIRMED,
         OKX_SYNC_OKX_ONLY,
         OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        OKX_SYNC_ORDER_DETAIL_CONFIRMED,
     }
 
 
 def _order_has_close_evidence(order: Order) -> bool:
     raw = getattr(order, "okx_raw_fills", None)
     raw = raw if isinstance(raw, dict) else {}
-    return bool(raw.get("fills_history_confirmed") or raw.get("execution_result_confirmed"))
+    return bool(
+        raw.get("fills_history_confirmed")
+        or raw.get("order_detail_confirmed")
+        or raw.get("execution_result_confirmed")
+    )
 
 
 def _confirmed_order_lifecycle_fragments_for_base(
@@ -2144,8 +2150,6 @@ def _fill_row_from_order(order: Order) -> OkxLinkedFillRow | None:
     )
     if contracts > 0 and contract_size > 0:
         quantity = contracts * contract_size
-    elif quantity <= 0 and contracts > 0:
-        quantity = contracts * (contract_size if contract_size > 0 else 1.0)
     price = _first_positive(
         raw.get("avg_price"), raw.get("average"), getattr(order, "price", None), default=0.0
     )
@@ -2169,12 +2173,17 @@ def _fill_row_from_order(order: Order) -> OkxLinkedFillRow | None:
         OKX_SYNC_CONFIRMED,
         OKX_SYNC_OKX_ONLY,
         OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        OKX_SYNC_ORDER_DETAIL_CONFIRMED,
     }
     source = "okx_raw_fills" if raw else "local_order_cache"
     if bool(raw.get("position_snapshot_confirmed")) and not bool(
         raw.get("fills_history_confirmed")
     ):
         source = "okx_current_position_snapshot"
+    elif bool(raw.get("order_detail_confirmed")) and not bool(
+        raw.get("fills_history_confirmed")
+    ):
+        source = "okx_order_detail"
     elif bool(raw.get("execution_result_confirmed")) and not bool(
         raw.get("fills_history_confirmed")
     ):
@@ -2224,8 +2233,6 @@ def _order_quantity(order: Order) -> float:
     )
     if contracts > 0 and contract_size > 0:
         quantity = contracts * contract_size
-    elif quantity <= 0 and contracts > 0:
-        quantity = contracts * (contract_size if contract_size > 0 else 1.0)
     return quantity
 
 

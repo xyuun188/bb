@@ -356,3 +356,24 @@
 - 回归覆盖 purge 后训练集不足、仅 1 个训练决策组、严格时间互斥、成熟分区、拟合样本计数、自动训练跳过且不写 artifact、旧 artifact/候选拒绝、旧 champion 退出比较及禁止回滚。定向验证为 `90 passed`，Ruff 全通过，完整测试为 `2797 passed, 4 skipped`；完整测试跨过 UTC 午夜时还发现并修复 3 个纸面 canary 自然日夹具错误，生产的 UTC 自然日损失预算重置语义保持不变。
 - 线上首次部署时 78 行/52 组成本完整样本被严格拆为训练 5 行/5 组、留出 36 行/26 组、purge 37 行/21 组，调度状态为 `skipped`、`retry_count=0`、下次检查 30 分钟后且未写 artifact。标签继续成熟后自动恢复训练，证明等待状态不会阻断后续训练。
 - 最终强制验收使用正式 `run_local_ml_auto_train.py --force` 路径完成：current 已替换为 `2026-07-24.chronological-purged-holdout.v1` 的 ready shadow artifact，108 行严格闭合为训练 25、留出 55、purge 28；旧 current 不再参与 champion 比较，rollback 指针为空。后续同数据 challenger 按费后收益比较正常拒绝，current 保持 shadow，`live_ml_ready=false`、paper canary 未授权、Local ML warning 数为 0，模型晋升前规则交易继续独立运行。
+
+## 26. OKX 订单、仓位与结算事实单一职责合同
+
+- 精确根因：原 `OkxOrderFactSyncService` 在一次后台任务中串行请求当前仓位、活动保护单、账户余额、成交、订单历史、资金账单和官方仓位历史；调用方只给 3-6 秒，它却让多个历史阶段各自获得最高 30 秒，导致单轮持续数分钟并与当前仓位对账争用同一组 OKX 私有接口。线上持续出现 `active_position_protection`、`orders_history_targeted`、`account_bills`、`position_history_*` 超时和 `50026`。
+- 唯一职责固定为四条链路：`OkxOrderFactSyncService` 只写 `orders` 的订单、成交、保护成交与合约单位事实；`SyncService` 只拥有当前仓位、当前保护单和账户快照；`OkxSettlementFactSyncService` 是唯一的 OKX 仓位历史与资金账单 API 调用方并写入 `okx_position_history`、`okx_account_bills`；`OkxPositionSettlementSyncService` 只读取本地结算事实镜像，写入最终 `positions` 结算和训练结果，绝不再请求 OKX 私有接口或改写历史镜像。
+- 删除订单同步中的当前仓位确认、余额/保护单/账单/仓位历史拉取、持仓创建修复、部分平仓修复、历史 PnL 修复、持仓抑制事件和 `okx_position_confirmed` 降级状态。`okx_position_history_sync.py` 及旧测试被删除，替换为 `okx_settlement_fact_sync.py`；不保留兼容导入、双读字段或旧状态回退。
+- 订单事实同步和结算事实镜像均采用“单轮一个硬截止时间”。预算耗尽、OKX `50011/50026`、限流或系统繁忙时只记录结构化 `deferred_stages` 并进入下一轮，不写局部负面事实；只有明确的非暂态 API 失败才写 `stage_errors`。任何未被本轮直接覆盖的订单 ID 只能延期，不能被误标为 `okx_unverified`。
+- 训练收益证据只接受官方 `okx_position_history_realized_pnl` 和由其生成的 `okx_position_history_settlement`；删除订单同步、执行对回退、当前仓位对账和局部成交 PnL 作为训练收益权威来源的白名单。规则交易继续独立执行，只有完整结算事实才能进入 `net_return_after_all_cost_pct` 训练和晋升证据。
+- 新回归覆盖：订单同步不访问仓位/账单/历史端点；超时只延期不污染订单状态；结算事实镜像同时持久化官方仓位历史和资金账单；最终结算只读本地镜像且缺少镜像时结构化重试。部署后必须验证订单同步耗时受总预算约束、当前仓位对账不再被其拖超时、镜像和结算持续前进、规则小仓交易不断。
+- 官方仓位历史已存在但持续无法匹配本地生命周期时，不再无限重试：累计达到 `30` 次或平仓超过 `6` 小时即写入 `settlement_quarantined`，来源固定为 `okx_position_history_identity_quarantine`，删除下一次重试时间并保留身份、次数、平仓时间和触发阈值证据。该状态永久退出结算候选，不会被后续轮次自动改写为正式结算。
+- 删除从本地 `Position.settlement_raw` 反写 `okx_position_history` 的回填入口及未调用批量包装器，官方历史镜像只能来自 `OkxSettlementFactSyncService`。训练 PnL 白名单改为三个精确值：`okx_position_history_realized_pnl`、`okx_position_history_settlement`、`position_settlement_snapshot:okx_position_history_settlement`；删除接受任意 `position_settlement_snapshot:okx_*` 的前缀兼容，隔离来源无法进入训练。
+- 学习快照改为有界递归投影：深度最多 3 层、字符串最多 1024 字符、数组最多 32 项，`profit_risk_sizing` 和 `opportunity_score` 保留风险、成本、来源和指纹字段且单字段不超过 PostgreSQL 触发器的 16 KiB 限制。受污染的 27 条已成交纸面决策快照必须精确重建，不允许在 `init_db()` 或 Dashboard 启动期间执行批量迁移，避免 HTTP 绑定被数据修复阻塞。
+- 合约单位唯一来源固定为 OKX `public/instruments` 的 `ctVal * ctMult`。删除账户当前仓位保证金/名义金额反推、仓位历史 PnL/成交反推、当前仓位 `info.ctVal`、缺失规格默认 1、目标数量/成交合约数反推以及对应类型、函数、兼容来源和正向测试。私有仓位只提供身份、方向和合约数；读取仓位时单独拉取公开规格并注入顶层，缺规格时基础币数量保持 0 并失败关闭。
+- 订单事实、权威修复、交易事实完整性审计和训练样本只接受 `contract_size_verified=true`、`contract_size_source=okx_public_instruments`、订单 ID/合约 ID/成交合约数完整一致的事实。历史污染订单由公开规格精确修复；未完成身份链的本地数量、决策 payload、局部 PnL 和仓位字段不能成为后备来源。
+- 成交名义金额统一计算为 `OKX 成交合约数 * 决策时 public instruments ctVal * ctMult * OKX 成交均价`，不再使用 `Order.quantity * price`。本地数量污染只产生独立的 `filled_order_contract_quantity_mismatch`，不能放大名义金额；ACT 决策 `108685` / 订单 `4944` 的验收值为 4 合约、`ctVal=1`、基础数量 4、名义金额 `0.0358 USDT`。
+- 本地最终验收：Ruff 全库通过，完整测试 `2733 passed, 4 skipped`。回归覆盖 30 次/6 小时隔离阈值、隔离后永久退出候选、训练来源精确白名单、公开规格覆盖污染订单、缺规格失败关闭、ACT 十倍数量污染和 Dashboard 启动不执行批量迁移。
+- 官方成交事实只允许两种确认来源：合并去重后的 OKX `fills-history` 近期/历史成交账本，以及嵌入完整官方订单详情并严格满足 `state=filled`、精确 `ordId/instId/tradeId`、`accFillSz/avgPx/fee/fillTime` 和公开规格数量代数的 `okx_order_detail_confirmed`。普通 execution result 不能冒充成交账本，也不能直接放行训练、费用、持仓或交易契约。
+- `fills-history` 权威成交事实优先于决策 payload 中遗留的 execution/close 恢复信息。缺少 OKX 公开规格时，新成交不创建可训练本地订单，已有订单不清零但保持不可训练；已有正确公开规格且无需修改时标记为 `local_order_stored_fill_already_verified`，不得误计入 `contract_size_deferred_count`。
+- 2026-07-24 最终本地验收：Ruff 全库通过，完整测试 `2744 passed, 4 skipped`。线上订单事实同步检查 455 条本地订单，`contract_size_deferred_count=0`、`stage_errors=[]`；唯一延期阶段为独立的 `protection_algo_history` 拉取预算，不再出现公开规格缺失误报。
+- 同一线上 8 小时交易契约验收为入口执行 `31/31`、退出执行 `12/12`、合同违规 `0`、废弃策略字段 `0`；20 个已平仓持仓的真实净 PnL 合计 `+0.34229212 USDT`。该结果证明交易执行事实合同已闭合，但不代表训练收益闭环已经完成。
+- 下一批硬任务是补齐权威执行成本和滑点结算：当前权威结果加载 376 条但 `complete_count=0`，训练治理明确报告缺少 `authoritative_execution_cost_distribution` 和 `authoritative_slippage_distribution`。在完整 OKX 成交、手续费、资金费和滑点进入 `authoritative_trade_outcome` 前，必须保持 `live_ml_ready=false`，不得用影子收益、execution result 或默认成本绕过晋升。

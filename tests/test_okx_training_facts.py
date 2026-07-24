@@ -29,7 +29,9 @@ def _history(**overrides):
             "ctVal": "0.01",
             "ctMult": "1",
             "lotSz": "1",
+            "source": "okx_public_instruments",
         },
+        "_bb_contract_spec_source": "okx_public_instruments",
     }
     values = {
         "id": 1,
@@ -254,7 +256,7 @@ def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> Non
     assert contract["model_shadow_alignment"] == "avoided_losing_side"
 
 
-def test_paper_training_prefers_verified_account_contract_size_over_public_spec() -> None:
+def test_training_rejects_account_derived_contract_size_override() -> None:
     history = _history(pnl=100.0, realized_pnl=98.5)
     lineage = _complete_lineage()
     entry_order = lineage["orders_by_exchange_id"]["entry-1"]
@@ -271,12 +273,11 @@ def test_paper_training_prefers_verified_account_contract_size_over_public_spec(
     )
     sample = build_okx_history_training_sample(history, **lineage)
 
-    assert sample["contract_ct_val"] == pytest.approx(0.1)
-    assert sample["contract_ct_val_source"].startswith("okx_account_position_")
-    assert sample["contract_ct_val_corrected"] is True
+    assert sample["contract_ct_val"] == pytest.approx(0.01)
+    assert sample["contract_ct_val_source"] == "okx_public_instruments"
     assert sample["notional"] == pytest.approx(20_000.0)
-    assert "account_contract_size_evidence_conflict" not in sample["training_evidence_gaps"]
-    assert sample["trade_fact_trusted"] is True
+    assert "entry_fill_contract_quantity_mismatch" in sample["training_evidence_gaps"]
+    assert sample["trade_fact_trusted"] is False
 
 
 def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reason() -> None:

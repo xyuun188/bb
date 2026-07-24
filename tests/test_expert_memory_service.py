@@ -61,7 +61,7 @@ def test_authoritative_reflection_backfill_deduplicates_exchange_lifecycle() -> 
     }
     repaired = SimpleNamespace(
         id=4467,
-        settlement_source="okx_order_fact_sync",
+        settlement_source="system_execution",
         **base,
     )
     authoritative = SimpleNamespace(

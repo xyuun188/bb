@@ -51,10 +51,6 @@ class EntryExistingWinnerContextPolicy:
             entry = _safe_float(pos.get("entry_price"), 0.0)
             current = _safe_float(pos.get("current_price"), entry)
             qty = abs(_safe_float(pos.get("quantity"), 0.0))
-            contract_size = _safe_float(
-                pos.get("contract_size") or pos.get("contractSize"),
-                1.0,
-            )
             direct_notional = abs(
                 _safe_float(
                     pos.get("notional")
@@ -69,7 +65,7 @@ class EntryExistingWinnerContextPolicy:
             notional = (
                 direct_notional
                 if direct_notional > 0
-                else qty * max(entry, current, 0.0) * (contract_size if contract_size > 0 else 1.0)
+                else qty * max(entry, current, 0.0)
             )
             total_notional += max(notional, 0.0)
             total_quantity += qty

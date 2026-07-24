@@ -35,6 +35,7 @@ def test_normalized_open_position_context_uses_contract_value_and_stable_open_ti
             "side": "short",
             "quantity": 99.5,
             "contracts": 99.5,
+            "contractSize": 0.1,
             "entryPrice": 3.532,
             "markPrice": 3.528,
             "unrealizedPnl": 0.0398,

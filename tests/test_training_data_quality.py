@@ -272,6 +272,16 @@ def test_closed_position_training_requires_authoritative_pnl_and_funding_sources
             trade_fact_trust_reason="",
         )
     )
+    quarantined_settlement = assess_trade_sample(
+        _trade_sample(
+            pnl_source=(
+                "position_settlement_snapshot:"
+                "okx_position_history_identity_quarantine"
+            ),
+            settlement_source="okx_position_history_identity_quarantine",
+            settlement_status="settlement_quarantined",
+        )
+    )
 
     assert local_pnl.status == "excluded"
     assert "untrusted_realized_pnl_source:position_realized_pnl" in local_pnl.reasons
@@ -279,6 +289,11 @@ def test_closed_position_training_requires_authoritative_pnl_and_funding_sources
     assert "missing_or_untrusted_funding_fee_source" in missing_funding.reasons
     assert explicit_untrusted.status == "excluded"
     assert "untrusted_trade_fact" in explicit_untrusted.reasons
+    assert quarantined_settlement.status == "excluded"
+    assert (
+        "untrusted_realized_pnl_source:position_settlement_snapshot:"
+        "okx_position_history_identity_quarantine"
+    ) in quarantined_settlement.reasons
 
 
 def test_trade_unknown_losing_exit_attribution_is_excluded() -> None:
@@ -518,11 +533,7 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
                 execution_slippage_usdt=0.0,
                 execution_mode="paper",
                 training_evidence_gaps=[],
-                pnl_source=(
-                    "okx_verified_execution_pair_settlement"
-                    if source == "okx_verified_execution_pair"
-                    else "okx_position_history_realized_pnl"
-                ),
+                pnl_source="okx_position_history_realized_pnl",
                 training_label_contract={
                     "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
                     "label_name": PROFIT_TRAINING_TARGET,
@@ -553,7 +564,7 @@ def test_training_payload_trade_contract_feeds_return_objective_report() -> None
                 },
             )
             for index, source in enumerate(
-                ("okx_position_history", "okx_verified_execution_pair"),
+                ("okx_position_history", "okx_position_history"),
                 start=1,
             )
         ],

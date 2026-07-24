@@ -236,7 +236,7 @@ async def _seed_okx_position_history_rows(rows) -> None:
                 session,
                 row,
                 mode="paper",
-                source="test_okx_position_history_mirror",
+                source="okx_settlement_fact_mirror",
                 match_status="test_seed",
             )
 

@@ -679,6 +679,7 @@ async def test_paper_training_entry_close_and_loss_reach_authoritative_training(
             "fundingFee": "0",
             "pnlRatio": "-0.051",
             "_bb_contract_spec": {"ctVal": "1", "ctMult": "1", "lotSz": "1"},
+            "_bb_contract_spec_source": "okx_public_instruments",
         },
         sync_status="synced",
     )

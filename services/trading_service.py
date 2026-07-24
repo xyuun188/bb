@@ -142,8 +142,8 @@ from services.model_training_state import (
     ModelTrainingStateStore,
 )
 from services.okx_order_fact_sync import OkxOrderFactSyncService
-from services.okx_position_history_sync import OkxPositionHistoryMirrorSyncService
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
+from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
 from services.paper_bootstrap_canary import (
     PaperBootstrapCanaryPolicy,
@@ -622,7 +622,7 @@ class TradingService:
             memory_position_remover=self.memory_position_store.remove_open_position,
         )
         self.okx_order_fact_sync_factory = OkxOrderFactSyncService
-        self.okx_position_history_mirror_sync_factory = OkxPositionHistoryMirrorSyncService
+        self.okx_settlement_fact_sync_factory = OkxSettlementFactSyncService
         self.okx_position_settlement_sync_factory = OkxPositionSettlementSyncService
         self.exit_position_matcher = ExitPositionMatcher(self._normalize_position_symbol)
         self.exit_position_snapshot = ExitPositionSnapshotPolicy(self.okx_sync_service)
@@ -882,13 +882,13 @@ class TradingService:
         self._okx_order_fact_sync_last_error: str | None = None
         self._okx_order_fact_sync_success_count = 0
         self._okx_order_fact_sync_failure_count = 0
-        self._okx_position_history_mirror_sync_task: asyncio.Task | None = None
-        self._okx_position_history_mirror_sync_last_started_at: datetime | None = None
-        self._okx_position_history_mirror_sync_last_finished_at: datetime | None = None
-        self._okx_position_history_mirror_sync_last_row: dict[str, Any] | None = None
-        self._okx_position_history_mirror_sync_last_error: str | None = None
-        self._okx_position_history_mirror_sync_success_count = 0
-        self._okx_position_history_mirror_sync_failure_count = 0
+        self._okx_settlement_fact_sync_task: asyncio.Task | None = None
+        self._okx_settlement_fact_sync_last_started_at: datetime | None = None
+        self._okx_settlement_fact_sync_last_finished_at: datetime | None = None
+        self._okx_settlement_fact_sync_last_row: dict[str, Any] | None = None
+        self._okx_settlement_fact_sync_last_error: str | None = None
+        self._okx_settlement_fact_sync_success_count = 0
+        self._okx_settlement_fact_sync_failure_count = 0
         self._okx_position_settlement_sync_task: asyncio.Task | None = None
         self._okx_position_settlement_sync_last_started_at: datetime | None = None
         self._okx_position_settlement_sync_last_finished_at: datetime | None = None
@@ -1126,7 +1126,7 @@ class TradingService:
 
         return max(240.0, self.okx_authoritative_sync_interval_seconds() * 8.0)
 
-    def okx_position_history_mirror_sync_interval_seconds(self) -> float:
+    def okx_settlement_fact_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""
 
         return max(30.0, self.okx_authoritative_sync_interval_seconds())
@@ -1228,36 +1228,36 @@ class TradingService:
             "success_count": int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_authoritative_sync_failure_count", 0) or 0),
             "order_fact_sync": self._okx_order_fact_sync_status_payload(now),
-            "position_history_mirror_sync": self._okx_position_history_mirror_sync_status_payload(
+            "settlement_fact_sync": self._okx_settlement_fact_sync_status_payload(
                 now
             ),
             "position_settlement_sync": self._okx_position_settlement_sync_status_payload(now),
             "source": "okx_private_api_current_positions",
         }
 
-    def _okx_position_history_mirror_sync_status_payload(
+    def _okx_settlement_fact_sync_status_payload(
         self,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Return diagnostics for the account-level OKX history mirror sync."""
 
         now = now or datetime.now(UTC)
-        task = getattr(self, "_okx_position_history_mirror_sync_task", None)
-        started_at = getattr(self, "_okx_position_history_mirror_sync_last_started_at", None)
-        finished_at = getattr(self, "_okx_position_history_mirror_sync_last_finished_at", None)
-        last_row = getattr(self, "_okx_position_history_mirror_sync_last_row", None)
+        task = getattr(self, "_okx_settlement_fact_sync_task", None)
+        started_at = getattr(self, "_okx_settlement_fact_sync_last_started_at", None)
+        finished_at = getattr(self, "_okx_settlement_fact_sync_last_finished_at", None)
+        last_row = getattr(self, "_okx_settlement_fact_sync_last_row", None)
         last_finished_age_seconds = (
             max((now - finished_at).total_seconds(), 0.0)
             if isinstance(finished_at, datetime)
             else None
         )
-        interval_seconds = self.okx_position_history_mirror_sync_interval_seconds()
+        interval_seconds = self.okx_settlement_fact_sync_interval_seconds()
         status = "pending"
         if task is not None and not task.done():
             status = "running"
         elif isinstance(last_row, dict):
             status = str(last_row.get("status") or "ok").lower() or "ok"
-        elif getattr(self, "_okx_position_history_mirror_sync_last_error", None):
+        elif getattr(self, "_okx_settlement_fact_sync_last_error", None):
             status = "degraded"
         return {
             "status": status,
@@ -1271,13 +1271,13 @@ class TradingService:
                 if last_finished_age_seconds is not None
                 else None
             ),
-            "last_error": getattr(self, "_okx_position_history_mirror_sync_last_error", None),
+            "last_error": getattr(self, "_okx_settlement_fact_sync_last_error", None),
             "last_row": last_row,
             "success_count": int(
-                getattr(self, "_okx_position_history_mirror_sync_success_count", 0) or 0
+                getattr(self, "_okx_settlement_fact_sync_success_count", 0) or 0
             ),
             "failure_count": int(
-                getattr(self, "_okx_position_history_mirror_sync_failure_count", 0) or 0
+                getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0
             ),
             "interval_seconds": round(interval_seconds, 3),
         }
@@ -1516,7 +1516,6 @@ class TradingService:
         ).sync()
         status = str(report.get("status") or "unknown").lower()
         unverified_count = int(report.get("unverified_count") or 0)
-        position_confirmed_count = int(report.get("position_confirmed_count") or 0)
         okx_pull_available = bool(report.get("okx_pull_available") is not False)
         local_checked = int(report.get("local_checked") or 0)
         pull_error = (
@@ -1541,7 +1540,6 @@ class TradingService:
                 "OKX 订单事实同步发现本地已成交订单未被 OKX 原生成交确认："
                 f"status={status}, local_checked={local_checked}, "
                 f"confirmed={int(report.get('confirmed_count') or 0)}, "
-                f"position_confirmed={position_confirmed_count}, "
                 f"unverified={unverified_count}；需要复核后再允许新开仓。"
             )
         else:
@@ -1549,12 +1547,9 @@ class TradingService:
                 f"OKX 订单事实同步正常：status={status}, "
                 f"local_checked={local_checked}, "
                 f"confirmed={int(report.get('confirmed_count') or 0)}, "
-                f"position_confirmed={position_confirmed_count}, "
                 f"unverified={unverified_count}, "
                 f"backfilled={int(report.get('backfilled_count') or 0)}, "
-                "position_history="
-                f"{int(report.get('position_history_backfilled_count') or 0)}+"
-                f"{int(report.get('position_history_updated_count') or 0)}"
+                f"deferred_stages={len(report.get('deferred_stages') or [])}"
             )
         return {
             "kind": "order_fact_sync",
@@ -1658,16 +1653,16 @@ class TradingService:
         if getattr(self, "_okx_order_fact_sync_task", None) is task:
             self._okx_order_fact_sync_task = None
 
-    async def _okx_position_history_mirror_sync_loop(self) -> None:
-        """Keep the local OKX positions-history mirror current account-wide."""
+    async def _okx_settlement_fact_sync_loop(self) -> None:
+        """Keep authoritative OKX settlement facts current account-wide."""
 
         while self._running:
-            factory = getattr(self, "okx_position_history_mirror_sync_factory", None)
+            factory = getattr(self, "okx_settlement_fact_sync_factory", None)
             if factory is None:
-                await asyncio.sleep(self.okx_position_history_mirror_sync_interval_seconds())
+                await asyncio.sleep(self.okx_settlement_fact_sync_interval_seconds())
                 continue
             started_at = datetime.now(UTC)
-            self._okx_position_history_mirror_sync_last_started_at = started_at
+            self._okx_settlement_fact_sync_last_started_at = started_at
             try:
                 mode = "live" if mode_manager.mode.value == "live" else "paper"
                 row = await factory(
@@ -1681,19 +1676,19 @@ class TradingService:
                     row = {
                         "status": "degraded",
                         "mode": mode,
-                        "source": "okx_position_history_account_sync",
+                        "source": "okx_settlement_fact_mirror",
                         "okx_pull_available": False,
-                        "error": "invalid_position_history_mirror_sync_result",
+                        "error": "invalid_settlement_fact_sync_result",
                     }
-                self._okx_position_history_mirror_sync_last_row = row
+                self._okx_settlement_fact_sync_last_row = row
                 error = safe_error_text(row.get("error"), limit=220) if row.get("error") else None
-                self._okx_position_history_mirror_sync_last_error = error
+                self._okx_settlement_fact_sync_last_error = error
                 if str(row.get("status") or "").lower() in {"degraded", "error", "critical"}:
-                    self._okx_position_history_mirror_sync_failure_count = (
+                    self._okx_settlement_fact_sync_failure_count = (
                         int(
                             getattr(
                                 self,
-                                "_okx_position_history_mirror_sync_failure_count",
+                                "_okx_settlement_fact_sync_failure_count",
                                 0,
                             )
                             or 0
@@ -1701,19 +1696,19 @@ class TradingService:
                         + 1
                     )
                 else:
-                    self._okx_position_history_mirror_sync_success_count = (
+                    self._okx_settlement_fact_sync_success_count = (
                         int(
                             getattr(
                                 self,
-                                "_okx_position_history_mirror_sync_success_count",
+                                "_okx_settlement_fact_sync_success_count",
                                 0,
                             )
                             or 0
                         )
                         + 1
                     )
-                    changed_count = int(row.get("inserted_count") or 0) + int(
-                        row.get("updated_count") or 0
+                    changed_count = int(row.get("position_history_inserted_count") or 0) + int(
+                        row.get("position_history_updated_count") or 0
                     )
                     if changed_count > 0:
                         try:
@@ -1746,30 +1741,27 @@ class TradingService:
                 raise
             except Exception as exc:
                 error = safe_error_text(exc, limit=220)
-                self._okx_position_history_mirror_sync_last_error = error
-                self._okx_position_history_mirror_sync_last_row = {
+                self._okx_settlement_fact_sync_last_error = error
+                self._okx_settlement_fact_sync_last_row = {
                     "status": "degraded",
                     "mode": mode_manager.mode.value,
-                    "source": "okx_position_history_account_sync",
+                    "source": "okx_settlement_fact_mirror",
                     "okx_pull_available": False,
-                    "live_count": 0,
-                    "upserted_count": 0,
-                    "inserted_count": 0,
-                    "updated_count": 0,
-                    "skipped_count": 0,
+                    "position_history_count": 0,
+                    "account_bill_count": 0,
                     "error": error,
                 }
-                self._okx_position_history_mirror_sync_failure_count = (
-                    int(getattr(self, "_okx_position_history_mirror_sync_failure_count", 0) or 0)
+                self._okx_settlement_fact_sync_failure_count = (
+                    int(getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0)
                     + 1
                 )
                 logger.warning(
-                    "OKX position history mirror background sync failed",
+                    "OKX settlement fact background sync failed",
                     error=error,
                 )
             finally:
-                self._okx_position_history_mirror_sync_last_finished_at = datetime.now(UTC)
-            await asyncio.sleep(self.okx_position_history_mirror_sync_interval_seconds())
+                self._okx_settlement_fact_sync_last_finished_at = datetime.now(UTC)
+            await asyncio.sleep(self.okx_settlement_fact_sync_interval_seconds())
 
     async def _okx_position_settlement_sync_loop(self) -> None:
         """Retry official OKX settlement for recently closed local positions."""
@@ -1786,7 +1778,6 @@ class TradingService:
                 row = await factory(
                     mode=mode,
                     retry_seconds=self.okx_position_settlement_sync_interval_seconds(),
-                    timeout_seconds=6.0,
                     limit=10,
                 ).sync_once()
                 self._okx_position_settlement_sync_last_row = row
@@ -7979,8 +7970,8 @@ class TradingService:
         )
         self._runtime_heartbeat_task = asyncio.create_task(self._runtime_heartbeat_loop())
         self._okx_authoritative_sync_task = asyncio.create_task(self._okx_authoritative_sync_loop())
-        self._okx_position_history_mirror_sync_task = asyncio.create_task(
-            self._okx_position_history_mirror_sync_loop()
+        self._okx_settlement_fact_sync_task = asyncio.create_task(
+            self._okx_settlement_fact_sync_loop()
         )
         self._okx_position_settlement_sync_task = asyncio.create_task(
             self._okx_position_settlement_sync_loop()
@@ -7991,7 +7982,7 @@ class TradingService:
                 self._market_analysis_task,
                 self._runtime_heartbeat_task,
                 self._okx_authoritative_sync_task,
-                self._okx_position_history_mirror_sync_task,
+                self._okx_settlement_fact_sync_task,
                 self._okx_position_settlement_sync_task,
             )
         except asyncio.CancelledError:
@@ -8008,7 +7999,7 @@ class TradingService:
             getattr(self, "_runtime_heartbeat_task", None),
             getattr(self, "_okx_authoritative_sync_task", None),
             getattr(self, "_okx_order_fact_sync_task", None),
-            getattr(self, "_okx_position_history_mirror_sync_task", None),
+            getattr(self, "_okx_settlement_fact_sync_task", None),
             getattr(self, "_okx_position_settlement_sync_task", None),
             getattr(self, "_shadow_backtest_update_task", None),
             getattr(self, "_stale_entry_expire_task", None),
@@ -8025,7 +8016,7 @@ class TradingService:
         self._runtime_heartbeat_task = None
         self._okx_authoritative_sync_task = None
         self._okx_order_fact_sync_task = None
-        self._okx_position_history_mirror_sync_task = None
+        self._okx_settlement_fact_sync_task = None
         self._okx_position_settlement_sync_task = None
         self._shadow_backtest_update_task = None
         self._stale_entry_expire_task = None
@@ -9038,11 +9029,10 @@ class TradingService:
         )
         contract_size = self._safe_float(
             exchange_position.get("contractSize")
-            or exchange_position.get("contract_size")
-            or info.get("ctVal"),
-            1.0,
+            or exchange_position.get("contract_size"),
+            0.0,
         )
-        return abs(contracts * (contract_size if contract_size > 0 else 1.0))
+        return abs(contracts * contract_size) if contract_size > 0 else 0.0
 
     async def _manual_close_fraction_for_position(
         self,

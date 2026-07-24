@@ -56,7 +56,6 @@ def _reflection_position_rank(position: Any) -> tuple[int, int, int, int]:
     source_rank = {
         "okx_position_history": 4,
         "okx_position_history_settlement": 3,
-        "okx_order_fact_sync": 2,
         "system_execution": 1,
     }.get(settlement_source, 0)
     status_rank = int(settlement_status in {"okx_position_history", "reconciled", "settled"})

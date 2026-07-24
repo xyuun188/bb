@@ -35,6 +35,9 @@ class _FakeCcxt:
             raise self.fill_history_inst_id_error
         return {"data": self.fills_history}
 
+    async def privateGetTradeFills(self, params):
+        return {"data": self.fills_history}
+
     async def publicGetPublicInstruments(self, params):
         self.instrument_params.append(params)
         return {"data": self.instruments}
@@ -73,6 +76,7 @@ def _without_begin(params: list[dict]) -> list[dict]:
 async def test_exchange_close_fill_finder_uses_latest_native_okx_fill_candidate():
     timestamp = int(datetime(2026, 6, 8, 12, 10, tzinfo=UTC).timestamp() * 1000)
     ccxt = _FakeCcxt(
+        instruments=[{"instId": "BTC-USDT-SWAP", "ctVal": "0.5", "ctMult": "1"}],
         fills_history=[
             {
                 "instId": "BTC-USDT-SWAP",
@@ -117,6 +121,7 @@ async def test_exchange_close_fill_finder_uses_latest_native_okx_fill_candidate(
 async def test_exchange_close_fill_finder_prefers_native_quantity_match_over_latest_candidate():
     timestamp = int(datetime(2026, 6, 8, 12, 10, tzinfo=UTC).timestamp() * 1000)
     ccxt = _FakeCcxt(
+        instruments=[{"instId": "BTC-USDT-SWAP", "ctVal": "1", "ctMult": "1"}],
         fills_history=[
             {
                 "instId": "BTC-USDT-SWAP",
@@ -192,13 +197,14 @@ async def test_exchange_close_fill_finder_uses_okx_ctval_for_contract_quantity_m
     assert result["quantity"] == pytest.approx(600000.0)
     assert result["contracts"] == pytest.approx(6.0)
     assert result["contract_size"] == pytest.approx(100000.0)
-    assert result["contract_size_source"] == "okx_public_instruments_ctVal"
-    assert result["contract_size_inferred_from_target"] is False
+    assert result["contract_size_source"] == "okx_public_instruments"
 
 
 @pytest.mark.asyncio
 async def test_exchange_close_fill_finder_ignores_ccxt_abstract_history_without_native_fills():
-    ccxt = _FakeCcxt()
+    ccxt = _FakeCcxt(
+        instruments=[{"instId": "BTC-USDT-SWAP", "ctVal": "1", "ctMult": "1"}]
+    )
     finder = ExchangeCloseFillFinder(paper_okx_provider=lambda: _FakePaperOkx(ccxt))
 
     result = await finder.find(_position(side="short", quantity=2.0))
@@ -213,6 +219,7 @@ async def test_exchange_close_fill_finder_ignores_ccxt_abstract_history_without_
 async def test_exchange_close_fill_finder_reads_native_okx_fills_history_when_market_missing():
     timestamp = int(datetime(2026, 6, 26, 3, 20, tzinfo=UTC).timestamp() * 1000)
     ccxt = _FakeCcxt(
+        instruments=[{"instId": "LAB-USDT-SWAP", "ctVal": "0.1", "ctMult": "1"}],
         fills_history=[
             {
                 "instId": "LAB-USDT-SWAP",
@@ -255,7 +262,6 @@ async def test_exchange_close_fill_finder_reads_native_okx_fills_history_when_ma
     assert result["quantity"] == pytest.approx(0.9)
     assert result["contracts"] == pytest.approx(9.0)
     assert result["contract_size"] == pytest.approx(0.1)
-    assert result["contract_size_inferred_from_target"] is True
     assert result["fee"] == pytest.approx(0.015696)
 
 
@@ -288,15 +294,8 @@ async def test_exchange_close_fill_finder_retries_account_wide_history_for_offli
 
     result = await finder.find(_position(symbol="LAB/USDT", side="long", quantity=0.9))
 
-    assert _without_begin(ccxt.fill_history_params) == [
-        {"instType": "SWAP", "instId": "LAB-USDT-SWAP", "limit": "100"},
-        {"instType": "SWAP", "limit": "100"},
-    ]
-    assert result["source"] == "okx_fills_history"
-    assert result["order_id"] == "close-lab"
-    assert result["price"] == pytest.approx(17.44)
-    assert result["quantity"] == pytest.approx(0.9)
-    assert result["pnl"] == pytest.approx(0.517)
+    assert result == {}
+    assert ccxt.fill_history_params == []
 
 
 @pytest.mark.asyncio

@@ -375,6 +375,7 @@ async def _position_entry_order_is_exchange_close_fill(
         )
         confirmed = (
             raw.get("fills_history_confirmed") is True
+            or raw.get("order_detail_confirmed") is True
             or raw.get("execution_result_confirmed") is True
             or str(getattr(order, "okx_sync_status", "") or "").startswith("okx_")
         )
@@ -760,9 +761,8 @@ def normalized_open_position_context(
     )
     contract_size = float_parser(
         position_payload.get("contract_size")
-        or position_payload.get("contractSize")
-        or info.get("ctVal"),
-        1.0,
+        or position_payload.get("contractSize"),
+        0.0,
     )
     contracts = abs(
         float_parser(
@@ -776,7 +776,11 @@ def normalized_open_position_context(
         )
     )
     quantity = (
-        contracts * (contract_size if contract_size > 0 else 1.0) if contracts > 0 else raw_quantity
+        contracts * contract_size
+        if contracts > 0 and contract_size > 0
+        else raw_quantity
+        if contracts <= 0
+        else 0.0
     )
     direct_notional = abs(
         float_parser(

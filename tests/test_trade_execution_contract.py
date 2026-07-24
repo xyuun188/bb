@@ -25,6 +25,16 @@ def _provenance(*, samples: int = 8, fallback_reason: str = "") -> dict[str, obj
 def _entry_raw() -> dict[str, object]:
     provenance = _provenance()
     return {
+        "pre_order_execution_facts": {
+            "production_eligible": True,
+            "input_fingerprint": "test-pre-order-fingerprint",
+            "inst_id": "BTC-USDT-SWAP",
+            "contract_spec": {
+                "ctVal": "0.01",
+                "ctMult": "1",
+                "source": "okx_public_instruments",
+            },
+        },
         "live_ml_profit_contract": {
             "eligible": True,
             "expected_net_return_pct": 0.8,
@@ -71,11 +81,27 @@ def _filled_order(
     quantity: float = 1.2,
     price: float = 100.0,
 ) -> SimpleNamespace:
+    exchange_order_id = f"okx-order-{decision_id}"
+    contracts = quantity / 0.01
     return SimpleNamespace(
         decision_id=decision_id,
         status="filled",
         quantity=quantity,
         price=price,
+        exchange_order_id=exchange_order_id,
+        okx_fill_contracts=contracts,
+        okx_raw_fills={
+            "fills_history_confirmed": True,
+            "order_id": exchange_order_id,
+            "trade_ids": [f"trade-{decision_id}"],
+            "inst_id": "BTC-USDT-SWAP",
+            "contracts": contracts,
+            "contract_size": 0.01,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": quantity,
+            "avg_price": price,
+        },
     )
 
 
@@ -93,6 +119,16 @@ def _rules_canary_raw(
         "minimum_notional_usdt": 1.0,
     }
     return {
+        "pre_order_execution_facts": {
+            "production_eligible": True,
+            "input_fingerprint": "test-rules-canary-pre-order",
+            "inst_id": "BTC-USDT-SWAP",
+            "contract_spec": {
+                "ctVal": "0.01",
+                "ctMult": "1",
+                "source": "okx_public_instruments",
+            },
+        },
         "production_trade_gate": {
             "can_trade": True,
             "mode": "live_rules_canary",
@@ -215,6 +251,80 @@ def test_live_rules_canary_contract_does_not_require_live_ml_profit_contract() -
     assert report["entry_contracts"][0]["contract_lifecycle"] == "live_rules_canary"
 
 
+def test_entry_notional_uses_okx_contracts_and_public_spec_not_local_quantity() -> None:
+    raw = _entry_raw()
+    raw["pre_order_execution_facts"].update(
+        {
+            "inst_id": "ACT-USDT-SWAP",
+            "contract_spec": {
+                "ctVal": "1",
+                "ctMult": "1",
+                "source": "okx_public_instruments",
+            },
+        }
+    )
+    raw["profit_risk_sizing"].update(
+        {
+            "target_notional_usdt": 0.0358,
+            "final_notional_usdt": 0.0358,
+        }
+    )
+    order = SimpleNamespace(
+        decision_id=108685,
+        status="filled",
+        quantity=40.0,
+        price=0.00895,
+        exchange_order_id="act-order-4944",
+        okx_fill_contracts=4.0,
+        okx_raw_fills={
+            "fills_history_confirmed": True,
+            "order_id": "act-order-4944",
+            "trade_ids": ["act-trade-4944"],
+            "inst_id": "ACT-USDT-SWAP",
+            "contracts": 4.0,
+            "contract_size": 1.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": 4.0,
+            "avg_price": 0.00895,
+        },
+    )
+
+    report = summarize_trade_execution_contract(
+        [_decision(108685, "long", raw)],
+        orders=[order],
+    )
+
+    entry = report["entry_contracts"][0]
+    assert entry["filled_order_notional_usdt"] == 0.0358
+    assert "filled_order_contract_quantity_mismatch" in entry["reasons"]
+    assert "filled_order_notional_differs_from_risk_contract" not in entry["reasons"]
+
+
+def test_entry_contract_accepts_complete_okx_order_detail_fact() -> None:
+    order = _filled_order(108686)
+    order.okx_raw_fills.update(
+        {
+            "source": "okx_order_detail",
+            "fills_history_confirmed": False,
+            "execution_result_confirmed": False,
+            "order_detail_confirmed": True,
+        }
+    )
+
+    report = summarize_trade_execution_contract(
+        [_decision(108686, "long", _entry_raw())],
+        orders=[order],
+    )
+
+    entry = report["entry_contracts"][0]
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    assert entry["filled_order_notional_source"] == (
+        "okx_order_detail_contracts_x_pre_order_public_contract_spec_x_fill_price"
+    )
+
+
 def test_live_rules_canary_contract_enforces_gate_notional_limit() -> None:
     report = summarize_trade_execution_contract(
         [
@@ -307,14 +417,7 @@ def test_executed_entry_requires_real_filled_order_link() -> None:
 def test_complete_executed_paper_canary_uses_its_own_entry_contract() -> None:
     report = summarize_trade_execution_contract(
         [_decision(11, "long", complete_paper_canary_raw())],
-        orders=[
-            SimpleNamespace(
-                decision_id=11,
-                status="filled",
-                quantity=0.5,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(11, quantity=0.5)],
     )
 
     assert report["summary"]["entry_contract_ready_count"] == 1
@@ -330,14 +433,32 @@ def test_compact_decision_projection_preserves_paper_canary_contract() -> None:
 
     report = summarize_trade_execution_contract(
         [_decision(13, "long", compact)],
-        orders=[
-            SimpleNamespace(
-                decision_id=13,
-                status="filled",
-                quantity=0.5,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(13, quantity=0.5)],
+    )
+
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+
+
+def test_compact_decision_projection_retains_large_execution_contract_fields() -> None:
+    raw = _rules_canary_raw()
+    raw["profit_risk_sizing"]["large_exchange_diagnostics"] = "x" * 20_000
+    raw["opportunity_score"]["large_market_diagnostics"] = "x" * 20_000
+
+    compact = _compact_decision_learning_snapshot(raw)
+    compact_sizing = compact["profit_risk_sizing"]
+    compact_opportunity = compact["opportunity_score"]
+
+    assert compact_sizing["contract_lifecycle"] == "live_rules_canary"
+    assert compact_sizing["final_notional_usdt"] == 8.0
+    assert compact_sizing["policy_provenance"]["source"] == "live_return_distribution"
+    assert "large_exchange_diagnostics" not in compact_sizing
+    assert compact_opportunity["execution_cost"]["order_size_complete"] is True
+    assert "large_market_diagnostics" not in compact_opportunity
+
+    report = summarize_trade_execution_contract(
+        [_decision(14, "long", compact)],
+        orders=[_filled_order(14, quantity=0.08)],
     )
 
     assert report["summary"]["entry_contract_ready_count"] == 1
@@ -351,14 +472,7 @@ def test_malformed_executed_paper_canary_still_fails_closed() -> None:
 
     report = summarize_trade_execution_contract(
         [_decision(12, "long", raw)],
-        orders=[
-            SimpleNamespace(
-                decision_id=12,
-                status="filled",
-                quantity=0.5,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(12, quantity=0.5)],
     )
 
     assert report["summary"]["entry_contract_ready_count"] == 0
@@ -373,14 +487,7 @@ def test_bounded_legacy_canary_fill_drift_uses_persisted_cost_evidence() -> None
     final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]
     report = summarize_trade_execution_contract(
         [_decision(13, "long", raw)],
-        orders=[
-            SimpleNamespace(
-                decision_id=13,
-                status="filled",
-                quantity=final_notional / 100.0,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(13, quantity=final_notional / 100.0)],
     )
 
     assert report["summary"]["contract_violation_count"] == 0
@@ -424,14 +531,7 @@ def test_confirmed_canary_fill_within_reserved_ceiling_keeps_contract_complete()
 
     report = summarize_trade_execution_contract(
         [_decision(15, "long", raw)],
-        orders=[
-            SimpleNamespace(
-                decision_id=15,
-                status="filled",
-                quantity=settled_notional / 100.0,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(15, quantity=settled_notional / 100.0)],
     )
 
     assert report["summary"]["contract_violation_count"] == 0
@@ -482,14 +582,7 @@ def test_confirmed_canary_fill_beyond_reserved_ceiling_fails_closed() -> None:
 
     report = summarize_trade_execution_contract(
         [_decision(16, "long", raw)],
-        orders=[
-            SimpleNamespace(
-                decision_id=16,
-                status="filled",
-                quantity=settled_notional / 100.0,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(16, quantity=settled_notional / 100.0)],
     )
 
     assert report["summary"]["entry_contract_ready_count"] == 0
@@ -501,14 +594,7 @@ def test_canary_fill_drift_beyond_persisted_cost_evidence_fails_closed() -> None
     final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]
     report = summarize_trade_execution_contract(
         [_decision(14, "long", raw)],
-        orders=[
-            SimpleNamespace(
-                decision_id=14,
-                status="filled",
-                quantity=final_notional / 100.0,
-                price=100.0,
-            )
-        ],
+        orders=[_filled_order(14, quantity=final_notional / 100.0)],
     )
 
     assert report["summary"]["entry_contract_ready_count"] == 0
@@ -600,9 +686,11 @@ def test_external_okx_reconciliation_uses_exact_fills_history_lifecycle() -> Non
         "source": "okx_reconcile_close_fill",
         "fills_history_confirmed": True,
         "order_id": "okx-external-close-9",
+        "trade_ids": ["okx-external-trade-9"],
         "inst_id": "BTC-USDT-SWAP",
         "contracts": 2.0,
         "contract_size_verified": True,
+        "contract_size_source": "okx_public_instruments",
         "base_quantity": 0.02,
         "avg_price": 100.0,
         "fee_abs": 0.01,

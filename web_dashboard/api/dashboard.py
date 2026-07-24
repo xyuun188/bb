@@ -3059,7 +3059,7 @@ async def _dashboard_closed_position_ledger_rows_uncached(
         limit=5000,
     )
     position_history_rows = okx_position_history_records_to_rows(history_records)
-    official_history_source = "okx_position_history_mirror"
+    official_history_source = "okx_settlement_fact_mirror"
     if not position_history_rows:
         position_history_rows = _dashboard_persisted_position_history_rows(
             closed_rows,

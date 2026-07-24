@@ -24,9 +24,6 @@ DEFAULT_MAX_ALGO_DETAIL_QUERIES = 100
 DEFAULT_PROTECTION_ALGO_ORDER_TYPES = ("conditional", "oco", "trigger", "move_order_stop")
 OKX_PROTECTION_EXECUTION_VERSION = "2026-07-15.okx-protection-execution.v1"
 FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
-OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO = 0.02
-
-
 def okx_minimum_order_notional_usdt(
     contract_spec: dict[str, Any] | None,
     mark_price: Any,
@@ -142,37 +139,6 @@ class OkxNativeAccountBill:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class OkxAccountContractSizeEvidence:
-    """Account-scoped evidence for the effective base units in one SWAP contract.
-
-    OKX demo and public instrument metadata can temporarily disagree.  The
-    private position row is therefore treated as the account authority, but a
-    derived value is accepted only when margin and USD-notional paths agree.
-    """
-
-    inst_id: str
-    contract_size: float
-    verified: bool
-    source: str
-    reason: str
-    direct_contract_size: float = 0.0
-    margin_implied_contract_size: float = 0.0
-    notional_implied_contract_size: float = 0.0
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "inst_id": self.inst_id,
-            "contract_size": self.contract_size,
-            "verified": self.verified,
-            "source": self.source,
-            "reason": self.reason,
-            "direct_contract_size": self.direct_contract_size,
-            "margin_implied_contract_size": self.margin_implied_contract_size,
-            "notional_implied_contract_size": self.notional_implied_contract_size,
-        }
-
-
 class OkxNativeFactsClient:
     """Small read-only adapter for OKX-native private facts."""
 
@@ -205,11 +171,13 @@ class OkxNativeFactsClient:
         strict: bool = False,
     ) -> list[OkxNativeFillGroup]:
         ccxt = await self.executor._get_ccxt()
-        fetch_fills = getattr(ccxt, "privateGetTradeFillsHistory", None)
-        if not callable(fetch_fills):
-            if strict:
-                raise RuntimeError("OKX native fills-history API is unavailable")
-            return []
+        fetch_recent_fills = getattr(ccxt, "privateGetTradeFills", None)
+        fetch_historical_fills = getattr(ccxt, "privateGetTradeFillsHistory", None)
+        if not callable(fetch_recent_fills) or not callable(fetch_historical_fills):
+            raise RuntimeError(
+                "OKX native recent and historical fills APIs are both required"
+            )
+        fill_endpoints = (fetch_recent_fills, fetch_historical_fills)
 
         target_inst_ids = _target_inst_ids(symbols=symbols, inst_ids=inst_ids)
         target_order_ids = _target_order_ids(order_ids)
@@ -232,6 +200,27 @@ class OkxNativeFactsClient:
         last_error: Exception | None = None
         successful_read = False
 
+        async def fetch_complete_fill_rows(
+            params: dict[str, Any],
+            *,
+            filter_inst_ids: set[str] | None = None,
+        ) -> list[dict[str, Any]]:
+            complete_rows: list[dict[str, Any]] = []
+            effective_inst_ids = target_inst_ids if filter_inst_ids is None else filter_inst_ids
+            for fetch_fills in fill_endpoints:
+                complete_rows.extend(
+                    await self._fetch_fill_pages(
+                        fetch_fills,
+                        params,
+                        since_ms=since_ms,
+                        side=side,
+                        target_inst_ids=effective_inst_ids,
+                        page_limit=page_limit,
+                        max_pages=page_count,
+                    )
+                )
+            return complete_rows
+
         def append_rows(page_rows: Iterable[dict[str, Any]]) -> None:
             for row in page_rows:
                 key = _fill_row_identity(row)
@@ -252,14 +241,9 @@ class OkxNativeFactsClient:
             query_limit = _target_order_query_limit(target_order_query_limit)
             for order_id in sorted(target_order_ids - known_order_ids)[:query_limit]:
                 try:
-                    page_rows = await self._fetch_fill_history_pages(
-                        fetch_fills,
+                    page_rows = await fetch_complete_fill_rows(
                         {"instType": "SWAP", "ordId": order_id, "limit": str(page_limit)},
-                        since_ms=since_ms,
-                        side=side,
-                        target_inst_ids=set(),
-                        page_limit=page_limit,
-                        max_pages=page_count,
+                        filter_inst_ids=set(),
                     )
                     successful_read = True
                 except Exception as exc:
@@ -280,14 +264,8 @@ class OkxNativeFactsClient:
         for params in params_list:
             inst_id = str(params.get("instId") or "").strip().upper()
             try:
-                page_rows = await self._fetch_fill_history_pages(
-                    fetch_fills,
+                page_rows = await fetch_complete_fill_rows(
                     params,
-                    since_ms=since_ms,
-                    side=side,
-                    target_inst_ids=target_inst_ids,
-                    page_limit=page_limit,
-                    max_pages=page_count,
                 )
                 successful_read = True
             except Exception as exc:
@@ -303,14 +281,8 @@ class OkxNativeFactsClient:
             and (fallback_needed or failed_inst_ids)
         ):
             try:
-                page_rows = await self._fetch_fill_history_pages(
-                    fetch_fills,
+                page_rows = await fetch_complete_fill_rows(
                     {"instType": "SWAP", "limit": str(page_limit)},
-                    since_ms=since_ms,
-                    side=side,
-                    target_inst_ids=target_inst_ids,
-                    page_limit=page_limit,
-                    max_pages=page_count,
                 )
                 successful_read = True
             except Exception as exc:
@@ -333,7 +305,7 @@ class OkxNativeFactsClient:
             symbol_normalizer=self.symbol_normalizer,
         )
 
-    async def _fetch_fill_history_pages(
+    async def _fetch_fill_pages(
         self,
         fetch_fills: Any,
         params: dict[str, Any],
@@ -402,8 +374,23 @@ class OkxNativeFactsClient:
                 or str(row.get("instId") or "").strip().upper() in target_inst_ids
             )
         ]
+        position_inst_ids = {
+            str(row.get("instId") or "").strip().upper()
+            for row in rows
+            if str(row.get("instId") or "").strip()
+        }
+        contract_sizes: dict[str, float] = {}
+        if callable(getattr(ccxt, "publicGetPublicInstruments", None)):
+            contract_sizes = await self.fetch_contract_sizes(inst_ids=position_inst_ids)
         return [
-            _native_position_to_ccxt_shape(row, symbol_normalizer=self.symbol_normalizer)
+            _native_position_to_ccxt_shape(
+                row,
+                symbol_normalizer=self.symbol_normalizer,
+                public_contract_size=contract_sizes.get(
+                    str(row.get("instId") or "").strip().upper(),
+                    0.0,
+                ),
+            )
             for row in rows
         ]
 
@@ -660,8 +647,10 @@ class OkxNativeFactsClient:
         specs = await self.fetch_contract_specs(symbols=symbols, inst_ids=inst_ids)
         return {
             inst_id: _safe_float(spec.get("ctVal"), 0.0)
+            * _safe_float(spec.get("ctMult"), 1.0)
             for inst_id, spec in specs.items()
             if _safe_float(spec.get("ctVal"), 0.0) > 0
+            and _safe_float(spec.get("ctMult"), 1.0) > 0
         }
 
     async def fetch_contract_specs(
@@ -1439,305 +1428,11 @@ def _native_position_row_is_open(row: dict[str, Any]) -> bool:
     return abs(_safe_float(row.get("pos") or row.get("qty"), 0.0)) > 0
 
 
-def derive_okx_account_contract_size_evidence(
-    row: dict[str, Any] | None,
-    *,
-    tolerance_ratio: float = OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO,
-) -> OkxAccountContractSizeEvidence:
-    """Resolve the effective contract size from one private account position.
-
-    A direct account ``ctVal`` is preferred.  When it is absent, two
-    independent private-account equations must agree:
-
-    * initial margin * leverage / contracts / price
-    * USD notional / contracts / mark price
-
-    A public instrument value is deliberately not used here because demo
-    instruments can lag or differ from the public production catalogue.
-    """
-
-    payload = row if isinstance(row, dict) else {}
-    info = payload.get("info")
-    info = info if isinstance(info, dict) else payload
-    inst_id = str(info.get("instId") or payload.get("instId") or payload.get("symbol") or "")
-    inst_id = inst_id.strip().upper()
-    contracts = abs(
-        _safe_float(
-            info.get("pos")
-            or info.get("qty")
-            or payload.get("contracts")
-            or payload.get("pos")
-            or payload.get("qty"),
-            0.0,
-        )
-    )
-    direct_size = _safe_float(
-        info.get("ctVal")
-        or info.get("contractSize")
-        or payload.get("contractSize")
-        or payload.get("ctVal"),
-        0.0,
-    )
-    mark_price = _safe_float(
-        info.get("markPx")
-        or info.get("last")
-        or payload.get("markPrice")
-        or payload.get("markPx"),
-        0.0,
-    )
-    entry_price = _safe_float(
-        info.get("avgPx")
-        or info.get("entryPrice")
-        or payload.get("entryPrice")
-        or payload.get("avgPx"),
-        0.0,
-    )
-    leverage = _safe_float(
-        info.get("lever") or info.get("leverage") or payload.get("leverage"),
-        0.0,
-    )
-    initial_margin = abs(
-        _safe_float(
-            info.get("imr")
-            or info.get("margin")
-            or info.get("initialMargin")
-            or payload.get("initialMargin")
-            or payload.get("margin"),
-            0.0,
-        )
-    )
-    notional_usd = abs(
-        _safe_float(
-            info.get("notionalUsd")
-            or info.get("notional")
-            or payload.get("notional"),
-            0.0,
-        )
-    )
-    margin_price = mark_price or entry_price
-    notional_price = mark_price or entry_price
-    margin_size = (
-        initial_margin * leverage / contracts / margin_price
-        if initial_margin > 0 and leverage > 0 and contracts > 0 and margin_price > 0
-        else 0.0
-    )
-    notional_size = (
-        notional_usd / contracts / notional_price
-        if notional_usd > 0 and contracts > 0 and notional_price > 0
-        else 0.0
-    )
-
-    def result(
-        *,
-        contract_size: float = 0.0,
-        verified: bool,
-        source: str,
-        reason: str,
-    ) -> OkxAccountContractSizeEvidence:
-        return OkxAccountContractSizeEvidence(
-            inst_id=inst_id,
-            contract_size=float(contract_size if contract_size > 0 else 0.0),
-            verified=verified,
-            source=source,
-            reason=reason,
-            direct_contract_size=float(direct_size if direct_size > 0 else 0.0),
-            margin_implied_contract_size=float(margin_size if margin_size > 0 else 0.0),
-            notional_implied_contract_size=float(notional_size if notional_size > 0 else 0.0),
-        )
-
-    if not inst_id:
-        return result(
-            verified=False,
-            source="okx_account_position_evidence_incomplete",
-            reason="missing_instrument_id",
-        )
-    if contracts <= 0:
-        return result(
-            verified=False,
-            source="okx_account_position_evidence_incomplete",
-            reason="missing_position_contracts",
-        )
-
-    available_derived = [value for value in (margin_size, notional_size) if value > 0]
-    if direct_size > 0:
-        if any(
-            not _contract_sizes_close(direct_size, value, tolerance_ratio)
-            for value in available_derived
-        ):
-            return result(
-                verified=False,
-                source="okx_account_position_evidence_conflict",
-                reason="direct_contract_size_conflicts_with_account_derived_value",
-            )
-        return result(
-            contract_size=direct_size,
-            verified=True,
-            source="okx_account_position_direct_contract_size",
-            reason="private_position_direct_contract_size",
-        )
-
-    if margin_size <= 0 or notional_size <= 0:
-        return result(
-            verified=False,
-            source="okx_account_position_evidence_incomplete",
-            reason="margin_and_notional_crosscheck_required",
-        )
-    if not _contract_sizes_close(margin_size, notional_size, tolerance_ratio):
-        return result(
-            verified=False,
-            source="okx_account_position_evidence_conflict",
-            reason="margin_and_notional_contract_sizes_disagree",
-        )
-    return result(
-        contract_size=(margin_size + notional_size) / 2.0,
-        verified=True,
-        source="okx_account_position_margin_notional_crosscheck",
-        reason="private_position_margin_and_notional_agree",
-    )
-
-
-def derive_okx_account_history_contract_size_evidence(
-    row: dict[str, Any] | None,
-    *,
-    fills: Iterable[OkxNativeFillGroup] = (),
-    tolerance_ratio: float = OKX_ACCOUNT_CONTRACT_SIZE_TOLERANCE_RATIO,
-) -> OkxAccountContractSizeEvidence:
-    """Recover a closed demo contract size from official PnL and fill paths."""
-
-    payload = row if isinstance(row, dict) else {}
-    inst_id = str(payload.get("instId") or "").strip().upper()
-    open_contracts = abs(
-        _safe_float(payload.get("openMaxPos") or payload.get("open_max_pos"), 0.0)
-    )
-    close_contracts = abs(
-        _safe_float(
-            payload.get("closeTotalPos") or payload.get("close_total_pos"),
-            0.0,
-        )
-    )
-    entry_price = _safe_float(
-        payload.get("openAvgPx") or payload.get("open_avg_px"),
-        0.0,
-    )
-    close_price = _safe_float(
-        payload.get("closeAvgPx") or payload.get("close_avg_px"),
-        0.0,
-    )
-    gross_pnl = _safe_float(payload.get("pnl") or payload.get("closePnl"), 0.0)
-    history_size = (
-        abs(gross_pnl) / open_contracts / abs(close_price - entry_price)
-        if open_contracts > 0
-        and close_contracts > 0
-        and _contract_sizes_close(open_contracts, close_contracts, tolerance_ratio)
-        and entry_price > 0
-        and close_price > 0
-        and abs(close_price - entry_price) > 1e-12
-        and abs(gross_pnl) > 1e-12
-        else 0.0
-    )
-    opened_ms = _safe_float(
-        payload.get("cTime") or payload.get("createdTime") or payload.get("openTime"),
-        0.0,
-    )
-    closed_ms = _safe_float(
-        payload.get("uTime") or payload.get("updatedTime") or payload.get("closeTime"),
-        0.0,
-    )
-    direction = str(
-        payload.get("direction")
-        or payload.get("side")
-        or payload.get("posSide")
-        or ""
-    ).strip().lower()
-    if direction not in {"long", "short"}:
-        open_side = str(payload.get("openSide") or "").strip().lower()
-        direction = "long" if open_side == "buy" else "short" if open_side == "sell" else ""
-    expected_close_side = "sell" if direction == "long" else "buy" if direction == "short" else ""
-    fill_sizes: list[float] = []
-    for fill in fills:
-        if str(getattr(fill, "inst_id", "") or "").strip().upper() != inst_id:
-            continue
-        if expected_close_side and str(getattr(fill, "side", "") or "").strip().lower() != expected_close_side:
-            continue
-        timestamp_ms = _safe_float(getattr(fill, "timestamp_ms", None), 0.0)
-        if opened_ms > 0 and timestamp_ms > 0 and timestamp_ms + 60_000 < opened_ms:
-            continue
-        if closed_ms > 0 and timestamp_ms > 0 and timestamp_ms - 60_000 > closed_ms:
-            continue
-        fill_contracts = abs(_safe_float(getattr(fill, "contracts", None), 0.0))
-        fill_price = _safe_float(getattr(fill, "avg_price", None), 0.0)
-        fill_pnl = _safe_float(getattr(fill, "fill_pnl", None), 0.0)
-        if (
-            fill_contracts > 0
-            and fill_price > 0
-            and entry_price > 0
-            and abs(fill_price - entry_price) > 1e-12
-            and abs(fill_pnl) > 1e-12
-        ):
-            fill_sizes.append(
-                abs(fill_pnl) / fill_contracts / abs(fill_price - entry_price)
-            )
-
-    def result(
-        *,
-        contract_size: float = 0.0,
-        verified: bool,
-        source: str,
-        reason: str,
-    ) -> OkxAccountContractSizeEvidence:
-        return OkxAccountContractSizeEvidence(
-            inst_id=inst_id,
-            contract_size=float(contract_size if contract_size > 0 else 0.0),
-            verified=verified,
-            source=source,
-            reason=reason,
-            direct_contract_size=0.0,
-            margin_implied_contract_size=float(history_size if history_size > 0 else 0.0),
-            notional_implied_contract_size=(
-                float(sum(fill_sizes) / len(fill_sizes)) if fill_sizes else 0.0
-            ),
-        )
-
-    if not inst_id:
-        return result(
-            verified=False,
-            source="okx_account_position_history_evidence_incomplete",
-            reason="missing_instrument_id",
-        )
-    if history_size <= 0 or not fill_sizes:
-        return result(
-            verified=False,
-            source="okx_account_position_history_evidence_incomplete",
-            reason="official_history_and_close_fill_crosscheck_required",
-        )
-    if any(
-        not _contract_sizes_close(history_size, fill_size, tolerance_ratio)
-        for fill_size in fill_sizes
-    ):
-        return result(
-            verified=False,
-            source="okx_account_position_history_evidence_conflict",
-            reason="official_history_and_close_fill_contract_sizes_disagree",
-        )
-    return result(
-        contract_size=(history_size + (sum(fill_sizes) / len(fill_sizes))) / 2.0,
-        verified=True,
-        source="okx_account_position_history_pnl_fill_crosscheck",
-        reason="official_history_and_close_fill_contract_sizes_agree",
-    )
-
-
-def _contract_sizes_close(left: float, right: float, tolerance_ratio: float) -> bool:
-    if left <= 0 or right <= 0:
-        return False
-    tolerance = max(float(tolerance_ratio or 0.0), 0.0)
-    return abs(left - right) <= max(abs(left), abs(right), 1e-12) * tolerance
-
-
 def _native_position_to_ccxt_shape(
     row: dict[str, Any],
     *,
     symbol_normalizer: Any,
+    public_contract_size: float = 0.0,
 ) -> dict[str, Any]:
     inst_id = str(row.get("instId") or "").strip().upper()
     pos = _safe_float(row.get("pos") or row.get("qty"), 0.0)
@@ -1748,7 +1443,6 @@ def _native_position_to_ccxt_shape(
     if side not in {"long", "short", "net"}:
         side = "short" if pos < 0 else "long" if pos > 0 else ""
     contracts = abs(pos)
-    contract_size = _safe_float(row.get("ctVal"), 0.0)
     mark_price = _safe_float(row.get("markPx") or row.get("last"), 0.0)
     entry_price = _safe_float(row.get("avgPx"), 0.0)
     return {
@@ -1756,7 +1450,10 @@ def _native_position_to_ccxt_shape(
         "symbol": inst_id or symbol_normalizer(row.get("instId")),
         "side": side,
         "contracts": contracts,
-        "contractSize": contract_size if contract_size > 0 else None,
+        "contractSize": public_contract_size if public_contract_size > 0 else None,
+        "contractSizeSource": (
+            "okx_public_instruments" if public_contract_size > 0 else "missing"
+        ),
         "markPrice": mark_price,
         "entryPrice": entry_price,
         "unrealizedPnl": _safe_float(row.get("upl"), 0.0),

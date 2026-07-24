@@ -58,7 +58,7 @@ async def _seed_okx_position_history_rows(
                 session,
                 row,
                 mode="paper",
-                source="test_okx_position_history_mirror",
+                source="okx_settlement_fact_mirror",
                 entry_order_ids=(entry_order_ids or {}).get(row.get("posId")),
                 close_order_ids=(close_order_ids or {}).get(row.get("posId")),
                 match_status="test_seed",
@@ -403,7 +403,7 @@ async def test_dashboard_position_history_prefers_closed_position_settlement_sna
                     "close_fee": 0.2,
                     "funding_fee": -0.03,
                     "settlement_status": "reconciled",
-                    "settlement_source": "okx_order_fact_sync",
+                    "settlement_source": "okx_position_history_settlement",
                     "settlement_synced_at": closed_at,
                     "settlement_raw": {
                         "formula": "close_fill_pnl + funding_fee - entry_fee - close_fee"
@@ -895,7 +895,7 @@ async def test_dashboard_position_history_uses_okx_grouped_ledger_with_linked_fi
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_position_history_mirror"
+    assert payload["ledger_source"] == "okx_settlement_fact_mirror"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "INJ/USDT"
@@ -1157,7 +1157,7 @@ async def test_dashboard_position_history_uses_okx_official_rows_over_polluted_l
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_position_history_mirror"
+    assert payload["ledger_source"] == "okx_settlement_fact_mirror"
     assert payload["total"] == 2
     by_symbol = {row["symbol"]: row for row in payload["positions"]}
 
@@ -1286,7 +1286,7 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
                         "close_fee": close_fee,
                         "funding_fee": 0.0,
                         "settlement_status": "reconciled",
-                        "settlement_source": "okx_order_fact_sync",
+                        "settlement_source": "okx_position_history_settlement",
                         "is_open": False,
                         "okx_inst_id": "BAND-USDT-SWAP",
                         "okx_pos_id": pos_id,
@@ -1340,7 +1340,7 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     finally:
         await close_db()
 
-    assert payload["ledger_source"] == "okx_position_history_mirror"
+    assert payload["ledger_source"] == "okx_settlement_fact_mirror"
     assert payload["total"] == 1
     row = payload["positions"][0]
     assert row["symbol"] == "BAND/USDT"
@@ -1529,7 +1529,7 @@ async def test_dashboard_position_history_keeps_reused_posid_lifecycles_and_part
                 "unrealized_pnl": 0.0,
                 "realized_pnl": realized_pnl,
                 "settlement_status": "reconciled",
-                "settlement_source": "okx_order_fact_sync",
+                "settlement_source": "okx_position_history_settlement",
                 "is_open": False,
                 "okx_inst_id": inst_id,
                 "okx_pos_id": pos_id,
@@ -3150,8 +3150,8 @@ async def test_xrp_final_close_cannot_be_downgraded_by_stale_local_order_links(
         "pnl": "-0.0013",
         "fee": "-0.00454945",
         "fundingFee": "0",
-        "_bb_contract_spec": {"ctVal": "100.0"},
-        "_bb_contract_spec_source": "okx_account_position_margin_notional_crosscheck",
+        "_bb_contract_spec": {"ctVal": "100.0", "ctMult": "1", "lotSz": "0.01"},
+        "_bb_contract_spec_source": "okx_public_instruments",
     }
 
     async def add_order(

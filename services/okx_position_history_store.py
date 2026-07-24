@@ -15,8 +15,7 @@ from typing import Any
 from sqlalchemy import select
 
 from core.symbols import normalize_trading_symbol, symbol_from_okx_inst_id
-from models.trade import OkxPositionHistory, Position
-from services.position_settlement import is_final_settlement_status
+from models.trade import OkxPositionHistory
 
 
 def okx_position_history_row_identity(row: dict[str, Any], *, mode: str | None = None) -> str:
@@ -82,86 +81,6 @@ async def upsert_okx_position_history_row(
         return record
     _apply_payload(existing, payload)
     return existing
-
-
-async def upsert_okx_position_history_rows(
-    session: Any,
-    rows: Iterable[dict[str, Any]],
-    *,
-    mode: str,
-    source: str,
-    synced_at: datetime | None = None,
-) -> int:
-    count = 0
-    for row in rows:
-        record = await upsert_okx_position_history_row(
-            session,
-            row,
-            mode=mode,
-            source=source,
-            synced_at=synced_at,
-        )
-        if record is not None:
-            count += 1
-    return count
-
-
-async def backfill_okx_position_history_from_positions(
-    session: Any,
-    *,
-    mode: str | None = None,
-    limit: int = 10000,
-) -> dict[str, Any]:
-    stmt = (
-        select(Position)
-        .where(Position.is_open.is_(False))
-        .order_by(Position.closed_at.desc().nullslast(), Position.created_at.desc())
-        .limit(max(1, int(limit or 1)))
-    )
-    if mode:
-        stmt = stmt.where(Position.execution_mode == mode)
-    result = await session.execute(stmt)
-    scanned = 0
-    upserted = 0
-    invalid: list[dict[str, Any]] = []
-    now = datetime.now(UTC)
-    for position in result.scalars().all():
-        scanned += 1
-        raw = getattr(position, "settlement_raw", None)
-        raw = raw if isinstance(raw, dict) else {}
-        row = raw.get("okx_position_history_row")
-        if not isinstance(row, dict):
-            continue
-        if not is_final_settlement_status(getattr(position, "settlement_status", None)):
-            invalid.append(
-                {
-                    "position_id": getattr(position, "id", None),
-                    "symbol": getattr(position, "symbol", None),
-                    "reason": "non_final_settlement_status",
-                }
-            )
-            continue
-        record = await upsert_okx_position_history_row(
-            session,
-            row,
-            mode=str(getattr(position, "execution_mode", "") or mode or "paper"),
-            source="position_settlement_snapshot",
-            entry_order_ids=[
-                *(_list_from_raw(raw.get("entry_order_ids"))),
-                getattr(position, "entry_exchange_order_id", None),
-            ],
-            close_order_ids=[
-                *(_list_from_raw(raw.get("close_order_ids"))),
-                raw.get("close_exchange_order_id"),
-                getattr(position, "close_exchange_order_id", None),
-            ],
-            position_ids=[getattr(position, "id", None)],
-            match_status="position_settlement_snapshot",
-            synced_at=now,
-        )
-        if record is not None:
-            upserted += 1
-    return {"scanned": scanned, "upserted": upserted, "invalid": invalid[:20]}
 
 
 async def load_okx_position_history_records(
@@ -297,23 +216,6 @@ def _apply_payload(record: OkxPositionHistory, payload: dict[str, Any]) -> None:
         elif key == "raw_row":
             existing_raw = dict(getattr(record, "raw_row", None) or {})
             incoming_raw = dict(value or {})
-            existing_spec_source = str(
-                existing_raw.get("_bb_contract_spec_source") or ""
-            ).strip()
-            incoming_spec_source = str(
-                incoming_raw.get("_bb_contract_spec_source") or ""
-            ).strip()
-            if (
-                existing_spec_source.startswith("okx_account_position_")
-                and not incoming_spec_source.startswith("okx_account_position_")
-            ):
-                for contract_key in (
-                    "_bb_contract_spec",
-                    "_bb_contract_spec_source",
-                    "_bb_contract_size_evidence",
-                ):
-                    if contract_key in existing_raw:
-                        incoming_raw[contract_key] = existing_raw[contract_key]
             for raw_key, raw_value in existing_raw.items():
                 if raw_key.startswith("_bb_") and raw_key not in incoming_raw:
                     incoming_raw[raw_key] = raw_value

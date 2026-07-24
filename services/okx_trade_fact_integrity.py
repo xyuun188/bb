@@ -216,11 +216,15 @@ class OkxTradeFactIntegrityService:
                 )
             )
 
-        contract_size = _first_positive(
-            raw.get("contract_size"),
-            raw.get("contractSize"),
-            _nested(raw, "info", "ctVal"),
-            default=0.0,
+        contract_size_verified = bool(
+            raw.get("contract_size_verified") is True
+            and str(raw.get("contract_size_source") or "").strip()
+            == "okx_public_instruments"
+        )
+        contract_size = (
+            _first_positive(raw.get("contract_size"), default=0.0)
+            if contract_size_verified
+            else 0.0
         )
         raw_contracts = _first_positive(
             raw.get("filled_contracts"),
@@ -241,9 +245,7 @@ class OkxTradeFactIntegrityService:
             default=0.0,
         )
         expected_base_quantity = (
-            raw_base_quantity
-            if raw_base_quantity > 0
-            else raw_contracts * contract_size
+            raw_contracts * contract_size
             if raw_contracts > 0 and contract_size > 0
             else 0.0
         )
@@ -259,18 +261,29 @@ class OkxTradeFactIntegrityService:
                     order_quantity=local_quantity,
                     raw_contracts=raw_contracts,
                     reason=(
-                        "OKX execution exposes contract counts but no authoritative "
-                        "base_quantity or ctVal; quantity and notional comparisons are disabled."
+                        "OKX execution exposes contract counts but has no verified "
+                        "okx_public_instruments contract size; quantity and notional "
+                        "comparisons are disabled."
                     ),
                 )
             )
         if (
             local_quantity > 0
             and expected_base_quantity > 0
-            and not _relative_close_enough(
-                local_quantity,
-                expected_base_quantity,
-                QUANTITY_TOLERANCE_RATIO,
+            and (
+                not _relative_close_enough(
+                    local_quantity,
+                    expected_base_quantity,
+                    QUANTITY_TOLERANCE_RATIO,
+                )
+                or (
+                    raw_base_quantity > 0
+                    and not _relative_close_enough(
+                        raw_base_quantity,
+                        expected_base_quantity,
+                        QUANTITY_TOLERANCE_RATIO,
+                    )
+                )
             )
         ):
             issues.append(
@@ -669,14 +682,8 @@ def _raw_from_order_fills(order: Order, okx_raw_fills: dict[str, Any]) -> dict[s
         contracts = raw.get("contracts") or raw.get("filled_contracts") or first_row.get("fillSz")
         if contracts is not None:
             info["accFillSz"] = contracts
-    if not info.get("ctVal"):
-        contract_size = raw.get("contract_size") or raw.get("contractSize")
-        if contract_size is not None:
-            info["ctVal"] = contract_size
-
     raw["info"] = info
     raw.setdefault("okx_inst_id", inst_id)
-    raw.setdefault("contract_size", raw.get("contractSize") or raw.get("ctVal"))
     raw.setdefault("filled_contracts", raw.get("contracts") or raw.get("filled") or raw.get("amount"))
     raw.setdefault("average", raw.get("avg_price") or raw.get("avgPx"))
     raw.setdefault("avgPx", raw.get("avg_price") or raw.get("average"))

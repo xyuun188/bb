@@ -82,6 +82,7 @@ def _execution_raw(
     contract_size: float | None = 0.1,
     avg_price: float = 2.44,
 ) -> dict:
+    contract_size_verified = contract_size is not None and contract_size > 0
     return {
         "execution_result": {
             "raw_response": {
@@ -93,7 +94,14 @@ def _execution_raw(
                     "avgPx": str(avg_price),
                 },
                 "contract_size": contract_size,
+                "contract_size_verified": contract_size_verified,
+                "contract_size_source": (
+                    "okx_public_instruments" if contract_size_verified else "missing"
+                ),
                 "filled_contracts": contracts,
+                "base_quantity": (
+                    contracts * contract_size if contract_size_verified else None
+                ),
             }
         }
     }
@@ -466,9 +474,11 @@ async def test_order_okx_raw_fills_win_over_stale_decision_execution_price(
                             "order_id": "3694561249469370368",
                             "trade_ids": ["aave-fill-1"],
                             "inst_id": "AAVE-USDT-SWAP",
-                            "contracts": 2.0,
-                            "contract_size": 1.0,
-                            "base_quantity": 2.0,
+                                "contracts": 2.0,
+                                "contract_size": 1.0,
+                                "contract_size_verified": True,
+                                "contract_size_source": "okx_public_instruments",
+                                "base_quantity": 2.0,
                             "avg_price": 97.54,
                             "rows": [
                                 {
@@ -558,9 +568,7 @@ async def test_verified_pepe_order_fact_wins_over_stale_decision_contract_size(
                             "contracts": 40.9,
                             "contract_size": 10_000_000.0,
                             "contract_size_verified": True,
-                            "contract_size_source": (
-                                "okx_account_position_margin_notional_crosscheck"
-                            ),
+                            "contract_size_source": "okx_public_instruments",
                             "base_quantity": 409_000_000.0,
                             "avg_price": 0.00000288,
                             "rows": [
@@ -1531,8 +1539,10 @@ async def test_split_exit_order_uses_weighted_child_fill_price(
                     "price": 3.95,
                     "filled": 4.0,
                     "amount": 4.0,
-                    "contract_size": 1.0,
-                    "filled_contracts": 24.0,
+                        "contract_size": 1.0,
+                        "contract_size_verified": True,
+                        "contract_size_source": "okx_public_instruments",
+                        "filled_contracts": 24.0,
                     "base_quantity": 24.0,
                     "split_exit_order": True,
                     "split_chunks": [

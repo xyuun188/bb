@@ -106,6 +106,14 @@ class _TradeApi:
         self.calls.append(("get_algo_order_details", dict(kwargs)))
         return {"code": "0", "data": [{"algoId": "algo-1", "state": "effective"}]}
 
+    def get_fills(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_fills", dict(kwargs)))
+        return {"code": "0", "data": []}
+
+    def get_fills_history(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_fills_history", dict(kwargs)))
+        return {"code": "0", "data": []}
+
 
 class _AccountApi:
     def __init__(self) -> None:
@@ -391,6 +399,51 @@ async def test_sdk_adapter_reads_algo_history_and_exact_details() -> None:
     assert trade_api.calls[1] == (
         "get_algo_order_details",
         {"algoId": "algo-1", "algoClOrdId": ""},
+    )
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_exposes_recent_and_historical_fill_ledgers() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    trade_api = _TradeApi()
+    exchange._trade_api = trade_api
+
+    params = {
+        "instType": "SWAP",
+        "instId": "ACT-USDT-SWAP",
+        "ordId": "order-1",
+        "limit": "100",
+    }
+    await exchange.privateGetTradeFills(params)
+    await exchange.privateGetTradeFillsHistory(params)
+
+    assert trade_api.calls[0] == (
+        "get_fills",
+        {
+            "instType": "SWAP",
+            "instId": "ACT-USDT-SWAP",
+            "ordId": "order-1",
+            "after": "",
+            "before": "",
+            "limit": "100",
+            "uly": "",
+            "instFamily": "",
+            "begin": "",
+            "end": "",
+        },
+    )
+    assert trade_api.calls[1] == (
+        "get_fills_history",
+        {
+            "instType": "SWAP",
+            "instId": "ACT-USDT-SWAP",
+            "ordId": "order-1",
+            "after": "",
+            "before": "",
+            "limit": "100",
+            "uly": "",
+            "instFamily": "",
+        },
     )
 
 

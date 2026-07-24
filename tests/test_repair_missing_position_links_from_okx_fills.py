@@ -1106,7 +1106,7 @@ def test_open_position_close_plan_uses_okx_contract_size_for_quantity() -> None:
     assert plan.contract_size == pytest.approx(10.0)
     assert plan.fill_quantity == pytest.approx(20.0)
     assert plan.fill_pnl == pytest.approx(-0.049)
-    assert plan.contract_size_source == "okx_public_instruments_ctVal"
+    assert plan.contract_size_source == "okx_public_instruments"
 
 
 def test_close_link_reassignment_plan_switches_to_quantity_matching_fill() -> None:
@@ -1565,7 +1565,7 @@ async def test_apply_open_position_close_plan_closes_position_and_quarantines_tr
             fill_quantity=20.0,
             fill_contracts=2.0,
             contract_size=10.0,
-            contract_size_source="okx_public_instruments_ctVal",
+            contract_size_source="okx_public_instruments",
             entry_price=0.17245,
             exit_price=0.1749,
             close_fee=0.001,
@@ -1823,7 +1823,7 @@ async def test_apply_close_link_reassignment_updates_order_and_reflection(
             old_fill_contracts=3.0,
             new_fill_contracts=1.0,
             contract_size=10.0,
-            contract_size_source="okx_public_instruments_ctVal",
+            contract_size_source="okx_public_instruments",
             target_quantity=10.0,
             entry_price=1.819,
             exit_price=1.929,
@@ -2054,7 +2054,7 @@ async def test_apply_open_position_close_plan_rejects_missing_okx_inst_id(
             fill_quantity=20.0,
             fill_contracts=2.0,
             contract_size=10.0,
-            contract_size_source="okx_public_instruments_ctVal",
+            contract_size_source="okx_public_instruments",
             entry_price=0.17245,
             exit_price=0.1749,
             close_fee=0.001,

@@ -93,6 +93,13 @@ def _has_authoritative_fee_fact(order: Any, *, order_id: str) -> bool:
     exchange_confirmation = bool(
         raw.get("fills_history_confirmed") is True
         or (
+            raw.get("order_detail_confirmed") is True
+            and str(raw.get("source") or "").strip() == "okx_order_detail"
+            and raw.get("contract_size_verified") is True
+            and str(raw.get("contract_size_source") or "").strip()
+            == "okx_public_instruments"
+        )
+        or (
             raw.get("execution_result_confirmed") is True
             and raw.get("contract_size_verified") is True
             and str(raw.get("contract_size_source") or "").strip()

@@ -247,6 +247,7 @@ async def test_exchange_mark_map_uses_okx_info_markpx_upl_and_contract_size(
                     "symbol": "PROS/USDT:USDT",
                     "side": "long",
                     "contracts": 0,
+                    "contractSize": 1.0,
                     "markPrice": 0,
                     "entryPrice": 0,
                     "info": {

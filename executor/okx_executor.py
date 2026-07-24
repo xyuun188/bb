@@ -305,8 +305,10 @@ class OKXExecutor(AbstractExecutor):
             return None
         contract_size = self._safe_float(snapshot.get("contract_size"), 0.0)
         if contract_size <= 0:
-            contract_size = 1.0
-        min_size = self._safe_float(info.get("minSz") or info.get("lotSz"), 0.0) or 1.0
+            return None
+        min_size = self._safe_float(info.get("minSz") or info.get("lotSz"), 0.0)
+        if min_size <= 0:
+            return None
         max_market_size = self._safe_float(info.get("maxMktSz"), 0.0)
         market_info = {
             **info,
@@ -458,7 +460,7 @@ class OKXExecutor(AbstractExecutor):
                     last_error = e
                     continue
                 if self._is_transient_system_error(message) and attempt < attempts - 1:
-                    logger.warning(
+                    logger.info(
                         "OKX SDK temporary system error; retrying",
                         method=method_name,
                         attempt=attempt,
@@ -472,6 +474,11 @@ class OKXExecutor(AbstractExecutor):
                         "OKX SDK expected capability rejection",
                         method=method_name,
                         error_code=error_code,
+                    )
+                elif self._is_transient_system_error(message):
+                    logger.info(
+                        "OKX SDK temporary system error exhausted retry budget",
+                        error=message,
                     )
                 else:
                     logger.error("OKX SDK exchange error", error=message)
@@ -573,7 +580,7 @@ class OKXExecutor(AbstractExecutor):
 
         side = "buy"
         okx_symbol = self._to_swap_symbol(decision.symbol)
-        contract_size = 1.0
+        contract_size = 0.0
         order_quantity = 0.0
         base_quantity = 0.0
         okx_order_rules: dict[str, Any] = {}
@@ -2108,7 +2115,7 @@ class OKXExecutor(AbstractExecutor):
         contract_size: float,
     ) -> dict[str, Any] | None:
         fetch_fills = getattr(ccxt, "privateGetTradeFillsHistory", None)
-        if not callable(fetch_fills) or expected_contracts <= 0:
+        if not callable(fetch_fills) or expected_contracts <= 0 or contract_size <= 0:
             return None
 
         try:
@@ -2198,7 +2205,7 @@ class OKXExecutor(AbstractExecutor):
                 {
                     **group,
                     "price": self._safe_float(group.get("price_value"), 0.0) / contracts,
-                    "quantity": contracts * (contract_size if contract_size > 0 else 1.0),
+                    "quantity": contracts * contract_size,
                     "timestamp": (
                         datetime.fromtimestamp(timestamp_ms / 1000.0, UTC)
                         if timestamp_ms > 0
@@ -2973,7 +2980,6 @@ class OKXExecutor(AbstractExecutor):
         contract_size = abs(
             self._safe_float((snapshot or {}).get("contract_size"), 0.0)
             or self._safe_float(position.get("contractSize"), 0.0)
-            or self._safe_float(info.get("ctVal"), 0.0)
         )
         matches_symbol = bool(symbol and expected_symbol and symbol == expected_symbol)
         matches_side = bool(side and target_side and side == target_side)

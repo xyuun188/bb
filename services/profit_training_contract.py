@@ -166,7 +166,11 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
         "okx_entry_fill_base_quantity_and_average_price"
     ):
         blockers.append("notional_source_not_authoritative")
-    allowed_fee_sources = {"okx_fills_history", "okx_execution_result"}
+    allowed_fee_sources = {
+        "okx_fills_history",
+        "okx_order_detail",
+        "okx_execution_result",
+    }
     for field in ("entry_fee_source", "close_fee_source"):
         sources = {
             token
@@ -177,7 +181,6 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
             blockers.append(f"{field}_not_authoritative")
     if _text(sample.get("pnl_source")) not in {
         "okx_position_history_realized_pnl",
-        "okx_verified_execution_pair_settlement",
     }:
         blockers.append("pnl_source_not_authoritative")
     funding_fee_source = _text(sample.get("funding_fee_source"))

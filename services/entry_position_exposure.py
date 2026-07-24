@@ -52,10 +52,6 @@ class EntryPositionExposurePolicy:
                     0.0,
                 )
             )
-            contract_size = _safe_float(
-                position.get("contract_size") or position.get("contractSize") or info.get("ctVal"),
-                1.0,
-            )
             price = _safe_float(
                 position.get("current_price")
                 or position.get("markPrice")
@@ -68,7 +64,7 @@ class EntryPositionExposurePolicy:
             notional = (
                 direct_notional
                 if direct_notional > 0
-                else quantity * max(price, 0.0) * (contract_size if contract_size > 0 else 1.0)
+                else quantity * max(price, 0.0)
             )
             unrealized_pnl = _safe_float(
                 position.get("unrealized_pnl")

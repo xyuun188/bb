@@ -683,6 +683,76 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
         await conn.execute(
             text(
                 """
+                CREATE OR REPLACE FUNCTION bb_compact_ai_decision_learning_value(
+                    input_value JSONB,
+                    depth INTEGER DEFAULT 0
+                )
+                RETURNS JSONB
+                LANGUAGE plpgsql
+                IMMUTABLE
+                AS $$
+                DECLARE
+                    compacted JSONB;
+                BEGIN
+                    IF input_value IS NULL THEN
+                        RETURN NULL;
+                    END IF;
+                    IF jsonb_typeof(input_value) IN ('null', 'number', 'boolean') THEN
+                        RETURN input_value;
+                    END IF;
+                    IF jsonb_typeof(input_value) = 'string' THEN
+                        RETURN CASE
+                            WHEN length(input_value #>> '{}') <= 1024 THEN input_value
+                            ELSE NULL
+                        END;
+                    END IF;
+                    IF depth >= 3 THEN
+                        RETURN NULL;
+                    END IF;
+                    IF jsonb_typeof(input_value) = 'object' THEN
+                        SELECT jsonb_object_agg(projected.key, projected.value)
+                        INTO compacted
+                        FROM (
+                            SELECT item.key,
+                                   bb_compact_ai_decision_learning_value(
+                                       item.value,
+                                       depth + 1
+                                   ) AS value
+                            FROM jsonb_each(input_value) AS item
+                        ) AS projected
+                        WHERE projected.value IS NOT NULL;
+                        RETURN compacted;
+                    END IF;
+                    IF jsonb_typeof(input_value) = 'array' THEN
+                        IF jsonb_array_length(input_value) > 32 THEN
+                            RETURN NULL;
+                        END IF;
+                        SELECT COALESCE(
+                            jsonb_agg(projected.value ORDER BY projected.ordinality),
+                            '[]'::JSONB
+                        )
+                        INTO compacted
+                        FROM (
+                            SELECT item.ordinality,
+                                   bb_compact_ai_decision_learning_value(
+                                       item.value,
+                                       depth + 1
+                                   ) AS value
+                            FROM jsonb_array_elements(input_value)
+                                 WITH ORDINALITY AS item(value, ordinality)
+                        ) AS projected
+                        WHERE projected.value IS NOT NULL;
+                        RETURN compacted;
+                    END IF;
+                    RETURN NULL;
+                END;
+                $$
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
                 CREATE OR REPLACE FUNCTION bb_sync_ai_decision_model_health()
                 RETURNS trigger
                 LANGUAGE plpgsql
@@ -722,17 +792,34 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                     NEW.model_health_snapshot_version := 1;
                     NEW.decision_learning_snapshot := COALESCE(
                         (
-                            SELECT jsonb_object_agg(item.key, item.value)
-                            FROM jsonb_each(raw) AS item(key, value)
-                            WHERE jsonb_typeof(item.value) IN ('number', 'boolean', 'null')
-                               OR (
-                                   jsonb_typeof(item.value) = 'string'
-                                   AND length(item.value #>> '{}') <= 1024
-                               )
-                               OR (
-                                   jsonb_typeof(item.value) IN ('object', 'array')
-                                   AND pg_column_size(item.value) <= 16384
-                               )
+                            SELECT jsonb_object_agg(projected.key, projected.value)
+                            FROM (
+                                SELECT
+                                    item.key,
+                                    CASE
+                                        WHEN jsonb_typeof(item.value)
+                                            IN ('number', 'boolean', 'null')
+                                        THEN item.value
+                                        WHEN jsonb_typeof(item.value) = 'string'
+                                             AND length(item.value #>> '{}') <= 1024
+                                        THEN item.value
+                                        WHEN jsonb_typeof(item.value) IN ('object', 'array')
+                                             AND pg_column_size(item.value) <= 16384
+                                        THEN item.value
+                                        WHEN item.key IN (
+                                            'profit_risk_sizing',
+                                            'opportunity_score'
+                                        )
+                                        THEN bb_compact_ai_decision_learning_value(
+                                            item.value,
+                                            0
+                                        )
+                                        ELSE NULL
+                                    END AS value
+                                FROM jsonb_each(raw) AS item(key, value)
+                            ) AS projected
+                            WHERE projected.value IS NOT NULL
+                              AND pg_column_size(projected.value) <= 16384
                         ),
                         '{}'::JSONB
                     );
