@@ -28,6 +28,7 @@ from services.paper_exploration import (
 from services.paper_training import (
     PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
     PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_TRAINING_SIZING_VERSION,
     PAPER_TRAINING_VERSION,
     paper_training_contract_reasons,
@@ -87,8 +88,8 @@ class TradeExecutionContractService:
         since_naive = since_utc.replace(tzinfo=None)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
-            decisions = list(
-                SimpleNamespace(**dict(row))
+            decisions = [
+                _decision_report_projection(row)
                 for row in (
                     await session.execute(
                         select(
@@ -99,6 +100,9 @@ class TradeExecutionContractService:
                             AIDecision.decision_learning_snapshot.label(
                                 "raw_llm_response"
                             ),
+                            AIDecision.raw_llm_response["profit_risk_sizing"][
+                                "execution_reconciliations"
+                            ].label("execution_reconciliations"),
                         )
                         .where(
                             AIDecision.created_at >= since_naive,
@@ -110,7 +114,7 @@ class TradeExecutionContractService:
                 )
                 .mappings()
                 .all()
-            )
+            ]
             orders = list(
                 (
                     await session.execute(
@@ -149,6 +153,20 @@ class TradeExecutionContractService:
         report["training_epoch_started_at"] = epoch_start.isoformat()
         report["pre_epoch_contracts_can_block_entries"] = False
         return report
+
+
+def _decision_report_projection(row: Any) -> SimpleNamespace:
+    payload = dict(row)
+    reconciliations = payload.pop("execution_reconciliations", None)
+    raw = dict(_safe_dict(payload.get("raw_llm_response")))
+    if isinstance(reconciliations, list):
+        sizing = dict(_safe_dict(raw.get("profit_risk_sizing")))
+        sizing["execution_reconciliations"] = [
+            dict(item) for item in reconciliations if isinstance(item, dict)
+        ]
+        raw["profit_risk_sizing"] = sizing
+    payload["raw_llm_response"] = raw
+    return SimpleNamespace(**payload)
 
 
 def summarize_trade_execution_contract(
@@ -531,10 +549,11 @@ def validate_paper_canary_entry_contract(
     observation = _safe_dict(canary.get("selected_observation"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     reasons = _paper_canary_observation_reasons(canary)
-    bounded_fill_drift = _bounded_canary_fill_drift(
-        canary=canary,
+    bounded_fill_drift = _bounded_confirmed_fill_drift(
+        observation=observation,
         opportunity=opportunity,
         sizing=sizing,
+        minimum_reserve_fraction=PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
     )
     bounded_fill_drift_accepted = bounded_fill_drift["accepted"] is True
 
@@ -720,13 +739,14 @@ def validate_paper_canary_entry_contract(
     return contract, reasons
 
 
-def _bounded_canary_fill_drift(
+def _bounded_confirmed_fill_drift(
     *,
-    canary: dict[str, Any],
+    observation: dict[str, Any],
     opportunity: dict[str, Any],
     sizing: dict[str, Any],
+    minimum_reserve_fraction: float,
 ) -> dict[str, Any]:
-    """Validate a confirmed canary fill against its reserved risk ceiling."""
+    """Validate a confirmed fill against its reserved risk ceiling."""
 
     rejected = {
         "accepted": False,
@@ -764,6 +784,7 @@ def _bounded_canary_fill_drift(
     }
     allowed_reasons = {
         "execution_notional_exceeds_authoritative_target",
+        "execution_position_exceeds_model_request",
         "execution_stressed_loss_exceeds_risk_budget",
     }
     confirmed_fill_eligible = confirmed_fill.get("eligible") is True
@@ -786,16 +807,14 @@ def _bounded_canary_fill_drift(
 
     declared_fill_ceiling = _safe_float(sizing.get("fill_notional_ceiling_usdt"))
     observation_cost_pct = _safe_float(
-        _safe_dict(canary.get("selected_observation")).get(
-            "current_execution_cost_pct"
-        )
+        observation.get("current_execution_cost_pct")
     )
     opportunity_cost_pct = _safe_float(
         _safe_dict(opportunity.get("execution_cost")).get("total_pct")
     )
     observed_reserve_fraction = max(
         max(observation_cost_pct, opportunity_cost_pct) / 100.0,
-        PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
+        minimum_reserve_fraction,
     )
     explicit_reserve_contract = bool(
         declared_reserve_fraction > 0
@@ -874,6 +893,13 @@ def validate_paper_training_entry_contract(
     pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
     sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
     reasons = paper_training_contract_reasons(training)
+    bounded_fill_drift = _bounded_confirmed_fill_drift(
+        observation={},
+        opportunity=opportunity,
+        sizing=sizing,
+        minimum_reserve_fraction=PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION,
+    )
+    bounded_fill_drift_accepted = bounded_fill_drift["accepted"] is True
     if training.get("version") != PAPER_TRAINING_VERSION:
         reasons.append("paper_training_version_invalid")
     if sizing.get("contract_version") != PAPER_TRAINING_SIZING_VERSION:
@@ -884,11 +910,28 @@ def validate_paper_training_entry_contract(
         reasons.append("paper_training_sizing_scope_invalid")
     if sizing.get("production_permission") is not False:
         reasons.append("paper_training_sizing_production_permission_invalid")
-    if sizing.get("production_eligible") is not True:
+    if (
+        sizing.get("production_eligible") is not True
+        and not bounded_fill_drift_accepted
+    ):
         reasons.append("paper_training_sizing_ineligible")
-    if not _provenance_complete(sizing.get("policy_provenance")):
+    sizing_provenance = _safe_dict(sizing.get("policy_provenance"))
+    if not (
+        _provenance_complete(sizing_provenance)
+        or (
+            bounded_fill_drift_accepted
+            and _provenance_core_complete(sizing_provenance)
+            and set(
+                filter(
+                    None,
+                    str(sizing_provenance.get("fallback_reason") or "").split(","),
+                )
+            )
+            == set(bounded_fill_drift["reasons"])
+        )
+    ):
         reasons.append("paper_training_sizing_provenance_incomplete")
-    if not str(_safe_dict(sizing.get("policy_provenance")).get("contract_fingerprint") or ""):
+    if not str(sizing_provenance.get("contract_fingerprint") or ""):
         reasons.append("paper_training_sizing_fingerprint_missing")
 
     stress = _safe_float(sizing.get("stressed_loss_fraction"))
@@ -906,7 +949,14 @@ def validate_paper_training_entry_contract(
         abs_tol=1e-8,
     ):
         reasons.append("paper_training_stressed_loss_algebra_mismatch")
-    if final_notional <= 0 or target_notional <= 0 or final_notional > target_notional + 1e-8:
+    if (
+        final_notional <= 0
+        or target_notional <= 0
+        or (
+            final_notional > target_notional + 1e-8
+            and not bounded_fill_drift_accepted
+        )
+    ):
         reasons.append("paper_training_notional_invalid")
     if final_leverage < 1:
         reasons.append("paper_training_leverage_invalid")
@@ -922,7 +972,11 @@ def validate_paper_training_entry_contract(
         reasons.append("paper_training_execution_cost_incomplete")
     if execution_cost.get("order_size_complete") is not True:
         reasons.append("paper_training_order_size_cost_incomplete")
-    if _safe_float(execution_cost.get("order_notional_usdt")) + 1e-8 < final_notional:
+    if (
+        _safe_float(execution_cost.get("order_notional_usdt")) + 1e-8
+        < final_notional
+        and not bounded_fill_drift_accepted
+    ):
         reasons.append("paper_training_execution_cost_notional_too_small")
     if pre_order.get("production_eligible") is not True or not str(
         pre_order.get("input_fingerprint") or ""
@@ -931,7 +985,11 @@ def validate_paper_training_entry_contract(
     if sizing_pass.get("order_size_complete") is not True:
         reasons.append("paper_training_size_aware_cost_incomplete")
     filled_notional = max(_safe_float(filled_notional_usdt), 0.0)
-    if executed and filled_notional > target_notional + 1e-8:
+    if (
+        executed
+        and filled_notional > target_notional + 1e-8
+        and not bounded_fill_drift_accepted
+    ):
         reasons.append("paper_training_filled_notional_exceeds_target")
     if executed and filled_order_present is False:
         reasons.append("executed_entry_without_filled_order")
@@ -952,6 +1010,8 @@ def validate_paper_training_entry_contract(
             "final_notional_usdt": final_notional,
             "final_leverage": final_leverage,
             "filled_notional_usdt": filled_notional,
+            "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
+            "fill_drift_evidence": bounded_fill_drift,
         },
         reasons,
     )

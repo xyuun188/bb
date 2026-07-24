@@ -245,6 +245,8 @@ def test_okx_close_fill_order_payload_persists_native_fill_fact() -> None:
             "source": "okx_fills_history",
             "pnl": -3.58808175,
             "contracts": 145.5,
+            "contract_size": 10.0,
+            "contract_size_source": "okx_public_instruments",
             "quantity": 1455.0,
             "order_info": {
                 "instId": "SAND-USDT-SWAP",
@@ -261,6 +263,38 @@ def test_okx_close_fill_order_payload_persists_native_fill_fact() -> None:
     assert payload["okx_fill_contracts"] == pytest.approx(145.5)
     assert payload["okx_fill_pnl"] == pytest.approx(-3.58808175)
     assert payload["okx_raw_fills"]["fills_history_confirmed"] is True
+    assert payload["okx_raw_fills"]["contract_size_verified"] is True
+    assert payload["okx_raw_fills"]["contract_size_source"] == "okx_public_instruments"
+
+
+def test_okx_close_fill_order_payload_does_not_invent_contract_size_authority() -> None:
+    payload = _okx_close_fill_order_payload(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="HBAR/USDT",
+        side="sell",
+        quantity=190.0,
+        price=0.0738,
+        fee=0.007011,
+        decision_id=112901,
+        close_order_id="3771703227805569024",
+        filled_at=datetime(2026, 7, 24, 15, 45, 15, tzinfo=UTC),
+        close_fill={
+            "source": "okx_fills_history",
+            "contracts": 1.9,
+            "contract_size": 100.0,
+            "order_info": {
+                "instId": "HBAR-USDT-SWAP",
+                "tradeId": "40613588",
+                "fillSz": "1.9",
+            },
+        },
+        okx_inst_id="HBAR-USDT-SWAP",
+    )
+
+    assert payload["okx_raw_fills"]["contract_size"] == 100.0
+    assert payload["okx_raw_fills"]["contract_size_verified"] is False
+    assert payload["okx_raw_fills"]["contract_size_source"] == "missing"
 
 
 @pytest.mark.asyncio

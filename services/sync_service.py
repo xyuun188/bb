@@ -495,6 +495,10 @@ def _okx_close_fill_order_payload(
         ),
         0.0,
     )
+    contract_size_source = str(fill.get("contract_size_source") or "").strip()
+    contract_size_verified = bool(
+        contract_size > 0 and contract_size_source == "okx_public_instruments"
+    )
     fact_quantity = _okx_close_fill_fact_quantity(
         fill=fill,
         order_info=order_info,
@@ -520,8 +524,8 @@ def _okx_close_fill_order_payload(
         "inst_id": okx_inst_id or _okx_inst_id_from_close_fill(fill, fallback=symbol),
         "contracts": contracts or None,
         "contract_size": contract_size or fill.get("contract_size"),
-        "contract_size_verified": contract_size > 0,
-        "contract_size_source": "okx_close_fill" if contract_size > 0 else "missing",
+        "contract_size_verified": contract_size_verified,
+        "contract_size_source": contract_size_source or "missing",
         "base_quantity": fact_quantity,
         "avg_price": price,
         "fee_abs": abs(float(fee or 0.0)),

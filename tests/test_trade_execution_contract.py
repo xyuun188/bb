@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 from models.decision import _compact_decision_learning_snapshot
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
-from services.trade_execution_contract import summarize_trade_execution_contract
+from services.trade_execution_contract import (
+    _decision_report_projection,
+    summarize_trade_execution_contract,
+)
 from tests.paper_canary_fixtures import (
     bounded_legacy_fill_drift_raw,
     complete_paper_canary_raw,
@@ -438,6 +441,37 @@ def test_compact_decision_projection_preserves_paper_canary_contract() -> None:
 
     assert report["summary"]["entry_contract_ready_count"] == 1
     assert report["summary"]["contract_violation_count"] == 0
+
+
+def test_report_projection_restores_only_execution_reconciliations() -> None:
+    reconciliations = [
+        {
+            "source": "okx_pre_submit_order_shape",
+            "eligible": True,
+            "reasons": [],
+        }
+    ]
+
+    decision = _decision_report_projection(
+        {
+            "id": 13,
+            "symbol": "BTC/USDT",
+            "action": "long",
+            "was_executed": True,
+            "raw_llm_response": {
+                "profit_risk_sizing": {"contract_lifecycle": "paper_training"}
+            },
+            "execution_reconciliations": reconciliations,
+        }
+    )
+
+    assert decision.raw_llm_response == {
+        "profit_risk_sizing": {
+            "contract_lifecycle": "paper_training",
+            "execution_reconciliations": reconciliations,
+        }
+    }
+    assert not hasattr(decision, "execution_reconciliations")
 
 
 def test_compact_decision_projection_retains_large_execution_contract_fields() -> None:

@@ -9,8 +9,12 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_score import EntryOpportunityScorePolicy
-from services.entry_profit_risk_sizing import EntryProfitRiskSizingPolicy
+from services.entry_profit_risk_sizing import (
+    EntryProfitRiskSizingPolicy,
+    reconcile_profit_risk_sizing,
+)
 from services.paper_training import (
+    PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_TRAINING_ORDER_IDENTITY_VERSION,
     PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
     assess_paper_training_entry,
@@ -260,10 +264,182 @@ async def test_paper_training_sizing_has_no_profit_gate_but_bounded_risk() -> No
     assert sizing["paper_training_no_profit_gate"] is True
     assert sizing["paper_training_bounded_exploration_risk"] is True
     assert sizing["expected_net_return_pct"] == -2.5
-    assert sizing["final_notional_usdt"] == pytest.approx(5.0)
+    assert sizing["fill_notional_ceiling_usdt"] == pytest.approx(5.0)
+    assert sizing["estimated_fill_drift_reserve_fraction"] == pytest.approx(
+        PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION
+    )
+    assert sizing["final_notional_usdt"] == pytest.approx(
+        sizing["fill_notional_ceiling_usdt"]
+        / (1.0 + sizing["estimated_fill_drift_reserve_fraction"])
+    )
     assert sizing["risk_budget_usdt"] == pytest.approx(0.1)
     assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(0.3)
-    assert decision.position_size_pct == pytest.approx(0.005)
+    assert decision.position_size_pct == pytest.approx(
+        sizing["final_notional_usdt"] / sizing["available_margin_usdt"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_paper_training_accepts_only_evidence_bounded_confirmed_fill_drift() -> None:
+    decision = _decision(expected_net=-2.5)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    target = sizing["target_notional_usdt"]
+    ceiling = sizing["fill_notional_ceiling_usdt"]
+    pre_submit = target * 0.999
+    confirmed = target * 1.001
+
+    decision.raw_response["opportunity_score"]["execution_cost"].update(
+        {
+            "order_size_complete": True,
+            "order_notional_usdt": target,
+        }
+    )
+    decision.raw_response["pre_order_execution_facts"] = {
+        "production_eligible": True,
+        "input_fingerprint": "paper-training-bounded-fill",
+    }
+    decision.raw_response["execution_cost_sizing_pass"] = {
+        "order_size_complete": True,
+        "final_notional_usdt": target,
+    }
+    reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=pre_submit,
+        final_leverage=1.0,
+        source="okx_pre_submit_order_shape",
+    )
+    accepted = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=confirmed,
+        final_leverage=1.0,
+        source="okx_confirmed_entry_fill",
+    )
+
+    assert accepted["eligible"] is True
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=confirmed,
+        executed=True,
+        filled_order_present=True,
+    )
+    assert reasons == []
+    assert contract["bounded_fill_drift_accepted"] is True
+
+    rejected = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=ceiling + 0.01,
+        final_leverage=1.0,
+        source="okx_confirmed_entry_fill",
+    )
+    assert rejected["eligible"] is False
+    assert "execution_notional_exceeds_authoritative_target" in rejected["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_paper_training_accepts_legacy_bounded_fill_with_persisted_failures() -> None:
+    decision = _decision(expected_net=-2.5)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    target = sizing["fill_notional_ceiling_usdt"]
+    stress = sizing["stressed_loss_fraction"]
+    sizing.pop("fill_notional_ceiling_usdt")
+    sizing.pop("estimated_fill_drift_reserve_fraction")
+    sizing["target_notional_usdt"] = target
+    sizing["model_requested_notional_cap_usdt"] = target
+    sizing["model_final_notional_cap_usdt"] = target
+    sizing["risk_budget_usdt"] = target * stress
+    sizing["final_notional_usdt"] = target
+    sizing["final_margin_usdt"] = target
+    sizing["planned_stressed_loss_usdt"] = target * stress
+    decision.raw_response["opportunity_score"]["execution_cost"].update(
+        {
+            "order_size_complete": True,
+            "order_notional_usdt": target,
+        }
+    )
+    decision.raw_response["pre_order_execution_facts"] = {
+        "production_eligible": True,
+        "input_fingerprint": "paper-training-legacy-bounded-fill",
+    }
+    decision.raw_response["execution_cost_sizing_pass"] = {
+        "order_size_complete": True,
+        "final_notional_usdt": target,
+    }
+    reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=target * 0.999,
+        final_leverage=1.0,
+        source="okx_pre_submit_order_shape",
+    )
+    confirmed = target * 1.0004
+    result = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=confirmed,
+        final_leverage=1.0,
+        source="okx_confirmed_entry_fill",
+    )
+
+    assert result["eligible"] is False
+    assert set(result["reasons"]) == {
+        "execution_notional_exceeds_authoritative_target",
+        "execution_position_exceeds_model_request",
+        "execution_stressed_loss_exceeds_risk_budget",
+    }
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=confirmed,
+        executed=True,
+        filled_order_present=True,
+    )
+    assert reasons == []
+    assert contract["bounded_fill_drift_accepted"] is True
+    assert contract["fill_drift_evidence"]["source"] == (
+        "legacy_cost_bound_and_okx_reconciliations"
+    )
+
+
+@pytest.mark.asyncio
+async def test_paper_training_rejects_fill_drift_without_reconciliation_evidence() -> None:
+    decision = _decision(expected_net=-2.5)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    target = sizing["target_notional_usdt"]
+    confirmed = target * 1.001
+    sizing["final_notional_usdt"] = confirmed
+    sizing["final_margin_usdt"] = confirmed
+    sizing["planned_stressed_loss_usdt"] = (
+        confirmed * sizing["stressed_loss_fraction"]
+    )
+    decision.raw_response["opportunity_score"]["execution_cost"].update(
+        {
+            "order_size_complete": True,
+            "order_notional_usdt": target,
+        }
+    )
+    decision.raw_response["pre_order_execution_facts"] = {
+        "production_eligible": True,
+        "input_fingerprint": "paper-training-unproven-fill",
+    }
+    decision.raw_response["execution_cost_sizing_pass"] = {
+        "order_size_complete": True,
+        "final_notional_usdt": target,
+    }
+
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=confirmed,
+        executed=True,
+        filled_order_present=True,
+    )
+
+    assert contract["bounded_fill_drift_accepted"] is False
+    assert "paper_training_notional_invalid" in reasons
+    assert "paper_training_execution_cost_notional_too_small" in reasons
+    assert "paper_training_filled_notional_exceeds_target" in reasons
 
 
 @pytest.mark.asyncio
@@ -352,7 +528,9 @@ async def test_paper_training_records_final_size_aware_cost_pass() -> None:
 
     sizing = decision.raw_response["profit_risk_sizing"]
     sizing_pass = decision.raw_response["execution_cost_sizing_pass"]
-    assert sizing_pass["impact_basis_notional_usdt"] == pytest.approx(5.0)
+    assert sizing_pass["impact_basis_notional_usdt"] == pytest.approx(
+        sizing["final_notional_usdt"]
+    )
     assert sizing_pass["final_notional_usdt"] == sizing["final_notional_usdt"]
     assert sizing_pass["order_size_complete"] is True
 

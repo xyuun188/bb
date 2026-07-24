@@ -31,6 +31,7 @@ from services.paper_exploration import (
 from services.paper_training import (
     PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
     PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_TRAINING_SIZING_VERSION,
     is_paper_training_decision,
 )
@@ -1436,8 +1437,28 @@ class EntryProfitRiskSizingPolicy:
         side = _side(decision)
         depth_key = "orderbook_ask_depth" if side == "long" else "orderbook_bid_depth"
         side_depth = max(_safe_float(snapshot.get(depth_key), 0.0), 0.0)
-        requested_leverage = max(_safe_float(decision.suggested_leverage, 1.0), 1.0)
-        model_position_fraction = _clamp(_safe_float(decision.position_size_pct, 0.0))
+        prior_sizing = _safe_dict(raw.get("profit_risk_sizing"))
+        reuse_model_request = (
+            prior_sizing.get("contract_version") == PAPER_TRAINING_SIZING_VERSION
+            and prior_sizing.get("contract_lifecycle") == "paper_training"
+        )
+        requested_leverage = max(
+            _safe_float(
+                prior_sizing.get("model_requested_leverage")
+                if reuse_model_request
+                else decision.suggested_leverage,
+                1.0,
+            ),
+            1.0,
+        )
+        model_position_fraction = _clamp(
+            _safe_float(
+                prior_sizing.get("model_requested_position_fraction")
+                if reuse_model_request
+                else decision.position_size_pct,
+                0.0,
+            )
+        )
         model_position_cap_applied = model_position_fraction > 0.0
         contract_specs = _safe_dict(facts.get("contract_specs"))
         target_inst_id = str(
@@ -1495,11 +1516,20 @@ class EntryProfitRiskSizingPolicy:
             if model_position_cap_applied
             else available_margin * requested_leverage
         )
-        target_notional = min(
+        fill_drift_reserve_fraction = max(
+            max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0) / 100.0,
+            PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION,
+        )
+        fill_notional_ceiling = min(
             available_margin * requested_leverage,
             side_depth,
             risk_limited_notional,
             model_requested_notional_cap,
+        )
+        target_notional = (
+            fill_notional_ceiling / (1.0 + fill_drift_reserve_fraction)
+            if fill_notional_ceiling > 0
+            else 0.0
         )
         leverage_tier_selection = select_okx_leverage_tier(
             facts.get("leverage_tiers"),
@@ -1580,6 +1610,8 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "target_notional_usdt": target_notional,
+            "fill_notional_ceiling_usdt": fill_notional_ceiling,
+            "estimated_fill_drift_reserve_fraction": fill_drift_reserve_fraction,
             "final_notional_usdt": final_notional,
             "stressed_loss_fraction": stress_fraction,
             "expected_net_return_pct": expected_net,
@@ -1630,6 +1662,11 @@ class EntryProfitRiskSizingPolicy:
             "current_portfolio_stressed_loss_usdt": round(current_portfolio_risk, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
             "target_notional_usdt": round(target_notional, 8),
+            "fill_notional_ceiling_usdt": round(fill_notional_ceiling, 8),
+            "estimated_fill_drift_reserve_fraction": round(
+                fill_drift_reserve_fraction,
+                8,
+            ),
             "model_requested_position_fraction": round(model_position_fraction, 8),
             "model_requested_leverage": round(requested_leverage, 8),
             "model_requested_notional_cap_usdt": round(
