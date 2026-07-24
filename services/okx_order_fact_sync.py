@@ -51,6 +51,7 @@ PHASE3_DEFAULT_ORDER_SYNC_START = PHASE3_CLEAN_START_LOCAL
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 500
 DEFAULT_TIMEOUT_SECONDS = 8.0
+ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS = 1.0
 DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 4
 DEFAULT_MAX_ORDER_GAP_QUERIES = 4
 ACCOUNT_HISTORY_MAX_PAGES = 5
@@ -195,7 +196,7 @@ class OkxOrderFactSyncService:
 
     async def sync(self) -> dict[str, Any]:
         if not str(settings.database_url or "").startswith("postgresql"):
-            return await self._sync_single_writer()
+            return await self._sync_with_hard_deadline()
 
         lock_key = ORDER_FACT_SYNC_ADVISORY_LOCK_BASE + (1 if self.mode == "live" else 0)
         async with get_session_ctx() as lock_session:
@@ -224,12 +225,45 @@ class OkxOrderFactSyncService:
                     ),
                 ).as_dict()
             try:
-                return await self._sync_single_writer()
+                return await self._sync_with_hard_deadline()
             finally:
                 await lock_session.execute(
                     text("SELECT pg_advisory_unlock(:lock_key)"),
                     {"lock_key": lock_key},
                 )
+
+    async def _sync_with_hard_deadline(self) -> dict[str, Any]:
+        hard_deadline_seconds = (
+            self.timeout_seconds + ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS
+        )
+        try:
+            return await asyncio.wait_for(
+                self._sync_single_writer(),
+                timeout=hard_deadline_seconds,
+            )
+        except TimeoutError:
+            logger.warning(
+                "OKX order fact sync hard deadline exceeded",
+                mode=self.mode,
+                hard_deadline_seconds=round(hard_deadline_seconds, 3),
+            )
+            return OkxOrderFactSyncSummary(
+                status="deferred",
+                mode=self.mode,
+                source="okx_native_orders_and_fills",
+                phase3_order_sync_start=self.phase3_order_sync_start,
+                checked_at=datetime.now(UTC),
+                okx_pull_available=False,
+                deferred_stages=("hard_deadline",),
+                error="order_fact_sync_hard_deadline_exceeded",
+                samples=(
+                    {
+                        "kind": "order_fact_sync_hard_deadline",
+                        "mode": self.mode,
+                        "hard_deadline_seconds": round(hard_deadline_seconds, 3),
+                    },
+                ),
+            ).as_dict()
 
     async def _sync_single_writer(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)

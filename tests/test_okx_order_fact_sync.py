@@ -302,6 +302,94 @@ async def test_postgres_single_writer_lock_is_released_after_sync_failure(
 
 
 @pytest.mark.asyncio
+async def test_postgres_hard_deadline_cancels_sync_and_releases_writer_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_session = _AdvisoryLockSession([True, True])
+    cancelled = asyncio.Event()
+    events: list[str] = []
+    execute = lock_session.execute
+
+    async def tracking_execute(
+        statement: Any,
+        params: dict[str, Any],
+    ) -> _ScalarResult:
+        if "pg_advisory_unlock" in str(statement):
+            events.append("unlock")
+        return await execute(statement, params)
+
+    lock_session.execute = tracking_execute  # type: ignore[method-assign]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield lock_session
+
+    service = OkxOrderFactSyncService(mode="paper")
+    service.timeout_seconds = 0.01
+
+    async def never_finish() -> dict[str, Any]:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            events.append("cancelled")
+            cancelled.set()
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
+    monkeypatch.setattr(
+        order_fact_sync_module,
+        "ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(order_fact_sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(service, "_sync_single_writer", never_finish)
+
+    started = time.monotonic()
+    report = await service.sync()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert cancelled.is_set() is True
+    assert report["status"] == "deferred"
+    assert report["okx_pull_available"] is False
+    assert report["deferred_stages"] == ["hard_deadline"]
+    assert report["error"] == "order_fact_sync_hard_deadline_exceeded"
+    assert len(lock_session.calls) == 2
+    assert "pg_advisory_unlock" in str(lock_session.calls[1][0])
+    assert events == ["cancelled", "unlock"]
+
+
+@pytest.mark.asyncio
+async def test_non_postgres_sync_uses_same_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = asyncio.Event()
+    service = OkxOrderFactSyncService(mode="paper")
+    service.timeout_seconds = 0.01
+
+    async def never_finish() -> dict[str, Any]:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(settings, "database_url", "sqlite+aiosqlite:///test.db")
+    monkeypatch.setattr(
+        order_fact_sync_module,
+        "ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(service, "_sync_single_writer", never_finish)
+
+    report = await service.sync()
+
+    assert cancelled.is_set() is True
+    assert report["status"] == "deferred"
+    assert report["deferred_stages"] == ["hard_deadline"]
+    assert report["error"] == "order_fact_sync_hard_deadline_exceeded"
+
+
+@pytest.mark.asyncio
 async def test_order_fact_sync_only_calls_order_fact_endpoints_and_confirms_fill(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
