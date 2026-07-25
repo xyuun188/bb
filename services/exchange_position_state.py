@@ -355,11 +355,25 @@ class ExchangeProtectionMapProvider:
                     continue
 
                 existing = protection_by_key.get(key)
-                if existing and self.float_parser(
-                    existing.get("updated_at_ms"), 0.0
-                ) > self.float_parser(order.get("updated_at_ms"), 0.0):
+                if existing is None:
+                    protection_by_key[key] = {
+                        **order,
+                        "protection_orders": [dict(order)],
+                    }
                     continue
-                protection_by_key[key] = order
+
+                orders = list(existing.get("protection_orders") or [])
+                algo_id = str(order.get("algo_id") or "").strip()
+                if algo_id and any(str(item.get("algo_id") or "").strip() == algo_id for item in orders):
+                    continue
+                orders.append(dict(order))
+                orders.sort(
+                    key=lambda item: self.float_parser(item.get("updated_at_ms"), 0.0),
+                    reverse=True,
+                )
+                primary = dict(orders[0])
+                primary["protection_orders"] = orders
+                protection_by_key[key] = primary
 
         return protection_by_key
 

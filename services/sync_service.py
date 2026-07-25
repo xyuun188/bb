@@ -32,6 +32,7 @@ from models.trade import Order, Position
 from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_KIND,
     CURRENT_POSITION_MANAGEMENT_VERSION,
+    build_current_position_management_contract,
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
@@ -97,6 +98,31 @@ def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _authoritative_entry_fee_available(order: Order) -> bool:
+    """Require a linked OKX fill fact before treating an entry fee as complete."""
+
+    raw = _dict_value(order.okx_raw_fills)
+    return bool(
+        str(order.exchange_order_id or "").strip()
+        and raw.get("fee_abs") is not None
+        and (
+            raw.get("fills_history_confirmed") is True
+            or (
+                raw.get("order_detail_confirmed") is True
+                and raw.get("contract_size_verified") is True
+                and str(raw.get("contract_size_source") or "")
+                == "okx_public_instruments"
+            )
+            or (
+                raw.get("execution_result_confirmed") is True
+                and raw.get("contract_size_verified") is True
+                and str(raw.get("contract_size_source") or "")
+                == "okx_public_instruments"
+            )
+        )
+    )
 
 
 def _split_exchange_order_ids(value: Any) -> list[str]:
@@ -187,6 +213,7 @@ def _merge_local_position_candidates(
         if matching:
             scoped_candidates = matching
     merged = dict(scoped_candidates[0])
+    merged_entry_fee = max(_float_value(merged.get("entry_fee"), 0.0), 0.0)
     for candidate in scoped_candidates[1:]:
         for key in (
             "model_name",
@@ -219,8 +246,9 @@ def _merge_local_position_candidates(
             merged["paper_training_lifecycle"] = _dict_value(
                 candidate.get("paper_training_lifecycle")
             )
-        if _float_value(merged.get("entry_fee"), 0.0) <= 0:
-            merged["entry_fee"] = candidate.get("entry_fee")
+        merged_entry_fee += max(_float_value(candidate.get("entry_fee"), 0.0), 0.0)
+
+    merged["entry_fee"] = merged_entry_fee
 
     return merged
 
@@ -890,6 +918,7 @@ class OkxSyncService:
         trade_reflection_recorder: Callable[..., Awaitable[None]] | None = None,
         position_margin_calculator: Callable[[float, float | None], float] | None = None,
         memory_position_remover: Callable[[str, str, str], None] | None = None,
+        account_equity_provider: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> None:
         self.exchange_reconcile_lock = exchange_reconcile_lock
         self.round_error_recorder = round_error_recorder
@@ -916,6 +945,7 @@ class OkxSyncService:
         self.trade_reflection_recorder = trade_reflection_recorder
         self.position_margin_calculator = position_margin_calculator
         self.memory_position_remover = memory_position_remover
+        self.account_equity_provider = account_equity_provider
         self._reconcile_deadline_monotonic: float | None = None
         self._reconcile_degraded_rows: list[dict[str, Any]] | None = None
 
@@ -1736,6 +1766,229 @@ class OkxSyncService:
             )
             return {"lookup_unavailable": True, "error": error_text}
 
+    async def _refresh_current_position_management_contracts(
+        self,
+        *,
+        session: Any,
+        positions: list[Position],
+        exchange_positions: list[dict[str, Any]],
+        protection_by_key: dict[tuple[str, str], dict[str, Any]],
+        symbol_normalizer: Callable[[Any], str],
+        float_parser: Callable[[Any, float], float],
+        entry_fee_for_position: Callable[[Any, Any, float], Awaitable[float]],
+    ) -> int:
+        """Persist one reduce-only contract per authoritative OKX net-position group."""
+
+        if self.account_equity_provider is None:
+            return 0
+        try:
+            balance = await self.account_equity_provider("paper")
+        except Exception as exc:
+            logger.warning(
+                "failed to fetch account equity for current-position management refresh",
+                error=safe_error_text(exc),
+            )
+            balance = None
+        balance = balance if isinstance(balance, dict) else {}
+        account_equity = max(
+            float_parser(balance.get("equity") or balance.get("total"), 0.0),
+            0.0,
+        )
+
+        exchange_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw_position in exchange_positions or []:
+            snapshot = parse_exchange_position_snapshot(
+                raw_position,
+                symbol_normalizer=symbol_normalizer,
+            )
+            if snapshot is None:
+                continue
+            key = (str(snapshot["symbol"]), str(snapshot["side"]))
+            exchange_by_key[key] = snapshot
+
+        local_by_key: dict[tuple[str, str], list[Position]] = {}
+        for position in positions:
+            if (
+                not position.is_open
+                or position.execution_mode != "paper"
+            ):
+                continue
+            key = (
+                symbol_normalizer(position.symbol),
+                str(position.side or "").lower(),
+            )
+            if key in exchange_by_key:
+                local_by_key.setdefault(key, []).append(position)
+
+        group_rows: list[dict[str, Any]] = []
+        for key, snapshot in exchange_by_key.items():
+            protection = _dict_value(protection_by_key.get(key))
+            protection_orders = _list_of_dicts(protection.get("protection_orders"))
+            if not protection_orders and protection:
+                protection_orders = [dict(protection)]
+            contracts = abs(float_parser(snapshot.get("contracts"), 0.0))
+            quantity = abs(float_parser(snapshot.get("quantity"), 0.0))
+            entry_price = max(float_parser(snapshot.get("entry_price"), 0.0), 0.0)
+            stop_loss = max(
+                float_parser(protection.get("stop_loss_price"), 0.0),
+                0.0,
+            )
+            if stop_loss <= 0:
+                stop_loss = max(
+                    *(
+                        [float_parser(item.get("stop_loss_price"), 0.0) for item in protection_orders]
+                        or [0.0]
+                    )
+                )
+            group_rows.append(
+                {
+                    "key": key,
+                    "snapshot": snapshot,
+                    "contracts": contracts,
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "current_price": max(
+                        float_parser(snapshot.get("mark_price"), 0.0),
+                        float_parser(snapshot.get("last_price"), 0.0),
+                        entry_price,
+                    ),
+                    "protection": protection,
+                    "protection_orders": protection_orders,
+                    "stop_loss": stop_loss,
+                }
+            )
+
+        portfolio_stressed_loss = sum(
+            abs(row["entry_price"] - row["stop_loss"]) * row["quantity"]
+            for row in group_rows
+            if row["entry_price"] > 0 and row["stop_loss"] > 0 and row["quantity"] > 0
+        )
+        portfolio_gross_notional = sum(
+            row["current_price"] * row["quantity"]
+            for row in group_rows
+            if row["current_price"] > 0 and row["quantity"] > 0
+        )
+
+        refreshed = 0
+        for row in group_rows:
+            key = row["key"]
+            fragments = local_by_key.get(key, [])
+            if not fragments:
+                continue
+            entry_order_ids = sorted(
+                {
+                    order_id
+                    for position in fragments
+                    for order_id in _split_exchange_order_ids(position.entry_exchange_order_id)
+                }
+            )
+            orders_by_id: dict[str, Order] = {}
+            if entry_order_ids:
+                result = await session.execute(
+                    select(Order).where(
+                        Order.execution_mode == "paper",
+                        Order.exchange_order_id.in_(entry_order_ids),
+                    )
+                )
+                orders_by_id = {
+                    str(order.exchange_order_id): order
+                    for order in result.scalars().all()
+                    if str(order.exchange_order_id or "").strip()
+                }
+            entry_orders = [orders_by_id.get(order_id) for order_id in entry_order_ids]
+            entry_fee_evidence_complete = bool(
+                entry_orders
+                and all(
+                    order is not None
+                    and order.status == OrderStatus.FILLED.value
+                    and _authoritative_entry_fee_available(order)
+                    for order in entry_orders
+                )
+            )
+            current_entry_fee = 0.0
+            for position in fragments:
+                current_entry_fee += await entry_fee_for_position(
+                    session,
+                    position,
+                    position.quantity,
+                )
+            full_entry_fee = sum(
+                abs(float_parser(_dict_value(order.okx_raw_fills).get("fee_abs"), 0.0))
+                for order in entry_orders
+                if order is not None
+            )
+            full_entry_notional = sum(
+                abs(float_parser(order.price, 0.0) * float_parser(order.quantity, 0.0))
+                for order in entry_orders
+                if order is not None
+            )
+            protection_orders = row["protection_orders"]
+            protection_contracts = sum(
+                abs(float_parser(item.get("contracts"), 0.0))
+                for item in protection_orders
+            )
+            protection_evidence_complete = bool(
+                protection_orders
+                and all(
+                    str(item.get("algo_id") or "").strip()
+                    and item.get("reduce_only") is True
+                    and str(item.get("state") or "").lower()
+                    in {"live", "effective", "partially_effective", "open", "pending"}
+                    and float_parser(item.get("contracts"), 0.0) > 0
+                    and float_parser(item.get("stop_loss_price"), 0.0) > 0
+                    and float_parser(item.get("take_profit_price"), 0.0) > 0
+                    for item in protection_orders
+                )
+                and isclose(protection_contracts, row["contracts"], rel_tol=1e-9, abs_tol=1e-12)
+            )
+            facts = {
+                "symbol": key[0],
+                "side": key[1],
+                "quantity": row["quantity"],
+                "contracts": row["contracts"],
+                "entry_price": row["entry_price"],
+                "current_price": row["current_price"],
+                "entry_fee_usdt": current_entry_fee,
+                "full_entry_fee_usdt": full_entry_fee,
+                "full_entry_notional_usdt": full_entry_notional,
+                "entry_fee_evidence_complete": entry_fee_evidence_complete,
+                "entry_fee_source": "okx_fills_history",
+                "stop_loss_price": row["protection"].get("stop_loss_price"),
+                "take_profit_price": row["protection"].get("take_profit_price"),
+                "protection_evidence_complete": protection_evidence_complete,
+                "protection_orders": protection_orders,
+                "position_stressed_loss_usdt": abs(
+                    row["entry_price"] - row["stop_loss"]
+                )
+                * row["quantity"],
+                "portfolio_stressed_loss_usdt": portfolio_stressed_loss,
+                "portfolio_gross_notional_usdt": portfolio_gross_notional,
+                "account_equity_usdt": account_equity,
+                "open_position_count": len(group_rows),
+                "entry_order_ids": entry_order_ids,
+                "entry_decision_ids": [
+                    int(order.decision_id)
+                    for order in entry_orders
+                    if order is not None and order.decision_id
+                ],
+                "original_entry_contract_complete": False,
+                "original_entry_contract_gaps": [
+                    "historical_entry_contract_not_reconstructed"
+                ],
+                "position_fragment_ids": [position.id for position in fragments if position.id],
+                "position_fragment_count": len(fragments),
+            }
+            previous = _dict_value(fragments[0].current_management_contract)
+            contract = build_current_position_management_contract(
+                facts,
+                previous_contract=previous,
+            )
+            for position in fragments:
+                position.current_management_contract = dict(contract)
+                position.updated_at = datetime.now(UTC)
+                refreshed += 1
+        return refreshed
+
     async def reconcile_exchange_positions(self) -> list[dict]:
         """Reconcile local paper positions with actual OKX demo positions.
 
@@ -2104,6 +2357,25 @@ class OkxSyncService:
                         symbol=symbol,
                         side=side,
                         order_id=order.exchange_order_id,
+                    )
+
+                management_refreshed = await self._refresh_current_position_management_contracts(
+                    session=session,
+                    positions=positions,
+                    exchange_positions=exchange_positions,
+                    protection_by_key=protection_by_key,
+                    symbol_normalizer=normalize_symbol,
+                    float_parser=parse_float,
+                    entry_fee_for_position=entry_fee_for_position,
+                )
+                if management_refreshed:
+                    reconciled.append(
+                        {
+                            "kind": "current_position_management_contract_refresh",
+                            "source": "okx_current_position_fills_protection_account_and_portfolio_facts",
+                            "position_count": management_refreshed,
+                            "note": "已按 OKX 当前净仓位刷新只减仓管理合同。",
+                        }
                     )
 
                 for pos in positions:

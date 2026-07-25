@@ -9,8 +9,10 @@ from core.symbols import normalize_trading_symbol
 from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_KIND,
     CURRENT_POSITION_MANAGEMENT_VERSION,
+    current_position_management_contract_complete,
 )
 from services.sync_service import (
+    OkxSyncService,
     _confirmed_local_close_fill_for_position,
     _merge_local_position_candidates,
     _okx_close_fill_order_payload,
@@ -295,6 +297,131 @@ def test_okx_close_fill_order_payload_does_not_invent_contract_size_authority() 
     assert payload["okx_raw_fills"]["contract_size"] == 100.0
     assert payload["okx_raw_fills"]["contract_size_verified"] is False
     assert payload["okx_raw_fills"]["contract_size_source"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_position() -> None:
+    first = SimpleNamespace(
+        id=1,
+        is_open=True,
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        quantity=2.0,
+        entry_price=100.0,
+        entry_fee=0.2,
+        entry_exchange_order_id="entry-a",
+        current_management_contract={},
+        updated_at=None,
+    )
+    second = SimpleNamespace(
+        id=2,
+        is_open=True,
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        quantity=1.0,
+        entry_price=100.0,
+        entry_fee=0.1,
+        entry_exchange_order_id="entry-b",
+        current_management_contract={},
+        updated_at=None,
+    )
+    orders = [
+        SimpleNamespace(
+            exchange_order_id="entry-a",
+            status="filled",
+            okx_raw_fills={"fee_abs": 0.2, "fills_history_confirmed": True},
+            price=100.0,
+            quantity=2.0,
+            decision_id=11,
+        ),
+        SimpleNamespace(
+            exchange_order_id="entry-b",
+            status="filled",
+            okx_raw_fills={"fee_abs": 0.1, "fills_history_confirmed": True},
+            price=100.0,
+            quantity=1.0,
+            decision_id=12,
+        ),
+    ]
+
+    class Result:
+        class Scalars:
+            @staticmethod
+            def all():
+                return orders
+
+        @staticmethod
+        def scalars():
+            return Result.Scalars()
+
+    class Session:
+        @staticmethod
+        async def execute(_statement):
+            return Result()
+
+    async def balance(_mode):
+        return {"equity": 1_000.0}
+
+    async def entry_fee(_session, position, _quantity):
+        return position.entry_fee
+
+    service = OkxSyncService(account_equity_provider=balance)
+    refreshed = await service._refresh_current_position_management_contracts(
+        session=Session(),
+        positions=[first, second],
+        exchange_positions=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "contracts": 3.0,
+                "contractSize": 1.0,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+                "info": {"instId": "BTC-USDT-SWAP", "pos": "3", "posSide": "long"},
+            }
+        ],
+        protection_by_key={
+            ("BTC/USDT", "long"): {
+                "stop_loss_price": 95.0,
+                "take_profit_price": 110.0,
+                "protection_orders": [
+                    {
+                        "algo_id": "oco-a",
+                        "state": "live",
+                        "contracts": 3.0,
+                        "reduce_only": True,
+                        "stop_loss_price": 95.0,
+                        "take_profit_price": 110.0,
+                    }
+                ],
+            }
+        },
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=_float,
+        entry_fee_for_position=entry_fee,
+    )
+
+    contract = first.current_management_contract
+    assert refreshed == 2
+    assert second.current_management_contract == contract
+    assert contract["position_scope"] == "exchange_net_position_group"
+    assert contract["position_fragment_ids"] == [1, 2]
+    assert contract["entry_fee_usdt"] == pytest.approx(0.3)
+    assert contract["contracts"] == pytest.approx(3.0)
+    assert current_position_management_contract_complete(
+        SimpleNamespace(
+            symbol="BTC/USDT",
+            side="long",
+            quantity=3.0,
+            entry_price=100.0,
+            entry_fee=0.3,
+            stop_loss_price=95.0,
+            take_profit_price=110.0,
+        ),
+        contract,
+    )
 
 
 @pytest.mark.asyncio

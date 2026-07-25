@@ -142,6 +142,59 @@ def test_capacity_audit_reports_hard_capacity_and_position_economics_only() -> N
     assert not any("release_decision" in key or "crowded" in key for key in report)
 
 
+def test_capacity_audit_checks_fragmented_positions_as_one_net_position_group() -> None:
+    contract = build_current_position_management_contract(
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 3.0,
+            "contracts": 3.0,
+            "entry_price": 100.0,
+            "current_price": 103.0,
+            "entry_fee_usdt": 0.18,
+            "full_entry_fee_usdt": 0.18,
+            "full_entry_notional_usdt": 300.0,
+            "entry_fee_evidence_complete": True,
+            "entry_fee_source": "okx_fills_history",
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_evidence_complete": True,
+            "protection_orders": [
+                {
+                    "algo_id": "oco-net-position",
+                    "state": "live",
+                    "contracts": 3.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 98.0,
+                    "take_profit_price": 110.0,
+                }
+            ],
+            "position_stressed_loss_usdt": 6.0,
+            "portfolio_stressed_loss_usdt": 6.0,
+            "portfolio_gross_notional_usdt": 309.0,
+            "account_equity_usdt": 1_000.0,
+            "open_position_count": 1,
+            "entry_order_ids": ["entry-a", "entry-b"],
+            "entry_decision_ids": [1, 2],
+            "original_entry_contract_complete": False,
+            "original_entry_contract_gaps": ["historical_contract_missing"],
+            "position_fragment_ids": [1, 2],
+            "position_fragment_count": 2,
+        }
+    )
+    first = _position(id=1, quantity=2.0, entry_fee=0.12, current_management_contract=contract)
+    second = _position(id=2, quantity=1.0, entry_fee=0.06, current_management_contract=contract)
+
+    report = PositionCapacityReleaseAuditService()._summarize([first, second], [], [])
+
+    assert report["open_position_count"] == 2
+    assert report["open_position_group_count"] == 1
+    assert report["position_economics_complete_count"] == 1
+    assert report["position_economics_incomplete_count"] == 0
+    group = report["position_economics_incomplete"]
+    assert group == []
+
+
 def test_capacity_audit_requires_dynamic_exit_provenance_and_filled_order_link() -> None:
     service = PositionCapacityReleaseAuditService()
     decision = _decision(

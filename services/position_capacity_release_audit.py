@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from math import isfinite
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -86,8 +87,9 @@ class PositionCapacityReleaseAuditService:
         decisions: list[AIDecision],
         orders: list[Order],
     ) -> dict[str, Any]:
-        position_rows = [self._position_row(position) for position in positions]
-        capacity = self.capacity_policy.evaluate(open_positions=position_rows).as_dict()
+        fragment_rows = [self._position_row(position) for position in positions]
+        position_rows = self._position_group_rows(positions)
+        capacity = self.capacity_policy.evaluate(open_positions=fragment_rows).as_dict()
         orders_by_decision: dict[int, list[Order]] = {}
         for order in orders:
             decision_id = int(getattr(order, "decision_id", 0) or 0)
@@ -117,9 +119,10 @@ class PositionCapacityReleaseAuditService:
             "can_bypass_risk_controls": False,
             "lookback_hours": self.lookback_hours,
             "checked_decisions": len(decisions),
-            "open_position_count": len(position_rows),
+            "open_position_count": len(fragment_rows),
+            "open_position_group_count": len(position_rows),
             "open_group_count": capacity["open_group_count"],
-            "side_counts": dict(Counter(row["side"] or "unknown" for row in position_rows)),
+            "side_counts": dict(Counter(row["side"] or "unknown" for row in fragment_rows)),
             "capacity": capacity,
             "position_economics_complete_count": len(position_rows) - len(incomplete_positions),
             "position_economics_incomplete_count": len(incomplete_positions),
@@ -145,6 +148,82 @@ class PositionCapacityReleaseAuditService:
                 "filled_order_link_required_for_executed_exit": True,
             },
         }
+
+    @classmethod
+    def _position_group_rows(cls, positions: list[Position]) -> list[dict[str, Any]]:
+        """Audit management economics against the exchange net-position scope.
+
+        A single OKX net position can have multiple local persistence fragments.
+        Its protection order and management contract belong to the net position,
+        not to every fragment independently.
+        """
+
+        grouped: dict[tuple[str, str], list[Position]] = {}
+        for position in positions:
+            key = (
+                normalize_trading_symbol(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "side", "") or "").lower(),
+            )
+            grouped.setdefault(key, []).append(position)
+
+        rows: list[dict[str, Any]] = []
+        for (_symbol, _side), fragments in grouped.items():
+            contracts = [
+                _safe_dict(getattr(fragment, "current_management_contract", None))
+                for fragment in fragments
+            ]
+            management = next(
+                (
+                    contract
+                    for contract in contracts
+                    if contract.get("position_scope") == "exchange_net_position_group"
+                ),
+                contracts[0] if contracts else {},
+            )
+            local_quantity = sum(
+                abs(_safe_float(getattr(fragment, "quantity", None)))
+                for fragment in fragments
+            )
+            contract_quantity = abs(_safe_float(management.get("quantity")))
+            quantity_matches = bool(
+                contract_quantity > 0
+                and abs(local_quantity - contract_quantity)
+                <= max(contract_quantity * 0.001, 1e-8)
+            )
+            aggregate = SimpleNamespace(
+                id=min((int(getattr(fragment, "id", 0) or 0) for fragment in fragments), default=0),
+                model_name=getattr(fragments[0], "model_name", "") if fragments else "",
+                symbol=management.get("symbol") or getattr(fragments[0], "symbol", ""),
+                side=management.get("side") or getattr(fragments[0], "side", ""),
+                quantity=contract_quantity or local_quantity,
+                entry_price=_safe_float(management.get("entry_price")),
+                current_price=_safe_float(management.get("current_price")),
+                entry_fee=_safe_float(management.get("entry_fee_usdt")),
+                stop_loss_price=_safe_float(management.get("stop_loss_price")),
+                take_profit_price=_safe_float(management.get("take_profit_price")),
+                unrealized_pnl=sum(
+                    _safe_float(getattr(fragment, "unrealized_pnl", None))
+                    for fragment in fragments
+                ),
+                current_management_contract=management,
+                created_at=min(
+                    (getattr(fragment, "created_at", None) for fragment in fragments),
+                    default=None,
+                ),
+            )
+            row = cls._position_row(aggregate)
+            row["position_fragment_count"] = len(fragments)
+            row["position_fragment_ids"] = [
+                int(getattr(fragment, "id", 0) or 0)
+                for fragment in fragments
+                if int(getattr(fragment, "id", 0) or 0) > 0
+            ]
+            row["local_fragment_quantity"] = round(local_quantity, 8)
+            row["local_fragment_quantity_matches_contract"] = quantity_matches
+            if not quantity_matches:
+                row["position_economics_complete"] = False
+            rows.append(row)
+        return rows
 
     @staticmethod
     def _position_row(position: Position) -> dict[str, Any]:

@@ -141,6 +141,14 @@ def build_current_position_management_contract(
         for value in facts.get("protection_orders") or []
         if isinstance(value, dict)
     ]
+    fragment_ids = sorted(
+        {
+            _safe_int(value)
+            for value in facts.get("position_fragment_ids") or []
+            if _safe_int(value) > 0
+        }
+    )
+    fragment_count = max(_safe_int(facts.get("position_fragment_count")), len(fragment_ids), 1)
 
     blockers: list[str] = []
     if not symbol or side not in {"long", "short"}:
@@ -224,6 +232,8 @@ def build_current_position_management_contract(
         "entry_decision_ids": decision_ids,
         "original_entry_contract_gaps": entry_contract_gaps,
         "protection_orders": protection_orders,
+        "position_fragment_ids": fragment_ids,
+        "position_fragment_count": fragment_count,
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "paper_canary_lifecycle": paper_canary_lifecycle,
@@ -278,6 +288,9 @@ def build_current_position_management_contract(
         "dynamic_equal_risk_share": round(equal_risk_share, 12),
         "portfolio_concentration_pressure": round(concentration_pressure, 12),
         "open_position_count": open_position_count,
+        "position_scope": "exchange_net_position_group",
+        "position_fragment_ids": fragment_ids,
+        "position_fragment_count": fragment_count,
         "can_expand_position": False,
         "can_increase_leverage": False,
         "allowed_actions": list(ALLOWED_MANAGEMENT_ACTIONS),

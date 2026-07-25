@@ -620,6 +620,7 @@ class TradingService:
             trade_reflection_recorder=self.record_trade_reflection_in_session,
             position_margin_calculator=self.position_margin_calculator.margin,
             memory_position_remover=self.memory_position_store.remove_open_position,
+            account_equity_provider=self._get_okx_balance_snapshot_for_mode,
         )
         self.okx_order_fact_sync_factory = OkxOrderFactSyncService
         self.okx_settlement_fact_sync_factory = OkxSettlementFactSyncService

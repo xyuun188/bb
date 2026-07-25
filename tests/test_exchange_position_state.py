@@ -320,3 +320,45 @@ async def test_exchange_protection_map_does_not_fan_out_after_account_wide_timeo
 
     assert result == {}
     assert executor.calls == [None]
+
+
+@pytest.mark.asyncio
+async def test_exchange_protection_map_retains_split_group_inventory() -> None:
+    class FakeExecutor:
+        async def get_position_protection_orders(self, symbol=None):
+            return [
+                {
+                    "symbol": "BTC/USDT",
+                    "position_side": "long",
+                    "algo_id": "oco-a",
+                    "contracts": 2.0,
+                    "stop_loss_price": 95.0,
+                    "take_profit_price": 110.0,
+                    "updated_at_ms": 1,
+                },
+                {
+                    "symbol": "BTC/USDT",
+                    "position_side": "long",
+                    "algo_id": "oco-b",
+                    "contracts": 1.0,
+                    "stop_loss_price": 96.0,
+                    "take_profit_price": 112.0,
+                    "updated_at_ms": 2,
+                },
+            ]
+
+    provider = ExchangeProtectionMapProvider(
+        symbol_normalizer=normalize_trading_symbol,
+        position_open_checker=lambda position: float(position.get("contracts") or 0) > 0,
+        timeout_seconds=1.0,
+        cache_ttl_seconds=0.0,
+    )
+
+    result = await provider.fetch(
+        FakeExecutor(),
+        [{"symbol": "BTC/USDT", "contracts": "3"}],
+    )
+
+    orders = result[("BTC/USDT", "long")]["protection_orders"]
+    assert {order["algo_id"] for order in orders} == {"oco-a", "oco-b"}
+    assert sum(order["contracts"] for order in orders) == pytest.approx(3.0)
