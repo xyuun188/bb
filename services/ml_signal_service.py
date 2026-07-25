@@ -118,6 +118,8 @@ def _training_source_code_version() -> str:
         digest.update(path.name.encode("utf-8"))
         digest.update(path.read_bytes())
     return f"source-sha256:{digest.hexdigest()}"
+
+
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
 
@@ -171,6 +173,7 @@ FEATURE_KEYS = [
     "horizon_minutes",
 ]
 
+
 def _parse_json(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -196,12 +199,16 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _market_regime_label(features: dict[str, Any]) -> str:
-    explicit = str(
-        features.get("market_regime")
-        or features.get("regime")
-        or features.get("market_state")
-        or ""
-    ).strip().lower()
+    explicit = (
+        str(
+            features.get("market_regime")
+            or features.get("regime")
+            or features.get("market_state")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     if explicit:
         return explicit[:80]
     volatility = abs(_safe_float(features.get("volatility_20")))
@@ -213,13 +220,7 @@ def _market_regime_label(features: dict[str, Any]) -> str:
         atr = abs(_safe_float(features.get("atr_14")))
         volatility = atr / price if price > 0 else 0.0
     returns_20 = abs(_safe_float(features.get("returns_20")))
-    return (
-        "volatile"
-        if volatility >= 0.03
-        else "trending"
-        if returns_20 >= 0.01
-        else "ranging"
-    )
+    return "volatile" if volatility >= 0.03 else "trending" if returns_20 >= 0.01 else "ranging"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -623,18 +624,12 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
     if int(slippage_distribution.get("count") or 0) <= 0:
         hard_reasons.append("authoritative slippage tail calibration is missing")
     if top_return <= bottom_return:
-        hard_reasons.append(
-            f"高分组平均收益 {top_return:.3f}% 未优于低分组 {bottom_return:.3f}%"
-        )
+        hard_reasons.append(f"高分组平均收益 {top_return:.3f}% 未优于低分组 {bottom_return:.3f}%")
     if top_return_lcb is None or top_return_lcb <= 0:
         hard_reasons.append("高分组费后收益置信下界未大于 0")
     if top_profit_factor is None or top_profit_factor <= 1.0:
         hard_reasons.append("高分组 Profit Factor 未大于 1")
-    if (
-        top_tail_loss is None
-        or bottom_tail_loss is None
-        or top_tail_loss > bottom_tail_loss
-    ):
+    if top_tail_loss is None or bottom_tail_loss is None or top_tail_loss > bottom_tail_loss:
         hard_reasons.append("高分组尾部损失率缺失或劣于低分组")
 
     reliable = not hard_reasons
@@ -651,13 +646,9 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         "top_avg_return_pct": round(top_return, 4),
         "bottom_avg_return_pct": round(bottom_return, 4),
         "top_return_lcb_pct": None if top_return_lcb is None else round(top_return_lcb, 4),
-        "top_profit_factor": (
-            None if top_profit_factor is None else round(top_profit_factor, 4)
-        ),
+        "top_profit_factor": (None if top_profit_factor is None else round(top_profit_factor, 4)),
         "top_tail_loss_rate": None if top_tail_loss is None else round(top_tail_loss, 4),
-        "bottom_tail_loss_rate": (
-            None if bottom_tail_loss is None else round(bottom_tail_loss, 4)
-        ),
+        "bottom_tail_loss_rate": (None if bottom_tail_loss is None else round(bottom_tail_loss, 4)),
         "diagnostics": {
             "auc": _safe_float(metrics.get(f"{side}_auc"), None),
             "pr_auc": _safe_float(metrics.get(f"{side}_pr_auc"), None),
@@ -709,9 +700,7 @@ def _activation_gated_policy(
     activation = _safe_dict(artifact.activation_manifest if artifact is not None else None)
     stage = str(activation.get("activation_stage") or "unregistered")
     activation_blockers = activation.get("blocking_reasons")
-    activation_blockers = (
-        activation_blockers if isinstance(activation_blockers, list) else []
-    )
+    activation_blockers = activation_blockers if isinstance(activation_blockers, list) else []
     manifest_authorized = bool(
         stage in {"canary", "active"}
         and activation.get("live_ml_ready") is True
@@ -872,6 +861,8 @@ _TRAINING_FEATURE_SNAPSHOT_KEYS = (
     "whale_txn_count",
 )
 _TRAINING_FEATURE_COLUMN_PREFIX = "training_feature__"
+
+
 def _shadow_training_columns() -> tuple[Any, ...]:
     return (
         ShadowBacktest.id,
@@ -1059,13 +1050,7 @@ def _training_data_sha256(frame: pd.DataFrame) -> str:
 
 
 def _compact_integer_ranges(values: list[Any]) -> list[list[int]]:
-    ordered = sorted(
-        {
-            int(number)
-            for value in values
-            if (number := _safe_float(value, 0.0)) > 0
-        }
-    )
+    ordered = sorted({int(number) for value in values if (number := _safe_float(value, 0.0)) > 0})
     if not ordered:
         return []
     ranges: list[list[int]] = []
@@ -1161,9 +1146,7 @@ def _walk_forward_side_scores(
     weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
     return_column = f"{side}_return_pct"
     cost_column = f"{side}_execution_cost_pct"
-    net_training_returns = (
-        train[return_column].astype(float) - train[cost_column].astype(float)
-    )
+    net_training_returns = train[return_column].astype(float) - train[cost_column].astype(float)
     tail_policy = empirical_policy_value(
         f"{side}_walk_forward_tail_loss_boundary_pct",
         net_training_returns[net_training_returns < 0].tolist(),
@@ -1179,9 +1162,11 @@ def _walk_forward_side_scores(
     market_model.fit(x_train, train[return_column], model__sample_weight=weights)
     cost_model.fit(x_train, train[cost_column], model__sample_weight=weights)
     tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
-    scores = np.asarray(market_model.predict(x_validation), dtype=float) - np.asarray(
-        cost_model.predict(x_validation), dtype=float
-    ) - _positive_proba(tail_model, x_validation) * tail_scale
+    scores = (
+        np.asarray(market_model.predict(x_validation), dtype=float)
+        - np.asarray(cost_model.predict(x_validation), dtype=float)
+        - _positive_proba(tail_model, x_validation) * tail_scale
+    )
     return scores, {
         **tail_policy.to_dict(),
         "scale_pct": tail_scale,
@@ -1320,9 +1305,11 @@ def _market_regime_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
             []
             if stable
             else [
-                "insufficient_market_regime_coverage"
-                if len(reports) < 2
-                else "market_regime_fee_after_return_unstable"
+                (
+                    "insufficient_market_regime_coverage"
+                    if len(reports) < 2
+                    else "market_regime_fee_after_return_unstable"
+                )
             ]
         ),
     }
@@ -1333,9 +1320,7 @@ def _authoritative_trade_return_evidence(
 ) -> dict[str, Any]:
     side_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
     for sample in trade_samples:
-        tasks = _safe_dict(
-            _safe_dict(sample.get("profit_supervision")).get("tasks")
-        )
+        tasks = _safe_dict(_safe_dict(sample.get("profit_supervision")).get("tasks"))
         realized = _safe_dict(tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK))
         side = str(realized.get("side") or sample.get("side") or "").lower()
         value = _safe_float(realized.get(PROFIT_TRAINING_TARGET), float("nan"))
@@ -1363,10 +1348,7 @@ def _authoritative_trade_return_evidence(
                 "score": float(value),
             }
         )
-    sides = {
-        side: _return_evidence(rows)
-        for side, rows in side_rows.items()
-    }
+    sides = {side: _return_evidence(rows) for side, rows in side_rows.items()}
     fingerprint_payload = {
         side: [
             {
@@ -1414,8 +1396,7 @@ def _leave_one_symbol_out_stability(
         "version": "2026-07-15.leave-one-symbol-out.v1",
         "evaluated_symbol_count": len(symbols),
         "rows": reports,
-        "stable": bool(reports)
-        and all(row["evidence"]["promotion_math_ready"] for row in reports),
+        "stable": bool(reports) and all(row["evidence"]["promotion_math_ready"] for row in reports),
         "policy": "recompute_oos_fee_after_return_evidence_after_each_symbol_removal",
     }
 
@@ -1439,11 +1420,9 @@ def _walk_forward_return_report(
         group
         for group in groups
         if any(
-            group_bounds[prior]["end"]
-            < group_bounds[group]["decision_start"]
+            group_bounds[prior]["end"] < group_bounds[group]["decision_start"]
             for prior in groups
-            if group_bounds[prior]["decision_start"]
-            < group_bounds[group]["decision_start"]
+            if group_bounds[prior]["decision_start"] < group_bounds[group]["decision_start"]
         )
     ]
     if not validation_candidates:
@@ -1473,21 +1452,16 @@ def _walk_forward_return_report(
     oos_rows = {"long": [], "short": []}
     for index, validation_groups in enumerate(group_blocks, start=1):
         validation_decision_start = min(
-            group_bounds[group]["decision_start"]
-            for group in validation_groups
+            group_bounds[group]["decision_start"] for group in validation_groups
         )
         training_set = {
-            group
-            for group in groups
-            if group_bounds[group]["end"] < validation_decision_start
+            group for group in groups if group_bounds[group]["end"] < validation_decision_start
         }
         validation_set = set(validation_groups)
         if training_set & validation_set:
             raise ValueError("walk-forward decision groups overlap")
         train = ordered[ordered["decision_group"].astype(str).isin(training_set)].copy()
-        validation = ordered[
-            ordered["decision_group"].astype(str).isin(validation_set)
-        ].copy()
+        validation = ordered[ordered["decision_group"].astype(str).isin(validation_set)].copy()
         side_reports: dict[str, Any] = {}
         for side in ("long", "short"):
             scores, fold_tail_policy = _walk_forward_side_scores(
@@ -1500,9 +1474,7 @@ def _walk_forward_return_report(
                 scores,
                 side=side,
             )
-            oos_rows[side].extend(
-                _all_scored_return_rows(validation, scores, side=side)
-            )
+            oos_rows[side].extend(_all_scored_return_rows(validation, scores, side=side))
             side_reports[side] = {
                 **_return_evidence(selected_rows),
                 "training_tail_loss_policy": fold_tail_policy,
@@ -1512,24 +1484,17 @@ def _walk_forward_return_report(
                 "fold": index,
                 "training_decision_group_count": len(training_set),
                 "validation_decision_group_count": len(validation_set),
-                "validation_start": _fingerprint_value(
-                    validation.iloc[0].get("label_timestamp")
-                ),
-                "validation_end": _fingerprint_value(
-                    validation.iloc[-1].get("label_timestamp")
-                ),
+                "validation_start": _fingerprint_value(validation.iloc[0].get("label_timestamp")),
+                "validation_end": _fingerprint_value(validation.iloc[-1].get("label_timestamp")),
                 "training_label_end": _fingerprint_value(
                     max(group_bounds[group]["end"] for group in training_set)
                 ),
-                "validation_decision_start": _fingerprint_value(
-                    validation_decision_start
-                ),
+                "validation_decision_start": _fingerprint_value(validation_decision_start),
                 "label_timestamp_overlap_count": 0,
                 "purged_training_decision_group_count": sum(
                     1
                     for group in groups
-                    if group_bounds[group]["decision_start"]
-                    < validation_decision_start
+                    if group_bounds[group]["decision_start"] < validation_decision_start
                     and group not in training_set
                 ),
                 "decision_group_overlap_count": 0,
@@ -1550,9 +1515,7 @@ def _walk_forward_return_report(
         "folds": folds,
         "fold_count": len(folds),
         "decision_group_count": len(groups),
-        "decision_group_disjoint": all(
-            row["decision_group_overlap_count"] == 0 for row in folds
-        ),
+        "decision_group_disjoint": all(row["decision_group_overlap_count"] == 0 for row in folds),
         "chronological_label_disjoint": all(
             row["label_timestamp_overlap_count"] == 0
             and row["training_label_end"] < row["validation_decision_start"]
@@ -1566,10 +1529,7 @@ def _walk_forward_return_report(
             evidence["promotion_math_ready"]
             and evidence["leave_one_symbol_out"]["stable"]
             and evidence["market_regime_stability"]["stable"]
-            and all(
-                fold["sides"][side]["promotion_math_ready"]
-                for fold in folds
-            )
+            and all(fold["sides"][side]["promotion_math_ready"] for fold in folds)
             for side, evidence in side_reports.items()
         ),
     }
@@ -1588,15 +1548,64 @@ def _champion_comparison_inputs(
     if not isinstance(current_artifact, ResolvedModelArtifact):
         return None, None, []
     manifest = current_artifact.manifest
-    partition_errors = decision_group_partition_errors(
-        manifest.get("decision_group_partition")
-    )
-    if partition_errors:
-        return None, None, partition_errors
-    stage = str(
-        _safe_dict(current_artifact.activation_manifest).get("activation_stage") or ""
-    )
+    eligibility_errors = [
+        *local_ml_artifact_compatibility_errors(manifest),
+        *decision_group_partition_errors(manifest.get("decision_group_partition")),
+    ]
+    if not eligibility_errors:
+        try:
+            bundle = load_trusted_joblib(
+                current_artifact.model_path,
+                trusted_root=current_artifact.model_path.parent,
+                expected_type=dict,
+            )
+        except Exception:
+            eligibility_errors.append("artifact_bundle_unloadable")
+        else:
+            eligibility_errors.extend(
+                local_ml_artifact_compatibility_errors(
+                    _safe_dict(bundle.get("metadata")),
+                    bundle=bundle,
+                )
+            )
+    if eligibility_errors:
+        return None, None, sorted(set(eligibility_errors))
+    stage = str(_safe_dict(current_artifact.activation_manifest).get("activation_stage") or "")
     return manifest, stage or None, []
+
+
+_REQUIRED_LOCAL_ML_BUNDLE_KEYS = (
+    "long_regressor",
+    "short_regressor",
+    "long_cost_regressor",
+    "short_cost_regressor",
+)
+
+
+def local_ml_artifact_compatibility_errors(
+    metadata: dict[str, Any],
+    *,
+    bundle: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return stable diagnostics for artifacts the current runtime cannot use."""
+
+    errors: list[str] = []
+    expected_values = {
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_version": RETURN_LABEL_VERSION,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+    }
+    for key, expected in expected_values.items():
+        if metadata.get(key) != expected:
+            errors.append(f"artifact_{key}_mismatch")
+    if bundle is not None:
+        errors.extend(
+            f"artifact_model_component_missing:{key}"
+            for key in _REQUIRED_LOCAL_ML_BUNDLE_KEYS
+            if key not in bundle
+        )
+    return errors
 
 
 def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
@@ -1652,9 +1661,7 @@ def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
     )
     overlap_count = len(train_groups & holdout_groups)
     training_label_end = (
-        max(group_bounds[group]["end"] for group in train_groups)
-        if train_groups
-        else None
+        max(group_bounds[group]["end"] for group in train_groups) if train_groups else None
     )
     chronological_label_disjoint = bool(
         training_label_end is not None
@@ -1679,9 +1686,7 @@ def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
         "sample_count": int(len(ordered)),
         "decision_group_count": len(ordered_groups),
         "candidate_training_decision_group_count": len(candidate_train_groups),
-        "purged_training_decision_group_count": len(
-            purged_training_groups
-        ),
+        "purged_training_decision_group_count": len(purged_training_groups),
         "purged_training_sample_count": purged_training_sample_count,
         "train_sample_count": int(len(train)),
         "train_decision_group_count": len(train_groups),
@@ -1738,8 +1743,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         long_cost = _safe_float(cost_task.get("long_total_cost_pct"), float("nan"))
         short_cost = _safe_float(cost_task.get("short_total_cost_pct"), float("nan"))
         if not all(
-            math.isfinite(value)
-            for value in (long_return, short_return, long_cost, short_cost)
+            math.isfinite(value) for value in (long_return, short_return, long_cost, short_cost)
         ):
             continue
         feature_row: dict[str, Any] = dict(
@@ -1753,11 +1757,10 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             {
                 "id": sample_id,
                 "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
-                "decision_group": _safe_dict(
-                    quality_sample.get("correlation_weight")
-                ).get("correlation_group"),
-                "label_timestamp": getattr(row, "due_at", None)
-                or getattr(row, "created_at", None),
+                "decision_group": _safe_dict(quality_sample.get("correlation_weight")).get(
+                    "correlation_group"
+                ),
+                "label_timestamp": getattr(row, "due_at", None) or getattr(row, "created_at", None),
                 "symbol": str(getattr(row, "symbol", "") or ""),
                 "market_regime": _market_regime_label(snapshot),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
@@ -1783,10 +1786,9 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         return frame
     tail_policy: dict[str, Any] = {}
     for side in ("long", "short"):
-        returns = (
-            frame[f"{side}_return_pct"].astype(float)
-            - frame[f"{side}_execution_cost_pct"].astype(float)
-        )
+        returns = frame[f"{side}_return_pct"].astype(float) - frame[
+            f"{side}_execution_cost_pct"
+        ].astype(float)
         boundary = empirical_policy_value(
             f"{side}_tail_loss_boundary_pct",
             returns[returns < 0].tolist(),
@@ -1856,10 +1858,9 @@ def train_from_frame(
     tail_policy: dict[str, Any] = {}
     tail_scales: dict[str, float] = {}
     for side in ("long", "short"):
-        training_net_returns = (
-            partition.train[f"{side}_return_pct"].astype(float)
-            - partition.train[f"{side}_execution_cost_pct"].astype(float)
-        )
+        training_net_returns = partition.train[f"{side}_return_pct"].astype(
+            float
+        ) - partition.train[f"{side}_execution_cost_pct"].astype(float)
         negatives = training_net_returns[training_net_returns < 0].tolist()
         generated = empirical_policy_value(
             f"{side}_tail_loss_boundary_pct",
@@ -1869,10 +1870,9 @@ def train_from_frame(
         )
         tail_policy[side] = generated.to_dict()
         boundary = float(generated.value) if generated.value is not None else 0.0
-        net_returns = (
-            frame[f"{side}_return_pct"].astype(float)
-            - frame[f"{side}_execution_cost_pct"].astype(float)
-        )
+        net_returns = frame[f"{side}_return_pct"].astype(float) - frame[
+            f"{side}_execution_cost_pct"
+        ].astype(float)
         frame[f"{side}_tail_loss"] = (net_returns < boundary).astype(int)
         frame[f"{side}_win"] = (net_returns > 0.0).astype(int)
         tail_scales[side] = max(abs(boundary), float(np.finfo(float).eps))
@@ -1907,12 +1907,8 @@ def train_from_frame(
 
     long_classifier.fit(x_train, train["long_win"], model__sample_weight=train_weights)
     short_classifier.fit(x_train, train["short_win"], model__sample_weight=train_weights)
-    long_tail_classifier.fit(
-        x_train, train["long_tail_loss"], model__sample_weight=train_weights
-    )
-    short_tail_classifier.fit(
-        x_train, train["short_tail_loss"], model__sample_weight=train_weights
-    )
+    long_tail_classifier.fit(x_train, train["long_tail_loss"], model__sample_weight=train_weights)
+    short_tail_classifier.fit(x_train, train["short_tail_loss"], model__sample_weight=train_weights)
     long_regressor.fit(x_train, train["long_return_pct"], model__sample_weight=train_weights)
     short_regressor.fit(x_train, train["short_return_pct"], model__sample_weight=train_weights)
     long_cost_regressor.fit(
@@ -1996,18 +1992,14 @@ def train_from_frame(
         }
     )
     actual_trade_calibration = authoritative_trade_calibration(trade_samples or [])
-    authoritative_return_evidence = _authoritative_trade_return_evidence(
-        trade_samples or []
-    )
+    authoritative_return_evidence = _authoritative_trade_return_evidence(trade_samples or [])
     supervision_report = profit_supervision_report(
         frame.to_dict("records"),
         trade_samples or [],
     )
     supervision_report = {
         **supervision_report,
-        "actual_trade_calibration_fingerprint": actual_trade_calibration.get(
-            "data_fingerprint"
-        ),
+        "actual_trade_calibration_fingerprint": actual_trade_calibration.get("data_fingerprint"),
     }
     frame_quality_report = {
         **frame_quality_report,
@@ -2029,9 +2021,7 @@ def train_from_frame(
         "last_trained_completed_trade_sample_count": len(trade_samples or []),
         "training_window_composition": _training_window_composition(train),
         "quality_report": frame_quality_report,
-        "market_fact_contract": _safe_dict(
-            frame_quality_report.get("market_fact_contract")
-        ),
+        "market_fact_contract": _safe_dict(frame_quality_report.get("market_fact_contract")),
         "governance_report": artifact_bound_governance_report(
             frame_quality_report,
             persist_artifact=persist_artifact,
@@ -2091,13 +2081,9 @@ def train_from_frame(
         ),
         "counterfactual_cost_holdout": {
             "long_expected_pct": float(long_cost_distribution["expected"].mean()),
-            "long_lower_quantile_pct": float(
-                long_cost_distribution["lower_quantile"].mean()
-            ),
+            "long_lower_quantile_pct": float(long_cost_distribution["lower_quantile"].mean()),
             "short_expected_pct": float(short_cost_distribution["expected"].mean()),
-            "short_lower_quantile_pct": float(
-                short_cost_distribution["lower_quantile"].mean()
-            ),
+            "short_lower_quantile_pct": float(short_cost_distribution["lower_quantile"].mean()),
         },
         "metrics": {
             "long_auc": _safe_auc(test["long_win"], long_scores),
@@ -2179,9 +2165,7 @@ def train_from_frame(
             resolved = ML_SIGNAL_ARTIFACT_REGISTRY.persist_candidate_joblib(
                 bundle,
                 metadata,
-                parent_model_identity=(
-                    "sklearn RandomForest/Dummy classifier-regressor pipelines"
-                ),
+                parent_model_identity=("sklearn RandomForest/Dummy classifier-regressor pipelines"),
                 code_version=source_code_version,
             )
             metadata.clear()
@@ -2205,13 +2189,16 @@ class MLSignalService:
         self.model_path = model_path or (
             self.artifact_registry.model_root / "unregistered-model.joblib"
         )
-        self.metadata_path = METADATA_PATH if model_path is not None else (
-            self.artifact_registry.model_root / "unregistered-metadata.json"
+        self.metadata_path = (
+            METADATA_PATH
+            if model_path is not None
+            else (self.artifact_registry.model_root / "unregistered-metadata.json")
         )
         self._bundle: dict[str, Any] | None = None
         self._loaded_mtime: float | None = None
         self._loaded_pointer_mtime_ns: int | None = None
         self._resolved_artifact: ResolvedModelArtifact | None = None
+        self._load_diagnostic: dict[str, Any] | None = None
         self._train_lock = asyncio.Lock()
         self._training = False
         self._last_check_at: str | None = None
@@ -2225,24 +2212,39 @@ class MLSignalService:
         self._ensure_loaded()
         auto_status = self._auto_train_status()
         if not self._bundle:
+            diagnostic = self._model_unavailable_diagnostic()
             readiness = disabled_ml_readiness(
-                "no_model",
-                "ML model artifact is not available.",
+                diagnostic["code"],
+                diagnostic["message"],
+            )
+            artifact_metadata = _safe_dict(
+                self._resolved_artifact.manifest if self._resolved_artifact is not None else None
+            )
+            activation = _safe_dict(
+                self._resolved_artifact.activation_manifest
+                if self._resolved_artifact is not None
+                else None
             )
             return {
+                **artifact_metadata,
                 "available": False,
-                "status": "no_model",
+                "status": diagnostic["code"],
                 "readiness_state": readiness["state"],
                 "readiness": readiness,
                 "live_ml_ready": False,
                 "model_path": str(self.model_path),
                 "artifact_registry": self._artifact_registry_status(),
+                "artifact_lifecycle": activation.get("activation_stage")
+                or artifact_metadata.get("artifact_lifecycle")
+                or "unregistered",
+                "artifact_activation_manifest": activation,
+                "model_load_diagnostic": diagnostic,
                 "strategy_blueprint": build_model_strategy_blueprint(
                     metadata=None,
                     readiness=readiness,
                     activation=None,
                 ),
-                "message": "本地 ML 盈亏质量模型尚未训练。",
+                "message": diagnostic["message"],
                 **auto_status,
             }
         metadata = _safe_dict(self._bundle.get("metadata"))
@@ -2325,9 +2327,10 @@ class MLSignalService:
 
     def _loaded_strategy_blueprint(self) -> dict[str, Any]:
         if not self._bundle:
+            diagnostic = self._model_unavailable_diagnostic()
             readiness = disabled_ml_readiness(
-                "no_model",
-                "ML model artifact is not available.",
+                diagnostic["code"],
+                diagnostic["message"],
             )
             return build_model_strategy_blueprint(
                 metadata=None,
@@ -2355,12 +2358,15 @@ class MLSignalService:
         )
 
     def _artifact_version(self, metadata: dict[str, Any]) -> str | None:
-        return str(
-            getattr(self._resolved_artifact, "version", None)
-            or metadata.get("artifact_version")
-            or metadata.get("version")
-            or ""
-        ) or None
+        return (
+            str(
+                getattr(self._resolved_artifact, "version", None)
+                or metadata.get("artifact_version")
+                or metadata.get("version")
+                or ""
+            )
+            or None
+        )
 
     def rollback_to_strategy_model(self, target_version: str | None) -> dict[str, Any]:
         """Restore the registered predecessor only when it matches the strategy target."""
@@ -2472,9 +2478,7 @@ class MLSignalService:
                 "timeout",
             }
             delay = (
-                AUTO_TRAIN_RETRY_INTERVAL_SECONDS
-                if failed
-                else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
+                AUTO_TRAIN_RETRY_INTERVAL_SECONDS if failed else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
             )
             next_check = datetime.now(UTC) + timedelta(seconds=delay)
             self.training_state_store.finish_check(
@@ -2638,16 +2642,12 @@ class MLSignalService:
                         "reason": partition_report["reason"],
                         "completed_sample_count": completed_count,
                         "cost_complete_sample_count": int(len(frame)),
-                        "decision_group_count": partition_report[
-                            "decision_group_count"
-                        ],
+                        "decision_group_count": partition_report["decision_group_count"],
                         "train_sample_count": partition_report["train_sample_count"],
                         "train_decision_group_count": partition_report[
                             "train_decision_group_count"
                         ],
-                        "holdout_sample_count": partition_report[
-                            "holdout_sample_count"
-                        ],
+                        "holdout_sample_count": partition_report["holdout_sample_count"],
                         "holdout_decision_group_count": partition_report[
                             "holdout_decision_group_count"
                         ],
@@ -2742,9 +2742,7 @@ class MLSignalService:
                     if production_authorized
                     and trained_readiness.get("state") == "ready"
                     and set(live_enabled_sides) == {"long", "short"}
-                    else "canary"
-                    if production_authorized or paper_canary_authorized
-                    else "shadow"
+                    else "canary" if production_authorized or paper_canary_authorized else "shadow"
                 )
                 current_artifact = None
                 resolve_current = getattr(self.artifact_registry, "resolve_current", None)
@@ -2753,7 +2751,7 @@ class MLSignalService:
                 (
                     champion_manifest,
                     champion_stage,
-                    champion_partition_errors,
+                    champion_eligibility_errors,
                 ) = _champion_comparison_inputs(
                     current_artifact
                     if isinstance(current_artifact, ResolvedModelArtifact)
@@ -2765,19 +2763,15 @@ class MLSignalService:
                     candidate_stage=activation_stage,
                     champion_stage=champion_stage,
                 )
-                if champion_partition_errors:
+                if champion_eligibility_errors:
                     champion_comparison = {
                         **champion_comparison,
                         "replaced_ineligible_champion": True,
                         "ineligible_champion_version": current_artifact.version,
-                        "ineligible_champion_partition_errors": sorted(
-                            set(champion_partition_errors)
-                        ),
+                        "ineligible_champion_errors": sorted(set(champion_eligibility_errors)),
                     }
                 if champion_comparison.get("accepted") is not True:
-                    reject_candidate = getattr(
-                        self.artifact_registry, "reject_candidate", None
-                    )
+                    reject_candidate = getattr(self.artifact_registry, "reject_candidate", None)
                     rejected = (
                         reject_candidate(champion_comparison)
                         if callable(reject_candidate)
@@ -2818,18 +2812,14 @@ class MLSignalService:
                         "candidate_readiness": candidate_readiness,
                         "readiness": readiness,
                         "readiness_state": readiness.get("state"),
-                        "live_ml_ready": bool(
-                            readiness.get("live_ml_ready")
-                        ),
+                        "live_ml_ready": bool(readiness.get("live_ml_ready")),
                         "artifact_persisted": True,
                         "artifact_version": (
                             current_artifact.version
                             if isinstance(current_artifact, ResolvedModelArtifact)
                             else None
                         ),
-                        "artifact_activation_stage": current_activation.get(
-                            "activation_stage"
-                        ),
+                        "artifact_activation_stage": current_activation.get("activation_stage"),
                         "strategy_blueprint": build_model_strategy_blueprint(
                             metadata=_safe_dict(
                                 current_artifact.manifest
@@ -2871,22 +2861,16 @@ class MLSignalService:
                     "live_ml_ready": False,
                     "paper_canary_authorized": False,
                     "live_enabled_sides": [],
-                    "blocking_reasons": (
-                        trained_readiness.get("blocking_reasons") or []
-                    ),
+                    "blocking_reasons": (trained_readiness.get("blocking_reasons") or []),
                     "lifecycle_path": ["candidate", "shadow"],
                 }
-                shadow_activation["strategy_blueprint"] = (
-                    build_model_strategy_blueprint(
-                        metadata=trained_metadata,
-                        readiness=trained_readiness,
-                        activation=shadow_activation,
-                        artifact_version=trained_metadata.get("version"),
-                    )
+                shadow_activation["strategy_blueprint"] = build_model_strategy_blueprint(
+                    metadata=trained_metadata,
+                    readiness=trained_readiness,
+                    activation=shadow_activation,
+                    artifact_version=trained_metadata.get("version"),
                 )
-                activated_artifact = self.artifact_registry.promote_candidate(
-                    shadow_activation
-                )
+                activated_artifact = self.artifact_registry.promote_candidate(shadow_activation)
                 if activation_stage in {"canary", "active"}:
                     canary_activation = {
                         **common_activation_evidence,
@@ -2902,13 +2886,11 @@ class MLSignalService:
                         "blocking_reasons": [],
                         "lifecycle_path": ["candidate", "shadow", "canary"],
                     }
-                    canary_activation["strategy_blueprint"] = (
-                        build_model_strategy_blueprint(
-                            metadata=trained_metadata,
-                            readiness=trained_readiness,
-                            activation=canary_activation,
-                            artifact_version=trained_metadata.get("version"),
-                        )
+                    canary_activation["strategy_blueprint"] = build_model_strategy_blueprint(
+                        metadata=trained_metadata,
+                        readiness=trained_readiness,
+                        activation=canary_activation,
+                        artifact_version=trained_metadata.get("version"),
                     )
                     activated_artifact = self.artifact_registry.transition_current(
                         canary_activation
@@ -2929,13 +2911,11 @@ class MLSignalService:
                             "active",
                         ],
                     }
-                    active_activation["strategy_blueprint"] = (
-                        build_model_strategy_blueprint(
-                            metadata=trained_metadata,
-                            readiness=trained_readiness,
-                            activation=active_activation,
-                            artifact_version=trained_metadata.get("version"),
-                        )
+                    active_activation["strategy_blueprint"] = build_model_strategy_blueprint(
+                        metadata=trained_metadata,
+                        readiness=trained_readiness,
+                        activation=active_activation,
+                        artifact_version=trained_metadata.get("version"),
                     )
                     activated_artifact = self.artifact_registry.transition_current(
                         active_activation
@@ -2949,11 +2929,15 @@ class MLSignalService:
                     "reason": (
                         "trained_active_activated"
                         if activation_stage == "active"
-                        else "trained_canary_activated"
-                        if production_authorized
-                        else "trained_paper_bootstrap_canary_activated"
-                        if paper_canary_authorized
-                        else "trained_shadow_activated"
+                        else (
+                            "trained_canary_activated"
+                            if production_authorized
+                            else (
+                                "trained_paper_bootstrap_canary_activated"
+                                if paper_canary_authorized
+                                else "trained_shadow_activated"
+                            )
+                        )
                     ),
                     "completed_sample_count": completed_count,
                     "previous_sample_count": last_sample_count,
@@ -2989,14 +2973,18 @@ class MLSignalService:
                         "本地 ML 候选已通过双边费后收益证据，并按 shadow → canary → "
                         "active 顺序原子激活为统一生产模型。"
                         if activation_stage == "active"
-                        else "本地 ML 候选已通过单边费后收益证据并原子激活为 canary，"
-                        "仅允许证据达标方向影响生产。"
-                        if production_authorized
-                        else "本地 ML 候选已通过数据治理与时间滚动完整性检查，原子激活为"
-                        "仅限模拟盘的 bootstrap canary；该阶段不拥有生产权限。"
-                        if paper_canary_authorized
-                        else "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
-                        "生产影响保持关闭，等待收益证据达标。"
+                        else (
+                            "本地 ML 候选已通过单边费后收益证据并原子激活为 canary，"
+                            "仅允许证据达标方向影响生产。"
+                            if production_authorized
+                            else (
+                                "本地 ML 候选已通过数据治理与时间滚动完整性检查，原子激活为"
+                                "仅限模拟盘的 bootstrap canary；该阶段不拥有生产权限。"
+                                if paper_canary_authorized
+                                else "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
+                                "生产影响保持关闭，等待收益证据达标。"
+                            )
+                        )
                     ),
                 }
                 self._last_train_result = result
@@ -3181,22 +3169,24 @@ class MLSignalService:
     def predict(self, features: Any, *, horizons: tuple[int, ...] = (10, 30)) -> dict[str, Any]:
         self._ensure_loaded()
         if not self._bundle:
+            diagnostic = self._model_unavailable_diagnostic()
             readiness = disabled_ml_readiness(
-                "no_model",
-                "ML model artifact is not available.",
+                diagnostic["code"],
+                diagnostic["message"],
             )
             return {
                 "available": False,
-                "status": "no_model",
+                "status": diagnostic["code"],
                 "readiness_state": readiness["state"],
                 "readiness": readiness,
                 "live_ml_ready": False,
+                "model_load_diagnostic": diagnostic,
                 "strategy_blueprint": build_model_strategy_blueprint(
                     metadata=None,
                     readiness=readiness,
                     activation=None,
                 ),
-                "message": "本地 ML 盈亏质量模型尚未训练，当前分析不使用 ML 辅助信号。",
+                "message": diagnostic["message"],
             }
         metadata = _safe_dict(self._bundle.get("metadata"))
         influence = _influence_policy(metadata)
@@ -3289,12 +3279,8 @@ class MLSignalService:
                 tail_loss_probability=short_tail_loss_probability,
                 tail_loss_scale_pct=short_tail_scale,
             )
-            long_market_distribution_ready = bool(
-                long_return_contract.get("production_eligible")
-            )
-            short_market_distribution_ready = bool(
-                short_return_contract.get("production_eligible")
-            )
+            long_market_distribution_ready = bool(long_return_contract.get("production_eligible"))
+            short_market_distribution_ready = bool(short_return_contract.get("production_eligible"))
             long_objective_expected = _safe_float(
                 long_return_contract.get("objective_expected_return_pct"),
                 float("nan"),
@@ -3303,15 +3289,9 @@ class MLSignalService:
                 short_return_contract.get("objective_expected_return_pct"),
                 float("nan"),
             )
-            long_rank = (
-                long_objective_expected
-                if long_market_distribution_ready
-                else float("-inf")
-            )
+            long_rank = long_objective_expected if long_market_distribution_ready else float("-inf")
             short_rank = (
-                short_objective_expected
-                if short_market_distribution_ready
-                else float("-inf")
+                short_objective_expected if short_market_distribution_ready else float("-inf")
             )
             if not math.isfinite(long_rank) and not math.isfinite(short_rank):
                 long_rank = raw_long_expected
@@ -3319,22 +3299,16 @@ class MLSignalService:
             best_side = "long" if long_rank >= short_rank else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
             best_objective_expected = (
-                long_objective_expected
-                if best_side == "long"
-                else short_objective_expected
+                long_objective_expected if best_side == "long" else short_objective_expected
             )
-            best_raw_expected = (
-                raw_long_expected if best_side == "long" else raw_short_expected
-            )
+            best_raw_expected = raw_long_expected if best_side == "long" else raw_short_expected
             best_scoring_expected = (
                 best_objective_expected
                 if math.isfinite(best_objective_expected)
                 else best_raw_expected
             )
             best_tail_loss_probability = (
-                long_tail_loss_probability
-                if best_side == "long"
-                else short_tail_loss_probability
+                long_tail_loss_probability if best_side == "long" else short_tail_loss_probability
             )
             best_lower_quantile = (
                 long_lower_quantile if best_side == "long" else short_lower_quantile
@@ -3365,9 +3339,7 @@ class MLSignalService:
                 _safe_dict(actual_calibration.get(best_side))
             )
             selected_return_contract = (
-                long_return_contract
-                if best_side == "long"
-                else short_return_contract
+                long_return_contract if best_side == "long" else short_return_contract
             )
             profit_edge = abs(
                 (
@@ -3395,17 +3367,14 @@ class MLSignalService:
             )
             return_scale = abs(best_scoring_expected) + abs(best_lower_quantile)
             risk_score = _clamp(
-                downside / max(return_scale, 1e-9)
-                + float(best_tail_loss_probability or 0.0)
+                downside / max(return_scale, 1e-9) + float(best_tail_loss_probability or 0.0)
             )
             predictions.append(
                 {
                     "horizon_minutes": int(horizon),
                     "long_win_rate": round(long_win_rate, 4),
                     "short_win_rate": round(short_win_rate, 4),
-                    "return_distribution_contract_version": (
-                        RETURN_DISTRIBUTION_CONTRACT_VERSION
-                    ),
+                    "return_distribution_contract_version": (RETURN_DISTRIBUTION_CONTRACT_VERSION),
                     "return_distribution_contract": {
                         "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
                         "long": long_return_contract,
@@ -3413,33 +3382,21 @@ class MLSignalService:
                     },
                     "counterfactual_execution_cost_distribution": {
                         "long": {
-                            "expected_pct": round(
-                                float(long_cost_distribution["expected"][0]), 4
-                            ),
+                            "expected_pct": round(float(long_cost_distribution["expected"][0]), 4),
                             "upper_tail_pct": round(
                                 float(long_cost_distribution["upper_quantile"][0]), 4
                             ),
-                            "uncertainty_pct": round(
-                                float(long_cost_distribution["std"][0]), 4
-                            ),
-                            "source_authority": (
-                                "shadow_counterfactual_live_microstructure"
-                            ),
+                            "uncertainty_pct": round(float(long_cost_distribution["std"][0]), 4),
+                            "source_authority": ("shadow_counterfactual_live_microstructure"),
                             "distribution_ready": long_cost_distribution_ready,
                         },
                         "short": {
-                            "expected_pct": round(
-                                float(short_cost_distribution["expected"][0]), 4
-                            ),
+                            "expected_pct": round(float(short_cost_distribution["expected"][0]), 4),
                             "upper_tail_pct": round(
                                 float(short_cost_distribution["upper_quantile"][0]), 4
                             ),
-                            "uncertainty_pct": round(
-                                float(short_cost_distribution["std"][0]), 4
-                            ),
-                            "source_authority": (
-                                "shadow_counterfactual_live_microstructure"
-                            ),
+                            "uncertainty_pct": round(float(short_cost_distribution["std"][0]), 4),
+                            "source_authority": ("shadow_counterfactual_live_microstructure"),
                             "distribution_ready": short_cost_distribution_ready,
                         },
                         "source_authority": "shadow_counterfactual_live_microstructure",
@@ -3472,37 +3429,28 @@ class MLSignalService:
                     "selected_return_distribution_blockers": list(
                         selected_return_contract.get("blockers") or []
                     ),
-                    "actual_trade_calibration_ready": (
-                        selected_actual_calibration_ready
-                    ),
+                    "actual_trade_calibration_ready": (selected_actual_calibration_ready),
                 }
             )
 
         primary = predictions[0] if predictions else {}
         primary_side = str(primary.get("best_side") or "")
         primary_cost_distribution = _safe_dict(
-            _safe_dict(primary.get("counterfactual_execution_cost_distribution")).get(
-                primary_side
-            )
+            _safe_dict(primary.get("counterfactual_execution_cost_distribution")).get(primary_side)
         )
         primary_return_distribution = _safe_dict(
-            _safe_dict(primary.get("return_distribution_contract")).get(
-                primary_side
-            )
+            _safe_dict(primary.get("return_distribution_contract")).get(primary_side)
         )
         current_prediction_ready = bool(
             primary
             and primary_side in {"long", "short"}
             and primary_side in set(readiness.get("live_enabled_sides") or [])
-            and primary_return_distribution.get("version")
-            == RETURN_DISTRIBUTION_CONTRACT_VERSION
+            and primary_return_distribution.get("version") == RETURN_DISTRIBUTION_CONTRACT_VERSION
             and primary_return_distribution.get("production_eligible") is True
             and primary_cost_distribution.get("distribution_ready") is True
             and primary.get("actual_trade_calibration_ready") is True
         )
-        live_prediction_influence = bool(
-            live_ml_ready and current_prediction_ready
-        )
+        live_prediction_influence = bool(live_ml_ready and current_prediction_ready)
         activation = _safe_dict(
             self._resolved_artifact.activation_manifest
             if self._resolved_artifact is not None
@@ -3523,9 +3471,7 @@ class MLSignalService:
         )
         return {
             "available": True,
-            "route_mode": (
-                "live" if live_prediction_influence else "shadow_observation"
-            ),
+            "route_mode": ("live" if live_prediction_influence else "shadow_observation"),
             "live_ml_ready": live_ml_ready,
             "objective_name": metadata.get("objective_name"),
             "objective_version": metadata.get("objective_version"),
@@ -3542,18 +3488,18 @@ class MLSignalService:
             "paper_canary_authorized": paper_canary_authorized,
             "paper_canary": paper_canary,
             "strategy_blueprint": strategy_blueprint,
-            "return_distribution_contract_version": (
-                RETURN_DISTRIBUTION_CONTRACT_VERSION
-            ),
+            "return_distribution_contract_version": (RETURN_DISTRIBUTION_CONTRACT_VERSION),
             "prediction_quality": {
                 "production_eligible": live_prediction_influence,
                 "anomalous": not live_prediction_influence,
                 "reason": (
                     "separated_market_cost_and_actual_calibration_ready"
                     if live_prediction_influence
-                    else "current_prediction_contract_incomplete"
-                    if live_ml_ready
-                    else "ml_readiness_blocks_live_influence"
+                    else (
+                        "current_prediction_contract_incomplete"
+                        if live_ml_ready
+                        else "ml_readiness_blocks_live_influence"
+                    )
                 ),
                 "blockers": [
                     *list(primary_return_distribution.get("blockers") or []),
@@ -3599,9 +3545,7 @@ class MLSignalService:
             "short_win_rate": primary.get("short_win_rate"),
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
             "return_semantics": "gross_market_opportunity_before_execution",
-            "return_distribution_contract": primary.get(
-                "return_distribution_contract"
-            ),
+            "return_distribution_contract": primary.get("return_distribution_contract"),
             "profit_edge_pct": primary.get("profit_edge_pct"),
             "profit_quality_score": primary.get("profit_quality_score"),
             "profit_signal": primary.get("profit_signal"),
@@ -3620,6 +3564,7 @@ class MLSignalService:
         }
 
     def _ensure_loaded(self) -> None:
+        resolved_in_attempt: ResolvedModelArtifact | None = None
         try:
             trusted_root = MODEL_DIR
             if self._explicit_model_path is None:
@@ -3642,7 +3587,13 @@ class MLSignalService:
                     self._loaded_mtime = None
                     self._loaded_pointer_mtime_ns = pointer_mtime_ns
                     self._resolved_artifact = None
+                    self._load_diagnostic = {
+                        "code": "no_model",
+                        "message": "本地 ML 尚未注册当前模型 Artifact。",
+                        "details": [],
+                    }
                     return
+                resolved_in_attempt = current
                 self.model_path = current.model_path
                 self.metadata_path = current.metadata_path
                 trusted_root = self.artifact_registry.model_root
@@ -3651,6 +3602,15 @@ class MLSignalService:
             if not self.model_path.exists():
                 self._bundle = None
                 self._loaded_mtime = None
+                self._load_diagnostic = {
+                    "code": "artifact_load_failed" if self._resolved_artifact else "no_model",
+                    "message": (
+                        "当前已注册模型 Artifact 文件不存在，运行时已禁止使用。"
+                        if self._resolved_artifact
+                        else "本地 ML 模型 Artifact 文件不存在。"
+                    ),
+                    "details": ["artifact_model_file_missing"],
+                }
                 return
             mtime = self.model_path.stat().st_mtime
             if self._bundle is not None and self._loaded_mtime == mtime:
@@ -3662,36 +3622,49 @@ class MLSignalService:
             )
             _configure_single_row_inference(self._bundle)
             metadata = _safe_dict(self._bundle.get("metadata"))
-            if (
-                metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
-                or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
-                or metadata.get("label_version") != RETURN_LABEL_VERSION
-                or metadata.get("profit_supervision_version")
-                != PROFIT_SUPERVISION_VERSION
-                or not all(
-                    key in self._bundle
-                    for key in (
-                        "long_regressor",
-                        "short_regressor",
-                        "long_cost_regressor",
-                        "short_cost_regressor",
-                    )
+            compatibility_errors = local_ml_artifact_compatibility_errors(
+                metadata,
+                bundle=self._bundle,
+            )
+            if compatibility_errors:
+                self._bundle = None
+                self._loaded_mtime = None
+                self._load_diagnostic = {
+                    "code": "artifact_incompatible",
+                    "message": "当前已注册模型与运行时收益监督合同不兼容，已禁止加载。",
+                    "details": compatibility_errors,
+                }
+                logger.warning(
+                    "refusing incompatible ML signal artifact",
+                    path=str(self.model_path),
+                    errors=compatibility_errors,
                 )
-            ):
-                raise ValueError(
-                    "refusing local ML artifact without separated profit supervision"
-                )
+                return
             self._loaded_mtime = mtime
+            self._load_diagnostic = None
         except Exception as exc:
+            error_text = safe_error_text(exc)
             logger.warning(
                 "failed to load ML signal model",
                 path=str(self.model_path),
-                error=safe_error_text(exc),
+                error=error_text,
             )
             self._bundle = None
             self._loaded_mtime = None
             self._loaded_pointer_mtime_ns = None
-            self._resolved_artifact = None
+            self._resolved_artifact = resolved_in_attempt
+            self._load_diagnostic = {
+                "code": "artifact_load_failed",
+                "message": "当前模型 Artifact 加载失败，运行时已禁止使用。",
+                "details": [error_text],
+            }
+
+    def _model_unavailable_diagnostic(self) -> dict[str, Any]:
+        return self._load_diagnostic or {
+            "code": "no_model",
+            "message": "本地 ML 尚未注册当前模型 Artifact。",
+            "details": [],
+        }
 
     def _artifact_registry_status(self) -> dict[str, Any]:
         current = self._resolved_artifact
@@ -3724,8 +3697,7 @@ class MLSignalService:
             "auto_training": row.get("state") == "running",
             "auto_train_last_check_at": row.get("last_check_at") or self._last_check_at,
             "auto_train_next_check_at": row.get("next_check_at") or self._next_check_at,
-            "auto_train_last_started_at": row.get("last_started_at")
-            or self._last_train_started_at,
+            "auto_train_last_started_at": row.get("last_started_at") or self._last_train_started_at,
             "auto_train_last_finished_at": row.get("last_finished_at")
             or self._last_train_finished_at,
             "auto_train_last_result": row.get("last_result") or self._last_train_result,
@@ -3772,19 +3744,13 @@ class MLSignalService:
         if not isinstance(challenger, ResolvedModelArtifact):
             return selected
         challenger_metadata = _safe_dict(challenger.manifest)
-        current_cursor = int(
-            selected.get("last_trained_completed_shadow_sample_count") or 0
-        )
+        current_cursor = int(selected.get("last_trained_completed_shadow_sample_count") or 0)
         challenger_cursor = int(
-            challenger_metadata.get("last_trained_completed_shadow_sample_count")
-            or 0
+            challenger_metadata.get("last_trained_completed_shadow_sample_count") or 0
         )
-        current_trade_cursor = int(
-            selected.get("last_trained_completed_trade_sample_count") or 0
-        )
+        current_trade_cursor = int(selected.get("last_trained_completed_trade_sample_count") or 0)
         challenger_trade_cursor = int(
-            challenger_metadata.get("last_trained_completed_trade_sample_count")
-            or 0
+            challenger_metadata.get("last_trained_completed_trade_sample_count") or 0
         )
         if (challenger_cursor, challenger_trade_cursor) > (
             current_cursor,
@@ -3882,10 +3848,7 @@ async def load_shadow_training_rows() -> list[Any]:
     async with get_read_session_ctx() as session:
         stmt = select(*columns).where(*base_filters).order_by(*order_by)
         result = await session.execute(stmt)
-        rows = [
-            _shadow_training_row_from_mapping(row)
-            for row in result.mappings().all()
-        ]
+        rows = [_shadow_training_row_from_mapping(row) for row in result.mappings().all()]
     return select_shadow_training_rows(rows)
 
 

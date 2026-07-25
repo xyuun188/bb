@@ -217,9 +217,7 @@ def test_opportunity_score_ui_prefers_expected_net_return() -> None:
 
 
 def test_model_distribution_ui_reads_only_standardized_contract_fields() -> None:
-    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "function standardizedReturnDistribution" in script
     assert "function distributionSummaryText" in script
@@ -710,7 +708,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "applyRecommendedDataCollectionSources()" in external_settings_html
     assert 'id="data-external-source-list"' in external_settings_html
     assert 'id="data-external-sources"' not in external_settings_html
-    assert 'data-data-collection-setting' in external_settings_html
+    assert "data-data-collection-setting" in external_settings_html
     assert 'id="data-cryptopanic-api-key"' in external_settings_html
     assert 'id="data-coinmarketcal-api-key"' in external_settings_html
     assert 'id="data-newsapi-api-key"' in external_settings_html
@@ -946,13 +944,9 @@ def test_ml_signal_dashboard_renders_readiness_blockers() -> None:
 
 
 def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> None:
-    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     reason_block = script[
-        script.index("const DASHBOARD_REASON_TEXT") : script.index(
-            "function mlSampleCounts"
-        )
+        script.index("const DASHBOARD_REASON_TEXT") : script.index("function mlSampleCounts")
     ]
     overview_block = script[
         script.index("function renderMLSignalOverview") : script.index(
@@ -965,6 +959,14 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "const rawText = message || code" in reason_block
     assert "const [baseCode, ...detailParts] = code.split(':')" in reason_block
     assert "DASHBOARD_REASON_TEXT[code] || DASHBOARD_REASON_TEXT[baseCode]" in reason_block
+    assert "no_model: '本地 ML 尚未注册当前模型 Artifact'" in reason_block
+    assert (
+        "artifact_incompatible: '当前模型 Artifact 与运行时收益监督合同不兼容，已禁止加载'"
+        in reason_block
+    )
+    assert (
+        "artifact_load_failed: '当前模型 Artifact 加载失败，已禁止用于运行时预测'" in reason_block
+    )
     assert "okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据'" in reason_block
     assert "risk_contract_version_missing: '历史入场记录未保存风险合同版本'" in reason_block
     assert "历史开仓订单关联的决策已不在当前保留窗口" in reason_block
@@ -978,12 +980,12 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "upstream.map(systemAuditNodeLabel)" in script
     assert "downstream.map(systemAuditNodeLabel)" in script
     assert "adjustments.map(item => escHtml(dashboardReasonText(item)))" in script
+    assert "function mlArtifactEvidenceMissingText(status)" in script
+    assert "Artifact 不兼容，运行时未加载" in script
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
-    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     counts_block = script[
         script.index("function mlSampleCounts") : script.index("function mlWinBar")
     ]

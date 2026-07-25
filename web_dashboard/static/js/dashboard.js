@@ -4268,6 +4268,9 @@ function mlFirstNumber(source, keys) {
 }
 
 const DASHBOARD_REASON_TEXT = Object.freeze({
+    no_model: '本地 ML 尚未注册当前模型 Artifact',
+    artifact_incompatible: '当前模型 Artifact 与运行时收益监督合同不兼容，已禁止加载',
+    artifact_load_failed: '当前模型 Artifact 加载失败，已禁止用于运行时预测',
     shadow_market_opportunity_distribution_missing: '缺少影子市场机会收益分布',
     counterfactual_execution_cost_distribution_missing: '缺少反事实执行成本分布',
     authoritative_realized_return_distribution_missing: '缺少权威真实成交收益分布',
@@ -9660,9 +9663,16 @@ function renderReadableTrainableModelCard(model) {
         </div>`;
 }
 
-function mlEvidenceValue(value, suffix = '') {
-    if (value === null || value === undefined || value === '') return '证据缺失';
+function mlEvidenceValue(value, suffix = '', missingText = '证据缺失') {
+    if (value === null || value === undefined || value === '') return missingText;
     return `${value}${suffix}`;
+}
+
+function mlArtifactEvidenceMissingText(status) {
+    if (status.status === 'artifact_incompatible') return 'Artifact 不兼容，运行时未加载';
+    if (status.status === 'artifact_load_failed') return 'Artifact 加载失败';
+    if (status.status === 'no_model') return '尚未注册模型 Artifact';
+    return '证据缺失';
 }
 
 function mlEvidenceRow(label, value, tone = '') {
@@ -9670,6 +9680,11 @@ function mlEvidenceRow(label, value, tone = '') {
 }
 
 function mlLocalEvidenceHtml(status) {
+    const evidenceValue = (value, suffix = '') => mlEvidenceValue(
+        value,
+        suffix,
+        mlArtifactEvidenceMissingText(status),
+    );
     const quality = status.quality_report || {};
     const totals = quality.totals || {};
     const byKind = quality.by_kind || {};
@@ -9696,7 +9711,7 @@ function mlLocalEvidenceHtml(status) {
     const evidenceSections = [
         `<section class="ml-evidence-panel">
             <div class="ml-evidence-head"><strong>数据版本与样本分布</strong><span>${escHtml(quality.data_quality_version || '版本缺失')}</span></div>
-            ${mlEvidenceRow('数据指纹', mlEvidenceValue(fingerprint))}
+            ${mlEvidenceRow('数据指纹', evidenceValue(fingerprint))}
             ${mlEvidenceRow('全部 / 纳入 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(totals.total))} / ${mlSampleCountLabel(mlOptionalNumber(totals.included))} / ${mlSampleCountLabel(mlOptionalNumber(totals.excluded))}`)}
             ${mlEvidenceRow('影子样本 原始 / 纳入 / 降权 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(shadow.total))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.included))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.downweighted))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.excluded))}`)}
             ${mlEvidenceRow('真实成交 纳入 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(trade.included))} / ${mlSampleCountLabel(mlOptionalNumber(trade.excluded))}`)}
@@ -9718,20 +9733,20 @@ function mlLocalEvidenceHtml(status) {
         </section>`,
         `<section class="ml-evidence-panel">
             <div class="ml-evidence-head"><strong>Artifact manifest</strong><span>${escHtml(status.artifact_lifecycle || '生命周期缺失')}</span></div>
-            ${mlEvidenceRow('Artifact 版本', mlEvidenceValue(registry.version || manifest.artifact_version || status.artifact_version))}
-            ${mlEvidenceRow('Artifact SHA256', mlEvidenceValue(registry.sha256 || manifest.artifact_sha256 || status.artifact_sha256))}
-            ${mlEvidenceRow('训练数据 SHA256', mlEvidenceValue(status.training_data_sha256))}
-            ${mlEvidenceRow('源码 SHA256', mlEvidenceValue(status.source_code_sha256))}
-            ${mlEvidenceRow('Manifest 路径', mlEvidenceValue(registry.manifest_path || status.artifact_manifest_path))}
+            ${mlEvidenceRow('Artifact 版本', evidenceValue(registry.version || manifest.artifact_version || status.artifact_version))}
+            ${mlEvidenceRow('Artifact SHA256', evidenceValue(registry.sha256 || manifest.artifact_sha256 || status.artifact_sha256))}
+            ${mlEvidenceRow('训练数据 SHA256', evidenceValue(status.training_data_sha256))}
+            ${mlEvidenceRow('源码 SHA256', evidenceValue(status.source_code_sha256))}
+            ${mlEvidenceRow('Manifest 路径', evidenceValue(registry.manifest_path || status.artifact_manifest_path))}
         </section>`,
         `<section class="ml-evidence-panel ${activation.live_ml_ready === true ? '' : 'warn'}">
             <div class="ml-evidence-head"><strong>晋升与激活证据</strong><span>${activation.live_ml_ready === true ? '已授权' : '未授权'}</span></div>
-            ${mlEvidenceRow('激活阶段', mlEvidenceValue(activation.activation_stage || status.artifact_lifecycle))}
-            ${mlEvidenceRow('Walk-forward', mlEvidenceValue(walkForward.status))}
+            ${mlEvidenceRow('激活阶段', evidenceValue(activation.activation_stage || status.artifact_lifecycle))}
+            ${mlEvidenceRow('Walk-forward', evidenceValue(walkForward.status))}
             ${mlEvidenceRow('滚动折数', mlSampleCountLabel(mlOptionalNumber(walkForward.folds?.length)))}
-            ${mlEvidenceRow('做多移除单币稳定', mlEvidenceValue(symbolStability.long?.stable))}
-            ${mlEvidenceRow('做空移除单币稳定', mlEvidenceValue(symbolStability.short?.stable))}
-            ${mlEvidenceRow('权威成交指纹', mlEvidenceValue(authoritative.data_fingerprint))}
+            ${mlEvidenceRow('做多移除单币稳定', evidenceValue(symbolStability.long?.stable))}
+            ${mlEvidenceRow('做空移除单币稳定', evidenceValue(symbolStability.short?.stable))}
+            ${mlEvidenceRow('权威成交指纹', evidenceValue(authoritative.data_fingerprint))}
         </section>`,
         `<section class="ml-evidence-panel ${blockers.length ? 'bad' : ''}">
             <div class="ml-evidence-head"><strong>当前晋升阻断</strong><span>${blockers.length ? `${blockers.length} 项` : '无阻断'}</span></div>

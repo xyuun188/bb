@@ -58,7 +58,7 @@ def test_ml_signal_service_does_not_load_joblib_outside_model_dir(tmp_path: Path
     status = service.status()
 
     assert status["available"] is False
-    assert status["status"] == "no_model"
+    assert status["status"] == "artifact_load_failed"
     assert service._bundle is None
 
 

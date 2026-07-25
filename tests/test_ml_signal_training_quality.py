@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from config.settings import settings
+from core.model_artifact_safety import dump_trusted_joblib
 from core.training_contracts import (
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
@@ -101,9 +102,7 @@ def _with_return_objective(metadata: dict) -> dict:
         {
             "version": PROFIT_SUPERVISION_VERSION,
             "shadow_market_sample_count": int(metadata.get("sample_count") or 1),
-            "shadow_counterfactual_cost_sample_count": int(
-                metadata.get("sample_count") or 1
-            ),
+            "shadow_counterfactual_cost_sample_count": int(metadata.get("sample_count") or 1),
             "actual_realized_return_sample_count": 2,
         },
     )
@@ -228,18 +227,12 @@ def _with_return_objective(metadata: dict) -> dict:
                 {
                     "fold": 1,
                     "decision_group_overlap_count": 0,
-                    "sides": {
-                        side: dict(ready_return_evidence)
-                        for side in ("long", "short")
-                    },
+                    "sides": {side: dict(ready_return_evidence) for side in ("long", "short")},
                 },
                 {
                     "fold": 2,
                     "decision_group_overlap_count": 0,
-                    "sides": {
-                        side: dict(ready_return_evidence)
-                        for side in ("long", "short")
-                    },
+                    "sides": {side: dict(ready_return_evidence) for side in ("long", "short")},
                 },
             ],
             "sides": {
@@ -253,25 +246,18 @@ def _with_return_objective(metadata: dict) -> dict:
     )
     metadata.setdefault(
         "leave_one_symbol_out_report",
-        {
-            side: {"stable": True, "rows": []}
-            for side in ("long", "short")
-        },
+        {side: {"stable": True, "rows": []} for side in ("long", "short")},
     )
     metadata.setdefault(
         "oos_return_evaluation",
-        {
-            side: dict(ready_return_evidence) for side in ("long", "short")
-        },
+        {side: dict(ready_return_evidence) for side in ("long", "short")},
     )
     metadata.setdefault(
         "authoritative_trade_return_evidence",
         {
             "version": "2026-07-15.authoritative-trade-return-evidence.v1",
             "data_fingerprint": "c" * 64,
-            "sides": {
-                side: dict(ready_return_evidence) for side in ("long", "short")
-            },
+            "sides": {side: dict(ready_return_evidence) for side in ("long", "short")},
         },
     )
     metrics = dict(metadata.get("metrics") or {})
@@ -499,9 +485,7 @@ class _Regressor:
             "imputer": SimpleNamespace(transform=lambda values: values),
             "model": SimpleNamespace(
                 estimators_=[
-                    SimpleNamespace(
-                        predict=lambda _values, value=value: np.array([value])
-                    )
+                    SimpleNamespace(predict=lambda _values, value=value: np.array([value]))
                     for value in member_predictions
                 ]
             ),
@@ -572,8 +556,7 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
                 "id": idx + 1,
                 "decision_group": f"shadow_decision:{idx + 1}",
                 "label_timestamp": (
-                    datetime(2026, 7, 14, tzinfo=UTC)
-                    + timedelta(minutes=idx * 61)
+                    datetime(2026, 7, 14, tzinfo=UTC) + timedelta(minutes=idx * 61)
                 ).isoformat(),
                 "horizon_minutes": 30,
                 "symbol": "BTC/USDT" if idx % 2 == 0 else "ETH/USDT",
@@ -603,9 +586,7 @@ def _multi_horizon_partition_frame(
     decision_start = datetime(2026, 7, 24, tzinfo=UTC)
     row_id = 0
     for decision_index in range(decision_count):
-        decision_at = decision_start + timedelta(
-            minutes=decision_index * spacing_minutes
-        )
+        decision_at = decision_start + timedelta(minutes=decision_index * spacing_minutes)
         for horizon in horizons:
             row_id += 1
             rows.append(
@@ -613,9 +594,7 @@ def _multi_horizon_partition_frame(
                     "id": row_id,
                     "decision_group": f"shadow_decision:{decision_index + 1}",
                     "decision_timestamp": decision_at.isoformat(),
-                    "label_timestamp": (
-                        decision_at + timedelta(minutes=horizon)
-                    ).isoformat(),
+                    "label_timestamp": (decision_at + timedelta(minutes=horizon)).isoformat(),
                     "horizon_minutes": horizon,
                 }
             )
@@ -655,40 +634,42 @@ def _ml_training_metadata(
     top_return = 0.16 if ready else -0.08
     bottom_return = -0.03 if ready else -0.12
     now = datetime.now(UTC).isoformat()
-    return _with_return_objective({
-        "version": now,
-        "trained_at": now,
-        "sample_count": 1200,
-        "test_count": 240,
-        "last_trained_completed_shadow_sample_count": completed_sample_count,
-        "training_run_mode": "persist" if artifact_persisted else "dry_run",
-        "artifact_persisted": artifact_persisted,
-        "quality_report": {
-            "data_quality_version": DATA_QUALITY_VERSION,
-            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
-        },
-        "training_window_composition": {
+    return _with_return_objective(
+        {
+            "version": now,
+            "trained_at": now,
             "sample_count": 1200,
-            "decision_action_counts": {"long": 600, "short": 600},
-            "best_action_counts": {"long": 600, "short": 600},
-        },
-        "metrics": {
-            "long_auc": 0.64,
-            "short_auc": 0.63,
-            "long_pr_auc": 0.60,
-            "short_pr_auc": 0.59,
-            "long_accuracy": 0.61,
-            "short_accuracy": 0.60,
-            "top_long_avg_return_pct": top_return,
-            "bottom_long_avg_return_pct": bottom_return,
-            "top_short_avg_return_pct": top_return,
-            "bottom_short_avg_return_pct": bottom_return,
-            "top_long_win_rate": 0.72 if ready else 0.48,
-            "bottom_long_win_rate": 0.41 if ready else 0.52,
-            "top_short_win_rate": 0.71 if ready else 0.47,
-            "bottom_short_win_rate": 0.40 if ready else 0.51,
-        },
-    })
+            "test_count": 240,
+            "last_trained_completed_shadow_sample_count": completed_sample_count,
+            "training_run_mode": "persist" if artifact_persisted else "dry_run",
+            "artifact_persisted": artifact_persisted,
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+            },
+            "training_window_composition": {
+                "sample_count": 1200,
+                "decision_action_counts": {"long": 600, "short": 600},
+                "best_action_counts": {"long": 600, "short": 600},
+            },
+            "metrics": {
+                "long_auc": 0.64,
+                "short_auc": 0.63,
+                "long_pr_auc": 0.60,
+                "short_pr_auc": 0.59,
+                "long_accuracy": 0.61,
+                "short_accuracy": 0.60,
+                "top_long_avg_return_pct": top_return,
+                "bottom_long_avg_return_pct": bottom_return,
+                "top_short_avg_return_pct": top_return,
+                "bottom_short_avg_return_pct": bottom_return,
+                "top_long_win_rate": 0.72 if ready else 0.48,
+                "bottom_long_win_rate": 0.41 if ready else 0.52,
+                "top_short_win_rate": 0.71 if ready else 0.47,
+                "bottom_short_win_rate": 0.40 if ready else 0.51,
+            },
+        }
+    )
 
 
 def test_train_from_frame_can_evaluate_without_persisting_artifacts(
@@ -729,26 +710,23 @@ def test_train_from_frame_can_evaluate_without_persisting_artifacts(
         fold["training_label_end"] < fold["validation_decision_start"]
         for fold in metadata["walk_forward_report"]["folds"]
     )
-    assert metadata["artifact_activation_manifest"][
-        "live_ml_ready"
-    ] is False
+    assert metadata["artifact_activation_manifest"]["live_ml_ready"] is False
     assert metadata["live_promotion_manifest"]["status"] == "not_issued"
-    assert metadata["profit_supervision_report"][
-        "actual_execution_cost_sample_count"
-    ] == 1
-    assert metadata["profit_supervision_report"][
-        "actual_realized_return_sample_count"
-    ] == 1
-    assert metadata["profit_supervision_report"]["authoritative_realized_trade"][
-        PROFIT_TRAINING_TARGET
-    ]["count"] == 1
+    assert metadata["profit_supervision_report"]["actual_execution_cost_sample_count"] == 1
+    assert metadata["profit_supervision_report"]["actual_realized_return_sample_count"] == 1
+    assert (
+        metadata["profit_supervision_report"]["authoritative_realized_trade"][
+            PROFIT_TRAINING_TARGET
+        ]["count"]
+        == 1
+    )
     assert (
         "net_return_after_cost_pct"
         not in metadata["profit_supervision_report"]["authoritative_realized_trade"]
     )
-    assert metadata["quality_report"]["profit_supervision"][
-        "actual_realized_return_sample_count"
-    ] == 1
+    assert (
+        metadata["quality_report"]["profit_supervision"]["actual_realized_return_sample_count"] == 1
+    )
     assert metadata["promotion_flow"] == PHASE3_REQUIRED_PROMOTION_FLOW
     assert not model_path.exists()
     assert not metadata_path.exists()
@@ -807,9 +785,7 @@ def test_train_from_frame_binds_exact_market_fact_training_view_contract() -> No
                     "sample_weight": 1.0,
                     "quality_reasons": [],
                     "features": {
-                        "training_market_fact_contract": (
-                            _clean_training_market_fact_contract()
-                        )
+                        "training_market_fact_contract": (_clean_training_market_fact_contract())
                     },
                 }
             ]
@@ -916,9 +892,7 @@ def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None
                     "id": row_id,
                     "decision_group": f"shadow_decision:{decision_index + 1}",
                     "decision_timestamp": decision_at.isoformat(),
-                    "label_timestamp": (
-                        decision_at + timedelta(minutes=horizon)
-                    ).isoformat(),
+                    "label_timestamp": (decision_at + timedelta(minutes=horizon)).isoformat(),
                     "horizon_minutes": horizon,
                     "symbol": "BTC/USDT" if decision_index % 2 == 0 else "ETH/USDT",
                     "long_return_pct": 0.3 if decision_index % 3 == 0 else -0.1,
@@ -934,10 +908,7 @@ def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None
 
     assert report["status"] == "complete"
     assert report["chronological_label_disjoint"] is True
-    assert any(
-        fold["purged_training_decision_group_count"] > 0
-        for fold in report["folds"]
-    )
+    assert any(fold["purged_training_decision_group_count"] > 0 for fold in report["folds"])
     assert all(
         fold["training_label_end"] < fold["validation_decision_start"]
         and fold["decision_group_overlap_count"] == 0
@@ -983,10 +954,7 @@ def test_decision_group_partition_is_strictly_time_disjoint_when_ready() -> None
     assert partition.report["holdout_sample_count"] == 20
     assert partition.report["decision_group_overlap_count"] == 0
     assert partition.report["chronological_label_disjoint"] is True
-    assert (
-        partition.report["training_label_end"]
-        < partition.report["holdout_decision_start"]
-    )
+    assert partition.report["training_label_end"] < partition.report["holdout_decision_start"]
 
 
 def test_old_champion_without_partition_contract_cannot_enter_comparison(
@@ -1012,6 +980,105 @@ def test_old_champion_without_partition_contract_cannot_enter_comparison(
     assert "partition_report_missing" in errors
 
 
+def test_champion_missing_separated_cost_model_cannot_block_candidate(
+    tmp_path: Path,
+) -> None:
+    metadata = _with_return_objective(
+        {
+            "decision_group_partition": decision_group_partition(_training_frame(40)).report,
+        }
+    )
+    model_path = tmp_path / "model.joblib"
+    dump_trusted_joblib(
+        {
+            "metadata": metadata,
+            "long_regressor": object(),
+            "short_regressor": object(),
+            "long_cost_regressor": object(),
+        },
+        model_path,
+        trusted_root=tmp_path,
+    )
+    champion = ResolvedModelArtifact(
+        model_id="local_ml_profit_quality",
+        version="legacy-without-short-cost-model",
+        model_path=model_path,
+        metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json",
+        sha256="a" * 64,
+        manifest=metadata,
+        pointer_role="current",
+        pointer_path=tmp_path / "current.json",
+        activation_manifest={"activation_stage": "canary"},
+    )
+
+    manifest, stage, errors = _champion_comparison_inputs(champion)
+
+    assert manifest is None
+    assert stage is None
+    assert "artifact_model_component_missing:short_cost_regressor" in errors
+
+
+def test_incompatible_registered_artifact_keeps_manifest_evidence_in_status(
+    tmp_path: Path,
+) -> None:
+    metadata = _with_return_objective(
+        {
+            "artifact_version": "legacy-separated-supervision",
+            "training_data_sha256": "b" * 64,
+            "quality_report": {
+                "data_quality_version": "legacy-quality-contract",
+                "totals": {"total": 42, "included": 40, "excluded": 2},
+            },
+        }
+    )
+    metadata["profit_supervision_version"] = "legacy-combined-supervision"
+    model_path = tmp_path / "model.joblib"
+    dump_trusted_joblib(
+        {"metadata": metadata},
+        model_path,
+        trusted_root=tmp_path,
+    )
+    pointer_path = tmp_path / "current.json"
+    pointer_path.write_text("{}", encoding="utf-8")
+    artifact = ResolvedModelArtifact(
+        model_id="local_ml_profit_quality",
+        version="legacy-separated-supervision",
+        model_path=model_path,
+        metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json",
+        sha256="c" * 64,
+        manifest=metadata,
+        pointer_role="current",
+        pointer_path=pointer_path,
+        activation_manifest={
+            "activation_stage": "canary",
+            "live_ml_ready": False,
+        },
+    )
+    registry = SimpleNamespace(
+        model_root=tmp_path,
+        current_path=pointer_path,
+        resolve_current=lambda: artifact,
+    )
+    service = MLSignalService(
+        artifact_registry=registry,
+        training_state_store=ModelTrainingStateStore(tmp_path / "training-state.json"),
+    )
+
+    status = service.status()
+
+    assert status["available"] is False
+    assert status["status"] == "artifact_incompatible"
+    assert (
+        "artifact_profit_supervision_version_mismatch" in status["model_load_diagnostic"]["details"]
+    )
+    assert status["artifact_registry"]["version"] == artifact.version
+    assert status["training_data_sha256"] == "b" * 64
+    assert status["quality_report"]["totals"]["included"] == 40
+    assert status["readiness"]["blocking_reasons"][0]["code"] == ("artifact_incompatible")
+
+
 def test_leave_one_symbol_out_detects_single_symbol_profit_support() -> None:
     rows = [
         {
@@ -1034,9 +1101,7 @@ def test_leave_one_symbol_out_detects_single_symbol_profit_support() -> None:
     ]
 
     report = _leave_one_symbol_out_stability(rows)
-    robo_removed = next(
-        row for row in report["rows"] if row["excluded_symbol"] == "ROBO/USDT"
-    )
+    robo_removed = next(row for row in report["rows"] if row["excluded_symbol"] == "ROBO/USDT")
 
     assert report["stable"] is False
     assert robo_removed["evidence"]["promotion_math_ready"] is False
@@ -1056,8 +1121,8 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
         horizon_minutes=30,
         feature_snapshot={
             "current_price": 100.0,
-                "spread_pct": 0.01,
-                "taker_fee_rate": 0.0004,
+            "spread_pct": 0.01,
+            "taker_fee_rate": 0.0004,
             "funding_rate": 0.0001,
             "funding_interval_hours": 8,
             "abnormal_wick_count_72h": 2,
@@ -1388,12 +1453,8 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     ]
     assert promotion_evidence[1]["paper_canary_authorized"] is True
     assert promotion_evidence[1]["live_ml_ready"] is False
-    assert promotion_evidence[1]["strategy_blueprint"][
-        "paper_execution_eligible"
-    ] is True
-    assert promotion_evidence[1]["strategy_blueprint"][
-        "live_execution_permission"
-    ] is False
+    assert promotion_evidence[1]["strategy_blueprint"]["paper_execution_eligible"] is True
+    assert promotion_evidence[1]["strategy_blueprint"]["live_execution_permission"] is False
     assert result["readiness_state"] == "degraded"
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_lcb_not_positive" in reason_codes
@@ -1794,9 +1855,7 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert metadata["objective_name"] == RETURN_OBJECTIVE_NAME
     assert metadata["objective_version"] == RETURN_OBJECTIVE_VERSION
     assert metadata["label_version"] == RETURN_LABEL_VERSION
-    assert metadata["prediction_distribution"]["lower_bound"] == (
-        "tree_prediction_lower_hinge"
-    )
+    assert metadata["prediction_distribution"]["lower_bound"] == ("tree_prediction_lower_hinge")
     assert metadata["prediction_distribution"]["uncertainty_source"] == (
         "random_forest_tree_empirical_order_statistics"
     )
@@ -1805,9 +1864,7 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert "top_short_profit_factor" in metadata["metrics"]
     replay_holdout = metadata["strategy_replay_holdout"]
     assert replay_holdout["sample_count"] == metadata["test_count"]
-    assert replay_holdout["decision_group_count"] == metadata[
-        "test_decision_group_count"
-    ]
+    assert replay_holdout["decision_group_count"] == metadata["test_decision_group_count"]
     assert replay_holdout["shadow_source_id_ranges"]
 
 
@@ -1850,43 +1907,45 @@ def test_quality_report_separates_missed_opportunity_downweight_from_contaminati
 
 
 def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights() -> None:
-    metadata = _with_return_objective({
-        "version": "2026-07-03T00:00:00+00:00",
-        "trained_at": "2026-07-03T00:00:00+00:00",
-        "sample_count": 1000,
-        "test_count": 250,
-        "quality_report": {
-            "data_quality_version": DATA_QUALITY_VERSION,
-            "totals": {
-                "total": 1000,
-                "included": 600,
-                "downweighted": 400,
-                "benign_downweighted": 395,
-                "contamination_downweighted": 5,
-                "excluded": 0,
+    metadata = _with_return_objective(
+        {
+            "version": "2026-07-03T00:00:00+00:00",
+            "trained_at": "2026-07-03T00:00:00+00:00",
+            "sample_count": 1000,
+            "test_count": 250,
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {
+                    "total": 1000,
+                    "included": 600,
+                    "downweighted": 400,
+                    "benign_downweighted": 395,
+                    "contamination_downweighted": 5,
+                    "excluded": 0,
+                },
             },
-        },
-        "metrics": {
-            "long_auc": 0.7,
-            "short_auc": 0.7,
-            "long_pr_auc": 0.7,
-            "short_pr_auc": 0.7,
-            "long_accuracy": 0.7,
-            "short_accuracy": 0.7,
-            "top_long_avg_return_pct": 0.2,
-            "bottom_long_avg_return_pct": -0.1,
-            "top_long_tail_loss_rate": 0.22,
-            "bottom_long_tail_loss_rate": 0.31,
-            "top_short_avg_return_pct": 0.2,
-            "bottom_short_avg_return_pct": -0.1,
-            "top_short_tail_loss_rate": 0.28,
-            "bottom_short_tail_loss_rate": 0.35,
-            "top_long_win_rate": 0.7,
-            "bottom_long_win_rate": 0.3,
-            "top_short_win_rate": 0.7,
-            "bottom_short_win_rate": 0.3,
-        },
-    })
+            "metrics": {
+                "long_auc": 0.7,
+                "short_auc": 0.7,
+                "long_pr_auc": 0.7,
+                "short_pr_auc": 0.7,
+                "long_accuracy": 0.7,
+                "short_accuracy": 0.7,
+                "top_long_avg_return_pct": 0.2,
+                "bottom_long_avg_return_pct": -0.1,
+                "top_long_tail_loss_rate": 0.22,
+                "bottom_long_tail_loss_rate": 0.31,
+                "top_short_avg_return_pct": 0.2,
+                "bottom_short_avg_return_pct": -0.1,
+                "top_short_tail_loss_rate": 0.28,
+                "bottom_short_tail_loss_rate": 0.35,
+                "top_long_win_rate": 0.7,
+                "bottom_long_win_rate": 0.3,
+                "top_short_win_rate": 0.7,
+                "bottom_short_win_rate": 0.3,
+            },
+        }
+    )
 
     readiness = build_ml_readiness_report(metadata, {"enabled": True})
 
@@ -1894,9 +1953,7 @@ def test_ml_readiness_dirty_ratio_ignores_benign_missed_opportunity_downweights(
     assert readiness["metrics"]["benign_downweighted_sample_count"] == 395
     assert readiness["metrics"]["contamination_downweighted_sample_count"] == 5
     assert readiness["metrics"]["top_short_tail_loss_rate"] == 0.28
-    assert "dirty_sample_ratio_high" not in {
-        item["code"] for item in readiness["blocking_reasons"]
-    }
+    assert "dirty_sample_ratio_high" not in {item["code"] for item in readiness["blocking_reasons"]}
 
 
 def test_ml_readiness_allows_low_win_rate_high_fee_after_return() -> None:
@@ -2001,36 +2058,38 @@ def test_ml_readiness_separates_paper_bootstrap_from_live_profit_gate() -> None:
 
 
 def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration() -> None:
-    metadata = _with_return_objective({
-        "version": datetime.now(UTC).isoformat(),
-        "trained_at": datetime.now(UTC).isoformat(),
-        "sample_count": 1200,
-        "test_count": 240,
-        "quality_report": {
-            "data_quality_version": DATA_QUALITY_VERSION,
-            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
-        },
-        "metrics": {
-            "long_auc": 0.7,
-            "short_auc": 0.7,
-            "long_pr_auc": 0.7,
-            "short_pr_auc": 0.7,
-            "long_accuracy": 0.7,
-            "short_accuracy": 0.7,
-            "top_long_avg_return_pct": 0.2,
-            "bottom_long_avg_return_pct": -0.1,
-            "top_short_avg_return_pct": 0.2,
-            "bottom_short_avg_return_pct": -0.1,
-            "top_long_win_rate": 0.7,
-            "bottom_long_win_rate": 0.3,
-            "top_short_win_rate": 0.7,
-            "bottom_short_win_rate": 0.3,
-        },
-        "expected_return_calibration": {
-            "long": {"win_avg_return_pct": 1.0, "non_win_avg_return_pct": -0.5},
-            "short": {"win_avg_return_pct": 0.8, "non_win_avg_return_pct": -0.4},
-        },
-    })
+    metadata = _with_return_objective(
+        {
+            "version": datetime.now(UTC).isoformat(),
+            "trained_at": datetime.now(UTC).isoformat(),
+            "sample_count": 1200,
+            "test_count": 240,
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+            },
+            "metrics": {
+                "long_auc": 0.7,
+                "short_auc": 0.7,
+                "long_pr_auc": 0.7,
+                "short_pr_auc": 0.7,
+                "long_accuracy": 0.7,
+                "short_accuracy": 0.7,
+                "top_long_avg_return_pct": 0.2,
+                "bottom_long_avg_return_pct": -0.1,
+                "top_short_avg_return_pct": 0.2,
+                "bottom_short_avg_return_pct": -0.1,
+                "top_long_win_rate": 0.7,
+                "bottom_long_win_rate": 0.3,
+                "top_short_win_rate": 0.7,
+                "bottom_short_win_rate": 0.3,
+            },
+            "expected_return_calibration": {
+                "long": {"win_avg_return_pct": 1.0, "non_win_avg_return_pct": -0.5},
+                "short": {"win_avg_return_pct": 0.8, "non_win_avg_return_pct": -0.4},
+            },
+        }
+    )
     service = MLSignalService()
     service._bundle = {
         "metadata": metadata,
@@ -2054,47 +2113,49 @@ def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration
 
 
 def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
-    metadata = _with_return_objective({
-        "version": datetime.now(UTC).isoformat(),
-        "trained_at": datetime.now(UTC).isoformat(),
-        "sample_count": 1200,
-        "test_count": 240,
-        "quality_report": {
-            "data_quality_version": DATA_QUALITY_VERSION,
-            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
-        },
-        "metrics": {
-            "long_auc": 0.7,
-            "short_auc": 0.7,
-            "long_pr_auc": 0.7,
-            "short_pr_auc": 0.7,
-            "long_accuracy": 0.7,
-            "short_accuracy": 0.7,
-            "top_long_avg_return_pct": 0.2,
-            "bottom_long_avg_return_pct": -0.1,
-            "top_short_avg_return_pct": 0.2,
-            "bottom_short_avg_return_pct": -0.1,
-            "top_long_win_rate": 0.7,
-            "bottom_long_win_rate": 0.3,
-            "top_short_win_rate": 0.7,
-            "bottom_short_win_rate": 0.3,
-        },
-        "expected_return_calibration": {
-            "long": {
-                "win_avg_return_pct": 0.7,
-                "non_win_avg_return_pct": -0.3,
-                "tail_loss_rate": 0.10,
-                "tail_loss_avg_return_pct": -2.0,
+    metadata = _with_return_objective(
+        {
+            "version": datetime.now(UTC).isoformat(),
+            "trained_at": datetime.now(UTC).isoformat(),
+            "sample_count": 1200,
+            "test_count": 240,
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
             },
-            "short": {
-                "win_avg_return_pct": 0.7,
-                "non_win_avg_return_pct": -0.3,
-                "tail_loss_rate": 0.10,
-                "tail_loss_avg_return_pct": -2.0,
+            "metrics": {
+                "long_auc": 0.7,
+                "short_auc": 0.7,
+                "long_pr_auc": 0.7,
+                "short_pr_auc": 0.7,
+                "long_accuracy": 0.7,
+                "short_accuracy": 0.7,
+                "top_long_avg_return_pct": 0.2,
+                "bottom_long_avg_return_pct": -0.1,
+                "top_short_avg_return_pct": 0.2,
+                "bottom_short_avg_return_pct": -0.1,
+                "top_long_win_rate": 0.7,
+                "bottom_long_win_rate": 0.3,
+                "top_short_win_rate": 0.7,
+                "bottom_short_win_rate": 0.3,
             },
-        },
-        "tail_loss_scale_pct": {"long": 0.18, "short": 0.18},
-    })
+            "expected_return_calibration": {
+                "long": {
+                    "win_avg_return_pct": 0.7,
+                    "non_win_avg_return_pct": -0.3,
+                    "tail_loss_rate": 0.10,
+                    "tail_loss_avg_return_pct": -2.0,
+                },
+                "short": {
+                    "win_avg_return_pct": 0.7,
+                    "non_win_avg_return_pct": -0.3,
+                    "tail_loss_rate": 0.10,
+                    "tail_loss_avg_return_pct": -2.0,
+                },
+            },
+            "tail_loss_scale_pct": {"long": 0.18, "short": 0.18},
+        }
+    )
     service = MLSignalService()
     service._bundle = {
         "metadata": metadata,
@@ -2117,12 +2178,8 @@ def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:
     assert primary["best_side"] == "long"
     assert distributions["long"]["raw_expected_return_pct"] == pytest.approx(0.3)
     assert distributions["short"]["raw_expected_return_pct"] == pytest.approx(0.3)
-    assert distributions["long"]["objective_expected_return_pct"] == pytest.approx(
-        0.279
-    )
-    assert distributions["short"]["objective_expected_return_pct"] == pytest.approx(
-        0.198
-    )
+    assert distributions["long"]["objective_expected_return_pct"] == pytest.approx(0.279)
+    assert distributions["short"]["objective_expected_return_pct"] == pytest.approx(0.198)
     assert distributions["short"]["tail_loss_probability"] == pytest.approx(0.55)
     assert distributions["long"]["tail_loss_probability"] == pytest.approx(0.10)
 
@@ -2340,51 +2397,53 @@ def test_ml_signal_status_exposes_learning_only_readiness_reasons() -> None:
 
 
 def test_ml_signal_readiness_surfaces_fee_after_profit_bucket_diagnostics() -> None:
-    metadata = _with_return_objective({
-        "version": datetime.now(UTC).isoformat(),
-        "trained_at": datetime.now(UTC).isoformat(),
-        "sample_count": 1200,
-        "test_count": 240,
-        "quality_report": {
-            "data_quality_version": DATA_QUALITY_VERSION,
-            "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
-        },
-        "metrics": {
-            "long_auc": 0.61,
-            "short_auc": 0.61,
-            "long_pr_auc": 0.60,
-            "short_pr_auc": 0.60,
-            "long_accuracy": 0.60,
-            "short_accuracy": 0.60,
-            "top_long_avg_return_pct": -0.14,
-            "bottom_long_avg_return_pct": -0.02,
-            "top_long_win_rate": 0.42,
-            "bottom_long_win_rate": 0.51,
-            "top_long_tail_loss_rate": 0.18,
-            "bottom_long_tail_loss_rate": 0.07,
-            "top_short_avg_return_pct": 0.18,
-            "bottom_short_avg_return_pct": -0.03,
-            "top_short_win_rate": 0.70,
-            "bottom_short_win_rate": 0.42,
-            "top_short_tail_loss_rate": 0.04,
-            "bottom_short_tail_loss_rate": 0.09,
-        },
-        "score_bucket_diagnostics": {
-            "long": {
-                "top": {
-                    "count": 48,
-                    "tail_loss_rate": 0.18,
-                    "action_counts": {"long": 48},
-                    "top_quality_reasons": [{"reason": "fee_drag", "count": 9}],
-                },
-                "bottom": {
-                    "count": 48,
-                    "tail_loss_rate": 0.07,
-                    "action_counts": {"short": 48},
-                },
-            }
-        },
-    })
+    metadata = _with_return_objective(
+        {
+            "version": datetime.now(UTC).isoformat(),
+            "trained_at": datetime.now(UTC).isoformat(),
+            "sample_count": 1200,
+            "test_count": 240,
+            "quality_report": {
+                "data_quality_version": DATA_QUALITY_VERSION,
+                "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
+            },
+            "metrics": {
+                "long_auc": 0.61,
+                "short_auc": 0.61,
+                "long_pr_auc": 0.60,
+                "short_pr_auc": 0.60,
+                "long_accuracy": 0.60,
+                "short_accuracy": 0.60,
+                "top_long_avg_return_pct": -0.14,
+                "bottom_long_avg_return_pct": -0.02,
+                "top_long_win_rate": 0.42,
+                "bottom_long_win_rate": 0.51,
+                "top_long_tail_loss_rate": 0.18,
+                "bottom_long_tail_loss_rate": 0.07,
+                "top_short_avg_return_pct": 0.18,
+                "bottom_short_avg_return_pct": -0.03,
+                "top_short_win_rate": 0.70,
+                "bottom_short_win_rate": 0.42,
+                "top_short_tail_loss_rate": 0.04,
+                "bottom_short_tail_loss_rate": 0.09,
+            },
+            "score_bucket_diagnostics": {
+                "long": {
+                    "top": {
+                        "count": 48,
+                        "tail_loss_rate": 0.18,
+                        "action_counts": {"long": 48},
+                        "top_quality_reasons": [{"reason": "fee_drag", "count": 9}],
+                    },
+                    "bottom": {
+                        "count": 48,
+                        "tail_loss_rate": 0.07,
+                        "action_counts": {"short": 48},
+                    },
+                }
+            },
+        }
+    )
 
     readiness = build_ml_readiness_report(metadata, {"enabled": True})
     long_diag = readiness["profit_quality_diagnostics"]["long"]
@@ -2460,10 +2519,7 @@ def test_rules_trade_profit_factor_does_not_gate_model_readiness() -> None:
     service = _service_with_metadata(metadata)
 
     status = service.status()
-    long_codes = {
-        item["code"]
-        for item in status["readiness"]["side_blocking_reasons"]["long"]
-    }
+    long_codes = {item["code"] for item in status["readiness"]["side_blocking_reasons"]["long"]}
 
     assert status["readiness_state"] == "ready"
     assert status["readiness"]["live_enabled_sides"] == ["long", "short"]
@@ -2493,10 +2549,7 @@ def test_symbol_removal_instability_blocks_that_prediction_side() -> None:
         {"current_price": 100.0, "atr_14": 1.0},
         horizons=(10,),
     )
-    long_codes = {
-        item["code"]
-        for item in prediction["readiness"]["side_blocking_reasons"]["long"]
-    }
+    long_codes = {item["code"] for item in prediction["readiness"]["side_blocking_reasons"]["long"]}
 
     assert prediction["readiness"]["live_enabled_sides"] == ["short"]
     assert prediction["predictions"][0]["best_side"] == "long"
@@ -2543,9 +2596,7 @@ def test_ml_signal_status_allows_directional_partial_live_influence() -> None:
     assert status["live_ml_ready"] is True
     assert status["readiness"]["live_enabled_sides"] == ["long"]
     assert status["readiness"]["blocking_reasons"] == []
-    short_codes = {
-        item["code"] for item in status["readiness"]["side_blocking_reasons"]["short"]
-    }
+    short_codes = {item["code"] for item in status["readiness"]["side_blocking_reasons"]["short"]}
     assert "short_pr_auc_below_threshold" not in short_codes
     assert "short_top_return_not_above_bottom" in short_codes
 
@@ -2662,15 +2713,15 @@ def test_strategy_replay_batch_matches_single_prediction_contract() -> None:
     )[0]
 
     assert batch["model_version"] == single["model_version"]
-    assert batch["predictions"][0]["best_side"] == single["predictions"][0][
-        "best_side"
-    ]
-    assert batch["predictions"][0]["return_distribution_contract"] == single[
-        "predictions"
-    ][0]["return_distribution_contract"]
-    assert batch["predictions"][0]["actual_trade_calibration_ready"] == single[
-        "predictions"
-    ][0]["actual_trade_calibration_ready"]
+    assert batch["predictions"][0]["best_side"] == single["predictions"][0]["best_side"]
+    assert (
+        batch["predictions"][0]["return_distribution_contract"]
+        == single["predictions"][0]["return_distribution_contract"]
+    )
+    assert (
+        batch["predictions"][0]["actual_trade_calibration_ready"]
+        == single["predictions"][0]["actual_trade_calibration_ready"]
+    )
 
 
 def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_influence() -> None:
