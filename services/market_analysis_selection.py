@@ -141,11 +141,7 @@ class MarketAnalysisSelectionPolicy:
         selected_keys = {str(row["symbol_key"]) for row in selected_rows}
 
         coverage_ranked = sorted(
-            (
-                row
-                for row in coverage_candidates
-                if str(row["symbol_key"]) not in selected_keys
-            ),
+            (row for row in coverage_candidates if str(row["symbol_key"]) not in selected_keys),
             key=lambda row: (
                 bool(row["never_analyzed"]),
                 _safe_float(row["recent_age_seconds"], float("inf")),
@@ -158,9 +154,7 @@ class MarketAnalysisSelectionPolicy:
             selected_rows.append(row)
             selected_keys.add(str(row["symbol_key"]))
 
-        coverage_assigned = sum(
-            row.get("selection_role") == "coverage" for row in selected_rows
-        )
+        coverage_assigned = sum(row.get("selection_role") == "coverage" for row in selected_rows)
         if coverage_assigned < coverage_slots:
             for row in reversed(selected_rows):
                 if not bool(row["coverage_due"]):
@@ -187,10 +181,7 @@ class MarketAnalysisSelectionPolicy:
                 if len(selected_rows) >= final_limit:
                     break
 
-        selected = {
-            str(row["symbol"]): row["feature"]
-            for row in selected_rows
-        }
+        selected = {str(row["symbol"]): row["feature"] for row in selected_rows}
         diagnostics = self._diagnostics(rows, selected_rows, final_limit, selected_at)
         return MarketAnalysisSelectionResult(selected=selected, diagnostics=diagnostics)
 
@@ -341,19 +332,21 @@ class MarketAnalysisSelectionPolicy:
         selected_at: datetime,
     ) -> dict[str, Any]:
         selected_keys = {str(row["symbol_key"]) for row in selected_rows}
+        coverage_due_rows = [row for row in rows if bool(row["coverage_due"])]
+        coverage_due_unselected = [
+            row for row in coverage_due_rows if str(row["symbol_key"]) not in selected_keys
+        ]
         recent_excluded = [
-            row for row in rows if row["recent_unchanged"] and row["symbol_key"] not in selected_keys
+            row
+            for row in rows
+            if row["recent_unchanged"] and row["symbol_key"] not in selected_keys
         ]
         selected_details = [self._public_row(row) for row in selected_rows]
         coverage_selected = [
-            str(row["symbol"])
-            for row in selected_rows
-            if row.get("selection_role") == "coverage"
+            str(row["symbol"]) for row in selected_rows if row.get("selection_role") == "coverage"
         ]
         advantage_selected = [
-            str(row["symbol"])
-            for row in selected_rows
-            if row.get("selection_role") == "advantage"
+            str(row["symbol"]) for row in selected_rows if row.get("selection_role") == "advantage"
         ]
         return {
             "version": self.VERSION,
@@ -373,11 +366,26 @@ class MarketAnalysisSelectionPolicy:
             ),
             "coverage_target_seconds": int(self.params.coverage_target_seconds),
             "coverage_configured_slots": int(self.params.coverage_slots),
-            "single_slot_coverage_interval": int(
-                self.params.single_slot_coverage_interval
-            ),
+            "single_slot_coverage_interval": int(self.params.single_slot_coverage_interval),
             "selection_round": int(self._selection_round),
             "coverage_due_candidate_count": sum(bool(row["coverage_due"]) for row in rows),
+            "coverage_due_symbols": [str(row["symbol"]) for row in coverage_due_rows],
+            "coverage_due_unselected_count": len(coverage_due_unselected),
+            "coverage_due_unselected_symbols": [
+                str(row["symbol"]) for row in coverage_due_unselected
+            ],
+            "never_analyzed_candidate_count": sum(bool(row["never_analyzed"]) for row in rows),
+            "oldest_completed_analysis_age_seconds": round(
+                max(
+                    (
+                        _safe_float(row["recent_age_seconds"])
+                        for row in rows
+                        if row["recent_age_seconds"] is not None
+                    ),
+                    default=0.0,
+                ),
+                3,
+            ),
             "coverage_selected_count": len(coverage_selected),
             "coverage_selected_symbols": coverage_selected,
             "advantage_selected_count": len(advantage_selected),
@@ -387,9 +395,7 @@ class MarketAnalysisSelectionPolicy:
                 and row.get("selection_status") == "recent_material_change_penalty"
                 for row in rows
             ),
-            "recent_unchanged_candidate_count": sum(
-                bool(row["recent_unchanged"]) for row in rows
-            ),
+            "recent_unchanged_candidate_count": sum(bool(row["recent_unchanged"]) for row in rows),
             "skipped_count": len(recent_excluded),
             "skipped_symbols": [str(row["symbol"]) for row in recent_excluded],
             "candidate_sample": [self._public_row(row) for row in rows[:12]],

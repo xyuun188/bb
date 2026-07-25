@@ -149,6 +149,10 @@ def test_overdue_coverage_displaces_a_recent_repeat_without_changing_entry_permi
 
     assert list(result.selected) == ["BTC/USDT", "SOL/USDT"]
     assert result.diagnostics["coverage_selected_symbols"] == ["SOL/USDT"]
+    assert result.diagnostics["coverage_due_symbols"] == ["SOL/USDT"]
+    assert result.diagnostics["coverage_due_unselected_count"] == 0
+    assert result.diagnostics["coverage_due_unselected_symbols"] == []
+    assert result.diagnostics["oldest_completed_analysis_age_seconds"] == 40 * 60
     assert result.diagnostics["is_entry_gate"] is False
     assert "ETH/USDT" in result.diagnostics["skipped_symbols"]
 
@@ -172,6 +176,7 @@ def test_single_slot_rounds_periodically_cover_overdue_candidate() -> None:
     assert list(first.selected) == ["BTC/USDT"]
     assert list(second.selected) == ["BTC/USDT"]
     assert list(third.selected) == ["SOL/USDT"]
+    assert first.diagnostics["coverage_due_unselected_symbols"] == ["SOL/USDT"]
     assert third.diagnostics["coverage_selected_symbols"] == ["SOL/USDT"]
 
 

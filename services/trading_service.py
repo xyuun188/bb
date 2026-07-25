@@ -4275,6 +4275,7 @@ class TradingService:
                 "last_market_round_summary": self._safe_dict(
                     getattr(self, "_last_market_round_summary", {})
                 ),
+                "market_analysis_deferred": self._market_defer_snapshot(),
                 "okx_authoritative_sync": okx_authoritative_sync,
                 "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
                 "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
@@ -5667,6 +5668,44 @@ class TradingService:
         self.market_analysis_defer_tracker = tracker
         return tracker
 
+    def _market_defer_snapshot(
+        self,
+        *,
+        monitoring_active: bool | None = None,
+    ) -> dict[str, Any]:
+        snapshot = self._market_defer_tracker().snapshot(
+            coverage_target_seconds=MARKET_ANALYSIS_SELECTION_PARAMS.coverage_target_seconds,
+        )
+        if monitoring_active is None:
+            monitoring_active = bool(
+                getattr(self, "_running", False)
+                and not mode_manager.is_paused
+                and not self._safe_dict(getattr(self, "_new_pair_pause_reasons", {})).get(
+                    ENSEMBLE_TRADER_NAME
+                )
+            )
+        snapshot["monitoring_active"] = bool(monitoring_active)
+        snapshot["coverage_window_evaluable"] = bool(monitoring_active)
+        snapshot["coverage_window_met"] = (
+            snapshot.get("pending_coverage_window_met") if monitoring_active else None
+        )
+        return snapshot
+
+    def _market_hydration_unavailable_symbols(
+        self,
+        diagnostics: dict[str, Any] | None,
+    ) -> list[str]:
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for item in self._safe_dict(diagnostics).get("unavailable_symbols") or []:
+            symbol = item.get("symbol") if isinstance(item, dict) else item
+            key = self._normalize_position_symbol(symbol)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            symbols.append(str(symbol))
+        return symbols
+
     def _complete_resolved_market_candidates(
         self,
         considered_symbols: list[str] | dict[str, Any],
@@ -5771,7 +5810,13 @@ class TradingService:
             selected_symbols=diagnostics.get("selected_symbols"),
             recent_unchanged_candidate_count=diagnostics.get("recent_unchanged_candidate_count"),
             coverage_due_candidate_count=diagnostics.get("coverage_due_candidate_count"),
+            coverage_due_symbols=diagnostics.get("coverage_due_symbols"),
+            coverage_due_unselected_count=diagnostics.get("coverage_due_unselected_count"),
+            coverage_due_unselected_symbols=diagnostics.get("coverage_due_unselected_symbols"),
             coverage_selected_symbols=diagnostics.get("coverage_selected_symbols"),
+            oldest_completed_analysis_age_seconds=diagnostics.get(
+                "oldest_completed_analysis_age_seconds"
+            ),
             skipped_symbols=diagnostics.get("skipped_symbols"),
             recent_material_change_count=diagnostics.get("recent_material_change_count"),
         )
@@ -5954,7 +5999,9 @@ class TradingService:
             "recent_analysis_dedupe_symbols": recent_dedupe.get("skipped_symbols", []),
             "market_analysis_selection": analysis_selection,
             "market_deferred_rotation": deferred_rotation,
-            "market_analysis_deferred": self._market_defer_tracker().snapshot(),
+            "market_analysis_deferred": self._market_defer_snapshot(
+                monitoring_active=run_market_analysis,
+            ),
             "market_feature_after_dedupe_count": len(market_feature_vectors_after_dedupe or {}),
             "market_feature_after_dedupe_symbols": list(
                 (market_feature_vectors_after_dedupe or {}).keys()
@@ -6904,8 +6951,8 @@ class TradingService:
                     "changes_trading_thresholds": False,
                 }
             results["market_prewarmed_feature_hydration"] = hydration_diagnostics
-            hydration_unavailable_symbols = list(
-                hydration_diagnostics.get("unavailable_symbols") or []
+            hydration_unavailable_symbols = self._market_hydration_unavailable_symbols(
+                hydration_diagnostics
             )
             if hydration_unavailable_symbols:
                 self._market_defer_tracker().defer_many(
@@ -6963,6 +7010,7 @@ class TradingService:
                     ],
                     "shortlist_capacity",
                 )
+                self._market_defer_tracker().begin_many(market_feature_vectors)
                 market_feature_vectors = self._rotate_market_feature_vectors_for_deferred_coverage(
                     market_feature_vectors,
                     analysis_budget_context=analysis_budget_context,
@@ -8009,7 +8057,9 @@ class TradingService:
                 await self._release_analysis_symbol(symbol)
             claimed_analysis_symbols.clear()
             if analysis_scope == "market":
-                deferred_snapshot = self._market_defer_tracker().snapshot()
+                deferred_snapshot = self._market_defer_snapshot(
+                    monitoring_active=run_market_analysis,
+                )
                 results["market_analysis_deferred"] = deferred_snapshot
                 funnel = results.get("market_candidate_funnel")
                 if isinstance(funnel, dict):
@@ -11765,6 +11815,7 @@ class TradingService:
             "last_market_round_summary": self._safe_dict(
                 getattr(self, "_last_market_round_summary", {})
             ),
+            "market_analysis_deferred": self._market_defer_snapshot(),
             "active_model": ENSEMBLE_TRADER_NAME,
             "models": [ENSEMBLE_TRADER_NAME],
             "risk": self.risk_engine.circuit_breaker.get_state(),

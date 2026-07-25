@@ -4464,6 +4464,48 @@ def test_market_deferred_resolution_keeps_unfinished_and_clears_ineligible() -> 
     ]
 
 
+def test_market_hydration_unavailable_symbols_extracts_names_from_diagnostics() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+
+    symbols = service._market_hydration_unavailable_symbols(
+        {
+            "unavailable_symbols": [
+                {"symbol": "BTC/USDT", "reason": "refresh_timeout"},
+                {"symbol": "BTC-USDT-SWAP", "reason": "duplicate"},
+                {"symbol": "ETH/USDT", "reason": "indicator_missing"},
+                {},
+            ]
+        }
+    )
+
+    assert symbols == ["BTC/USDT", "ETH/USDT"]
+
+
+def test_market_coverage_summary_is_not_evaluable_while_monitoring_is_paused() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+
+    paused = service._market_defer_snapshot(monitoring_active=False)
+    active = service._market_defer_snapshot(monitoring_active=True)
+
+    assert paused["pending_coverage_window_met"] is True
+    assert paused["coverage_window_evaluable"] is False
+    assert paused["coverage_window_met"] is None
+    assert active["coverage_window_evaluable"] is True
+    assert active["coverage_window_met"] is True
+
+
 def test_market_ai_budget_clock_ignores_pre_ai_round_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
