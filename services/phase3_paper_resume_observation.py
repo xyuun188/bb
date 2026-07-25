@@ -13,6 +13,7 @@ from typing import Any
 from config.settings import settings
 from core.safe_output import safe_error_text
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
+from services.okx_integrity_gate import partition_okx_integrity_issues
 from services.server_monitor_status import (
     collect_platform_runtime_status,
     collect_platform_server_status,
@@ -257,7 +258,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
     elif bool(preflight):
         passed.append("latest_preflight_ready")
 
-    okx_issue_count = _safe_int(okx_sync.get("issue_count"))
+    okx_blocking_issues, okx_quarantined_issues = partition_okx_integrity_issues(okx_sync)
     okx_audit_unhealthy = okx_sync.get("okx_pull_available") is False or str(
         okx_sync.get("status") or ""
     ).lower() in {
@@ -266,14 +267,14 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "unavailable",
     }
     runtime_okx_clean = _runtime_okx_sync_clean_for_entry(trading_runtime)
-    if okx_issue_count > 0:
+    if okx_blocking_issues:
         blockers.append(
             _blocker(
                 "okx_authoritative_sync_has_post_resume_differences",
                 "OKX/local differences appeared during the post-resume observation window.",
                 evidence={
                     "issue_count": okx_sync.get("issue_count"),
-                    "issues": _safe_list(okx_sync.get("issues"))[:8],
+                    "blocking_issues": okx_blocking_issues[:8],
                 },
             )
         )
@@ -310,6 +311,18 @@ def evaluate_phase3_paper_resume_observation_inputs(
                 },
             )
         )
+    elif okx_quarantined_issues:
+        warnings.append(
+            _warning(
+                "okx_authoritative_sync_historical_differences_quarantined_after_resume",
+                "Historical OKX differences remain quarantined and do not represent current-state drift.",
+                evidence={
+                    "issue_count": okx_sync.get("issue_count"),
+                    "quarantined_issues": okx_quarantined_issues[:8],
+                },
+            )
+        )
+        passed.append("okx_authoritative_sync_no_current_blocking_differences_after_resume")
     else:
         passed.append("okx_authoritative_sync_clean_after_resume")
 
@@ -415,6 +428,8 @@ def evaluate_phase3_paper_resume_observation_inputs(
             "specialist_eligible_shadow_count": specialist_eligible_count,
             "phase3_quant_child_endpoint_count": len(child_endpoints),
             "okx_issue_count": _safe_int(okx_sync.get("issue_count")),
+            "okx_blocking_issue_count": len(okx_blocking_issues),
+            "okx_quarantined_issue_count": len(okx_quarantined_issues),
             "runtime_okx_sync_clean": runtime_okx_clean,
             "specialist_report_age_seconds": (
                 None if specialist_age is None else round(specialist_age, 3)

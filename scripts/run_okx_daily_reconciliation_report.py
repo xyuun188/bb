@@ -31,6 +31,9 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 from config.settings import settings  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text  # noqa: E402
+from services.okx_integrity_gate import (  # noqa: E402
+    okx_integrity_has_current_blocking_issue,
+)
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY  # noqa: E402
 from web_dashboard.api import system_audit  # noqa: E402
 
@@ -204,7 +207,7 @@ def _card_details(card: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _okx_integrity_has_data_issue(details: dict[str, Any]) -> bool:
-    if system_audit._okx_integrity_has_current_blocking_issue(details):
+    if okx_integrity_has_current_blocking_issue(details):
         return True
     authoritative = _safe_dict(details.get("okx_authoritative_sync"))
     runtime_gate = _safe_dict(details.get("runtime_okx_entry_gate"))

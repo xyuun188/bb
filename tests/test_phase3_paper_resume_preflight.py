@@ -173,6 +173,37 @@ def test_phase3_paper_resume_preflight_blocks_okx_differences() -> None:
     }
 
 
+def test_phase3_paper_resume_preflight_warns_for_quarantined_historical_okx_differences() -> None:
+    okx = _okx_sync_clean()
+    okx.update(
+        {
+            "status": "warning",
+            "issue_count": 1,
+            "manual_review_count": 1,
+            "severity_counts": {"warning": 1},
+            "issues": [
+                {
+                    "kind": "okx_fill_not_linked_to_position",
+                    "severity": "warning",
+                    "classification": "manual_review",
+                }
+            ],
+        }
+    )
+
+    report = evaluate_phase3_paper_resume_preflight_inputs(
+        **_ready_inputs(okx_authoritative_sync=okx)
+    )
+
+    assert report["status"] == "ready_with_warnings"
+    assert report["can_resume_paper"] is True
+    assert report["blockers"] == []
+    assert "okx_authoritative_sync_historical_differences_quarantined" in {
+        item["code"] for item in report["warnings"]
+    }
+    assert "okx_authoritative_sync_no_current_blocking_differences" in report["passed_checks"]
+
+
 def test_phase3_paper_resume_preflight_blocks_unhealthy_child_endpoint() -> None:
     runtime = _platform_runtime_ready()
     runtime["local_ai_tools"]["child_endpoints"]["exit_advice"]["available"] = False

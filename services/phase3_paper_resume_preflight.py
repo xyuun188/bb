@@ -13,6 +13,7 @@ from core.phase3_model_contract import PHASE3_REQUIRED_LLM_MODEL_IDS
 from core.safe_output import safe_error_text
 from executor.okx_executor import OKXExecutor
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
+from services.okx_integrity_gate import partition_okx_integrity_issues
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
 from services.phase3_model_server_readiness import Phase3ModelServerReadinessAuditService
 from services.server_monitor_status import collect_platform_runtime_status
@@ -153,6 +154,7 @@ def evaluate_phase3_paper_resume_preflight_inputs(
     platform = _safe_dict(platform_server)
     specialist = _safe_dict(specialist_shadow_evaluation)
     equity_truth = _safe_dict(account_equity_truth)
+    okx_blocking_issues, okx_quarantined_issues = partition_okx_integrity_issues(okx_sync)
 
     if okx_sync.get("okx_pull_available") is False:
         blockers.append(
@@ -174,17 +176,29 @@ def evaluate_phase3_paper_resume_preflight_inputs(
                 },
             )
         )
-    elif _safe_int(okx_sync.get("issue_count")) > 0:
+    elif okx_blocking_issues:
         blockers.append(
             _blocker(
                 "okx_authoritative_sync_has_differences",
                 "OKX/local current facts still have unresolved differences.",
                 evidence={
                     "issue_count": okx_sync.get("issue_count"),
-                    "issues": _safe_list(okx_sync.get("issues"))[:8],
+                    "blocking_issues": okx_blocking_issues[:8],
                 },
             )
         )
+    elif okx_quarantined_issues:
+        warnings.append(
+            _warning(
+                "okx_authoritative_sync_historical_differences_quarantined",
+                "Historical OKX differences remain preserved and quarantined from current trading gates.",
+                evidence={
+                    "issue_count": okx_sync.get("issue_count"),
+                    "quarantined_issues": okx_quarantined_issues[:8],
+                },
+            )
+        )
+        passed.append("okx_authoritative_sync_no_current_blocking_differences")
     else:
         passed.append("okx_authoritative_sync_clean")
 

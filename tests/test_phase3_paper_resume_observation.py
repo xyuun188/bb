@@ -146,6 +146,43 @@ def test_paper_resume_observation_blocks_on_okx_difference() -> None:
     }
 
 
+def test_paper_resume_observation_warns_for_quarantined_historical_okx_differences() -> None:
+    okx = _okx_clean()
+    okx.update(
+        {
+            "status": "warning",
+            "issue_count": 1,
+            "manual_review_count": 1,
+            "severity_counts": {"warning": 1},
+            "issues": [
+                {
+                    "kind": "okx_fill_not_linked_to_position",
+                    "severity": "warning",
+                    "classification": "manual_review",
+                }
+            ],
+        }
+    )
+
+    report = evaluate_phase3_paper_resume_observation_inputs(
+        **_ready_inputs(
+            okx_authoritative_sync=okx,
+            trading_runtime_status=_trading_runtime_clean(),
+        )
+    )
+
+    assert report["status"] == "warming_up"
+    assert report["blockers"] == []
+    assert report["summary"]["okx_blocking_issue_count"] == 0
+    assert report["summary"]["okx_quarantined_issue_count"] == 1
+    assert "okx_authoritative_sync_historical_differences_quarantined_after_resume" in {
+        item["code"] for item in report["warnings"]
+    }
+    assert "okx_authoritative_sync_no_current_blocking_differences_after_resume" in report[
+        "passed_checks"
+    ]
+
+
 def test_paper_resume_observation_warns_on_read_only_okx_pull_timeout_when_runtime_is_clean() -> None:
     okx = _okx_clean()
     okx.update(

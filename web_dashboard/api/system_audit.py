@@ -45,6 +45,10 @@ from services.model_expert_health import ModelExpertHealthService
 from services.model_training_registry import build_model_training_registry
 from services.model_training_state import ModelTrainingStateStore
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
+from services.okx_integrity_gate import (
+    okx_integrity_has_current_blocking_issue,
+    partition_okx_integrity_issues,
+)
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
 from services.phase3_model_server_readiness import Phase3ModelServerReadinessAuditService
@@ -1152,92 +1156,6 @@ def _okx_reconciliation_root_cause_summary(
     }
 
 
-OKX_TRADE_FACT_QUARANTINED_WARNING_KINDS = {
-    "contract_specification_evidence_missing",
-    "manual_close_position_fact_not_exchange_backed",
-    "okx_fill_not_linked_to_position",
-    "order_position_missing",
-    "orphan_position_quarantine_not_exchange_backed",
-    "position_missing_close_order_link",
-    "position_missing_entry_order_link",
-    "position_order_link_missing_local_order",
-    "superseded_position_residual",
-}
-
-
-def _okx_integrity_issue_partition(
-    details: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    authoritative = _safe_dict(details.get("okx_authoritative_sync"))
-    detail_issues = [
-        item for item in _safe_list(details.get("issues")) if isinstance(item, dict)
-    ]
-    authoritative_issues = [
-        item for item in _safe_list(authoritative.get("issues")) if isinstance(item, dict)
-    ]
-    issues = [*detail_issues, *authoritative_issues]
-    blocking: list[dict[str, Any]] = []
-    quarantined: list[dict[str, Any]] = []
-    has_explicit_integrity_evidence = any(
-        key in details
-        for key in (
-            "issue_count",
-            "warning_count",
-            "critical_count",
-            "severity_counts",
-            "okx_authoritative_sync",
-            "position_fact_link_repair",
-        )
-    )
-    if not issues and not has_explicit_integrity_evidence:
-        blocking.append({"kind": "integrity_evidence_missing"})
-    for issue in issues:
-        severity = str(issue.get("severity") or "").strip().lower()
-        kind = str(issue.get("kind") or "").strip()
-        if severity == "critical":
-            blocking.append(issue)
-        elif severity == "warning":
-            if kind in OKX_TRADE_FACT_QUARANTINED_WARNING_KINDS:
-                quarantined.append(issue)
-            else:
-                blocking.append(issue)
-
-    aggregate_critical = any(
-        int(value or 0) > 0
-        for value in (
-            details.get("critical_count"),
-            _safe_dict(details.get("severity_counts")).get("critical"),
-            _safe_dict(authoritative.get("severity_counts")).get("critical"),
-        )
-    )
-    if aggregate_critical and not any(
-        str(item.get("severity") or "").lower() == "critical" for item in blocking
-    ):
-        blocking.append({"kind": "unclassified_critical_integrity_issue"})
-
-    authoritative_warning_count = max(
-        int(_safe_dict(authoritative.get("severity_counts")).get("warning") or 0),
-        int(authoritative.get("manual_review_count") or 0),
-    )
-    if authoritative_warning_count > 0 and not authoritative_issues:
-        blocking.append({"kind": "unclassified_authoritative_warning"})
-    if int(authoritative.get("repairable_count") or 0) > 0:
-        blocking.append({"kind": "authoritative_repairable_issue"})
-
-    detail_warning_count = max(
-        int(details.get("warning_count") or 0),
-        int(_safe_dict(details.get("severity_counts")).get("warning") or 0),
-    )
-    if detail_warning_count > 0 and not detail_issues:
-        blocking.append({"kind": "unclassified_trade_fact_warning"})
-    return blocking, quarantined
-
-
-def _okx_integrity_has_current_blocking_issue(details: dict[str, Any]) -> bool:
-    blocking, _quarantined = _okx_integrity_issue_partition(details)
-    return bool(blocking)
-
-
 def _okx_reconciliation_is_quarantined_observation(details: dict[str, Any]) -> bool:
     root_cause = _safe_dict(details.get("root_cause_summary"))
     missing_count = int(details.get("missing_closed_positions") or 0)
@@ -1999,7 +1917,7 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
     authoritative_sync["can_write_database"] = False
     details["okx_authoritative_sync"] = authoritative_sync
     blocking_integrity_issues, quarantined_integrity_issues = (
-        _okx_integrity_issue_partition(details)
+        partition_okx_integrity_issues(details)
     )
     details["current_blocking_issue_count"] = len(blocking_integrity_issues)
     details["quarantined_warning_count"] = len(quarantined_integrity_issues)
@@ -4485,7 +4403,7 @@ def _issue_ledger_state(
             "trading_runtime_inactive",
             "trading_runtime_heartbeat_stale",
         }
-        has_data_integrity_issue = _okx_integrity_has_current_blocking_issue(details)
+        has_data_integrity_issue = okx_integrity_has_current_blocking_issue(details)
         authoritative_pull_failed = (
             "okx_pull_available" in authoritative_sync
             and authoritative_sync.get("okx_pull_available") is False
@@ -4514,7 +4432,7 @@ def _issue_ledger_state(
         ):
             return "observing", "观察项 / OKX 运行同步健康或仅运行态待观察"
         if not has_data_integrity_issue and runtime_sync_healthy:
-            _blocking_issues, quarantined_issues = _okx_integrity_issue_partition(
+            _blocking_issues, quarantined_issues = partition_okx_integrity_issues(
                 details
             )
             if quarantined_issues:
