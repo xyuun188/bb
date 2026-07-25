@@ -162,6 +162,9 @@ from services.position_protection_fallback import PositionProtectionFallbackPoli
 from services.position_protection_rebalance import (
     rebalance_position_protection_after_exit,
 )
+from services.position_replacement_opportunity import (
+    load_position_replacement_opportunity,
+)
 from services.position_review_batch import PositionReviewBatchPolicy
 from services.position_review_decision_processor import PositionReviewDecisionProcessor
 from services.position_review_decision_service import (
@@ -9779,6 +9782,33 @@ class TradingService:
             return candidates, handled_keys
 
         grouped_items = list(grouped.items())
+        replacement_params = DEFAULT_TRADING_PARAMS.position_replacement
+        try:
+            stronger_opportunity_context = await asyncio.wait_for(
+                load_position_replacement_opportunity(
+                    execution_mode=mode_manager.mode.value,
+                    open_symbols={
+                        str(position.get("symbol") or "")
+                        for position in open_positions
+                        if isinstance(position, dict)
+                    },
+                    max_age_seconds=replacement_params.opportunity_max_age_seconds,
+                    limit=replacement_params.recent_decision_limit,
+                ),
+                timeout=replacement_params.load_timeout_seconds,
+            )
+        except Exception as exc:
+            stronger_opportunity_context = {
+                "available": False,
+                "reason": "position_replacement_evidence_load_failed",
+                "error_type": type(exc).__name__,
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "creates_order": False,
+                "can_increase_leverage": False,
+            }
+        if isinstance(results, dict):
+            results["position_replacement_opportunity"] = stronger_opportunity_context
         portfolio_profit_context = self._portfolio_profit_protection_context(open_positions)
         market_regime_context = self._market_regime_context(feature_vectors)
         strategy_mode_context = await self._strategy_mode_context(
@@ -9977,6 +10007,9 @@ class TradingService:
                             strategy_mode_context=strategy_mode_context,
                             portfolio_symbol_context=portfolio_symbol_context,
                             position_profit_peak_context=position_profit_peak_context,
+                            stronger_opportunity_context=(
+                                stronger_opportunity_context
+                            ),
                             analysis_deadline_monotonic=group_deadline_monotonic,
                             analysis_budget_seconds=group_timeout,
                         )

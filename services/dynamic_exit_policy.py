@@ -64,6 +64,13 @@ class DynamicExitAssessment:
     stop_risk_usage: float
     continuation_deterioration: float
     opposite_pressure: float
+    replacement_opportunity_eligible: bool
+    replacement_symbol: str | None
+    replacement_side: str | None
+    replacement_expected_net_return_pct: float
+    replacement_return_lcb_pct: float
+    replacement_advantage_pct: float
+    replacement_pressure: float
     portfolio_exposure_pressure: float
     model_requested_close_fraction: float
     model_exit_confidence: float
@@ -268,7 +275,60 @@ def assess_dynamic_exit(
         if (target_side == "long" and value < 0.0) or (target_side == "short" and value > 0.0)
     )
     continuation = _clamp(adverse_move / total_move) if total_move > 0.0 else 0.0
-    opposite = 0.0
+    replacement = _safe_dict(raw.get("stronger_opportunity"))
+    replacement_cost = _safe_dict(replacement.get("execution_cost"))
+    replacement_expected = max(
+        _safe_float(replacement.get("expected_net_return_pct"), 0.0),
+        0.0,
+    )
+    replacement_lcb = max(
+        _safe_float(replacement.get("return_lcb_pct"), 0.0),
+        0.0,
+    )
+    replacement_expected_loss_value = _safe_float(
+        replacement.get("expected_loss_pct"),
+        float("nan"),
+    )
+    replacement_expected_loss = (
+        max(replacement_expected_loss_value, 0.0)
+        if isfinite(replacement_expected_loss_value)
+        else 0.0
+    )
+    replacement_eligible = bool(
+        str(raw.get("execution_mode") or "").lower() == "paper"
+        and replacement.get("available") is True
+        and replacement.get("production_eligible") is True
+        and replacement.get("execution_scope") == "paper_only"
+        and replacement.get("production_permission") is False
+        and replacement.get("creates_order") is False
+        and replacement.get("can_increase_leverage") is False
+        and replacement_expected > 0.0
+        and replacement_lcb > 0.0
+        and isfinite(replacement_expected_loss_value)
+        and replacement_expected_loss_value >= 0.0
+        and replacement_cost.get("production_eligible") is True
+        and _normalized_symbol(replacement.get("symbol"))
+        and _normalized_symbol(replacement.get("symbol"))
+        != _normalized_symbol(decision.symbol)
+        and str(replacement.get("side") or "").lower() in {"long", "short"}
+    )
+    current_fee_after_return_pct = net_pnl / notional * 100.0 if notional > 0 else 0.0
+    replacement_advantage = (
+        max(replacement_lcb - current_fee_after_return_pct, 0.0)
+        if replacement_eligible
+        else 0.0
+    )
+    replacement_scale = (
+        abs(replacement_lcb)
+        + abs(current_fee_after_return_pct)
+        + replacement_expected_loss
+    )
+    replacement_pressure = (
+        _clamp(replacement_advantage / replacement_scale)
+        if replacement_scale > 0.0
+        else 0.0
+    )
+    opposite = replacement_pressure
     current_management_contract_complete = bool(
         matches
         and len(management_contracts) == len(matches)
@@ -323,12 +383,12 @@ def assess_dynamic_exit(
     eligible = not reasons
     provenance = {
         "source": (
-            "current_position_takeover_fee_after_pnl_peak_planned_stop_market_and_portfolio_facts"
+            "current_position_takeover_fee_after_pnl_peak_planned_stop_market_portfolio_and_replacement_facts"
         ),
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-07-22.dynamic-exit-model-risk-comparison.v4",
+        "strategy_version": "2026-07-25.dynamic-exit-replacement-comparison.v5",
         "fallback_reason": ",".join(reasons),
     }
     return DynamicExitAssessment(
@@ -345,6 +405,17 @@ def assess_dynamic_exit(
         stop_risk_usage=round(stop_usage, 8),
         continuation_deterioration=round(continuation, 8),
         opposite_pressure=round(opposite, 8),
+        replacement_opportunity_eligible=replacement_eligible,
+        replacement_symbol=(
+            str(replacement.get("symbol")) if replacement_eligible else None
+        ),
+        replacement_side=(
+            str(replacement.get("side")) if replacement_eligible else None
+        ),
+        replacement_expected_net_return_pct=round(replacement_expected, 8),
+        replacement_return_lcb_pct=round(replacement_lcb, 8),
+        replacement_advantage_pct=round(replacement_advantage, 8),
+        replacement_pressure=round(replacement_pressure, 8),
         portfolio_exposure_pressure=round(portfolio_pressure, 8),
         model_requested_close_fraction=round(model_requested_close_fraction, 8),
         model_exit_confidence=round(model_exit_confidence, 8),

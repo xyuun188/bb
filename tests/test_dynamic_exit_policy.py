@@ -99,11 +99,98 @@ def test_profit_retrace_generates_continuous_fraction_and_overrides_legacy_size(
     assert decision.position_size_pct == pytest.approx(0.5)
     assert decision.raw_response["close_fraction"] == pytest.approx(0.5)
     assert result.policy_provenance["source"] == (
-        "current_position_takeover_fee_after_pnl_peak_planned_stop_market_and_portfolio_facts"
+        "current_position_takeover_fee_after_pnl_peak_planned_stop_market_portfolio_and_replacement_facts"
     )
     assert result.policy_provenance["fallback_reason"] == ""
     assert result.execution_cost_complete is True
     assert result.current_management_contract_complete is True
+
+
+def test_complete_paper_replacement_adds_exit_pressure_without_creating_order() -> None:
+    decision = _decision(
+        {
+            "execution_mode": "paper",
+            "stronger_opportunity": {
+                "available": True,
+                "production_eligible": True,
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "creates_order": False,
+                "can_increase_leverage": False,
+                "symbol": "ETH/USDT",
+                "side": "short",
+                "expected_net_return_pct": 0.6,
+                "return_lcb_pct": 0.4,
+                "expected_loss_pct": 0.2,
+                "execution_cost": {"production_eligible": True},
+            },
+        }
+    )
+    position = _position(
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    baseline = apply_dynamic_exit(_decision({"execution_mode": "paper"}), [position])
+    result = apply_dynamic_exit(decision, [position])
+
+    assert result.eligible is True
+    assert result.replacement_opportunity_eligible is True
+    assert result.replacement_symbol == "ETH/USDT"
+    assert result.replacement_pressure > 0.0
+    assert result.close_fraction > baseline.close_fraction
+    assert decision.raw_response["dynamic_exit_policy"]["replacement_pressure"] > 0.0
+
+
+@pytest.mark.parametrize(
+    "raw_overrides",
+    [
+        {"execution_mode": "live"},
+        {"stronger_opportunity": {"creates_order": True}},
+        {"stronger_opportunity": {"execution_cost": {}}},
+        {"stronger_opportunity": {"expected_loss_pct": None}},
+    ],
+)
+def test_ineligible_replacement_evidence_cannot_create_exit_pressure(
+    raw_overrides: dict,
+) -> None:
+    replacement = {
+        "available": True,
+        "production_eligible": True,
+        "execution_scope": "paper_only",
+        "production_permission": False,
+        "creates_order": False,
+        "can_increase_leverage": False,
+        "symbol": "ETH/USDT",
+        "side": "long",
+        "expected_net_return_pct": 0.6,
+        "return_lcb_pct": 0.4,
+        "expected_loss_pct": 0.2,
+        "execution_cost": {"production_eligible": True},
+    }
+    replacement.update(raw_overrides.get("stronger_opportunity", {}))
+    raw = {
+        "execution_mode": raw_overrides.get("execution_mode", "paper"),
+        "stronger_opportunity": replacement,
+    }
+    position = _position(
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    baseline = apply_dynamic_exit(
+        _decision({"execution_mode": raw["execution_mode"]}),
+        [position],
+    )
+    result = apply_dynamic_exit(_decision(raw), [position])
+
+    assert result.replacement_opportunity_eligible is False
+    assert result.replacement_pressure == 0.0
+    assert result.close_fraction == baseline.close_fraction
 
 
 def test_explicit_model_close_recommendation_enters_risk_comparison() -> None:

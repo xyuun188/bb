@@ -243,6 +243,39 @@ def test_exit_plan_has_hold_partial_and_full_exit_paths() -> None:
     assert plan["exit"]["full_close"]["maximum_minutes"] == 60.0
 
 
+def test_exit_plan_exposes_read_only_replacement_from_close_evidence() -> None:
+    raw = _raw()
+    candidate = {
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "creates_order": False,
+    }
+    raw["close_evidence"] = {
+        "dynamic_exit_policy": {
+            "replacement_opportunity_eligible": True,
+            "replacement_pressure": 0.25,
+        },
+        "decision_comparison": {
+            "rotate_to_stronger_opportunity": {"candidate": candidate}
+        },
+    }
+    decision = _decision(action=Action.CLOSE_LONG, raw=raw)
+
+    attach_initial_trade_recommendation(
+        decision,
+        analysis_type="position_review",
+        execution_mode="paper",
+    )
+    replacement = trade_recommendation_snapshot(decision.raw_response)[
+        "unified_recommendation"
+    ]["exit"]["replacement"]
+
+    assert replacement["eligible"] is True
+    assert replacement["candidate"] == candidate
+    assert replacement["replacement_pressure"] == 0.25
+    assert replacement["creates_order"] is False
+
+
 @pytest.mark.asyncio
 async def test_trading_service_attaches_contract_only_to_paper_decisions() -> None:
     from services.trading_service import TradingService

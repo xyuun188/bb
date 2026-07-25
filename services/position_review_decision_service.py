@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -34,6 +34,7 @@ class PositionReviewDecisionRequest:
     strategy_mode_context: dict[str, Any]
     portfolio_symbol_context: dict[str, Any]
     position_profit_peak_context: dict[str, Any]
+    stronger_opportunity_context: dict[str, Any] = field(default_factory=dict)
     analysis_deadline_monotonic: float | None = None
     analysis_budget_seconds: float | None = None
 
@@ -177,6 +178,7 @@ class PositionReviewDecisionService:
             "local_ai_tools_prompt_enabled": self.local_quant_prompt_enabled,
             "portfolio_profit_protection": request.portfolio_symbol_context,
             "position_profit_peak": request.position_profit_peak_context,
+            "stronger_opportunity": request.stronger_opportunity_context,
         }
         if request.analysis_deadline_monotonic is not None:
             context.update(
@@ -201,6 +203,7 @@ class PositionReviewDecisionService:
             "position_entry_pause_reason": request.position_entry_pause_reason or "",
             "portfolio_profit_protection": request.portfolio_symbol_context,
             "position_profit_peak": request.position_profit_peak_context,
+            "stronger_opportunity": request.stronger_opportunity_context,
         }
 
     def _attach_review_metadata(
@@ -217,6 +220,8 @@ class PositionReviewDecisionService:
             raw["portfolio_profit_protection"] = request.portfolio_symbol_context
         if request.position_profit_peak_context:
             raw["position_profit_peak"] = request.position_profit_peak_context
+        if request.stronger_opportunity_context:
+            raw["stronger_opportunity"] = request.stronger_opportunity_context
         decision.raw_response = raw
         self.agent_skills_attacher(
             decision,

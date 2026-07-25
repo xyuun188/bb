@@ -256,6 +256,16 @@ def _exit_plan(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, Any]:
         close_evidence.get("close_fraction"),
         close_evidence.get("position_size_pct"),
     )
+    dynamic_exit = _dict(raw.get("dynamic_exit_policy"))
+    if not dynamic_exit:
+        dynamic_exit = _dict(close_evidence.get("dynamic_exit_policy"))
+    replacement = _dict(raw.get("stronger_opportunity"))
+    if not replacement:
+        replacement = _dict(
+            _dict(_dict(close_evidence.get("decision_comparison")).get(
+                "rotate_to_stronger_opportunity"
+            )).get("candidate")
+        )
     return {
         "stop_loss_fraction": stop,
         "take_profit_fraction": take,
@@ -275,6 +285,15 @@ def _exit_plan(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, Any]:
         "full_close": {
             "type": "stop_loss_take_profit_max_horizon_or_dynamic_exit",
             "maximum_minutes": holding.get("maximum_minutes"),
+        },
+        "replacement": {
+            "type": "close_or_reduce_before_separate_market_entry_review",
+            "eligible": dynamic_exit.get("replacement_opportunity_eligible") is True,
+            "candidate": replacement,
+            "replacement_pressure": _finite(
+                dynamic_exit.get("replacement_pressure")
+            ),
+            "creates_order": False,
         },
     }
 

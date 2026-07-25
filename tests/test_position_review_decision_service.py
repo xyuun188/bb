@@ -37,6 +37,11 @@ def _request(model_name: str = "ensemble_trader") -> PositionReviewDecisionReque
         strategy_mode_context={"mode": "balanced"},
         portfolio_symbol_context={"active": True, "net_pnl": 3.0},
         position_profit_peak_context={"peak_pnl": 5.0},
+        stronger_opportunity_context={
+            "available": True,
+            "symbol": "ETH/USDT",
+            "creates_order": False,
+        },
     )
 
 
@@ -90,8 +95,10 @@ async def test_position_review_decision_service_builds_ensemble_context_and_meta
     assert context["expert_memory"] == {"symbol": "BTC/USDT"}
     assert context["ml_signal"] == {"ready": True}
     assert context["local_ai_tools"] == {"exit_advice": {"action": "hold"}}
+    assert context["stronger_opportunity"]["symbol"] == "ETH/USDT"
     assert decision.raw_response["analysis_type"] == "position_review"
     assert decision.raw_response["portfolio_profit_protection"]["active"] is True
+    assert decision.raw_response["stronger_opportunity"]["creates_order"] is False
     attach_kwargs = next(value for name, value in calls if name == "attach")[1]
     assert attach_kwargs["phase"] == "position_review"
     assert attach_kwargs["skills"] == ["skill"]

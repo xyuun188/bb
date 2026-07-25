@@ -113,6 +113,15 @@ class StrategyLearningParams:
     order_extra_lookback_hours: int = 2
 
 
+@dataclass(frozen=True, slots=True)
+class PositionReplacementParams:
+    """Read-only market evidence window for paper position replacement review."""
+
+    opportunity_max_age_seconds: float = 45 * 60
+    recent_decision_limit: int = 300
+    load_timeout_seconds: float = 1.0
+
+
 
 
 
@@ -135,7 +144,10 @@ class TradingParameterSnapshot:
         default_factory=MarketAnalysisSelectionParams
     )
     strategy_learning: StrategyLearningParams = field(default_factory=StrategyLearningParams)
-    version: str = "2026-07-21.market-analysis-value-v2"
+    position_replacement: PositionReplacementParams = field(
+        default_factory=PositionReplacementParams
+    )
+    version: str = "2026-07-25.position-replacement-evidence.v3"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

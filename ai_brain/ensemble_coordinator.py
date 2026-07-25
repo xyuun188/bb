@@ -1545,14 +1545,6 @@ class EnsembleCoordinator:
             else 0.0
         )
         stronger_opportunity = self._safe_dict(self._safe_dict(context).get("stronger_opportunity"))
-        rotation_available = bool(
-            stronger_opportunity.get("production_eligible") is True
-            and self._safe_float(
-                stronger_opportunity.get("expected_net_return_pct"),
-                0.0,
-            )
-            > 0.0
-        )
         dynamic_decision = DecisionOutput(
             model_name=ENSEMBLE_TRADER_NAME,
             symbol=features.symbol if features is not None else "",
@@ -1574,6 +1566,9 @@ class EnsembleCoordinator:
                     "weighted_direction_score": score,
                 },
                 "stronger_opportunity": stronger_opportunity,
+                "execution_mode": str(
+                    self._safe_dict(context).get("execution_mode") or ""
+                ).lower(),
             },
             feature_snapshot=features.to_dict() if features is not None else {},
         )
@@ -1603,8 +1598,16 @@ class EnsembleCoordinator:
             },
             "rotate_to_stronger_opportunity": {
                 "evidence_available": bool(stronger_opportunity),
-                "eligible": rotation_available and assessment.eligible,
-                "candidate": stronger_opportunity if rotation_available else {},
+                "eligible": (
+                    assessment.replacement_opportunity_eligible
+                    and assessment.eligible
+                ),
+                "candidate": (
+                    stronger_opportunity
+                    if assessment.replacement_opportunity_eligible
+                    else {}
+                ),
+                "replacement_pressure": assessment.replacement_pressure,
                 "creates_order": False,
             },
             "model_requested_close_fraction": model_close_fraction,
