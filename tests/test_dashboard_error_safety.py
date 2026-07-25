@@ -23,6 +23,50 @@ from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api import dashboard, symbols
 
 
+def test_trade_reflection_authority_status_distinguishes_pending_and_linkage_failure() -> None:
+    pending = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="settlement_exception",
+            settlement_source="okx_position_history_settlement",
+        ),
+        reflection_source="okx_reconcile",
+        authoritative_outcome=None,
+    )
+    missing_link = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="reconciled",
+            settlement_source="okx_position_history_settlement",
+        ),
+        reflection_source="okx_reconcile",
+        authoritative_outcome=None,
+    )
+    quarantined = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="settlement_quarantined",
+            settlement_source="okx_position_history_identity_quarantine",
+        ),
+        reflection_source="okx_reconcile",
+        authoritative_outcome=None,
+    )
+    orphan = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="settlement_quarantined",
+            settlement_source="okx_position_history_identity_quarantine",
+        ),
+        reflection_source="okx_orphan_position_quarantine",
+        authoritative_outcome=None,
+    )
+
+    assert pending["code"] == "authoritative_settlement_pending"
+    assert pending["label"] == "等待权威结算"
+    assert missing_link["code"] == "authoritative_outcome_linkage_missing"
+    assert missing_link["label"] == "权威结果关联异常"
+    assert quarantined["code"] == "authoritative_settlement_quarantined"
+    assert quarantined["production_evidence_eligible"] is False
+    assert orphan["code"] == "non_authoritative_local_position_quarantined"
+    assert orphan["label"] == "本地孤立仓位已隔离"
+
+
 class _FakeServerInfo:
     host = "203.0.113.17"
     access_host = "203.0.113.17"

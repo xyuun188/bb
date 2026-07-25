@@ -618,7 +618,9 @@ def test_phase11_dashboard_exposes_profit_evidence_without_zero_fallbacks() -> N
     assert "dirtySampleRatioLabel" in SCRIPT
     assert "splitEvidenceAvailable ? 'good' : 'warn'" in SCRIPT
     assert "economics.available === true" in SCRIPT
-    assert "const pnl = authoritative ? authoritativePnl : fallbackPnl;" in SCRIPT
+    assert "const pnl = authoritative ? authoritativePnl : null;" in SCRIPT
+    assert "const pnl = authoritative ? authoritativePnl : fallbackPnl;" not in SCRIPT
+    assert "复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实" in SCRIPT
     assert "authoritativePnl ?? fallbackPnl" not in SCRIPT
     assert "? mlOptionalNumber(authoritative.realized_pnl) : null;" in SCRIPT
     assert "positionProtectionInventoryWarnings(inventory)" in SCRIPT

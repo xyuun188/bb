@@ -3939,10 +3939,11 @@ function renderExpertMemories(data = {}) {
         } else {
             reflectionBody.innerHTML = reflections.map(r => {
                 const authoritative = r.authoritative_outcome || null;
+                const authorityStatus = r.authority_status || {};
                 const authoritativePnl = authoritative
                     ? mlOptionalNumber(authoritative.realized_pnl) : null;
                 const fallbackPnl = mlOptionalNumber(r.realized_pnl);
-                const pnl = authoritative ? authoritativePnl : fallbackPnl;
+                const pnl = authoritative ? authoritativePnl : null;
                 const pnlColor = pnl === null ? 'var(--text-muted)' : pnl >= 0 ? 'var(--green)' : 'var(--red)';
                 const generatedTime = tradeReflectionTimeHtml(r.created_at);
                 const generatedTimeTitle = toBeijingDateTime(r.created_at);
@@ -3952,22 +3953,26 @@ function renderExpertMemories(data = {}) {
                     ? `<div class="trade-outcome-cell ${authoritative.complete ? 'ready' : 'blocked'}">
                         <strong>${distributionPctLabel(authoritative.net_return_after_all_cost_pct)}</strong>
                         <span>${escHtml(authoritative.outcome_id || 'Outcome ID 缺失')}</span>
-                        <em>${authoritative.complete ? '权威证据完整' : `缺口：${(authoritative.evidence_gaps || []).map(item => escHtml(item)).join(' / ') || '未说明'}`}</em>
+                        <em>${authoritative.complete ? '权威证据完整' : `缺口：${(authoritative.evidence_gaps || []).map(item => escHtml(dashboardReasonText(item))).join(' / ') || '未说明'}`}</em>
                     </div>`
-                    : '<div class="trade-outcome-cell blocked"><strong>未关联</strong><span>权威成交 outcome 缺失</span><em>当前只显示复盘记录，不能作为完整训练事实</em></div>';
+                    : `<div class="trade-outcome-cell blocked">
+                        <strong>${escHtml(authorityStatus.label || '等待权威结算')}</strong>
+                        <span>${escHtml(authorityStatus.reason || 'OKX 完整仓位生命周期尚未返回')}</span>
+                        <em>${fallbackPnl === null ? '复盘暂存盈亏也不可用' : `复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实`}</em>
+                    </div>`;
                 const shadowHtml = authoritative
                     ? `<div class="trade-shadow-cell">
                         <strong>${shadowRows.length} 条路径</strong>
                         <span>生产权重 ${mlEvidenceValue(authoritative.counterfactual_production_weight)}</span>
                         <em>只作反事实对照，不能覆盖真实盈亏</em>
                     </div>`
-                    : '<div class="trade-shadow-cell"><strong>未关联</strong><span>没有权威 outcome 上下文</span><em>影子结果不得替代真实成交</em></div>';
+                    : '<div class="trade-shadow-cell"><strong>等待结算</strong><span>尚无权威结果上下文</span><em>影子结果不得替代真实成交</em></div>';
                 return `
                     <tr>
                         <td class="trade-reflection-time" title="${escHtml(generatedTimeTitle)}">${generatedTime}</td>
                         <td>${escHtml(r.symbol || '-')}</td>
                         <td>${sideLabel(r.side)}</td>
-                        <td style="color:${pnlColor};white-space:nowrap;">${pnl === null ? '证据缺失' : `${signedMoney(pnl)} USDT`}</td>
+                        <td style="color:${pnlColor};white-space:nowrap;">${pnl === null ? escHtml(authorityStatus.label || '等待权威结算') : `${signedMoney(pnl)} USDT`}</td>
                         <td>${mlOptionalNumber(r.hold_minutes) === null ? '证据缺失' : `${mlOptionalNumber(r.hold_minutes).toFixed(1)} 分钟`}</td>
                         <td>${actualHtml}</td>
                         <td>${shadowHtml}</td>

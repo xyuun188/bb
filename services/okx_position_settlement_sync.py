@@ -48,6 +48,7 @@ DEFAULT_SETTLEMENT_LOOKBACK_HOURS = 72
 DEFAULT_SETTLEMENT_LIMIT = 20
 DEFAULT_SETTLEMENT_RETRY_SECONDS = 10.0
 POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS = 45 * 60
+POSITION_HISTORY_CLOSE_EARLY_TOLERANCE_SECONDS = 2 * 60
 POSITION_HISTORY_OPEN_MATCH_WINDOW_SECONDS = 24 * 60 * 60
 POSITION_HISTORY_MATCH_MAX_ATTEMPTS = 30
 POSITION_HISTORY_MATCH_MAX_AGE_HOURS = 6.0
@@ -494,6 +495,31 @@ class OkxPositionSettlementSyncService:
                 if history_record_id > 0
                 else None
             )
+            if history is not None:
+                entry_order_ids = _split_exchange_order_ids(
+                    candidate.entry_exchange_order_id
+                )
+                close_order_ids = _split_exchange_order_ids(
+                    candidate.close_exchange_order_id
+                )
+                history.position_ids = _merge_history_links(
+                    history.position_ids,
+                    {str(candidate.position_id)},
+                )
+                history.entry_order_ids = _merge_history_links(
+                    history.entry_order_ids,
+                    entry_order_ids,
+                )
+                history.close_order_ids = _merge_history_links(
+                    history.close_order_ids,
+                    close_order_ids,
+                )
+                history.linked_order_ids = _merge_history_links(
+                    history.linked_order_ids,
+                    entry_order_ids | close_order_ids,
+                )
+                history.match_status = "okx_position_settlement_linked"
+                history.synced_at = now
             outcome_change = await sync_settled_entry_decision_outcome(
                 session,
                 position=position,
@@ -713,6 +739,16 @@ def _match_position_history_row(
             continue
         if candidate.side and row_side in {"long", "short"} and row_side != candidate.side:
             continue
+        row_closed_at = _position_history_closed_at(row)
+        signed_close_delta = _signed_time_delta_seconds(
+            candidate.closed_at,
+            row_closed_at,
+        )
+        if signed_close_delta is not None and (
+            signed_close_delta < -POSITION_HISTORY_CLOSE_EARLY_TOLERANCE_SECONDS
+            or signed_close_delta > POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS
+        ):
+            continue
         score = 0
         reasons: list[str] = []
         if candidate.okx_pos_id and row_pos_id == candidate.okx_pos_id:
@@ -724,13 +760,10 @@ def _match_position_history_row(
         if candidate.side and row_side == candidate.side:
             score += 15
             reasons.append("side")
-        closed_delta = _time_delta_seconds(candidate.closed_at, _position_history_closed_at(row))
+        closed_delta = _time_delta_seconds(candidate.closed_at, row_closed_at)
         if closed_delta is not None:
-            if closed_delta <= POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS:
-                score += max(0, 40 - int(closed_delta // 60))
-                reasons.append(f"closed_at_delta={int(closed_delta)}s")
-            elif not candidate.okx_pos_id:
-                continue
+            score += max(0, 40 - int(closed_delta // 60))
+            reasons.append(f"closed_at_delta={int(closed_delta)}s")
         opened_delta = _time_delta_seconds(candidate.created_at, _position_history_opened_at(row))
         if opened_delta is not None and opened_delta <= POSITION_HISTORY_OPEN_MATCH_WINDOW_SECONDS:
             score += 5
@@ -929,12 +962,33 @@ def _split_exchange_order_ids(value: Any) -> set[str]:
     return {token for token in tokens if token}
 
 
+def _merge_history_links(existing: Any, incoming: set[str]) -> list[str]:
+    values = {
+        str(value or "").strip()
+        for value in (existing if isinstance(existing, list) else [])
+        if str(value or "").strip()
+    }
+    values.update(str(value).strip() for value in incoming if str(value).strip())
+    return sorted(values)
+
+
 def _time_delta_seconds(left: datetime | None, right: datetime | None) -> float | None:
     left = _aware_utc(left)
     right = _aware_utc(right)
     if left is None or right is None:
         return None
     return abs((left - right).total_seconds())
+
+
+def _signed_time_delta_seconds(
+    left: datetime | None,
+    right: datetime | None,
+) -> float | None:
+    left = _aware_utc(left)
+    right = _aware_utc(right)
+    if left is None or right is None:
+        return None
+    return (right - left).total_seconds()
 
 
 def _ms_datetime(value: Any) -> datetime | None:

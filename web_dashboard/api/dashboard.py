@@ -7669,6 +7669,67 @@ async def get_model_contribution_stats(
     }
 
 
+def _trade_reflection_authority_status(
+    *,
+    position: Any | None,
+    reflection_source: str,
+    authoritative_outcome: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if authoritative_outcome:
+        return {
+            "code": "authoritative_trade_outcome",
+            "label": "权威结果已关联",
+            "reason": "已关联 OKX 完整仓位生命周期结果。",
+            "production_evidence_eligible": authoritative_outcome.get("outcome_complete") is True,
+        }
+    source = str(reflection_source or "").strip()
+    if source in {"okx_orphan_position_quarantine", "okx_orphan_quarantine"}:
+        return {
+            "code": "non_authoritative_local_position_quarantined",
+            "label": "本地孤立仓位已隔离",
+            "reason": "OKX 当前仓位和成交事实均未确认该本地仓位，不能生成权威成交结果。",
+            "production_evidence_eligible": False,
+        }
+    if position is None:
+        return {
+            "code": "reflection_position_missing",
+            "label": "本地仓位记录缺失",
+            "reason": "复盘记录无法定位对应本地仓位，权威结果关联不可用。",
+            "production_evidence_eligible": False,
+        }
+    settlement_status = str(getattr(position, "settlement_status", "") or "").strip()
+    settlement_source = str(getattr(position, "settlement_source", "") or "").strip()
+    if (
+        settlement_status == "settlement_quarantined"
+        or settlement_source == "okx_position_history_identity_quarantine"
+    ):
+        return {
+            "code": "authoritative_settlement_quarantined",
+            "label": "权威结算身份未确认",
+            "reason": "OKX 历史生命周期暂时无法与本地仓位唯一匹配，当前记录已隔离。",
+            "production_evidence_eligible": False,
+            "settlement_status": settlement_status,
+            "settlement_source": settlement_source,
+        }
+    if settlement_status in {"reconciled", "settled", "okx_position_history"}:
+        return {
+            "code": "authoritative_outcome_linkage_missing",
+            "label": "权威结果关联异常",
+            "reason": "仓位已标记权威结算，但对应 OKX 生命周期尚未关联到结果合同。",
+            "production_evidence_eligible": False,
+            "settlement_status": settlement_status,
+            "settlement_source": settlement_source,
+        }
+    return {
+        "code": "authoritative_settlement_pending",
+        "label": "等待权威结算",
+        "reason": "OKX 净仓位生命周期尚未完整结束或结算同步仍在重试，暂不生成权威结果。",
+        "production_evidence_eligible": False,
+        "settlement_status": settlement_status or "pending",
+        "settlement_source": settlement_source,
+    }
+
+
 @router.get("/expert-memories")
 async def get_expert_memories(
     limit: int = 10,
@@ -7680,8 +7741,11 @@ async def get_expert_memories(
     mode: str | None = None,
 ):
     """Return long-term expert memories and recent trade reflections."""
+    from sqlalchemy import select
+
     from db.repositories.memory_repo import MemoryRepository
     from db.session import get_session_ctx
+    from models.trade import Position
     from services.authoritative_trade_outcome import (
         AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         load_authoritative_trade_outcomes,
@@ -7712,6 +7776,22 @@ async def get_expert_memories(
             limit=size,
             offset=reflection_offset,
         )
+        reflection_position_ids = {
+            int(row.position_id)
+            for row in reflections
+            if int(row.position_id or 0) > 0
+        }
+        positions = (
+            list(
+                (
+                    await session.execute(
+                        select(Position).where(Position.id.in_(reflection_position_ids))
+                    )
+                ).scalars().all()
+            )
+            if reflection_position_ids
+            else []
+        )
 
     selected_mode = str(mode or "").lower()
     outcomes = await load_authoritative_trade_outcomes(
@@ -7723,6 +7803,7 @@ async def get_expert_memories(
         for position_id in (outcome.get("position_ids") or [outcome.get("position_id")])
         if str(position_id or "").isdigit() and int(position_id) > 0
     }
+    position_by_id = {int(row.id): row for row in positions}
 
     memory_rows = [
         {
@@ -7753,6 +7834,11 @@ async def get_expert_memories(
     reflection_rows = []
     for r in reflections:
         authoritative_outcome = outcome_by_position_id.get(int(r.position_id or 0))
+        authority_status = _trade_reflection_authority_status(
+            position=position_by_id.get(int(r.position_id or 0)),
+            reflection_source=str(r.source or ""),
+            authoritative_outcome=authoritative_outcome,
+        )
         reflection_rows.append({
             "id": r.id,
             "position_id": r.position_id,
@@ -7770,11 +7856,8 @@ async def get_expert_memories(
             "improvement_summary": sanitize_text(r.improvement_summary),
             "source": r.source,
             "created_at": r.created_at.isoformat() if r.created_at else None,
-            "evidence_precedence": (
-                "authoritative_trade_outcome"
-                if authoritative_outcome
-                else "reflection_without_authoritative_outcome"
-            ),
+            "evidence_precedence": authority_status["code"],
+            "authority_status": authority_status,
             "authoritative_outcome": (
                 {
                     "event_type": authoritative_outcome.get("event_type"),

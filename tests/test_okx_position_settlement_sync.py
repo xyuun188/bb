@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
-from models.trade import Position
+from models.trade import OkxPositionHistory, Position
 from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_settlement_sync import (
     POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
@@ -107,12 +107,75 @@ async def test_position_settlement_reads_only_local_settlement_fact_mirror(
         assert report["reconciled_count"] == 1
         async with get_session_ctx() as session:
             position = await session.get(Position, position_id)
-            histories = (await session.execute(select(Position))).scalars().all()
+            positions = (await session.execute(select(Position))).scalars().all()
+            history = (
+                await session.execute(select(OkxPositionHistory))
+            ).scalars().one()
         assert position is not None
         assert position.settlement_source == "okx_position_history_settlement"
         assert position.settlement_status == "reconciled"
         assert position.realized_pnl == pytest.approx(4.09)
-        assert len(histories) == 1
+        assert len(positions) == 1
+        assert history.position_ids == [str(position_id)]
+        assert history.entry_order_ids == ["entry-1"]
+        assert history.close_order_ids == ["close-1"]
+        assert history.linked_order_ids == ["close-1", "entry-1"]
+        assert history.match_status == "okx_position_settlement_linked"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_settlement_rejects_reused_pos_id_from_older_lifecycle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-reused-pos-id.db")
+    now = datetime.now(UTC)
+    try:
+        position_id = await _seed_closed_position(now)
+        async with get_session_ctx() as session:
+            await upsert_okx_position_history_row(
+                session,
+                {
+                    "instId": "ADA-USDT-SWAP",
+                    "posId": "ada-pos-1",
+                    "posSide": "long",
+                    "type": "2",
+                    "cTime": _ms(now - timedelta(days=1, minutes=20)),
+                    "uTime": _ms(now - timedelta(days=1)),
+                    "openAvgPx": "0.6",
+                    "closeAvgPx": "0.64",
+                    "openMaxPos": "100",
+                    "closeTotalPos": "100",
+                    "realizedPnl": "4.09",
+                    "pnl": "4.2",
+                    "fundingFee": "-0.01",
+                    "fee": "-0.1",
+                },
+                mode="paper",
+                source="okx_settlement_fact_mirror",
+                match_status="okx_account_position_history",
+                synced_at=now,
+            )
+
+        report = await OkxPositionSettlementSyncService(
+            mode="paper",
+            retry_seconds=30.0,
+        ).sync_once()
+
+        assert report["status"] == "warning"
+        assert report["reconciled_count"] == 0
+        assert report["samples"][0]["error_code"] == "positions_history_no_matching_row"
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            history = (
+                await session.execute(select(OkxPositionHistory))
+            ).scalars().one()
+        assert position is not None
+        assert position.realized_pnl == pytest.approx(0.0)
+        assert position.settlement_status == "settlement_exception"
+        assert history.position_ids == []
     finally:
         await close_db()
 
