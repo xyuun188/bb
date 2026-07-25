@@ -38,6 +38,7 @@ from services.exchange_position_state import parse_exchange_position_snapshot
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.paper_training import build_paper_training_position_lifecycle
 from services.position_open_time import parse_position_time, serialize_position_time
+from services.position_protection_rebalance import rebalance_current_position_protection
 from services.position_settlement import (
     SETTLEMENT_STATUS_SETTLING,
     apply_position_settlement_snapshot,
@@ -948,6 +949,102 @@ class OkxSyncService:
         self.account_equity_provider = account_equity_provider
         self._reconcile_deadline_monotonic: float | None = None
         self._reconcile_degraded_rows: list[dict[str, Any]] | None = None
+        self._pending_position_protection_rebalance_keys: set[tuple[str, str]] = set()
+
+    def _protection_coverage_mismatch_keys(
+        self,
+        exchange_positions: list[dict[str, Any]],
+        protection_by_key: dict[tuple[str, str], dict[str, Any]],
+    ) -> set[tuple[str, str]]:
+        """Find proven quantity mismatches from the already-fetched OKX inventory."""
+
+        normalize_symbol = self._required_symbol_normalizer()
+        parse_float = self._required_float_parser()
+        exchange_position_is_open = self._required_exchange_position_open_checker()
+        mismatches: set[tuple[str, str]] = set()
+        for exchange_position in exchange_positions or []:
+            if not exchange_position_is_open(exchange_position):
+                continue
+            snapshot = parse_exchange_position_snapshot(
+                exchange_position,
+                symbol_normalizer=normalize_symbol,
+            )
+            if not snapshot:
+                continue
+            key = (str(snapshot["symbol"]), str(snapshot["side"]))
+            desired_contracts = abs(parse_float(snapshot.get("contracts"), 0.0))
+            protection = protection_by_key.get(key)
+            if desired_contracts <= 0 or not isinstance(protection, dict):
+                continue
+            orders = _list_of_dicts(protection.get("protection_orders"))
+            if not orders:
+                orders = [dict(protection)]
+            raw_contracts = [order.get("contracts") for order in orders]
+            if not raw_contracts or any(value in (None, "") for value in raw_contracts):
+                continue
+            covered_contracts = sum(abs(parse_float(value, 0.0)) for value in raw_contracts)
+            if covered_contracts <= 0:
+                continue
+            tolerance = max(desired_contracts * 1e-9, covered_contracts * 1e-9, 1e-12)
+            if abs(covered_contracts - desired_contracts) > tolerance:
+                mismatches.add(key)
+        return mismatches
+
+    async def _rebalance_pending_position_protection(self, executor: Any) -> list[dict[str, Any]]:
+        """Repair proven mismatches after the local reconciliation transaction commits."""
+
+        rows: list[dict[str, Any]] = []
+        for symbol, side in sorted(self._pending_position_protection_rebalance_keys):
+            try:
+                report = await rebalance_current_position_protection(
+                    executor,
+                    symbol=symbol,
+                    side=side,
+                    observation_window="post_okx_authoritative_position_reconcile",
+                )
+            except Exception as exc:
+                report = getattr(exc, "report", None)
+                report = report if isinstance(report, dict) else {}
+                row = {
+                    "kind": "current_position_protection_rebalance_failed",
+                    "source": "okx_authoritative_current_position",
+                    "symbol": symbol,
+                    "side": side,
+                    "status": str(report.get("status") or "failed"),
+                    "verified": False,
+                    "repair_blockers": list(
+                        (_dict_value(report.get("before"))).get("repair_blockers") or []
+                    ),
+                    "requires_attention": True,
+                    "error": safe_error_text(exc, limit=180),
+                }
+                rows.append(row)
+                logger.warning(
+                    "current OKX position protection rebalance failed",
+                    symbol=symbol,
+                    side=side,
+                    status=row["status"],
+                    repair_blockers=row["repair_blockers"],
+                    error=row["error"],
+                )
+                continue
+
+            verified = report.get("verified") is True
+            if verified:
+                self._pending_position_protection_rebalance_keys.discard((symbol, side))
+            rows.append(
+                {
+                    "kind": "current_position_protection_rebalanced",
+                    "source": "okx_authoritative_current_position",
+                    "symbol": symbol,
+                    "side": side,
+                    "status": str(report.get("status") or "unknown"),
+                    "verified": verified,
+                    "applied_action_count": len(report.get("applied_actions") or []),
+                    "requires_attention": not verified,
+                }
+            )
+        return rows
 
     def _required_exchange_reconcile_lock(self) -> AbstractAsyncContextManager[Any]:
         if self.exchange_reconcile_lock is None:
@@ -2034,6 +2131,9 @@ class OkxSyncService:
             paper_okx,
             exchange_positions,
         )
+        self._pending_position_protection_rebalance_keys.update(
+            self._protection_coverage_mismatch_keys(exchange_positions, protection_by_key)
+        )
 
         exchange_position_keys = {
             key
@@ -2768,6 +2868,8 @@ class OkxSyncService:
         except Exception as e:
             logger.warning("exchange position reconciliation failed", error=safe_error_text(e))
             return self._with_reconcile_degraded_rows(reconciled)
+
+        reconciled.extend(await self._rebalance_pending_position_protection(paper_okx))
 
         if reconciled:
             logger.info(

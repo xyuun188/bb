@@ -9,7 +9,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
 from services.protection_order_integrity import audit_protection_order_integrity
 
-POSITION_PROTECTION_REBALANCE_VERSION = "2026-07-15.post-exit-exact-coverage.v1"
+POSITION_PROTECTION_REBALANCE_VERSION = "2026-07-25.current-position-exact-coverage.v2"
 
 
 class PositionProtectionRebalanceError(RuntimeError):
@@ -155,24 +155,27 @@ async def apply_protection_repair_actions(
     return applied
 
 
-async def rebalance_position_protection_after_exit(
+async def rebalance_current_position_protection(
     executor: Any,
-    decision: DecisionOutput,
+    *,
+    symbol: str,
+    side: str,
+    observation_window: str,
 ) -> dict[str, Any]:
-    """Make active OCO coverage equal the current OKX position quantity."""
+    """Make active OCO coverage equal one current OKX position quantity."""
 
-    side = _target_side(decision)
-    symbol = normalize_trading_symbol(decision.symbol)
+    normalized_side = str(side or "").lower()
+    normalized_symbol = normalize_trading_symbol(symbol)
     generated_at = datetime.now(UTC).isoformat()
     provenance = {
         "source": "okx_native_position_and_algo_inventory",
-        "observation_window": "immediate_post_exit_exchange_state",
+        "observation_window": observation_window,
         "sample_count": 0,
         "generated_at": generated_at,
         "strategy_version": POSITION_PROTECTION_REBALANCE_VERSION,
         "fallback_reason": "",
     }
-    if not symbol or not side:
+    if not normalized_symbol or normalized_side not in {"long", "short"}:
         return {
             "status": "not_applicable",
             "verified": True,
@@ -181,8 +184,8 @@ async def rebalance_position_protection_after_exit(
 
     before = await protection_integrity_snapshot(
         executor,
-        symbol=symbol,
-        side=side,
+        symbol=normalized_symbol,
+        side=normalized_side,
     )
     before_report = before["report"]
     provenance["sample_count"] = int(before_report.get("position_count") or 0) + int(
@@ -191,8 +194,8 @@ async def rebalance_position_protection_after_exit(
     base_report = {
         "status": "planned",
         "verified": False,
-        "symbol": symbol,
-        "side": side,
+        "symbol": normalized_symbol,
+        "side": normalized_side,
         "before": before_report,
         "policy_provenance": provenance,
     }
@@ -231,8 +234,8 @@ async def rebalance_position_protection_after_exit(
 
     after = await protection_integrity_snapshot(
         executor,
-        symbol=symbol,
-        side=side,
+        symbol=normalized_symbol,
+        side=normalized_side,
     )
     after_report = after["report"]
     positions_unchanged = bool(
@@ -260,3 +263,17 @@ async def rebalance_position_protection_after_exit(
             final_report,
         )
     return final_report
+
+
+async def rebalance_position_protection_after_exit(
+    executor: Any,
+    decision: DecisionOutput,
+) -> dict[str, Any]:
+    """Resize protection immediately after a locally executed exit."""
+
+    return await rebalance_current_position_protection(
+        executor,
+        symbol=decision.symbol,
+        side=_target_side(decision),
+        observation_window="immediate_post_exit_exchange_state",
+    )

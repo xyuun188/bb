@@ -6413,6 +6413,7 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
     decision_logs: list[dict[str, Any]] = []
     reflection_calls: list[dict[str, Any]] = []
     close_fill_probes: list[Any] = []
+    protection_rebalances: list[dict[str, Any]] = []
 
     class FakeScalarResult:
         def scalar_one_or_none(self):
@@ -6467,7 +6468,18 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
         yield FakeSession()
 
     async def protection_map(_paper_okx, _exchange_positions):
-        return {}
+        return {
+            ("USAR/USDT", "long"): {
+                "contracts": "16",
+                "protection_orders": [
+                    {
+                        "symbol": "USAR/USDT",
+                        "position_side": "long",
+                        "contracts": "16",
+                    }
+                ],
+            }
+        }
 
     async def fallback_protection(_session, **_kwargs):
         return {}
@@ -6500,8 +6512,21 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
     def position_margin(notional, leverage):
         return notional / leverage
 
+    async def rebalance_protection(_executor, **kwargs):
+        protection_rebalances.append(kwargs)
+        return {
+            "status": "repaired",
+            "verified": True,
+            "applied_actions": [{"action": "amend_size"}],
+        }
+
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(
+        sync_module,
+        "rebalance_current_position_protection",
+        rebalance_protection,
+    )
 
     result = await OkxSyncService(
         symbol_normalizer=lambda symbol: symbol,
@@ -6563,6 +6588,55 @@ async def test_sync_service_reconcile_exchange_positions_records_exchange_quanti
     assert result[0]["quantity"] == 10.0
     assert result[0]["remaining_quantity"] == 6.0
     assert result[0]["exchange_order_id"] == "usar-close-10"
+    assert protection_rebalances == [
+        {
+            "symbol": "USAR/USDT",
+            "side": "long",
+            "observation_window": "post_okx_authoritative_position_reconcile",
+        }
+    ]
+    assert result[-1] == {
+        "kind": "current_position_protection_rebalanced",
+        "source": "okx_authoritative_current_position",
+        "symbol": "USAR/USDT",
+        "side": "long",
+        "status": "repaired",
+        "verified": True,
+        "applied_action_count": 1,
+        "requires_attention": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sync_service_retries_failed_position_protection_rebalance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+
+    async def rebalance_protection(_executor, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary OKX public instrument failure")
+        return {"status": "already_exact", "verified": True, "applied_actions": []}
+
+    monkeypatch.setattr(
+        sync_module,
+        "rebalance_current_position_protection",
+        rebalance_protection,
+    )
+    service = OkxSyncService()
+    key = ("ETH/USDT", "long")
+    service._pending_position_protection_rebalance_keys.add(key)
+
+    first = await service._rebalance_pending_position_protection(object())
+    second = await service._rebalance_pending_position_protection(object())
+
+    assert first[0]["kind"] == "current_position_protection_rebalance_failed"
+    assert first[0]["requires_attention"] is True
+    assert second[0]["kind"] == "current_position_protection_rebalanced"
+    assert second[0]["status"] == "already_exact"
+    assert key not in service._pending_position_protection_rebalance_keys
 
 
 @pytest.mark.asyncio
