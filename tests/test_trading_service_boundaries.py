@@ -855,8 +855,8 @@ def test_market_auto_feature_fetch_can_build_cached_indicator_snapshots() -> Non
         "block_on_remote_indicators": False,
         "block_on_remote_derivatives": False,
         "allow_cached_indicator_build": True,
-        "allow_indicator_background_refresh": True,
-        "allow_derivatives_background_refresh": True,
+        "allow_indicator_background_refresh": False,
+        "allow_derivatives_background_refresh": False,
     }
 
 
@@ -875,7 +875,7 @@ def test_non_market_discovery_feature_fetch_keeps_complete_source_policy() -> No
 
 
 @pytest.mark.asyncio
-async def test_final_market_candidate_refresh_blocks_on_complete_market_sources() -> None:
+async def test_final_market_candidate_refresh_prefers_fresh_complete_local_sources() -> None:
     service = TradingService.__new__(TradingService)
     received: dict[str, Any] = {}
     vector = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
@@ -893,13 +893,89 @@ async def test_final_market_candidate_refresh_blocks_on_complete_market_sources(
     assert received == {
         "symbol": "BTC/USDT",
         "wait_for_sentiment": False,
-        "block_on_remote_indicators": True,
-        "block_on_remote_derivatives": True,
-        "allow_cached_indicator_build": False,
+        "block_on_remote_ticker": False,
+        "block_on_remote_indicators": False,
+        "block_on_remote_derivatives": False,
+        "allow_cached_indicator_build": True,
         "allow_indicator_background_refresh": False,
         "allow_derivatives_background_refresh": False,
         "prioritize_indicator_build": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_invalid() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[dict[str, Any]] = []
+    invalid = SimpleNamespace(current_price=0.0, close=0.0, bid=0.0, ask=0.0)
+    fresh = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
+
+    async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return invalid if len(calls) == 1 else fresh
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT")
+
+    assert result is fresh
+    assert calls[0]["block_on_remote_ticker"] is False
+    assert calls[0]["allow_cached_indicator_build"] is True
+    assert calls[1]["block_on_remote_ticker"] is True
+    assert calls[1]["block_on_remote_indicators"] is True
+    assert calls[1]["block_on_remote_derivatives"] is True
+    assert calls[1]["allow_cached_indicator_build"] is False
+
+
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_stale_fact() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[dict[str, Any]] = []
+    stale = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        indicator_snapshot_available=True,
+    )
+    fresh = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        indicator_snapshot_available=True,
+    )
+    stale_issue = SimpleNamespace(
+        code="native_market_fact_invalid",
+        details={"market_fact_reason_codes": "stale_market_fact"},
+    )
+
+    async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return stale if len(calls) == 1 else fresh
+
+    class QualityPolicy:
+        @staticmethod
+        def issue(candidate: Any, *, stage_label: str) -> Any | None:
+            assert stage_label == "AI分析前"
+            return stale_issue if candidate is stale else None
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+    service.entry_market_data_quality = QualityPolicy()
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT")
+
+    assert result is fresh
+    assert calls[0]["block_on_remote_ticker"] is False
+    assert calls[0]["block_on_remote_indicators"] is False
+    assert calls[0]["block_on_remote_derivatives"] is False
+    assert calls[1]["block_on_remote_ticker"] is True
+    assert calls[1]["block_on_remote_indicators"] is False
+    assert calls[1]["block_on_remote_derivatives"] is True
+    assert calls[1]["allow_cached_indicator_build"] is True
+    assert calls[1]["allow_indicator_background_refresh"] is False
+    assert calls[1]["allow_derivatives_background_refresh"] is False
+    assert calls[1]["prioritize_native_market_data"] is True
 
 
 @pytest.mark.asyncio
@@ -4497,13 +4573,152 @@ def test_market_coverage_summary_is_not_evaluable_while_monitoring_is_paused() -
     )
 
     paused = service._market_defer_snapshot(monitoring_active=False)
+    active_without_selection = service._market_defer_snapshot(monitoring_active=True)
+    service._last_market_analysis_selection_diagnostics = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "candidate_count": 3,
+        "coverage_target_seconds": 30 * 60,
+        "coverage_due_symbols": [],
+        "coverage_due_resolved_count": 0,
+        "coverage_due_resolved_symbols": [],
+    }
     active = service._market_defer_snapshot(monitoring_active=True)
 
     assert paused["pending_coverage_window_met"] is True
     assert paused["coverage_window_evaluable"] is False
     assert paused["coverage_window_met"] is None
+    assert active_without_selection["candidate_coverage_evidence_available"] is False
+    assert active_without_selection["coverage_window_evaluable"] is False
+    assert active_without_selection["coverage_window_met"] is None
     assert active["coverage_window_evaluable"] is True
     assert active["coverage_window_met"] is True
+
+
+def test_successful_market_analysis_resolves_due_candidate_before_coverage_snapshot() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service.market_analysis_selector = SimpleNamespace(remember=lambda *_args, **_kwargs: None)
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service._last_market_analysis_selection_diagnostics = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "candidate_count": 2,
+        "coverage_target_seconds": 30 * 60,
+        "coverage_due_candidate_count": 2,
+        "coverage_due_symbols": ["BTC/USDT", "ETH/USDT"],
+        "coverage_due_unselected_count": 1,
+        "coverage_due_unselected_symbols": ["ETH/USDT"],
+        "coverage_due_resolved_count": 0,
+        "coverage_due_resolved_symbols": [],
+        "never_analyzed_candidate_count": 1,
+        "selected": [
+            {
+                "symbol": "BTC/USDT",
+                "coverage_due": True,
+                "never_analyzed": True,
+            }
+        ],
+        "candidate_sample": [],
+    }
+
+    service._remember_market_analysis_observation("BTC-USDT-SWAP", {})
+    snapshot = service._market_defer_snapshot(monitoring_active=True)
+
+    diagnostics = service._last_market_analysis_selection_diagnostics
+    assert diagnostics["coverage_due_symbols"] == ["ETH/USDT"]
+    assert diagnostics["coverage_due_candidate_count"] == 1
+    assert diagnostics["coverage_due_resolved_symbols"] == ["BTC-USDT-SWAP"]
+    assert diagnostics["never_analyzed_candidate_count"] == 0
+    assert diagnostics["selected"][0]["selection_status"] == "completed_this_round"
+    assert snapshot["coverage_due_symbols"] == ["ETH/USDT"]
+    assert snapshot["coverage_window_met"] is False
+
+
+@pytest.mark.asyncio
+async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking_round() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._analysis_symbol_lock = asyncio.Lock()
+    service._active_analysis_symbols = {service._normalize_position_symbol("ZIL/USDT")}
+    service._market_entry_pipeline_tasks = {}
+    service._market_entry_pipeline_semaphore = asyncio.Semaphore(1)
+    service._recent_decisions = []
+    service._recent_executions = []
+    pipeline_started = asyncio.Event()
+    release_pipeline = asyncio.Event()
+    pending_ids: list[int] = []
+    ensured_ids: list[int] = []
+    published: list[dict[str, Any]] = []
+
+    async def mark_pending(decision_id: int, _reason: str) -> None:
+        pending_ids.append(decision_id)
+
+    async def run_pipeline(**kwargs: Any) -> None:
+        pipeline_started.set()
+        await release_pipeline.wait()
+        kwargs["results"]["decisions"].append(
+            {
+                "model": kwargs["model_name"],
+                "symbol": kwargs["symbol"],
+                "execution_status": "rejected",
+            }
+        )
+
+    async def publish(results: dict[str, Any]) -> None:
+        published.append(results)
+
+    async def ensure(decision_id: int, *_args: Any, **_kwargs: Any) -> None:
+        ensured_ids.append(decision_id)
+
+    service._mark_decision_pending_execution = mark_pending
+    service._run_market_entry_pipeline = run_pipeline
+    service._publish_dashboard_update = publish
+    service.decision_final_state_ensurer = SimpleNamespace(ensure=ensure)
+
+    scheduled = service._schedule_market_entry_pipeline(
+        symbol="ZIL/USDT",
+        model_name="ensemble_trader",
+        decision=_decision(Action.LONG),
+        decision_db_id=122269,
+        model_mode="paper",
+        feature_vector=SimpleNamespace(symbol="ZIL/USDT"),
+        open_positions=[],
+        staged_entry_counts={},
+        strategy_mode_context={},
+        market_regime_context={},
+        new_pair_pause_reason=None,
+    )
+
+    assert scheduled is True
+    await asyncio.wait_for(pipeline_started.wait(), timeout=0.2)
+    task = service._market_entry_pipeline_tasks["ZIL/USDT"]
+    assert task.done() is False
+    assert pending_ids == [122269]
+    assert "ZIL/USDT" in service._active_analysis_symbols
+
+    release_pipeline.set()
+    await asyncio.wait_for(task, timeout=0.2)
+
+    assert service._market_entry_pipeline_tasks == {}
+    assert "ZIL/USDT" not in service._active_analysis_symbols
+    assert ensured_ids == [122269]
+    assert service._recent_decisions[-1]["symbol"] == "ZIL/USDT"
+    assert service._market_entry_pipeline_snapshot() == {
+        "active_count": 0,
+        "active_symbols": [],
+        "queue_timeout_seconds": 30.0,
+        "single_flight": True,
+        "stage": "idle",
+        "stage_updated_at": service._market_entry_pipeline_stage_updated_at.isoformat(),
+    }
+    assert len(published) == 1
 
 
 def test_market_ai_budget_clock_ignores_pre_ai_round_work(
@@ -6349,6 +6564,36 @@ async def test_sync_service_quarantines_position_created_from_entry_close_fill(
 
 
 @pytest.mark.asyncio
+async def test_current_position_management_refresh_allows_missing_protection() -> None:
+    async def account_equity(_mode: str) -> dict[str, float]:
+        return {"equity": 1000.0}
+
+    service = OkxSyncService(account_equity_provider=account_equity)
+
+    refreshed = await service._refresh_current_position_management_contracts(
+        session=SimpleNamespace(),
+        positions=[],
+        exchange_positions=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "contracts": 1.0,
+                "contractSize": 1.0,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+                "info": {"instId": "BTC-USDT-SWAP", "pos": "1", "ctVal": "1"},
+            }
+        ],
+        protection_by_key={},
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        entry_fee_for_position=lambda *_args: None,
+    )
+
+    assert refreshed == 0
+
+
+@pytest.mark.asyncio
 async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_syncer(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -6986,6 +7231,107 @@ async def test_sync_service_does_not_record_full_close_as_partial_reduction():
 
 
 @pytest.mark.asyncio
+async def test_sync_service_does_not_reopen_closed_position_during_entry_persistence_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    recent_order = SimpleNamespace(
+        model_name="ensemble_trader",
+        exchange_order_id="new-pepe-entry",
+        status=OrderStatus.FILLED.value,
+        quantity=7_000_000.0,
+        price=0.000002781,
+        filled_at=now,
+        created_at=now,
+    )
+    unrelated_closed_position = SimpleNamespace(
+        id=5183,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="PEPE/USDT",
+        side="long",
+        is_open=False,
+        entry_exchange_order_id="old-pepe-entry",
+        close_exchange_order_id="old-pepe-close",
+        closed_at=now - timedelta(hours=12),
+    )
+    opened_positions: list[dict[str, Any]] = []
+
+    class FakeScalarResult:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def scalar_one_or_none(self) -> Any:
+            return self.value
+
+    class FakeSession:
+        async def execute(self, statement: Any) -> FakeScalarResult:
+            entity = statement.column_descriptions[0].get("entity")
+            if entity is sync_module.Order:
+                return FakeScalarResult(recent_order)
+            if entity is sync_module.Position:
+                return FakeScalarResult(unrelated_closed_position)
+            raise AssertionError(f"unexpected reconciliation query: {statement}")
+
+    class FakePaperOKX:
+        async def get_positions_strict(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "symbol": "PEPE/USDT:USDT",
+                    "side": "long",
+                    "contracts": 7_000_000.0,
+                    "contractSize": 1.0,
+                    "entryPrice": 0.000002781,
+                    "markPrice": 0.00000279,
+                    "info": {"instId": "PEPE-USDT-SWAP", "pos": "7000000"},
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_open_positions(self) -> list[Any]:
+            return []
+
+        async def open_position(self, payload: dict[str, Any]) -> None:
+            opened_positions.append(payload)
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def protection_map(
+        _paper_okx: Any,
+        _exchange_positions: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        return {}
+
+    async def fallback_protection(_session: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: now,
+        **_noop_reconcile_close_boundaries(),
+    ).reconcile_exchange_positions()
+
+    assert result == []
+    assert unrelated_closed_position.is_open is False
+    assert unrelated_closed_position.close_exchange_order_id == "old-pepe-close"
+    assert opened_positions == []
+
+
+@pytest.mark.asyncio
 async def test_sync_service_reconcile_exchange_positions_uses_injected_datetime_parser(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -7010,7 +7356,7 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_datetime_
 
     class FakeSession:
         def __init__(self):
-            self.results = [None, order]
+            self.results = [order, None]
 
         async def execute(self, _stmt):
             return FakeScalarResult(self.results.pop(0))
@@ -7137,7 +7483,7 @@ async def test_sync_service_created_missing_position_uses_okx_inst_id_over_alias
 
     class FakeSession:
         def __init__(self):
-            self.results = [None, order]
+            self.results = [order, None]
 
         async def execute(self, _stmt):
             return FakeScalarResult(self.results.pop(0))
@@ -7676,6 +8022,8 @@ async def test_refresh_position_prices_fetches_active_and_paper_snapshots_concur
 async def test_refresh_position_prices_defers_database_write_when_pool_is_busy(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    rollback_calls = 0
+
     class FakeTradeRepository:
         def __init__(self, _session):
             pass
@@ -7684,9 +8032,14 @@ async def test_refresh_position_prices_defers_database_write_when_pool_is_busy(
             await asyncio.sleep(0.05)
             return []
 
+    class FakeSession:
+        async def rollback(self):
+            nonlocal rollback_calls
+            rollback_calls += 1
+
     @asynccontextmanager
     async def fake_session_ctx():
-        yield object()
+        yield FakeSession()
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
@@ -7703,6 +8056,7 @@ async def test_refresh_position_prices_defers_database_write_when_pool_is_busy(
         "connection_pool_or_open_position_query_timeout"
     )
     assert result["database_deferred"]["timeout_seconds"] == 0.01
+    assert rollback_calls == 1
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -68,6 +71,13 @@ class _PublicApi:
         self.calls.append(("get_mark_price", dict(kwargs)))
         return {"code": "0", "data": [{"markPx": "0.0129"}]}
 
+    def get_price_limit(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_price_limit", dict(kwargs)))
+        return {
+            "code": "0",
+            "data": [{"buyLmt": "0.0135", "sellLmt": "0.0123"}],
+        }
+
 
 class _MarketApi:
     def __init__(self) -> None:
@@ -128,6 +138,24 @@ class _AccountApi:
         return {"code": "0", "data": [{"taker": "-0.0005", "ts": "1783931709453"}]}
 
 
+class _ConcurrentProbeApi:
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    def probe(self, *, value: str) -> dict[str, Any]:
+        with self._state_lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(0.03)
+            return {"code": "0", "data": [{"value": value}]}
+        finally:
+            with self._state_lock:
+                self.active_calls -= 1
+
+
 class _ServerTimeResponse:
     def __init__(self, server_ms: int) -> None:
         self.server_ms = server_ms
@@ -181,6 +209,20 @@ def test_public_market_data_stays_live_when_private_paper_account_is_demo(
 
 
 @pytest.mark.asyncio
+async def test_sdk_adapter_serializes_calls_on_same_sync_client() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    api = _ConcurrentProbeApi()
+
+    results = await asyncio.gather(
+        exchange._call_sdk(lambda: api, "probe", value="first"),
+        exchange._call_sdk(lambda: api, "probe", value="second"),
+    )
+
+    assert {row["data"][0]["value"] for row in results} == {"first", "second"}
+    assert api.max_active_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_sdk_adapter_forces_public_tickers_to_swap() -> None:
     exchange = OkxPerpetualSdkExchange("paper")
     market_api = _MarketApi()
@@ -228,6 +270,22 @@ async def test_sdk_adapter_exposes_native_mark_and_index_price_calls() -> None:
     ]
     assert market_api.calls == [
         ("get_index_tickers", {"quoteCcy": "", "instId": "ROBO-USDT"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_exposes_native_market_order_price_limits() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    public_api = _PublicApi()
+    exchange._public_api = public_api
+
+    limits = await exchange.publicGetPublicPriceLimit(
+        {"instType": "SWAP", "instId": "STRK-USDT-SWAP"}
+    )
+
+    assert limits["data"][0] == {"buyLmt": "0.0135", "sellLmt": "0.0123"}
+    assert public_api.calls == [
+        ("get_price_limit", {"instId": "STRK-USDT-SWAP"})
     ]
 
 

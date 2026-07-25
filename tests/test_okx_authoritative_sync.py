@@ -13,7 +13,9 @@ from services.okx_authoritative_sync import (
     MAX_AUTHORITATIVE_FILL_PAGES,
     OkxAuthoritativeSyncService,
     OkxFillGroup,
+    _linked_protection_fill_context,
     _local_order_verified_okx_raw_contract_size,
+    _position_management_entry_order_ids,
 )
 
 
@@ -1505,6 +1507,164 @@ async def test_okx_authoritative_sync_prioritizes_unlinked_local_order_contexts(
 
     assert "aave-protection-close" in contexts
     assert executor.ccxt.order_history_params[0]["ordId"] == "aave-protection-close"
+    assert len(executor.ccxt.order_history_params) == 1
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_prioritizes_missing_local_order_contexts() -> None:
+    timestamp_ms = int(datetime.now(UTC).timestamp() * 1000)
+    linked_fill = OkxFillGroup(
+        order_id="already-linked-entry",
+        trade_ids=("linked-trade",),
+        inst_id="AAVE-USDT-SWAP",
+        symbol="AAVE/USDT",
+        side="sell",
+        pos_side="net",
+        contracts=1.0,
+        avg_price=93.0,
+        fee_abs=0.0,
+        fill_pnl=0.0,
+        timestamp_ms=float(timestamp_ms - 1),
+        timestamp=datetime.fromtimestamp((timestamp_ms - 1) / 1000, UTC),
+        raw_count=1,
+    )
+    missing_fill = OkxFillGroup(
+        order_id="aave-protection-close",
+        trade_ids=("close-trade",),
+        inst_id="AAVE-USDT-SWAP",
+        symbol="AAVE/USDT",
+        side="buy",
+        pos_side="net",
+        contracts=6.1,
+        avg_price=97.54,
+        fee_abs=0.0,
+        fill_pnl=-1.84,
+        timestamp_ms=float(timestamp_ms),
+        timestamp=datetime.fromtimestamp(timestamp_ms / 1000, UTC),
+        raw_count=1,
+    )
+    executor = _LinkedProtectionFillExecutor()
+
+    contexts = await OkxAuthoritativeSyncService()._fetch_order_history_contexts(
+        executor,
+        exchange_fills=[linked_fill, missing_fill],
+        local_exchange_order_ids={"already-linked-entry"},
+    )
+
+    assert list(contexts) == ["aave-protection-close"]
+    assert executor.ccxt.order_history_params == [
+        {
+            "instType": "SWAP",
+            "ordId": "aave-protection-close",
+            "limit": "5",
+            "instId": "AAVE-USDT-SWAP",
+        }
+    ]
+
+
+def test_linked_protection_uses_position_management_algo_lineage() -> None:
+    entry_order = Order(
+        id=42,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="DOGE/USDT",
+        side="buy",
+        order_type="market",
+        quantity=300.0,
+        status="filled",
+        exchange_order_id="doge-entry-order",
+    )
+    position = Position(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="DOGE/USDT",
+        side="long",
+        quantity=20.0,
+        entry_price=0.06962,
+        is_open=False,
+        okx_inst_id="DOGE-USDT-SWAP",
+        entry_exchange_order_id="doge-entry-order",
+        current_management_contract={
+            "original_entry_order_ids": ["doge-entry-order"],
+            "protection_orders": [
+                {
+                    "algo_id": "doge-triggered-algo",
+                    "close_side": "sell",
+                }
+            ],
+        },
+    )
+    fill = OkxFillGroup(
+        order_id="doge-protection-close",
+        trade_ids=("trade-1",),
+        inst_id="DOGE-USDT-SWAP",
+        symbol="DOGE/USDT",
+        side="sell",
+        pos_side="net",
+        contracts=0.02,
+        avg_price=0.07034,
+        fee_abs=0.0007,
+        fill_pnl=0.0144,
+        timestamp_ms=1.0,
+        timestamp=datetime.now(UTC),
+        raw_count=1,
+    )
+
+    linked = _linked_protection_fill_context(
+        fill,
+        order_contexts={
+            "doge-protection-close": (
+                {
+                    "ordId": "doge-protection-close",
+                    "instId": "DOGE-USDT-SWAP",
+                    "side": "sell",
+                    "reduceOnly": "true",
+                    "algoId": "doge-triggered-algo",
+                    "source": "7",
+                },
+            )
+        },
+        local_orders_by_exchange_id={"doge-entry-order": entry_order},
+        local_orders=[entry_order],
+        local_decisions={},
+        local_positions=[position],
+    )
+
+    assert linked is not None
+    assert linked["local_order_id"] == 42
+    assert linked["linked_exchange_order_id"] == "doge-entry-order"
+    assert linked["match_source"] == "local_position_management_protection_algo_id"
+
+
+def test_position_management_entry_order_ids_require_protection_evidence() -> None:
+    protected = Position(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="TRX/USDT",
+        side="long",
+        quantity=10.0,
+        entry_price=0.3315,
+        entry_exchange_order_id="trx-position-entry",
+        current_management_contract={
+            "original_entry_order_ids": ["trx-original-entry"],
+            "protection_orders": [{"algo_id": "trx-algo"}],
+        },
+    )
+    unprotected = Position(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        quantity=1.0,
+        entry_price=100.0,
+        entry_exchange_order_id="btc-entry",
+        current_management_contract={"original_entry_order_ids": ["btc-entry"]},
+    )
+
+    assert _position_management_entry_order_ids([protected, unprotected]) == {
+        "trx-position-entry",
+        "trx-original-entry",
+    }
 
 
 @pytest.mark.asyncio

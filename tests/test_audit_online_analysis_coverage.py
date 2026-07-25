@@ -32,6 +32,12 @@ def _report(now: datetime) -> dict:
             "coverage_window_evaluable": True,
             "coverage_window_met": True,
             "overdue_count": 0,
+            "candidate_coverage_evidence_available": True,
+            "candidate_selection_generated_at": (now - timedelta(seconds=30)).isoformat(),
+            "candidate_count": 12,
+            "candidate_coverage_target_seconds": 30 * 60,
+            "coverage_due_count": 0,
+            "coverage_due_symbols": [],
         },
         "market": {
             "decision_count": 12,
@@ -97,6 +103,33 @@ def test_assessment_requires_full_window_of_service_continuity() -> None:
 
     assert assessment["ready"] is False
     assert assessment["blockers"] == ["trading_service_continuity_unproven"]
+
+
+def test_assessment_rejects_unresolved_due_market_candidates() -> None:
+    now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+    report = _report(now)
+    report["coverage"]["coverage_window_met"] = False
+    report["coverage"]["coverage_due_count"] = 1
+    report["coverage"]["coverage_due_symbols"] = ["ETH/USDT"]
+
+    assessment = audit.assess_coverage_report(report, now=now)
+
+    assert assessment["ready"] is False
+    assert "market_coverage_window_not_met" in assessment["blockers"]
+    assert "market_candidate_coverage_has_unresolved_due_symbols" in assessment["blockers"]
+
+
+def test_assessment_rejects_stale_candidate_selection_evidence() -> None:
+    now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+    report = _report(now)
+    report["coverage"]["candidate_selection_generated_at"] = (
+        now - timedelta(minutes=11)
+    ).isoformat()
+
+    assessment = audit.assess_coverage_report(report, now=now)
+
+    assert assessment["ready"] is False
+    assert assessment["blockers"] == ["market_candidate_coverage_evidence_stale"]
 
 
 def test_assessment_rejects_shortened_acceptance_window() -> None:

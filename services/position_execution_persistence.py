@@ -490,8 +490,6 @@ class PositionExecutionPersistenceService:
                     result,
                     recovered.plan.entry_fee_allocated,
                     recovered.plan.close_fee_allocated,
-                    recovered.plan.gross_pnl,
-                    decision,
                 )
                 await session.flush()
                 logger.warning(
@@ -614,8 +612,6 @@ class PositionExecutionPersistenceService:
                     result,
                     entry_fee,
                     close_fee,
-                    gross_pnl,
-                    decision,
                 )
             else:
                 self._position_peak_remover(model_name, symbol, side)
@@ -637,8 +633,6 @@ class PositionExecutionPersistenceService:
                     result,
                     entry_fee,
                     close_fee,
-                    gross_pnl,
-                    decision,
                 )
         if result.pnl == 0.0 and total_pnl != 0.0:
             result.pnl = total_pnl
@@ -651,8 +645,6 @@ class PositionExecutionPersistenceService:
         result: Any,
         entry_fee: float,
         close_fee: float,
-        gross_pnl: float,
-        decision: DecisionOutput,
     ) -> None:
         await self._trade_reflection_recorder(
             session,
@@ -660,7 +652,5 @@ class PositionExecutionPersistenceService:
             exit_price=result.price,
             entry_fee=entry_fee,
             close_fee=close_fee,
-            gross_pnl=gross_pnl,
             source="system_execution",
-            decision=decision,
         )

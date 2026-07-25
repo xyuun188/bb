@@ -62,6 +62,7 @@ RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
+LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
 
 
 def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
@@ -89,6 +90,23 @@ def _float_value(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _entry_order_persistence_pending(
+    order: Any,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    timestamp = getattr(order, "filled_at", None) or getattr(order, "created_at", None)
+    if not isinstance(timestamp, datetime):
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    observed_at = now or datetime.now(UTC)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    age_seconds = max((observed_at.astimezone(UTC) - timestamp.astimezone(UTC)).total_seconds(), 0.0)
+    return age_seconds < LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
@@ -1407,6 +1425,7 @@ class OkxSyncService:
                         timeout=POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS,
                     )
                 except TimeoutError:
+                    await session.rollback()
                     diagnostics["database_deferred"] = {
                         "reason": "connection_pool_or_open_position_query_timeout",
                         "timeout_seconds": POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS,
@@ -1932,10 +1951,11 @@ class OkxSyncService:
             )
             if stop_loss <= 0:
                 stop_loss = max(
-                    *(
-                        [float_parser(item.get("stop_loss_price"), 0.0) for item in protection_orders]
-                        or [0.0]
-                    )
+                    [
+                        float_parser(item.get("stop_loss_price"), 0.0)
+                        for item in protection_orders
+                    ],
+                    default=0.0,
                 )
             group_rows.append(
                 {
@@ -2325,53 +2345,6 @@ class OkxSyncService:
                             )
                         continue
 
-                    closed_position_result = await session.execute(
-                        select(Position)
-                        .where(
-                            Position.execution_mode == "paper",
-                            Position.symbol.in_(symbol_variants),
-                            Position.side == side,
-                            Position.is_open.is_(False),
-                        )
-                        .order_by(Position.created_at.desc())
-                        .limit(1)
-                    )
-                    closed_position = closed_position_result.scalar_one_or_none()
-                    if closed_position:
-                        closed_position.is_open = True
-                        closed_position.quantity = quantity
-                        closed_position.entry_price = entry_price
-                        closed_position.current_price = current_price
-                        closed_position.leverage = leverage
-                        closed_position.unrealized_pnl = exchange_unrealized
-                        closed_position.realized_pnl = exchange_realized
-                        closed_position.stop_loss_price = stop_loss_price
-                        closed_position.take_profit_price = take_profit_price
-                        closed_position.closed_at = None
-                        closed_position.okx_inst_id = okx_inst_id or closed_position.okx_inst_id
-                        closed_position.okx_pos_id = okx_pos_id or closed_position.okx_pos_id
-                        closed_position.close_exchange_order_id = None
-                        closed_position.updated_at = datetime.now(UTC)
-                        local_open_keys.add(key)
-                        reconciled.append(
-                            {
-                                "kind": "reopened_local_position",
-                                "source": "okx_authoritative_current_position",
-                                "model_name": closed_position.model_name,
-                                "symbol": symbol,
-                                "side": side,
-                                "entry_price": entry_price,
-                                "note": "OKX 仍有持仓，本地之前误记为已平仓，已重新打开本地持仓记录。",
-                            }
-                        )
-                        logger.warning(
-                            "reopened local position still open on OKX",
-                            position_id=closed_position.id,
-                            symbol=symbol,
-                            side=side,
-                        )
-                        continue
-
                     entry_side = "buy" if side == "long" else "sell"
                     order_result = await session.execute(
                         select(Order)
@@ -2396,6 +2369,73 @@ class OkxSyncService:
                     order = order_result.scalar_one_or_none()
                     if not order:
                         continue
+                    if _entry_order_persistence_pending(order):
+                        logger.info(
+                            "deferred missing local position while entry persistence is pending",
+                            symbol=symbol,
+                            side=side,
+                            order_id=order.exchange_order_id,
+                            grace_seconds=LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS,
+                        )
+                        continue
+
+                    closed_position_result = await session.execute(
+                        select(Position)
+                        .where(
+                            Position.execution_mode == "paper",
+                            Position.symbol.in_(symbol_variants),
+                            Position.side == side,
+                            Position.is_open.is_(False),
+                            Position.entry_exchange_order_id == order.exchange_order_id,
+                        )
+                        .order_by(Position.created_at.desc())
+                        .limit(1)
+                    )
+                    closed_position = closed_position_result.scalar_one_or_none()
+                    if closed_position:
+                        closed_position.is_open = True
+                        closed_position.quantity = quantity
+                        closed_position.entry_price = entry_price
+                        closed_position.current_price = current_price
+                        closed_position.leverage = leverage
+                        closed_position.unrealized_pnl = exchange_unrealized
+                        closed_position.realized_pnl = exchange_realized
+                        closed_position.close_fill_pnl = 0.0
+                        closed_position.close_fee = 0.0
+                        closed_position.funding_fee = 0.0
+                        closed_position.settlement_status = None
+                        closed_position.settlement_source = None
+                        closed_position.settlement_synced_at = None
+                        closed_position.settlement_raw = None
+                        closed_position.stop_loss_price = stop_loss_price
+                        closed_position.take_profit_price = take_profit_price
+                        closed_position.closed_at = None
+                        closed_position.okx_inst_id = okx_inst_id or closed_position.okx_inst_id
+                        closed_position.okx_pos_id = okx_pos_id or closed_position.okx_pos_id
+                        closed_position.close_exchange_order_id = None
+                        closed_position.updated_at = datetime.now(UTC)
+                        local_open_keys.add(key)
+                        reconciled.append(
+                            {
+                                "kind": "reopened_exact_local_position",
+                                "source": "okx_authoritative_current_position",
+                                "model_name": closed_position.model_name,
+                                "symbol": symbol,
+                                "side": side,
+                                "entry_price": entry_price,
+                                "exchange_order_id": order.exchange_order_id,
+                                "note": "OKX 仍有持仓，本地之前误记为已平仓，已重新打开本地持仓记录。",
+                            }
+                        )
+                        logger.warning(
+                            "reopened exact local position still open on OKX",
+                            position_id=closed_position.id,
+                            symbol=symbol,
+                            side=side,
+                            order_id=order.exchange_order_id,
+                        )
+                        continue
+
                     if not stop_loss_price or not take_profit_price:
                         order_fallback_protection = await fallback_position_protection(
                             session,
@@ -2866,7 +2906,10 @@ class OkxSyncService:
                     )
 
         except Exception as e:
-            logger.warning("exchange position reconciliation failed", error=safe_error_text(e))
+            logger.exception(
+                "exchange position reconciliation failed",
+                error=safe_error_text(e),
+            )
             return self._with_reconcile_degraded_rows(reconciled)
 
         reconciled.extend(await self._rebalance_pending_position_protection(paper_okx))

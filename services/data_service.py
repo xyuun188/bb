@@ -80,6 +80,10 @@ TICKER_PERSIST_CONCURRENCY = max(
     min(4, max(int(settings.database_pool_size or 1) // 8, 1)),
 )
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
+NATIVE_MARKET_REMOTE_CONCURRENCY = max(
+    1,
+    int(_MARKET_DATA_PARAMS.native_market_remote_concurrency),
+)
 TIMEFRAME_SECONDS = {
     "1m": 60,
     "5m": 300,
@@ -109,7 +113,7 @@ CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
 
 
 class _PriorityBuildGate:
-    """Bound indicator work while always serving queued market candidates first."""
+    """Bound source work while always serving queued market candidates first."""
 
     def __init__(self, limit: int) -> None:
         self._limit = max(1, int(limit))
@@ -141,7 +145,7 @@ class _PriorityBuildGate:
 
     def release(self) -> None:
         if self._active <= 0:
-            raise RuntimeError("indicator build gate released without acquisition")
+            raise RuntimeError("priority gate released without acquisition")
         self._active -= 1
         self._wake_next()
 
@@ -195,6 +199,9 @@ class DataService:
         )
         self._indicator_remote_refresh_semaphore = asyncio.Semaphore(
             max(1, int(INDICATOR_REMOTE_REFRESH_CONCURRENCY))
+        )
+        self._native_market_snapshot_priority_gate = _PriorityBuildGate(
+            NATIVE_MARKET_REMOTE_CONCURRENCY
         )
         self._kline_fetch_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._kline_background_refresh_tasks: dict[tuple[str, str], asyncio.Task] = {}
@@ -711,6 +718,7 @@ class DataService:
         allow_indicator_background_refresh: bool = True,
         allow_derivatives_background_refresh: bool = True,
         prioritize_indicator_build: bool = False,
+        prioritize_native_market_data: bool = False,
     ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
         sentiment_task = asyncio.create_task(
@@ -720,17 +728,42 @@ class DataService:
             )
         )
 
-        async def bounded_snapshot(name: str, provider) -> dict[str, Any]:
+        async def bounded_snapshot(
+            name: str,
+            provider,
+            *,
+            uses_native_remote: bool = False,
+        ) -> dict[str, Any]:
             timeout = max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5)
+
+            async def read() -> Any:
+                if not uses_native_remote:
+                    return await provider()
+                gate = self._native_market_snapshot_gate()
+                await gate.acquire(priority=prioritize_native_market_data)
+                try:
+                    return await asyncio.wait_for(provider(), timeout=timeout)
+                finally:
+                    gate.release()
+
             try:
-                result = await asyncio.wait_for(provider(), timeout=timeout)
+                total_timeout = (
+                    timeout * 2.0
+                    if uses_native_remote and prioritize_native_market_data
+                    else timeout
+                )
+                result = await asyncio.wait_for(read(), timeout=total_timeout)
                 return result if isinstance(result, dict) else {}
             except TimeoutError:
                 logger.warning(
                     "feature snapshot source timed out",
                     symbol=symbol,
                     source=name,
-                    timeout_seconds=timeout,
+                    timeout_seconds=total_timeout,
+                    provider_timeout_seconds=timeout,
+                    priority_queue=bool(
+                        uses_native_remote and prioritize_native_market_data
+                    ),
                 )
                 return {}
             except Exception as exc:
@@ -748,6 +781,7 @@ class DataService:
                 lambda: self._get_feature_ticker_snapshot(
                     symbol, block_on_remote=block_on_remote_ticker
                 ),
+                uses_native_remote=block_on_remote_ticker,
             )
         )
         indicators_task = asyncio.create_task(
@@ -770,6 +804,7 @@ class DataService:
                     block_on_remote=block_on_remote_derivatives,
                     allow_background_refresh=allow_derivatives_background_refresh,
                 ),
+                uses_native_remote=block_on_remote_derivatives,
             )
         )
         gather_results: tuple[Any, Any, Any, Any] = await asyncio.gather(
@@ -1579,6 +1614,13 @@ class DataService:
         if not isinstance(gate, _PriorityBuildGate):
             gate = _PriorityBuildGate(INDICATOR_SNAPSHOT_BUILD_CONCURRENCY)
             self._indicator_snapshot_priority_gate = gate
+        return gate
+
+    def _native_market_snapshot_gate(self) -> _PriorityBuildGate:
+        gate = getattr(self, "_native_market_snapshot_priority_gate", None)
+        if not isinstance(gate, _PriorityBuildGate):
+            gate = _PriorityBuildGate(NATIVE_MARKET_REMOTE_CONCURRENCY)
+            self._native_market_snapshot_priority_gate = gate
         return gate
 
     @staticmethod

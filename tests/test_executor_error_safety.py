@@ -806,6 +806,50 @@ class _EntryMaxMarketSizeCcxt:
         raise AssertionError("order confirmation must use OKX native privateGetTradeOrder")
 
 
+class _MovingEntryTickerCcxt(_EntryMaxMarketSizeCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ticker_calls = 0
+
+    async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.ticker_calls += 1
+        price = 1.0 if self.ticker_calls == 1 else 1.2
+        return await _native_ticker(
+            params,
+            last=price,
+            bid=price - 0.001,
+            ask=price + 0.001,
+        )
+
+    async def publicGetPublicPriceLimit(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "instId": params["instId"],
+                    "buyLmt": "1.3",
+                    "sellLmt": "1.1",
+                    "ts": "1730000000001",
+                }
+            ],
+        }
+
+
+class _InvalidEntryPriceLimitCcxt(_MovingEntryTickerCcxt):
+    async def publicGetPublicPriceLimit(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "instId": params["instId"],
+                    "buyLmt": "0",
+                    "sellLmt": "0",
+                    "ts": "1730000000001",
+                }
+            ],
+        }
+
+
 class _ExitMaxMarketSizeCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -1907,6 +1951,49 @@ async def test_okx_entry_caps_market_order_above_exchange_max_before_submit() ->
     assert submission["algo_ids"] == ["entry-max-market-oco"]
     assert submission["client_submit_requested_at"]
     assert submission["exchange_confirmed_at"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_reprices_attached_protection_immediately_before_submit() -> None:
+    exchange = _MovingEntryTickerCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.feature_snapshot = {"current_price": 1.0}
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status.value == "filled"
+    assert exchange.ticker_calls == 2
+    request_params = exchange.create_calls[0][5]
+    protection = request_params["attachAlgoOrds"][0]
+    assert float(protection["slTriggerPx"]) < 1.1
+    assert float(protection["tpTriggerPx"]) > 1.3
+    refresh = result.raw_response["okx_order_rules"]["pre_submit_price_refresh"]
+    assert refresh["previous_price"] == 1.0
+    assert refresh["refreshed_price"] == 1.2
+    assert refresh["source"] == "okx_native_ticker_immediately_before_submit"
+    assert refresh["buy_price_limit"] == 1.3
+    assert refresh["sell_price_limit"] == 1.1
+    assert refresh["price_limit_timestamp_ms"] == 1730000000001
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_rejects_before_submit_when_native_price_limit_is_invalid() -> None:
+    exchange = _InvalidEntryPriceLimitCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status.value == "rejected"
+    assert result.raw_response["system_pre_submit_rejection"] is True
+    assert result.raw_response["okx_rejection"] is False
+    assert (
+        result.raw_response["execution_blocker"]
+        == "okx_pre_submit_execution_quote_unavailable"
+    )
+    assert "price limit has no positive bounds" in result.raw_response["raw_error"]
+    assert exchange.create_calls == []
 
 
 @pytest.mark.asyncio

@@ -311,6 +311,7 @@ class OkxPerpetualSdkExchange:
         self._trade_api: Any | None = None
         self._market_api: Any | None = None
         self._public_api: Any | None = None
+        self._sdk_call_locks: dict[int, asyncio.Lock] = {}
         self._server_time_lock = threading.Lock()
         self._server_time_offset_ms: int | None = None
         self._server_time_synced_at: float = 0.0
@@ -433,8 +434,10 @@ class OkxPerpetualSdkExchange:
         check_data_code: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        api = api_getter()
+        call_lock = self._sdk_call_locks.setdefault(id(api), asyncio.Lock())
+
         def _sync() -> dict[str, Any]:
-            api = api_getter()
             method = getattr(api, method_name)
             result = method(**kwargs)
             raise_if_okx_error(
@@ -444,7 +447,10 @@ class OkxPerpetualSdkExchange:
             )
             return dict(result)
 
-        return await asyncio.to_thread(_sync)
+        # python-okx reuses a requests Session inside each API object. Concurrent
+        # to_thread calls can corrupt that session's mutable cookie state.
+        async with call_lock:
+            return await asyncio.to_thread(_sync)
 
     async def load_time_difference(self) -> int:
         return 0
@@ -562,6 +568,14 @@ class OkxPerpetualSdkExchange:
             uly=str(params.get("uly") or ""),
             instFamily=str(params.get("instFamily") or ""),
             instId=str(params.get("instId") or ""),
+        )
+
+    async def publicGetPublicPriceLimit(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params, require_inst_id=True)
+        return await self._call_sdk(
+            lambda: self.public_api,
+            "get_price_limit",
+            instId=str(params["instId"]),
         )
 
     async def publicGetMarketIndexTickers(

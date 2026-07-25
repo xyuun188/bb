@@ -247,7 +247,8 @@ class OkxAuthoritativeSyncService:
         if supplemental_positions:
             local_positions = [*local_positions, *supplemental_positions]
         context_orders, context_decisions = await self._load_context_local_orders(
-            _order_ids_from_order_history_contexts(exchange_order_contexts),
+            _order_ids_from_order_history_contexts(exchange_order_contexts)
+            | _position_management_entry_order_ids(local_positions),
             known_exchange_order_ids=target_order_ids,
         )
 
@@ -478,7 +479,7 @@ class OkxAuthoritativeSyncService:
             stages,
             attempt=attempt,
             stage="okx_order_history_contexts",
-            timeout_seconds=optional_timeout,
+            timeout_seconds=self.timeout_seconds,
             operation=self._fetch_order_history_contexts(
                 executor,
                 exchange_fills=exchange_fills,
@@ -798,21 +799,45 @@ class OkxAuthoritativeSyncService:
         ]
         if not fills:
             return {}
-        priority_ids = {str(item or "").strip() for item in priority_order_ids or set() if str(item or "").strip()}
-        local_ids = {str(item or "").strip() for item in local_exchange_order_ids if str(item or "").strip()}
+        priority_ids = {
+            str(item or "").strip()
+            for item in priority_order_ids or set()
+            if str(item or "").strip()
+        }
+        local_ids = {
+            str(item or "").strip()
+            for item in local_exchange_order_ids
+            if str(item or "").strip()
+        }
+        fill_ids = {
+            str(getattr(fill, "order_id", "") or "").strip() for fill in fills
+        }
+        relevant_priority_ids = priority_ids & fill_ids
+        relevant_fills = [
+            fill
+            for fill in fills
+            if str(getattr(fill, "order_id", "") or "").strip() not in local_ids
+            or str(getattr(fill, "order_id", "") or "").strip()
+            in relevant_priority_ids
+        ]
         ordered_order_ids: list[str] = []
         seen_order_ids: set[str] = set()
-        for fill in fills:
+        for fill in relevant_fills:
             order_id = str(getattr(fill, "order_id", "") or "").strip()
-            if order_id in priority_ids and order_id not in seen_order_ids:
+            if order_id not in local_ids and order_id not in seen_order_ids:
                 ordered_order_ids.append(order_id)
                 seen_order_ids.add(order_id)
-        for order_id in sorted(priority_ids | local_ids):
+        for fill in relevant_fills:
+            order_id = str(getattr(fill, "order_id", "") or "").strip()
+            if order_id in relevant_priority_ids and order_id not in seen_order_ids:
+                ordered_order_ids.append(order_id)
+                seen_order_ids.add(order_id)
+        for order_id in sorted(relevant_priority_ids):
             if order_id and order_id not in seen_order_ids:
                 ordered_order_ids.append(order_id)
                 seen_order_ids.add(order_id)
         return await OkxNativeFactsClient(executor).fetch_order_history_contexts(
-            fills=fills,
+            fills=relevant_fills,
             order_ids=ordered_order_ids,
             limit=5,
             strict=False,
@@ -1016,6 +1041,7 @@ class OkxAuthoritativeSyncService:
                 local_orders_by_exchange_id=local_orders_by_exchange_id,
                 local_orders=all_context_orders,
                 local_decisions=all_context_decisions,
+                local_positions=local_positions,
                 protection_algo_rows=protection_algo_rows,
             )
             if linked_protection is not None:
@@ -1100,6 +1126,7 @@ class OkxAuthoritativeSyncService:
                     local_orders_by_exchange_id=local_orders_by_exchange_id,
                     local_orders=all_context_orders,
                     local_decisions=all_context_decisions,
+                    local_positions=local_positions,
                     protection_algo_rows=protection_algo_rows,
                 )
                 if linked_protection is not None:
@@ -1159,6 +1186,28 @@ def _order_ids_from_order_history_contexts(
             order_id = str(row.get("ordId") or "").strip()
             if order_id:
                 result.add(order_id)
+    return result
+
+
+def _position_management_entry_order_ids(local_positions: list[Position]) -> set[str]:
+    result: set[str] = set()
+    for position in local_positions:
+        contract = getattr(position, "current_management_contract", None)
+        if not isinstance(contract, dict):
+            continue
+        protection_orders = contract.get("protection_orders")
+        if not isinstance(protection_orders, list) or not protection_orders:
+            continue
+        result.update(
+            _split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None))
+        )
+        original_entry_ids = contract.get("original_entry_order_ids")
+        if isinstance(original_entry_ids, list):
+            result.update(
+                str(item or "").strip()
+                for item in original_entry_ids
+                if str(item or "").strip()
+            )
     return result
 
 
@@ -1222,6 +1271,7 @@ def _linked_protection_fill_context(
     local_orders_by_exchange_id: dict[str, Order],
     local_orders: list[Order],
     local_decisions: dict[int, AIDecision],
+    local_positions: list[Position] | None = None,
     protection_algo_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     rows = list(order_contexts.get(str(fill.order_id)) or ())
@@ -1299,6 +1349,29 @@ def _linked_protection_fill_context(
         }
 
     if okx_algo_id:
+        position_match = _position_protection_order_match(
+            okx_algo_id=okx_algo_id,
+            target_inst_id=target_inst_id,
+            target_side=target_side,
+            local_positions=local_positions or [],
+            local_orders_by_exchange_id=local_orders_by_exchange_id,
+        )
+        if position_match is not None:
+            return {
+                "local_order_id": int(position_match.id),
+                "linked_exchange_order_id": next(
+                    iter(
+                        _split_exchange_order_ids(
+                            getattr(position_match, "exchange_order_id", None)
+                        )
+                    ),
+                    "",
+                ),
+                "okx_algo_id": okx_algo_id,
+                "okx_source": okx_source,
+                "match_source": "local_position_management_protection_algo_id",
+                "protection_execution": protection_execution,
+            }
         for order in local_orders:
             decision = local_decisions.get(int(getattr(order, "decision_id", 0) or 0))
             if not _decision_has_attach_algo_id(decision, okx_algo_id):
@@ -1317,6 +1390,61 @@ def _linked_protection_fill_context(
                 "match_source": "local_decision_attach_algo_id",
                 "protection_execution": protection_execution,
             }
+    return None
+
+
+def _position_protection_order_match(
+    *,
+    okx_algo_id: str,
+    target_inst_id: str,
+    target_side: str,
+    local_positions: list[Position],
+    local_orders_by_exchange_id: dict[str, Order],
+) -> Order | None:
+    expected_algo_id = str(okx_algo_id or "").strip()
+    if not expected_algo_id:
+        return None
+    for position in local_positions:
+        contract = getattr(position, "current_management_contract", None)
+        if not isinstance(contract, dict):
+            continue
+        position_inst_id = (
+            str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            or okx_inst_id_from_symbol(str(getattr(position, "symbol", "") or ""))
+            or ""
+        )
+        if not _same_okx_inst_id(target_inst_id, position_inst_id):
+            continue
+        protection_orders = contract.get("protection_orders")
+        if not isinstance(protection_orders, list):
+            continue
+        if not any(
+            isinstance(item, dict)
+            and str(item.get("algo_id") or "").strip() == expected_algo_id
+            and str(item.get("close_side") or "").strip().lower() == target_side
+            for item in protection_orders
+        ):
+            continue
+        entry_order_ids = _split_exchange_order_ids(
+            getattr(position, "entry_exchange_order_id", None)
+        )
+        original_entry_ids = contract.get("original_entry_order_ids")
+        if isinstance(original_entry_ids, list):
+            entry_order_ids.update(
+                str(item or "").strip()
+                for item in original_entry_ids
+                if str(item or "").strip()
+            )
+        for entry_order_id in sorted(entry_order_ids):
+            source_order = local_orders_by_exchange_id.get(entry_order_id)
+            if source_order is None:
+                continue
+            if not _is_reduce_only_close_side(
+                close_side=target_side,
+                entry_side=str(getattr(source_order, "side", "") or ""),
+            ):
+                continue
+            return source_order
     return None
 
 

@@ -27,18 +27,32 @@ class _FakeCcxt:
         self.bills = bills
         self.delay_seconds = delay_seconds
         self.calls: list[str] = []
+        self.active_private_calls = 0
+        self.max_active_private_calls = 0
+
+    async def _private_response(
+        self,
+        call_name: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.calls.append(call_name)
+        self.active_private_calls += 1
+        self.max_active_private_calls = max(
+            self.max_active_private_calls,
+            self.active_private_calls,
+        )
+        try:
+            if self.delay_seconds:
+                await asyncio.sleep(self.delay_seconds)
+            return {"data": rows}
+        finally:
+            self.active_private_calls -= 1
 
     async def privateGetAccountPositionsHistory(self, _params: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append("position_history")
-        if self.delay_seconds:
-            await asyncio.sleep(self.delay_seconds)
-        return {"data": self.history_rows}
+        return await self._private_response("position_history", self.history_rows)
 
     async def privateGetAccountBills(self, _params: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append("account_bills")
-        if self.delay_seconds:
-            await asyncio.sleep(self.delay_seconds)
-        return {"data": self.bills}
+        return await self._private_response("account_bills", self.bills)
 
     async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append("contract_specs")
@@ -136,6 +150,7 @@ async def test_settlement_fact_sync_mirrors_history_and_funding_bills(
         assert report["position_history_inserted_count"] == 1
         assert report["account_bill_count"] == 1
         assert report["account_bill_inserted_count"] == 1
+        assert ccxt.max_active_private_calls == 1
         assert {"position_history", "account_bills"} <= set(report["completed_stages"])
         async with get_session_ctx() as session:
             history = (await session.execute(select(OkxPositionHistory))).scalar_one()

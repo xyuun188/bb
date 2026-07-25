@@ -403,7 +403,14 @@ async def test_persist_partial_exit_splits_closed_position_and_records_reflectio
     assert reflections[0]["position"].quantity == 2.0
     assert reflections[0]["entry_fee"] == 0.4
     assert reflections[0]["close_fee"] == 1.0
-    assert reflections[0]["gross_pnl"] == 20.0
+    assert set(reflections[0]) == {
+        "session",
+        "position",
+        "exit_price",
+        "entry_fee",
+        "close_fee",
+        "source",
+    }
 
 
 @pytest.mark.asyncio
@@ -501,7 +508,56 @@ async def test_persist_exit_uses_okx_native_fill_pnl_over_local_formula() -> Non
     assert position.is_open is False
     assert position.realized_pnl == pytest.approx(4.5)
     assert result.pnl == pytest.approx(4.5)
-    assert reflections[0]["gross_pnl"] == pytest.approx(6.0)
+    assert reflections[0]["position"].close_fill_pnl == pytest.approx(6.0)
+
+
+@pytest.mark.asyncio
+async def test_persist_exit_uses_authoritative_reflection_recorder_contract() -> None:
+    session = FakeSession()
+    position = _position(id=1, quantity=2.0)
+    repo = FakeTradeRepo([position])
+    calls: list[dict[str, Any]] = []
+
+    async def strict_reflection_recorder(
+        session_arg: Any,
+        position_arg: Any,
+        *,
+        exit_price: float,
+        entry_fee: float,
+        close_fee: float,
+        source: str,
+    ) -> None:
+        calls.append(
+            {
+                "session": session_arg,
+                "position": position_arg,
+                "exit_price": exit_price,
+                "entry_fee": entry_fee,
+                "close_fee": close_fee,
+                "source": source,
+            }
+        )
+
+    service = _service(session=session, repo=repo, entry_fee=0.5)
+    service._trade_reflection_recorder = strict_reflection_recorder
+
+    await service.persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.CLOSE_LONG),
+        result=_result(quantity=2.0, price=110.0, fee=1.0),
+        execution_mode="paper",
+    )
+
+    assert calls == [
+        {
+            "session": session,
+            "position": position,
+            "exit_price": 110.0,
+            "entry_fee": 0.5,
+            "close_fee": 1.0,
+            "source": "system_execution",
+        }
+    ]
 
 
 @pytest.mark.asyncio

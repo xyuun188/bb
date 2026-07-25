@@ -1172,6 +1172,101 @@ class OKXExecutor(AbstractExecutor):
                                 "okx_order_rules": okx_order_rules,
                             },
                         )
+                previous_price = price
+                try:
+                    submit_ticker, submit_price_limit = await asyncio.gather(
+                        self._fetch_native_ticker(decision.symbol),
+                        self._fetch_native_price_limit(decision.symbol),
+                    )
+                except Exception as exc:
+                    error_text = safe_error_text(exc)
+                    logger.warning(
+                        "OKX native execution quote unavailable immediately before entry submit",
+                        symbol=decision.symbol,
+                        okx_symbol=okx_symbol,
+                        error=error_text,
+                    )
+                    return ExecutionResult(
+                        order_id="ticker_unavailable",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0,
+                        price=previous_price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "OKX 提交前最新行情不可用，系统已在本地拒绝开仓，"
+                                "未发送主订单或保护单。"
+                            ),
+                            "execution_blocker": "okx_pre_submit_execution_quote_unavailable",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "okx_symbol": okx_symbol,
+                            "raw_error": error_text,
+                        },
+                    )
+                price = self._safe_float(submit_ticker.get("last"), 0.0)
+                ticker = {**submit_ticker, **submit_price_limit}
+                order_quantity, base_quantity = self._entry_order_amount(
+                    ccxt,
+                    market,
+                    position_value,
+                    price,
+                    balance,
+                    decision.suggested_leverage,
+                )
+                okx_order_rules = self._entry_order_rule_snapshot(
+                    market,
+                    price=price,
+                    balance=balance,
+                    leverage=decision.suggested_leverage,
+                    planned_notional_usdt=position_value,
+                    final_contracts=order_quantity,
+                )
+                if paper_training_margin_reserve:
+                    okx_order_rules["paper_training_margin_execution_reserve"] = dict(
+                        paper_training_margin_reserve
+                    )
+                okx_order_rules["pre_submit_price_refresh"] = {
+                    "source": "okx_native_ticker_immediately_before_submit",
+                    "previous_price": round(previous_price, 12),
+                    "refreshed_price": round(price, 12),
+                    "source_timestamp_ms": int(submit_ticker.get("timestamp") or 0),
+                    "price_limit_timestamp_ms": int(
+                        submit_price_limit.get("price_limit_timestamp_ms") or 0
+                    ),
+                    "buy_price_limit": self._safe_float(
+                        submit_price_limit.get("buy_price_limit"),
+                        0.0,
+                    ),
+                    "sell_price_limit": self._safe_float(
+                        submit_price_limit.get("sell_price_limit"),
+                        0.0,
+                    ),
+                    "refreshed_at": datetime.now(UTC).isoformat(),
+                }
+                if order_quantity <= 0:
+                    return ExecutionResult(
+                        order_id="rejected",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "提交前价格刷新后，最小下单张数超过当前余额或风险预算；"
+                                "系统未向 OKX 发送订单。"
+                            ),
+                            "execution_blocker": "system_pre_submit_order_rule",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "okx_symbol": okx_symbol,
+                            "okx_order_rules": okx_order_rules,
+                        },
+                    )
                 market_size_adjustment = self._entry_market_order_size_adjustment(
                     decision=decision,
                     side=side,
@@ -2874,6 +2969,38 @@ class OKXExecutor(AbstractExecutor):
             "info": dict(row),
         }
 
+    async def _fetch_native_price_limit(self, symbol: str) -> dict[str, Any]:
+        """Fetch OKX market-order price bounds used by attached TP validation."""
+
+        inst_id = okx_inst_id_from_symbol(symbol)
+        if not inst_id:
+            raise ExchangeAPIError(f"Cannot resolve OKX instId for price limit: {symbol}")
+        ccxt = await self._get_ccxt()
+        fetch_price_limit = getattr(ccxt, "publicGetPublicPriceLimit", None)
+        if not callable(fetch_price_limit):
+            if isinstance(ccxt, OkxPerpetualSdkExchange):
+                raise ExchangeAPIError("OKX SDK price-limit API is unavailable")
+            # Lightweight test doubles and older adapters may not expose this
+            # generated endpoint. The production OKX adapter must expose it.
+            return {}
+        response = await self._with_retry(fetch_price_limit, {"instId": inst_id})
+        rows = response.get("data") if isinstance(response, dict) else None
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        if not isinstance(row, dict):
+            row = {}
+        buy_limit = self._safe_float(row.get("buyLmt"), 0.0)
+        sell_limit = self._safe_float(row.get("sellLmt"), 0.0)
+        if buy_limit <= 0 or sell_limit <= 0:
+            raise ExchangeAPIError(
+                f"OKX native price limit has no positive bounds: {inst_id}"
+            )
+        return {
+            "buy_price_limit": buy_limit,
+            "sell_price_limit": sell_limit,
+            "price_limit_timestamp_ms": int(self._safe_float(row.get("ts"), 0.0)),
+            "price_limit_info": dict(row),
+        }
+
     @staticmethod
     def _format_okx_number(value: float) -> str:
         try:
@@ -4569,7 +4696,16 @@ class OKXExecutor(AbstractExecutor):
         """Convert AI stop/take percentages into OKX trigger prices."""
         refs = [self._safe_float(entry_price, 0.0)]
         ticker = ticker if isinstance(ticker, dict) else {}
-        for key in ("last", "close", "bid", "ask", "high", "low"):
+        for key in (
+            "last",
+            "close",
+            "bid",
+            "ask",
+            "high",
+            "low",
+            "buy_price_limit",
+            "sell_price_limit",
+        ):
             value = self._safe_float(ticker.get(key), 0.0)
             if value > 0:
                 refs.append(value)

@@ -33,6 +33,9 @@ def _service() -> DataService:
     service._indicator_snapshot_priority_gate = data_service_module._PriorityBuildGate(
         max(1, int(data_service_module.INDICATOR_SNAPSHOT_BUILD_CONCURRENCY))
     )
+    service._native_market_snapshot_priority_gate = data_service_module._PriorityBuildGate(
+        max(1, int(data_service_module.NATIVE_MARKET_REMOTE_CONCURRENCY))
+    )
     service._kline_fetch_tasks = {}
     service._kline_background_refresh_tasks = {}
     service._kline_refresh_scheduled_at = {}
@@ -51,6 +54,101 @@ def _service() -> DataService:
     service._available_symbols_refresh_task = None
     service._stopping = False
     return service
+
+
+@pytest.mark.asyncio
+async def test_prioritized_feature_vector_wraps_native_sources_in_priority_gate() -> None:
+    service = _service()
+    acquired: list[bool] = []
+    release_count = 0
+
+    class Gate:
+        async def acquire(self, *, priority: bool) -> None:
+            acquired.append(priority)
+
+        def release(self) -> None:
+            nonlocal release_count
+            release_count += 1
+
+    async def no_sentiment(_symbol: str, *, wait_for_initial: bool) -> None:
+        assert wait_for_initial is False
+
+    async def ticker(_symbol: str, *, block_on_remote: bool) -> dict[str, Any]:
+        assert block_on_remote is True
+        return {"last_price": 100.0, "bid": 99.9, "ask": 100.1}
+
+    async def indicators(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return {"indicator_snapshot_available": True, "close": 100.0}
+
+    async def derivatives(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return {"orderbook_bid_depth": 10.0, "orderbook_ask_depth": 10.0}
+
+    service._native_market_snapshot_gate = lambda: Gate()  # type: ignore[method-assign]
+    service._ensure_sentiment_for_analysis = no_sentiment  # type: ignore[method-assign]
+    service._get_feature_ticker_snapshot = ticker  # type: ignore[method-assign]
+    service._get_feature_indicator_snapshot = indicators  # type: ignore[method-assign]
+    service._get_feature_derivatives_snapshot = derivatives  # type: ignore[method-assign]
+    service._attach_market_source_consistency = (  # type: ignore[method-assign]
+        lambda _symbol, ticker_snapshot, _derivatives_snapshot: ticker_snapshot
+    )
+
+    vector = await service.get_feature_vector(
+        "BTC/USDT",
+        wait_for_sentiment=False,
+        prioritize_native_market_data=True,
+    )
+
+    assert vector.current_price == 100.0
+    assert acquired == [True, True]
+    assert release_count == 2
+
+
+@pytest.mark.asyncio
+async def test_priority_queue_wait_does_not_consume_native_provider_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    monkeypatch.setattr(data_service_module, "FEATURE_SNAPSHOT_TIMEOUT_SECONDS", 0.5)
+
+    class SlowGate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is True
+            await asyncio.sleep(0.3)
+
+        def release(self) -> None:
+            return None
+
+    async def no_sentiment(_symbol: str, *, wait_for_initial: bool) -> None:
+        assert wait_for_initial is False
+
+    async def ticker(_symbol: str, *, block_on_remote: bool) -> dict[str, Any]:
+        assert block_on_remote is True
+        await asyncio.sleep(0.3)
+        return {"last_price": 100.0, "bid": 99.9, "ask": 100.1}
+
+    async def indicators(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return {"indicator_snapshot_available": True, "close": 100.0}
+
+    async def derivatives(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(0.3)
+        return {"orderbook_bid_depth": 10.0, "orderbook_ask_depth": 10.0}
+
+    service._native_market_snapshot_gate = lambda: SlowGate()  # type: ignore[method-assign]
+    service._ensure_sentiment_for_analysis = no_sentiment  # type: ignore[method-assign]
+    service._get_feature_ticker_snapshot = ticker  # type: ignore[method-assign]
+    service._get_feature_indicator_snapshot = indicators  # type: ignore[method-assign]
+    service._get_feature_derivatives_snapshot = derivatives  # type: ignore[method-assign]
+    service._attach_market_source_consistency = (  # type: ignore[method-assign]
+        lambda _symbol, ticker_snapshot, _derivatives_snapshot: ticker_snapshot
+    )
+
+    vector = await service.get_feature_vector(
+        "BTC/USDT",
+        wait_for_sentiment=False,
+        prioritize_native_market_data=True,
+    )
+
+    assert vector.current_price == 100.0
 
 
 @pytest.mark.asyncio

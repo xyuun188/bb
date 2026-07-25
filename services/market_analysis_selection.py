@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-07-22.advantage-coverage-market-analysis.v2"
+    VERSION = "2026-07-26.advantage-coverage-market-analysis.v3"
 
     def __init__(
         self,
@@ -374,6 +374,8 @@ class MarketAnalysisSelectionPolicy:
             "coverage_due_unselected_symbols": [
                 str(row["symbol"]) for row in coverage_due_unselected
             ],
+            "coverage_due_resolved_count": 0,
+            "coverage_due_resolved_symbols": [],
             "never_analyzed_candidate_count": sum(bool(row["never_analyzed"]) for row in rows),
             "oldest_completed_analysis_age_seconds": round(
                 max(

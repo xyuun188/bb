@@ -193,6 +193,7 @@ def assess_coverage_report(
     *,
     minimum_window_minutes: int = 30,
     max_activity_gap_seconds: float = 10 * 60,
+    candidate_selection_stale_seconds: float = 10 * 60,
     position_stale_seconds: float = 5 * 60,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -234,6 +235,21 @@ def assess_coverage_report(
         blockers.append("market_coverage_window_not_met")
     if int(coverage.get("overdue_count") or 0) > 0:
         blockers.append("market_coverage_has_overdue_symbols")
+    if coverage.get("monitoring_active") is True:
+        if coverage.get("candidate_coverage_evidence_available") is not True:
+            blockers.append("market_candidate_coverage_evidence_missing")
+        selection_generated_at = _parse_datetime(coverage.get("candidate_selection_generated_at"))
+        if selection_generated_at is None or (
+            observed_at - selection_generated_at
+        ).total_seconds() > max(float(candidate_selection_stale_seconds), 1.0):
+            blockers.append("market_candidate_coverage_evidence_stale")
+        if int(coverage.get("coverage_due_count") or 0) > 0:
+            blockers.append("market_candidate_coverage_has_unresolved_due_symbols")
+        candidate_target_seconds = float(
+            coverage.get("candidate_coverage_target_seconds") or float("inf")
+        )
+        if candidate_target_seconds > max(window_minutes * 60, 1):
+            blockers.append("market_candidate_coverage_target_exceeds_window")
 
     market = report.get("market") if isinstance(report.get("market"), dict) else {}
     if int(market.get("decision_count") or 0) <= 0:
@@ -276,6 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-app-dir", default="/data/bb/app")
     parser.add_argument("--window-minutes", type=int, default=30)
     parser.add_argument("--max-activity-gap-seconds", type=float, default=10 * 60)
+    parser.add_argument("--candidate-selection-stale-seconds", type=float, default=10 * 60)
     parser.add_argument("--position-stale-seconds", type=float, default=5 * 60)
     parser.add_argument("--timeout", type=int, default=90)
     parser.add_argument(
@@ -315,6 +332,7 @@ def main() -> None:
     report["assessment"] = assess_coverage_report(
         report,
         max_activity_gap_seconds=args.max_activity_gap_seconds,
+        candidate_selection_stale_seconds=args.candidate_selection_stale_seconds,
         position_stale_seconds=args.position_stale_seconds,
     )
     safe_print(json.dumps(report, ensure_ascii=False, indent=2, default=str))

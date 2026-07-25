@@ -251,6 +251,8 @@ MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
+MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 30.0
+MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 
 
@@ -776,7 +778,7 @@ class TradingService:
             mark_decision_reason=self._mark_decision_reason,
             mark_decision_pending_execution=self._mark_decision_pending_execution,
             result_recorder=self.market_decision_result_recorder,
-            set_loop_stage=self._set_loop_stage,
+            set_loop_stage=self._set_market_entry_pipeline_stage,
             candidate_executor=self._execute_candidate,
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
             capacity_releaser=self.entry_capacity.release_slot,
@@ -833,6 +835,10 @@ class TradingService:
         self._trade_count = 0
         self._recent_decisions: list[dict] = []
         self._recent_executions: list[dict] = []
+        self._market_entry_pipeline_tasks: dict[str, asyncio.Task] = {}
+        self._market_entry_pipeline_semaphore = asyncio.Semaphore(1)
+        self._market_entry_pipeline_stage = "idle"
+        self._market_entry_pipeline_stage_updated_at: datetime | None = None
         self._start_time: datetime | None = None
         self._current_stage = "idle"
         self._last_round_started_at: datetime | None = None
@@ -3966,6 +3972,7 @@ class TradingService:
         allow_indicator_background_refresh: bool = True,
         allow_derivatives_background_refresh: bool = True,
         prioritize_indicator_build: bool = False,
+        prioritize_native_market_data: bool = False,
     ) -> Any:
         """Read a feature vector while preserving compatibility with older test doubles."""
 
@@ -3995,6 +4002,9 @@ class TradingService:
             accepts_indicator_priority_option = (
                 "prioritize_indicator_build" in parameters or accepts_var_kwargs
             )
+            accepts_native_market_priority_option = (
+                "prioritize_native_market_data" in parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             accepts_options = True
             accepts_ticker_option = True
@@ -4004,6 +4014,7 @@ class TradingService:
             accepts_indicator_background_refresh_option = True
             accepts_derivatives_background_refresh_option = True
             accepts_indicator_priority_option = True
+            accepts_native_market_priority_option = True
 
         kwargs: dict[str, Any] = {}
         if accepts_options:
@@ -4022,6 +4033,8 @@ class TradingService:
             kwargs["allow_derivatives_background_refresh"] = allow_derivatives_background_refresh
         if accepts_indicator_priority_option:
             kwargs["prioritize_indicator_build"] = prioritize_indicator_build
+        if accepts_native_market_priority_option and prioritize_native_market_data:
+            kwargs["prioritize_native_market_data"] = True
         if kwargs:
             return await getter(symbol, **kwargs)
         return await getter(symbol)
@@ -4043,8 +4056,8 @@ class TradingService:
             # keep the ranker from seeing an empty candidate pool while the
             # final AI/entry gates still require complete current evidence.
             "allow_cached_indicator_build": True,
-            "allow_indicator_background_refresh": True,
-            "allow_derivatives_background_refresh": True,
+            "allow_indicator_background_refresh": not market_only,
+            "allow_derivatives_background_refresh": not market_only,
         }
 
     def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:
@@ -4276,6 +4289,7 @@ class TradingService:
                     getattr(self, "_last_market_round_summary", {})
                 ),
                 "market_analysis_deferred": self._market_defer_snapshot(),
+                "market_entry_pipeline": self._market_entry_pipeline_snapshot(),
                 "okx_authoritative_sync": okx_authoritative_sync,
                 "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
                 "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
@@ -4316,35 +4330,96 @@ class TradingService:
         signals tied to a recent market snapshot.
         """
         _ = fallback
+
+        def validated(candidate: Any, *, source: str) -> tuple[Any | None, Any | None]:
+            if not self._is_valid_feature_vector(candidate):
+                return None, None
+            quality_policy = getattr(self, "entry_market_data_quality", None)
+            quality_issue = (
+                quality_policy.issue(candidate, stage_label="AI分析前")
+                if quality_policy is not None
+                else None
+            )
+            if quality_issue is None:
+                return candidate, None
+            quality_details = getattr(quality_issue, "details", None)
+            quality_details = quality_details if isinstance(quality_details, dict) else {}
+            logger.warning(
+                "fresh feature vector failed entry market data quality; deferring symbol",
+                symbol=symbol,
+                source=source,
+                diagnostic_code=getattr(quality_issue, "code", "market_data_quality"),
+                diagnostic_reason_codes=str(
+                    quality_details.get("market_fact_reason_codes") or ""
+                ),
+                diagnostic_details=quality_details,
+            )
+            return None, quality_issue
+
+        local_quality_issue: Any | None = None
+        local_candidate: Any | None = None
+        try:
+            local_candidate = await asyncio.wait_for(
+                self._get_feature_vector_snapshot(
+                    symbol,
+                    wait_for_sentiment=False,
+                    block_on_remote_ticker=False,
+                    block_on_remote_indicators=False,
+                    block_on_remote_derivatives=False,
+                    allow_cached_indicator_build=True,
+                    allow_indicator_background_refresh=False,
+                    allow_derivatives_background_refresh=False,
+                    prioritize_indicator_build=True,
+                ),
+                timeout=MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS,
+            )
+            cached, local_quality_issue = validated(
+                local_candidate,
+                source="fresh_local_market_cache",
+            )
+            if cached is not None:
+                return cached
+        except TimeoutError:
+            logger.info(
+                "fresh local feature cache timed out; trying remote refresh",
+                symbol=symbol,
+            )
+        except Exception as exc:
+            logger.info(
+                "fresh local feature cache failed; trying remote refresh",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+
+        refresh_native_market_only = bool(
+            local_quality_issue is not None
+            and getattr(local_quality_issue, "code", "") == "native_market_fact_invalid"
+            and bool(getattr(local_candidate, "indicator_snapshot_available", False))
+        )
+        refresh_source = (
+            "blocking_native_market_refresh"
+            if refresh_native_market_only
+            else "blocking_remote_market_refresh"
+        )
         try:
             fresh = await asyncio.wait_for(
                 self._get_feature_vector_snapshot(
                     symbol,
                     wait_for_sentiment=False,
-                    block_on_remote_indicators=True,
+                    block_on_remote_ticker=True,
+                    block_on_remote_indicators=not refresh_native_market_only,
                     block_on_remote_derivatives=True,
-                    allow_cached_indicator_build=False,
+                    allow_cached_indicator_build=refresh_native_market_only,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
                     prioritize_indicator_build=True,
+                    prioritize_native_market_data=True,
                 ),
-                timeout=8.0,
+                timeout=MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS,
             )
-            if self._is_valid_feature_vector(fresh):
-                quality_policy = getattr(self, "entry_market_data_quality", None)
-                quality_issue = (
-                    quality_policy.issue(fresh, stage_label="AI分析前")
-                    if quality_policy is not None
-                    else None
-                )
-                if quality_issue is None:
-                    return fresh
-                logger.warning(
-                    "fresh feature vector failed entry market data quality; deferring symbol",
-                    symbol=symbol,
-                    diagnostic_code=getattr(quality_issue, "code", "market_data_quality"),
-                )
-                return None
+            fresh, _fresh_quality_issue = validated(fresh, source=refresh_source)
+            if fresh is not None:
+                return fresh
             logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
             logger.warning(
@@ -4630,6 +4705,7 @@ class TradingService:
                     wait_for_sentiment=False,
                     block_on_remote_indicators=False,
                     block_on_remote_derivatives=True,
+                    prioritize_native_market_data=True,
                 ),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
@@ -5684,10 +5760,31 @@ class TradingService:
                     ENSEMBLE_TRADER_NAME
                 )
             )
+        selection = self._safe_dict(
+            getattr(self, "_last_market_analysis_selection_diagnostics", {})
+        )
+        coverage_due_symbols = list(selection.get("coverage_due_symbols") or [])
+        selection_evidence_available = bool(selection.get("generated_at"))
         snapshot["monitoring_active"] = bool(monitoring_active)
-        snapshot["coverage_window_evaluable"] = bool(monitoring_active)
+        snapshot["candidate_coverage_evidence_available"] = selection_evidence_available
+        snapshot["candidate_selection_generated_at"] = selection.get("generated_at")
+        snapshot["candidate_count"] = int(selection.get("candidate_count") or 0)
+        snapshot["candidate_coverage_target_seconds"] = selection.get("coverage_target_seconds")
+        snapshot["coverage_due_count"] = len(coverage_due_symbols)
+        snapshot["coverage_due_symbols"] = coverage_due_symbols[:50]
+        snapshot["coverage_due_resolved_count"] = int(
+            selection.get("coverage_due_resolved_count") or 0
+        )
+        snapshot["coverage_due_resolved_symbols"] = list(
+            selection.get("coverage_due_resolved_symbols") or []
+        )[:50]
+        snapshot["coverage_window_evaluable"] = bool(
+            monitoring_active and selection_evidence_available
+        )
         snapshot["coverage_window_met"] = (
-            snapshot.get("pending_coverage_window_met") if monitoring_active else None
+            bool(snapshot.get("pending_coverage_window_met") and not coverage_due_symbols)
+            if snapshot["coverage_window_evaluable"]
+            else None
         )
         return snapshot
 
@@ -5824,6 +5921,58 @@ class TradingService:
 
     def _remember_market_analysis_observation(self, symbol: str, feature: Any) -> None:
         self._market_analysis_selector_policy().remember(symbol, feature)
+        self._mark_market_analysis_coverage_completed(symbol)
+
+    def _mark_market_analysis_coverage_completed(self, symbol: str) -> None:
+        diagnostics = self._safe_dict(
+            getattr(self, "_last_market_analysis_selection_diagnostics", {})
+        )
+        key = self._normalize_position_symbol(symbol)
+        if not diagnostics or not key:
+            return
+
+        def without_symbol(values: Any) -> list[str]:
+            return [
+                str(value)
+                for value in values or []
+                if self._normalize_position_symbol(value) != key
+            ]
+
+        due_before = list(diagnostics.get("coverage_due_symbols") or [])
+        was_due = any(self._normalize_position_symbol(value) == key for value in due_before)
+        diagnostics["coverage_due_symbols"] = without_symbol(due_before)
+        diagnostics["coverage_due_candidate_count"] = len(diagnostics["coverage_due_symbols"])
+        diagnostics["coverage_due_unselected_symbols"] = without_symbol(
+            diagnostics.get("coverage_due_unselected_symbols")
+        )
+        diagnostics["coverage_due_unselected_count"] = len(
+            diagnostics["coverage_due_unselected_symbols"]
+        )
+
+        was_never_analyzed = False
+        for collection_name in ("selected", "candidate_sample"):
+            for item in diagnostics.get(collection_name) or []:
+                if not isinstance(item, dict) or (
+                    self._normalize_position_symbol(item.get("symbol")) != key
+                ):
+                    continue
+                was_never_analyzed = was_never_analyzed or item.get("never_analyzed") is True
+                item["recent_age_seconds"] = 0.0
+                item["recent_unchanged"] = False
+                item["never_analyzed"] = False
+                item["coverage_due"] = False
+                item["selection_status"] = "completed_this_round"
+        if was_never_analyzed:
+            diagnostics["never_analyzed_candidate_count"] = max(
+                int(diagnostics.get("never_analyzed_candidate_count") or 0) - 1,
+                0,
+            )
+        if was_due:
+            resolved = list(diagnostics.get("coverage_due_resolved_symbols") or [])
+            if not any(self._normalize_position_symbol(value) == key for value in resolved):
+                resolved.append(str(symbol))
+            diagnostics["coverage_due_resolved_symbols"] = resolved
+            diagnostics["coverage_due_resolved_count"] = len(resolved)
 
     def _rank_auto_feature_vectors(
         self,
@@ -6307,6 +6456,454 @@ class TradingService:
             return
         async with self._analysis_symbol_lock:
             self._active_analysis_symbols.discard(normalized)
+
+    def _market_entry_task_store(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_market_entry_pipeline_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._market_entry_pipeline_tasks = tasks
+        return tasks
+
+    def _market_entry_pipeline_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_market_entry_pipeline_semaphore", None)
+        if not isinstance(gate, asyncio.Semaphore):
+            gate = asyncio.Semaphore(1)
+            self._market_entry_pipeline_semaphore = gate
+        return gate
+
+    def _set_market_entry_pipeline_stage(self, stage: str) -> None:
+        self._market_entry_pipeline_stage = str(stage or "idle")
+        self._market_entry_pipeline_stage_updated_at = datetime.now(UTC)
+
+    def _market_entry_pipeline_snapshot(self) -> dict[str, Any]:
+        active_tasks = {
+            symbol: task
+            for symbol, task in self._market_entry_task_store().items()
+            if not task.done()
+        }
+        updated_at = getattr(self, "_market_entry_pipeline_stage_updated_at", None)
+        return {
+            "active_count": len(active_tasks),
+            "active_symbols": list(active_tasks)[:20],
+            "queue_timeout_seconds": MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS,
+            "single_flight": True,
+            "stage": str(getattr(self, "_market_entry_pipeline_stage", "idle") or "idle"),
+            "stage_updated_at": (
+                updated_at.isoformat() if isinstance(updated_at, datetime) else None
+            ),
+        }
+
+    async def _run_market_entry_pipeline(
+        self,
+        *,
+        symbol: str,
+        model_name: str,
+        decision: DecisionOutput,
+        decision_db_id: int | None,
+        model_mode: str,
+        feature_vector: Any,
+        results: dict[str, Any],
+        open_positions: list[dict[str, Any]],
+        staged_entry_counts: dict[str, dict[Any, int]],
+        strategy_mode_context: dict[str, Any] | None,
+        market_regime_context: dict[str, Any] | None,
+        new_pair_pause_reason: str | None,
+    ) -> None:
+        """Finish risk preparation and execution outside the market analysis clock."""
+
+        try:
+            await self._prepare_entry_for_hard_risk(
+                decision,
+                model_mode,
+                open_positions,
+                decision_db_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = (
+                "动态费后收益风险预算生成失败，本次 entry 失败关闭："
+                f"{safe_error_text(exc, limit=160)}"
+            )
+            raw_response = self._annotate_candidate_selection(
+                decision,
+                selected=False,
+                reason=reason,
+            )
+            if decision_db_id is not None:
+                await self._mark_decision_raw_response(decision_db_id, raw_response)
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.RISK_CHECK,
+                    DecisionStageStatus.FAILED,
+                    reason,
+                    {
+                        "blocker": "dynamic_entry_risk_contract_preparation",
+                        "selected_for_execution": False,
+                    },
+                )
+                await self._mark_decision_reason(decision_db_id, reason)
+            self.market_decision_result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=decision,
+                model_mode=model_mode,
+                approved=False,
+                execution_status="error",
+                reason=reason,
+            )
+            return
+
+        assessment = await self.market_decision_risk_assessment.assess(
+            decision=decision,
+            model_name=model_name,
+            open_positions=open_positions,
+            feature_vector=feature_vector,
+            strategy_mode_context=strategy_mode_context,
+        )
+
+        if not assessment.approved:
+            logger.info(
+                "risk blocked decision",
+                model=model_name,
+                symbol=symbol,
+                reason=assessment.rejection_reason,
+            )
+            reason = assessment.rejection_reason or "风控引擎拒绝该决策。"
+            if model_mode == "paper":
+                attach_risk_adjusted_trade_recommendation(
+                    decision,
+                    status="rejected",
+                    reason=reason,
+                )
+            if decision_db_id is not None:
+                await self._mark_decision_reason(decision_db_id, reason)
+            self.market_decision_result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=decision,
+                model_mode=model_mode,
+                approved=False,
+                execution_status="rejected",
+                reason=reason,
+            )
+            if decision_db_id is not None:
+                raw_response = self._annotate_candidate_selection(
+                    decision,
+                    selected=False,
+                    reason=reason,
+                )
+                await self._mark_decision_raw_response(decision_db_id, raw_response)
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.RISK_CHECK,
+                    DecisionStageStatus.BLOCKED,
+                    reason,
+                    {
+                        "blocker": "hard_risk_engine",
+                        "selected_for_execution": False,
+                    },
+                )
+                await self._mark_decision_reason(decision_db_id, reason)
+            return
+
+        executed = assessment.decision if assessment.decision else decision
+        if executed is not decision and decision.raw_response and not executed.raw_response:
+            executed.raw_response = decision.raw_response
+            executed.feature_snapshot = executed.feature_snapshot or decision.feature_snapshot
+        if model_mode == "paper":
+            attach_risk_adjusted_trade_recommendation(
+                executed,
+                status=("adjusted_to_hold" if executed.is_hold else "approved"),
+                reason=(
+                    "硬风控调整后改为观望。"
+                    if executed.is_hold
+                    else "硬风控已确认模拟盘最终交易方案。"
+                ),
+            )
+            if decision_db_id is not None:
+                await self._mark_decision_raw_response(
+                    decision_db_id,
+                    executed.raw_response,
+                )
+        if executed.is_hold:
+            executed_raw = executed.raw_response if isinstance(executed.raw_response, dict) else {}
+            hold_reason = (
+                executed.reasoning
+                if isinstance(executed_raw.get("paper_bootstrap_canary_observation"), dict)
+                else "多模型裁决结果为观望，未提交订单。"
+            )
+            if decision_db_id is not None:
+                if executed_raw:
+                    await self._mark_decision_raw_response(decision_db_id, executed_raw)
+                await self._mark_decision_reason(decision_db_id, hold_reason)
+            self.market_decision_result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action="hold",
+                model_mode=model_mode,
+                approved=True,
+                confidence=executed.confidence,
+                reason=hold_reason,
+            )
+            return
+
+        if executed.is_exit:
+            reason = "市场分析阶段禁止执行平仓动作；平仓只允许由持仓分析产生，本轮改为观望。"
+            raw_response = executed.raw_response if isinstance(executed.raw_response, dict) else {}
+            raw_response["market_exit_execution_guard"] = {
+                "applied": True,
+                "original_action": executed.action.value,
+                "reason": "market_analysis_close_forbidden",
+            }
+            executed.raw_response = raw_response
+            if decision_db_id is not None:
+                await self._mark_decision_raw_response(decision_db_id, raw_response)
+                await self._mark_decision_reason(decision_db_id, reason)
+            self.market_decision_result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=executed,
+                model_mode=model_mode,
+                approved=True,
+                execution_status="skipped",
+                reason=reason,
+            )
+            return
+
+        if new_pair_pause_reason and executed.is_entry:
+            raw_response = self._annotate_candidate_selection(
+                decision,
+                selected=False,
+                reason=new_pair_pause_reason,
+            )
+            if decision_db_id is not None:
+                await self._mark_decision_raw_response(decision_db_id, raw_response)
+                await self._mark_decision_reason(decision_db_id, new_pair_pause_reason)
+            self.market_decision_result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=executed,
+                model_mode=model_mode,
+                approved=True,
+                execution_status="skipped",
+                reason=new_pair_pause_reason,
+            )
+            return
+
+        regime_reason = self.entry_market_regime.reason(
+            executed,
+            strategy_mode_context or market_regime_context,
+        )
+        if regime_reason:
+            raw_response = self._annotate_candidate_selection(
+                decision,
+                selected=False,
+                reason=regime_reason,
+            )
+            if decision_db_id is not None:
+                await self._mark_decision_raw_response(decision_db_id, raw_response)
+                await self._mark_decision_reason(decision_db_id, regime_reason)
+            self.market_decision_result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=executed,
+                model_mode=model_mode,
+                approved=True,
+                execution_status="skipped",
+                reason=regime_reason,
+            )
+            return
+
+        await self.market_auto_entry_processor.process(
+            symbol=symbol,
+            model_name=model_name,
+            decision=executed,
+            assessment=assessment,
+            decision_db_id=decision_db_id,
+            results=results,
+            model_mode=model_mode,
+            open_positions=open_positions,
+            staged_entry_counts=staged_entry_counts,
+            strategy_mode_context=strategy_mode_context,
+        )
+
+    async def _run_scheduled_market_entry_pipeline(
+        self,
+        *,
+        symbol: str,
+        model_name: str,
+        decision: DecisionOutput,
+        decision_db_id: int | None,
+        model_mode: str,
+        feature_vector: Any,
+        results: dict[str, Any],
+        open_positions: list[dict[str, Any]],
+        staged_entry_counts: dict[str, dict[Any, int]],
+        strategy_mode_context: dict[str, Any] | None,
+        market_regime_context: dict[str, Any] | None,
+        new_pair_pause_reason: str | None,
+    ) -> None:
+        key = self._normalize_position_symbol(symbol)
+        gate = self._market_entry_pipeline_gate()
+        gate_acquired = False
+        try:
+            if decision_db_id is not None:
+                await self._mark_decision_pending_execution(
+                    decision_db_id,
+                    "开仓裁决已移交执行队列，正在等待风险准备和 OKX 执行链路；市场分析继续处理后续币种。",
+                )
+            try:
+                await asyncio.wait_for(
+                    gate.acquire(),
+                    timeout=MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS,
+                )
+                gate_acquired = True
+            except TimeoutError:
+                reason = (
+                    "开仓裁决等待执行链路超过 30 秒，行情与账户快照可能已经过期；"
+                    "本次不提交订单，下一轮使用最新数据重新评估。"
+                )
+                if decision_db_id is not None:
+                    await self._mark_decision_reason(decision_db_id, reason)
+                self.market_decision_result_recorder.append_result(
+                    results=results,
+                    model_name=model_name,
+                    symbol=symbol,
+                    decision_or_action=decision,
+                    model_mode=model_mode,
+                    approved=True,
+                    execution_status="skipped",
+                    reason=reason,
+                )
+            else:
+                self._set_market_entry_pipeline_stage(f"risk_and_execution:{symbol}")
+                await self._run_market_entry_pipeline(
+                    symbol=symbol,
+                    model_name=model_name,
+                    decision=decision,
+                    decision_db_id=decision_db_id,
+                    model_mode=model_mode,
+                    feature_vector=feature_vector,
+                    results=results,
+                    open_positions=open_positions,
+                    staged_entry_counts=staged_entry_counts,
+                    strategy_mode_context=strategy_mode_context,
+                    market_regime_context=market_regime_context,
+                    new_pair_pause_reason=new_pair_pause_reason,
+                )
+            if decision_db_id is not None:
+                await self.decision_final_state_ensurer.ensure(
+                    decision_db_id,
+                    symbol,
+                    model_name,
+                    decision,
+                    results,
+                )
+        except asyncio.CancelledError:
+            reason = "开仓执行队列在服务停止时被取消，系统未把该裁决视为已成交。"
+            if decision_db_id is not None:
+                await self._mark_decision_reason(decision_db_id, reason)
+                await self.decision_final_state_ensurer.ensure(
+                    decision_db_id,
+                    symbol,
+                    model_name,
+                    decision,
+                    results,
+                )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "background market entry pipeline failed",
+                symbol=symbol,
+                model=model_name,
+                error=safe_error_text(exc),
+            )
+            if decision_db_id is not None:
+                await self._mark_decision_reason(
+                    decision_db_id,
+                    "开仓执行队列异常中断，系统未提交或确认新的成交。",
+                )
+                await self.decision_final_state_ensurer.ensure(
+                    decision_db_id,
+                    symbol,
+                    model_name,
+                    decision,
+                    results,
+                )
+        finally:
+            await self._release_analysis_symbol(symbol)
+            current = asyncio.current_task()
+            tasks = self._market_entry_task_store()
+            if tasks.get(key) is current:
+                tasks.pop(key, None)
+            if gate_acquired:
+                remaining_tasks = [task for task in tasks.values() if not task.done()]
+                self._set_market_entry_pipeline_stage("queued" if remaining_tasks else "idle")
+                gate.release()
+            new_decisions = list(results.get("decisions") or [])
+            new_executions = list(results.get("executions") or [])
+            if new_decisions:
+                self._recent_decisions = (self._recent_decisions + new_decisions)[-20:]
+            if new_executions:
+                self._recent_executions = (self._recent_executions + new_executions)[-20:]
+            if new_decisions or new_executions:
+                await self._publish_dashboard_update(results)
+
+    def _schedule_market_entry_pipeline(
+        self,
+        *,
+        symbol: str,
+        model_name: str,
+        decision: DecisionOutput,
+        decision_db_id: int | None,
+        model_mode: str,
+        feature_vector: Any,
+        open_positions: list[dict[str, Any]],
+        staged_entry_counts: dict[str, dict[Any, int]],
+        strategy_mode_context: dict[str, Any] | None,
+        market_regime_context: dict[str, Any] | None,
+        new_pair_pause_reason: str | None,
+    ) -> bool:
+        key = self._normalize_position_symbol(symbol)
+        tasks = self._market_entry_task_store()
+        existing = tasks.get(key)
+        if existing is not None and not existing.done():
+            return False
+        background_results: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "status": "ok",
+            "decisions": [],
+            "executions": [],
+            "warnings": [],
+        }
+        task = asyncio.create_task(
+            self._run_scheduled_market_entry_pipeline(
+                symbol=symbol,
+                model_name=model_name,
+                decision=decision,
+                decision_db_id=decision_db_id,
+                model_mode=model_mode,
+                feature_vector=feature_vector,
+                results=background_results,
+                open_positions=open_positions,
+                staged_entry_counts=staged_entry_counts,
+                strategy_mode_context=strategy_mode_context,
+                market_regime_context=market_regime_context,
+                new_pair_pause_reason=new_pair_pause_reason,
+            )
+        )
+        tasks[key] = task
+        task.add_done_callback(_consume_task_result)
+        return True
 
     async def initialize(self) -> None:
         """Initialize models, executors, and connections."""
@@ -7607,246 +8204,51 @@ class TradingService:
                     )
                     continue
 
-                try:
-                    await self._prepare_entry_for_hard_risk(
-                        decision,
-                        model_mode,
-                        open_positions,
-                        decision_db_id,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    reason = (
-                        "动态费后收益风险预算生成失败，本次 entry 失败关闭："
-                        f"{safe_error_text(exc, limit=160)}"
-                    )
-                    raw_response = self._annotate_candidate_selection(
-                        decision,
-                        selected=False,
-                        reason=reason,
-                    )
-                    if decision_db_id is not None:
-                        await self._mark_decision_raw_response(decision_db_id, raw_response)
-                        await self._record_and_persist_decision_stage(
-                            decision_db_id,
-                            decision,
-                            DecisionStage.RISK_CHECK,
-                            DecisionStageStatus.FAILED,
-                            reason,
-                            {
-                                "blocker": "dynamic_entry_risk_contract_preparation",
-                                "selected_for_execution": False,
-                            },
-                        )
-                        await self._mark_decision_reason(decision_db_id, reason)
-                    self.market_decision_result_recorder.append_result(
-                        results=results,
-                        model_name=model_name,
-                        symbol=symbol,
-                        decision_or_action=decision,
-                        model_mode=model_mode,
-                        approved=False,
-                        execution_status="error",
-                        reason=reason,
-                    )
-                    continue
-
-                assessment = await self.market_decision_risk_assessment.assess(
-                    decision=decision,
-                    model_name=model_name,
-                    open_positions=open_positions,
-                    feature_vector=fv,
-                    strategy_mode_context=strategy_mode_context,
-                )
-
-                if not assessment.approved:
-                    logger.info(
-                        "risk blocked decision",
-                        model=model_name,
-                        symbol=symbol,
-                        reason=assessment.rejection_reason,
-                    )
-                    reason = assessment.rejection_reason or "风控引擎拒绝该决策。"
-                    if model_mode == "paper":
-                        attach_risk_adjusted_trade_recommendation(
-                            decision,
-                            status="rejected",
-                            reason=reason,
-                        )
-                    if decision_db_id is not None:
-                        await self._mark_decision_reason(decision_db_id, reason)
-                    self.market_decision_result_recorder.append_result(
-                        results=results,
-                        model_name=model_name,
-                        symbol=symbol,
-                        decision_or_action=decision,
-                        model_mode=model_mode,
-                        approved=False,
-                        execution_status="rejected",
-                        reason=reason,
-                    )
-                    if decision_db_id is not None:
-                        raw_response = self._annotate_candidate_selection(
-                            decision,
-                            selected=False,
-                            reason=reason,
-                        )
-                        await self._mark_decision_raw_response(decision_db_id, raw_response)
-                        await self._record_and_persist_decision_stage(
-                            decision_db_id,
-                            decision,
-                            DecisionStage.RISK_CHECK,
-                            DecisionStageStatus.BLOCKED,
-                            reason,
-                            {
-                                "blocker": "hard_risk_engine",
-                                "selected_for_execution": False,
-                            },
-                        )
-                        await self._mark_decision_reason(decision_db_id, reason)
-                    continue
-
-                executed = assessment.decision if assessment.decision else decision
-                if executed is not decision and decision.raw_response and not executed.raw_response:
-                    executed.raw_response = decision.raw_response
-                    executed.feature_snapshot = (
-                        executed.feature_snapshot or decision.feature_snapshot
-                    )
-                if model_mode == "paper":
-                    attach_risk_adjusted_trade_recommendation(
-                        executed,
-                        status=("adjusted_to_hold" if executed.is_hold else "approved"),
-                        reason=(
-                            "硬风控调整后改为观望。"
-                            if executed.is_hold
-                            else "硬风控已确认模拟盘最终交易方案。"
-                        ),
-                    )
-                    if decision_db_id is not None:
-                        await self._mark_decision_raw_response(
-                            decision_db_id,
-                            executed.raw_response,
-                        )
-                if executed.is_hold:
-                    executed_raw = (
-                        executed.raw_response if isinstance(executed.raw_response, dict) else {}
-                    )
-                    hold_reason = (
-                        executed.reasoning
-                        if isinstance(
-                            executed_raw.get("paper_bootstrap_canary_observation"),
-                            dict,
-                        )
-                        else "多模型裁决结果为观望，未提交订单。"
-                    )
-                    if decision_db_id is not None:
-                        if executed_raw:
-                            await self._mark_decision_raw_response(
-                                decision_db_id,
-                                executed_raw,
-                            )
-                        await self._mark_decision_reason(
-                            decision_db_id,
-                            hold_reason,
-                        )
-                    self.market_decision_result_recorder.append_result(
-                        results=results,
-                        model_name=model_name,
-                        symbol=symbol,
-                        decision_or_action="hold",
-                        model_mode=model_mode,
-                        approved=True,
-                        confidence=executed.confidence,
-                        reason=hold_reason,
-                    )
-                    continue
-
-                if executed.is_exit:
-                    reason = (
-                        "市场分析阶段禁止执行平仓动作；平仓只允许由持仓分析产生，本轮改为观望。"
-                    )
-                    raw_response = (
-                        executed.raw_response if isinstance(executed.raw_response, dict) else {}
-                    )
-                    raw_response["market_exit_execution_guard"] = {
-                        "applied": True,
-                        "original_action": executed.action.value,
-                        "reason": "market_analysis_close_forbidden",
-                    }
-                    executed.raw_response = raw_response
-                    if decision_db_id is not None:
-                        await self._mark_decision_raw_response(decision_db_id, raw_response)
-                        await self._mark_decision_reason(decision_db_id, reason)
-                    self.market_decision_result_recorder.append_result(
-                        results=results,
-                        model_name=model_name,
-                        symbol=symbol,
-                        decision_or_action=executed,
-                        model_mode=model_mode,
-                        approved=True,
-                        execution_status="skipped",
-                        reason=reason,
-                    )
-                    continue
-
-                if new_pair_pause_reason and executed.is_entry:
-                    raw_response = self._annotate_candidate_selection(
-                        decision,
-                        selected=False,
-                        reason=new_pair_pause_reason,
-                    )
-                    if decision_db_id is not None:
-                        await self._mark_decision_raw_response(decision_db_id, raw_response)
-                        await self._mark_decision_reason(decision_db_id, new_pair_pause_reason)
-                    self.market_decision_result_recorder.append_result(
-                        results=results,
-                        model_name=model_name,
-                        symbol=symbol,
-                        decision_or_action=executed,
-                        model_mode=model_mode,
-                        approved=True,
-                        execution_status="skipped",
-                        reason=new_pair_pause_reason,
-                    )
-                    continue
-
-                regime_reason = self.entry_market_regime.reason(
-                    executed,
-                    strategy_mode_context or market_regime_context,
-                )
-                if regime_reason:
-                    raw_response = self._annotate_candidate_selection(
-                        decision,
-                        selected=False,
-                        reason=regime_reason,
-                    )
-                    if decision_db_id is not None:
-                        await self._mark_decision_raw_response(decision_db_id, raw_response)
-                        await self._mark_decision_reason(decision_db_id, regime_reason)
-                    self.market_decision_result_recorder.append_result(
-                        results=results,
-                        model_name=model_name,
-                        symbol=symbol,
-                        decision_or_action=executed,
-                        model_mode=model_mode,
-                        approved=True,
-                        execution_status="skipped",
-                        reason=regime_reason,
-                    )
-                    continue
-
-                await self.market_auto_entry_processor.process(
+                scheduled = self._schedule_market_entry_pipeline(
                     symbol=symbol,
                     model_name=model_name,
-                    decision=executed,
-                    assessment=assessment,
+                    decision=decision,
                     decision_db_id=decision_db_id,
-                    results=results,
                     model_mode=model_mode,
                     open_positions=open_positions,
+                    feature_vector=fv,
                     staged_entry_counts=staged_entry_counts,
                     strategy_mode_context=strategy_mode_context,
+                    market_regime_context=market_regime_context,
+                    new_pair_pause_reason=new_pair_pause_reason,
+                )
+                if not scheduled:
+                    reason = "该币种已有开仓执行任务，当前裁决不重复进入执行队列。"
+                    if decision_db_id is not None:
+                        await self._mark_decision_reason(decision_db_id, reason)
+                    self.market_decision_result_recorder.append_result(
+                        results=results,
+                        model_name=model_name,
+                        symbol=symbol,
+                        decision_or_action=decision,
+                        model_mode=model_mode,
+                        approved=True,
+                        execution_status="skipped",
+                        reason=reason,
+                    )
+                    continue
+                normalized_symbol = self._normalize_position_symbol(symbol)
+                claimed_analysis_symbols[:] = [
+                    claimed_symbol
+                    for claimed_symbol in claimed_analysis_symbols
+                    if self._normalize_position_symbol(claimed_symbol) != normalized_symbol
+                ]
+                if decision_db_id is not None:
+                    round_decision_ids.discard(decision_db_id)
+                    round_decisions.pop(decision_db_id, None)
+                results.setdefault("market_entry_handoffs", []).append(
+                    {
+                        "symbol": symbol,
+                        "model": model_name,
+                        "decision_id": decision_db_id,
+                        "status": "queued",
+                        "analysis_continues": True,
+                    }
                 )
                 continue
 
@@ -8203,6 +8605,13 @@ class TradingService:
         self._shadow_backtest_update_task = None
         self._stale_entry_expire_task = None
         self._market_indicator_prewarm_task = None
+        market_entry_tasks = list(self._market_entry_task_store().values())
+        for task in market_entry_tasks:
+            if not task.done():
+                task.cancel()
+        if market_entry_tasks:
+            await asyncio.gather(*market_entry_tasks, return_exceptions=True)
+        self._market_entry_pipeline_tasks = {}
         vector_memory_tasks = list(
             (getattr(self, "_vector_memory_context_tasks", {}) or {}).values()
         )
@@ -11767,6 +12176,7 @@ class TradingService:
             "trades_total": self._trade_count,
             "recent_decisions": recent_decs,
             "recent_executions": recent_execs,
+            "market_entry_pipeline": self._market_entry_pipeline_snapshot(),
             "current_stage": current_state.current_stage,
             "current_stage_label": stage_label,
             "round_active": round_active,

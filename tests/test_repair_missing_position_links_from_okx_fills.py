@@ -1470,6 +1470,71 @@ def test_native_full_close_shared_plan_matches_split_positions() -> None:
     assert plan.fill_pnl == pytest.approx(-0.4564)
 
 
+def test_shared_open_position_close_requires_one_confirmed_aggregate_order() -> None:
+    opened_at = datetime(2026, 7, 22, 16, 54, 41, tzinfo=UTC)
+    filled_at = datetime(2026, 7, 25, 17, 6, 17, tzinfo=UTC)
+    positions = [
+        Position(
+            id=position_id,
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            symbol="HBAR/USDT",
+            side="long",
+            quantity=150.0,
+            entry_price=0.068,
+            is_open=True,
+            created_at=opened_at,
+            okx_inst_id="HBAR-USDT-SWAP",
+            entry_exchange_order_id=f"hbar-entry-{position_id}",
+            current_management_contract={
+                "position_scope": "exchange_net_position_group",
+                "position_fragment_ids": [51, 52],
+                "original_entry_order_ids": ["hbar-entry-51", "hbar-entry-52"],
+                "protection_orders": [
+                    {
+                        "algo_id": "hbar-protection-algo",
+                        "close_side": "sell",
+                    }
+                ],
+            },
+        )
+        for position_id in (51, 52)
+    ]
+    order = Order(
+        id=61,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="HBAR/USDT",
+        side="sell",
+        order_type="market",
+        quantity=300.0,
+        price=0.0706,
+        status="filled",
+        fee=0.01059,
+        exchange_order_id="hbar-protection-close",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_inst_id="HBAR-USDT-SWAP",
+        okx_fill_contracts=3.0,
+        okx_fill_pnl=0.78,
+        okx_sync_status=repair_script.OKX_SYNC_CONFIRMED,
+    )
+
+    plan = repair_script._match_open_position_shared_close_plan(
+        positions,
+        [order],
+        exchange_order_ids={"hbar-protection-close"},
+    )
+
+    assert plan is not None
+    assert plan.position_ids == (51, 52)
+    assert plan.close_order_id == 61
+    assert plan.total_quantity == pytest.approx(300.0)
+    assert plan.fill_contracts == pytest.approx(3.0)
+    assert plan.contract_size == pytest.approx(100.0)
+    assert plan.fill_pnl == pytest.approx(0.78)
+
+
 def test_native_full_close_group_allows_multiple_entry_orders() -> None:
     closed_at = datetime(2026, 6, 27, 19, 26, 18, tzinfo=UTC)
     positions = [
@@ -1609,6 +1674,8 @@ async def test_apply_open_position_close_plan_closes_position_and_quarantines_tr
     assert position.close_exchange_order_id == "met-close"
     assert position.current_price == pytest.approx(0.1749)
     assert position.realized_pnl == pytest.approx(-0.049)
+    assert position.close_fill_pnl == pytest.approx(-0.049)
+    assert position.close_fee == pytest.approx(0.001)
     assert position.closed_at == closed_at.replace(tzinfo=None)
     assert order["symbol"] == "MET/USDT"
     assert order["side"] == "buy"
@@ -1734,6 +1801,8 @@ async def test_apply_open_position_close_plan_reuses_existing_okx_confirmed_orde
     assert position.close_exchange_order_id == "act-close"
     assert position.realized_pnl == pytest.approx(1.7907)
     assert position.unrealized_pnl == pytest.approx(0.0)
+    assert position.close_fill_pnl == pytest.approx(1.7907)
+    assert position.close_fee == pytest.approx(0.0057658)
     assert order_count == 1
     assert reflection["expert_lessons"]["repair_plan"]["source"] == "okx_confirmed_existing_close_order"
 
@@ -2005,6 +2074,117 @@ async def test_apply_native_full_close_shared_updates_split_positions_and_one_or
     assert order.fee == pytest.approx(0.0104908)
     assert len(reflections) == 4
     assert sum(1 for row in reflections if row["source"] == repair_script.REPAIR_REFLECTION_SOURCE) == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_shared_open_position_close_closes_all_fragments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'shared-open-position-close.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        opened_at = datetime(2026, 7, 22, 16, 54, 41, tzinfo=UTC)
+        filled_at = datetime(2026, 7, 25, 17, 6, 17, tzinfo=UTC)
+        async with get_session_ctx() as session:
+            position_ids: list[int] = []
+            for _idx in range(2):
+                position = Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="HBAR/USDT",
+                    side="long",
+                    quantity=150.0,
+                    entry_price=0.068,
+                    current_price=0.0704,
+                    is_open=True,
+                    created_at=opened_at,
+                    okx_inst_id="HBAR-USDT-SWAP",
+                    entry_exchange_order_id="hbar-entry",
+                )
+                session.add(position)
+                await session.flush()
+                position_ids.append(int(position.id))
+            close_order = Order(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="HBAR/USDT",
+                side="sell",
+                order_type="market",
+                quantity=300.0,
+                price=0.0706,
+                status="filled",
+                fee=0.01059,
+                exchange_order_id="hbar-protection-close",
+                filled_at=filled_at,
+                created_at=filled_at,
+                okx_inst_id="HBAR-USDT-SWAP",
+                okx_fill_contracts=3.0,
+                okx_fill_pnl=0.78,
+                okx_sync_status=repair_script.OKX_SYNC_CONFIRMED,
+            )
+            session.add(close_order)
+            await session.flush()
+            close_order_id = int(close_order.id)
+
+        plan = repair_script.NativeFullCloseSharedPlan(
+            position_ids=tuple(position_ids),
+            symbol="HBAR/USDT",
+            side="long",
+            close_side="sell",
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            close_order_id=close_order_id,
+            old_exchange_order_id="hbar-protection-close",
+            okx_order_id="hbar-protection-close",
+            total_quantity=300.0,
+            fill_quantity=300.0,
+            fill_contracts=3.0,
+            contract_size=100.0,
+            entry_price_weighted=0.068,
+            exit_price=0.0706,
+            close_fee=0.01059,
+            fill_pnl=0.78,
+            fill_timestamp=filled_at,
+            source="okx_confirmed_shared_open_position_close",
+            okx_inst_id="HBAR-USDT-SWAP",
+        )
+        monkeypatch.setattr(
+            repair_script,
+            "_backup_open_position_shared_closes",
+            lambda _plans: _async_path(tmp_path),
+        )
+
+        result = await repair_script.apply_open_position_shared_close_plans([plan])
+
+        async with get_session_ctx() as session:
+            positions = [
+                await session.get(Position, position_id) for position_id in position_ids
+            ]
+    finally:
+        await close_db()
+
+    assert result["applied"] == 1
+    assert result["closed_position_count"] == 2
+    assert all(position is not None and position.is_open is False for position in positions)
+    assert all(
+        position is not None
+        and position.close_exchange_order_id == "hbar-protection-close"
+        for position in positions
+    )
+    assert all(
+        position is not None and position.realized_pnl == pytest.approx(0.39)
+        for position in positions
+    )
+    assert all(
+        position is not None and position.close_fee == pytest.approx(0.005295)
+        for position in positions
+    )
 
 
 @pytest.mark.asyncio

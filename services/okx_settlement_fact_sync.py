@@ -180,30 +180,28 @@ class OkxSettlementFactSyncService:
             )
             if initialized:
                 native_facts = OkxNativeFactsClient(executor)
-                history_result, bill_result = await asyncio.gather(
-                    run_stage(
-                        "position_history",
-                        lambda: native_facts.fetch_position_history_rows(
-                            inst_ids=None,
-                            pos_ids=None,
-                            since=since,
-                            limit=self.limit,
-                            max_pages=self.max_pages,
-                            strict=True,
-                        ),
-                        cap_seconds=5.0,
+                history_result = await run_stage(
+                    "position_history",
+                    lambda: native_facts.fetch_position_history_rows(
+                        inst_ids=None,
+                        pos_ids=None,
+                        since=since,
+                        limit=self.limit,
+                        max_pages=self.max_pages,
+                        strict=True,
                     ),
-                    run_stage(
-                        "account_bills",
-                        lambda: native_facts.fetch_account_bills(
-                            since=since,
-                            limit=self.limit,
-                            max_pages=self.max_pages,
-                            funding_only=True,
-                            strict=True,
-                        ),
-                        cap_seconds=3.0,
+                    cap_seconds=5.0,
+                )
+                bill_result = await run_stage(
+                    "account_bills",
+                    lambda: native_facts.fetch_account_bills(
+                        since=since,
+                        limit=self.limit,
+                        max_pages=self.max_pages,
+                        funding_only=True,
+                        strict=True,
                     ),
+                    cap_seconds=3.0,
                 )
                 history_rows = list(history_result[0] or [])
                 account_bills = list(bill_result[0] or [])

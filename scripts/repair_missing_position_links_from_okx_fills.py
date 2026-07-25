@@ -854,6 +854,54 @@ async def collect_open_position_close_plans(
     return plans
 
 
+async def collect_open_position_shared_close_plans(
+    *,
+    days: int = DEFAULT_DAYS,
+    limit: int = DEFAULT_LIMIT,
+    position_ids: tuple[int, ...] = (),
+    exchange_order_ids: tuple[str, ...] = (),
+) -> list[NativeFullCloseSharedPlan]:
+    positions = await _candidate_open_positions(
+        days=days,
+        limit=max(int(limit or DEFAULT_LIMIT), len(position_ids), 1000),
+        position_ids=(),
+    )
+    requested_position_ids = {int(item) for item in position_ids if int(item) > 0}
+    requested_exchange_ids = {
+        str(item or "").strip()
+        for item in exchange_order_ids
+        if str(item or "").strip()
+    }
+    orders = await _candidate_existing_close_orders_for_open_positions(
+        positions,
+        days=days,
+        limit=max(int(limit or DEFAULT_LIMIT), 1000),
+    )
+    exchange_keys = await _fetch_current_okx_position_keys(positions)
+    plans: list[NativeFullCloseSharedPlan] = []
+    for group in _group_open_position_fragments(positions):
+        group_position_ids = {int(position.id) for position in group}
+        if requested_position_ids and not group_position_ids.issubset(
+            requested_position_ids
+        ):
+            continue
+        first = group[0]
+        group_key = (
+            _position_okx_inst_id(first),
+            str(getattr(first, "side", "") or "").lower().strip(),
+        )
+        if group_key in exchange_keys:
+            continue
+        plan = _match_open_position_shared_close_plan(
+            group,
+            orders,
+            exchange_order_ids=requested_exchange_ids,
+        )
+        if plan is not None:
+            plans.append(plan)
+    return plans
+
+
 async def collect_orphan_open_position_quarantine_plans(
     *,
     days: int = DEFAULT_DAYS,
@@ -1055,6 +1103,109 @@ def _match_existing_close_order_open_position_plan(
     )
 
 
+def _match_open_position_shared_close_plan(
+    positions: list[Position],
+    orders: list[Order],
+    *,
+    exchange_order_ids: set[str],
+) -> NativeFullCloseSharedPlan | None:
+    if len(positions) < 2:
+        return None
+    first = positions[0]
+    inst_id = _position_okx_inst_id(first)
+    position_side = str(getattr(first, "side", "") or "").lower().strip()
+    close_side = _close_side(first)
+    group_identity = _open_position_fragment_group_identity(first)
+    entry_order_ids = {
+        exchange_order_id
+        for position in positions
+        for exchange_order_id in _position_management_original_entry_order_ids(
+            position
+        )
+    }
+    if not inst_id or not position_side or group_identity is None or not entry_order_ids:
+        return None
+    if group_identity[0] == "exchange_net_position_group" and tuple(
+        sorted(int(position.id) for position in positions)
+    ) != group_identity[1]:
+        return None
+    if any(
+        not bool(getattr(position, "is_open", False))
+        or str(getattr(position, "close_exchange_order_id", "") or "").strip()
+        or _position_okx_inst_id(position) != inst_id
+        or str(getattr(position, "side", "") or "").lower().strip()
+        != position_side
+        or _open_position_fragment_group_identity(position) != group_identity
+        for position in positions
+    ):
+        return None
+    total_quantity = sum(abs(_safe_float(position.quantity)) for position in positions)
+    if total_quantity <= 0:
+        return None
+    opened_times = [
+        opened_at
+        for position in positions
+        if (opened_at := _aware(position.created_at)) is not None
+    ]
+    opened_at = max(opened_times, default=None)
+    if opened_at is None:
+        return None
+    candidates: list[Order] = []
+    for order in orders:
+        exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        if exchange_order_ids and exchange_order_id not in exchange_order_ids:
+            continue
+        if not exchange_order_id or exchange_order_id in entry_order_ids:
+            continue
+        if str(getattr(order, "status", "") or "").lower() != "filled":
+            continue
+        if str(getattr(order, "okx_sync_status", "") or "").strip() not in (
+            TRUSTED_CLOSE_ORDER_SYNC_STATUSES
+        ):
+            continue
+        if str(getattr(order, "side", "") or "").lower().strip() != close_side:
+            continue
+        if str(getattr(order, "okx_inst_id", "") or "").strip().upper() != inst_id:
+            continue
+        filled_at = _aware(getattr(order, "filled_at", None))
+        if filled_at is None or filled_at < opened_at:
+            continue
+        if not _quantity_close_enough(_safe_float(order.quantity), total_quantity):
+            continue
+        candidates.append(order)
+    if len(candidates) != 1:
+        return None
+    order = candidates[0]
+    weighted_entry_price = sum(
+        _safe_float(position.entry_price) * abs(_safe_float(position.quantity))
+        for position in positions
+    ) / total_quantity
+    fill_contracts = _safe_float(getattr(order, "okx_fill_contracts", None))
+    contract_size = total_quantity / fill_contracts if fill_contracts > 0 else 0.0
+    return NativeFullCloseSharedPlan(
+        position_ids=tuple(sorted(int(position.id) for position in positions)),
+        symbol=normalize_trading_symbol(inst_id),
+        side=position_side,
+        close_side=close_side,
+        model_name=str(getattr(first, "model_name", "") or "ensemble_trader"),
+        execution_mode=str(getattr(first, "execution_mode", "") or "paper"),
+        close_order_id=int(order.id),
+        old_exchange_order_id=str(order.exchange_order_id or ""),
+        okx_order_id=str(order.exchange_order_id or ""),
+        total_quantity=total_quantity,
+        fill_quantity=_safe_float(order.quantity),
+        fill_contracts=fill_contracts,
+        contract_size=contract_size,
+        entry_price_weighted=weighted_entry_price,
+        exit_price=_safe_float(order.price),
+        close_fee=_safe_float(order.fee),
+        fill_pnl=_safe_float(getattr(order, "okx_fill_pnl", None)),
+        fill_timestamp=_aware(getattr(order, "filled_at", None)),
+        source="okx_confirmed_shared_open_position_close",
+        okx_inst_id=inst_id,
+    )
+
+
 def _order_fill_quantity(
     order: Order,
     contract_sizes: dict[str, float],
@@ -1172,7 +1323,7 @@ async def collect_linked_protection_fill_order_plans(
     limit: int = DEFAULT_LIMIT,
     exchange_order_ids: tuple[str, ...] = (),
 ) -> list[LinkedProtectionFillOrderPlan]:
-    local_orders, local_decisions = await _candidate_linked_protection_orders(
+    local_orders, local_decisions, local_positions = await _candidate_linked_protection_orders(
         days=days,
         limit=limit,
     )
@@ -1210,6 +1361,7 @@ async def collect_linked_protection_fill_order_plans(
             local_orders_by_exchange_id=local_orders_by_exchange_id,
             local_orders=local_orders,
             local_decisions=local_decisions,
+            local_positions=local_positions,
         )
         if linked is None:
             continue
@@ -1293,7 +1445,7 @@ async def _candidate_linked_protection_orders(
     *,
     days: int,
     limit: int,
-) -> tuple[list[Order], dict[int, AIDecision]]:
+) -> tuple[list[Order], dict[int, AIDecision], list[Position]]:
     since = datetime.now(UTC) - timedelta(days=max(int(days or DEFAULT_DAYS), 1))
     capped_limit = max(1, min(int(limit or DEFAULT_LIMIT), 1000))
     async with get_session_ctx() as session:
@@ -1323,7 +1475,28 @@ async def _candidate_linked_protection_orders(
             decisions = {
                 int(decision.id): decision for decision in decision_rows.scalars().all()
             }
-    return orders, decisions
+        exchange_order_ids = {
+            exchange_order_id
+            for order in orders
+            for exchange_order_id in _split_exchange_order_ids(order.exchange_order_id)
+        }
+        positions_by_id: dict[int, Position] = {}
+        ordered_exchange_ids = sorted(exchange_order_ids)
+        for offset in range(0, len(ordered_exchange_ids), 100):
+            batch = ordered_exchange_ids[offset : offset + 100]
+            position_rows = await session.execute(
+                select(Position).where(
+                    Position.execution_mode == "paper",
+                    or_(*[Position.entry_exchange_order_id.contains(item) for item in batch]),
+                )
+            )
+            for position in position_rows.scalars().all():
+                if (
+                    set(_split_exchange_order_ids(position.entry_exchange_order_id))
+                    & exchange_order_ids
+                ):
+                    positions_by_id[int(position.id)] = position
+    return orders, decisions, list(positions_by_id.values())
 
 
 async def _candidate_native_full_close_positions(
@@ -2046,6 +2219,75 @@ def _group_native_full_close_positions(positions: list[Position]) -> list[list[P
     ]
 
 
+def _group_open_position_fragments(positions: list[Position]) -> list[list[Position]]:
+    groups: dict[tuple[Any, ...], list[Position]] = {}
+    for position in positions:
+        if not bool(getattr(position, "is_open", False)):
+            continue
+        group_identity = _open_position_fragment_group_identity(position)
+        if group_identity is None:
+            continue
+        key = (
+            str(position.model_name or ""),
+            str(position.execution_mode or ""),
+            _position_okx_inst_id(position),
+            str(position.side or "").lower(),
+            group_identity,
+        )
+        groups.setdefault(key, []).append(position)
+    return [
+        sorted(group, key=lambda item: int(item.id))
+        for group in groups.values()
+        if len(group) > 1
+    ]
+
+
+def _open_position_fragment_group_identity(position: Position) -> tuple[Any, ...] | None:
+    contract = getattr(position, "current_management_contract", None)
+    if isinstance(contract, dict) and contract.get("position_scope") == (
+        "exchange_net_position_group"
+    ):
+        fragment_ids = contract.get("position_fragment_ids")
+        protection_orders = contract.get("protection_orders")
+        normalized_fragment_ids = tuple(
+            sorted(
+                int(item)
+                for item in fragment_ids
+                if isinstance(item, int) and int(item) > 0
+            )
+        ) if isinstance(fragment_ids, list) else ()
+        algo_ids = tuple(
+            sorted(
+                {
+                    str(item.get("algo_id") or "").strip()
+                    for item in protection_orders
+                    if isinstance(item, dict) and str(item.get("algo_id") or "").strip()
+                }
+            )
+        ) if isinstance(protection_orders, list) else ()
+        if normalized_fragment_ids and algo_ids:
+            return ("exchange_net_position_group", normalized_fragment_ids, algo_ids)
+    entry_order_ids = tuple(
+        sorted(_split_exchange_order_ids(position.entry_exchange_order_id))
+    )
+    return ("shared_entry_order", entry_order_ids) if entry_order_ids else None
+
+
+def _position_management_original_entry_order_ids(position: Position) -> set[str]:
+    result = set(_split_exchange_order_ids(position.entry_exchange_order_id))
+    contract = getattr(position, "current_management_contract", None)
+    if not isinstance(contract, dict):
+        return result
+    original_entry_ids = contract.get("original_entry_order_ids")
+    if isinstance(original_entry_ids, list):
+        result.update(
+            str(item or "").strip()
+            for item in original_entry_ids
+            if str(item or "").strip()
+        )
+    return result
+
+
 async def apply_plans(plans: list[FillLinkPlan]) -> dict[str, Any]:
     if not plans:
         return {"applied": 0}
@@ -2339,6 +2581,8 @@ async def apply_open_position_close_plans(plans: list[OpenPositionClosePlan]) ->
             position.current_price = plan.exit_price
             position.unrealized_pnl = 0.0
             position.realized_pnl = plan.fill_pnl or plan.computed_realized_pnl
+            position.close_fill_pnl = plan.fill_pnl
+            position.close_fee = plan.close_fee
             position.closed_at = plan.fill_timestamp or datetime.now(UTC)
             position.close_exchange_order_id = plan.okx_order_id
             if not str(getattr(position, "okx_inst_id", "") or "").strip():
@@ -2611,6 +2855,94 @@ async def apply_native_full_close_shared_plans(
             applied += 1
         await session.flush()
     return {"applied": applied, "backup_path": str(backup_path)}
+
+
+async def apply_open_position_shared_close_plans(
+    plans: list[NativeFullCloseSharedPlan],
+) -> dict[str, Any]:
+    if not plans:
+        return {"applied": 0, "closed_position_count": 0}
+    backup_path = await _backup_open_position_shared_closes(plans)
+    applied = 0
+    closed_position_count = 0
+    async with get_session_ctx() as session:
+        for plan in plans:
+            if plan.close_order_id is None or len(plan.position_ids) < 2:
+                continue
+            order = await session.get(Order, int(plan.close_order_id))
+            if order is None:
+                continue
+            if str(order.exchange_order_id or "").strip() != plan.okx_order_id:
+                continue
+            if str(order.status or "").lower() != "filled":
+                continue
+            if str(order.okx_sync_status or "").strip() not in TRUSTED_CLOSE_ORDER_SYNC_STATUSES:
+                continue
+            if str(order.okx_inst_id or "").strip().upper() != plan.okx_inst_id:
+                continue
+            if str(order.side or "").lower().strip() != plan.close_side:
+                continue
+            if not _quantity_close_enough(_safe_float(order.quantity), plan.total_quantity):
+                continue
+
+            positions = [
+                await session.get(Position, int(position_id))
+                for position_id in plan.position_ids
+            ]
+            if any(position is None for position in positions):
+                continue
+            selected = [position for position in positions if position is not None]
+            if any(
+                not bool(position.is_open)
+                or str(position.close_exchange_order_id or "").strip()
+                or _position_okx_inst_id(position) != plan.okx_inst_id
+                or str(position.side or "").lower().strip() != plan.side
+                for position in selected
+            ):
+                continue
+            selected_total = sum(abs(_safe_float(position.quantity)) for position in selected)
+            if not _quantity_close_enough(selected_total, plan.total_quantity):
+                continue
+
+            for position in selected:
+                quantity = abs(_safe_float(position.quantity))
+                ratio = quantity / plan.total_quantity
+                allocated_fill_pnl = plan.fill_pnl * ratio
+                allocated_fee = plan.close_fee * ratio
+                if plan.fill_pnl:
+                    realized_pnl = allocated_fill_pnl
+                elif plan.side == "short":
+                    realized_pnl = (
+                        (_safe_float(position.entry_price) - plan.exit_price) * quantity
+                        - allocated_fee
+                    )
+                else:
+                    realized_pnl = (
+                        (plan.exit_price - _safe_float(position.entry_price)) * quantity
+                        - allocated_fee
+                    )
+                position.is_open = False
+                position.current_price = plan.exit_price
+                position.unrealized_pnl = 0.0
+                position.realized_pnl = realized_pnl
+                position.close_fill_pnl = allocated_fill_pnl
+                position.close_fee = allocated_fee
+                position.closed_at = plan.fill_timestamp or datetime.now(UTC)
+                position.close_exchange_order_id = plan.okx_order_id
+                _add_repair_reflection_marker(
+                    session,
+                    position=position,
+                    source=REPAIR_REFLECTION_SOURCE,
+                    plan=asdict(plan),
+                )
+                closed_position_count += 1
+            applied += 1
+        await session.flush()
+    return {
+        "applied": applied,
+        "closed_position_count": closed_position_count,
+        "backup_path": str(backup_path),
+    }
 
 
 def _add_repair_reflection_marker(
@@ -2920,9 +3252,13 @@ async def _backup_close_link_reassignments(plans: list[CloseLinkReassignmentPlan
     return path
 
 
-async def _backup_native_full_close_shared(plans: list[NativeFullCloseSharedPlan]) -> Path:
+async def _backup_shared_close_plans(
+    plans: list[NativeFullCloseSharedPlan],
+    *,
+    filename_prefix: str,
+) -> Path:
     await asyncio.to_thread(BACKUP_DIR.mkdir, parents=True, exist_ok=True)
-    path = BACKUP_DIR / f"native_full_close_shared_before_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.json"
+    path = BACKUP_DIR / f"{filename_prefix}_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.json"
     ids = sorted({position_id for plan in plans for position_id in plan.position_ids})
     order_ids = sorted(
         {int(plan.close_order_id) for plan in plans if plan.close_order_id is not None}
@@ -2978,6 +3314,22 @@ async def _backup_native_full_close_shared(plans: list[NativeFullCloseSharedPlan
     return path
 
 
+async def _backup_native_full_close_shared(plans: list[NativeFullCloseSharedPlan]) -> Path:
+    return await _backup_shared_close_plans(
+        plans,
+        filename_prefix="native_full_close_shared_before",
+    )
+
+
+async def _backup_open_position_shared_closes(
+    plans: list[NativeFullCloseSharedPlan],
+) -> Path:
+    return await _backup_shared_close_plans(
+        plans,
+        filename_prefix="open_position_shared_closes_before",
+    )
+
+
 def _model_payload(row: Any) -> dict[str, Any]:
     return {column.name: getattr(row, column.name) for column in row.__table__.columns}
 
@@ -3004,6 +3356,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--link-additional-entry-orders", action="store_true")
     parser.add_argument("--create-linked-protection-fill-orders", action="store_true")
     parser.add_argument("--close-missing-exchange-open-position", action="store_true")
+    parser.add_argument("--close-shared-open-position-fragments", action="store_true")
     parser.add_argument("--quarantine-missing-exchange-open-position", action="store_true")
     parser.add_argument("--reassign-mismatched-close-links", action="store_true")
     parser.add_argument("--repair-native-full-close-shared", action="store_true")
@@ -3012,6 +3365,13 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.apply and not args.position_id and not args.exchange_order_id:
         parser.error("--apply requires --position-id or --exchange-order-id after dry-run audit")
+    if args.apply and args.close_shared_open_position_fragments and (
+        not args.position_id or not args.exchange_order_id
+    ):
+        parser.error(
+            "--close-shared-open-position-fragments --apply requires both "
+            "--position-id and --exchange-order-id after dry-run audit"
+        )
     return args
 
 
@@ -3082,6 +3442,16 @@ async def main() -> int:
             if args.close_missing_exchange_open_position
             else []
         )
+        open_position_shared_close_plans = (
+            await collect_open_position_shared_close_plans(
+                days=args.days,
+                limit=args.limit,
+                position_ids=tuple(args.position_id or ()),
+                exchange_order_ids=tuple(args.exchange_order_id or ()),
+            )
+            if args.close_shared_open_position_fragments
+            else []
+        )
         close_link_reassignment_plans = (
             await collect_close_link_reassignment_plans(
                 days=args.days,
@@ -3135,6 +3505,9 @@ async def main() -> int:
         "open_position_close_plans": [
             _json_safe(asdict(plan)) for plan in open_position_close_plans
         ],
+        "open_position_shared_close_plans": [
+            _json_safe(asdict(plan)) for plan in open_position_shared_close_plans
+        ],
         "close_link_reassignment_plans": [
             _json_safe(asdict(plan)) for plan in close_link_reassignment_plans
         ],
@@ -3177,6 +3550,12 @@ async def main() -> int:
             if args.close_missing_exchange_open_position:
                 result["apply_open_position_close_result"] = await apply_open_position_close_plans(
                     open_position_close_plans
+                )
+            if args.close_shared_open_position_fragments:
+                result["apply_open_position_shared_close_result"] = (
+                    await apply_open_position_shared_close_plans(
+                        open_position_shared_close_plans
+                    )
                 )
             if args.reassign_mismatched_close_links:
                 result["apply_close_link_reassignment_result"] = (
