@@ -188,6 +188,11 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchSystemAudit({ silent: true });
         }
     }, 60000);
+    setInterval(() => {
+        if (isPageActive('ml-signal')) {
+            fetchMLSignalDashboard();
+        }
+    }, 60000);
     fetchDashboardAccountSettings();
     fetchModelServerSettings();
     fetchOKXSettings();
