@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -280,6 +281,25 @@ def _combined_multiplier(
         if previous is None
         else previous + SMOOTHING_RATE * (target - previous)
     )
+    evidence_sources = [str(item.get("source") or "unknown") for item in evidence]
+    adjustment_reasons: list[str] = []
+    if not evidence:
+        adjustment_reasons.append("no_fee_after_return_evidence_cold_start")
+    else:
+        if actual.get("available") is True:
+            adjustment_reasons.append("authoritative_fee_after_return_evidence")
+        if shadow.get("available") is True:
+            adjustment_reasons.append("specialist_shadow_fee_after_return_evidence")
+        if quality > 1e-10:
+            adjustment_reasons.append("positive_combined_fee_after_return_quality")
+        elif quality < -1e-10:
+            adjustment_reasons.append("negative_combined_fee_after_return_quality")
+        else:
+            adjustment_reasons.append("neutral_combined_fee_after_return_quality")
+    if stability_multiplier < 1.0 - 1e-10:
+        adjustment_reasons.append("health_stability_penalty")
+    if previous is not None:
+        adjustment_reasons.append("smoothed_from_previous_scenario_weight")
     return {
         "target_multiplier": round(target, 8),
         "previous_multiplier": round(previous, 8) if previous is not None else None,
@@ -294,6 +314,8 @@ def _combined_multiplier(
         "combined_evidence_confidence": round(combined_confidence, 8),
         "combined_return_quality": round(quality, 8),
         "cold_start": not evidence,
+        "evidence_sources": evidence_sources,
+        "adjustment_reasons": adjustment_reasons,
     }
 
 
@@ -431,8 +453,9 @@ class ContinuousModelWeightPolicy:
                 "shadow_health": health_item,
                 "production_permission": False,
             }
-            if multiplier["previous_multiplier"] is not None and not math.isclose(
-                float(multiplier["previous_multiplier"]),
+            previous_multiplier = multiplier["previous_multiplier"]
+            if previous_multiplier is None or not math.isclose(
+                float(previous_multiplier),
                 float(multiplier["effective_multiplier"]),
                 abs_tol=1e-10,
             ):
@@ -440,9 +463,16 @@ class ContinuousModelWeightPolicy:
                     {
                         "model": name,
                         "kind": "expert",
-                        "before": multiplier["previous_multiplier"],
+                        "change_type": (
+                            "initial_evidence_assignment"
+                            if previous_multiplier is None
+                            else "smoothed_update"
+                        ),
+                        "before": 1.0 if previous_multiplier is None else previous_multiplier,
                         "after": multiplier["effective_multiplier"],
                         "target": multiplier["target_multiplier"],
+                        "evidence_sources": multiplier["evidence_sources"],
+                        "reasons": multiplier["adjustment_reasons"],
                     }
                 )
 
@@ -481,8 +511,9 @@ class ContinuousModelWeightPolicy:
                 "shadow_fee_after_return": shadow,
                 "production_permission": False,
             }
-            if multiplier["previous_multiplier"] is not None and not math.isclose(
-                float(multiplier["previous_multiplier"]),
+            previous_multiplier = multiplier["previous_multiplier"]
+            if previous_multiplier is None or not math.isclose(
+                float(previous_multiplier),
                 float(multiplier["effective_multiplier"]),
                 abs_tol=1e-10,
             ):
@@ -490,9 +521,16 @@ class ContinuousModelWeightPolicy:
                     {
                         "model": source_name,
                         "kind": "quant_source",
-                        "before": multiplier["previous_multiplier"],
+                        "change_type": (
+                            "initial_evidence_assignment"
+                            if previous_multiplier is None
+                            else "smoothed_update"
+                        ),
+                        "before": 1.0 if previous_multiplier is None else previous_multiplier,
                         "after": multiplier["effective_multiplier"],
                         "target": multiplier["target_multiplier"],
+                        "evidence_sources": multiplier["evidence_sources"],
+                        "reasons": multiplier["adjustment_reasons"],
                     }
                 )
         self._previous_by_scenario[scenario] = current
@@ -533,6 +571,32 @@ class ContinuousModelWeightEvidenceService:
         self.specialist_service = specialist_service or SpecialistShadowEvaluationService()
         self.cache_seconds = max(float(cache_seconds), 1.0)
         self._cache: dict[str, Any] = {}
+        self._refresh_task: asyncio.Task | None = None
+
+    async def _refresh_report(self) -> dict[str, Any]:
+        health, specialist = await asyncio.gather(
+            self.health_service.report(hours=72, limit=1200, mode="paper"),
+            self.specialist_service.report(hours=72, mode="paper"),
+        )
+        completed_at = datetime.now(UTC)
+        report = {
+            "execution_scope": "paper_only",
+            "available": True,
+            "generated_at": completed_at.isoformat(),
+            "health": health,
+            "specialist_shadow": specialist,
+            "expires_at": (
+                completed_at + timedelta(seconds=self.cache_seconds)
+            ).isoformat(),
+        }
+        self._cache = {"cached_at": completed_at, "report": report}
+        return report
+
+    @staticmethod
+    def _consume_refresh_result(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        task.exception()
 
     async def report(self, mode: str) -> dict[str, Any]:
         selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
@@ -542,6 +606,10 @@ class ContinuousModelWeightEvidenceService:
                 "available": False,
                 "reason": "live_path_unchanged",
             }
+        task = self._refresh_task
+        if task is not None and task.done():
+            self._refresh_task = None
+            task = None
         now = datetime.now(UTC)
         cached_at = self._cache.get("cached_at")
         cached_report = self._cache.get("report")
@@ -551,15 +619,12 @@ class ContinuousModelWeightEvidenceService:
             and isinstance(cached_report, dict)
         ):
             return cached_report
-        health = await self.health_service.report(hours=72, limit=1200, mode="paper")
-        specialist = await self.specialist_service.report(hours=72, mode="paper")
-        report = {
-            "execution_scope": "paper_only",
-            "available": True,
-            "generated_at": now.isoformat(),
-            "health": health,
-            "specialist_shadow": specialist,
-            "expires_at": (now + timedelta(seconds=self.cache_seconds)).isoformat(),
-        }
-        self._cache = {"cached_at": now, "report": report}
-        return report
+        if task is None:
+            task = asyncio.create_task(self._refresh_report())
+            task.add_done_callback(self._consume_refresh_result)
+            self._refresh_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._refresh_task is task:
+                self._refresh_task = None

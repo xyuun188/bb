@@ -86,6 +86,7 @@ async def test_position_review_decision_service_builds_ensemble_context_and_meta
     assert result.decision is decision
     context = next(value for name, value in calls if name == "ensemble")
     assert context["review_positions"] is True
+    assert context["execution_mode"] == "paper"
     assert context["expert_memory"] == {"symbol": "BTC/USDT"}
     assert context["ml_signal"] == {"ready": True}
     assert context["local_ai_tools"] == {"exit_advice": {"action": "hold"}}
@@ -179,6 +180,7 @@ async def test_position_review_decision_service_uses_single_model_context() -> N
 
     assert result is not None
     assert calls[0]["review_positions"] is True
+    assert calls[0]["execution_mode"] == "paper"
     assert "ml_signal" not in calls[0]
     assert calls[0]["portfolio_profit_protection"]["active"] is True
 

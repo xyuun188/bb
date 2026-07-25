@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -105,6 +106,13 @@ def test_negative_fee_after_return_smoothly_downweights_model() -> None:
     target = second["expert_weights"]["trend_expert"]["target_multiplier"]
     assert target < after < before
     assert second["weight_changes"]
+    change = next(
+        item for item in second["weight_changes"] if item["model"] == "trend_expert"
+    )
+    assert change["evidence_sources"] == ["authoritative_trade:expert:trend_expert"]
+    assert change["change_type"] == "smoothed_update"
+    assert "negative_combined_fee_after_return_quality" in change["reasons"]
+    assert "smoothed_from_previous_scenario_weight" in change["reasons"]
 
 
 def test_new_model_starts_low_but_remains_observable() -> None:
@@ -114,6 +122,23 @@ def test_new_model_starts_low_but_remains_observable() -> None:
     assert item["cold_start"] is True
     assert item["effective_multiplier"] == COLD_START_MULTIPLIER
     assert item["effective_multiplier"] > 0
+    assert item["evidence_sources"] == []
+    assert item["adjustment_reasons"] == [
+        "no_fee_after_return_evidence_cold_start"
+    ]
+    initial_change = next(
+        item for item in report["weight_changes"] if item["model"] == "trend_expert"
+    )
+    assert initial_change == {
+        "model": "trend_expert",
+        "kind": "expert",
+        "change_type": "initial_evidence_assignment",
+        "before": 1.0,
+        "after": COLD_START_MULTIPLIER,
+        "target": COLD_START_MULTIPLIER,
+        "evidence_sources": [],
+        "reasons": ["no_fee_after_return_evidence_cold_start"],
+    }
     assert report["failed_models_remain_observable"] is True
 
 
@@ -253,3 +278,43 @@ async def test_evidence_service_reads_paper_health_and_shadow_only() -> None:
         ("health", {"hours": 72, "limit": 1200, "mode": "paper"}),
         ("specialist", {"hours": 72, "mode": "paper"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_evidence_refresh_survives_cancelled_caller_and_populates_cache() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"health": 0, "specialist": 0}
+
+    class Health:
+        async def report(self, **_kwargs):
+            calls["health"] += 1
+            started.set()
+            await release.wait()
+            return {"components": {}}
+
+    class Specialist:
+        async def report(self, **_kwargs):
+            calls["specialist"] += 1
+            await release.wait()
+            return {"models": []}
+
+    service = ContinuousModelWeightEvidenceService(
+        health_service=Health(),
+        specialist_service=Specialist(),
+    )
+    caller = asyncio.create_task(service.report("paper"))
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    release.set()
+    refresh_task = service._refresh_task
+    assert refresh_task is not None
+    await asyncio.wait_for(asyncio.shield(refresh_task), timeout=0.2)
+
+    report = await service.report("paper")
+
+    assert report["available"] is True
+    assert calls == {"health": 1, "specialist": 1}

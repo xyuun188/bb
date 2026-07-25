@@ -164,6 +164,7 @@ class PositionReviewDecisionService:
         context = {
             "open_positions": request.open_positions,
             "trading_mode": request.trading_mode,
+            "execution_mode": request.trading_mode,
             "review_positions": True,
             "position_entry_disabled": bool(request.position_entry_pause_reason),
             "position_entry_pause_reason": request.position_entry_pause_reason or "",
@@ -194,6 +195,7 @@ class PositionReviewDecisionService:
         return {
             "open_positions": request.open_positions,
             "trading_mode": request.trading_mode,
+            "execution_mode": request.trading_mode,
             "review_positions": True,
             "position_entry_disabled": bool(request.position_entry_pause_reason),
             "position_entry_pause_reason": request.position_entry_pause_reason or "",

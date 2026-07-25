@@ -326,6 +326,7 @@ STRATEGY_CONTEXT_IO_CONCURRENCY = 2
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS = 20.0
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_MAX_STALE_SECONDS = 300.0
 STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS = 8.0
+CONTINUOUS_MODEL_WEIGHT_EVIDENCE_REFRESH_TIMEOUT_SECONDS = 20.0
 STALE_ENTRY_EXPIRE_BACKGROUND_LIMIT_DESCRIPTION = "single_flight_batched_maintenance"
 UNCONFIRMED_EXCHANGE_CLOSE_GRACE_SECONDS = 180.0
 ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS = 5.0
@@ -2260,6 +2261,11 @@ class TradingService:
         loop = asyncio.get_running_loop()
         started = loop.time()
         gate = self._strategy_context_io_gate()
+        timeout_seconds = (
+            CONTINUOUS_MODEL_WEIGHT_EVIDENCE_REFRESH_TIMEOUT_SECONDS
+            if label == "continuous_model_weight_evidence"
+            else STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS
+        )
         acquired = False
         queue_wait_seconds = 0.0
         status = "ok"
@@ -2267,12 +2273,12 @@ class TradingService:
         try:
             await asyncio.wait_for(
                 gate.acquire(),
-                timeout=STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
             acquired = True
             queue_wait_seconds = max(loop.time() - started, 0.0)
             remaining_seconds = max(
-                STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS - queue_wait_seconds,
+                timeout_seconds - queue_wait_seconds,
                 0.0,
             )
             if remaining_seconds <= 0.0:

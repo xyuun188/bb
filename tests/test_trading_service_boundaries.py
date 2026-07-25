@@ -4799,6 +4799,41 @@ async def test_strategy_context_io_gate_bounds_shared_history_query_fanout() -> 
     assert await asyncio.gather(*tasks) == [0, 1, 2]
 
 
+@pytest.mark.asyncio
+async def test_continuous_weight_evidence_has_independent_background_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service,
+        "STRATEGY_CONTEXT_PERFORMANCE_REFRESH_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        trading_service,
+        "CONTINUOUS_MODEL_WEIGHT_EVIDENCE_REFRESH_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    async def slow_value() -> str:
+        await asyncio.sleep(0.03)
+        return "ready"
+
+    regular = await service._refresh_strategy_context_performance_value(
+        "model_contribution_perf",
+        slow_value,
+    )
+    continuous = await service._refresh_strategy_context_performance_value(
+        "continuous_model_weight_evidence",
+        slow_value,
+    )
+
+    assert regular[1] is False
+    assert regular[3]["status"] == "timeout"
+    assert continuous[1] is True
+    assert continuous[2] == "ready"
+
+
 def test_market_round_budget_is_not_used_as_outer_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
