@@ -222,6 +222,44 @@ def test_cross_symbol_failure_keeps_profitable_strategy_out_of_primary_route() -
     assert row["routing_reason"] == "cross_symbol_generalization_failed"
 
 
+def test_validated_symbol_route_exposes_risk_only_exploration_maturity() -> None:
+    development = _metrics(
+        average=-0.1,
+        lcb=-0.2,
+        profit_factor=0.7,
+        drawdown=1.0,
+        tail=-0.8,
+        pnl=-12.0,
+        count=80,
+    )
+    exam = _metrics(
+        average=-0.05,
+        lcb=-0.1,
+        profit_factor=0.8,
+        drawdown=0.8,
+        tail=-0.6,
+        pnl=-4.0,
+        count=40,
+    )
+    candidate = _candidate(
+        "btc_long_maturity",
+        side="long",
+        scope="symbol_side",
+        development=development,
+        exam=exam,
+    )
+
+    report = _build(ContinuousStrategyRoutingPolicy(), [candidate], "trend_up")
+
+    evidence = report["exploration_maturity_by_symbol_side"]["BTC/USDT"]["long"]
+    assert evidence["source"] == "validated_continuous_strategy_route"
+    assert evidence["evidence_count"] == 40
+    assert evidence["development_sample_count"] == 80
+    assert evidence["exam_sample_count"] == 40
+    assert evidence["can_authorize_entry"] is False
+    assert evidence["can_change_size_or_leverage"] is False
+
+
 def test_market_regime_switches_primary_strategy() -> None:
     policy = ContinuousStrategyRoutingPolicy()
     candidates = [

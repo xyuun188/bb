@@ -263,6 +263,34 @@ def test_positive_mean_near_threshold_candidate_is_exposed_for_bounded_paper_exp
     assert evidence["long"]["return_distribution_ready"] is True
 
 
+def test_blocked_strategy_evidence_only_reduces_exploration_risk() -> None:
+    strategy = {
+        "continuous_strategy_routing": {
+            "exploration_maturity_by_symbol_side": {
+                "BTC/USDT": {
+                    "long": {
+                        "source": "validated_continuous_strategy_route",
+                        "profile_id": "btc_long_blocked",
+                        "profile_version": 7,
+                        "evidence_count": 400,
+                        "can_authorize_entry": False,
+                        "can_change_size_or_leverage": False,
+                    }
+                }
+            }
+        }
+    }
+
+    evidence = _policy().build(_Feature(), strategy, {}, {}, {}, {})
+
+    maturity = evidence["long"]["exploration_maturity_evidence"]
+    assert maturity["available"] is True
+    assert maturity["evidence_count"] == 400
+    assert maturity["can_authorize_entry"] is False
+    assert maturity["can_change_size_or_leverage"] is False
+    assert evidence["long"]["scheduled_return_prior"]["available"] is False
+
+
 def test_missing_return_distribution_never_persists_non_finite_score() -> None:
     def unavailable_score(decision: DecisionOutput, _strategy: dict | None) -> float:
         raw = dict(decision.raw_response)

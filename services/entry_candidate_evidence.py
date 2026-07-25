@@ -105,6 +105,39 @@ def _scheduled_return_prior(
     }
 
 
+def _exploration_maturity_evidence(
+    strategy: dict[str, Any] | None,
+    *,
+    symbol: str,
+    side: str,
+) -> dict[str, Any]:
+    strategy_context = _safe_dict(strategy)
+    learning = _safe_dict(strategy_context.get("strategy_learning"))
+    runtime = _safe_dict(learning.get("runtime"))
+    routing = _safe_dict(
+        strategy_context.get("continuous_strategy_routing")
+        or learning.get("continuous_strategy_routing")
+        or runtime.get("continuous_strategy_routing")
+    )
+    by_symbol = _safe_dict(routing.get("exploration_maturity_by_symbol_side"))
+    evidence = _safe_dict(_safe_dict(by_symbol.get(symbol.upper())).get(side))
+    if not evidence:
+        return {
+            "available": False,
+            "source": "validated_continuous_strategy_route",
+            "reason": "no_validated_symbol_side_maturity_evidence",
+            "evidence_count": 0,
+            "can_authorize_entry": False,
+            "can_change_size_or_leverage": False,
+        }
+    return {
+        **evidence,
+        "available": True,
+        "can_authorize_entry": False,
+        "can_change_size_or_leverage": False,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class EntryCandidateEvidencePolicy:
     """Compare both sides without granting execution or probe permission."""
@@ -258,6 +291,11 @@ class EntryCandidateEvidencePolicy:
             ),
             "execution_cost": _safe_dict(opportunity.get("execution_cost")),
             "scheduled_return_prior": _scheduled_return_prior(
+                strategy,
+                symbol=symbol,
+                side=side,
+            ),
+            "exploration_maturity_evidence": _exploration_maturity_evidence(
                 strategy,
                 symbol=symbol,
                 side=side,

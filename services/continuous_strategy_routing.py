@@ -161,6 +161,51 @@ def _strategy_quality_target(quality: float) -> float:
     )
 
 
+def _exploration_maturity_by_symbol_side(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    maturity: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        selector = _dict(row.get("selector"))
+        scope = str(selector.get("scope") or "")
+        symbol = str(selector.get("symbol") or "").strip().upper()
+        side = str(selector.get("side") or "").strip().lower()
+        evidence_count = _int(row.get("evidence_count"))
+        if (
+            row.get("validated") is not True
+            or scope not in {"symbol_side", "symbol_side_horizon"}
+            or not symbol
+            or side not in {"long", "short"}
+            or evidence_count <= 0
+        ):
+            continue
+        candidate = {
+            "version": "2026-07-25.paper-exploration-maturity.v1",
+            "source": "validated_continuous_strategy_route",
+            "profile_id": row.get("profile_id"),
+            "profile_version": row.get("profile_version"),
+            "selector": selector,
+            "evidence_count": evidence_count,
+            "development_sample_count": _int(
+                _dict(row.get("development_metrics")).get("sample_count")
+            ),
+            "exam_sample_count": _int(
+                _dict(row.get("exam_metrics")).get("sample_count")
+            ),
+            "historical_sample_count": _int(
+                _dict(row.get("historical_metrics")).get("sample_count")
+            ),
+            "future_profitable": row.get("future_profitable") is True,
+            "cross_symbol_stable": row.get("cross_symbol_stable") is True,
+            "can_authorize_entry": False,
+            "can_change_size_or_leverage": False,
+        }
+        current = _dict(_dict(maturity.get(symbol)).get(side))
+        if evidence_count > _int(current.get("evidence_count")):
+            maturity.setdefault(symbol, {})[side] = candidate
+    return maturity
+
+
 def _time_separated(candidate: dict[str, Any]) -> bool:
     backtest = _dict(candidate.get("backtest"))
     exam = _dict(candidate.get("shadow_validation"))
@@ -435,6 +480,9 @@ class ContinuousStrategyRoutingPolicy:
             "candidate_weights": routed_rows,
             "candidate_weight_count": len(rows),
             "candidate_weights_truncated": len(rows) > len(routed_rows),
+            "exploration_maturity_by_symbol_side": (
+                _exploration_maturity_by_symbol_side(rows)
+            ),
             "current_route": current_route,
             "validated_candidate_count": sum(row["validated"] for row in rows),
             "primary_candidate_count": sum(row["primary_eligible"] for row in rows),

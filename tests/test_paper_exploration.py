@@ -38,6 +38,7 @@ def _side(
     loss_probability: float = 0.30,
     tail_risk: float = 0.20,
     historical_sample_count: int = 0,
+    validated_route_evidence_count: int = 0,
 ) -> dict:
     return {
         "side": "long",
@@ -58,6 +59,13 @@ def _side(
                 "sample_count": historical_sample_count,
             }
         },
+        "exploration_maturity_evidence": {
+            "available": validated_route_evidence_count > 0,
+            "source": "validated_continuous_strategy_route",
+            "evidence_count": validated_route_evidence_count,
+            "can_authorize_entry": False,
+            "can_change_size_or_leverage": False,
+        },
     }
 
 
@@ -74,6 +82,28 @@ def test_exploration_allocation_decreases_as_historical_evidence_grows() -> None
     assert cold["eligible"] is True
     assert mature["eligible"] is True
     assert mature["historical_evidence_count"] == 400
+    assert (
+        mature["exploration_allocation_multiplier"]
+        < cold["exploration_allocation_multiplier"]
+    )
+
+
+def test_exploration_allocation_uses_validated_route_when_prior_is_blocked() -> None:
+    cold = evaluate_paper_exploration_side(
+        _side(),
+        feature_opportunity_score=8.0,
+    )
+    mature = evaluate_paper_exploration_side(
+        _side(validated_route_evidence_count=400),
+        feature_opportunity_score=8.0,
+    )
+
+    assert mature["historical_evidence_count"] == 0
+    assert mature["validated_route_evidence_count"] == 400
+    assert mature["reliable_evidence_count"] == 400
+    assert mature["exploration_maturity_source"] == (
+        "validated_continuous_strategy_route"
+    )
     assert (
         mature["exploration_allocation_multiplier"]
         < cold["exploration_allocation_multiplier"]
@@ -222,6 +252,14 @@ def test_exploration_contract_has_no_sample_quota_and_detects_tampering() -> Non
     tampered = {**contract, "daily_sample_quota": 10}
     reasons = paper_exploration_contract_reasons(tampered)
     assert "paper_exploration_sample_quota_forbidden" in reasons
+    assert "paper_exploration_contract_fingerprint_mismatch" in reasons
+    maturity_tampered = {
+        **contract,
+        "reliable_evidence_count": 400,
+        "exploration_allocation_multiplier": 1.0,
+    }
+    reasons = paper_exploration_contract_reasons(maturity_tampered)
+    assert "paper_exploration_reliable_evidence_count_mismatch" in reasons
     assert "paper_exploration_contract_fingerprint_mismatch" in reasons
 
 

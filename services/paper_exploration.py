@@ -16,7 +16,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 
-PAPER_EXPLORATION_VERSION = "2026-07-22.complete-paper-exploration.v2"
+PAPER_EXPLORATION_VERSION = "2026-07-25.complete-paper-exploration.v3"
 PAPER_EXPLORATION_SIZING_VERSION = "2026-07-21.bounded-paper-risk.v1"
 PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0001
 PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION = 0.0003
@@ -85,6 +85,10 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "tail_risk_score",
             "return_source_count",
             "historical_evidence_count",
+            "validated_route_evidence_count",
+            "reliable_evidence_count",
+            "exploration_maturity_source",
+            "exploration_maturity_evidence",
             "exploration_allocation_multiplier",
             "feature_opportunity_score",
             "information_value_score",
@@ -119,9 +123,20 @@ def evaluate_paper_exploration_side(
         )
     )
     historical_evidence_count = _int(historical.get("sample_count"))
+    maturity_evidence = _dict(evidence.get("exploration_maturity_evidence"))
+    validated_route_evidence_count = (
+        _int(maturity_evidence.get("evidence_count"))
+        if maturity_evidence.get("available") is True
+        and maturity_evidence.get("source") == "validated_continuous_strategy_route"
+        else 0
+    )
+    reliable_evidence_count = max(
+        historical_evidence_count,
+        validated_route_evidence_count,
+    )
     exploration_allocation_multiplier = max(
         0.10,
-        1.0 / sqrt(1.0 + historical_evidence_count / 20.0),
+        1.0 / sqrt(1.0 + reliable_evidence_count / 20.0),
     )
     horizon_minutes = max(_float(evidence.get("horizon_minutes"), 0.0) or 0.0, 0.0)
     feature_score = max(float(feature_opportunity_score), 0.0)
@@ -177,6 +192,17 @@ def evaluate_paper_exploration_side(
         "tail_risk_score": round(tail_risk, 8),
         "return_source_count": source_count,
         "historical_evidence_count": historical_evidence_count,
+        "validated_route_evidence_count": validated_route_evidence_count,
+        "reliable_evidence_count": reliable_evidence_count,
+        "exploration_maturity_source": (
+            "validated_continuous_strategy_route"
+            if validated_route_evidence_count >= historical_evidence_count
+            and validated_route_evidence_count > 0
+            else "governed_historical_prior"
+            if historical_evidence_count > 0
+            else "cold_start"
+        ),
+        "exploration_maturity_evidence": maturity_evidence,
         "exploration_allocation_multiplier": round(
             exploration_allocation_multiplier,
             8,
@@ -265,6 +291,16 @@ def build_paper_exploration_contract(
         "tail_risk_score": selected.get("tail_risk_score"),
         "return_source_count": selected.get("return_source_count"),
         "historical_evidence_count": selected.get("historical_evidence_count"),
+        "validated_route_evidence_count": selected.get(
+            "validated_route_evidence_count"
+        ),
+        "reliable_evidence_count": selected.get("reliable_evidence_count"),
+        "exploration_maturity_source": selected.get(
+            "exploration_maturity_source"
+        ),
+        "exploration_maturity_evidence": selected.get(
+            "exploration_maturity_evidence"
+        ),
         "exploration_allocation_multiplier": selected.get(
             "exploration_allocation_multiplier"
         ),
@@ -359,10 +395,48 @@ def paper_exploration_contract_reasons(contract_value: Any) -> list[str]:
     if (_float(contract.get("information_value_score"), 0.0) or 0.0) <= 0:
         reasons.append("paper_exploration_information_value_zero")
     allocation = _float(contract.get("exploration_allocation_multiplier"), 0.0) or 0.0
+    historical_evidence_count = _int(contract.get("historical_evidence_count"))
+    validated_route_evidence_count = _int(
+        contract.get("validated_route_evidence_count")
+    )
+    reliable_evidence_count = _int(contract.get("reliable_evidence_count"))
+    expected_reliable_evidence_count = max(
+        historical_evidence_count,
+        validated_route_evidence_count,
+    )
+    expected_maturity_source = (
+        "validated_continuous_strategy_route"
+        if validated_route_evidence_count >= historical_evidence_count
+        and validated_route_evidence_count > 0
+        else "governed_historical_prior"
+        if historical_evidence_count > 0
+        else "cold_start"
+    )
+    maturity_evidence = _dict(contract.get("exploration_maturity_evidence"))
+    expected_allocation = max(
+        0.10,
+        1.0 / sqrt(1.0 + reliable_evidence_count / 20.0),
+    )
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     portfolio_cap = _float(contract.get("portfolio_risk_fraction_cap"), 0.0) or 0.0
     if allocation < 0.10 or allocation > 1.0:
         reasons.append("paper_exploration_allocation_multiplier_invalid")
+    if reliable_evidence_count != expected_reliable_evidence_count:
+        reasons.append("paper_exploration_reliable_evidence_count_mismatch")
+    if contract.get("exploration_maturity_source") != expected_maturity_source:
+        reasons.append("paper_exploration_maturity_source_mismatch")
+    if validated_route_evidence_count > 0 and not (
+        maturity_evidence.get("available") is True
+        and maturity_evidence.get("source")
+        == "validated_continuous_strategy_route"
+        and _int(maturity_evidence.get("evidence_count"))
+        == validated_route_evidence_count
+        and maturity_evidence.get("can_authorize_entry") is False
+        and maturity_evidence.get("can_change_size_or_leverage") is False
+    ):
+        reasons.append("paper_exploration_route_maturity_evidence_invalid")
+    if not isclose(allocation, expected_allocation, abs_tol=1e-8):
+        reasons.append("paper_exploration_maturity_allocation_mismatch")
     if not isclose(
         single_cap,
         PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION * allocation,
