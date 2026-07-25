@@ -122,6 +122,7 @@ from services.live_rules_canary_signal import apply_live_rules_canary_signal
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.manual_trade_execution import ManualTradeExecutionProcessor
 from services.manual_trade_risk_assessment import ManualTradeRiskAssessmentPolicy
+from services.market_analysis_defer_tracker import MarketAnalysisDeferTracker
 from services.market_analysis_selection import MarketAnalysisSelectionPolicy
 from services.market_auto_entry_processor import MarketAutoEntryProcessor
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
@@ -671,9 +672,7 @@ class TradingService:
         self.model_contribution_performance_service = ModelContributionPerformanceService(
             lookback_days=SYMBOL_PROFIT_PROFILE_LOOKBACK_DAYS,
         )
-        self.continuous_model_weight_evidence_service = (
-            ContinuousModelWeightEvidenceService()
-        )
+        self.continuous_model_weight_evidence_service = ContinuousModelWeightEvidenceService()
         self.continuous_model_weight_policy = ContinuousModelWeightPolicy()
         self._continuous_model_weight_snapshot_cache: dict[str, dict[str, Any]] = {}
         self.entry_opportunity_score = EntryOpportunityScoringPolicy(
@@ -700,7 +699,9 @@ class TradingService:
             params=MARKET_ANALYSIS_SELECTION_PARAMS,
         )
         self._last_market_analysis_selection_diagnostics: dict[str, Any] = {}
-        self._market_budget_deferred_symbols: list[str] = []
+        self.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+            normalize_symbol=self._normalize_position_symbol,
+        )
         self._market_indicator_prewarm_queue: list[str] = []
         self._market_indicator_prewarm_task: asyncio.Task | None = None
         self._market_indicator_prewarm_last_diagnostics: dict[str, Any] = {}
@@ -1046,9 +1047,7 @@ class TradingService:
         )
         cross_validation_timeout = min(max(decision_timeout * 0.60, 6.0), 12.0)
         return round(
-            expert_timeout
-            + cross_validation_timeout
-            + MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+            expert_timeout + cross_validation_timeout + MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
             3,
         )
 
@@ -1238,9 +1237,7 @@ class TradingService:
             "success_count": int(getattr(self, "_okx_authoritative_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_authoritative_sync_failure_count", 0) or 0),
             "order_fact_sync": self._okx_order_fact_sync_status_payload(now),
-            "settlement_fact_sync": self._okx_settlement_fact_sync_status_payload(
-                now
-            ),
+            "settlement_fact_sync": self._okx_settlement_fact_sync_status_payload(now),
             "position_settlement_sync": self._okx_position_settlement_sync_status_payload(now),
             "source": "okx_private_api_current_positions",
         }
@@ -1283,12 +1280,8 @@ class TradingService:
             ),
             "last_error": getattr(self, "_okx_settlement_fact_sync_last_error", None),
             "last_row": last_row,
-            "success_count": int(
-                getattr(self, "_okx_settlement_fact_sync_success_count", 0) or 0
-            ),
-            "failure_count": int(
-                getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0
-            ),
+            "success_count": int(getattr(self, "_okx_settlement_fact_sync_success_count", 0) or 0),
+            "failure_count": int(getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0),
             "interval_seconds": round(interval_seconds, 3),
         }
 
@@ -1367,9 +1360,7 @@ class TradingService:
         return {
             "status": status,
             "task_running": bool(task is not None and not task.done()),
-            "force_pending": bool(
-                getattr(self, "_okx_order_fact_sync_force_pending", False)
-            ),
+            "force_pending": bool(getattr(self, "_okx_order_fact_sync_force_pending", False)),
             "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
             "last_finished_at": (
                 finished_at.isoformat() if isinstance(finished_at, datetime) else None
@@ -1773,8 +1764,7 @@ class TradingService:
                     "error": error,
                 }
                 self._okx_settlement_fact_sync_failure_count = (
-                    int(getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0)
-                    + 1
+                    int(getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0) + 1
                 )
                 logger.warning(
                     "OKX settlement fact background sync failed",
@@ -2362,11 +2352,10 @@ class TradingService:
             }
             if (
                 selected_mode == "paper"
-                and getattr(self, "continuous_model_weight_evidence_service", None)
-                is not None
+                and getattr(self, "continuous_model_weight_evidence_service", None) is not None
             ):
-                loaders["continuous_model_weight_evidence"] = (
-                    lambda: self._continuous_model_weight_evidence("paper")
+                loaders["continuous_model_weight_evidence"] = lambda: (
+                    self._continuous_model_weight_evidence("paper")
                 )
             rows = await asyncio.gather(
                 *[
@@ -2544,9 +2533,7 @@ class TradingService:
         async def _refresh() -> dict[str, Any]:
             ml_signal_service = getattr(self, "ml_signal_service", None)
             model_strategy_blueprint = (
-                ml_signal_service.strategy_blueprint()
-                if ml_signal_service is not None
-                else {}
+                ml_signal_service.strategy_blueprint() if ml_signal_service is not None else {}
             )
             learned_context = await strategy_learning.apply_to_strategy_context(
                 mode=selected_mode,
@@ -2554,19 +2541,12 @@ class TradingService:
                 open_positions=open_positions,
                 model_strategy_blueprint=model_strategy_blueprint,
                 model_predictor=(
-                    ml_signal_service.predict
-                    if ml_signal_service is not None
-                    else None
+                    ml_signal_service.predict if ml_signal_service is not None else None
                 ),
                 limit=DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_row_limit,
             )
-            champion = self._safe_dict(
-                learned_context.get("paper_strategy_champion")
-            )
-            if (
-                selected_mode == "paper"
-                and champion.get("model_rollback_required") is True
-            ):
+            champion = self._safe_dict(learned_context.get("paper_strategy_champion"))
+            if selected_mode == "paper" and champion.get("model_rollback_required") is True:
                 if ml_signal_service is not None:
                     rollback_result = await asyncio.to_thread(
                         ml_signal_service.rollback_to_strategy_model,
@@ -3375,9 +3355,7 @@ class TradingService:
         credentials = settings.get_okx_credentials(selected_mode)
         required_fields = ("api_key", "api_secret", "passphrase")
         missing_fields = [
-            field
-            for field in required_fields
-            if not str(credentials.get(field) or "").strip()
+            field for field in required_fields if not str(credentials.get(field) or "").strip()
         ]
         return {
             "mode": selected_mode,
@@ -3424,9 +3402,7 @@ class TradingService:
             sync_reason is None and (sync_status == "ok" or degraded_with_fresh_success)
         )
         okx_healthy = bool(
-            selected_mode == "live"
-            and credential_presence["configured"]
-            and current_state_verified
+            selected_mode == "live" and credential_presence["configured"] and current_state_verified
         )
         breaker_state = self.risk_engine.circuit_breaker.get_state()
         daily_pnl = self._safe_float(breaker_state.get("daily_pnl"), 0.0) or 0.0
@@ -3899,9 +3875,7 @@ class TradingService:
             self._vector_memory_context_tasks = tasks
         task = tasks.get(key)
         if task is None or task.done():
-            task = asyncio.create_task(
-                self._refresh_vector_memory_context(key, symbol, action)
-            )
+            task = asyncio.create_task(self._refresh_vector_memory_context(key, symbol, action))
             tasks[key] = task
         return {
             "enabled": True,
@@ -3926,12 +3900,16 @@ class TradingService:
                     top_k=6,
                     symbol=symbol,
                 )
-                payload = result if isinstance(result, dict) else {
-                    "enabled": True,
-                    "status": "error",
-                    "error": "vector_memory_result_invalid",
-                    "hits": [],
-                }
+                payload = (
+                    result
+                    if isinstance(result, dict)
+                    else {
+                        "enabled": True,
+                        "status": "error",
+                        "error": "vector_memory_result_invalid",
+                        "hits": [],
+                    }
+                )
             except Exception as exc:
                 payload = {
                     "enabled": True,
@@ -4469,9 +4447,7 @@ class TradingService:
             self._market_indicator_prewarm_task = asyncio.create_task(
                 self._market_indicator_prewarm_worker()
             )
-        last = self._safe_dict(
-            getattr(self, "_market_indicator_prewarm_last_diagnostics", None)
-        )
+        last = self._safe_dict(getattr(self, "_market_indicator_prewarm_last_diagnostics", None))
         return {
             "status": "queued" if requested else "skipped",
             "requested_count": len(requested),
@@ -4501,15 +4477,11 @@ class TradingService:
 
         try:
             while self._market_indicator_prewarm_queue:
-                batch = self._market_indicator_prewarm_queue[
-                    :MARKET_BACKGROUND_PREWARM_BATCH_SIZE
-                ]
+                batch = self._market_indicator_prewarm_queue[:MARKET_BACKGROUND_PREWARM_BATCH_SIZE]
                 del self._market_indicator_prewarm_queue[: len(batch)]
                 diagnostics = await self._prewarm_market_candidate_indicators(batch)
                 diagnostics["background"] = True
-                diagnostics["remaining_queue_count"] = len(
-                    self._market_indicator_prewarm_queue
-                )
+                diagnostics["remaining_queue_count"] = len(self._market_indicator_prewarm_queue)
                 self._market_indicator_prewarm_last_diagnostics = diagnostics
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
@@ -4641,8 +4613,7 @@ class TradingService:
             "unavailable_count": len(unavailable),
             "unavailable_symbols": unavailable,
             "reused_existing_full_snapshot_count": sum(
-                source == "existing_full_snapshot"
-                for _symbol, _refreshed, _reason, source in rows
+                source == "existing_full_snapshot" for _symbol, _refreshed, _reason, source in rows
             ),
             "timeout_seconds": round(timeout_seconds, 3),
             "source": "prewarmed_indicator_cache",
@@ -4716,15 +4687,22 @@ class TradingService:
             for symbol in market_symbols
             if self._normalize_position_symbol(symbol) in verified_symbols
         ]
+        deferred_symbols = self._market_defer_tracker().ordered_symbols()
         deferred_keys = {
             self._normalize_position_symbol(symbol)
-            for symbol in (getattr(self, "_market_budget_deferred_symbols", []) or [])
+            for symbol in deferred_symbols
+            if self._normalize_position_symbol(symbol)
+        }
+        market_symbol_by_key = {
+            self._normalize_position_symbol(symbol): symbol
+            for symbol in market_symbols
             if self._normalize_position_symbol(symbol)
         }
         deferred_market_symbols = [
-            symbol
-            for symbol in market_symbols
-            if self._normalize_position_symbol(symbol) in deferred_keys
+            market_symbol_by_key[key]
+            for symbol in deferred_symbols
+            if (key := self._normalize_position_symbol(symbol)) in deferred_keys
+            and key in market_symbol_by_key
         ]
         major_symbol_keys = {
             self._normalize_position_symbol(symbol) for symbol in ALT_LONG_ALLOWED_SYMBOLS
@@ -4992,9 +4970,7 @@ class TradingService:
         continuous_weight_report = self._continuous_model_weight_report(
             mode=selected_mode,
             market_regime=market_regime,
-            evidence=self._safe_dict(
-                performance_values.get("continuous_model_weight_evidence")
-            ),
+            evidence=self._safe_dict(performance_values.get("continuous_model_weight_evidence")),
             contribution=model_contribution_perf,
             snapshot_version=int(performance_snapshot.get("version") or 0),
         )
@@ -5220,8 +5196,7 @@ class TradingService:
         if not champion:
             champion = self._safe_dict(learning.get("paper_strategy_champion"))
         routing = self._safe_dict(
-            result.get("continuous_strategy_routing")
-            or learning.get("continuous_strategy_routing")
+            result.get("continuous_strategy_routing") or learning.get("continuous_strategy_routing")
         )
         continuous_primary_ready = bool(
             self._safe_dict(routing.get("current_route")).get("primary")
@@ -5494,7 +5469,9 @@ class TradingService:
         primary_source = (
             "authoritative_all_cost_profit_distribution"
             if decision.is_entry
-            else "position_economics_dynamic_exit" if decision.is_exit else "observation_only_hold"
+            else "position_economics_dynamic_exit"
+            if decision.is_exit
+            else "observation_only_hold"
         )
 
         raw["decision_source"] = {
@@ -5661,9 +5638,7 @@ class TradingService:
             "available": evidence.get("available") is True,
             "generated_at": evidence.get("generated_at"),
             "expires_at": evidence.get("expires_at"),
-            "fallback": (
-                "none" if evidence.get("available") is True else "cold_start_weights"
-            ),
+            "fallback": ("none" if evidence.get("available") is True else "cold_start_weights"),
         }
         if len(cache) >= 16:
             cache.pop(next(iter(cache)))
@@ -5681,6 +5656,43 @@ class TradingService:
         )
         self.market_analysis_selector = policy
         return policy
+
+    def _market_defer_tracker(self) -> MarketAnalysisDeferTracker:
+        tracker = getattr(self, "market_analysis_defer_tracker", None)
+        if tracker is not None:
+            return tracker
+        tracker = MarketAnalysisDeferTracker(
+            normalize_symbol=self._normalize_position_symbol,
+        )
+        self.market_analysis_defer_tracker = tracker
+        return tracker
+
+    def _complete_resolved_market_candidates(
+        self,
+        considered_symbols: list[str] | dict[str, Any],
+        eligible_symbols: list[str] | dict[str, Any],
+        unresolved_keys: set[str],
+    ) -> None:
+        eligible_keys = {
+            self._normalize_position_symbol(symbol)
+            for symbol in eligible_symbols
+            if self._normalize_position_symbol(symbol)
+        }
+        for symbol in considered_symbols:
+            key = self._normalize_position_symbol(symbol)
+            if key and key not in eligible_keys and key not in unresolved_keys:
+                self._market_defer_tracker().complete(symbol)
+
+    @staticmethod
+    def _persisted_market_analysis_completed(
+        reasoning: Any,
+        raw_response: Any,
+    ) -> bool:
+        raw = raw_response if isinstance(raw_response, dict) else {}
+        timeout = raw.get("market_model_timeout")
+        if isinstance(timeout, dict) and timeout.get("isolated_to_symbol") is True:
+            return False
+        return "模型分析超过独立时间上限" not in str(reasoning or "")
 
     async def _ensure_market_analysis_selection_history(self) -> None:
         """Hydrate the short cooldown window once after each service start."""
@@ -5703,6 +5715,8 @@ class TradingService:
                             AIDecision.symbol,
                             AIDecision.created_at,
                             AIDecision.feature_snapshot,
+                            AIDecision.reasoning,
+                            AIDecision.raw_llm_response,
                         )
                         .where(
                             AIDecision.model_name == ENSEMBLE_TRADER_NAME,
@@ -5720,6 +5734,11 @@ class TradingService:
             )
             return
         for row in reversed(rows):
+            if not self._persisted_market_analysis_completed(
+                row.reasoning,
+                row.raw_llm_response,
+            ):
+                continue
             policy.remember(
                 str(row.symbol or ""),
                 row.feature_snapshot if isinstance(row.feature_snapshot, dict) else {},
@@ -5743,18 +5762,14 @@ class TradingService:
             "is_entry_gate": False,
             "skipped_count": int(diagnostics.get("skipped_count") or 0),
             "skipped_symbols": list(diagnostics.get("skipped_symbols") or []),
-            "reason": (
-                "unchanged recent symbols that lost the marginal analysis value selection"
-            ),
+            "reason": ("unchanged recent symbols that lost the marginal analysis value selection"),
         }
         logger.info(
             "market analysis value shortlist",
             candidate_count=diagnostics.get("candidate_count"),
             selected_count=diagnostics.get("selected_count"),
             selected_symbols=diagnostics.get("selected_symbols"),
-            recent_unchanged_candidate_count=diagnostics.get(
-                "recent_unchanged_candidate_count"
-            ),
+            recent_unchanged_candidate_count=diagnostics.get("recent_unchanged_candidate_count"),
             coverage_due_candidate_count=diagnostics.get("coverage_due_candidate_count"),
             coverage_selected_symbols=diagnostics.get("coverage_selected_symbols"),
             skipped_symbols=diagnostics.get("skipped_symbols"),
@@ -5897,8 +5912,8 @@ class TradingService:
         recent_dedupe = self._safe_dict(
             self._safe_dict(analysis_budget_context).get("recent_market_analysis_dedupe")
         )
-        budget_rotation = self._safe_dict(
-            self._safe_dict(analysis_budget_context).get("market_budget_rotation")
+        deferred_rotation = self._safe_dict(
+            self._safe_dict(analysis_budget_context).get("market_deferred_rotation")
         )
         analysis_selection = self._safe_dict(
             self._safe_dict(analysis_budget_context).get("market_analysis_selection")
@@ -5938,7 +5953,8 @@ class TradingService:
             "recent_analysis_dedupe_count": int(recent_dedupe.get("skipped_count") or 0),
             "recent_analysis_dedupe_symbols": recent_dedupe.get("skipped_symbols", []),
             "market_analysis_selection": analysis_selection,
-            "market_budget_rotation": budget_rotation,
+            "market_deferred_rotation": deferred_rotation,
+            "market_analysis_deferred": self._market_defer_tracker().snapshot(),
             "market_feature_after_dedupe_count": len(market_feature_vectors_after_dedupe or {}),
             "market_feature_after_dedupe_symbols": list(
                 (market_feature_vectors_after_dedupe or {}).keys()
@@ -6030,9 +6046,7 @@ class TradingService:
                 },
                 "market_context_timings": list(market_context_timings),
             },
-            feature_snapshot=(
-                feature.to_dict() if hasattr(feature, "to_dict") else {}
-            ),
+            feature_snapshot=(feature.to_dict() if hasattr(feature, "to_dict") else {}),
         )
 
     @staticmethod
@@ -6110,17 +6124,17 @@ class TradingService:
             ),
         }
 
-    def _rotate_market_feature_vectors_for_budget_coverage(
+    def _rotate_market_feature_vectors_for_deferred_coverage(
         self,
         market_feature_vectors: dict[str, Any],
         *,
         analysis_budget_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         items = list((market_feature_vectors or {}).items())
-        deferred = list(getattr(self, "_market_budget_deferred_symbols", []) or [])
+        deferred = self._market_defer_tracker().ordered_symbols()
         if len(items) <= 1 or not deferred:
             if isinstance(analysis_budget_context, dict):
-                analysis_budget_context["market_budget_rotation"] = {
+                analysis_budget_context["market_deferred_rotation"] = {
                     "read_only": True,
                     "is_entry_gate": False,
                     "applied": False,
@@ -6144,7 +6158,7 @@ class TradingService:
                 break
         if start_key is None or start_index <= 0:
             if isinstance(analysis_budget_context, dict):
-                analysis_budget_context["market_budget_rotation"] = {
+                analysis_budget_context["market_deferred_rotation"] = {
                     "read_only": True,
                     "is_entry_gate": False,
                     "applied": False,
@@ -6159,7 +6173,7 @@ class TradingService:
 
         rotated_items = items[start_index:] + items[:start_index]
         if isinstance(analysis_budget_context, dict):
-            analysis_budget_context["market_budget_rotation"] = {
+            analysis_budget_context["market_deferred_rotation"] = {
                 "read_only": True,
                 "is_entry_gate": False,
                 "applied": True,
@@ -6169,23 +6183,13 @@ class TradingService:
                 "deferred_symbol_count": len(deferred),
                 "deferred_symbols": deferred[:20],
                 "reason": (
-                    "previous market AI round hit the soft time budget; current shortlist "
-                    "is rotated to give deferred ranked symbols coverage without changing "
-                    "ranking scores, entry thresholds, sizing, leverage, ML readiness, or risk gates"
+                    "unfinished market candidates lead the current shortlist in queue order; "
+                    "repeated failures move to the tail so one slow symbol cannot starve other "
+                    "candidates. Entry thresholds, sizing, leverage, ML readiness, and risk "
+                    "gates remain unchanged"
                 ),
             }
         return dict(rotated_items)
-
-    def _remember_market_budget_deferred_symbols(self, symbols: list[str]) -> None:
-        normalized_seen: set[str] = set()
-        remembered: list[str] = []
-        for symbol in symbols or []:
-            key = self._normalize_position_symbol(symbol)
-            if not key or key in normalized_seen:
-                continue
-            normalized_seen.add(key)
-            remembered.append(symbol)
-        self._market_budget_deferred_symbols = remembered[:50]
 
     def _mark_market_symbol_timeout_cooldown(
         self,
@@ -6201,9 +6205,7 @@ class TradingService:
             store = {}
             self._market_timeout_retry_not_before = store
         current = now or datetime.now(UTC)
-        store[key] = current + timedelta(
-            seconds=MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS
-        )
+        store[key] = current + timedelta(seconds=MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS)
 
     def _filter_market_symbol_timeout_cooldowns(
         self,
@@ -6220,9 +6222,7 @@ class TradingService:
         for key in expired:
             store.pop(key, None)
         skipped = [
-            symbol
-            for symbol in feature_vectors
-            if self._normalize_position_symbol(symbol) in store
+            symbol for symbol in feature_vectors if self._normalize_position_symbol(symbol) in store
         ]
         available = {
             symbol: feature
@@ -6505,6 +6505,7 @@ class TradingService:
                     symbols=open_position_filter.skipped[:10],
                 )
             if run_market_analysis:
+                self._market_defer_tracker().retain(market_scan_symbols)
                 async with self._analysis_symbol_lock:
                     active_analysis_symbols = set(self._active_analysis_symbols)
                 unclaimed_filter = self.entry_symbol_universe.filter_unclaimed_market_symbols(
@@ -6513,6 +6514,10 @@ class TradingService:
                 )
                 market_scan_symbols = unclaimed_filter.symbols
                 if unclaimed_filter.skipped:
+                    self._market_defer_tracker().defer_many(
+                        unclaimed_filter.skipped,
+                        "analysis_claim_conflict",
+                    )
                     logger.info(
                         "skipping symbols already under position/market analysis",
                         count=len(unclaimed_filter.skipped),
@@ -6717,6 +6722,35 @@ class TradingService:
                         "warning": ("本轮行情特征批量拉取超时，系统已跳过剩余候选并进入下一轮。"),
                     }
                 )
+            fetched_by_key = {
+                self._normalize_position_symbol(symbol): fv
+                for symbol, fv in fv_results
+                if self._normalize_position_symbol(symbol)
+            }
+            market_fetch_keys = {
+                self._normalize_position_symbol(symbol)
+                for symbol in market_scan_symbols
+                if self._normalize_position_symbol(symbol)
+            }
+            unavailable_market_features = [
+                symbol
+                for symbol in fetch_symbols
+                if self._normalize_position_symbol(symbol) in market_fetch_keys
+                and not self._is_valid_feature_vector(
+                    fetched_by_key.get(self._normalize_position_symbol(symbol))
+                )
+            ]
+            if unavailable_market_features:
+                self._market_defer_tracker().defer_many(
+                    unavailable_market_features,
+                    "feature_unavailable",
+                )
+            results["market_feature_retries"] = {
+                "read_only": True,
+                "is_entry_gate": False,
+                "count": len(unavailable_market_features),
+                "symbols": unavailable_market_features[:50],
+            }
             feature_vectors = {s: fv for s, fv in fv_results if fv is not None}
             invalid_symbols = [
                 s for s, fv in feature_vectors.items() if not self._is_valid_feature_vector(fv)
@@ -6774,8 +6808,18 @@ class TradingService:
                 strategy_context=strategy_mode_context,
             )
             market_symbol_budget = int(analysis_budget_context.get("market_symbol_limit") or 0)
+            unresolved_market_keys: set[str] = set()
             if run_market_analysis and market_feature_vectors:
                 if market_symbol_budget <= 0:
+                    self._market_defer_tracker().defer_many(
+                        market_feature_vectors,
+                        "market_budget_unavailable",
+                    )
+                    unresolved_market_keys.update(
+                        self._normalize_position_symbol(symbol)
+                        for symbol in market_feature_vectors
+                        if self._normalize_position_symbol(symbol)
+                    )
                     market_feature_vectors = {}
                     market_feature_vectors_after_rank = {}
                 else:
@@ -6784,30 +6828,28 @@ class TradingService:
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, rank_limit
                     )
-                    availability_target = self._market_analysis_selector_policy().candidate_pool_limit(
-                        market_symbol_budget,
-                        len(market_feature_vectors),
-                    )
-                    market_feature_vectors = (
-                        await self._filter_entry_instrument_shortlist(
-                            market_feature_vectors,
-                            availability_target,
-                            model_mode,
+                    availability_target = (
+                        self._market_analysis_selector_policy().candidate_pool_limit(
+                            market_symbol_budget,
+                            len(market_feature_vectors),
                         )
+                    )
+                    market_feature_vectors = await self._filter_entry_instrument_shortlist(
+                        market_feature_vectors,
+                        availability_target,
+                        model_mode,
                     )
                     rank_diagnostics_snapshot = self._safe_dict(
                         getattr(self, "_last_auto_feature_rank_diagnostics", None)
                     )
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
             if run_market_analysis and market_feature_vectors:
-                prewarm_symbols = self._market_indicator_prewarm_symbols(
-                    market_feature_vectors
-                )
+                prewarm_symbols = self._market_indicator_prewarm_symbols(market_feature_vectors)
                 market_indicator_prewarm = self._queue_market_candidate_indicator_prewarm(
                     prewarm_symbols
                 )
-                market_indicator_prewarm["already_ready_count"] = (
-                    len(market_feature_vectors) - len(prewarm_symbols)
+                market_indicator_prewarm["already_ready_count"] = len(market_feature_vectors) - len(
+                    prewarm_symbols
                 )
             else:
                 market_indicator_prewarm = {
@@ -6820,9 +6862,10 @@ class TradingService:
                 }
             results["market_indicator_prewarm"] = market_indicator_prewarm
             if run_market_analysis and market_feature_vectors:
-                hydrated_market_feature_vectors, hydration_diagnostics = (
-                    await self._hydrate_prewarmed_market_candidates(market_feature_vectors)
-                )
+                (
+                    hydrated_market_feature_vectors,
+                    hydration_diagnostics,
+                ) = await self._hydrate_prewarmed_market_candidates(market_feature_vectors)
                 market_feature_vectors = hydrated_market_feature_vectors
                 feature_vectors.update(hydrated_market_feature_vectors)
                 if market_feature_vectors:
@@ -6861,15 +6904,33 @@ class TradingService:
                     "changes_trading_thresholds": False,
                 }
             results["market_prewarmed_feature_hydration"] = hydration_diagnostics
+            hydration_unavailable_symbols = list(
+                hydration_diagnostics.get("unavailable_symbols") or []
+            )
+            if hydration_unavailable_symbols:
+                self._market_defer_tracker().defer_many(
+                    hydration_unavailable_symbols,
+                    "indicator_hydration_unavailable",
+                )
+                unresolved_market_keys.update(
+                    self._normalize_position_symbol(symbol)
+                    for symbol in hydration_unavailable_symbols
+                    if self._normalize_position_symbol(symbol)
+                )
+            self._complete_resolved_market_candidates(
+                market_feature_vectors_before_rank,
+                market_feature_vectors,
+                unresolved_market_keys,
+            )
             if run_market_analysis and market_feature_vectors:
                 market_feature_vectors, timeout_cooldown_diagnostics = (
-                    self._filter_market_symbol_timeout_cooldowns(
-                        market_feature_vectors
-                    )
+                    self._filter_market_symbol_timeout_cooldowns(market_feature_vectors)
                 )
-                results["market_symbol_timeout_cooldowns"] = (
-                    timeout_cooldown_diagnostics
+                self._market_defer_tracker().defer_many(
+                    timeout_cooldown_diagnostics.get("skipped_symbols") or [],
+                    "timeout_cooldown",
                 )
+                results["market_symbol_timeout_cooldowns"] = timeout_cooldown_diagnostics
             else:
                 results["market_symbol_timeout_cooldowns"] = {
                     "read_only": True,
@@ -6882,13 +6943,27 @@ class TradingService:
                     ),
                 }
             if run_market_analysis and market_feature_vectors:
+                selectable_market_symbols = list(market_feature_vectors)
                 await self._ensure_market_analysis_selection_history()
                 market_feature_vectors = self._select_market_analysis_candidates(
                     market_feature_vectors,
                     market_symbol_budget,
                     analysis_budget_context=analysis_budget_context,
                 )
-                market_feature_vectors = self._rotate_market_feature_vectors_for_budget_coverage(
+                selected_market_keys = {
+                    self._normalize_position_symbol(symbol)
+                    for symbol in market_feature_vectors
+                    if self._normalize_position_symbol(symbol)
+                }
+                self._market_defer_tracker().defer_many(
+                    [
+                        symbol
+                        for symbol in selectable_market_symbols
+                        if self._normalize_position_symbol(symbol) not in selected_market_keys
+                    ],
+                    "shortlist_capacity",
+                )
+                market_feature_vectors = self._rotate_market_feature_vectors_for_deferred_coverage(
                     market_feature_vectors,
                     analysis_budget_context=analysis_budget_context,
                 )
@@ -6966,20 +7041,21 @@ class TradingService:
             review_blocked_keys: set[tuple[str, str]] = set()
             if run_position_analysis:
                 self._set_loop_stage("position_review")
-                open_positions, review_blocked_keys = (
-                    await self.position_review_service.review_open_positions(
-                        feature_vectors=feature_vectors,
-                        results=results,
-                        round_decision_ids=round_decision_ids,
-                        open_positions=open_positions,
-                        position_entry_pause_reason=new_pair_pause_reason,
-                        max_groups_override=int(
-                            analysis_budget_context.get("position_max_groups")
-                            or POSITION_REVIEW_MAX_GROUPS_PER_ROUND
-                        ),
-                        claimed_analysis_symbols=claimed_analysis_symbols,
-                        round_deadline_monotonic=round_deadline_monotonic,
-                    )
+                (
+                    open_positions,
+                    review_blocked_keys,
+                ) = await self.position_review_service.review_open_positions(
+                    feature_vectors=feature_vectors,
+                    results=results,
+                    round_decision_ids=round_decision_ids,
+                    open_positions=open_positions,
+                    position_entry_pause_reason=new_pair_pause_reason,
+                    max_groups_override=int(
+                        analysis_budget_context.get("position_max_groups")
+                        or POSITION_REVIEW_MAX_GROUPS_PER_ROUND
+                    ),
+                    claimed_analysis_symbols=claimed_analysis_symbols,
+                    round_deadline_monotonic=round_deadline_monotonic,
                 )
                 strategy_mode_context = self._refresh_dynamic_capacity(
                     open_positions=open_positions,
@@ -7072,9 +7148,16 @@ class TradingService:
                             "skipped_symbols": remaining[:20],
                         }
                     )
-                    self._remember_market_budget_deferred_symbols(remaining)
+                    self._market_defer_tracker().defer_many(
+                        remaining,
+                        "round_budget",
+                    )
                     break
                 if not await self._try_claim_analysis_symbol(symbol, "market"):
+                    self._market_defer_tracker().defer(
+                        symbol,
+                        "analysis_claim_conflict",
+                    )
                     logger.info(
                         "market symbol skipped because another analysis owns it", symbol=symbol
                     )
@@ -7086,15 +7169,18 @@ class TradingService:
                 results["symbols_processed"] += 1
                 fv = await self._fresh_feature_vector_for_analysis(symbol, fv)
                 if not self._is_valid_feature_vector(fv):
+                    self._market_defer_tracker().defer(
+                        symbol,
+                        "fresh_feature_unavailable",
+                    )
                     logger.warning("skip symbol after fresh feature check failed", symbol=symbol)
                     continue
-                self._remember_market_analysis_observation(symbol, fv)
                 model_name = ENSEMBLE_TRADER_NAME
                 model_mode = self._get_model_execution_mode(model_name)
                 if model_mode not in market_execution_cost_facts:
-                    market_execution_cost_facts[model_mode] = (
-                        await self._market_execution_cost_facts(model_mode)
-                    )
+                    market_execution_cost_facts[
+                        model_mode
+                    ] = await self._market_execution_cost_facts(model_mode)
                 attach_execution_cost_facts(
                     fv,
                     market_execution_cost_facts.get(model_mode),
@@ -7102,8 +7188,8 @@ class TradingService:
                 feature_vectors[symbol] = fv
                 symbol_started_monotonic = asyncio.get_running_loop().time()
                 context_timeout_seconds = self.market_symbol_context_timeout_seconds()
-                context_deadline_monotonic = (
-                    symbol_started_monotonic + max(context_timeout_seconds, 0.05)
+                context_deadline_monotonic = symbol_started_monotonic + max(
+                    context_timeout_seconds, 0.05
                 )
                 market_analysis_progress = self._market_analysis_progress_snapshot(
                     symbol=symbol,
@@ -7268,6 +7354,13 @@ class TradingService:
                         round_decision_ids.add(decision_db_id)
                         round_decisions[decision_db_id] = quick_decision
                         await self._mark_decision_reason(decision_db_id, prefilter_reason)
+                        self._remember_market_analysis_observation(symbol, fv)
+                        self._market_defer_tracker().complete(symbol)
+                    else:
+                        self._market_defer_tracker().defer(
+                            symbol,
+                            "decision_persistence_failed",
+                        )
                     self._decision_count += 1
                     self.market_decision_result_recorder.append_result(
                         results=results,
@@ -7290,8 +7383,8 @@ class TradingService:
                     ),
                     remaining_symbol_count=len(market_feature_items) - market_index,
                 )
-                symbol_deadline_monotonic = (
-                    model_started_monotonic + max(symbol_timeout_seconds, 0.05)
+                symbol_deadline_monotonic = model_started_monotonic + max(
+                    symbol_timeout_seconds, 0.05
                 )
                 market_analysis_progress["context_preparation_duration_seconds"] = round(
                     max(model_started_monotonic - symbol_started_monotonic, 0.0),
@@ -7342,6 +7435,7 @@ class TradingService:
                 )
                 if not isinstance(ensemble_result, tuple) or len(ensemble_result) != 2:
                     market_timeout_retry_symbols.append(symbol)
+                    self._market_defer_tracker().defer(symbol, "model_timeout")
                     self._mark_market_symbol_timeout_cooldown(symbol)
                     logger.warning(
                         "market ensemble decision exceeded isolated symbol deadline",
@@ -7416,6 +7510,14 @@ class TradingService:
                 if decision_db_id is not None:
                     round_decision_ids.add(decision_db_id)
                     round_decisions[decision_db_id] = decision
+                    if not self._is_market_analysis_timeout_hold(decision):
+                        self._remember_market_analysis_observation(symbol, fv)
+                        self._market_defer_tracker().complete(symbol)
+                else:
+                    self._market_defer_tracker().defer(
+                        symbol,
+                        "decision_persistence_failed",
+                    )
                 self._decision_count += 1
                 await self.shadow_backtest_service.create(
                     decision_db_id,
@@ -7435,9 +7537,7 @@ class TradingService:
                         decision_or_action=decision,
                         model_mode=model_mode,
                         approved=True,
-                        execution_status=(
-                            "model_timeout_hold" if timeout_hold else "hold"
-                        ),
+                        execution_status=("model_timeout_hold" if timeout_hold else "hold"),
                         reason=decision.reasoning,
                     )
                     continue
@@ -7739,10 +7839,6 @@ class TradingService:
                     ),
                 }
 
-            if market_feature_items:
-                self._remember_market_budget_deferred_symbols(
-                    market_round_skipped_by_budget
-                )
             if market_timeout_retry_symbols:
                 results["market_symbol_timeouts"] = {
                     "count": len(market_timeout_retry_symbols),
@@ -7912,6 +8008,12 @@ class TradingService:
             for symbol in claimed_analysis_symbols:
                 await self._release_analysis_symbol(symbol)
             claimed_analysis_symbols.clear()
+            if analysis_scope == "market":
+                deferred_snapshot = self._market_defer_tracker().snapshot()
+                results["market_analysis_deferred"] = deferred_snapshot
+                funnel = results.get("market_candidate_funnel")
+                if isinstance(funnel, dict):
+                    funnel["market_analysis_deferred"] = deferred_snapshot
             round_duration = (datetime.now(UTC) - round_start).total_seconds()
             results["duration_ms"] = round(round_duration * 1000)
             if analysis_scope == "market":
@@ -7929,18 +8031,21 @@ class TradingService:
                     "market_prewarmed_feature_hydration": self._safe_dict(
                         results.get("market_prewarmed_feature_hydration")
                     ),
+                    "market_analysis_deferred": self._safe_dict(
+                        results.get("market_analysis_deferred")
+                    ),
                     "analysis_budget": {
-                        "market_symbol_limit": self._safe_dict(
-                            results.get("analysis_budget")
-                        ).get("market_symbol_limit"),
-                        "market_limit_policy": self._safe_dict(
-                            results.get("analysis_budget")
-                        ).get("market_limit_policy"),
+                        "market_symbol_limit": self._safe_dict(results.get("analysis_budget")).get(
+                            "market_symbol_limit"
+                        ),
+                        "market_limit_policy": self._safe_dict(results.get("analysis_budget")).get(
+                            "market_limit_policy"
+                        ),
                     },
                 }
                 if isinstance(funnel, dict):
-                    self._last_market_round_summary["market_candidate_funnel"] = (
-                        self._safe_dict(funnel)
+                    self._last_market_round_summary["market_candidate_funnel"] = self._safe_dict(
+                        funnel
                     )
             finished_at = datetime.now(UTC)
             self._finish_runtime_round(
@@ -8149,12 +8254,8 @@ class TradingService:
                         "local ML signal auto-train waiting for mature data",
                         reason=ml_result.get("reason"),
                         train_sample_count=ml_result.get("train_sample_count"),
-                        train_decision_group_count=ml_result.get(
-                            "train_decision_group_count"
-                        ),
-                        purged_training_sample_count=ml_result.get(
-                            "purged_training_sample_count"
-                        ),
+                        train_decision_group_count=ml_result.get("train_decision_group_count"),
+                        purged_training_sample_count=ml_result.get("purged_training_sample_count"),
                     )
             except asyncio.CancelledError:
                 raise
@@ -9055,8 +9156,7 @@ class TradingService:
             0.0,
         )
         contract_size = self._safe_float(
-            exchange_position.get("contractSize")
-            or exchange_position.get("contract_size"),
+            exchange_position.get("contractSize") or exchange_position.get("contract_size"),
             0.0,
         )
         return abs(contracts * contract_size) if contract_size > 0 else 0.0
@@ -9708,10 +9808,7 @@ class TradingService:
                 take_profit_pct=0.0,
                 raw_response={
                     "fast_risk_trigger": trigger,
-                    "forced_exit": bool(
-                        stop_crossed
-                        or target_crossed
-                    ),
+                    "forced_exit": bool(stop_crossed or target_crossed),
                     "close_evidence": {
                         "hard_risk": stop_crossed,
                         "paper_canary_horizon": canary_horizon,
@@ -10007,9 +10104,7 @@ class TradingService:
                             strategy_mode_context=strategy_mode_context,
                             portfolio_symbol_context=portfolio_symbol_context,
                             position_profit_peak_context=position_profit_peak_context,
-                            stronger_opportunity_context=(
-                                stronger_opportunity_context
-                            ),
+                            stronger_opportunity_context=(stronger_opportunity_context),
                             analysis_deadline_monotonic=group_deadline_monotonic,
                             analysis_budget_seconds=group_timeout,
                         )
@@ -10557,10 +10652,7 @@ class TradingService:
         credential_presence = self._okx_credential_presence(model_mode)
         if model_mode == "live" and not credential_presence["configured"]:
             missing = ", ".join(credential_presence["missing_fields"])
-            return (
-                "实盘 OKX 凭据未配置完整，暂停新市场分析和新开仓。"
-                f"缺少字段：{missing}。"
-            )
+            return f"实盘 OKX 凭据未配置完整，暂停新市场分析和新开仓。缺少字段：{missing}。"
         cache_key = self._new_pair_pause_context_cache_key(
             model_name=model_name,
             model_mode=model_mode,
@@ -11213,7 +11305,9 @@ class TradingService:
         return (
             "做多"
             if str(side).lower() == "long"
-            else "做空" if str(side).lower() == "short" else str(side)
+            else "做空"
+            if str(side).lower() == "short"
+            else str(side)
         )
 
     async def _log_trade(

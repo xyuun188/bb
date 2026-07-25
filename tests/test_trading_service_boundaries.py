@@ -36,6 +36,7 @@ from services.exchange_position_state import (
 from services.execution_allocation_service import ExecutionAllocationService
 from services.execution_service import ExecutionService
 from services.expert_memory_service import ExpertMemoryService
+from services.market_analysis_defer_tracker import MarketAnalysisDeferTracker
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
@@ -619,9 +620,9 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
                 "status": "ok",
                 "okx_pull_available": True,
                 "confirmed_count": 96,
-                    "unverified_count": 0,
-                    "backfilled_count": 0,
-                    "deferred_stages": ["contract_sizes"],
+                "unverified_count": 0,
+                "backfilled_count": 0,
+                "deferred_stages": ["contract_sizes"],
             }
 
     def factory(**_kwargs: Any) -> FakeOrderFactSyncService:
@@ -1936,8 +1937,7 @@ async def test_pending_okx_sync_pauses_new_pair_analysis() -> None:
     )
 
     assert reason == (
-        "OKX 自动对账尚未完成首次成功同步；"
-        "暂停新开仓，等待 OKX 与本地后台状态恢复一致。"
+        "OKX 自动对账尚未完成首次成功同步；暂停新开仓，等待 OKX 与本地后台状态恢复一致。"
     )
 
 
@@ -1996,9 +1996,10 @@ async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone
     assert gate["mode"] == "live_rules_canary"
     assert gate["decision_authority"] == "rules"
     assert gate["model_can_influence"] is False
-    assert gate["evidence"]["training"]["current_decision_return_evidence"][
-        "expected_net_return_pct"
-    ] == 1.0
+    assert (
+        gate["evidence"]["training"]["current_decision_return_evidence"]["expected_net_return_pct"]
+        == 1.0
+    )
 
 
 @pytest.mark.asyncio
@@ -3025,8 +3026,8 @@ async def test_fixed_take_profit_crossing_cannot_authorize_dynamic_exit():
     service._get_model_execution_mode = lambda _model_name: "paper"
     service._log_decision = log_decision
     service._execute_candidate = execute_candidate
-    service._is_exchange_confirmed_execution = (
-        lambda execution_result: execution_result.status == OrderStatus.FILLED
+    service._is_exchange_confirmed_execution = lambda execution_result: (
+        execution_result.status == OrderStatus.FILLED
     )
     service._is_exit_progress_execution = lambda _execution_result: False
     service._log_risk_event = log_risk_event
@@ -3302,9 +3303,7 @@ async def test_entry_policy_allows_live_rules_canary_without_live_ml_profit_cont
         decision.raw_response = raw
 
     policy = EntryPolicy(
-        entry_opportunity_score=EntryOpportunityScorePolicy(
-            lambda _decision, _strategy: 1.0
-        ),
+        entry_opportunity_score=EntryOpportunityScorePolicy(lambda _decision, _strategy: 1.0),
         entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
     )
     decision = _decision(Action.LONG)
@@ -3517,9 +3516,7 @@ async def test_live_trade_gate_is_attached_before_dynamic_sizing() -> None:
         open_positions: list[dict[str, Any]],
     ) -> None:
         assert open_positions == []
-        assert decision_arg.raw_response["production_trade_gate"]["mode"] == (
-            "live_rules_canary"
-        )
+        assert decision_arg.raw_response["production_trade_gate"]["mode"] == ("live_rules_canary")
         events.append("sizing")
 
     async def persist_raw(_decision_id: int, _raw: dict[str, Any]) -> None:
@@ -4027,7 +4024,10 @@ def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = lambda symbol: str(symbol or "")
     service._auto_scan_feature_cursor = 0
-    service._market_budget_deferred_symbols = ["S7/USDT"]
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer("S7/USDT", "round_budget")
     service.entry_symbol_universe = SimpleNamespace(
         dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
     )
@@ -4042,9 +4042,47 @@ def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
     )
 
     assert selected[0] == "S7/USDT"
-    assert service._last_auto_feature_fetch_budget_diagnostics[
-        "deferred_candidate_symbol_count"
-    ] == 1
+    assert (
+        service._last_auto_feature_fetch_budget_diagnostics["deferred_candidate_symbol_count"] == 1
+    )
+
+
+def test_auto_scan_feature_budget_moves_repeated_failures_behind_waiting_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._auto_scan_feature_cursor = 0
+    service._verified_entry_symbols_by_mode = {"paper": set()}
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer_many(
+        [f"S{i}/USDT" for i in range(6)],
+        "round_budget",
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 4)
+
+    first = service._budget_auto_scan_feature_symbols(
+        [f"S{i}/USDT" for i in range(8)],
+        [],
+        configured_limit=2,
+    )
+    service.market_analysis_defer_tracker.defer_many(first, "feature_unavailable")
+    second = service._budget_auto_scan_feature_symbols(
+        [f"S{i}/USDT" for i in range(8)],
+        [],
+        configured_limit=2,
+    )
+
+    assert first == ["S0/USDT", "S1/USDT", "S2/USDT", "S3/USDT"]
+    assert second[:2] == ["S4/USDT", "S5/USDT"]
 
 
 def test_auto_scan_feature_budget_expands_discovery_without_lowering_entry_gates(
@@ -4098,10 +4136,10 @@ def test_auto_scan_feature_budget_bootstraps_major_symbols_for_private_probe(
     assert "BTC/USDT" in selected
     assert "ETH/USDT" in selected
     assert len(selected) == 4
-    assert service._last_auto_feature_fetch_budget_diagnostics[
-        "bootstrap_major_symbol_count"
-    ] == 2
-    assert service._last_auto_feature_fetch_budget_diagnostics["selected_priority_symbol_count"] == 2
+    assert service._last_auto_feature_fetch_budget_diagnostics["bootstrap_major_symbol_count"] == 2
+    assert (
+        service._last_auto_feature_fetch_budget_diagnostics["selected_priority_symbol_count"] == 2
+    )
 
 
 @pytest.mark.parametrize("model_mode", ["paper", "live"])
@@ -4235,7 +4273,7 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
             "selected_count": 1,
             "selected_symbols": ["BTC/USDT"],
         },
-        "market_budget_rotation": {
+        "market_deferred_rotation": {
             "read_only": True,
             "is_entry_gate": False,
             "applied": True,
@@ -4298,10 +4336,11 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
     assert funnel["recent_analysis_dedupe_count"] == 1
     assert funnel["market_analysis_selection"]["candidate_count"] == 4
     assert funnel["market_analysis_selection"]["is_entry_gate"] is False
-    assert funnel["market_budget_rotation"]["read_only"] is True
-    assert funnel["market_budget_rotation"]["is_entry_gate"] is False
-    assert funnel["market_budget_rotation"]["applied"] is True
-    assert funnel["market_budget_rotation"]["start_symbol"] == "ETH/USDT"
+    assert funnel["market_deferred_rotation"]["read_only"] is True
+    assert funnel["market_deferred_rotation"]["is_entry_gate"] is False
+    assert funnel["market_deferred_rotation"]["applied"] is True
+    assert funnel["market_deferred_rotation"]["start_symbol"] == "ETH/USDT"
+    assert funnel["market_analysis_deferred"]["deferred_count"] == 0
     assert funnel["market_feature_after_dedupe_count"] == 1
     assert funnel["analysis_budget"]["market_limit_policy"] == "position_first_low_risk"
     assert funnel["analysis_budget"]["configured_market_symbol_limit"] == 12
@@ -4313,16 +4352,22 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
     assert decision.raw_response["market_candidate_funnel"] == funnel
 
 
-def test_market_budget_deferred_rotation_starts_from_skipped_symbol() -> None:
+def test_market_deferred_rotation_starts_from_skipped_symbol() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
         service,
         TradingService,
     )
-    service._market_budget_deferred_symbols = ["SOL/USDT", "XRP/USDT"]
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer_many(
+        ["SOL/USDT", "XRP/USDT"],
+        "round_budget",
+    )
     analysis_budget = {}
 
-    rotated = service._rotate_market_feature_vectors_for_budget_coverage(
+    rotated = service._rotate_market_feature_vectors_for_deferred_coverage(
         {
             "BTC/USDT": "btc",
             "ETH/USDT": "eth",
@@ -4333,7 +4378,7 @@ def test_market_budget_deferred_rotation_starts_from_skipped_symbol() -> None:
     )
 
     assert list(rotated) == ["SOL/USDT", "XRP/USDT", "BTC/USDT", "ETH/USDT"]
-    rotation = analysis_budget["market_budget_rotation"]
+    rotation = analysis_budget["market_deferred_rotation"]
     assert rotation["read_only"] is True
     assert rotation["is_entry_gate"] is False
     assert rotation["applied"] is True
@@ -4342,16 +4387,19 @@ def test_market_budget_deferred_rotation_starts_from_skipped_symbol() -> None:
     assert "risk gates" in rotation["reason"]
 
 
-def test_market_budget_deferred_rotation_keeps_order_when_no_match() -> None:
+def test_market_deferred_rotation_keeps_order_when_no_match() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
         service,
         TradingService,
     )
-    service._market_budget_deferred_symbols = ["DOGE/USDT"]
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer("DOGE/USDT", "round_budget")
     analysis_budget = {}
 
-    rotated = service._rotate_market_feature_vectors_for_budget_coverage(
+    rotated = service._rotate_market_feature_vectors_for_deferred_coverage(
         {
             "BTC/USDT": "btc",
             "ETH/USDT": "eth",
@@ -4360,27 +4408,60 @@ def test_market_budget_deferred_rotation_keeps_order_when_no_match() -> None:
     )
 
     assert list(rotated) == ["BTC/USDT", "ETH/USDT"]
-    rotation = analysis_budget["market_budget_rotation"]
+    rotation = analysis_budget["market_deferred_rotation"]
     assert rotation["read_only"] is True
     assert rotation["is_entry_gate"] is False
     assert rotation["applied"] is False
     assert rotation["reason"] == "deferred symbols no longer match current shortlist"
 
 
-def test_market_budget_deferred_symbols_are_deduped_and_clearable() -> None:
+def test_market_deferred_symbols_are_deduped_and_completed() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
         service,
         TradingService,
     )
 
-    service._remember_market_budget_deferred_symbols(
-        ["BTC/USDT", "BTC/USDT", "", "ETH/USDT"],
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
     )
-    assert service._market_budget_deferred_symbols == ["BTC/USDT", "ETH/USDT"]
+    service.market_analysis_defer_tracker.defer_many(
+        ["BTC/USDT", "BTC/USDT", "", "ETH/USDT"],
+        "round_budget",
+    )
+    assert service.market_analysis_defer_tracker.ordered_symbols() == [
+        "BTC/USDT",
+        "ETH/USDT",
+    ]
 
-    service._remember_market_budget_deferred_symbols([])
-    assert service._market_budget_deferred_symbols == []
+    service.market_analysis_defer_tracker.complete("BTC/USDT")
+    assert service.market_analysis_defer_tracker.ordered_symbols() == ["ETH/USDT"]
+
+
+def test_market_deferred_resolution_keeps_unfinished_and_clears_ineligible() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer_many(
+        ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        "feature_unavailable",
+    )
+
+    service._complete_resolved_market_candidates(
+        ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        ["BTC/USDT"],
+        {"ETH/USDT"},
+    )
+
+    assert service.market_analysis_defer_tracker.ordered_symbols() == [
+        "BTC/USDT",
+        "ETH/USDT",
+    ]
 
 
 def test_market_ai_budget_clock_ignores_pre_ai_round_work(
@@ -4517,6 +4598,25 @@ def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
     assert TradingService._is_market_analysis_timeout_hold(_decision(Action.HOLD)) is False
 
 
+def test_market_selection_history_excludes_persisted_timeout_holds() -> None:
+    timeout_raw = {
+        "market_model_timeout": {
+            "isolated_to_symbol": True,
+            "retry_later": True,
+        }
+    }
+
+    assert TradingService._persisted_market_analysis_completed("正常分析完成", {}) is True
+    assert TradingService._persisted_market_analysis_completed("模型返回缺失", timeout_raw) is False
+    assert (
+        TradingService._persisted_market_analysis_completed(
+            "本次候选的模型分析超过独立时间上限，已记录为观望并交给后续轮次重试",
+            {},
+        )
+        is False
+    )
+
+
 def test_market_symbol_timeout_cooldown_yields_to_other_candidates() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = lambda symbol: str(symbol or "")
@@ -4624,9 +4724,9 @@ def test_parallel_loop_intervals_are_not_market_throttles(
 
 
 def test_paper_runner_has_one_trading_service_initialization_owner() -> None:
-    source = (
-        Path(__file__).resolve().parents[1] / "scripts" / "run_paper_trading.py"
-    ).read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "run_paper_trading.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "await trading_service.initialize()" not in source
     assert "asyncio.create_task(trading_service.start())" in source
@@ -4973,9 +5073,7 @@ def test_cached_continuous_primary_disables_fast_training_without_promotion() ->
                 "paper_strategy_champion": {"active": False},
                 "continuous_strategy_routing": {
                     "applied": True,
-                    "current_route": {
-                        "primary": {"profile_id": "future-stable-primary"}
-                    },
+                    "current_route": {"primary": {"profile_id": "future-stable-primary"}},
                 },
             },
         }
@@ -5285,9 +5383,7 @@ async def test_ml_signal_auto_train_quarantines_before_training(
                 {
                     "id": index + 1,
                     "decision_group": f"shadow_decision:{index + 1}",
-                    "label_timestamp": (
-                        start + timedelta(minutes=index * 61)
-                    ).isoformat(),
+                    "label_timestamp": (start + timedelta(minutes=index * 61)).isoformat(),
                     "horizon_minutes": 30,
                 }
                 for index in range(40)
@@ -6348,7 +6444,7 @@ async def test_sync_service_reconcile_exchange_positions_matches_okx_net_mode_po
                         "last": "0.01762",
                         "upl": "0.0300000000000002",
                         "posId": "3688338318498172929",
-                    }
+                    },
                 }
             ]
 
@@ -6840,8 +6936,7 @@ async def test_sync_service_does_not_record_full_close_as_partial_reduction():
         entry_fee_for_position=lambda *_args: 0.0,
         log_exchange_sync_close_decision=lambda **_kwargs: None,
         record_trade_reflection=lambda *_args, **_kwargs: None,
-        calculate_position_margin=lambda notional, leverage: notional
-        / float(leverage or 1.0),
+        calculate_position_margin=lambda notional, leverage: notional / float(leverage or 1.0),
     )
 
     assert result == []
@@ -8016,7 +8111,7 @@ async def test_open_positions_context_matches_okx_net_mode_position(
                         "avgPx": "0.01785",
                         "markPx": "0.0177",
                         "upl": "0.03",
-                    }
+                    },
                 }
             ]
 
