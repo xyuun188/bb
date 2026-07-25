@@ -23,7 +23,7 @@ async def test_historical_trade_fact_audit_classifies_clean_quarantined_and_repa
         f"sqlite+aiosqlite:///{(tmp_path / 'historical-facts.db').as_posix()}",
     )
     await init_db()
-    now = datetime(2026, 6, 26, tzinfo=UTC)
+    now = datetime.now(UTC)
     try:
         async with get_session_ctx() as session:
             clean = Position(

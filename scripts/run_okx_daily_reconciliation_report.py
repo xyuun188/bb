@@ -57,15 +57,6 @@ RUNTIME_ONLY_ENTRY_BLOCKERS = {
 TRAINING_NON_BLOCKING_UNRESOLVED_KEYS = {
     "trade_execution_contract",
 }
-TRAINING_QUARANTINED_OKX_INTEGRITY_KINDS = {
-    "order_position_missing",
-    "position_order_link_missing_local_order",
-    "superseded_position_residual",
-    "manual_close_position_fact_not_exchange_backed",
-    "orphan_position_quarantine_not_exchange_backed",
-    "position_missing_entry_order_link",
-    "position_missing_close_order_link",
-}
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -213,48 +204,10 @@ def _card_details(card: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _okx_integrity_has_data_issue(details: dict[str, Any]) -> bool:
+    if system_audit._okx_integrity_has_current_blocking_issue(details):
+        return True
     authoritative = _safe_dict(details.get("okx_authoritative_sync"))
     runtime_gate = _safe_dict(details.get("runtime_okx_entry_gate"))
-    severity_counts = _safe_dict(details.get("severity_counts"))
-    authoritative_severity_counts = _safe_dict(authoritative.get("severity_counts"))
-    if any(
-        _safe_int(value) > 0
-        for value in (
-            details.get("critical_count"),
-            severity_counts.get("critical"),
-            authoritative_severity_counts.get("critical"),
-            authoritative_severity_counts.get("warning"),
-            authoritative.get("manual_review_count"),
-            authoritative.get("repairable_count"),
-        )
-    ):
-        return True
-    issues = _safe_list(details.get("issues"))
-    has_explicit_integrity_evidence = any(
-        key in details
-        for key in (
-            "issue_count",
-            "warning_count",
-            "critical_count",
-            "severity_counts",
-            "okx_authoritative_sync",
-            "position_fact_link_repair",
-        )
-    )
-    if not issues and not has_explicit_integrity_evidence:
-        return True
-    for issue in issues:
-        if not isinstance(issue, dict):
-            continue
-        severity = str(issue.get("severity") or "").lower()
-        kind = str(issue.get("kind") or "")
-        if severity == "critical":
-            return True
-        if (
-            severity == "warning"
-            and kind not in TRAINING_QUARANTINED_OKX_INTEGRITY_KINDS
-        ):
-            return True
     authoritative_pull_failed = (
         "okx_pull_available" in authoritative
         and authoritative.get("okx_pull_available") is False
@@ -329,7 +282,16 @@ def _operational_gates_from_cards(
             key == "okx_trade_fact_integrity"
             and not _okx_integrity_has_data_issue(card_details)
         )
-        if non_blocking_okx_integrity_observation:
+        non_blocking_reconciliation_observation = (
+            key == "okx_reconciliation"
+            and system_audit._okx_reconciliation_is_quarantined_observation(
+                card_details
+            )
+        )
+        if (
+            non_blocking_okx_integrity_observation
+            or non_blocking_reconciliation_observation
+        ):
             continue
         item = {
             "code": f"unresolved_{key or 'audit_card'}",

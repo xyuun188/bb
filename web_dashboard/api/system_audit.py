@@ -1067,6 +1067,7 @@ def _okx_reconciliation_root_cause_summary(
     skipped_candidate_count: int,
     unscanned_candidate_count: int,
     truncated: bool,
+    historical_manual_review_only: bool,
 ) -> dict[str, Any]:
     linked_count = int(classification_counts.get("linked") or 0)
     missing_count = max(int(repairable_count or 0) + int(manual_review_count or 0), 0)
@@ -1111,10 +1112,22 @@ def _okx_reconciliation_root_cause_summary(
                 "action": "Run the full reconciliation script or scan by order-id batches before treating the window as clean.",
             }
         )
+    quarantined_only = bool(
+        manual_review_count > 0
+        and repairable_count == 0
+        and skipped_candidate_count == 0
+        and unscanned_candidate_count == 0
+        and not truncated
+        and historical_manual_review_only
+    )
     status = (
-        "dirty"
+        "quarantined"
+        if quarantined_only
+        else "dirty"
         if missing_count or skipped_candidate_count
-        else "incomplete" if unscanned_candidate_count or truncated else "clean"
+        else "incomplete"
+        if unscanned_candidate_count or truncated
+        else "clean"
     )
     return {
         "status": status,
@@ -1126,14 +1139,121 @@ def _okx_reconciliation_root_cause_summary(
         "unscanned_candidate_count": int(unscanned_candidate_count),
         "raw_records_preserved": True,
         "cleanup_mode": "quarantine_not_delete",
+        "quarantined_only": quarantined_only,
         "training_policy": (
             "only_okx_backed_clean_trade_facts"
             if status == "clean"
+            else "exclude_quarantined_historical_trade_facts"
+            if status == "quarantined"
             else "exclude_dirty_or_unclassified_trade_facts"
         ),
         "requires_training_rebuild": status in {"dirty", "incomplete"},
         "root_causes": root_causes,
     }
+
+
+OKX_TRADE_FACT_QUARANTINED_WARNING_KINDS = {
+    "contract_specification_evidence_missing",
+    "manual_close_position_fact_not_exchange_backed",
+    "okx_fill_not_linked_to_position",
+    "order_position_missing",
+    "orphan_position_quarantine_not_exchange_backed",
+    "position_missing_close_order_link",
+    "position_missing_entry_order_link",
+    "position_order_link_missing_local_order",
+    "superseded_position_residual",
+}
+
+
+def _okx_integrity_issue_partition(
+    details: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    authoritative = _safe_dict(details.get("okx_authoritative_sync"))
+    detail_issues = [
+        item for item in _safe_list(details.get("issues")) if isinstance(item, dict)
+    ]
+    authoritative_issues = [
+        item for item in _safe_list(authoritative.get("issues")) if isinstance(item, dict)
+    ]
+    issues = [*detail_issues, *authoritative_issues]
+    blocking: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
+    has_explicit_integrity_evidence = any(
+        key in details
+        for key in (
+            "issue_count",
+            "warning_count",
+            "critical_count",
+            "severity_counts",
+            "okx_authoritative_sync",
+            "position_fact_link_repair",
+        )
+    )
+    if not issues and not has_explicit_integrity_evidence:
+        blocking.append({"kind": "integrity_evidence_missing"})
+    for issue in issues:
+        severity = str(issue.get("severity") or "").strip().lower()
+        kind = str(issue.get("kind") or "").strip()
+        if severity == "critical":
+            blocking.append(issue)
+        elif severity == "warning":
+            if kind in OKX_TRADE_FACT_QUARANTINED_WARNING_KINDS:
+                quarantined.append(issue)
+            else:
+                blocking.append(issue)
+
+    aggregate_critical = any(
+        int(value or 0) > 0
+        for value in (
+            details.get("critical_count"),
+            _safe_dict(details.get("severity_counts")).get("critical"),
+            _safe_dict(authoritative.get("severity_counts")).get("critical"),
+        )
+    )
+    if aggregate_critical and not any(
+        str(item.get("severity") or "").lower() == "critical" for item in blocking
+    ):
+        blocking.append({"kind": "unclassified_critical_integrity_issue"})
+
+    authoritative_warning_count = max(
+        int(_safe_dict(authoritative.get("severity_counts")).get("warning") or 0),
+        int(authoritative.get("manual_review_count") or 0),
+    )
+    if authoritative_warning_count > 0 and not authoritative_issues:
+        blocking.append({"kind": "unclassified_authoritative_warning"})
+    if int(authoritative.get("repairable_count") or 0) > 0:
+        blocking.append({"kind": "authoritative_repairable_issue"})
+
+    detail_warning_count = max(
+        int(details.get("warning_count") or 0),
+        int(_safe_dict(details.get("severity_counts")).get("warning") or 0),
+    )
+    if detail_warning_count > 0 and not detail_issues:
+        blocking.append({"kind": "unclassified_trade_fact_warning"})
+    return blocking, quarantined
+
+
+def _okx_integrity_has_current_blocking_issue(details: dict[str, Any]) -> bool:
+    blocking, _quarantined = _okx_integrity_issue_partition(details)
+    return bool(blocking)
+
+
+def _okx_reconciliation_is_quarantined_observation(details: dict[str, Any]) -> bool:
+    root_cause = _safe_dict(details.get("root_cause_summary"))
+    missing_count = int(details.get("missing_closed_positions") or 0)
+    manual_review_count = int(details.get("manual_review_count") or 0)
+    return bool(
+        missing_count > 0
+        and manual_review_count == missing_count
+        and int(details.get("repairable_count") or 0) == 0
+        and int(details.get("skipped_candidate_count") or 0) == 0
+        and int(details.get("unscanned_candidate_count") or 0) == 0
+        and not bool(details.get("truncated"))
+        and root_cause.get("status") == "quarantined"
+        and root_cause.get("quarantined_only") is True
+        and root_cause.get("raw_records_preserved") is True
+        and root_cause.get("cleanup_mode") == "quarantine_not_delete"
+    )
 
 
 def _split_training_source_warnings(
@@ -1425,14 +1545,26 @@ async def _okx_reconciliation_audit(
         skipped_candidate_count=skipped_candidate_count,
         unscanned_candidate_count=unscanned_candidate_count,
         truncated=bool(report.truncated),
+        historical_manual_review_only=bool(
+            plans
+            and all(
+                (_age_seconds(plan.closed_at) or 0.0) >= 6 * 3600
+                for plan in plans
+                if getattr(plan, "closed_at", None) is not None
+            )
+            and all(getattr(plan, "closed_at", None) is not None for plan in plans)
+        ),
     )
     classifications_by_close_order_id = {
         str(item.get("close_order_id") or ""): item
         for item in plan_classifications
         if isinstance(item, dict)
     }
+    quarantined_only = root_cause_summary.get("quarantined_only") is True
     summary = (
-        "存在可由 OKX 成交订单反推的缺失历史仓位。"
+        "历史平仓链接缺口已保留原始事实并隔离，不阻断当前交易与干净样本训练。"
+        if quarantined_only
+        else "存在可由 OKX 成交订单反推的缺失历史仓位。"
         if missing
         else (
             "14 天历史仓位 dry-run 已限量扫描；需运行完整脚本确认无缺失。"
@@ -1461,6 +1593,8 @@ async def _okx_reconciliation_audit(
                 "skipped_candidate_count": skipped_candidate_count,
                 "unscanned_candidate_count": unscanned_candidate_count,
                 "root_cause_summary": root_cause_summary,
+                "observing": quarantined_only,
+                "historical_facts_quarantined": quarantined_only,
                 "training_data_policy": {
                     "raw_records_preserved": True,
                     "cleanup_mode": "quarantine_not_delete",
@@ -1864,6 +1998,11 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
     authoritative_sync["live_repair_mutation"] = False
     authoritative_sync["can_write_database"] = False
     details["okx_authoritative_sync"] = authoritative_sync
+    blocking_integrity_issues, quarantined_integrity_issues = (
+        _okx_integrity_issue_partition(details)
+    )
+    details["current_blocking_issue_count"] = len(blocking_integrity_issues)
+    details["quarantined_warning_count"] = len(quarantined_integrity_issues)
     runtime_status = _load_trading_runtime_status_for_audit()
     runtime_entry_gate = _okx_runtime_entry_gate_summary(runtime_status)
     details["runtime_okx_entry_gate"] = runtime_entry_gate
@@ -4312,6 +4451,12 @@ def _issue_ledger_state(
         return "fixed", "已修复 / 当前验证通过"
     if observation_only:
         return "observing", "历史/样本观察 / 当前未复现硬错误"
+    if (
+        key == "okx_reconciliation"
+        and status == "warning"
+        and _okx_reconciliation_is_quarantined_observation(details)
+    ):
+        return "observing", "历史交易事实只读隔离 / 当前交易与训练不受阻断"
     if status == "warning" and bool(details.get("observing")):
         return "observing", "观察项 / 受控阶段或预热中"
     if (
@@ -4340,17 +4485,7 @@ def _issue_ledger_state(
             "trading_runtime_inactive",
             "trading_runtime_heartbeat_stale",
         }
-        has_data_integrity_issue = any(
-            int(value or 0) > 0
-            for value in (
-                details.get("critical_count"),
-                details.get("warning_count"),
-                _safe_dict(authoritative_sync.get("severity_counts")).get("critical"),
-                _safe_dict(authoritative_sync.get("severity_counts")).get("warning"),
-                authoritative_sync.get("manual_review_count"),
-                authoritative_sync.get("repairable_count"),
-            )
-        )
+        has_data_integrity_issue = _okx_integrity_has_current_blocking_issue(details)
         authoritative_pull_failed = (
             "okx_pull_available" in authoritative_sync
             and authoritative_sync.get("okx_pull_available") is False
@@ -4379,6 +4514,14 @@ def _issue_ledger_state(
         ):
             return "observing", "观察项 / OKX 运行同步健康或仅运行态待观察"
         if not has_data_integrity_issue and runtime_sync_healthy:
+            _blocking_issues, quarantined_issues = _okx_integrity_issue_partition(
+                details
+            )
+            if quarantined_issues:
+                return (
+                    "observing",
+                    "历史交易事实逐条隔离 / 当前 OKX 运行态同步正常",
+                )
             severity_counts = _safe_dict(details.get("severity_counts"))
             issues = _safe_list(details.get("issues"))
             info_only = (

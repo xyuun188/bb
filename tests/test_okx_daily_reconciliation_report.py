@@ -485,12 +485,92 @@ def test_okx_daily_reconciliation_quarantined_integrity_warnings_do_not_block_tr
     )
 
     assert report["status"] == "warning"
-    assert report["issue_ledger"]["summary"]["unresolved"] == 1
+    assert report["issue_ledger"]["summary"]["unresolved"] == 0
+    assert report["issue_ledger"]["summary"]["observing"] == 1
     assert report["can_open_new_entries"] is True
     assert report["can_refresh_training"] is True
     assert report["requires_attention"] is False
     assert report["operational_gates"]["entry_blockers"] == []
     assert report["operational_gates"]["training_blockers"] == []
+
+
+def test_historical_quarantined_trade_facts_do_not_starve_new_clean_samples() -> None:
+    reconciliation = _card("okx_reconciliation", "warning")
+    reconciliation["details"] = {
+        "missing_closed_positions": 4,
+        "repairable_count": 0,
+        "manual_review_count": 4,
+        "skipped_candidate_count": 0,
+        "unscanned_candidate_count": 0,
+        "truncated": False,
+        "root_cause_summary": {
+            "status": "quarantined",
+            "quarantined_only": True,
+            "raw_records_preserved": True,
+            "cleanup_mode": "quarantine_not_delete",
+        },
+    }
+    integrity = _card("okx_trade_fact_integrity", "warning")
+    integrity["details"] = {
+        "issue_count": 2,
+        "critical_count": 0,
+        "warning_count": 2,
+        "severity_counts": {"warning": 2},
+        "issues": [
+            {
+                "kind": "contract_specification_evidence_missing",
+                "severity": "warning",
+            },
+            {
+                "kind": "order_position_missing",
+                "severity": "warning",
+            },
+        ],
+        "position_fact_link_repair": {"candidate_link_count": 0},
+        "okx_authoritative_sync": {
+            "okx_pull_available": True,
+            "issue_count": 1,
+            "manual_review_count": 1,
+            "repairable_count": 0,
+            "severity_counts": {"warning": 1},
+            "issues": [
+                {
+                    "kind": "okx_fill_not_linked_to_position",
+                    "severity": "warning",
+                }
+            ],
+        },
+        "runtime_okx_entry_gate": {
+            "entry_blocked": False,
+            "status": "ok",
+            "sync_status": "ok",
+            "last_requires_attention_count": 0,
+        },
+    }
+
+    report = report_script.build_report(
+        [
+            reconciliation,
+            integrity,
+            _card("position_price_integrity", "ok"),
+            _card("trade_execution_contract", "ok"),
+        ],
+        generated_at=datetime(2026, 7, 25, 4, 45, tzinfo=UTC),
+    )
+
+    assert report["status"] == "warning"
+    assert report["issue_ledger"]["summary"] == {
+        "fixed": 2,
+        "unresolved": 0,
+        "observing": 2,
+        "total": 4,
+    }
+    assert report["can_open_new_entries"] is True
+    assert report["can_refresh_training"] is True
+    assert report["requires_attention"] is False
+    assert report["operational_gates"]["entry_blockers"] == []
+    assert report["operational_gates"]["training_blockers"] == []
+    assert report_script.exit_code_for_report(report) == 0
 
 
 def test_okx_daily_reconciliation_unresolved_warning_exits_warning() -> None:
