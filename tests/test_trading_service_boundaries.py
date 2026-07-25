@@ -565,6 +565,50 @@ async def test_okx_order_fact_sync_background_backs_off_after_degraded_result() 
 
 
 @pytest.mark.asyncio
+async def test_forced_order_fact_sync_queues_follow_up_while_task_is_running() -> None:
+    service = TradingService.__new__(TradingService)
+    service.okx_order_fact_sync_factory = object()
+    service._okx_order_fact_sync_task = None
+    service._okx_order_fact_sync_last_finished_at = None
+    service._okx_order_fact_sync_force_pending = False
+    starts = [asyncio.Event(), asyncio.Event()]
+    releases = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    async def fake_sync() -> dict[str, Any]:
+        nonlocal calls
+        index = calls
+        calls += 1
+        starts[index].set()
+        await releases[index].wait()
+        return {"status": "ok", "okx_pull_available": True}
+
+    service._sync_okx_order_facts_for_loop = fake_sync  # type: ignore[method-assign]
+
+    service._start_okx_order_fact_sync_background(force=True)
+    await asyncio.wait_for(starts[0].wait(), timeout=1.0)
+    first_task = service._okx_order_fact_sync_task
+    service.request_okx_order_fact_recovery("paper")
+
+    assert service._okx_order_fact_sync_force_pending is True
+    assert service._okx_order_fact_sync_task is first_task
+
+    releases[0].set()
+    await asyncio.wait_for(first_task, timeout=1.0)
+    await asyncio.sleep(0)
+    await asyncio.wait_for(starts[1].wait(), timeout=1.0)
+    second_task = service._okx_order_fact_sync_task
+    assert second_task is not None and second_task is not first_task
+
+    releases[1].set()
+    await asyncio.wait_for(second_task, timeout=1.0)
+    await asyncio.sleep(0)
+
+    assert calls == 2
+    assert service._okx_order_fact_sync_force_pending is False
+
+
+@pytest.mark.asyncio
 async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -> None:
     service = TradingService.__new__(TradingService)
     service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]

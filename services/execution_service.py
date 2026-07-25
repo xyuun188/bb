@@ -550,7 +550,7 @@ class ExecutionService:
         return self.position_protection_rebalancer
 
     def _trigger_order_fact_recovery(self, execution_mode: str) -> bool:
-        """Request a non-blocking OKX fill recovery after local order persistence fails."""
+        """Request non-blocking authoritative OKX facts after a confirmed execution."""
 
         trigger = self.order_fact_recovery_trigger
         if trigger is None:
@@ -1653,6 +1653,8 @@ class ExecutionService:
                     {"model": model_name, "symbol": symbol, "warning": warning}
                 )
                 await log_risk_event("warning", symbol, warning, model_name)
+            if local_order_persisted and (exchange_confirmed or exit_progress):
+                recovery_requested = self._trigger_order_fact_recovery(model_mode)
             if exchange_confirmed:
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,

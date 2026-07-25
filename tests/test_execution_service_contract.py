@@ -1046,6 +1046,53 @@ async def test_execution_service_recovers_when_confirmed_order_fact_write_fails(
 
 
 @pytest.mark.asyncio
+async def test_execution_service_requests_authoritative_facts_after_confirmed_write() -> None:
+    recovery_requests: list[str] = []
+
+    class FilledExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(
+                order_id="local-order-2",
+                exchange_order_id="okx-order-2",
+                symbol=decision.symbol,
+                side="sell",
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return FilledExecutor()
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        order_fact_recovery_trigger=lambda mode: recovery_requests.append(mode),
+    )
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        _profit_first_ready_position_review_decision(),
+        SimpleNamespace(warnings=[]),
+        993,
+        results,
+        open_positions=[],
+    )
+
+    assert result is not None
+    assert result.status == OrderStatus.FILLED
+    assert recovery_requests == ["paper"]
+
+
+@pytest.mark.asyncio
 async def test_confirmed_exit_rebalances_protection_after_position_persistence() -> None:
     calls: list[str] = []
     raw_updates: list[dict[str, Any] | None] = []

@@ -52,6 +52,7 @@ DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_LIMIT = 500
 DEFAULT_TIMEOUT_SECONDS = 8.0
 ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS = 1.0
+ORDER_FACT_SYNC_MAX_PERSISTENCE_RESERVE_SECONDS = 1.5
 DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 4
 DEFAULT_MAX_ORDER_GAP_QUERIES = 4
 ACCOUNT_HISTORY_MAX_PAGES = 5
@@ -269,10 +270,6 @@ class OkxOrderFactSyncService:
         started_at = datetime.now(UTC)
         since = self._effective_since(started_at)
         since_naive = _db_naive_since(since)
-        (
-            stored_slippage_refresh_count,
-            stored_slippage_refresh_samples,
-        ) = await self._refresh_stored_slippage_from_rows()
         local_orders = await self._load_local_orders(since_naive)
         external_refresh_orders = [
             order for order in local_orders if _order_needs_okx_pull(order)
@@ -288,6 +285,12 @@ class OkxOrderFactSyncService:
                 limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
             )
         )[:DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC]
+        urgent_target_order_ids = {
+            token
+            for order in external_refresh_orders
+            if not _order_has_authoritative_stored_okx_fill_fact(order)
+            for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+        }
         order_target_inst_ids = {
             inst_id
             for order in external_refresh_orders
@@ -299,8 +302,17 @@ class OkxOrderFactSyncService:
             if _order_has_contract_sized_execution_fact(order)
             if (inst_id := _order_inst_id(order))
         }
+        (
+            stored_slippage_refresh_count,
+            stored_slippage_refresh_samples,
+        ) = await self._refresh_stored_slippage_from_rows()
         executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
-        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+        persistence_reserve = min(
+            ORDER_FACT_SYNC_MAX_PERSISTENCE_RESERVE_SECONDS,
+            max(self.timeout_seconds * 0.25, 0.2),
+        )
+        pull_budget_seconds = max(self.timeout_seconds - persistence_reserve, 0.5)
+        deadline = asyncio.get_running_loop().time() + pull_budget_seconds
         completed_stages: list[str] = []
         if stored_slippage_refresh_count:
             completed_stages.append("stored_slippage_contract_upgrade")
@@ -314,6 +326,11 @@ class OkxOrderFactSyncService:
         protection_algo_rows: list[dict[str, Any]] = []
         protection_execution_error: str | None = None
         contract_sizes: dict[str, float] = {}
+        priority_confirmed_count = 0
+        priority_unverified_count = 0
+        priority_skipped_old_count = 0
+        priority_contract_size_deferred_count = 0
+        priority_samples: list[dict[str, Any]] = []
         account_fills_complete = False
         account_orders_complete = False
         target_fill_order_ids: set[str] = set()
@@ -388,6 +405,85 @@ class OkxOrderFactSyncService:
                 local_orders,
                 overlap_hours=max(self.lookback_hours, ACCOUNT_HISTORY_OVERLAP_HOURS),
             )
+            if priority_target_order_ids:
+                target_fills, target_fills_complete = await run_stage(
+                    "fills_history_targeted",
+                    lambda: native_facts.fetch_fill_groups(
+                        order_ids=priority_target_order_ids,
+                        since=since,
+                        limit=100,
+                        max_pages=1,
+                        target_orders_only=True,
+                        target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
+                        strict=True,
+                    ),
+                    cap_seconds=2.0,
+                )
+                fills = list(target_fills or [])
+                if target_fills_complete:
+                    target_fill_order_ids.update(priority_target_order_ids)
+                priority_contract_sizes, _ = await run_stage(
+                    "contract_sizes_priority",
+                    lambda: native_facts.fetch_contract_sizes(
+                        inst_ids=(
+                            order_target_inst_ids
+                            | {fill.inst_id for fill in fills if fill.inst_id}
+                        ),
+                    ),
+                    cap_seconds=1.0,
+                )
+                contract_sizes.update(dict(priority_contract_sizes or {}))
+                targeted_fill_ids = {fill.order_id for fill in fills if fill.order_id}
+                if urgent_target_order_ids & targeted_fill_ids:
+                    (
+                        priority_local_checked,
+                        priority_confirmed_count,
+                        priority_unverified_count,
+                        priority_skipped_old_count,
+                        priority_contract_size_deferred_count,
+                        priority_samples,
+                    ) = await self._persist_priority_fill_facts(
+                        since=since,
+                        since_naive=since_naive,
+                        target_order_ids=urgent_target_order_ids & targeted_fill_ids,
+                        fills=fills,
+                        contract_sizes=contract_sizes,
+                    )
+                    completed_stages.append("priority_order_facts_persisted")
+                    if urgent_target_order_ids.issubset(targeted_fill_ids):
+                        status = (
+                            "warning"
+                            if priority_unverified_count
+                            else "deferred"
+                            if priority_contract_size_deferred_count
+                            else "ok"
+                        )
+                        return OkxOrderFactSyncSummary(
+                            status=status,
+                            mode=self.mode,
+                            source="okx_native_orders_and_fills_priority_fast_lane",
+                            phase3_order_sync_start=since,
+                            checked_at=datetime.now(UTC),
+                            okx_pull_available=True,
+                            local_checked=priority_local_checked,
+                            confirmed_count=(
+                                stored_slippage_refresh_count + priority_confirmed_count
+                            ),
+                            unverified_count=priority_unverified_count,
+                            contract_size_deferred_count=(
+                                priority_contract_size_deferred_count
+                            ),
+                            completed_stages=tuple(completed_stages),
+                            deferred_stages=("account_history_after_priority_fast_lane",),
+                            skipped_old_count=priority_skipped_old_count,
+                            samples=tuple(
+                                [
+                                    *stored_slippage_refresh_samples,
+                                    *priority_samples,
+                                ][:8]
+                            ),
+                        ).as_dict()
+
             account_wide_fills, account_fills_complete = await run_stage(
                 "fills_history_account",
                 lambda: native_facts.fetch_fill_groups(
@@ -401,7 +497,7 @@ class OkxOrderFactSyncService:
                 ),
                 cap_seconds=3.0,
             )
-            fills = list(account_wide_fills or [])
+            fills = _dedupe_fills_by_order_id([*fills, *(account_wide_fills or [])])
             seen_fill_order_ids = {fill.order_id for fill in fills if fill.order_id}
             missing_priority_ids = tuple(
                 order_id
@@ -485,19 +581,22 @@ class OkxOrderFactSyncService:
                     ),
                     None,
                 )
-            contract_sizes, _ = await run_stage(
-                "contract_sizes",
-                lambda: native_facts.fetch_contract_sizes(
-                    inst_ids=(
-                        {fill.inst_id for fill in fills if fill.inst_id}
-                        | _order_rows_inst_ids(order_rows)
-                        | order_target_inst_ids
-                        | stored_fact_inst_ids
-                    ),
-                ),
-                cap_seconds=1.0,
+            required_contract_inst_ids = (
+                {fill.inst_id for fill in fills if fill.inst_id}
+                | _order_rows_inst_ids(order_rows)
+                | order_target_inst_ids
+                | stored_fact_inst_ids
             )
-            contract_sizes = dict(contract_sizes or {})
+            missing_contract_inst_ids = required_contract_inst_ids - set(contract_sizes)
+            if missing_contract_inst_ids:
+                additional_contract_sizes, _ = await run_stage(
+                    "contract_sizes",
+                    lambda: native_facts.fetch_contract_sizes(
+                        inst_ids=missing_contract_inst_ids,
+                    ),
+                    cap_seconds=1.0,
+                )
+                contract_sizes.update(dict(additional_contract_sizes or {}))
         except Exception as exc:
             okx_pull_available = False
             pull_error = safe_error_text(exc, limit=180)
@@ -568,16 +667,19 @@ class OkxOrderFactSyncService:
                 decisions_by_id = {
                     int(decision.id): decision for decision in decision_rows.scalars().all()
                 }
-            confirmed_count = stored_slippage_refresh_count
-            unverified_count = 0
-            skipped_old_count = 0
-            samples: list[dict[str, Any]] = list(stored_slippage_refresh_samples)
+            confirmed_count = stored_slippage_refresh_count + priority_confirmed_count
+            unverified_count = priority_unverified_count
+            skipped_old_count = priority_skipped_old_count
+            samples: list[dict[str, Any]] = [
+                *stored_slippage_refresh_samples,
+                *priority_samples,
+            ]
             contract_sizes = _build_contract_size_catalog(
                 public_sizes=contract_sizes,
             )
             backfilled_count = 0
             order_history_backfilled_count = 0
-            contract_size_deferred_count = 0
+            contract_size_deferred_count = priority_contract_size_deferred_count
             if okx_pull_available:
                 (
                     local_confirmed_count,
@@ -876,6 +978,70 @@ class OkxOrderFactSyncService:
                 & fill_order_ids
             )
         ]
+
+    async def _persist_priority_fill_facts(
+        self,
+        *,
+        since: datetime,
+        since_naive: datetime,
+        target_order_ids: set[str],
+        fills: list[OkxNativeFillGroup],
+        contract_sizes: dict[str, float],
+    ) -> tuple[int, int, int, int, int, list[dict[str, Any]]]:
+        """Commit targeted native fills before slower account-wide history stages."""
+
+        fills_by_order_id = {fill.order_id: fill for fill in fills if fill.order_id}
+        async with get_session_ctx() as session:
+            writable_orders = await self._load_writable_refresh_orders(
+                session,
+                since_naive,
+                authoritative_fill_order_ids=set(fills_by_order_id),
+            )
+            priority_orders = [
+                order
+                for order in writable_orders
+                if _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+                & target_order_ids
+            ]
+            decision_ids = {
+                int(decision_id)
+                for order in priority_orders
+                if (decision_id := getattr(order, "decision_id", None))
+            }
+            decisions_by_id: dict[int, AIDecision] = {}
+            if decision_ids:
+                decision_rows = await session.execute(
+                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                )
+                decisions_by_id = {
+                    int(decision.id): decision for decision in decision_rows.scalars().all()
+                }
+            (
+                confirmed_count,
+                unverified_count,
+                skipped_old_count,
+                contract_size_deferred_count,
+                samples,
+            ) = self._apply_local_order_facts(
+                priority_orders,
+                fills=fills,
+                fills_by_order_id=fills_by_order_id,
+                order_rows_by_id={},
+                protection_execution_by_order_id={},
+                contract_sizes=_build_contract_size_catalog(public_sizes=contract_sizes),
+                decisions_by_id=decisions_by_id,
+                now=datetime.now(UTC),
+                since=since,
+                authoritative_absence_order_ids=set(),
+            )
+            return (
+                len(priority_orders),
+                confirmed_count,
+                unverified_count,
+                skipped_old_count,
+                contract_size_deferred_count,
+                samples,
+            )
 
     def _apply_local_order_facts(
         self,
@@ -2772,6 +2938,7 @@ def _prioritized_exchange_order_ids(orders: Iterable[Order], *, limit: int) -> l
     ordered = sorted(
         list(orders or []),
         key=lambda order: (
+            not _order_has_authoritative_stored_okx_fill_fact(order),
             _stored_slippage_fact_needs_refresh(order),
             _order_time(order) or datetime.min.replace(tzinfo=UTC),
         ),

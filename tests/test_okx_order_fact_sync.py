@@ -120,6 +120,19 @@ class _RecentOnlyCcxt(_FakeCcxt):
         return {"data": []}
 
 
+class _SlowAccountFastTargetCcxt(_FakeCcxt):
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        order_id = str(params.get("ordId") or "")
+        self.calls.append("fills_targeted" if order_id else "fills_account")
+        if not order_id:
+            await asyncio.sleep(2.0)
+            return {"data": []}
+        return {"data": [row for row in self.fills if row.get("ordId") == order_id]}
+
+    async def privateGetTradeFills(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self.privateGetTradeFillsHistory(params)
+
+
 class _FakeExecutor:
     def __init__(self, ccxt: _FakeCcxt) -> None:
         self.ccxt = ccxt
@@ -517,7 +530,7 @@ def test_fill_deduplication_keeps_complete_cumulative_order_fact() -> None:
     assert _dedupe_fills_by_order_id([partial, complete]) == [complete]
 
 
-def test_targeted_fill_queries_prioritize_incomplete_slippage_over_recency() -> None:
+def test_targeted_fill_queries_prioritize_unconfirmed_recent_fill_over_slippage_refresh() -> None:
     now = datetime.now(UTC)
     recent = SimpleNamespace(
         exchange_order_id="recent-generic",
@@ -527,10 +540,16 @@ def test_targeted_fill_queries_prioritize_incomplete_slippage_over_recency() -> 
     )
     incomplete_slippage = SimpleNamespace(
         exchange_order_id="older-slippage-gap",
+        okx_inst_id="BTC-USDT-SWAP",
         filled_at=now - timedelta(days=3),
         created_at=now - timedelta(days=3),
         okx_raw_fills={
             "fills_history_confirmed": True,
+            "order_id": "older-slippage-gap",
+            "trade_ids": ["trade-older-slippage-gap"],
+            "inst_id": "BTC-USDT-SWAP",
+            "contracts": 2.0,
+            "avg_price": 60000.0,
             "execution_slippage": {
                 "version": OKX_FILL_MARK_SLIPPAGE_VERSION,
                 "complete": False,
@@ -542,7 +561,75 @@ def test_targeted_fill_queries_prioritize_incomplete_slippage_over_recency() -> 
     assert _prioritized_exchange_order_ids(
         [recent, incomplete_slippage],
         limit=1,
-    ) == ["older-slippage-gap"]
+    ) == ["recent-generic"]
+
+
+@pytest.mark.asyncio
+async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "targeted-fill-fast-lane.db")
+    now = datetime.now(UTC)
+    ccxt = _SlowAccountFastTargetCcxt(
+        fills=[_act_fill_row(now, order_id="act-fast-lane")],
+        orders=[_act_order_row(now, order_id="act-fast-lane")],
+        instruments=[_act_instrument_row()],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ACT/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=4.0,
+                    price=0.00895,
+                    status="filled",
+                    fee=0.001,
+                    exchange_order_id="act-fast-lane",
+                    okx_inst_id="ACT-USDT-SWAP",
+                    okx_fill_contracts=4.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                    okx_raw_fills={
+                        "fills_history_confirmed": False,
+                        "execution_result_confirmed": True,
+                        "order_id": "act-fast-lane",
+                        "trade_ids": ["trade-act-fast-lane"],
+                        "inst_id": "ACT-USDT-SWAP",
+                        "contracts": 4.0,
+                        "avg_price": 0.00895,
+                        "fee_abs": 0.001,
+                        "fill_pnl": 0.0,
+                        "contract_size": 1.0,
+                        "contract_size_verified": True,
+                        "contract_size_source": "okx_public_instruments",
+                        "base_quantity": 4.0,
+                    },
+                    created_at=now,
+                    filled_at=now,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=0.8,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert ccxt.calls[0] == "fills_targeted"
+        assert "fills_account" not in ccxt.calls
+        assert "account_history_after_priority_fast_lane" in report["deferred_stages"]
+        assert report["confirmed_count"] == 1
+        assert order.okx_sync_status == OKX_SYNC_CONFIRMED
+        assert order.okx_raw_fills["fills_history_confirmed"] is True
+    finally:
+        await close_db()
 
 
 def test_contract_catalog_keeps_only_public_specification() -> None:
@@ -1074,7 +1161,7 @@ async def test_confirmed_fill_queries_public_spec_and_repairs_polluted_quantity(
 
         async with get_session_ctx() as session:
             order = (await session.execute(select(Order))).scalar_one()
-        assert ccxt.calls.count("fills") == 2
+        assert ccxt.calls.count("fills") >= 2
         assert "contract_specs" in ccxt.calls
         assert report["confirmed_count"] == 1
         assert report["contract_size_deferred_count"] == 0

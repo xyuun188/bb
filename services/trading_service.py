@@ -1126,6 +1126,11 @@ class TradingService:
 
         return max(240.0, self.okx_authoritative_sync_interval_seconds() * 8.0)
 
+    def okx_order_fact_sync_timeout_seconds(self) -> float:
+        """Keep background order facts independent from the current-position gate budget."""
+
+        return 8.0
+
     def okx_settlement_fact_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""
 
@@ -1357,6 +1362,9 @@ class TradingService:
         return {
             "status": status,
             "task_running": bool(task is not None and not task.done()),
+            "force_pending": bool(
+                getattr(self, "_okx_order_fact_sync_force_pending", False)
+            ),
             "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
             "last_finished_at": (
                 finished_at.isoformat() if isinstance(finished_at, datetime) else None
@@ -1369,6 +1377,7 @@ class TradingService:
             "last_error": getattr(self, "_okx_order_fact_sync_last_error", None),
             "success_count": int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_order_fact_sync_failure_count", 0) or 0),
+            "timeout_seconds": round(self.okx_order_fact_sync_timeout_seconds(), 3),
             "normal_interval_seconds": round(self.okx_order_fact_sync_interval_seconds(), 3),
             "degraded_interval_seconds": round(
                 self.okx_order_fact_sync_degraded_interval_seconds(),
@@ -1512,7 +1521,7 @@ class TradingService:
         report = await factory(
             mode=mode,
             lookback_hours=24,
-            timeout_seconds=max(3.0, min(6.0, self.round_start_reconcile_timeout_seconds() * 0.45)),
+            timeout_seconds=self.okx_order_fact_sync_timeout_seconds(),
         ).sync()
         status = str(report.get("status") or "unknown").lower()
         unverified_count = int(report.get("unverified_count") or 0)
@@ -1566,7 +1575,7 @@ class TradingService:
         }
 
     def request_okx_order_fact_recovery(self, _execution_mode: str) -> None:
-        """Force a background fill sync after an exchange-confirmed local write failure."""
+        """Force authoritative fill sync after any exchange-confirmed execution."""
 
         self._start_okx_order_fact_sync_background(force=True)
 
@@ -1577,6 +1586,8 @@ class TradingService:
             return
         task = getattr(self, "_okx_order_fact_sync_task", None)
         if task is not None and not task.done():
+            if force:
+                self._okx_order_fact_sync_force_pending = True
             return
         now = datetime.now(UTC)
         last_finished_at = getattr(self, "_okx_order_fact_sync_last_finished_at", None)
@@ -1598,6 +1609,8 @@ class TradingService:
             if (now - last_finished_at).total_seconds() < min_interval:
                 return
         self._okx_order_fact_sync_last_started_at = now
+        if force:
+            self._okx_order_fact_sync_force_pending = False
         task = asyncio.create_task(self._sync_okx_order_facts_for_loop())
         self._okx_order_fact_sync_task = task
         task.add_done_callback(self._consume_okx_order_fact_sync_result)
@@ -1652,6 +1665,9 @@ class TradingService:
             )
         if getattr(self, "_okx_order_fact_sync_task", None) is task:
             self._okx_order_fact_sync_task = None
+        if bool(getattr(self, "_okx_order_fact_sync_force_pending", False)):
+            self._okx_order_fact_sync_force_pending = False
+            self._start_okx_order_fact_sync_background(force=True)
 
     async def _okx_settlement_fact_sync_loop(self) -> None:
         """Keep authoritative OKX settlement facts current account-wide."""
@@ -8016,6 +8032,7 @@ class TradingService:
         self._runtime_heartbeat_task = None
         self._okx_authoritative_sync_task = None
         self._okx_order_fact_sync_task = None
+        self._okx_order_fact_sync_force_pending = False
         self._okx_settlement_fact_sync_task = None
         self._okx_position_settlement_sync_task = None
         self._shadow_backtest_update_task = None
