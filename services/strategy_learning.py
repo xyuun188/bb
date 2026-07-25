@@ -456,6 +456,73 @@ def _return_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _cross_symbol_generalization(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        symbol = str(sample.get("symbol") or "").strip().upper()
+        if symbol:
+            by_symbol.setdefault(symbol, []).append(sample)
+    sample_count = sum(len(rows) for rows in by_symbol.values())
+    symbol_count = len(by_symbol)
+    max_symbol_share = (
+        max((len(rows) for rows in by_symbol.values()), default=0) / sample_count
+        if sample_count > 0
+        else None
+    )
+    blockers: list[str] = []
+    if symbol_count < 2:
+        blockers.append("cross_symbol_coverage_insufficient")
+    if max_symbol_share is None or max_symbol_share > 0.80:
+        blockers.append("single_symbol_sample_concentration_high")
+    removal_rows: list[dict[str, Any]] = []
+    for removed_symbol in sorted(by_symbol):
+        remaining = [
+            sample
+            for symbol, rows in by_symbol.items()
+            if symbol != removed_symbol
+            for sample in rows
+        ]
+        metrics = _return_metrics(remaining)
+        average = _optional_float(metrics.get("average_net_return_pct"))
+        lower_bound = _optional_float(metrics.get("return_lcb_pct"))
+        profit_factor = _optional_float(metrics.get("profit_factor"))
+        profitable = bool(
+            average is not None
+            and average > 0.0
+            and lower_bound is not None
+            and lower_bound > 0.0
+            and profit_factor is not None
+            and profit_factor > 1.0
+        )
+        removal_rows.append(
+            {
+                "removed_symbol": removed_symbol,
+                "remaining_sample_count": metrics.get("sample_count"),
+                "average_net_return_pct": metrics.get("average_net_return_pct"),
+                "return_lcb_pct": metrics.get("return_lcb_pct"),
+                "profit_factor": metrics.get("profit_factor"),
+                "max_drawdown": metrics.get("max_drawdown"),
+                "tail_loss_pct": metrics.get("tail_loss_pct"),
+                "profitable_after_removal": profitable,
+            }
+        )
+        if not profitable:
+            blockers.append(f"remove_{removed_symbol}_fee_after_return_not_positive")
+    return {
+        "version": "2026-07-25.strategy-cross-symbol-generalization.v1",
+        "stable": not blockers,
+        "sample_count": sample_count,
+        "observed_symbol_count": symbol_count,
+        "max_symbol_sample_share": (
+            round(max_symbol_share, 8) if max_symbol_share is not None else None
+        ),
+        "required_minimum_symbol_count": 2,
+        "maximum_symbol_sample_share": 0.80,
+        "blocking_reasons": list(dict.fromkeys(blockers)),
+        "leave_one_symbol_out": removal_rows,
+    }
+
+
 def _legacy_observation_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
     metrics = _return_metrics(samples)
     pnls = [
@@ -747,7 +814,10 @@ def _shadow_report(
 
 
 def _candidate_rejections(
-    backtest: dict[str, Any], shadow: dict[str, Any]
+    backtest: dict[str, Any],
+    shadow: dict[str, Any],
+    *,
+    selector: dict[str, Any],
 ) -> list[str]:
     reasons: list[str] = []
     backtest_metrics = _safe_dict(backtest.get("metrics"))
@@ -768,6 +838,11 @@ def _candidate_rejections(
         reasons.append("shadow_profit_factor_undefined")
     elif shadow_metrics.get("profit_factor_above_break_even") is not True:
         reasons.append("shadow_profit_factor_not_above_break_even")
+    if str(selector.get("scope") or "") not in {"symbol_side", "symbol_side_horizon"}:
+        if _safe_dict(backtest.get("cross_symbol_generalization")).get("stable") is not True:
+            reasons.append("walk_forward_cross_symbol_generalization_failed")
+        if _safe_dict(shadow.get("cross_symbol_generalization")).get("stable") is not True:
+            reasons.append("shadow_cross_symbol_generalization_failed")
     return list(dict.fromkeys(reasons))
 
 
@@ -871,6 +946,9 @@ class StrategyLearningEngine:
                 if _selector_matches(selector, sample)
             ]
             backtest = _walk_forward_report(authoritative)
+            backtest["cross_symbol_generalization"] = _cross_symbol_generalization(
+                authoritative
+            )
             backtest["evidence_mode"] = (
                 "exact_trained_model_historical_replay"
                 if exact_replay
@@ -882,6 +960,7 @@ class StrategyLearningEngine:
                 else "authoritative_closed_positions"
             )
             shadow = _shadow_report(shadows, include_rows=include_evidence_rows)
+            shadow["cross_symbol_generalization"] = _cross_symbol_generalization(shadows)
             shadow["validation_method"] = (
                 replay.get("validation_method")
                 if exact_replay
@@ -892,7 +971,11 @@ class StrategyLearningEngine:
             shadow["evidence_partition"] = (
                 "strategy_exam" if exact_replay else "legacy_shadow"
             )
-            rejection_reasons = _candidate_rejections(backtest, shadow)
+            rejection_reasons = _candidate_rejections(
+                backtest,
+                shadow,
+                selector=selector,
+            )
             if model_replay_required and not exact_replay:
                 rejection_reasons.append(
                     f"model_historical_replay_{replay.get('status') or 'incomplete'}"

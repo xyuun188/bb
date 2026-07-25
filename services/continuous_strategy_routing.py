@@ -127,6 +127,40 @@ def _future_stable(development: dict[str, Any], exam: dict[str, Any]) -> bool:
     )
 
 
+def _future_profitable(exam: dict[str, Any]) -> bool:
+    average = _float(exam.get("average_net_return_pct"))
+    lower_bound = _float(exam.get("return_lcb_pct"))
+    profit_factor = _float(exam.get("profit_factor"))
+    return bool(
+        average is not None
+        and average > 0.0
+        and lower_bound is not None
+        and lower_bound > 0.0
+        and profit_factor is not None
+        and profit_factor > 1.0
+    )
+
+
+def _cross_symbol_stable(candidate: dict[str, Any]) -> bool:
+    backtest = _dict(candidate.get("backtest"))
+    exam = _dict(candidate.get("shadow_validation"))
+    return bool(
+        _dict(backtest.get("cross_symbol_generalization")).get("stable") is True
+        and _dict(exam.get("cross_symbol_generalization")).get("stable") is True
+    )
+
+
+def _strategy_quality_target(quality: float) -> float:
+    bounded = _clamp(quality, -1.0, 1.0)
+    if bounded >= 0.0:
+        return COLD_START_STRATEGY_WEIGHT + bounded * (
+            MAX_STRATEGY_WEIGHT - COLD_START_STRATEGY_WEIGHT
+        )
+    return COLD_START_STRATEGY_WEIGHT + bounded * (
+        COLD_START_STRATEGY_WEIGHT - MIN_STRATEGY_WEIGHT
+    )
+
+
 def _time_separated(candidate: dict[str, Any]) -> bool:
     backtest = _dict(candidate.get("backtest"))
     exam = _dict(candidate.get("shadow_validation"))
@@ -200,7 +234,7 @@ class ContinuousStrategyRoutingPolicy:
                     COLD_START_STRATEGY_WEIGHT
                     + confidence
                     * (
-                        _clamp(1.0 + 0.40 * quality, MIN_STRATEGY_WEIGHT, MAX_STRATEGY_WEIGHT)
+                        _strategy_quality_target(quality)
                         - COLD_START_STRATEGY_WEIGHT
                     ),
                     MIN_STRATEGY_WEIGHT,
@@ -222,9 +256,13 @@ class ContinuousStrategyRoutingPolicy:
             candidate_regime = str(selector.get("market_regime") or "").lower()
             matching_regime = not candidate_regime or candidate_regime == regime
             stable = _future_stable(development, exam)
+            future_profitable = _future_profitable(exam)
+            cross_symbol_stable = _cross_symbol_stable(candidate)
             primary_eligible = bool(
                 validated
                 and stable
+                and future_profitable
+                and cross_symbol_stable
                 and matching_regime
                 and scope not in {"symbol_side", "symbol_side_horizon"}
             )
@@ -238,6 +276,18 @@ class ContinuousStrategyRoutingPolicy:
                     "candidate_regime": candidate_regime or "all",
                     "validated": validated,
                     "future_stable": stable,
+                    "future_profitable": future_profitable,
+                    "cross_symbol_stable": cross_symbol_stable,
+                    "development_cross_symbol_generalization": _dict(
+                        _dict(candidate.get("backtest")).get(
+                            "cross_symbol_generalization"
+                        )
+                    ),
+                    "exam_cross_symbol_generalization": _dict(
+                        _dict(candidate.get("shadow_validation")).get(
+                            "cross_symbol_generalization"
+                        )
+                    ),
                     "primary_eligible": primary_eligible,
                     "historical_prior_context_eligible": _dict(
                         candidate.get("promotion")
@@ -256,13 +306,19 @@ class ContinuousStrategyRoutingPolicy:
                     )
                     or None,
                     "routing_reason": (
-                        "future_time_validation_stable"
+                        "future_time_fee_after_return_positive_and_stable"
                         if primary_eligible
-                        else "single_symbol_strategy_is_challenger_only"
-                        if validated and scope in {"symbol_side", "symbol_side_horizon"}
-                        else "future_time_performance_degraded"
-                        if validated and not stable
                         else "time_separated_validation_incomplete"
+                        if not validated
+                        else "market_regime_not_current"
+                        if not matching_regime
+                        else "single_symbol_strategy_is_challenger_only"
+                        if scope in {"symbol_side", "symbol_side_horizon"}
+                        else "future_time_performance_degraded"
+                        if not stable
+                        else "future_fee_after_return_not_positive"
+                        if not future_profitable
+                        else "cross_symbol_generalization_failed"
                     ),
                 }
             )

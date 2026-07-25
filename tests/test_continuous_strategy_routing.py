@@ -85,12 +85,14 @@ def _candidate(
             "status": "complete",
             "evidence_partition": "strategy_development",
             "metrics": development,
+            "cross_symbol_generalization": {"stable": True},
         },
         "shadow_validation": {
             "status": "complete",
             "evidence_partition": "strategy_exam",
             "validation_method": "exact_current_model_on_immutable_shadow_snapshot",
             "metrics": exam,
+            "cross_symbol_generalization": {"stable": True},
         },
     }
 
@@ -134,8 +136,17 @@ def test_negative_but_improving_strategy_can_remain_training_primary() -> None:
     report = _build(ContinuousStrategyRoutingPolicy(), [negative], "range_bound")
 
     assert report["current_route"]["recommended_side"] == "short"
-    assert report["current_route"]["primary"]["profile_id"] == "negative_improving"
-    assert report["candidate_weights"][0]["effective_weight"] > 0.0
+    assert report["current_route"]["primary"] is None
+    assert report["current_route"]["training_primary"]["profile_id"] == (
+        "negative_improving"
+    )
+    row = report["candidate_weights"][0]
+    assert row["future_stable"] is True
+    assert row["future_profitable"] is False
+    assert row["primary_eligible"] is False
+    assert row["route_role"] == "training_primary"
+    assert row["routing_reason"] == "future_fee_after_return_not_positive"
+    assert 0.0 < row["effective_weight"] < 0.15
     assert report["order_creation_permission"] is False
 
 
@@ -166,9 +177,49 @@ def test_training_good_but_future_bad_strategy_cannot_be_primary() -> None:
     row = report["candidate_weights"][0]
     assert row["validated"] is True
     assert row["future_stable"] is False
+    assert row["future_profitable"] is False
     assert row["primary_eligible"] is False
     assert report["current_route"]["primary"] is None
     assert report["current_route"]["training_primary"]["profile_id"] == "overfit"
+
+
+def test_future_profit_factor_below_break_even_cannot_be_primary() -> None:
+    weak = _candidate(
+        "weak_future_factor",
+        side="long",
+        exam=_metrics(
+            average=0.2,
+            lcb=0.1,
+            profit_factor=0.8,
+            drawdown=0.4,
+            tail=-0.3,
+            pnl=6.0,
+        ),
+    )
+
+    report = _build(ContinuousStrategyRoutingPolicy(), [weak], "trend_up")
+
+    row = report["candidate_weights"][0]
+    assert row["future_stable"] is True
+    assert row["future_profitable"] is False
+    assert row["primary_eligible"] is False
+    assert row["routing_reason"] == "future_fee_after_return_not_positive"
+
+
+def test_cross_symbol_failure_keeps_profitable_strategy_out_of_primary_route() -> None:
+    candidate = _candidate("single_symbol_dependent", side="long")
+    candidate["shadow_validation"]["cross_symbol_generalization"] = {
+        "stable": False,
+        "blocking_reasons": ["remove_ETH/USDT_fee_after_return_not_positive"],
+    }
+
+    report = _build(ContinuousStrategyRoutingPolicy(), [candidate], "trend_up")
+
+    row = report["candidate_weights"][0]
+    assert row["future_profitable"] is True
+    assert row["cross_symbol_stable"] is False
+    assert row["primary_eligible"] is False
+    assert row["routing_reason"] == "cross_symbol_generalization_failed"
 
 
 def test_market_regime_switches_primary_strategy() -> None:

@@ -131,6 +131,27 @@ def test_strategy_candidates_are_generated_from_observed_partitions() -> None:
     assert all(profile.params["current_return_contract_required"] is True for profile in profiles)
 
 
+def test_portfolio_strategy_requires_cross_symbol_generalization() -> None:
+    payload = StrategyLearningEngine().build_from_feedback(_feedback())
+    long_side = next(
+        row
+        for row in payload["schedule"]["candidates"]
+        if row["params"]["selector"] == {"scope": "side", "side": "long"}
+    )
+
+    development = long_side["backtest"]["cross_symbol_generalization"]
+    exam = long_side["shadow_validation"]["cross_symbol_generalization"]
+    assert development["stable"] is False
+    assert exam["stable"] is False
+    assert "cross_symbol_coverage_insufficient" in development["blocking_reasons"]
+    assert "walk_forward_cross_symbol_generalization_failed" in long_side["promotion"][
+        "rejection_reasons"
+    ]
+    assert "shadow_cross_symbol_generalization_failed" in long_side["promotion"][
+        "rejection_reasons"
+    ]
+
+
 def test_runtime_prior_usage_reports_actual_matches_not_ranked_candidates() -> None:
     entry_candidate_evidence = {
         "long": {
@@ -238,16 +259,28 @@ def test_full_detail_expands_shadow_evidence_without_changing_candidate_count() 
 
 
 def test_low_win_high_return_policy_outranks_high_win_negative_return_policy() -> None:
-    low_win_high_return = [-1.0, -1.0, 4.0] * 3
-    high_win_negative_return = [0.1, 0.1, -1.0] * 3
-    payload = StrategyLearningEngine().build_from_feedback(
-        _feedback(
-            long_returns=low_win_high_return,
-            short_returns=high_win_negative_return,
-            shadow_long_returns=low_win_high_return,
-            shadow_short_returns=high_win_negative_return,
-        )
+    low_win_high_return = [-1.0, 4.0, -1.0, 4.0] * 2
+    high_win_negative_return = [0.1, 0.1, -1.0] * 4
+    feedback = _feedback(
+        long_returns=low_win_high_return,
+        short_returns=high_win_negative_return,
+        shadow_long_returns=low_win_high_return,
+        shadow_short_returns=high_win_negative_return,
     )
+    for samples in (
+        feedback.authoritative_return_samples,
+        feedback.shadow_return_samples,
+    ):
+        rows_by_side = {
+            side: [row for row in samples if row["side"] == side]
+            for side in ("long", "short")
+        }
+        for rows in rows_by_side.values():
+            midpoint = len(rows) // 2
+            for index, row in enumerate(rows):
+                row["symbol"] = "BTC/USDT" if index < midpoint else "ETH/USDT"
+
+    payload = StrategyLearningEngine().build_from_feedback(feedback)
     side_candidates = {
         row["params"]["selector"]["side"]: row
         for row in payload["schedule"]["candidates"]

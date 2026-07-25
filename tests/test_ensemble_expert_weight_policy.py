@@ -615,3 +615,42 @@ def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> 
         ]
         == "trend_up_long"
     )
+
+
+def test_low_absolute_training_strategy_weight_cannot_override_quant_direction() -> None:
+    context = {
+        "strategy_mode": {
+            "continuous_strategy_routing": {
+                "applied": True,
+                "current_route": {
+                    "recommended_side": "long",
+                    "primary": None,
+                    "training_primary": {
+                        "profile_id": "loss_making_long",
+                        "side": "long",
+                        "normalized_current_regime_weight": 1.0,
+                        "effective_weight": 0.1,
+                    },
+                },
+            }
+        },
+        "direction_competition": {
+            "training_preferred_side": "short",
+            "training_long": {
+                "score": 0.09,
+                "raw_expected_return_pct": 0.09,
+                "objective_expected_return_pct": 0.09,
+                "horizon_minutes": 10,
+            },
+            "training_short": {
+                "score": 0.11,
+                "raw_expected_return_pct": 0.11,
+                "objective_expected_return_pct": 0.11,
+                "horizon_minutes": 10,
+            },
+        },
+    }
+
+    side, *_rest = _coordinator()._paper_training_side(context, 0.0)
+
+    assert side == "short"

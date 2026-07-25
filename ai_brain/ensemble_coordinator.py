@@ -1374,7 +1374,7 @@ class EnsembleCoordinator:
             current_strategy_route.get("primary") or current_strategy_route.get("training_primary")
         )
         strategy_side = str(current_strategy_route.get("recommended_side") or "").lower()
-        strategy_strength = min(
+        normalized_strategy_strength = min(
             max(
                 self._safe_float(
                     routed_strategy.get("normalized_current_regime_weight"),
@@ -1384,6 +1384,17 @@ class EnsembleCoordinator:
             ),
             0.5 if current_strategy_route.get("primary") else 0.25,
         )
+        absolute_strategy_weight = min(
+            max(
+                self._safe_float(
+                    routed_strategy.get("effective_weight"),
+                    1.0,
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        strategy_strength = normalized_strategy_strength * absolute_strategy_weight
         if all(
             training_scores[side] is not None
             and training_horizons[side] is not None
