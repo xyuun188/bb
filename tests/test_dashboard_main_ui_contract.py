@@ -475,7 +475,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260718-reason-catalog" in html
+    assert "dashboard.js?v=20260725-local-ml-evidence" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -615,7 +615,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260718-reason-catalog" in html
+    assert "dashboard.js?v=20260725-local-ml-evidence" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -772,7 +772,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260718-reason-catalog" in html
+    assert "dashboard.js?v=20260725-local-ml-evidence" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -967,6 +967,14 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert (
         "artifact_load_failed: '当前模型 Artifact 加载失败，已禁止用于运行时预测'" in reason_block
     )
+    assert "disabled: '已禁用'" in reason_block
+    assert "degraded: '证据未达标'" in reason_block
+    assert "learning_only: '仅学习观察'" in reason_block
+    assert (
+        "artifact_activation_not_production_authorized: "
+        "'当前 Artifact 仅获模拟盘小仓观察授权，尚未获得生产影响权限'"
+        in reason_block
+    )
     assert "okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据'" in reason_block
     assert "risk_contract_version_missing: '历史入场记录未保存风险合同版本'" in reason_block
     assert "历史开仓订单关联的决策已不在当前保留窗口" in reason_block
@@ -981,7 +989,16 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "downstream.map(systemAuditNodeLabel)" in script
     assert "adjustments.map(item => escHtml(dashboardReasonText(item)))" in script
     assert "function mlArtifactEvidenceMissingText(status)" in script
+    assert "status.model_load_diagnostic?.code || status.status" in script
     assert "Artifact 不兼容，运行时未加载" in script
+    assert ": dashboardReasonText(readinessState);" in script
+    assert "dashboardReasonText(readiness.state || status.readiness_state || '证据缺失')" in script
+
+
+def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "/static/js/dashboard.js?v=20260725-local-ml-evidence" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
@@ -1120,10 +1137,8 @@ def test_ml_signal_dashboard_renders_controlled_degraded_as_observing() -> None:
     ]
 
     assert "controlledReadinessDegrade" in overview_block
-    assert (
-        "const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;"
-        in overview_block
-    )
+    assert "const readinessDisplayState = controlledReadinessDegrade" in overview_block
+    assert ": dashboardReasonText(readinessState);" in overview_block
     assert (
         "const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');"
         in overview_block

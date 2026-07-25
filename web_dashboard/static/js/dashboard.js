@@ -4271,6 +4271,13 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     no_model: '本地 ML 尚未注册当前模型 Artifact',
     artifact_incompatible: '当前模型 Artifact 与运行时收益监督合同不兼容，已禁止加载',
     artifact_load_failed: '当前模型 Artifact 加载失败，已禁止用于运行时预测',
+    disabled: '已禁用',
+    degraded: '证据未达标',
+    learning_only: '仅学习观察',
+    shadow_ready: '影子观察就绪',
+    paper_canary_ready: '模拟盘小仓观察就绪',
+    partial_ready: '部分方向就绪',
+    artifact_activation_not_production_authorized: '当前 Artifact 仅获模拟盘小仓观察授权，尚未获得生产影响权限',
     shadow_market_opportunity_distribution_missing: '缺少影子市场机会收益分布',
     counterfactual_execution_cost_distribution_missing: '缺少反事实执行成本分布',
     authoritative_realized_return_distribution_missing: '缺少权威真实成交收益分布',
@@ -9669,9 +9676,10 @@ function mlEvidenceValue(value, suffix = '', missingText = '证据缺失') {
 }
 
 function mlArtifactEvidenceMissingText(status) {
-    if (status.status === 'artifact_incompatible') return 'Artifact 不兼容，运行时未加载';
-    if (status.status === 'artifact_load_failed') return 'Artifact 加载失败';
-    if (status.status === 'no_model') return '尚未注册模型 Artifact';
+    const diagnosticCode = status.model_load_diagnostic?.code || status.status;
+    if (diagnosticCode === 'artifact_incompatible') return 'Artifact 不兼容，运行时未加载';
+    if (diagnosticCode === 'artifact_load_failed') return 'Artifact 加载失败';
+    if (diagnosticCode === 'no_model') return '尚未注册模型 Artifact';
     return '证据缺失';
 }
 
@@ -9752,7 +9760,7 @@ function mlLocalEvidenceHtml(status) {
             <div class="ml-evidence-head"><strong>当前晋升阻断</strong><span>${blockers.length ? `${blockers.length} 项` : '无阻断'}</span></div>
             <div class="ml-evidence-list">${blockers.length
                 ? blockers.slice(0, 10).map(item => mlEvidenceRow('阻断原因', dashboardReasonText(item), 'bad')).join('')
-                : mlEvidenceRow('就绪判断', readiness.state || status.readiness_state || '证据缺失')}</div>
+                : mlEvidenceRow('就绪判断', dashboardReasonText(readiness.state || status.readiness_state || '证据缺失'))}</div>
         </section>`,
     ];
     return `<div class="ml-evidence-grid">${evidenceSections.join('')}</div>`;
@@ -9797,7 +9805,9 @@ function renderMLSignalOverview() {
     const allowLivePositionInfluence = status.live_ml_ready === true;
     const influenceEnabled = allowLivePositionInfluence;
     const controlledReadinessDegrade = ready && !allowLivePositionInfluence && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
-    const readinessDisplayState = controlledReadinessDegrade ? '学习观察' : readinessState;
+    const readinessDisplayState = controlledReadinessDegrade
+        ? '学习观察'
+        : dashboardReasonText(readinessState);
     const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
     const readinessReasonText = readinessBlockers.length
         ? readinessBlockers.slice(0, 4).map(dashboardReasonText).filter(Boolean).join('；')
