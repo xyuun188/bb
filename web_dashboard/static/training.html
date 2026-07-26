@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>模型训练与决策</title>
-  <link rel="stylesheet" href="/static/css/training.css">
+  <link rel="stylesheet" href="/static/css/training.css?v=20260726-training-evidence">
 </head>
 <body>
   <main class="shell">
@@ -27,9 +27,9 @@
     <section class="metric-grid">
       <article class="metric"><span>训练状态</span><strong data-metric="training-status">--</strong><small data-detail="training-status">--</small></article>
       <article class="metric"><span>可信样本</span><strong data-metric="trusted-samples">--</strong><small data-detail="trusted-samples">--</small></article>
-      <article class="metric"><span>等待结果</span><strong data-metric="pending-samples">--</strong><small data-detail="pending-samples">--</small></article>
+      <article class="metric"><span>新增待训练</span><strong data-metric="pending-samples">--</strong><small data-detail="pending-samples">--</small></article>
       <article class="metric"><span>隔离样本</span><strong data-metric="quarantined-samples">--</strong><small>不进入训练</small></article>
-      <article class="metric"><span>模型影响力</span><strong data-metric="model-influence">--</strong><small>模拟盘综合影响</small></article>
+      <article class="metric"><span>生产影响</span><strong data-metric="model-influence">--</strong><small data-detail="model-influence">--</small></article>
       <article class="metric"><span>最近训练</span><strong data-metric="last-training">--</strong><small data-detail="last-training">--</small></article>
     </section>
     <section class="grid two-columns">
@@ -37,8 +37,12 @@
       <article class="panel"><div class="panel-heading"><div><h2>训练任务</h2><p>运行、结果和下一次计划。</p></div></div><div id="scheduler" class="stack empty">正在读取。</div></article>
     </section>
     <section class="panel">
-      <div class="panel-heading"><div><h2>模型表现与影响力</h2><p>表现下降会降低影响力，但不会停止学习。</p></div></div>
-      <div class="table-wrap"><table><thead><tr><th>模型</th><th>职责</th><th>样本</th><th>费后表现</th><th>回撤 / 尾部</th><th>当前影响</th><th>变化原因</th></tr></thead><tbody id="model-table"><tr><td colspan="7" class="empty">正在读取。</td></tr></tbody></table></div>
+      <div class="panel-heading"><div><h2>就绪与晋升证据</h2><p>当前 Artifact、未来时间验证和真实晋升阻断。</p></div></div>
+      <div id="model-readiness" class="empty">正在读取。</div>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><div><h2>模型表现与影响力</h2><p>只展示注册表实际提供的费后证据，不把缺失值写成零。</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>模型</th><th>阶段</th><th>职责</th><th>样本</th><th>费后表现</th><th>盈亏比</th><th>当前影响</th><th>阻断或变化原因</th></tr></thead><tbody id="model-table"><tr><td colspan="8" class="empty">正在读取。</td></tr></tbody></table></div>
     </section>
     <section class="grid two-columns">
       <article class="panel"><div class="panel-heading"><div><h2>策略状态</h2><p>主要策略和挑战策略。</p></div></div><div id="strategies" class="stack empty">正在读取。</div></article>
@@ -46,6 +50,6 @@
     </section>
     <footer><span>只读页面，不改变主面板、实盘权限或风险限制。</span><span>数据来自训练、策略和分析记录。</span></footer>
   </main>
-  <script src="/static/js/training.js"></script>
+  <script src="/static/js/training.js?v=20260726-training-evidence"></script>
 </body>
 </html>

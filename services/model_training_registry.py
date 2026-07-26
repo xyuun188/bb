@@ -29,6 +29,18 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _reason_codes(value: Any) -> list[str]:
+    codes: list[str] = []
+    for item in _safe_list(value):
+        if isinstance(item, dict):
+            code = str(item.get("code") or item.get("reason") or "").strip()
+        else:
+            code = str(item or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
 def _first_present(*values: Any) -> Any:
     for value in values:
         if value is not None:
@@ -140,7 +152,13 @@ def _finquant_specialization_verified(
 def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     available = bool(status.get("available"))
     live = status.get("live_ml_ready") is True
-    readiness = str(status.get("readiness_state") or status.get("status") or "unknown")
+    readiness_report = _safe_dict(status.get("readiness"))
+    readiness = str(
+        readiness_report.get("state")
+        or status.get("readiness_state")
+        or status.get("status")
+        or "unknown"
+    )
     if live:
         lifecycle = "live"
     elif available and readiness in {"degraded", "blocked", "promotion_blocked"}:
@@ -166,7 +184,7 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         ),
         "live_ml_ready": live,
         "quality_state": readiness,
-        "blocking_reasons": _safe_list(status.get("blocking_reason_codes")),
+        "blocking_reasons": _reason_codes(readiness_report.get("blocking_reasons")),
         "identity_verified": available,
         "alias_only": False,
     }

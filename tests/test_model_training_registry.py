@@ -211,6 +211,36 @@ def test_registry_separates_pretrained_specialists_from_project_training() -> No
     assert rows["chronos_2"]["model_family"] == "amazon/chronos-2"
 
 
+def test_registry_exposes_local_ml_readiness_blocker_codes() -> None:
+    payload = build_model_training_registry(
+        local_ml_status={
+            "available": True,
+            "status": "degraded",
+            "readiness_state": "degraded",
+            "readiness": {
+                "state": "degraded",
+                "blocking_reasons": [
+                    {
+                        "code": "long_walk_forward_return_stability_failed",
+                        "message": "unstable",
+                    },
+                    {"reason": "short_leave_one_symbol_out_stability_failed"},
+                    "artifact_activation_not_production_authorized",
+                ],
+            },
+        }
+    )
+
+    local_ml = _by_id(payload)["local_ml_profit_quality"]
+
+    assert local_ml["quality_state"] == "degraded"
+    assert local_ml["blocking_reasons"] == [
+        "long_walk_forward_return_stability_failed",
+        "short_leave_one_symbol_out_stability_failed",
+        "artifact_activation_not_production_authorized",
+    ]
+
+
 def test_registry_preserves_zero_authoritative_profit_target() -> None:
     payload = build_model_training_registry(
         specialist_report={
