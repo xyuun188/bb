@@ -591,11 +591,6 @@ def _profit_quality_score(
     return expected_component + lower_bound_component + edge_component - tail_penalty
 
 
-def _net_return_pct(raw_return_pct: float) -> float:
-    """Compatibility helper for values already expressed after costs."""
-    return _safe_float(raw_return_pct)
-
-
 def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any]:
     metrics = _safe_dict(metadata.get("metrics"))
     top_return = _safe_float(metrics.get(f"top_{side}_avg_return_pct"), 0.0)

@@ -405,19 +405,6 @@ def _evidence_status(
     }
 
 
-def _close_reason(close_decision: AIDecision | None) -> str:
-    raw_close = _raw(close_decision)
-    close_evidence = _safe_dict(raw_close.get("close_evidence"))
-    reason = str(
-        raw_close.get("execution_reason")
-        or close_evidence.get("reason")
-        or getattr(close_decision, "execution_reason", "")
-        or getattr(close_decision, "reasoning", "")
-        or ""
-    )
-    return str(sanitize_text(reason) or "")
-
-
 def _classify_record(
     position: Position,
     entry_decision: AIDecision | None,

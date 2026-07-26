@@ -234,10 +234,6 @@ def _is_legacy_process(value: Any) -> bool:
     return any(hint in line for hint in LEGACY_PROCESS_HINTS_BLOCK_OUTSIDE_PHASE3)
 
 
-def _service_rows(snapshot: dict[str, Any], key: str) -> list[dict[str, Any]]:
-    return [_safe_dict(item) for item in _safe_list(snapshot.get(key))]
-
-
 def _manifest_items(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     rows = manifest.get("items")
     if not isinstance(rows, list):

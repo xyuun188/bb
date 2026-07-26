@@ -143,24 +143,6 @@ def _timeframe_to_okx_bar(timeframe: str) -> str:
     return mapping.get(text, mapping.get(text.lower(), text))
 
 
-def _okx_bar_to_milliseconds(bar: str) -> int:
-    text = str(bar or "").strip()
-    unit = text[-1:].lower()
-    try:
-        amount = int(text[:-1] or "1")
-    except ValueError:
-        amount = 1
-    if unit == "m":
-        return amount * 60_000
-    if unit == "h":
-        return amount * 3_600_000
-    if unit == "d":
-        return amount * 86_400_000
-    if unit == "w":
-        return amount * 7 * 86_400_000
-    return 60_000
-
-
 def _normalize_bool_text(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"

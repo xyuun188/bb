@@ -1418,12 +1418,6 @@ def _target_pos_ids(pos_ids: Iterable[Any] | None) -> set[str]:
     return result
 
 
-def _chunked(values: list[str], size: int) -> Iterable[list[str]]:
-    chunk_size = max(int(size or 1), 1)
-    for index in range(0, len(values), chunk_size):
-        yield values[index : index + chunk_size]
-
-
 def _native_position_row_is_open(row: dict[str, Any]) -> bool:
     return abs(_safe_float(row.get("pos") or row.get("qty"), 0.0)) > 0
 

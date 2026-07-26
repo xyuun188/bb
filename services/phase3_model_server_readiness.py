@@ -161,22 +161,6 @@ def _normalize_model_identity(value: Any) -> str:
     return "".join(ch for ch in text if ch not in {" ", "\t", "\r", "\n"})
 
 
-def _slot_model_identity(row: dict[str, Any]) -> str:
-    served_model_name = _normalize_model_identity(row.get("served_model_name"))
-    if served_model_name:
-        return served_model_name
-    specialization_target = _normalize_model_identity(row.get("specialization_target"))
-    if specialization_target:
-        return specialization_target
-    repo_id = _normalize_model_identity(row.get("repo_id"))
-    if repo_id:
-        return repo_id
-    path = str(row.get("path") or row.get("target") or "").strip().replace("\\", "/")
-    if not path:
-        return ""
-    return _normalize_model_identity(path.rstrip("/").rsplit("/", 1)[-1])
-
-
 def _slot_artifact_identity(row: dict[str, Any]) -> str:
     repo_id = _normalize_model_identity(row.get("repo_id"))
     if repo_id:

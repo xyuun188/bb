@@ -297,13 +297,6 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _number_text(value: Any) -> str:
-    number = _safe_float(value, None)
-    if number is None:
-        return _text(value)
-    return f"{number:.12g}"
-
-
 def _clean_list(values: Iterable[Any] | None) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()

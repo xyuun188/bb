@@ -124,15 +124,6 @@ def _merge_exchange_order_ids(*values: Any, max_length: int = 500) -> str:
     return ",".join(merged)
 
 
-def _created_sort_value(position: Any) -> float:
-    value = getattr(position, "created_at", None)
-    if not isinstance(value, datetime):
-        return 0.0
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.timestamp()
-
-
 def _position_has_entry_order_id(position: Any, target_order_id: str) -> bool:
     order_id = str(target_order_id or "").strip()
     if not order_id:

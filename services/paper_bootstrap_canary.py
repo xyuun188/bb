@@ -243,19 +243,6 @@ def paper_canary_position_lifecycle(position: dict[str, Any]) -> dict[str, Any]:
     return _safe_dict(management.get("paper_canary_lifecycle"))
 
 
-def _is_open_paper_canary_position(position: dict[str, Any]) -> bool:
-    lifecycle = paper_canary_position_lifecycle(position)
-    return bool(
-        position.get("is_open", True) is not False
-        and _positive(position.get("quantity", 1.0)) > 0
-        and str(position.get("execution_mode") or "paper").lower() == "paper"
-        and lifecycle.get("version") == PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
-        and lifecycle.get("authorized") is True
-        and lifecycle.get("execution_scope") == "paper_only"
-        and lifecycle.get("production_permission") is False
-    )
-
-
 def assess_paper_canary_position_horizon(
     position: dict[str, Any],
     *,

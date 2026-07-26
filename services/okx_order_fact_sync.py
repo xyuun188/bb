@@ -2249,12 +2249,6 @@ def _order_has_protection_fill_hint_without_execution(order: Order) -> bool:
     )
 
 
-def _order_has_fills_history_confirmed(order: Order) -> bool:
-    raw = getattr(order, "okx_raw_fills", None)
-    raw = raw if isinstance(raw, dict) else {}
-    return bool(raw.get("fills_history_confirmed"))
-
-
 def _order_has_confirmed_okx_fill_fact(
     order: Order,
     *,

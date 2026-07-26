@@ -1162,11 +1162,6 @@ def _first_positive(*values: Any, default: float = 0.0) -> float:
     return default
 
 
-def _close_enough(left: float, right: float, tolerance_ratio: float) -> bool:
-    tolerance = max(abs(left), abs(right), 1.0) * max(tolerance_ratio, 0.0)
-    return abs(left - right) <= tolerance
-
-
 def _relative_close_enough(left: float, right: float, tolerance_ratio: float) -> bool:
     tolerance = max(abs(left), abs(right), 1e-12) * max(tolerance_ratio, 0.0)
     return abs(left - right) <= tolerance

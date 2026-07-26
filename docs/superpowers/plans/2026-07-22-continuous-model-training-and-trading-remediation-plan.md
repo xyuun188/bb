@@ -487,6 +487,13 @@
 - 模型、策略、训练和交易看板数据与底层事实一致。
 - 相关测试、线上同步、运行验证、GitHub提交推送和Hindsight记录全部完成。
 
+阶段十进行中记录（2026-07-26，尚未完成总验收）：
+
+- 语义索引在当前会话未热加载，文档登记的本机 Semble 和 Codebase Memory 回退路径也不存在；本轮改用 AST 定义扫描、全仓标识符计数和逐项调用复核，只删除“定义自身之外全仓零引用”且没有装饰器、注册或导入副作用的私有助手。
+- 已删除 11 个确认不可达函数：旧费后收益兼容助手 `_net_return_pct`，以及 `_chunked`、`_order_has_fills_history_confirmed`、`_okx_bar_to_milliseconds`、`_number_text`、`_close_enough`、`_is_open_paper_canary_position`、`_slot_model_identity`、`_service_rows`、`_created_sort_value`、`_close_reason`。仍承担历史数据审计、故障关闭、回退或迁移保护的兼容逻辑全部保留。
+- 覆盖 ML、OKX 原生事实、订单事实同步、永续适配器、交易事实完整性、paper canary、模型服务就绪、服务器迁移、持仓持久化和利润归因的相关回归 243 通过，Ruff 与 `git diff --check` 通过。
+- 线上同步后交易与看板服务均为 `active/running`、`NRestarts=0`，模型隧道 active，最近 5 分钟错误级日志 0 条，模拟盘保持 `paper / paused=false / running=true`。本批只清理死代码，不改变开仓、风控、训练或持仓行为。
+
 ## 8. 实施顺序与停止条件
 
 必须严格按阶段一至阶段十顺序执行。以下情况出现时停止进入下一阶段，并继续修复当前阶段：
