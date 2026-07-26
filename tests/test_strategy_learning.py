@@ -433,6 +433,34 @@ def test_strategy_scheduler_has_no_fixed_promotion_gate_or_win_rate_branch() -> 
     assert "observation_only" not in source
 
 
+def test_strategy_feedback_shadow_query_omits_unused_large_payload_columns() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "services/strategy_learning.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    feedback_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_feedback"
+    )
+    shadow_assignment = next(
+        node
+        for node in ast.walk(feedback_method)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "shadows" for target in node.targets)
+    )
+    query_source = ast.unparse(shadow_assignment.value)
+
+    assert ".options(load_only(" in query_source
+    assert "ShadowBacktest.feature_snapshot" in query_source
+    assert "ShadowBacktest.long_return_pct" in query_source
+    assert "ShadowBacktest.short_return_pct" in query_source
+    for unused_column in (
+        "ShadowBacktest.raw_llm_response",
+        "ShadowBacktest.training_feature_snapshot",
+        "ShadowBacktest.note",
+    ):
+        assert unused_column not in query_source
+
+
 def test_feedback_contract_carries_authoritative_audit_and_evaluation_samples() -> None:
     names = {item.name for item in fields(StrategyFeedback)}
     assert {
@@ -444,3 +472,24 @@ def test_feedback_contract_carries_authoritative_audit_and_evaluation_samples() 
         "authoritative_return_samples",
         "shadow_return_samples",
     } <= names
+
+
+def test_feedback_summary_reports_prior_record_count_without_embedding_records() -> None:
+    feedback = _feedback()
+    records = [
+        {"decision_id": 12, "side_evaluations": [{"side": "long"}]},
+        {"decision_id": 11, "side_evaluations": [{"side": "short"}]},
+    ]
+    feedback.runtime_prior_usage["decision_records"] = records
+
+    summary = feedback.to_dict()["runtime_prior_usage"]
+    audit = feedback.to_dict(include_runtime_prior_records=True)[
+        "runtime_prior_usage"
+    ]
+
+    assert summary["decision_record_count"] == 2
+    assert summary["decision_records_included"] is False
+    assert "decision_records" not in summary
+    assert audit["decision_record_count"] == 2
+    assert audit["decision_records_included"] is True
+    assert audit["decision_records"] == records

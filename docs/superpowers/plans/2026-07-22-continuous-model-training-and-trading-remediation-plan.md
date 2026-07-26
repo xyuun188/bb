@@ -493,6 +493,10 @@
 - 已删除 11 个确认不可达函数：旧费后收益兼容助手 `_net_return_pct`，以及 `_chunked`、`_order_has_fills_history_confirmed`、`_okx_bar_to_milliseconds`、`_number_text`、`_close_enough`、`_is_open_paper_canary_position`、`_slot_model_identity`、`_service_rows`、`_created_sort_value`、`_close_reason`。仍承担历史数据审计、故障关闭、回退或迁移保护的兼容逻辑全部保留。
 - 覆盖 ML、OKX 原生事实、订单事实同步、永续适配器、交易事实完整性、paper canary、模型服务就绪、服务器迁移、持仓持久化和利润归因的相关回归 243 通过，Ruff 与 `git diff --check` 通过。
 - 线上同步后交易与看板服务均为 `active/running`、`NRestarts=0`，模型隧道 active，最近 5 分钟错误级日志 0 条，模拟盘保持 `paper / paused=false / running=true`。本批只清理死代码，不改变开仓、风控、训练或持仓行为。
+- `/api/strategy-learning` 超时根因已用线上分段探针确认：水印查询约 `0.57s`，模型上下文约 `4.36s`，策略引擎约 `0.79s`；主要慢点是策略反馈把 3000 条 shadow 的完整 ORM 行连同平均约 `70KB`、最大约 `311KB` 的 `raw_llm_response` 一并从 PostgreSQL TOAST 读取，单条 SQL 曾耗时 `18.24s`，但后续逻辑从未使用该字段。查询现只投影成本计算实际需要的币种、快照、horizon、方向收益和时间字段，同一线上 SQL 降至约 `0.86s`，未改变窗口、样本上限、成本规则、历史 replay 或候选治理。
+- 策略摘要不再传输 1467 条逐决策审计明细，而是明确返回 `decision_record_count=1467 / decision_records_included=false` 并保留全部聚合计数和最近匹配；只读策略审计通过显式参数继续读取全部明细。线上 summary 从约 `2.13MB` 降至约 `0.94MB`，连续请求耗时为 `15.17s / 10.85s / 11.29s`，均低于训练页 20 秒局部超时；8 条权威收益样本、1500 条 shadow 行、3000 个成本完整方向样本、2700 余条历史 replay 和 39 个候选均未减少。
+- 线上策略审计检查 1467 条逐决策记录，结果 `status=ok / violations=[]`；39 个候选均未通过治理，历史先验仍为只读上下文，`can_authorize_entry=false / can_change_size_or_leverage=false`。本地最终全量 pytest `2854 passed, 4 skipped`，全仓 Ruff 与 `git diff --check` 通过；线上交易与看板服务均为 `active/running`、`NRestarts=0`，最近 10 分钟错误级日志 0，运行控制保持 `paper / paused=false / running=true`。
+- 阶段十仍未完成：最新线上 OKX 对账为 `can_open_new_entries=false`，实时保护单盘点显示 `SAND/USDT long` 持仓 10 张但保护单仅覆盖 1 张，并因 `okx_contract_lot_size_missing` 暂不能自动修复。系统按硬闸门正确拒绝新开仓；后续继续自主修复并在对账恢复后由系统自动开放，不等待人工确认。
 
 ## 8. 实施顺序与停止条件
 

@@ -45,6 +45,7 @@ async def audit(*, mode: str) -> dict[str, Any]:
         hours=params.default_lookback_hours,
         limit=params.dashboard_summary_limit,
         detail="summary",
+        include_runtime_prior_records=True,
     )
     schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {}
     production = (

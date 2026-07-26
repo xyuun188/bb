@@ -625,13 +625,28 @@ class StrategyFeedback:
     shadow_return_samples: list[dict[str, Any]] = field(default_factory=list)
     shadow_replay_observations: list[dict[str, Any]] = field(default_factory=list)
 
-    def to_dict(self, *, include_samples: bool = False) -> dict[str, Any]:
-        payload = {
-            name: _json_safe(getattr(self, name))
-            for name in self.__dataclass_fields__
-            if name != "shadow_replay_observations"
-            and (include_samples or not name.endswith("_samples"))
-        }
+    def to_dict(
+        self,
+        *,
+        include_samples: bool = False,
+        include_runtime_prior_records: bool = False,
+    ) -> dict[str, Any]:
+        payload = {}
+        for name in self.__dataclass_fields__:
+            if name == "shadow_replay_observations" or (
+                not include_samples and name.endswith("_samples")
+            ):
+                continue
+            if name != "runtime_prior_usage":
+                payload[name] = _json_safe(getattr(self, name))
+                continue
+            usage = dict(self.runtime_prior_usage)
+            decision_records = list(usage.pop("decision_records", []) or [])
+            usage["decision_record_count"] = len(decision_records)
+            usage["decision_records_included"] = include_runtime_prior_records
+            if include_runtime_prior_records:
+                usage["decision_records"] = decision_records
+            payload[name] = _json_safe(usage)
         if include_samples:
             payload["authoritative_return_samples"] = _json_safe(
                 self.authoritative_return_samples
@@ -893,6 +908,7 @@ class StrategyLearningEngine:
         model_strategy_blueprint: dict[str, Any] | None = None,
         model_predictor: ModelPredictor | None = None,
         update_strategy_state: bool = True,
+        include_runtime_prior_records: bool = False,
     ) -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
         backtest_rows: list[dict[str, Any]] = []
@@ -1158,7 +1174,10 @@ class StrategyLearningEngine:
             "current_production_strategy": production_strategy,
         }
         return {
-            "feedback": feedback.to_dict(include_samples=detail == "full"),
+            "feedback": feedback.to_dict(
+                include_samples=detail == "full",
+                include_runtime_prior_records=include_runtime_prior_records,
+            ),
             "schedule": schedule,
             "current_production_strategy": production_strategy,
         }
@@ -1247,6 +1266,7 @@ class StrategyLearningService:
         hours: int = DEFAULT_LOOKBACK_HOURS,
         limit: int = 500,
         detail: str = "summary",
+        include_runtime_prior_records: bool = False,
     ) -> dict[str, Any]:
         blueprint, predictor = self._default_model_replay_context(mode)
         feedback = await self._feedback(
@@ -1265,6 +1285,7 @@ class StrategyLearningService:
             model_strategy_blueprint=blueprint,
             model_predictor=predictor,
             update_strategy_state=False,
+            include_runtime_prior_records=include_runtime_prior_records,
         )
         champion = await self.champion_service.current(mode)
         payload.update(
@@ -1422,6 +1443,17 @@ class StrategyLearningService:
                             ShadowBacktest.execution_mode == selected_mode,
                             ShadowBacktest.status == "completed",
                             ShadowBacktest.created_at >= since_naive,
+                        )
+                        .options(
+                            load_only(
+                                ShadowBacktest.id,
+                                ShadowBacktest.symbol,
+                                ShadowBacktest.feature_snapshot,
+                                ShadowBacktest.horizon_minutes,
+                                ShadowBacktest.long_return_pct,
+                                ShadowBacktest.short_return_pct,
+                                ShadowBacktest.created_at,
+                            )
                         )
                         .order_by(ShadowBacktest.created_at.desc())
                         .limit(effective_limit)
