@@ -4136,7 +4136,10 @@ class OKXExecutor(AbstractExecutor):
         ccxt = await self._get_ccxt()
         okx_symbol = await self._resolve_swap_symbol(decision.symbol)
         params = {"mgnMode": "cross"}
-        requested_leverage = max(1, int(round(decision.suggested_leverage)))
+        # OKX accepts integer leverage values.  Normalize conservatively so a
+        # fractional model request can never become a higher-risk leverage
+        # through nearest-integer rounding (for example, 1.5x -> 2x).
+        requested_leverage = max(1, int(decision.suggested_leverage))
         tier_selection = await self._fetch_applicable_okx_leverage_tier(okx_symbol, decision)
         max_leverage = self._safe_float(tier_selection.get("max_leverage"), 0.0)
         if tier_selection.get("production_eligible") is not True or max_leverage < 1.0:

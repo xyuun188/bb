@@ -621,6 +621,36 @@ class _ExistingPositionLeverageCcxt:
         raise AssertionError("existing-position add-on must not mutate OKX leverage")
 
 
+class _FractionalLeverageCcxt(_ExistingPositionLeverageCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fetch_leverage_calls = 0
+        self.requested_leverages: list[int] = []
+
+    async def fetch_leverage(
+        self,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.fetch_leverage_calls += 1
+        if self.fetch_leverage_calls == 1:
+            return {"longLeverage": 0, "shortLeverage": 0, "info": []}
+        return {"longLeverage": 1, "shortLeverage": 1, "info": []}
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def set_leverage(
+        self,
+        leverage: int,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.set_leverage_calls += 1
+        self.requested_leverages.append(leverage)
+        return {"code": "0", "data": [{"lever": str(leverage)}]}
+
+
 class _PrecisionEntryCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -1756,6 +1786,34 @@ async def test_okx_existing_position_add_on_reuses_authoritative_leverage() -> N
     assert reconciled["eligible"] is True
     assert sizing["final_notional_usdt"] == pytest.approx(planned_notional)
     assert sizing["final_margin_usdt"] == pytest.approx(planned_notional / 2.0)
+
+
+@pytest.mark.asyncio
+async def test_okx_fractional_model_leverage_is_normalized_downward() -> None:
+    exchange = _FractionalLeverageCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.suggested_leverage = 1.5
+    decision.raw_response["profit_risk_sizing"]["model_requested_leverage"] = 1.5
+
+    result = await executor._set_leverage_if_needed(decision)
+
+    assert result["ok"] is True
+    assert result["ai_requested_leverage"] == 1
+    assert result["target_leverage"] == 1
+    assert result["actual_leverage"] == 1
+    assert exchange.requested_leverages == [1]
+    assert decision.suggested_leverage == 1
+
+    planned_notional = decision.raw_response["profit_risk_sizing"]["final_notional_usdt"]
+    reconciled = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=planned_notional,
+        final_leverage=result["actual_leverage"],
+        source="test_fractional_model_leverage",
+    )
+    assert reconciled["eligible"] is True
+    assert "execution_leverage_exceeds_model_request" not in reconciled["reasons"]
 
 
 @pytest.mark.asyncio
