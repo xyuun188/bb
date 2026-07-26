@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
@@ -41,6 +42,23 @@ class _ScalarResult:
 
     def scalar(self) -> Any:
         return self.value
+
+
+class _EmptyRowsResult:
+    def scalars(self) -> _EmptyRowsResult:
+        return self
+
+    def all(self) -> list[Any]:
+        return []
+
+
+class _StatementCaptureSession:
+    def __init__(self) -> None:
+        self.statements: list[Any] = []
+
+    async def execute(self, statement: Any) -> _EmptyRowsResult:
+        self.statements.append(statement)
+        return _EmptyRowsResult()
 
 
 class _AdvisoryLockSession:
@@ -404,6 +422,37 @@ async def test_non_postgres_sync_uses_same_hard_deadline(
 
 
 @pytest.mark.asyncio
+async def test_background_fact_queries_never_wait_on_busy_order_rows() -> None:
+    service = OkxOrderFactSyncService(mode="paper")
+    session = _StatementCaptureSession()
+
+    await service._load_stored_slippage_refresh_orders(
+        session,
+        for_update=False,
+    )
+    await service._load_stored_slippage_refresh_orders(
+        session,
+        for_update=True,
+    )
+    await service._load_writable_refresh_orders(
+        session,
+        datetime.now(UTC).replace(tzinfo=None),
+    )
+
+    statements = [
+        str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        ).upper()
+        for statement in session.statements
+    ]
+    assert "FOR UPDATE" not in statements[0]
+    assert all("FOR UPDATE SKIP LOCKED" in statement for statement in statements[1:])
+
+
+@pytest.mark.asyncio
 async def test_order_fact_sync_only_calls_order_fact_endpoints_and_confirms_fill(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -566,6 +615,28 @@ def test_targeted_fill_queries_prioritize_unconfirmed_recent_fill_over_slippage_
 
 
 @pytest.mark.asyncio
+async def test_priority_only_sync_is_idle_without_pending_local_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "priority-only-idle.db")
+    ccxt = _FakeCcxt()
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            priority_only=True,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        assert report["status"] == "ok"
+        assert report["source"] == "okx_native_order_priority_sync"
+        assert report["completed_stages"] == ["priority_queue_idle"]
+        assert ccxt.calls == []
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -615,14 +686,31 @@ async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
                 )
             )
 
-        report = await OkxOrderFactSyncService(
+        service = OkxOrderFactSyncService(
             mode="paper",
             timeout_seconds=0.8,
+            priority_only=True,
             executor_factory=_executor_factory(ccxt),
-        ).sync()
+        )
+        slippage_refresh_called = False
+
+        async def blocked_slippage_refresh() -> tuple[int, list[dict[str, Any]]]:
+            nonlocal slippage_refresh_called
+            slippage_refresh_called = True
+            await asyncio.Event().wait()
+            return 0, []
+
+        monkeypatch.setattr(
+            service,
+            "_refresh_stored_slippage_from_rows",
+            blocked_slippage_refresh,
+        )
+
+        report = await service.sync()
 
         async with get_session_ctx() as session:
             order = (await session.execute(select(Order))).scalar_one()
+        assert slippage_refresh_called is False
         assert ccxt.calls[0] == "fills_targeted"
         assert "fills_account" not in ccxt.calls
         assert "account_history_after_priority_fast_lane" in report["deferred_stages"]

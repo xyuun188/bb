@@ -185,12 +185,14 @@ class OkxOrderFactSyncService:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         executor_factory: Any | None = None,
         phase3_order_sync_start: datetime | None = PHASE3_DEFAULT_ORDER_SYNC_START,
+        priority_only: bool = False,
     ) -> None:
         self.mode = "live" if str(mode or "").lower() == "live" else "paper"
         self.lookback_hours = max(int(lookback_hours or DEFAULT_LOOKBACK_HOURS), 1)
         self.limit = max(1, min(int(limit or DEFAULT_LIMIT), 2000))
         self.timeout_seconds = max(float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS), 0.5)
         self.executor_factory = executor_factory or OKXExecutor
+        self.priority_only = bool(priority_only)
         self.phase3_order_sync_start = _aware_utc(
             phase3_order_sync_start or PHASE3_DEFAULT_ORDER_SYNC_START
         )
@@ -315,6 +317,22 @@ class OkxOrderFactSyncService:
             if not _order_has_authoritative_stored_okx_fill_fact(order)
             for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
         } | set(submit_recovery_target_order_ids)
+        if self.priority_only:
+            priority_target_order_ids = tuple(
+                order_id
+                for order_id in priority_target_order_ids
+                if order_id in urgent_target_order_ids
+            )
+            if not priority_target_order_ids:
+                return OkxOrderFactSyncSummary(
+                    status="ok",
+                    mode=self.mode,
+                    source="okx_native_order_priority_sync",
+                    phase3_order_sync_start=since,
+                    checked_at=datetime.now(UTC),
+                    okx_pull_available=True,
+                    completed_stages=("priority_queue_idle",),
+                ).as_dict()
         order_target_inst_ids = {
             inst_id
             for order in [*external_refresh_orders, *submit_recovery_orders]
@@ -326,10 +344,8 @@ class OkxOrderFactSyncService:
             if _order_has_contract_sized_execution_fact(order)
             if (inst_id := _order_inst_id(order))
         }
-        (
-            stored_slippage_refresh_count,
-            stored_slippage_refresh_samples,
-        ) = await self._refresh_stored_slippage_from_rows()
+        stored_slippage_refresh_count = 0
+        stored_slippage_refresh_samples: list[dict[str, Any]] = []
         executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
         persistence_reserve = min(
             ORDER_FACT_SYNC_MAX_PERSISTENCE_RESERVE_SECONDS,
@@ -338,8 +354,6 @@ class OkxOrderFactSyncService:
         pull_budget_seconds = max(self.timeout_seconds - persistence_reserve, 0.5)
         deadline = asyncio.get_running_loop().time() + pull_budget_seconds
         completed_stages: list[str] = []
-        if stored_slippage_refresh_count:
-            completed_stages.append("stored_slippage_contract_upgrade")
         deferred_stages: list[str] = []
         stage_errors: list[str] = []
         initialized = False
@@ -354,6 +368,7 @@ class OkxOrderFactSyncService:
         priority_unverified_count = 0
         priority_skipped_old_count = 0
         priority_contract_size_deferred_count = 0
+        priority_local_checked = 0
         priority_samples: list[dict[str, Any]] = []
         account_fills_complete = False
         account_orders_complete = False
@@ -507,6 +522,48 @@ class OkxOrderFactSyncService:
                                 ][:8]
                             ),
                         ).as_dict()
+
+            if self.priority_only:
+                missing_priority_ids = sorted(
+                    urgent_target_order_ids
+                    - {fill.order_id for fill in fills if fill.order_id}
+                )
+                return OkxOrderFactSyncSummary(
+                    status=(
+                        "warning"
+                        if priority_unverified_count
+                        else "deferred"
+                    ),
+                    mode=self.mode,
+                    source="okx_native_order_priority_sync",
+                    phase3_order_sync_start=since,
+                    checked_at=datetime.now(UTC),
+                    okx_pull_available=True,
+                    local_checked=priority_local_checked,
+                    confirmed_count=priority_confirmed_count,
+                    unverified_count=priority_unverified_count,
+                    contract_size_deferred_count=priority_contract_size_deferred_count,
+                    completed_stages=tuple(completed_stages),
+                    deferred_stages=("priority_fill_not_yet_observed",),
+                    skipped_old_count=priority_skipped_old_count,
+                    samples=tuple(
+                        [
+                            *priority_samples,
+                            {
+                                "kind": "priority_fill_not_yet_observed",
+                                "mode": self.mode,
+                                "exchange_order_ids": missing_priority_ids[:4],
+                            },
+                        ][:8]
+                    ),
+                ).as_dict()
+
+            (
+                stored_slippage_refresh_count,
+                stored_slippage_refresh_samples,
+            ) = await self._refresh_stored_slippage_from_rows()
+            if stored_slippage_refresh_count:
+                completed_stages.append("stored_slippage_contract_upgrade")
 
             account_wide_fills, account_fills_complete = await run_stage(
                 "fills_history_account",
@@ -910,7 +967,8 @@ class OkxOrderFactSyncService:
             )
             recent = list(rows.scalars().all())
             stored_slippage_refresh = await self._load_stored_slippage_refresh_orders(
-                session
+                session,
+                for_update=False,
             )
             return _merge_local_order_rows(recent, stored_slippage_refresh)
 
@@ -936,6 +994,8 @@ class OkxOrderFactSyncService:
     async def _load_stored_slippage_refresh_orders(
         self,
         session: Any,
+        *,
+        for_update: bool = True,
     ) -> list[Order]:
         slippage_version = Order.okx_raw_fills["execution_slippage"][
             "version"
@@ -946,7 +1006,7 @@ class OkxOrderFactSyncService:
         slippage_recovery_terminal = Order.okx_raw_fills["execution_slippage"][
             "recovery_terminal"
         ].as_boolean()
-        rows = await session.execute(
+        statement = (
             select(Order)
             .where(
                 Order.execution_mode == self.mode,
@@ -964,8 +1024,10 @@ class OkxOrderFactSyncService:
             )
             .order_by(Order.id.desc())
             .limit(max(self.limit * 4, self.limit))
-            .with_for_update()
         )
+        if for_update:
+            statement = statement.with_for_update(skip_locked=True)
+        rows = await session.execute(statement)
         return [
             order
             for order in rows.scalars().all()
@@ -992,7 +1054,7 @@ class OkxOrderFactSyncService:
             )
             .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
             .limit(self.limit)
-            .with_for_update()
+            .with_for_update(skip_locked=True)
         )
         recent = list(rows.scalars().all())
         stored_slippage_refresh = await self._load_stored_slippage_refresh_orders(
@@ -1004,7 +1066,7 @@ class OkxOrderFactSyncService:
                 select(Order).where(
                     Order.execution_mode == self.mode,
                     Order.exchange_order_id.in_(sorted(fill_order_ids)),
-                ).with_for_update()
+                ).with_for_update(skip_locked=True)
             )
             matched_fills = list(matched_fill_rows.scalars().all())
         return [
