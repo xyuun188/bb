@@ -12,6 +12,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+@pytest.fixture(autouse=True)
+def isolate_model_training_scheduler_state(tmp_path, monkeypatch):
+    """Keep scheduler writes from tests out of the runtime data directory."""
+    from services.model_training_state import ModelTrainingStateStore
+
+    store = ModelTrainingStateStore(tmp_path / "model_training_scheduler_state.json")
+    monkeypatch.setattr("services.ml_signal_service.MODEL_TRAINING_STATE_STORE", store)
+    monkeypatch.setattr("services.trading_service.MODEL_TRAINING_STATE_STORE", store)
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create a single event loop for all async tests."""
