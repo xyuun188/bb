@@ -35,6 +35,8 @@ async def _seed_closed_position(
     now: datetime,
     *,
     settlement_raw: dict | None = None,
+    settlement_status: str = "settling",
+    settlement_source: str = "system_execution",
 ) -> int:
     async with get_session_ctx() as session:
         position = Position(
@@ -51,8 +53,8 @@ async def _seed_closed_position(
             entry_fee=0.05,
             close_fee=0.06,
             funding_fee=0.0,
-            settlement_status="settling",
-            settlement_source="system_execution",
+            settlement_status=settlement_status,
+            settlement_source=settlement_source,
             settlement_raw=settlement_raw or {},
             is_open=False,
             closed_at=now,
@@ -266,15 +268,78 @@ async def test_position_settlement_quarantines_persistent_identity_mismatch(
         assert report["status"] == "warning"
         assert report["exception_count"] == 1
         assert report["samples"][0]["kind"] == "okx_position_settlement_quarantined"
-        assert "next_retry_seconds" not in report["samples"][0]
+        assert report["samples"][0]["next_retry_seconds"] == pytest.approx(30.0)
         async with get_session_ctx() as session:
             position = await session.get(Position, position_id)
         assert position is not None
         assert position.settlement_status == SETTLEMENT_STATUS_QUARANTINED
         assert position.settlement_source == SETTLEMENT_QUARANTINE_SOURCE
-        assert position.settlement_raw["retry_policy"] == "permanent_no_retry"
-        assert "next_settlement_retry_at" not in position.settlement_raw
+        assert position.settlement_raw["retry_policy"].startswith(
+            "quarantined from authority; retry every 30s"
+        )
+        assert "next_settlement_retry_at" in position.settlement_raw
         assert expected_trigger in position.settlement_raw["quarantine_evidence"]["triggers"]
-        assert await service._load_candidates(now + timedelta(days=1)) == []
+        assert len(await service._load_candidates(now + timedelta(days=1))) == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_settlement_recovers_quarantined_position_when_official_row_arrives(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-quarantine-recovery.db")
+    now = datetime.now(UTC)
+    closed_at = now - timedelta(minutes=20)
+    try:
+        position_id = await _seed_closed_position(
+            closed_at,
+            settlement_status=SETTLEMENT_STATUS_QUARANTINED,
+            settlement_source=SETTLEMENT_QUARANTINE_SOURCE,
+            settlement_raw={
+                "settlement_attempt_count": POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
+                "next_settlement_retry_at": (now - timedelta(seconds=1)).isoformat(),
+                "retry_policy": "quarantined from authority; retry until available",
+            },
+        )
+        async with get_session_ctx() as session:
+            await upsert_okx_position_history_row(
+                session,
+                {
+                    "instId": "ADA-USDT-SWAP",
+                    "posId": "ada-pos-1",
+                    "posSide": "long",
+                    "type": "2",
+                    "cTime": _ms(closed_at - timedelta(minutes=20)),
+                    "uTime": _ms(closed_at),
+                    "openAvgPx": "0.6",
+                    "closeAvgPx": "0.64",
+                    "openMaxPos": "100",
+                    "closeTotalPos": "100",
+                    "realizedPnl": "4.09",
+                    "pnl": "4.2",
+                    "fundingFee": "-0.01",
+                    "fee": "-0.1",
+                },
+                mode="paper",
+                source="okx_settlement_fact_mirror",
+                match_status="okx_account_position_history",
+                synced_at=now,
+            )
+
+        report = await OkxPositionSettlementSyncService(
+            mode="paper",
+            retry_seconds=30.0,
+        ).sync_once()
+
+        assert report["status"] == "ok"
+        assert report["reconciled_count"] == 1
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+        assert position is not None
+        assert position.settlement_status == "reconciled"
+        assert position.settlement_source == "okx_position_history_settlement"
+        assert position.realized_pnl == pytest.approx(4.09)
     finally:
         await close_db()

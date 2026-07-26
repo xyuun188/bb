@@ -209,11 +209,17 @@ def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:
     assert ".position-linked-orders-table-wrap" in style
 
 
-def test_position_history_uses_official_settlement_badge_not_pending_reconciliation() -> None:
+def test_position_history_separates_confirmed_close_from_official_settlement() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "function isOfficialClosedPositionSettlement" in script
+    assert "function isPendingClosedPositionSettlement" in script
     assert "function closedPositionEvidenceLabel" in script
+    assert "pending_settlement_count" in script
+    assert "settlementPending || pnl === null" in script
+    assert "position.settlement_explanation" in script
+    assert "positions_history_no_matching_row" in script
+    assert "official_position_history_identity_unresolved" in script
     assert "\\u5f85\\u5bf9\\u8d26" not in script
     assert "\\u8ba2\\u5355\\u8865\\u5168\\u4e2d" in script
     assert "\\u5df2\\u5b98\\u65b9\\u7ed3\\u7b97" in script
@@ -498,7 +504,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260726-daily-pnl-facts" in html
+    assert "dashboard.js?v=20260726-position-history-pending-settlement" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -638,7 +644,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260726-daily-pnl-facts" in html
+    assert "dashboard.js?v=20260726-position-history-pending-settlement" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -795,7 +801,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260726-daily-pnl-facts" in html
+    assert "dashboard.js?v=20260726-position-history-pending-settlement" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1021,7 +1027,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260726-daily-pnl-facts" in html
+    assert "/static/js/dashboard.js?v=20260726-position-history-pending-settlement" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:

@@ -4342,6 +4342,8 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     deterministic_position_order_match: '历史仓位与订单可确定匹配，等待受控补链',
     missing_matching_entry_order: '历史仓位缺少可确认的开仓订单链接',
     missing_matching_close_order: '历史仓位缺少可确认的平仓订单链接',
+    positions_history_no_matching_row: 'OKX 官方仓位历史暂未匹配到该平仓生命周期',
+    official_position_history_identity_unresolved: 'OKX 平仓成交已确认，但官方仓位历史身份尚未解析',
     okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据',
     okx_protection_inventory_unavailable: 'OKX 保护单快照读取失败',
     okx_protection_evidence_unavailable: 'OKX 保护证据读取失败',
@@ -8243,6 +8245,10 @@ async function fetchPositionHistory() {
     if (!data) return;
     state.positionHistoryPage = data.page || state.positionHistoryPage;
     state.positionHistoryTotal = data.total || 0;
+    const label = document.getElementById('position-history-mode-label');
+    if (label) {
+        label.textContent = `${state.mode === 'paper' ? '模拟盘' : '实盘'} · ${Number(data.settled_count || 0)} 已结算 / ${Number(data.pending_settlement_count || 0)} 待结算`;
+    }
     renderClosedPositionsTable(data.positions || [], state.positionHistoryPage, data.total_pages || 1, data.total || 0);
 }
 
@@ -8314,6 +8320,7 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
 
 
 function isOfficialClosedPositionSettlement(position) {
+    if (isPendingClosedPositionSettlement(position)) return false;
     const status = String(position?.settlement_status || '').trim();
     if (['reconciled', 'settled', 'okx_position_history'].includes(status)) {
         return true;
@@ -8322,7 +8329,18 @@ function isOfficialClosedPositionSettlement(position) {
     return source.includes('okx_position_history') || source.includes('position_settlement_snapshot');
 }
 
+function isPendingClosedPositionSettlement(position) {
+    if (position?.settlement_complete === false || position?.settlement_state === 'pending') {
+        return true;
+    }
+    const status = String(position?.settlement_status || '').trim();
+    return status === 'settlement_quarantined' || status === 'settlement_pending';
+}
+
 function closedPositionEvidenceLabel(position) {
+    if (isPendingClosedPositionSettlement(position)) {
+        return '\u5e73\u4ed3\u6210\u4ea4\u5df2\u786e\u8ba4\uff0c\u5b98\u65b9\u7ed3\u7b97\u5f85\u8865\u9f50';
+    }
     if (isOfficialClosedPositionSettlement(position)) {
         return '\u5df2\u5b98\u65b9\u7ed3\u7b97';
     }
@@ -8343,17 +8361,23 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
         return;
     }
     tbody.innerHTML = positions.map((p, index) => {
-        const pnl = Number(p.realized_pnl || 0);
-        const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const settlementPending = isPendingClosedPositionSettlement(p);
+        const pnl = mlOptionalNumber(p.realized_pnl);
+        const pnlColor = pnl === null ? 'var(--text-muted)' : (pnl >= 0 ? 'var(--green)' : 'var(--red)');
+        const pnlText = settlementPending || pnl === null
+            ? '\u5f85\u5b98\u65b9\u7ed3\u7b97'
+            : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}`;
         const statusLabel = p.close_status_label || p.position_status || (p.close_status === 'partial' ? '\u90e8\u5206\u5e73\u4ed3' : '\u5168\u90e8\u5e73\u4ed3');
         const statusColor = p.close_status === 'partial' ? 'var(--accent-light)' : 'var(--text-muted)';
         const groupId = String(p.group_id || p.id || `row-${page}-${index}`);
         const linkedFills = Array.isArray(p.linked_fills) ? p.linked_fills : [];
         positionLinkedOrdersByGroup.set(groupId, { position: p, fills: linkedFills });
         const linkedCount = Number(p.linked_order_count ?? linkedFills.length ?? 0);
-        const evidenceBadge = isOfficialClosedPositionSettlement(p) || p.evidence_complete === true
-            ? '<div class="position-ledger-badge ok">OKX</div>'
-            : '<div class="position-ledger-badge warn">\u8ba2\u5355\u8865\u5168\u4e2d</div>';
+        const evidenceBadge = settlementPending
+            ? '<div class="position-ledger-badge warn">\u5df2\u5e73\u4ed3 \u00b7 \u5f85\u7ed3\u7b97</div>'
+            : (isOfficialClosedPositionSettlement(p) || p.evidence_complete === true
+                ? '<div class="position-ledger-badge ok">OKX</div>'
+                : '<div class="position-ledger-badge warn">\u8ba2\u5355\u8865\u5168\u4e2d</div>');
         const linkedButtonDisabled = linkedCount <= 0 ? 'disabled' : '';
         return `
         <tr>
@@ -8364,7 +8388,7 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
             <td>${fmtNum(p.quantity)}</td>
             <td>${fmtPrice(p.entry_price)}</td>
             <td>${fmtPrice(p.current_price || p.entry_price)}</td>
-            <td style="color:${pnlColor};font-weight:600;">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
+            <td style="color:${pnlColor};font-weight:600;">${pnlText}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.opened_at)}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.closed_at)}</td>
             <td>
@@ -8522,14 +8546,19 @@ function openPositionLinkedOrdersModal(groupId) {
         title.textContent = `${position.symbol || '-'} ${sideLabel(position.side)} \u5173\u8054\u8ba2\u5355`;
     }
     const gaps = Array.isArray(position.evidence_gaps) ? position.evidence_gaps : [];
+    const settlementPending = isPendingClosedPositionSettlement(position);
+    const realizedPnlText = settlementPending
+        ? '\u5f85\u5b98\u65b9\u7ed3\u7b97'
+        : `${signedMoney(position.realized_pnl || 0)} USDT`;
     const evidenceHtml = `
         <div class="position-ledger-summary">
             <div><strong>${escHtml(position.okx_inst_id || '-')}</strong><span>OKX instId</span></div>
             <div><strong>${fmtNum(position.closed_quantity ?? position.quantity)}</strong><span>\u5df2\u5e73\u6570\u91cf</span></div>
-            <div><strong>${signedMoney(position.realized_pnl || 0)} USDT</strong><span>\u5df2\u5b9e\u73b0\u76c8\u4e8f</span></div>
+            <div><strong>${realizedPnlText}</strong><span>\u5df2\u5b9e\u73b0\u76c8\u4e8f</span></div>
             <div><strong>${closedPositionEvidenceLabel(position)}</strong><span>OKX \u8bc1\u636e</span></div>
         </div>
-        ${gaps.length ? `<div class="position-ledger-gaps">\u8bc1\u636e\u7f3a\u53e3\uff1a${gaps.map(item => escHtml(item)).join(' / ')}</div>` : ''}`;
+        ${settlementPending && position.settlement_explanation ? `<div class="position-ledger-gaps">${escHtml(position.settlement_explanation)}</div>` : ''}
+        ${gaps.length ? `<div class="position-ledger-gaps">\u8bc1\u636e\u7f3a\u53e3\uff1a${gaps.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>` : ''}`;
     if (!fills.length) {
         body.innerHTML = `${evidenceHtml}<div class="reason-block">\u6682\u65e0 OKX \u5173\u8054\u8ba2\u5355\u660e\u7ec6\uff0c\u8bf7\u5148\u6267\u884c\u4e09\u671f OKX \u8ba2\u5355/\u6210\u4ea4\u540c\u6b65\u3002</div>`;
         overlay.style.display = 'flex';

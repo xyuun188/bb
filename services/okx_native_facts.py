@@ -612,8 +612,6 @@ class OkxNativeFactsClient:
         for _page in range(max(1, int(max_pages or 1))):
             page_params = dict(params)
             page_params["limit"] = str(page_limit)
-            if since_ms > 0 and "begin" not in page_params:
-                page_params["begin"] = str(int(since_ms))
             if after_cursor:
                 page_params["after"] = after_cursor
             response = await self.executor._with_retry(fetch_history, page_params)
@@ -1783,7 +1781,7 @@ def _oldest_position_history_pagination_cursor(rows: Iterable[dict[str, Any]]) -
             oldest_timestamp = timestamp
     if not oldest_row:
         return ""
-    return str(oldest_row.get("posId") or oldest_row.get("uTime") or "").strip()
+    return str(oldest_row.get("uTime") or oldest_row.get("cTime") or "").strip()
 
 
 def _fill_row_identity(row: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:

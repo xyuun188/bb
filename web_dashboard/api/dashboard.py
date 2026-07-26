@@ -3209,6 +3209,264 @@ async def _dashboard_closed_position_ledger_rows_uncached(
     )
 
 
+async def _dashboard_pending_closed_position_rows(
+    session: Any,
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Build display-only rows for OKX-confirmed closes awaiting official settlement."""
+    from sqlalchemy import or_, select
+
+    from models.trade import Order, Position
+    from services.okx_order_fact_sync import (
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+    )
+    from services.okx_position_ledger_view import build_okx_position_ledger_groups
+    from services.position_settlement import final_settlement_status_values
+
+    final_statuses = final_settlement_status_values()
+    position_stmt = select(Position).where(
+        Position.is_open.is_(False),
+        Position.closed_at.is_not(None),
+        or_(
+            Position.settlement_status.is_(None),
+            Position.settlement_status == "",
+            Position.settlement_status.not_in(final_statuses),
+        ),
+    )
+    if mode:
+        position_stmt = position_stmt.where(Position.execution_mode == mode)
+    if model_names:
+        position_stmt = position_stmt.where(Position.model_name.in_(model_names))
+    pending_positions = list(
+        (
+            await session.execute(
+                position_stmt.order_by(
+                    Position.closed_at.desc(),
+                    Position.created_at.desc(),
+                    Position.id.desc(),
+                ).limit(5000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not pending_positions:
+        return []
+
+    linked_order_ids = {
+        token
+        for position in pending_positions
+        for value in (
+            getattr(position, "entry_exchange_order_id", None),
+            getattr(position, "close_exchange_order_id", None),
+        )
+        for token in _dashboard_split_exchange_order_ids(value)
+    }
+    if not linked_order_ids:
+        return []
+
+    order_stmt = select(Order).where(
+        Order.status == "filled",
+        Order.exchange_order_id.in_(sorted(linked_order_ids)),
+    )
+    if mode:
+        order_stmt = order_stmt.where(Order.execution_mode == mode)
+    order_rows = list(
+        (
+            await session.execute(
+                order_stmt.order_by(
+                    Order.filled_at.desc().nullslast(),
+                    Order.created_at.desc(),
+                    Order.id.desc(),
+                ).limit(10000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    confirmed_statuses = {
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    }
+    confirmed_order_ids = {
+        token
+        for order in order_rows
+        if str(getattr(order, "okx_sync_status", "") or "").strip()
+        in confirmed_statuses
+        for token in _dashboard_split_exchange_order_ids(
+            getattr(order, "exchange_order_id", None)
+        )
+    }
+    if not confirmed_order_ids:
+        return []
+
+    positions_by_id = {
+        int(position.id): position
+        for position in pending_positions
+        if getattr(position, "id", None) is not None
+    }
+    rows: list[dict[str, Any]] = []
+    groups = build_okx_position_ledger_groups(
+        pending_positions,
+        order_rows,
+        require_order_lifecycle_source_positions=True,
+    )
+    for group in groups:
+        close_order_ids = set(group.close_order_ids)
+        if not close_order_ids or not (close_order_ids & confirmed_order_ids):
+            continue
+        source_positions = [
+            positions_by_id[position_id]
+            for position_id in group.position_ids
+            if position_id in positions_by_id
+        ]
+        settlement_statuses = sorted(
+            {
+                str(getattr(position, "settlement_status", "") or "").strip()
+                for position in source_positions
+                if str(getattr(position, "settlement_status", "") or "").strip()
+            }
+        )
+        settlement_sources = sorted(
+            {
+                str(getattr(position, "settlement_source", "") or "").strip()
+                for position in source_positions
+                if str(getattr(position, "settlement_source", "") or "").strip()
+            }
+        )
+        blockers = sorted(
+            {
+                str(value).strip()
+                for position in source_positions
+                for raw in [
+                    getattr(position, "settlement_raw", None)
+                    if isinstance(getattr(position, "settlement_raw", None), dict)
+                    else {}
+                ]
+                for value in (
+                    raw.get("last_error_code"),
+                    raw.get("quarantine_reason"),
+                )
+                if str(value or "").strip()
+            }
+        )
+        payload = group.as_dict(include_fills=True)
+        payload.update(
+            {
+                "realized_pnl": None,
+                "realized_pnl_pct": None,
+                "pnl_source": "pending_official_settlement",
+                "settlement_status": (
+                    ",".join(settlement_statuses) if settlement_statuses else "settlement_pending"
+                ),
+                "settlement_source": (
+                    ",".join(settlement_sources)
+                    if settlement_sources
+                    else "okx_confirmed_close_pending_settlement"
+                ),
+                "settlement_state": "pending",
+                "settlement_complete": False,
+                "settlement_blockers": blockers,
+                "settlement_explanation": (
+                    "OKX平仓成交已确认，官方仓位历史身份尚未匹配；净盈亏暂不入账。"
+                ),
+                "order_evidence_complete": bool(group.evidence_complete),
+                "evidence_complete": False,
+                "trainable": False,
+                "ledger_source": "okx_confirmed_close_pending_settlement",
+            }
+        )
+        payload["evidence_gaps"] = list(
+            dict.fromkeys([*payload.get("evidence_gaps", []), *blockers])
+        )
+        rows.append(payload)
+    return rows
+
+
+async def _dashboard_position_history_rows(
+    session: Any,
+    repo: Any,
+    *,
+    mode: str | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[dict[str, Any]], int, int, int, str, int, int]:
+    settled_rows, _total, _page, _pages, settled_source = (
+        await _dashboard_closed_position_ledger_rows(
+            session,
+            repo,
+            mode=mode,
+            page=1,
+            page_size=5000,
+            paginate=False,
+        )
+    )
+    settled_rows = [
+        {
+            **row,
+            "settlement_state": "settled",
+            "settlement_complete": True,
+        }
+        for row in settled_rows
+    ]
+    pending_rows = await _dashboard_pending_closed_position_rows(session, mode=mode)
+
+    settled_close_ids = {
+        token
+        for row in settled_rows
+        for token in _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
+    }
+    settled_position_ids = {
+        int(position_id)
+        for row in settled_rows
+        for position_id in row.get("position_ids", [])
+        if position_id is not None
+    }
+    pending_rows = [
+        row
+        for row in pending_rows
+        if not (
+            _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
+            & settled_close_ids
+        )
+        and not (
+            {
+                int(position_id)
+                for position_id in row.get("position_ids", [])
+                if position_id is not None
+            }
+            & settled_position_ids
+        )
+    ]
+    combined_rows = sorted(
+        [*settled_rows, *pending_rows],
+        key=lambda row: _as_utc_datetime(row.get("closed_at"))
+        or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    total = len(combined_rows)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    page = min(max(int(page or 1), 1), total_pages)
+    start = (page - 1) * page_size
+    ledger_source = settled_source
+    if pending_rows:
+        ledger_source = f"{settled_source}_plus_okx_confirmed_pending_settlement"
+    return (
+        combined_rows[start : start + page_size],
+        total,
+        page,
+        total_pages,
+        ledger_source,
+        len(settled_rows),
+        len(pending_rows),
+    )
+
+
 def _closed_rows_for_selected_ledger_groups(
     closed_rows: list[Any],
     selected_groups: list[Any],
@@ -5587,7 +5845,6 @@ async def get_positions(
     from db.session import get_session_ctx
     from models.decision import AIDecision
     from models.trade import Order
-    from services.okx_position_ledger_view import build_okx_position_ledger_groups
 
     page = max(int(page or 1), 1)
     page_size = max(1, min(int(page_size or 20), 100))
@@ -5653,94 +5910,31 @@ async def get_positions(
         repo = TradeRepository(session)
         is_open_filter = True if open_only else False if closed_only else None
         if closed_only:
-            positions, display_total, page, display_total_pages, ledger_source = (
-                await _dashboard_closed_position_ledger_rows(
-                    session,
-                    repo,
-                    mode=mode,
-                    page=page,
-                    page_size=page_size,
-                    paginate=True,
-                )
+            (
+                positions,
+                display_total,
+                page,
+                display_total_pages,
+                ledger_source,
+                settled_count,
+                pending_settlement_count,
+            ) = await _dashboard_position_history_rows(
+                session,
+                repo,
+                mode=mode,
+                page=page,
+                page_size=page_size,
             )
             return {
                 "positions": positions,
                 "count": display_total,
                 "total": display_total,
+                "settled_count": settled_count,
+                "pending_settlement_count": pending_settlement_count,
                 "page": page,
                 "page_size": page_size,
                 "total_pages": display_total_pages,
                 "ledger_source": ledger_source,
-            }
-            closed_rows = await repo.get_position_records(
-                execution_mode=mode,
-                limit=5000,
-                offset=0,
-                is_open=False,
-            )
-            linked_order_ids = {
-                token
-                for position in closed_rows
-                for value in (
-                    getattr(position, "entry_exchange_order_id", None),
-                    getattr(position, "close_exchange_order_id", None),
-                )
-                for token in _dashboard_split_exchange_order_ids(value)
-            }
-            symbol_variants = _dashboard_symbol_query_variants(
-                {
-                    _normalize_dashboard_symbol(str(getattr(position, "symbol", "") or ""))
-                    for position in closed_rows
-                    if getattr(position, "symbol", None)
-                }
-            )
-            order_stmt = select(Order).where(Order.status == "filled")
-            if mode:
-                order_stmt = order_stmt.where(Order.execution_mode == mode)
-            if symbol_variants:
-                order_stmt = order_stmt.where(Order.symbol.in_(symbol_variants))
-            else:
-                order_stmt = order_stmt.where(Order.id == -1)
-            order_rows = list(
-                (
-                    await session.execute(
-                        order_stmt.order_by(
-                            Order.filled_at.desc().nullslast(),
-                            Order.created_at.desc(),
-                        ).limit(10000)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            if linked_order_ids:
-                order_rows = [
-                    order
-                    for order in order_rows
-                    if _dashboard_split_exchange_order_ids(
-                        getattr(order, "exchange_order_id", None)
-                    )
-                    & linked_order_ids
-                ]
-            ledger_groups = build_okx_position_ledger_groups(closed_rows, order_rows)
-            display_total = len(ledger_groups)
-            display_total_pages = (
-                max(1, (display_total + page_size - 1) // page_size) if display_total else 1
-            )
-            page = min(page, display_total_pages)
-            start = (page - 1) * page_size
-            positions = [
-                group.as_dict(include_fills=True)
-                for group in ledger_groups[start : start + page_size]
-            ]
-            return {
-                "positions": positions,
-                "count": display_total,
-                "total": display_total,
-                "page": page,
-                "page_size": page_size,
-                "total_pages": display_total_pages,
-                "ledger_source": "okx_native_grouped_cache",
             }
         total = await repo.count_positions(execution_mode=mode, is_open=is_open_filter)
         open_count = await repo.count_positions(execution_mode=mode, is_open=True)

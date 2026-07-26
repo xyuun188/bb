@@ -59,7 +59,7 @@ DUPLICATE_CLOSED_POSITION_REASON = "duplicate_local_closed_position_for_same_okx
 SETTLEMENT_STATUS_QUARANTINED = "settlement_quarantined"
 SETTLEMENT_QUARANTINE_SOURCE = "okx_position_history_identity_quarantine"
 NON_RETRYABLE_SETTLEMENT_STATUSES = frozenset(
-    {SUPERSEDED_POSITION_STATUS, SETTLEMENT_STATUS_QUARANTINED}
+    {SUPERSEDED_POSITION_STATUS}
 )
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
@@ -215,8 +215,7 @@ class OkxPositionSettlementSyncService:
                 "error_code": result.code,
                 "error_message": result.message,
             }
-            if not quarantined:
-                sample["next_retry_seconds"] = self.retry_seconds
+            sample["next_retry_seconds"] = self.retry_seconds
             samples.append(sample)
 
         status = "warning" if exceptions else "ok"
@@ -595,9 +594,9 @@ class OkxPositionSettlementSyncService:
                 "settlement_attempt_count": attempts,
             }
             if quarantined:
-                updated_raw.pop("next_settlement_retry_at", None)
                 updated_raw.update(
                     {
+                        "next_settlement_retry_at": next_retry_at.isoformat(),
                         "quarantine_reason": "official_position_history_identity_unresolved",
                         "quarantined_at": now.isoformat(),
                         "quarantine_evidence": {
@@ -608,7 +607,10 @@ class OkxPositionSettlementSyncService:
                             "closed_age_hours": closed_age_hours,
                             "max_age_hours": POSITION_HISTORY_MATCH_MAX_AGE_HOURS,
                         },
-                        "retry_policy": "permanent_no_retry",
+                        "retry_policy": (
+                            f"quarantined from authority; retry every {self.retry_seconds:g}s "
+                            "until OKX official settlement identity is available"
+                        ),
                     }
                 )
             else:

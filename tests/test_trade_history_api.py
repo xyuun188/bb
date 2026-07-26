@@ -294,6 +294,122 @@ async def test_dashboard_position_history_marks_same_open_group_slices_as_partia
 
 
 @pytest.mark.asyncio
+async def test_dashboard_position_history_shows_confirmed_close_awaiting_official_settlement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-pending-settlement.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 25, 1, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 25, 2, 0, tzinfo=UTC)
+    entry_order_id = "pending-entry"
+    close_order_id = "pending-close"
+
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "DOT/USDT",
+                    "side": "long",
+                    "quantity": 5.0,
+                    "entry_price": 0.82,
+                    "current_price": 0.83,
+                    "leverage": 1.0,
+                    "realized_pnl": 0.04,
+                    "close_fill_pnl": 0.05,
+                    "entry_fee": 0.005,
+                    "close_fee": 0.005,
+                    "settlement_status": "settlement_quarantined",
+                    "settlement_source": "okx_position_history_identity_quarantine",
+                    "settlement_raw": {
+                        "last_error_code": "positions_history_no_matching_row",
+                        "quarantine_reason": "official_position_history_identity_unresolved",
+                    },
+                    "is_open": False,
+                    "okx_inst_id": "DOT-USDT-SWAP",
+                    "entry_exchange_order_id": entry_order_id,
+                    "close_exchange_order_id": close_order_id,
+                    "closed_at": closed_at,
+                    "created_at": opened_at,
+                }
+            )
+            for order_id, side, price, filled_at, pnl in (
+                (entry_order_id, "buy", 0.82, opened_at, 0.0),
+                (close_order_id, "sell", 0.83, closed_at, 0.05),
+            ):
+                await repo.create_order(
+                    {
+                        "model_name": "okx_authoritative_sync",
+                        "execution_mode": "paper",
+                        "symbol": "DOT/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": 5.0,
+                        "price": price,
+                        "status": "filled",
+                        "fee": 0.005,
+                        "exchange_order_id": order_id,
+                        "filled_at": filled_at,
+                        "created_at": filled_at,
+                        "okx_inst_id": "DOT-USDT-SWAP",
+                        "okx_trade_ids": f"trade-{order_id}",
+                        "okx_fill_contracts": 5.0,
+                        "okx_fill_pnl": pnl,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "order_id": order_id,
+                            "trade_ids": [f"trade-{order_id}"],
+                            "inst_id": "DOT-USDT-SWAP",
+                            "contracts": 5.0,
+                            "contract_size": 1.0,
+                            "base_quantity": 5.0,
+                            "avg_price": price,
+                            "fee_abs": 0.005,
+                            "fill_pnl": pnl,
+                            "timestamp": filled_at.isoformat(),
+                            "fills_history_confirmed": True,
+                        },
+                    }
+                )
+
+        payload = await get_dashboard_positions(mode="paper", closed_only=True)
+    finally:
+        await close_db()
+
+    assert payload["settled_count"] == 0
+    assert payload["pending_settlement_count"] == 1
+    assert payload["total"] == 1
+    assert payload["ledger_source"] == (
+        "okx_positions_history_official_unavailable_plus_"
+        "okx_confirmed_pending_settlement"
+    )
+    row = payload["positions"][0]
+    assert row["symbol"] == "DOT/USDT"
+    assert row["close_status"] == "full"
+    assert row["linked_order_count"] == 2
+    assert row["settlement_status"] == "settlement_quarantined"
+    assert row["settlement_state"] == "pending"
+    assert row["settlement_complete"] is False
+    assert row["realized_pnl"] is None
+    assert row["pnl_source"] == "pending_official_settlement"
+    assert row["order_evidence_complete"] is True
+    assert row["evidence_complete"] is False
+    assert row["trainable"] is False
+    assert row["settlement_blockers"] == [
+        "official_position_history_identity_unresolved",
+        "positions_history_no_matching_row",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_position_history_uses_synced_position_realized_pnl(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

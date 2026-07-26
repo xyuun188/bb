@@ -368,7 +368,7 @@ class _PositionHistoryCcxt:
                     "uTime": str(first_ts + 1),
                 },
             ],
-            "spk-pos-1": [
+            str(first_ts): [
                 {
                     "instId": "FLOKI-USDT-SWAP",
                     "posId": "floki-pos-1",
@@ -923,7 +923,7 @@ async def test_native_facts_client_falls_back_to_archive_order_history_rows() ->
 
 
 @pytest.mark.asyncio
-async def test_native_facts_client_fetches_position_history_rows_with_phase3_begin() -> None:
+async def test_native_facts_client_fetches_position_history_rows_with_time_cursor() -> None:
     ccxt = _PositionHistoryCcxt()
     since = datetime(2026, 6, 28, 0, 0, tzinfo=UTC)
 
@@ -938,13 +938,11 @@ async def test_native_facts_client_fetches_position_history_rows_with_phase3_beg
         {
             "instType": "SWAP",
             "limit": "2",
-            "begin": str(int(since.timestamp() * 1000)),
         },
         {
             "instType": "SWAP",
             "limit": "2",
-            "begin": str(int(since.timestamp() * 1000)),
-            "after": "spk-pos-1",
+            "after": str(int(datetime(2026, 6, 28, 1, 0, tzinfo=UTC).timestamp() * 1000)),
         },
     ]
 
@@ -966,7 +964,6 @@ async def test_native_facts_client_fetches_position_history_by_pos_ids() -> None
             "instType": "SWAP",
             "posId": "floki-pos-1",
             "limit": "5",
-            "begin": str(int(since.timestamp() * 1000)),
         }
     ]
 
@@ -988,13 +985,11 @@ async def test_native_position_history_queries_each_okx_pos_id_separately() -> N
             "instType": "SWAP",
             "posId": "arb-pos-1",
             "limit": "5",
-            "begin": str(int(since.timestamp() * 1000)),
         },
         {
             "instType": "SWAP",
             "posId": "floki-pos-1",
             "limit": "5",
-            "begin": str(int(since.timestamp() * 1000)),
         },
     ]
 
