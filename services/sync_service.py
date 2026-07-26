@@ -472,8 +472,39 @@ async def _confirmed_local_close_fill_for_position(
     result = await session.execute(statement)
     if not callable(getattr(result, "scalars", None)):
         return {}
+    orders = list(result.scalars().all())
+    candidate_exchange_order_ids = {
+        str(getattr(order, "exchange_order_id", "") or "").strip()
+        for order in orders
+        if str(getattr(order, "exchange_order_id", "") or "").strip()
+    }
+    consumed_exchange_order_ids: set[str] = set()
+    if candidate_exchange_order_ids:
+        linked_result = await session.execute(
+            select(Position).where(
+                Position.execution_mode == getattr(position, "execution_mode", None),
+                Position.symbol.in_(variants),
+                Position.close_exchange_order_id.is_not(None),
+                Position.close_exchange_order_id != "",
+            )
+        )
+        if callable(getattr(linked_result, "scalars", None)):
+            current_position_id = int(getattr(position, "id", 0) or 0)
+            for linked_position in linked_result.scalars().all():
+                if int(getattr(linked_position, "id", 0) or 0) == current_position_id:
+                    continue
+                consumed_exchange_order_ids.update(
+                    candidate_exchange_order_ids.intersection(
+                        _split_exchange_order_ids(
+                            getattr(linked_position, "close_exchange_order_id", None)
+                        )
+                    )
+                )
     target = abs(_float_value(target_quantity, 0.0))
-    for order in result.scalars().all():
+    for order in orders:
+        exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        if exchange_order_id in consumed_exchange_order_ids:
+            continue
         quantity = abs(_float_value(getattr(order, "quantity", None), 0.0))
         if target > 0 and (quantity <= 0 or quantity < target * 0.2):
             continue
@@ -484,7 +515,7 @@ async def _confirmed_local_close_fill_for_position(
         return {
             "price": price,
             "fee": abs(_float_value(getattr(order, "fee", None), 0.0)),
-            "order_id": str(getattr(order, "exchange_order_id", "") or ""),
+            "order_id": exchange_order_id,
             "timestamp": getattr(order, "filled_at", None) or getattr(order, "created_at", None),
             "quantity": quantity,
             "contracts": _float_value(

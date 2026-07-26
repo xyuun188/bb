@@ -5324,6 +5324,46 @@ class OKXExecutor(AbstractExecutor):
             },
         )
 
+    async def create_position_protection_order(
+        self,
+        *,
+        inst_id: str,
+        position_side: str,
+        okx_position_side: str,
+        contracts: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+    ) -> dict[str, Any]:
+        """Create a reduce-only OCO for an uncovered position quantity."""
+
+        normalized_side = str(position_side or "").lower()
+        if normalized_side not in {"long", "short"}:
+            raise ExchangeAPIError("Protection creation requires a position side")
+        if contracts <= 0 or stop_loss_price <= 0 or take_profit_price <= 0:
+            raise ExchangeAPIError("Protection creation requires positive size and prices")
+        ccxt = await self._get_ccxt()
+        place = getattr(ccxt, "privatePostTradeOrderAlgo", None)
+        if not callable(place):
+            raise ExchangeAPIError("OKX native place-algo API is unavailable")
+        return await self._with_retry(
+            place,
+            {
+                "instId": str(inst_id or "").upper(),
+                "tdMode": "cross",
+                "side": "sell" if normalized_side == "long" else "buy",
+                "posSide": str(okx_position_side or "net").lower(),
+                "ordType": "oco",
+                "sz": self._format_okx_number(contracts),
+                "reduceOnly": "true",
+                "tpTriggerPx": self._format_okx_number(take_profit_price),
+                "tpOrdPx": "-1",
+                "slTriggerPx": self._format_okx_number(stop_loss_price),
+                "slOrdPx": "-1",
+                "tpTriggerPxType": "last",
+                "slTriggerPxType": "last",
+            },
+        )
+
     async def cancel_position_protection_order(
         self,
         *,

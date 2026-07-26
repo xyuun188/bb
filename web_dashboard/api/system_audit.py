@@ -1633,7 +1633,12 @@ async def _okx_reconciliation_light_scan(
                 if str(order.exchange_order_id or "").strip()
             },
         )
+        partial_exit_coverage_index = await _load_partial_exit_coverage_index(
+            session,
+            close_rows=rows,
+        )
         official_history_covered_count = 0
+        partial_exit_covered_count = 0
         for order, action in rows:
             exchange_order_id = str(order.exchange_order_id or "").strip()
             if not exchange_order_id:
@@ -1646,6 +1651,16 @@ async def _okx_reconciliation_light_scan(
                 exchange_order_id,
             ) in official_history_link_index:
                 official_history_covered_count += 1
+                continue
+            partial_exit_evidence = partial_exit_coverage_index.get(
+                (
+                    str(order.execution_mode or "").strip().lower(),
+                    exchange_order_id,
+                )
+            )
+            if partial_exit_evidence is not None:
+                partial_exit_covered_count += 1
+                plan_classifications.append(partial_exit_evidence)
                 continue
             close_order_id = int(order.id)
             classification = {
@@ -1671,6 +1686,7 @@ async def _okx_reconciliation_light_scan(
     classification_counts = {
         "linked": linked_count,
         "official_history_covered": official_history_covered_count,
+        "partial_exit_covered": partial_exit_covered_count,
         "manual_review": len(plans),
         "unscanned": unscanned_count,
     }
@@ -1692,8 +1708,199 @@ async def _okx_reconciliation_light_scan(
         skipped_candidate_count=0,
         unscanned_candidate_count=unscanned_count,
         official_history_covered_count=official_history_covered_count,
+        partial_exit_covered_count=partial_exit_covered_count,
         scan_mode="light_close_order_link_summary",
     )
+
+
+async def _load_partial_exit_coverage_index(
+    session: Any,
+    *,
+    close_rows: list[tuple[Order, str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Prove that unlinked close orders are partial exits of an open position."""
+
+    candidate_keys = {
+        (
+            str(order.execution_mode or "").strip().lower(),
+            str(order.exchange_order_id or "").strip(),
+        )
+        for order, _action in close_rows
+        if str(order.exchange_order_id or "").strip()
+    }
+    modes = {mode for mode, _order_id in candidate_keys if mode}
+    if not candidate_keys or not modes:
+        return {}
+
+    open_positions = list(
+        (
+            await session.execute(
+                select(Position).where(
+                    Position.is_open.is_(True),
+                    func.lower(Position.execution_mode).in_(sorted(modes)),
+                )
+            )
+        ).scalars().all()
+    )
+    positions_with_entry_ids = [
+        (
+            position,
+            _exchange_order_link_tokens(
+                str(getattr(position, "entry_exchange_order_id", "") or "")
+            ),
+        )
+        for position in open_positions
+    ]
+    positions_with_entry_ids = [
+        (position, entry_ids)
+        for position, entry_ids in positions_with_entry_ids
+        if entry_ids and _safe_float(position.quantity) > 0
+    ]
+    if not positions_with_entry_ids:
+        return {}
+
+    all_entry_ids = {
+        entry_id
+        for _position, entry_ids in positions_with_entry_ids
+        for entry_id in entry_ids
+    }
+    entry_rows = list(
+        (
+            await session.execute(
+                select(Order, AIDecision.action)
+                .join(AIDecision, Order.decision_id == AIDecision.id)
+                .where(Order.exchange_order_id.in_(sorted(all_entry_ids)))
+            )
+        ).all()
+    )
+    entry_rows_by_id = {
+        str(order.exchange_order_id or "").strip(): (order, str(action or "").lower())
+        for order, action in entry_rows
+        if str(order.exchange_order_id or "").strip()
+    }
+    entry_times = [
+        order.filled_at or order.created_at
+        for order, _action in entry_rows
+        if (order.filled_at or order.created_at) is not None
+    ]
+    if not entry_times:
+        return {}
+
+    all_close_rows = list(
+        (
+            await session.execute(
+                select(Order, AIDecision.action)
+                .join(AIDecision, Order.decision_id == AIDecision.id)
+                .where(
+                    func.lower(Order.execution_mode).in_(sorted(modes)),
+                    func.lower(Order.status) == "filled",
+                    Order.exchange_order_id.is_not(None),
+                    Order.exchange_order_id != "",
+                    Order.filled_at >= min(entry_times),
+                    or_(
+                        and_(
+                            func.lower(AIDecision.action) == "close_long",
+                            func.lower(Order.side) == "sell",
+                        ),
+                        and_(
+                            func.lower(AIDecision.action) == "close_short",
+                            func.lower(Order.side) == "buy",
+                        ),
+                    ),
+                )
+            )
+        ).all()
+    )
+
+    evidence_by_candidate: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for position, entry_ids in positions_with_entry_ids:
+        side = str(position.side or "").strip().lower()
+        if side not in {"long", "short"}:
+            continue
+        mode = str(position.execution_mode or "").strip().lower()
+        symbol = normalize_trading_symbol(position.symbol)
+        model_name = str(position.model_name or "")
+        entry_action = "long" if side == "long" else "short"
+        entry_side = "buy" if side == "long" else "sell"
+        close_action = "close_long" if side == "long" else "close_short"
+        close_side = "sell" if side == "long" else "buy"
+
+        matched_entry_rows = [entry_rows_by_id.get(entry_id) for entry_id in entry_ids]
+        if any(row is None for row in matched_entry_rows):
+            continue
+        entries = [row for row in matched_entry_rows if row is not None]
+        if any(
+            str(order.execution_mode or "").strip().lower() != mode
+            or normalize_trading_symbol(order.symbol) != symbol
+            or str(order.model_name or "") != model_name
+            or str(order.status or "").strip().lower() != "filled"
+            or str(order.side or "").strip().lower() != entry_side
+            or action != entry_action
+            or _safe_float(order.quantity) <= 0
+            or (order.filled_at or order.created_at) is None
+            for order, action in entries
+        ):
+            continue
+
+        lifecycle_started_at = min(
+            order.filled_at or order.created_at for order, _action in entries
+        )
+        exits = [
+            order
+            for order, action in all_close_rows
+            if str(order.execution_mode or "").strip().lower() == mode
+            and normalize_trading_symbol(order.symbol) == symbol
+            and str(order.model_name or "") == model_name
+            and str(order.side or "").strip().lower() == close_side
+            and str(action or "").strip().lower() == close_action
+            and (order.filled_at or order.created_at) is not None
+            and (order.filled_at or order.created_at) >= lifecycle_started_at
+            and _safe_float(order.quantity) > 0
+        ]
+        entry_quantity = sum(_safe_float(order.quantity) for order, _action in entries)
+        exit_quantity = sum(_safe_float(order.quantity) for order in exits)
+        remaining_quantity = _safe_float(position.quantity)
+        tolerance = max(1e-8, abs(entry_quantity) * 1e-9)
+        if (
+            exit_quantity <= tolerance
+            or remaining_quantity <= tolerance
+            or exit_quantity >= entry_quantity - tolerance
+            or abs(entry_quantity - exit_quantity - remaining_quantity) > tolerance
+        ):
+            continue
+
+        exit_ids = sorted(
+            {
+                str(order.exchange_order_id or "").strip()
+                for order in exits
+                if str(order.exchange_order_id or "").strip()
+            }
+        )
+        for order in exits:
+            exchange_order_id = str(order.exchange_order_id or "").strip()
+            key = (mode, exchange_order_id)
+            if key not in candidate_keys:
+                continue
+            evidence_by_candidate.setdefault(key, []).append(
+                {
+                    "status": "covered",
+                    "reason": "open_position_quantity_conservation",
+                    "close_order_id": int(order.id),
+                    "close_exchange_order_id": exchange_order_id,
+                    "position_id": int(position.id),
+                    "entry_exchange_order_ids": sorted(entry_ids),
+                    "partial_exit_exchange_order_ids": exit_ids,
+                    "entry_quantity": round(entry_quantity, 8),
+                    "partial_exit_quantity": round(exit_quantity, 8),
+                    "remaining_quantity": round(remaining_quantity, 8),
+                }
+            )
+
+    return {
+        key: matches[0]
+        for key, matches in evidence_by_candidate.items()
+        if len(matches) == 1
+    }
 
 
 async def _load_position_close_link_index(

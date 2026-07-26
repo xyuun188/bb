@@ -40,6 +40,7 @@ def _test_execution_service(
     position_execution_persister=None,
     position_protection_rebalancer=None,
     order_fact_recovery_trigger=None,
+    decision_stage_recorder=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
         if reasons is not None:
@@ -68,7 +69,7 @@ def _test_execution_service(
         execution_lock=asyncio.Lock(),
         risk_event_logger=_noop_async,
         model_execution_mode_provider=lambda _model: "paper",
-        decision_stage_recorder=record_stage,
+        decision_stage_recorder=decision_stage_recorder or record_stage,
         decision_reason_marker=mark_reason,
         decision_raw_response_marker=mark_raw,
         position_review_alert_context_provider=lambda _decision: None,
@@ -1246,7 +1247,76 @@ async def test_execution_service_shields_exchange_submit_from_outer_timeout() ->
     assert not any("外层超时保护取消" in str(reason) for reason in reasons)
     assert not any("外层超时保护取消" in str(reason) for reason in reasons)
     assert not any("外层超时保护取消" in str(reason) for reason in reasons)
-    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
-    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
-    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
-    assert not any("外层超时保护取消" in str(reason) for reason in reasons)
+
+
+@pytest.mark.asyncio
+async def test_execution_service_preserves_fill_when_cancelled_during_stage_recording() -> None:
+    stages: list[tuple[str, str, str]] = []
+    passed_stage_started = asyncio.Event()
+
+    class ImmediateFillExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(
+                order_id="local-after-submit",
+                exchange_order_id="okx-after-submit",
+                symbol=decision.symbol,
+                side=decision.action.value,
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return ImmediateFillExecutor()
+
+    async def delayed_stage_recorder(
+        _decision_id: int | None,
+        decision: DecisionOutput,
+        stage: str,
+        status: str,
+        reason: str,
+        _data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        stages.append((stage, status, reason))
+        if stage == DecisionStage.EXCHANGE_SUBMIT and status == DecisionStageStatus.PASSED:
+            passed_stage_started.set()
+            await asyncio.sleep(0.05)
+        return decision.raw_response if isinstance(decision.raw_response, dict) else {}
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        decision_stage_recorder=delayed_stage_recorder,
+    )
+    decision = _profit_first_ready_position_review_decision()
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+
+    execution_task = asyncio.create_task(
+        service.execute_candidate(
+            "BTC/USDT",
+            "ensemble_trader",
+            decision,
+            SimpleNamespace(warnings=[]),
+            992,
+            results,
+            open_positions=[],
+        )
+    )
+    await asyncio.wait_for(passed_stage_started.wait(), timeout=1.0)
+    execution_task.cancel()
+    result = await execution_task
+
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert result.exchange_order_id == "okx-after-submit"
+    assert result.raw_response["outer_cancellation_after_exchange_result"]["preserved"] is True
+    assert results["decisions"][0]["executed"] is True
+    assert not any(
+        stage == DecisionStage.EXCHANGE_SUBMIT and status == DecisionStageStatus.FAILED
+        for stage, status, _reason in stages
+    )

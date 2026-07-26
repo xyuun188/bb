@@ -497,6 +497,12 @@
 - 策略摘要不再传输 1467 条逐决策审计明细，而是明确返回 `decision_record_count=1467 / decision_records_included=false` 并保留全部聚合计数和最近匹配；只读策略审计通过显式参数继续读取全部明细。线上 summary 从约 `2.13MB` 降至约 `0.94MB`，连续请求耗时为 `15.17s / 10.85s / 11.29s`，均低于训练页 20 秒局部超时；8 条权威收益样本、1500 条 shadow 行、3000 个成本完整方向样本、2700 余条历史 replay 和 39 个候选均未减少。
 - 线上策略审计检查 1467 条逐决策记录，结果 `status=ok / violations=[]`；39 个候选均未通过治理，历史先验仍为只读上下文，`can_authorize_entry=false / can_change_size_or_leverage=false`。本地最终全量 pytest `2854 passed, 4 skipped`，全仓 Ruff 与 `git diff --check` 通过；线上交易与看板服务均为 `active/running`、`NRestarts=0`，最近 10 分钟错误级日志 0，运行控制保持 `paper / paused=false / running=true`。
 - 阶段十仍未完成：最新线上 OKX 对账为 `can_open_new_entries=false`，实时保护单盘点显示 `SAND/USDT long` 持仓 10 张但保护单仅覆盖 1 张，并因 `okx_contract_lot_size_missing` 暂不能自动修复。系统按硬闸门正确拒绝新开仓；后续继续自主修复并在对账恢复后由系统自动开放，不等待人工确认。
+- 上述 SAND 阻断已自主修复：保留原 1 张 OCO，并新增同价 reduce-only 差额 OCO 9 张，线上严格盘点为 `1 + 9 = 10`、`coverage_mismatches=[]`、`verified=true`。保护过量仍原地缩量，保护不足改为保留原单并补差额，稳定修复指纹不再包含易变更新时间。
+- 修复成交确认与外层超时取消竞态：当决策已经取得交易所确认或退出进展时，取消不得再把真实成交覆盖为 `rejected`。订单事实同步可从 `decision_state_machine.exchange_submit=passed` 精确恢复原始订单号，并且只有“阶段订单号 + OKX 原生成交”双重匹配时才修复；CRV `3775285747067355136` 与 HOME `3775583728408690688` 已恢复并确认，HOME 保护触发成交 `3775818117457608704` 及 XLM 保护触发成交 `3775856378133577728` 均已创建本地事实并通过定向同步。
+- 轻量历史对账新增 `partial_exit_covered` 严格分类：仅当唯一开放仓位、完整入场订单链、方向/模型/模式/时间一致，且满足 `入场数量 = 全部已确认部分退出数量 + 当前剩余数量` 时才覆盖缺失闭仓误报。CRV 的 `3 = 2 + 1` 被正确识别；数量不守恒仍进入 `manual_review`。线上分类为 `linked=99 / partial_exit_covered=2 / manual_review=6`，历史 6 条仅隔离、不再阻断当前交易或干净训练。
+- 发现并修复本地旧减仓单被重复用于关闭剩余仓位的问题：本地已确认平仓单若已被另一仓位生命周期消费，`sync_service` 必须继续查询 OKX 最新原生成交，不得复用旧单。PEPE 入场 0.2 合约先减仓 0.1、后清仓 0.1；错误重复链接已在完整备份 `data/codex_backups/pepe-duplicate-close-fill-repair/before_20260726T022946Z.json` 后精确改链，剩余切片现链接真实清仓单 `3775867929313902592`，实际净收益按成交 PnL 和双边费用复算为 `0.025235 USDT`。
+- 最新正式线上对账已写入 `data/okx_daily_reconciliation_reports/latest.json`：`generated_at=2026-07-26T02:31:18.763175+00:00`、`current_blocking_issue_count=0`、`authoritative_repairable_count=0`、`entry_blockers=[]`、`can_open_new_entries=true`、`can_refresh_training=true`。交易循环未接受人工强制开仓，而是在放行后自行继续 `auto scan`、执行品种筛选、候选排序和市场分析；不满足动态风险预算的候选继续被正常拒绝。
+- 本批最终本地验证为 `2862 passed, 4 skipped`，全仓 Ruff 与 `git diff --check` 通过；交易、看板和模型隧道服务线上均为 `active`，OKX 网络与看板探针通过。阶段十仍需继续旧逻辑清理后的长期稳定观察和最终总验收，不能因新开仓能力恢复而宣称总计划完成。
 
 ## 8. 实施顺序与停止条件
 

@@ -2736,6 +2736,190 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
 
 
 @pytest.mark.asyncio
+async def test_okx_reconciliation_light_scan_covers_only_conserved_partial_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from db.session import close_db, get_session_ctx, init_db
+    from models.decision import AIDecision
+    from models.trade import Order, Position
+
+    await close_db()
+    db_path = tmp_path / "partial-exit-audit.db"
+    now = datetime(2026, 6, 22, 4, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        system_audit.settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{db_path.as_posix()}",
+    )
+    monkeypatch.setattr(system_audit, "_now", lambda: now)
+    monkeypatch.setattr(
+        system_audit,
+        "load_training_epoch_start",
+        lambda: now - timedelta(hours=1),
+    )
+
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            valid_entry_decision = AIDecision(
+                model_name="test_model",
+                symbol="CRV/USDT",
+                action="long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(minutes=20)).replace(tzinfo=None),
+            )
+            valid_close_decision = AIDecision(
+                model_name="test_model",
+                symbol="CRV/USDT",
+                action="close_long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(minutes=10)).replace(tzinfo=None),
+            )
+            mismatch_entry_decision = AIDecision(
+                model_name="test_model",
+                symbol="BAD/USDT",
+                action="long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(minutes=18)).replace(tzinfo=None),
+            )
+            mismatch_close_decision = AIDecision(
+                model_name="test_model",
+                symbol="BAD/USDT",
+                action="close_long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(minutes=8)).replace(tzinfo=None),
+            )
+            session.add_all(
+                [
+                    valid_entry_decision,
+                    valid_close_decision,
+                    mismatch_entry_decision,
+                    mismatch_close_decision,
+                ]
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=valid_entry_decision.id,
+                        symbol="CRV/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=3,
+                        price=0.2,
+                        status="filled",
+                        exchange_order_id="crv-entry",
+                        filled_at=(now - timedelta(minutes=20)).replace(tzinfo=None),
+                        created_at=(now - timedelta(minutes=20)).replace(tzinfo=None),
+                    ),
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=valid_close_decision.id,
+                        symbol="CRV/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=2,
+                        price=0.21,
+                        status="filled",
+                        exchange_order_id="crv-partial-close",
+                        filled_at=(now - timedelta(minutes=10)).replace(tzinfo=None),
+                        created_at=(now - timedelta(minutes=10)).replace(tzinfo=None),
+                    ),
+                    Position(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        symbol="CRV/USDT",
+                        side="long",
+                        quantity=1,
+                        entry_price=0.2,
+                        current_price=0.21,
+                        is_open=True,
+                        entry_exchange_order_id="crv-entry",
+                        created_at=(now - timedelta(minutes=20)).replace(tzinfo=None),
+                    ),
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=mismatch_entry_decision.id,
+                        symbol="BAD/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=3,
+                        price=1.0,
+                        status="filled",
+                        exchange_order_id="bad-entry",
+                        filled_at=(now - timedelta(minutes=18)).replace(tzinfo=None),
+                        created_at=(now - timedelta(minutes=18)).replace(tzinfo=None),
+                    ),
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=mismatch_close_decision.id,
+                        symbol="BAD/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=2,
+                        price=1.1,
+                        status="filled",
+                        exchange_order_id="bad-partial-close",
+                        filled_at=(now - timedelta(minutes=8)).replace(tzinfo=None),
+                        created_at=(now - timedelta(minutes=8)).replace(tzinfo=None),
+                    ),
+                    Position(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        symbol="BAD/USDT",
+                        side="long",
+                        quantity=2,
+                        entry_price=1.0,
+                        current_price=1.1,
+                        is_open=True,
+                        entry_exchange_order_id="bad-entry",
+                        created_at=(now - timedelta(minutes=18)).replace(tzinfo=None),
+                    ),
+                ]
+            )
+
+        report = await system_audit._okx_reconciliation_light_scan(days=14)
+
+        assert report.candidate_order_count == 2
+        assert report.classification_counts == {
+            "linked": 0,
+            "official_history_covered": 0,
+            "partial_exit_covered": 1,
+            "manual_review": 1,
+            "unscanned": 0,
+        }
+        assert report.partial_exit_covered_count == 1
+        assert report.manual_review_count == 1
+        assert [plan.exchange_order_id for plan in report.plans] == ["bad-partial-close"]
+        partial_exit = next(
+            item
+            for item in report.plan_classifications
+            if item["close_exchange_order_id"] == "crv-partial-close"
+        )
+        assert partial_exit["status"] == "covered"
+        assert partial_exit["reason"] == "open_position_quantity_conservation"
+        assert partial_exit["entry_quantity"] == 3.0
+        assert partial_exit["partial_exit_quantity"] == 2.0
+        assert partial_exit["remaining_quantity"] == 1.0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_trade_loop_recent_restart_without_decisions_is_observing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,

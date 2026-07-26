@@ -104,6 +104,10 @@ class _TradeApi:
         self.calls.append(("amend_algo_order", dict(kwargs)))
         return {"code": "0", "data": [{"algoId": "algo-1", "sCode": "0"}]}
 
+    def place_algo_order(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("place_algo_order", dict(kwargs)))
+        return {"code": "0", "data": [{"algoId": "algo-new", "sCode": "0"}]}
+
     def cancel_algo_order(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("cancel_algo_order", dict(kwargs)))
         return {"code": "0", "data": [{"algoId": "algo-1", "sCode": "0"}]}
@@ -389,6 +393,21 @@ async def test_sdk_adapter_amends_and_cancels_native_algo_orders() -> None:
     trade_api = _TradeApi()
     exchange._trade_api = trade_api
 
+    await exchange.privatePostTradeOrderAlgo(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "sell",
+            "posSide": "net",
+            "ordType": "oco",
+            "sz": "9",
+            "reduceOnly": "true",
+            "tpTriggerPx": "101",
+            "tpOrdPx": "-1",
+            "slTriggerPx": "99",
+            "slOrdPx": "-1",
+        }
+    )
     await exchange.privatePostTradeAmendAlgos(
         {
             "instId": "BTC-USDT-SWAP",
@@ -402,6 +421,24 @@ async def test_sdk_adapter_amends_and_cancels_native_algo_orders() -> None:
     )
 
     assert trade_api.calls[0] == (
+        "place_algo_order",
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "sell",
+            "ordType": "oco",
+            "sz": "9",
+            "posSide": "net",
+            "reduceOnly": "true",
+            "tpTriggerPx": "101",
+            "tpOrdPx": "-1",
+            "slTriggerPx": "99",
+            "slOrdPx": "-1",
+            "tpTriggerPxType": "last",
+            "slTriggerPxType": "last",
+        },
+    )
+    assert trade_api.calls[1] == (
         "amend_algo_order",
         {
             "instId": "BTC-USDT-SWAP",
@@ -418,7 +455,7 @@ async def test_sdk_adapter_amends_and_cancels_native_algo_orders() -> None:
             "newSlOrdPx": "",
         },
     )
-    assert trade_api.calls[1] == (
+    assert trade_api.calls[2] == (
         "cancel_algo_order",
         {"orders_data": [{"instId": "BTC-USDT-SWAP", "algoId": "algo-1"}]},
     )

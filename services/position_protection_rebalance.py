@@ -53,6 +53,12 @@ def _response_success(response: Any) -> bool:
     )
 
 
+def _response_algo_id(response: Any) -> str:
+    rows = response.get("data") if isinstance(response, dict) else None
+    row = rows[0] if isinstance(rows, list) and rows else None
+    return str(row.get("algoId") or "") if isinstance(row, dict) else ""
+
+
 async def protection_integrity_snapshot(
     executor: Any,
     *,
@@ -106,6 +112,15 @@ async def apply_protection_repair_actions(
                     algo_id=str(action.get("algo_id") or ""),
                     contracts=float(action.get("new_contracts") or 0.0),
                 )
+            elif action_name == "create_delta":
+                response = await executor.create_position_protection_order(
+                    inst_id=str(action.get("inst_id") or ""),
+                    position_side=str(action.get("position_side") or ""),
+                    okx_position_side=str(action.get("okx_position_side") or "net"),
+                    contracts=float(action.get("new_contracts") or 0.0),
+                    stop_loss_price=float(action.get("stop_loss_price") or 0.0),
+                    take_profit_price=float(action.get("take_profit_price") or 0.0),
+                )
             elif action_name == "cancel":
                 response = await executor.cancel_position_protection_order(
                     inst_id=str(action.get("inst_id") or ""),
@@ -117,11 +132,43 @@ async def apply_protection_repair_actions(
                 raise RuntimeError(
                     f"OKX rejected protection {action_name} for algo {action.get('algo_id')}"
                 )
-            applied.append({"action": action, "response": response, "applied": True})
+            applied.append(
+                {
+                    "action": action,
+                    "response": response,
+                    "applied": True,
+                    "created_algo_id": (
+                        _response_algo_id(response) if action_name == "create_delta" else ""
+                    ),
+                }
+            )
     except Exception as exc:
         rollback_results: list[dict[str, Any]] = []
         for item in reversed(applied):
             rollback = _safe_dict(item["action"].get("rollback"))
+            if rollback.get("action") == "cancel_created":
+                algo_id = str(item.get("created_algo_id") or "")
+                try:
+                    response = await executor.cancel_position_protection_order(
+                        inst_id=str(rollback.get("inst_id") or ""),
+                        algo_id=algo_id,
+                    )
+                    rollback_results.append(
+                        {
+                            "rollback": {**rollback, "algo_id": algo_id},
+                            "response": response,
+                            "applied": bool(algo_id and _response_success(response)),
+                        }
+                    )
+                except Exception as rollback_exc:  # pragma: no cover
+                    rollback_results.append(
+                        {
+                            "rollback": {**rollback, "algo_id": algo_id},
+                            "applied": False,
+                            "error": str(rollback_exc),
+                        }
+                    )
+                continue
             if rollback.get("action") != "amend_size":
                 rollback_results.append(
                     {"rollback": rollback, "applied": False, "manual_required": True}

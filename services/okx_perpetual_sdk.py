@@ -806,6 +806,27 @@ class OkxPerpetualSdkExchange:
             clOrdId=str(params.get("clOrdId") or ""),
         )
 
+    async def privatePostTradeOrderAlgo(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params, require_inst_id=True)
+        return await self._call_sdk(
+            lambda: self.trade_api,
+            "place_algo_order",
+            check_data_code=True,
+            instId=str(params["instId"]),
+            tdMode=str(params.get("tdMode") or OKX_CROSS_MARGIN_MODE),
+            side=str(params.get("side") or ""),
+            ordType=str(params.get("ordType") or "oco"),
+            sz=str(params.get("sz") or ""),
+            posSide=str(params.get("posSide") or ""),
+            reduceOnly=_normalize_bool_text(params.get("reduceOnly")),
+            tpTriggerPx=str(params.get("tpTriggerPx") or ""),
+            tpOrdPx=str(params.get("tpOrdPx") or ""),
+            slTriggerPx=str(params.get("slTriggerPx") or ""),
+            slOrdPx=str(params.get("slOrdPx") or ""),
+            tpTriggerPxType=str(params.get("tpTriggerPxType") or "last"),
+            slTriggerPxType=str(params.get("slTriggerPxType") or "last"),
+        )
+
     async def privatePostTradeAmendAlgos(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params, require_inst_id=True)
         return await self._call_sdk(

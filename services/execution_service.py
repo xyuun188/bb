@@ -1456,19 +1456,54 @@ class ExecutionService:
                 model_name,
             )
         except asyncio.CancelledError:
+            preserve_exchange_result = bool(
+                execution_result is not None
+                and (
+                    is_exchange_confirmed_execution(execution_result)
+                    or is_exit_progress_execution(execution_result)
+                )
+            )
             reason = (
                 "OKX 下单流程被外层超时保护取消，系统没有拿到最终订单结果；"
                 "本轮按未执行处理，下一轮会用最新行情重新分析。"
             )
-            logger.error(
-                "decision execution cancelled",
-                model=model_name,
-                symbol=symbol,
-                action=decision.action.value,
-                mode=model_mode,
-            )
-            execution_result = rejected_execution_result(decision, reason)
-            if decision.is_entry or decision.is_exit:
+            if preserve_exchange_result:
+                execution_raw = (
+                    execution_result.raw_response
+                    if isinstance(execution_result.raw_response, dict)
+                    else {}
+                )
+                execution_result.raw_response = {
+                    **execution_raw,
+                    "outer_cancellation_after_exchange_result": {
+                        "preserved": True,
+                        "source": "exchange_result_precedes_outer_cancellation",
+                    },
+                }
+                attach_execution_result_snapshot(
+                    "exchange_confirmed_after_outer_cancellation",
+                    exchange_confirmed=is_exchange_confirmed_execution(execution_result),
+                    exit_progress=is_exit_progress_execution(execution_result),
+                )
+                logger.warning(
+                    "outer cancellation arrived after exchange result; preserving result",
+                    model=model_name,
+                    symbol=symbol,
+                    action=decision.action.value,
+                    mode=model_mode,
+                    exchange_order_id=execution_result.exchange_order_id,
+                    status=execution_result.status.value,
+                )
+            else:
+                logger.error(
+                    "decision execution cancelled",
+                    model=model_name,
+                    symbol=symbol,
+                    action=decision.action.value,
+                    mode=model_mode,
+                )
+                execution_result = rejected_execution_result(decision, reason)
+            if not preserve_exchange_result and (decision.is_entry or decision.is_exit):
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
                     DecisionStageStatus.FAILED,
@@ -1478,18 +1513,19 @@ class ExecutionService:
                         "submitted_to_exchange": bool(submitted_to_exchange),
                     },
                 )
-            await mark_stage(
-                DecisionStage.EXCHANGE_CONFIRM,
-                DecisionStageStatus.FAILED,
-                execution_reason_from_result(execution_result),
-                {"error_type": "cancelled"},
-            )
-            await log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] OKX execution cancelled by outer watchdog",
-                model_name,
-            )
+            if not preserve_exchange_result:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.FAILED,
+                    execution_reason_from_result(execution_result),
+                    {"error_type": "cancelled"},
+                )
+                await log_risk_event(
+                    "warning",
+                    symbol,
+                    f"[{model_name}] OKX execution cancelled by outer watchdog",
+                    model_name,
+                )
         except Exception as e:
             error_text = safe_error_text(e, limit=180)
             logger.error(

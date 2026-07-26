@@ -76,6 +76,7 @@ def _order_row(order: dict[str, Any]) -> dict[str, Any] | None:
         "created_at_ms": order.get("created_at_ms"),
         "updated_at_ms": order.get("updated_at_ms"),
         "linked_order_id": order.get("linked_order_id"),
+        "okx_position_side": str(info.get("posSide") or "net").lower(),
     }
 
 
@@ -116,6 +117,7 @@ def _resize_actions(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     desired = _decimal(position.get("contracts"))
     exchange_step = _decimal(contract_spec.get("lotSz"))
+    exchange_minimum = _decimal(contract_spec.get("minSz"))
     weights = [_decimal(order.get("contracts")) for order in orders]
     total = sum(weights, Decimal(0))
     blockers: list[str] = []
@@ -158,7 +160,29 @@ def _resize_actions(
                     "rollback": _cancel_rollback(order),
                 }
             )
-        elif target != weight:
+        elif target > weight:
+            delta = target - weight
+            if delta < exchange_minimum:
+                return [], ["protection_delta_below_exchange_minimum"]
+            actions.append(
+                {
+                    "action": "create_delta",
+                    "reason": "cover_positive_position_residual_without_increasing_existing_oco",
+                    "inst_id": order["inst_id"],
+                    "position_side": position["side"],
+                    "okx_position_side": order.get("okx_position_side") or "net",
+                    "old_contracts": "0",
+                    "new_contracts": str(delta),
+                    "stop_loss_price": order.get("stop_loss_price"),
+                    "take_profit_price": order.get("take_profit_price"),
+                    "rollback": {
+                        "action": "cancel_created",
+                        "inst_id": order["inst_id"],
+                        "algo_id": None,
+                    },
+                }
+            )
+        elif target < weight:
             actions.append(
                 {
                     "action": "amend_size",
@@ -192,6 +216,21 @@ def _cancel_rollback(order: dict[str, Any]) -> dict[str, Any]:
         "take_profit_price": order.get("take_profit_price"),
         "linked_order_id": order.get("linked_order_id"),
     }
+
+
+def _repair_input_fingerprint(payload: dict[str, Any]) -> str:
+    fingerprint_payload = json.loads(json.dumps(payload, ensure_ascii=True, default=str))
+    for order in fingerprint_payload.get("protection_orders", []):
+        if isinstance(order, dict):
+            order.pop("updated_at_ms", None)
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def audit_protection_order_integrity(
@@ -304,8 +343,6 @@ def audit_protection_order_integrity(
             "utf-8"
         )
     ).hexdigest()
-    payload["input_fingerprint"] = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+    payload["input_fingerprint"] = _repair_input_fingerprint(payload)
     payload["repair_ready"] = not payload["repair_blockers"] and not missing and not invalid_orders
     return payload

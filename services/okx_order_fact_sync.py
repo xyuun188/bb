@@ -271,6 +271,25 @@ class OkxOrderFactSyncService:
         since = self._effective_since(started_at)
         since_naive = _db_naive_since(since)
         local_orders = await self._load_local_orders(since_naive)
+        submit_recovery_orders = [
+            order
+            for order in local_orders
+            if _order_is_rejected_without_exchange_fill(order)
+        ]
+        submit_recovery_decisions = await self._load_decisions_for_orders(
+            submit_recovery_orders
+        )
+        submit_recovery_target_order_ids = list(
+            dict.fromkeys(
+                exchange_order_id
+                for order in submit_recovery_orders
+                for exchange_order_id in _decision_completed_submit_exchange_order_ids(
+                    submit_recovery_decisions.get(
+                        int(getattr(order, "decision_id", 0) or 0)
+                    )
+                )
+            )
+        )
         external_refresh_orders = [
             order for order in local_orders if _order_needs_okx_pull(order)
         ]
@@ -278,11 +297,16 @@ class OkxOrderFactSyncService:
             token
             for order in external_refresh_orders
             for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-        }
+        } | set(submit_recovery_target_order_ids)
         priority_target_order_ids = tuple(
-            _prioritized_exchange_order_ids(
-                external_refresh_orders,
-                limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
+            dict.fromkeys(
+                [
+                    *submit_recovery_target_order_ids,
+                    *_prioritized_exchange_order_ids(
+                        external_refresh_orders,
+                        limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
+                    ),
+                ]
             )
         )[:DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC]
         urgent_target_order_ids = {
@@ -290,10 +314,10 @@ class OkxOrderFactSyncService:
             for order in external_refresh_orders
             if not _order_has_authoritative_stored_okx_fill_fact(order)
             for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-        }
+        } | set(submit_recovery_target_order_ids)
         order_target_inst_ids = {
             inst_id
-            for order in external_refresh_orders
+            for order in [*external_refresh_orders, *submit_recovery_orders]
             if (inst_id := _order_inst_id(order))
         }
         stored_fact_inst_ids = {
@@ -890,6 +914,25 @@ class OkxOrderFactSyncService:
             )
             return _merge_local_order_rows(recent, stored_slippage_refresh)
 
+    async def _load_decisions_for_orders(
+        self,
+        orders: list[Order],
+    ) -> dict[int, AIDecision]:
+        decision_ids = {
+            int(decision_id)
+            for order in orders
+            if (decision_id := getattr(order, "decision_id", None))
+        }
+        if not decision_ids:
+            return {}
+        async with get_session_ctx() as session:
+            rows = await session.execute(
+                select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
+            )
+            return {
+                int(decision.id): decision for decision in rows.scalars().all()
+            }
+
     async def _load_stored_slippage_refresh_orders(
         self,
         session: Any,
@@ -997,15 +1040,9 @@ class OkxOrderFactSyncService:
                 since_naive,
                 authoritative_fill_order_ids=set(fills_by_order_id),
             )
-            priority_orders = [
-                order
-                for order in writable_orders
-                if _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-                & target_order_ids
-            ]
             decision_ids = {
                 int(decision_id)
-                for order in priority_orders
+                for order in writable_orders
                 if (decision_id := getattr(order, "decision_id", None))
             }
             decisions_by_id: dict[int, AIDecision] = {}
@@ -1016,6 +1053,15 @@ class OkxOrderFactSyncService:
                 decisions_by_id = {
                     int(decision.id): decision for decision in decision_rows.scalars().all()
                 }
+            priority_orders = [
+                order
+                for order in writable_orders
+                if _order_exchange_ids_with_completed_submit(
+                    order,
+                    decisions_by_id.get(int(getattr(order, "decision_id", 0) or 0)),
+                )
+                & target_order_ids
+            ]
             (
                 confirmed_count,
                 unverified_count,
@@ -1079,7 +1125,10 @@ class OkxOrderFactSyncService:
                     continue
                 skipped_old_count += 1
                 continue
-            exchange_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+            decision = (decisions_by_id or {}).get(
+                int(getattr(order, "decision_id", 0) or 0)
+            )
+            exchange_ids = _order_exchange_ids_with_completed_submit(order, decision)
             fill = next(
                 (fills_by_order_id[exchange_id] for exchange_id in exchange_ids if exchange_id in fills_by_order_id),
                 None,
@@ -1302,8 +1351,29 @@ class OkxOrderFactSyncService:
                 order_row=order_row,
                 protection_execution=protection_execution_by_order_id.get(fill.order_id),
             )
+            recovered_from_submit_stage = bool(
+                decision is not None
+                and fill.order_id
+                in _decision_completed_submit_exchange_order_ids(decision)
+            )
+            if recovered_from_submit_stage:
+                _apply_completed_submit_fill_recovery_to_decision(
+                    decision,
+                    fill=fill,
+                    contract_size=contract_size,
+                    now=now,
+                )
             confirmed_count += 1
-            samples.append(_sample(order, kind="local_order_confirmed"))
+            samples.append(
+                _sample(
+                    order,
+                    kind=(
+                        "local_order_confirmed_from_completed_submit_stage"
+                        if recovered_from_submit_stage
+                        else "local_order_confirmed"
+                    ),
+                )
+            )
         return (
             confirmed_count,
             unverified_count,
@@ -2187,6 +2257,118 @@ def _order_needs_okx_fact_refresh(order: Order) -> bool:
     }:
         return False
     return refreshable_status
+
+
+def _decision_completed_submit_exchange_order_ids(
+    decision: AIDecision | None,
+) -> set[str]:
+    if decision is None:
+        return set()
+    raw = getattr(decision, "raw_llm_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    state_machine = raw.get("decision_state_machine")
+    state_machine = state_machine if isinstance(state_machine, dict) else {}
+    stages = state_machine.get("stages")
+    stages = stages if isinstance(stages, list) else []
+    result: set[str] = set()
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        data = stage.get("data")
+        data = data if isinstance(data, dict) else {}
+        if (
+            str(stage.get("stage") or "").strip() != "exchange_submit"
+            or str(stage.get("status") or "").strip() != "passed"
+            or data.get("has_execution_result") is not True
+            or str(data.get("status") or "").strip().lower()
+            not in {"filled", "partial", "partially_filled"}
+        ):
+            continue
+        exchange_order_id = str(data.get("exchange_order_id") or "").strip()
+        if exchange_order_id:
+            result.add(exchange_order_id)
+    return result
+
+
+def _order_exchange_ids_with_completed_submit(
+    order: Order,
+    decision: AIDecision | None,
+) -> set[str]:
+    return _split_exchange_order_ids(
+        getattr(order, "exchange_order_id", None)
+    ) | _decision_completed_submit_exchange_order_ids(decision)
+
+
+def _apply_completed_submit_fill_recovery_to_decision(
+    decision: AIDecision,
+    *,
+    fill: OkxNativeFillGroup,
+    contract_size: float,
+    now: datetime,
+) -> None:
+    base_quantity = _fill_base_quantity(fill, contract_size)
+    decision.was_executed = True
+    decision.executed_at = fill.timestamp or now
+    decision.execution_price = fill.avg_price
+    decision.execution_reason = (
+        "OKX 原生成交已确认；系统已从提交成功阶段恢复被外层超时覆盖的执行结果。"
+    )
+    raw = getattr(decision, "raw_llm_response", None)
+    raw = dict(raw) if isinstance(raw, dict) else {}
+    previous_execution_result = raw.get("execution_result")
+    recovery = {
+        "version": "2026-07-26.completed-submit-fill-recovery.v1",
+        "source_authority": "decision_submit_stage_plus_okx_native_fills",
+        "exchange_order_id": fill.order_id,
+        "contracts": fill.contracts,
+        "contract_size": contract_size,
+        "base_quantity": base_quantity,
+        "average_price": fill.avg_price,
+        "fee_usdt": fill.fee_abs,
+        "fill_pnl": fill.fill_pnl,
+        "recovered_at": now.isoformat(),
+        "superseded_execution_result": (
+            dict(previous_execution_result)
+            if isinstance(previous_execution_result, dict)
+            else previous_execution_result
+        ),
+    }
+    raw["completed_submit_fill_recovery"] = recovery
+    raw["execution_result"] = {
+        "source": "okx_native_fill_recovered_after_outer_cancellation",
+        "order_id": fill.order_id,
+        "exchange_order_id": fill.order_id,
+        "status": "filled",
+        "quantity": base_quantity,
+        "price": fill.avg_price,
+        "fee": fill.fee_abs,
+        "pnl": fill.fill_pnl,
+        "exchange_confirmed": True,
+        "exit_progress": True,
+        "okx_exit_position_mismatch_summary": None,
+        "raw_response": {
+            "recovered_from_completed_submit_stage": True,
+            "trade_ids": list(fill.trade_ids),
+        },
+    }
+    recommendation = raw.get("trade_recommendation_contract")
+    if isinstance(recommendation, dict):
+        recommendation = dict(recommendation)
+        recommendation["execution"] = {
+            "status": "filled",
+            "source": "okx_native_fill_recovered_after_outer_cancellation",
+            "exchange_confirmed": True,
+            "exit_progress": True,
+            "order_id": fill.order_id,
+            "exchange_order_id": fill.order_id,
+            "filled_quantity": base_quantity,
+            "filled_price": fill.avg_price,
+            "fee_usdt": fill.fee_abs,
+            "realized_pnl_usdt": fill.fill_pnl,
+            "recorded_at": now.isoformat(),
+        }
+        raw["trade_recommendation_contract"] = recommendation
+    decision.raw_llm_response = raw
 
 
 def _order_needs_local_stored_fact_recovery(order: Order) -> bool:

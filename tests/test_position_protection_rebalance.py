@@ -23,6 +23,7 @@ class _Executor:
         self.protection_contracts = list(protection_contracts)
         self.fail_algo_id = fail_algo_id
         self.amend_calls: list[dict[str, Any]] = []
+        self.create_calls: list[dict[str, Any]] = []
 
     async def get_positions_strict(self, _symbol: str | None) -> list[dict[str, Any]]:
         if not self.position_contracts:
@@ -92,6 +93,30 @@ class _Executor:
         self.protection_contracts.pop(index)
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
+    async def create_position_protection_order(
+        self,
+        *,
+        inst_id: str,
+        position_side: str,
+        okx_position_side: str,
+        contracts: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+    ) -> dict[str, Any]:
+        self.create_calls.append(
+            {
+                "inst_id": inst_id,
+                "position_side": position_side,
+                "okx_position_side": okx_position_side,
+                "contracts": contracts,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
+            }
+        )
+        self.protection_contracts.append(str(contracts).removesuffix(".0"))
+        algo_id = f"algo-{len(self.protection_contracts)}"
+        return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
+
 
 def _decision() -> DecisionOutput:
     return DecisionOutput(
@@ -115,6 +140,27 @@ async def test_partial_exit_resizes_split_oco_to_exact_exchange_position() -> No
     assert executor.protection_contracts == ["2", "3"]
     assert sum(float(value) for value in executor.protection_contracts) == 5.0
     assert result["after"]["coverage_mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_position_increase_adds_delta_oco_without_replacing_existing_order() -> None:
+    executor = _Executor(position_contracts="10", protection_contracts=("1",))
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert executor.protection_contracts == ["1", "9"]
+    assert executor.amend_calls == []
+    assert executor.create_calls == [
+        {
+            "inst_id": "IRYS-USDT-SWAP",
+            "position_side": "short",
+            "okx_position_side": "net",
+            "contracts": 9.0,
+            "stop_loss_price": 0.16,
+            "take_profit_price": 0.14,
+        }
+    ]
 
 
 @pytest.mark.asyncio

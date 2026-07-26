@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
+from models.decision import AIDecision
 from models.trade import Order
 from services import okx_order_fact_sync as order_fact_sync_module
 from services.okx_execution_slippage import (
@@ -628,6 +629,107 @@ async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
         assert report["confirmed_count"] == 1
         assert order.okx_sync_status == OKX_SYNC_CONFIRMED
         assert order.okx_raw_fills["fills_history_confirmed"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "completed-submit-fill-recovery.db")
+    now = datetime.now(UTC)
+    ccxt = _SlowAccountFastTargetCcxt(
+        fills=[_fill_row(now, order_id="okx-timeout-fill")],
+        orders=[_order_row(now, order_id="okx-timeout-fill")],
+    )
+    try:
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="BTC/USDT",
+                action="long",
+                confidence=0.5,
+                reasoning="test",
+                is_paper=True,
+                was_executed=False,
+                execution_reason="outer timeout",
+                raw_llm_response={
+                    "decision_state_machine": {
+                        "stages": [
+                            {
+                                "stage": "exchange_submit",
+                                "status": "passed",
+                                "data": {
+                                    "has_execution_result": True,
+                                    "status": "filled",
+                                    "exchange_order_id": "okx-timeout-fill",
+                                },
+                            },
+                            {
+                                "stage": "exchange_submit",
+                                "status": "failed",
+                                "data": {"error_type": "cancelled"},
+                            },
+                        ]
+                    },
+                    "execution_result": {
+                        "source": "exchange_not_confirmed",
+                        "status": "rejected",
+                        "exchange_order_id": None,
+                    },
+                },
+            )
+            session.add(decision)
+            await session.flush()
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=0.0,
+                    price=0.0,
+                    status="rejected",
+                    decision_id=decision.id,
+                    exchange_order_id=None,
+                    created_at=now,
+                    filled_at=now,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=0.8,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+            recovered_decision = (
+                await session.execute(
+                    select(AIDecision).where(AIDecision.id == order.decision_id)
+                )
+            ).scalar_one()
+        assert ccxt.calls[0] == "fills_targeted"
+        assert "fills_account" not in ccxt.calls
+        assert report["confirmed_count"] == 1
+        assert report["samples"][0]["kind"] == (
+            "local_order_confirmed_from_completed_submit_stage"
+        )
+        assert order.status == "filled"
+        assert order.exchange_order_id == "okx-timeout-fill"
+        assert order.quantity == pytest.approx(0.02)
+        assert order.okx_sync_status == OKX_SYNC_CONFIRMED
+        assert recovered_decision.was_executed is True
+        assert recovered_decision.raw_llm_response["execution_result"][
+            "exchange_confirmed"
+        ] is True
+        assert recovered_decision.raw_llm_response["completed_submit_fill_recovery"][
+            "exchange_order_id"
+        ] == "okx-timeout-fill"
     finally:
         await close_db()
 

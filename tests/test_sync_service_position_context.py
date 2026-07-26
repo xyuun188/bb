@@ -440,19 +440,26 @@ async def test_confirmed_local_close_order_is_reused_before_remote_fill_lookup()
     )
 
     class ScalarRows:
-        @staticmethod
-        def all():
-            return [order]
+        def __init__(self, rows):
+            self.rows = rows
+
+        def all(self):
+            return self.rows
 
     class Result:
-        @staticmethod
-        def scalars():
-            return ScalarRows()
+        def __init__(self, rows):
+            self.rows = rows
+
+        def scalars(self):
+            return ScalarRows(self.rows)
 
     class Session:
-        @staticmethod
-        async def execute(_statement):
-            return Result()
+        calls = 0
+
+        @classmethod
+        async def execute(cls, _statement):
+            cls.calls += 1
+            return Result([order] if cls.calls == 1 else [])
 
     fill = await _confirmed_local_close_fill_for_position(
         Session(),
@@ -468,3 +475,60 @@ async def test_confirmed_local_close_order_is_reused_before_remote_fill_lookup()
     assert fill["source"] == "local_okx_confirmed_close_order"
     assert fill["order_id"] == "kaito-close-1"
     assert fill["quantity"] == pytest.approx(109.0)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_local_close_order_is_not_reused_after_another_position_consumed_it(
+) -> None:
+    filled_at = datetime.now(UTC)
+    order = SimpleNamespace(
+        quantity=1_000_000.0,
+        price=0.000002748,
+        fee=0.001374,
+        exchange_order_id="pepe-partial-close",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_fill_contracts=0.1,
+        okx_fill_pnl=-0.003,
+        okx_raw_fills={},
+    )
+    consumed_position = SimpleNamespace(
+        id=41,
+        close_exchange_order_id="pepe-partial-close",
+    )
+
+    class ScalarRows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def all(self):
+            return self.rows
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def scalars(self):
+            return ScalarRows(self.rows)
+
+    class Session:
+        calls = 0
+
+        @classmethod
+        async def execute(cls, _statement):
+            cls.calls += 1
+            return Result([order] if cls.calls == 1 else [consumed_position])
+
+    fill = await _confirmed_local_close_fill_for_position(
+        Session(),
+        SimpleNamespace(
+            id=42,
+            symbol="PEPE/USDT",
+            side="long",
+            execution_mode="paper",
+            quantity=1_000_000.0,
+            created_at=filled_at - timedelta(hours=5),
+        ),
+    )
+
+    assert fill == {}
