@@ -59,7 +59,11 @@ def test_execution_account_ui_uses_okx_equity_pnl_not_local_trade_fallback() -> 
     assert "account.cumulative_total_pnl ?? account.total_pnl" not in script
     assert "const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);" in script
     assert "今日OKX权益变化" in script
-    assert "三期OKX权益变化" in script
+    assert "phase3EquityLabel" in script
+    assert "phase3_equity_series_complete" in script
+    assert "phase3_equity_observed_start_date" in script
+    assert "entry_filled_order_count" in script
+    assert "pending_settlement_close_count" in script
 
 
 def test_dashboard_refreshes_auth_status_in_topbar() -> None:
@@ -153,7 +157,7 @@ def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
     assert "okx_authoritative_sync" in script
     assert "OKX权威事实同步正常" in script
     assert "OKX权威事实同步异常" in script
-    assert "Missing real OKX equity snapshot" in script
+    assert "dailyPnlMissingSnapshotNotice" in script
 
 
 def test_live_mode_switch_requires_known_missing_okx_config() -> None:
@@ -494,7 +498,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260725-authoritative-reflection-status" in html
+    assert "dashboard.js?v=20260726-daily-pnl-facts" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -634,7 +638,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260725-authoritative-reflection-status" in html
+    assert "dashboard.js?v=20260726-daily-pnl-facts" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -791,7 +795,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260725-authoritative-reflection-status" in html
+    assert "dashboard.js?v=20260726-daily-pnl-facts" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1017,7 +1021,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260725-authoritative-reflection-status" in html
+    assert "/static/js/dashboard.js?v=20260726-daily-pnl-facts" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:

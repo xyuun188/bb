@@ -233,5 +233,50 @@ async def test_phase3_equity_change_uses_first_okx_snapshot_not_fixed_balance(
         assert result["phase3_equity_baseline"] == pytest.approx(4998.15)
         assert result["phase3_equity_pnl"] == pytest.approx(1.0)
         assert result["phase3_equity_start_date"] == "2026-06-28"
+        assert result["phase3_equity_observed_start_date"] == "2026-06-28"
+        assert result["phase3_equity_series_complete"] is True
+        assert result["phase3_equity_scope"] == "phase3"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_phase3_equity_change_discloses_late_first_okx_snapshot(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'phase3-equity-late-start.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                ExecutionEquitySnapshot(
+                    mode="paper",
+                    model_name="ensemble_trader",
+                    snapshot_date="2026-07-24",
+                    snapshot_at=datetime(2026, 7, 24, 0, 15, tzinfo=UTC),
+                    equity=4388.0,
+                    source="okx_snapshot",
+                )
+            )
+
+        async with get_session_ctx() as session:
+            result = await phase3_equity_change_from_snapshots(
+                session,
+                mode="paper",
+                model_name="ensemble_trader",
+                current_equity=4380.0,
+            )
+
+        assert result["phase3_equity_pnl"] == pytest.approx(-8.0)
+        assert result["phase3_equity_start_date"] == "2026-06-28"
+        assert result["phase3_equity_observed_start_date"] == "2026-07-24"
+        assert result["phase3_equity_series_complete"] is False
+        assert result["phase3_equity_scope"] == "first_observed_okx_snapshot"
     finally:
         await close_db()

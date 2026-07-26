@@ -77,6 +77,8 @@ async def phase3_equity_change_from_snapshots(
 
     selected_mode = "live" if mode == "live" else "paper"
     row = await _select_first_phase3_okx_snapshot(session, selected_mode, model_name)
+    observed_start_date = str(getattr(row, "snapshot_date", "") or "") or None
+    series_complete = observed_start_date == PHASE3_FIRST_CLEAN_DAY
     baseline_equity = _safe_float(getattr(row, "equity", None), None) if row else None
     okx_equity = _safe_float(current_equity, None)
     if baseline_equity is None or baseline_equity <= 0 or okx_equity is None or okx_equity <= 0:
@@ -87,6 +89,11 @@ async def phase3_equity_change_from_snapshots(
             "phase3_equity_baseline_at": _snapshot_at_iso(row) if row else None,
             "phase3_equity_baseline_source": "okx_snapshot" if row else "okx_unavailable",
             "phase3_equity_start_date": PHASE3_FIRST_CLEAN_DAY,
+            "phase3_equity_observed_start_date": observed_start_date,
+            "phase3_equity_series_complete": series_complete,
+            "phase3_equity_scope": (
+                "phase3" if series_complete else "first_observed_okx_snapshot"
+            ),
         }
     pnl = okx_equity - baseline_equity
     return {
@@ -96,6 +103,11 @@ async def phase3_equity_change_from_snapshots(
         "phase3_equity_baseline_at": _snapshot_at_iso(row),
         "phase3_equity_baseline_source": "okx_snapshot",
         "phase3_equity_start_date": PHASE3_FIRST_CLEAN_DAY,
+        "phase3_equity_observed_start_date": observed_start_date,
+        "phase3_equity_series_complete": series_complete,
+        "phase3_equity_scope": (
+            "phase3" if series_complete else "first_observed_okx_snapshot"
+        ),
     }
 
 

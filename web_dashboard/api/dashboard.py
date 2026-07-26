@@ -80,6 +80,7 @@ from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 BEIJING_TZ = timezone(timedelta(hours=8))
+_NATIVE_DATETIME_TYPE = datetime
 OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
 EXECUTION_LEDGER_MODEL_NAMES = (ENSEMBLE_TRADER_NAME, OKX_AUTHORITATIVE_LEDGER_MODEL)
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
@@ -418,7 +419,7 @@ def _as_utc_datetime(value: Any) -> datetime | None:
             value = datetime.fromisoformat(text.replace("Z", "+00:00"))
         except ValueError:
             return None
-    if not isinstance(value, datetime):
+    if not isinstance(value, _NATIVE_DATETIME_TYPE):
         return None
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -1744,6 +1745,13 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         "phase3_equity_baseline_at": phase3_equity.get("phase3_equity_baseline_at"),
         "phase3_equity_baseline_source": phase3_equity.get("phase3_equity_baseline_source"),
         "phase3_equity_start_date": phase3_equity.get("phase3_equity_start_date"),
+        "phase3_equity_observed_start_date": phase3_equity.get(
+            "phase3_equity_observed_start_date"
+        ),
+        "phase3_equity_series_complete": bool(
+            phase3_equity.get("phase3_equity_series_complete")
+        ),
+        "phase3_equity_scope": phase3_equity.get("phase3_equity_scope"),
         "today_total_pnl": today_total_pnl,
         "today_risk_pnl": today_risk_pnl,
         "unrealized_pnl": unrealized_pnl,
@@ -1925,6 +1933,13 @@ def _build_execution_account_status(
         "phase3_equity_baseline_source": pnl_summary.get("phase3_equity_baseline_source"),
         "phase3_equity_start_date": pnl_summary.get("phase3_equity_start_date")
         or PHASE3_FIRST_CLEAN_DAY,
+        "phase3_equity_observed_start_date": pnl_summary.get(
+            "phase3_equity_observed_start_date"
+        ),
+        "phase3_equity_series_complete": bool(
+            pnl_summary.get("phase3_equity_series_complete")
+        ),
+        "phase3_equity_scope": pnl_summary.get("phase3_equity_scope"),
         "today_total_pnl": okx_pnl["today_total_pnl"],
         "today_risk_pnl": _safe_float(pnl_summary.get("today_risk_pnl"), None),
         "cumulative_profit": _safe_float(pnl_summary.get("realized_profit"), 0.0),
@@ -8131,7 +8146,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
 
     from db.repositories.trade_repo import TradeRepository
     from db.session import get_session_ctx
-    from models.trade import Order
+    from models.trade import Order, Position
 
     selected_mode = "live" if mode == "live" else "paper"
     days = min(max(int(days or 30), 1), 180)
@@ -8162,6 +8177,11 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             "rejected_order_count": 0,
             "order_buy_count": 0,
             "order_sell_count": 0,
+            "entry_filled_order_count": 0,
+            "close_filled_order_count": 0,
+            "ambiguous_position_order_count": 0,
+            "settled_close_count": 0,
+            "pending_settlement_close_count": 0,
             "order_details": [],
             "cumulative_realized_pnl": 0.0,
             "cumulative_total_pnl": 0.0,
@@ -8216,13 +8236,24 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         )
         order_rows = list(order_result.scalars().all())
 
+        position_link_result = await session.execute(
+            select(
+                Position.entry_exchange_order_id,
+                Position.close_exchange_order_id,
+            ).where(
+                Position.execution_mode == selected_mode,
+                Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                Position.created_at >= PHASE3_CLEAN_START_UTC.replace(tzinfo=None),
+            )
+        )
+        position_link_rows = list(position_link_result.all())
+
         snapshot_result = await session.execute(
             select(ExecutionEquitySnapshot)
             .where(
                 ExecutionEquitySnapshot.model_name == ENSEMBLE_TRADER_NAME,
                 ExecutionEquitySnapshot.mode == selected_mode,
                 ExecutionEquitySnapshot.source == "okx_snapshot",
-                ExecutionEquitySnapshot.snapshot_date >= start_day.isoformat(),
                 ExecutionEquitySnapshot.snapshot_date >= PHASE3_FIRST_CLEAN_DAY,
             )
             .order_by(
@@ -8232,6 +8263,17 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             )
         )
         equity_snapshots = list(snapshot_result.scalars().all())
+
+    entry_exchange_order_ids = {
+        token
+        for entry_order_ids, _close_order_ids in position_link_rows
+        for token in _dashboard_split_exchange_order_ids(entry_order_ids)
+    }
+    close_exchange_order_ids = {
+        token
+        for _entry_order_ids, close_order_ids in position_link_rows
+        for token in _dashboard_split_exchange_order_ids(close_order_ids)
+    }
 
     for order in order_rows:
         order_time = _as_utc_datetime(getattr(order, "filled_at", None)) or _as_utc_datetime(
@@ -8256,21 +8298,43 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             row["order_buy_count"] += 1
         elif side == "sell":
             row["order_sell_count"] += 1
-        row["order_details"].append(_daily_pnl_order_detail(order, order_time=order_time))
+        position_roles: list[str] = []
+        if status == "filled":
+            exchange_order_ids = _dashboard_split_exchange_order_ids(
+                getattr(order, "exchange_order_id", None)
+            )
+            is_entry = bool(exchange_order_ids & entry_exchange_order_ids)
+            is_close = bool(exchange_order_ids & close_exchange_order_ids)
+            if is_entry and is_close:
+                row["ambiguous_position_order_count"] += 1
+                position_roles.append("ambiguous")
+            else:
+                if is_entry:
+                    row["entry_filled_order_count"] += 1
+                    position_roles.append("entry")
+                if is_close:
+                    row["close_filled_order_count"] += 1
+                    position_roles.append("close")
+        detail = _daily_pnl_order_detail(order, order_time=order_time)
+        detail["position_roles"] = position_roles
+        row["order_details"].append(detail)
 
-    equity_by_date: dict[str, dict[str, Any]] = {}
+    all_equity_by_date: dict[str, dict[str, Any]] = {}
     for snapshot in equity_snapshots:
         day = str(snapshot.snapshot_date or "")
-        if not day or day not in records or day in equity_by_date:
+        if not day or day in all_equity_by_date:
             continue
         equity = _safe_float(snapshot.equity, None)
         if equity is None or equity <= 0:
             continue
-        equity_by_date[day] = {
+        all_equity_by_date[day] = {
             "equity": equity,
             "snapshot_at": snapshot.snapshot_at.isoformat() if snapshot.snapshot_at else None,
             "source": snapshot.source or "okx_snapshot",
         }
+    equity_by_date = {
+        day: value for day, value in all_equity_by_date.items() if day in records
+    }
 
     for ledger_row in closed_ledger_rows:
         if not _daily_pnl_ledger_row_has_okx_realized_pnl(ledger_row):
@@ -8351,9 +8415,11 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         )
 
     cumulative = cumulative_before
-    sorted_equity_dates = sorted(equity_by_date)
+    sorted_equity_dates = sorted(all_equity_by_date)
+    equity_series_start_date = sorted_equity_dates[0] if sorted_equity_dates else None
+    equity_series_complete = equity_series_start_date == PHASE3_FIRST_CLEAN_DAY
     first_okx_equity = (
-        float(equity_by_date[sorted_equity_dates[0]]["equity"])
+        float(all_equity_by_date[sorted_equity_dates[0]]["equity"])
         if sorted_equity_dates
         else None
     )
@@ -8365,8 +8431,8 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         next_day_value = datetime.fromisoformat(next_day_key).date()
         if next_day_value != day_value + timedelta(days=1):
             continue
-        opening_equity = float(equity_by_date[day_key]["equity"])
-        next_opening_equity = float(equity_by_date[next_day_key]["equity"])
+        opening_equity = float(all_equity_by_date[day_key]["equity"])
+        next_opening_equity = float(all_equity_by_date[next_day_key]["equity"])
         completed_equity_days[day_key] = {
             "pnl": next_opening_equity - opening_equity,
             "cumulative_pnl": (
@@ -8459,6 +8525,16 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             row["total_pnl"] = row["okx_equity_pnl"]
             row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
         row["cumulative_realized_pnl"] = round(cumulative, 8)
+        row["settled_close_count"] = int(row["trade_count"] or 0)
+        row["pending_settlement_close_count"] = max(
+            int(row["close_filled_order_count"] or 0) - int(row["settled_close_count"] or 0),
+            0,
+        )
+        row["okx_equity_series_start_date"] = equity_series_start_date
+        row["okx_equity_series_complete"] = equity_series_complete
+        row["okx_cumulative_equity_scope"] = (
+            "phase3" if equity_series_complete else "first_observed_okx_snapshot"
+        )
         row["symbols"] = sorted(row["symbols"])
         row["position_details"] = sorted(
             row["position_details"],
@@ -8488,6 +8564,11 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         "mode": selected_mode,
         "timezone": "Asia/Shanghai",
         "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
+        "okx_equity_series_start_date": equity_series_start_date,
+        "okx_equity_series_complete": equity_series_complete,
+        "okx_cumulative_equity_scope": (
+            "phase3" if equity_series_complete else "first_observed_okx_snapshot"
+        ),
         "pnl_source": "okx_equity_snapshots_and_okx_position_ledger",
         "start_date": start_day.isoformat(),
         "end_date": today_local.isoformat(),

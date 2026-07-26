@@ -482,9 +482,21 @@ async function fetchDailyPnlRecords() {
         return;
     }
     state.dailyPnlRecords = data.records;
+    state.dailyPnlMeta = data;
     const subtitle = document.getElementById('daily-pnl-subtitle');
     if (subtitle) {
-        subtitle.textContent = `${mode === 'live' ? '实盘' : '模拟盘'} · 北京时间 ${data.start_date || ''} 至 ${data.end_date || ''}`;
+        const equityStart = data.okx_equity_series_start_date || '';
+        const equityScope = data.okx_equity_series_complete
+            ? '\u4e09\u671f\u5b8c\u6574 OKX \u6743\u76ca\u5feb\u7167'
+            : (equityStart ? `OKX \u6743\u76ca\u5feb\u7167\u81ea ${equityStart} \u5f00\u59cb` : 'OKX \u6743\u76ca\u5feb\u7167\u672a\u7559\u5b58');
+        subtitle.textContent = `${mode === 'live' ? '实盘' : '模拟盘'} · 北京时间 ${data.start_date || ''} 至 ${data.end_date || ''} · ${equityScope}`;
+    }
+    const headers = document.querySelectorAll('#page-daily-pnl thead th');
+    if (headers.length >= 6) {
+        headers[3].textContent = '\u6743\u5a01\u5df2\u7ed3\u7b97\u51c0\u76c8\u4e8f';
+        headers[5].textContent = data.okx_equity_series_complete
+            ? '\u4e09\u671f\u7d2f\u8ba1\u6743\u76ca\u53d8\u5316'
+            : `\u81ea ${data.okx_equity_series_start_date || '--'} \u6743\u76ca\u53d8\u5316`;
     }
     renderDailyPnlRecords(data.records);
 }
@@ -744,7 +756,11 @@ function dailyPnlOkxSnapshotMissing(row) {
 
 function dailyPnlEquityDisplay(row, field) {
     if (dailyPnlOkxSnapshotMissing(row)) {
-        return '<span style="color:var(--text-muted);">Missing OKX snapshot</span>';
+        const startDate = row?.okx_equity_series_start_date;
+        const message = startDate && String(row?.date || '') < String(startDate)
+            ? `\u672a\u7559\u5b58 ${startDate} \u4e4b\u524d\u7684\u771f\u5b9e OKX \u6743\u76ca\u5feb\u7167`
+            : '\u5f53\u65e5\u771f\u5b9e OKX \u6743\u76ca\u5feb\u7167\u7f3a\u5931';
+        return `<span style="color:var(--text-muted);">${escHtml(message)}</span>`;
     }
     const value = valueNumber(row?.[field]);
     return `<span style="color:${signedMoneyColor(value)};">${signedMoneyWithUnit(value)}</span>`;
@@ -754,8 +770,7 @@ function dailyPnlMissingSnapshotNotice(row) {
     if (!dailyPnlOkxSnapshotMissing(row)) return '';
     return `
         <div class="info-banner" style="margin:8px 0;">
-            Missing real OKX equity snapshot for this day. The system will not infer account PnL from fixed 4000/5000 balances,
-            local trade PnL, or OKX bill balance changes. Closed-trade details below are OKX-confirmed facts only.
+            \u5f53\u65e5\u6ca1\u6709\u7559\u5b58\u771f\u5b9e OKX \u6743\u76ca\u5feb\u7167\u3002\u7cfb\u7edf\u4e0d\u4f7f\u7528\u56fa\u5b9a\u4f59\u989d\u3001\u672c\u5730\u4ea4\u6613\u76c8\u4e8f\u6216 OKX \u8d26\u5355\u53d8\u52a8\u5012\u63a8\u5386\u53f2\u8d26\u6237\u6743\u76ca\u3002\u4e0b\u65b9\u5f00\u5e73\u4ed3\u6d3b\u52a8\u53ea\u5c55\u793a OKX \u6210\u4ea4\u4e8b\u5b9e\uff0c\u76c8\u4e8f\u4ecd\u53ea\u7edf\u8ba1\u6743\u5a01\u5df2\u7ed3\u7b97\u8bb0\u5f55\u3002
         </div>
     `;
 }
@@ -787,6 +802,12 @@ function updateExecutionAccountPanel(account) {
     const modeLabel = account.mode === 'live' ? '实盘' : '模拟盘';
     const unrealizedPnl = valueNumber(account.unrealized_pnl) || 0;
     const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);
+    const phase3ObservedStart = account.phase3_equity_observed_start_date || '';
+    const phase3EquityLabel = account.phase3_equity_series_complete
+        ? '\u4e09\u671fOKX\u6743\u76ca\u53d8\u5316'
+        : (phase3ObservedStart
+            ? `\u81ea ${phase3ObservedStart} \u9996\u4e2aOKX\u5feb\u7167\u6743\u76ca\u53d8\u5316`
+            : '\u4e09\u671fOKX\u6743\u76ca\u53d8\u5316\u4e0d\u53ef\u7528');
     const todayTotalPnl = valueNumber(account.today_equity_pnl);
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
@@ -814,7 +835,7 @@ function updateExecutionAccountPanel(account) {
                 <div class="exec-status-cell"><span>持仓保证金占用</span><strong>${accountMoneyText(positionMarginUsed, account)} USDT</strong></div>
                 <div class="exec-status-cell"><span>浮动盈亏</span><strong style="color:${unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(unrealizedPnl)} USDT</strong></div>
                 <div class="exec-status-cell"><span>今日OKX权益变化</span><strong style="color:${signedMoneyColor(todayTotalPnl)};">${signedMoneyWithUnit(todayTotalPnl)}</strong></div>
-                <div class="exec-status-cell"><span>三期OKX权益变化</span><strong style="color:${signedMoneyColor(phase3TotalPnl)};">${signedMoneyWithUnit(phase3TotalPnl)}</strong></div>
+                <div class="exec-status-cell"><span>${phase3EquityLabel}</span><strong style="color:${signedMoneyColor(phase3TotalPnl)};">${signedMoneyWithUnit(phase3TotalPnl)}</strong></div>
             </div>
             ${account.balance_error ? `<div class="exec-risk-note paused">${escHtml(account.balance_error)}</div>` : pauseNote}
         </div>
@@ -8670,7 +8691,10 @@ function renderDailyPnlRecords(records) {
             : (Array.isArray(row.position_details) ? row.position_details.length : 0);
         const orderCount = Number(row.filled_order_count ?? row.order_count ?? row.trade_count ?? 0);
         const closedCount = Number(row.closed_trade_count ?? row.trade_count ?? 0);
-        const orderWinLoss = `${closedCount}\u5e73 ${Number(row.win_count || 0)}\u80dc/${Number(row.loss_count || 0)}\u4e8f`;
+        const entryCount = Number(row.entry_filled_order_count || 0);
+        const closeCount = Number(row.close_filled_order_count || 0);
+        const pendingSettlementCount = Number(row.pending_settlement_close_count || 0);
+        const orderWinLoss = `${entryCount}\u5f00/${closeCount}\u5e73 \u00b7 ${closedCount}\u5df2\u7ed3\u7b97${pendingSettlementCount ? `/${pendingSettlementCount}\u5f85\u7ed3\u7b97` : ''}`;
         return `
         <tr>
             <td style="font-weight:700;white-space:nowrap;">${escHtml(row.date || '-')}</td>
@@ -8702,6 +8726,9 @@ function openDailyPnlModal(date) {
     const orderDetails = Array.isArray(row.order_details) ? row.order_details : [];
     const orderCount = Number(row.filled_order_count ?? row.order_count ?? row.trade_count ?? 0);
     const closedCount = Number(row.closed_trade_count ?? row.trade_count ?? 0);
+    const entryCount = Number(row.entry_filled_order_count || 0);
+    const closeCount = Number(row.close_filled_order_count || 0);
+    const pendingSettlementCount = Number(row.pending_settlement_close_count || 0);
     const total = valueNumber(row.okx_equity_pnl ?? row.total_pnl);
     const totalColor = signedMoneyColor(total);
     const snapshotNotice = dailyPnlMissingSnapshotNotice(row);
@@ -8713,7 +8740,9 @@ function openDailyPnlModal(date) {
                 <div>\u5df2\u5e73\u4ed3\u51c0\u76c8\u4e8f <strong style="color:${Number(row.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(row.realized_pnl || 0)} USDT</strong></div>
                 <div>OKX\u6743\u76ca\u53d8\u5316 <strong style="color:${totalColor};">${signedMoneyWithUnit(total)}</strong></div>
                 <div>\u6210\u4ea4\u8ba2\u5355 <strong>${orderCount}</strong></div>
-                <div>\u5df2\u5e73\u4ed3 <strong>${closedCount}</strong></div>
+                <div>\u5f00\u4ed3\u6210\u4ea4 <strong>${entryCount}</strong></div>
+                <div>\u5e73\u4ed3\u6210\u4ea4 <strong>${closeCount}</strong></div>
+                <div>\u6743\u5a01\u5df2\u7ed3\u7b97 <strong>${closedCount}</strong>${pendingSettlementCount ? ` \u00b7 \u5f85\u7ed3\u7b97 ${pendingSettlementCount}` : ''}</div>
             </div>
             ${snapshotNotice}
             ${renderDailyPnlOrderDetails(orderDetails)}

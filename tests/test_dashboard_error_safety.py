@@ -1589,6 +1589,156 @@ async def test_daily_pnl_assigns_midnight_equity_change_to_completed_beijing_day
 
 
 @pytest.mark.asyncio
+async def test_daily_pnl_cumulative_equity_keeps_first_real_snapshot_outside_view(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-daily-stable-equity-start.db').as_posix()}",
+    )
+    await init_db()
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 30, 12, 0, tzinfo=tz or UTC)
+
+    async def okx_snapshot(_mode: str):
+        return {"equity": 122.0, "total": 122.0, "free": 100.0}
+
+    monkeypatch.setattr(dashboard, "datetime", FrozenDatetime)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_open_position_symbols",
+        lambda _mode: _async_value(set()),
+    )
+    monkeypatch.setattr(dashboard, "_get_dashboard_okx_account_snapshot", okx_snapshot)
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    ExecutionEquitySnapshot(
+                        mode="paper",
+                        model_name="ensemble_trader",
+                        snapshot_date=day,
+                        snapshot_at=at,
+                        equity=equity,
+                        source="okx_snapshot",
+                    )
+                    for day, at, equity in (
+                        ("2026-07-24", datetime(2026, 7, 23, 16, 15, tzinfo=UTC), 100.0),
+                        ("2026-07-28", datetime(2026, 7, 27, 16, 0, tzinfo=UTC), 110.0),
+                        ("2026-07-29", datetime(2026, 7, 28, 16, 0, tzinfo=UTC), 115.0),
+                        ("2026-07-30", datetime(2026, 7, 29, 16, 0, tzinfo=UTC), 120.0),
+                    )
+                ]
+            )
+        payload = await dashboard.get_daily_pnl_records(mode="paper", days=3)
+    finally:
+        await close_db()
+
+    rows = {row["date"]: row for row in payload["records"]}
+    assert payload["start_date"] == "2026-07-28"
+    assert payload["okx_equity_series_start_date"] == "2026-07-24"
+    assert payload["okx_equity_series_complete"] is False
+    assert rows["2026-07-28"]["okx_cumulative_equity_pnl"] == pytest.approx(15.0)
+    assert rows["2026-07-30"]["okx_cumulative_equity_pnl"] == pytest.approx(22.0)
+
+
+@pytest.mark.asyncio
+async def test_daily_pnl_shows_linked_entry_and_close_activity_before_settlement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-daily-position-activity.db').as_posix()}",
+    )
+    await init_db()
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 26, 12, 0, tzinfo=tz or UTC)
+
+    async def okx_snapshot(_mode: str):
+        return {}
+
+    monkeypatch.setattr(dashboard, "datetime", FrozenDatetime)
+    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_open_position_symbols",
+        lambda _mode: _async_value(set()),
+    )
+    monkeypatch.setattr(dashboard, "_get_dashboard_okx_account_snapshot", okx_snapshot)
+    opened_at = datetime(2026, 7, 26, 1, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 26, 2, 0, tzinfo=UTC)
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Position(
+                        model_name=ENSEMBLE_TRADER_NAME,
+                        execution_mode="paper",
+                        symbol="DOT/USDT",
+                        side="long",
+                        quantity=1.0,
+                        entry_price=0.82,
+                        current_price=0.83,
+                        realized_pnl=0.0,
+                        settlement_status="settlement_quarantined",
+                        is_open=False,
+                        entry_exchange_order_id="dot-entry",
+                        close_exchange_order_id="dot-close",
+                        created_at=opened_at,
+                        closed_at=closed_at,
+                    ),
+                    _confirmed_okx_order(
+                        symbol="DOT/USDT",
+                        exchange_order_id="dot-entry",
+                        side="buy",
+                        quantity=1.0,
+                        price=0.82,
+                        filled_at=opened_at,
+                    ),
+                    _confirmed_okx_order(
+                        symbol="DOT/USDT",
+                        exchange_order_id="dot-close",
+                        side="sell",
+                        quantity=1.0,
+                        price=0.83,
+                        filled_at=closed_at,
+                        pnl=0.01,
+                    ),
+                ]
+            )
+        payload = await dashboard.get_daily_pnl_records(mode="paper", days=1)
+    finally:
+        await close_db()
+
+    day = payload["records"][0]
+    assert day["filled_order_count"] == 2, day
+    assert day["entry_filled_order_count"] == 1
+    assert day["close_filled_order_count"] == 1
+    assert day["trade_count"] == 0
+    assert day["settled_close_count"] == 0
+    assert day["pending_settlement_close_count"] == 1
+    assert {tuple(item["position_roles"]) for item in day["order_details"]} == {
+        ("entry",),
+        ("close",),
+    }
+
+
+@pytest.mark.asyncio
 async def test_daily_pnl_records_use_grouped_okx_ledger_not_raw_position_rows(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
