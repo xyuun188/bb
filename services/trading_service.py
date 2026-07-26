@@ -10272,6 +10272,9 @@ class TradingService:
                 if stop_crossed
                 else "take_profit"
                 if target_crossed
+                else "paper_training_horizon"
+                if training_horizon.get("authorized") is True
+                and training_horizon.get("elapsed") is True
                 else "dynamic_position_scan"
             )
             close_decision = DecisionOutput(
@@ -10286,7 +10289,14 @@ class TradingService:
                 take_profit_pct=0.0,
                 raw_response={
                     "fast_risk_trigger": trigger,
-                    "forced_exit": bool(stop_crossed or target_crossed),
+                    "forced_exit": bool(
+                        stop_crossed
+                        or target_crossed
+                        or (
+                            training_horizon.get("authorized") is True
+                            and training_horizon.get("elapsed") is True
+                        )
+                    ),
                     "close_evidence": {
                         "hard_risk": stop_crossed,
                         "paper_canary_horizon": canary_horizon,

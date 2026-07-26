@@ -355,6 +355,19 @@ def build_paper_training_position_lifecycle(decision: Any) -> dict[str, Any]:
 
     raw = _row_raw(decision)
     contract = _dict(raw.get("paper_training"))
+    identity = _dict(raw.get("paper_training_order_identity"))
+    identity_decision_id = paper_training_decision_id_from_client_order_id(
+        identity.get("client_order_id")
+    )
+    decision_id = _row_value(decision, "id")
+    if (
+        not decision_id
+        and identity.get("version") == PAPER_TRAINING_ORDER_IDENTITY_VERSION
+        and identity.get("execution_scope") == "paper_only"
+        and identity.get("production_permission") is False
+        and identity_decision_id == _float(identity.get("decision_id"), None)
+    ):
+        decision_id = identity_decision_id
     action = str(_row_value(decision, "action") or "").lower()
     executed_at = _as_utc(_row_value(decision, "executed_at"))
     horizon_minutes = _float(contract.get("prediction_horizon_minutes"), 0.0) or 0.0
@@ -375,7 +388,7 @@ def build_paper_training_position_lifecycle(decision: Any) -> dict[str, Any]:
         "authorized": True,
         "execution_scope": "paper_only",
         "production_permission": False,
-        "decision_id": _row_value(decision, "id"),
+        "decision_id": decision_id,
         "symbol": str(_row_value(decision, "symbol") or ""),
         "side": action,
         "executed_at": executed_at.isoformat(),

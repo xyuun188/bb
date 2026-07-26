@@ -133,6 +133,23 @@ def test_paper_training_order_identity_is_stable_and_paper_only() -> None:
     assert "paper_training_order_identity" not in live_decision.raw_response
 
 
+def test_paper_training_lifecycle_recovers_decision_id_from_order_identity() -> None:
+    decision = _decision()
+    attach_paper_training_order_identity(decision, 104208, "paper")
+    lifecycle = build_paper_training_position_lifecycle(
+        SimpleNamespace(
+            symbol=decision.symbol,
+            action="long",
+            raw_response=decision.raw_response,
+            is_paper=True,
+            was_executed=True,
+            executed_at=datetime.now(UTC),
+        )
+    )
+
+    assert lifecycle["decision_id"] == 104208
+
+
 def test_paper_training_position_closes_at_model_prediction_horizon() -> None:
     decision = _decision(expected_net=-1.0)
     lifecycle = build_paper_training_position_lifecycle(
@@ -277,6 +294,76 @@ async def test_paper_training_sizing_has_no_profit_gate_but_bounded_risk() -> No
     assert decision.position_size_pct == pytest.approx(
         sizing["final_notional_usdt"] / sizing["available_margin_usdt"]
     )
+
+
+@pytest.mark.asyncio
+async def test_normal_positions_do_not_consume_independent_paper_training_risk_cap() -> None:
+    decision = _decision(expected_net=-2.5)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    normal_position = {
+        "symbol": "ETH/USDT",
+        "side": "long",
+        "execution_mode": "paper",
+        "is_open": True,
+        "notional": 500.0,
+        "current_price": 100.0,
+        "stop_loss": 95.0,
+        "leverage": 2.0,
+    }
+
+    await policy.apply(decision, "paper", [normal_position])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    snapshot = sizing["portfolio_risk_snapshot"]
+    assert sizing["production_eligible"] is True
+    assert sizing["risk_budget_usdt"] == pytest.approx(0.1)
+    assert sizing["current_portfolio_stressed_loss_usdt"] == 0.0
+    assert snapshot["risk_scope"] == "open_paper_training_positions_only"
+    assert snapshot["all_open_position_count"] == 1
+    assert snapshot["paper_training_position_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_open_paper_training_positions_consume_training_portfolio_risk_cap() -> None:
+    decision = _decision(expected_net=-2.5)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    expires_at = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+    positions = [
+        {
+            "symbol": f"TRAIN-{index}/USDT",
+            "side": "long",
+            "execution_mode": "paper",
+            "is_open": True,
+            "notional": 5.0,
+            "current_price": 100.0,
+            "stop_loss": 98.0,
+            "leverage": 1.0,
+            "paper_training_lifecycle": {
+                "version": PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
+                "kind": "normal_paper_training_position",
+                "authorized": True,
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "decision_id": index,
+                "symbol": f"TRAIN-{index}/USDT",
+                "side": "long",
+                "horizon_minutes": 10.0,
+                "expires_at": expires_at,
+                "continuous_training_after_settlement": True,
+                "loss_tolerant_for_training": True,
+            },
+        }
+        for index in range(3)
+    ]
+
+    await policy.apply(decision, "paper", positions)
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    snapshot = sizing["portfolio_risk_snapshot"]
+    assert sizing["production_eligible"] is False
+    assert "paper_training_virtual_notional_zero" in sizing["reason"]
+    assert snapshot["paper_training_position_count"] == 3
+    assert sizing["current_portfolio_stressed_loss_usdt"] == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio

@@ -169,6 +169,29 @@ def _continuous_weights(**overrides: float) -> dict[str, object]:
     }
 
 
+def _training_evidence(
+    side: str,
+    count: int,
+    *,
+    raw_return: float,
+    objective_return: float,
+    horizon_minutes: float,
+) -> dict[str, object]:
+    sources = ("local_ml", "server_profit", "timeseries")
+    return {
+        "evidence": [
+            {
+                "source": source,
+                "side": side,
+                "raw_expected_return_pct": raw_return,
+                "objective_expected_return_pct": objective_return,
+                "horizon_minutes": horizon_minutes,
+            }
+            for source in sources[:count]
+        ]
+    }
+
+
 def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote() -> None:
     decision = _coordinator().combine(_features(), _return_context(), _strong_long_opinions())
 
@@ -267,7 +290,7 @@ def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
     assert "paper_exploration" not in decision.raw_response
 
 
-def test_no_champion_training_observation_cannot_create_entry_without_profit_permission() -> None:
+def test_single_source_training_observation_remains_blocked() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -278,6 +301,13 @@ def test_no_champion_training_observation_cannot_create_entry_without_profit_per
         direction_competition={
             "preferred_side": "neutral",
             "training_preferred_side": "short",
+            "short": _training_evidence(
+                "short",
+                1,
+                raw_return=-0.1,
+                objective_return=-0.4,
+                horizon_minutes=10,
+            ),
             "training_short": {
                 "score": -0.4,
                 "raw_expected_return_pct": -0.1,
@@ -300,9 +330,172 @@ def test_no_champion_training_observation_cannot_create_entry_without_profit_per
     assert "paper_training" not in decision.raw_response
     assert decision.raw_response["entry_permission"] == {
         "granted": False,
-        "reason": "authoritative_return_candidate_not_production_eligible",
+        "reason": "paper_training_independent_support_insufficient",
         "training_policy": "shadow_prediction_only",
     }
+    admission = decision.raw_response["paper_training_admission"]
+    assert admission["model_source_count"] == 1
+    assert admission["opposition_expert_count"] == 5
+
+
+def test_two_independent_model_sources_can_create_bounded_paper_training_entry() -> None:
+    context = _return_context(
+        execution_mode="paper",
+        paper_training_mode="bootstrap",
+        paper_strategy_champion={"active": False, "paper_execution_permission": False},
+        direction_competition={
+            "preferred_side": "neutral",
+            "training_preferred_side": "short",
+            "short": _training_evidence(
+                "short",
+                2,
+                raw_return=-0.1,
+                objective_return=-0.4,
+                horizon_minutes=10,
+            ),
+            "training_long": {
+                "score": -0.5,
+                "raw_expected_return_pct": -0.2,
+                "objective_expected_return_pct": -0.5,
+                "horizon_minutes": 10,
+                "observation_count": 2,
+            },
+            "training_short": {
+                "score": -0.4,
+                "raw_expected_return_pct": -0.1,
+                "objective_expected_return_pct": -0.4,
+                "horizon_minutes": 10,
+                "observation_count": 2,
+            },
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+    opinions = {
+        name: _decision(name, Action.HOLD, confidence=0.5)
+        for name in (
+            "trend_expert",
+            "momentum_expert",
+            "sentiment_expert",
+            "position_expert",
+            "risk_expert",
+        )
+    }
+
+    decision = _coordinator().combine(_features(), context, opinions)
+
+    assert decision.action == Action.SHORT
+    assert decision.raw_response["entry_permission"] == {
+        "granted": True,
+        "scope": "paper_training_only",
+        "reason": "independent_training_evidence_ready",
+        "production_permission": False,
+    }
+    contract = decision.raw_response["paper_training"]
+    assert contract["authorized"] is True
+    assert contract["execution_scope"] == "paper_only"
+    assert contract["production_permission"] is False
+    assert contract["single_trade_risk_fraction_cap"] == 0.0001
+    assert contract["portfolio_risk_fraction_cap"] == 0.0003
+    admission = decision.raw_response["paper_training_admission"]
+    assert admission["model_source_count"] == 2
+    assert admission["aligned_expert_count"] == 0
+    assert admission["opposition_expert_count"] == 0
+
+
+def test_one_model_source_plus_one_aligned_expert_can_create_paper_training_entry() -> None:
+    context = _return_context(
+        execution_mode="paper",
+        paper_training_mode="bootstrap",
+        paper_strategy_champion={"active": False, "paper_execution_permission": False},
+        direction_competition={
+            "preferred_side": "neutral",
+            "training_preferred_side": "long",
+            "long": _training_evidence(
+                "long",
+                1,
+                raw_return=0.1,
+                objective_return=-0.2,
+                horizon_minutes=15,
+            ),
+            "training_long": {
+                "score": -0.2,
+                "raw_expected_return_pct": 0.1,
+                "objective_expected_return_pct": -0.2,
+                "horizon_minutes": 15,
+                "observation_count": 1,
+            },
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+    opinions = {
+        name: _decision(
+            name,
+            Action.LONG if name == "trend_expert" else Action.HOLD,
+            confidence=0.5,
+        )
+        for name in (
+            "trend_expert",
+            "momentum_expert",
+            "sentiment_expert",
+            "position_expert",
+            "risk_expert",
+        )
+    }
+
+    decision = _coordinator().combine(_features(), context, opinions)
+
+    assert decision.action == Action.LONG
+    admission = decision.raw_response["paper_training_admission"]
+    assert admission["model_source_count"] == 1
+    assert admission["aligned_expert_count"] == 1
+    assert admission["support_channel_count"] == 2
+    assert admission["training_permission"] is True
+
+
+def test_unresolved_expert_opposition_blocks_paper_training_entry() -> None:
+    context = _return_context(
+        execution_mode="paper",
+        paper_training_mode="bootstrap",
+        paper_strategy_champion={"active": False, "paper_execution_permission": False},
+        direction_competition={
+            "preferred_side": "neutral",
+            "training_preferred_side": "long",
+            "long": _training_evidence(
+                "long",
+                1,
+                raw_return=0.3,
+                objective_return=0.2,
+                horizon_minutes=10,
+            ),
+            "training_long": {
+                "score": 0.2,
+                "raw_expected_return_pct": 0.3,
+                "objective_expected_return_pct": 0.2,
+                "horizon_minutes": 10,
+                "observation_count": 1,
+            },
+        },
+    )
+    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
+    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+    opinions = {
+        "trend_expert": _decision("trend_expert", Action.LONG, confidence=0.6),
+        "momentum_expert": _decision("momentum_expert", Action.SHORT, confidence=0.6),
+        "sentiment_expert": _decision("sentiment_expert", Action.SHORT, confidence=0.6),
+        "position_expert": _decision("position_expert", Action.HOLD, confidence=0.5),
+        "risk_expert": _decision("risk_expert", Action.HOLD, confidence=0.5),
+    }
+
+    decision = _coordinator().combine(_features(), context, opinions)
+
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
+    admission = decision.raw_response["paper_training_admission"]
+    assert admission["support_channel_count"] == 2
+    assert admission["opposition_channel_count"] == 2
+    assert admission["reason"] == "paper_training_opposition_not_resolved"
 
 
 def test_paper_training_route_is_never_created_for_live_execution() -> None:
@@ -527,6 +720,13 @@ def test_paper_bootstrap_direction_observations_remain_shadow_only() -> None:
         direction_competition={
             "preferred_side": "neutral",
             "training_preferred_side": "short",
+            "short": _training_evidence(
+                "short",
+                2,
+                raw_return=0.2,
+                objective_return=0.2,
+                horizon_minutes=10,
+            ),
             "training_long": {
                 "score": 0.1,
                 "raw_expected_return_pct": 0.1,

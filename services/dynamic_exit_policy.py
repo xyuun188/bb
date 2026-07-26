@@ -357,9 +357,10 @@ def assess_dynamic_exit(
         if current_management_contract_complete
         else 0.0
     )
+    paper_training_settlement_due = paper_training_horizon_elapsed
     close_fraction = (
         1.0
-        if hard_risk
+        if hard_risk or paper_training_settlement_due
         else continuous_budget_fraction(
             retrace,
             stop_usage,
@@ -372,13 +373,25 @@ def assess_dynamic_exit(
     reasons: list[str] = []
     if not matches:
         reasons.append("position_economics_missing")
-    if not hard_risk and matches and not current_management_contract_complete:
+    if (
+        not hard_risk
+        and not paper_training_settlement_due
+        and matches
+        and not current_management_contract_complete
+    ):
         reasons.append("current_position_management_contract_incomplete")
-    if not hard_risk and close_fraction <= 0:
+    if not hard_risk and not paper_training_settlement_due and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
-    if not hard_risk and gross_pnl > 0 and net_pnl <= 0 and stop_usage <= 0 and continuation <= 0:
+    if (
+        not hard_risk
+        and not paper_training_settlement_due
+        and gross_pnl > 0
+        and net_pnl <= 0
+        and stop_usage <= 0
+        and continuation <= 0
+    ):
         reasons.append("fee_after_profit_not_positive")
-    if not hard_risk and not execution_cost_complete:
+    if not hard_risk and not paper_training_settlement_due and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
     eligible = not reasons
     provenance = {
@@ -388,12 +401,18 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-07-25.dynamic-exit-replacement-comparison.v5",
+        "strategy_version": "2026-07-26.dynamic-exit-training-settlement.v6",
         "fallback_reason": ",".join(reasons),
     }
     return DynamicExitAssessment(
         eligible=eligible,
-        reason="dynamic_exit_policy_passed" if eligible else ",".join(reasons),
+        reason=(
+            "paper_training_prediction_horizon_settlement"
+            if eligible and paper_training_settlement_due
+            else "dynamic_exit_policy_passed"
+            if eligible
+            else ",".join(reasons)
+        ),
         close_fraction=round(close_fraction if eligible else 0.0, 8),
         hard_risk=hard_risk,
         gross_unrealized_pnl_usdt=round(gross_pnl, 8),

@@ -33,6 +33,7 @@ from services.paper_training import (
     PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
     PAPER_TRAINING_MIN_FILL_DRIFT_RESERVE_FRACTION,
     PAPER_TRAINING_SIZING_VERSION,
+    assess_paper_training_position_horizon,
     is_paper_training_decision,
 )
 from services.production_trade_gate import validate_production_trade_gate
@@ -1470,10 +1471,25 @@ class EntryProfitRiskSizingPolicy:
             open_positions,
             contract_specs,
         )
+        training_positions = [
+            item
+            for item in open_positions
+            if assess_paper_training_position_horizon(_safe_dict(item)).get(
+                "authorized"
+            )
+            is True
+        ]
         portfolio_snapshot, _portfolio_reasons = _portfolio_risk_snapshot(
-            open_positions,
+            training_positions,
             candidate_side=side,
             contract_specs=contract_specs,
+        )
+        portfolio_snapshot.update(
+            {
+                "risk_scope": "open_paper_training_positions_only",
+                "all_open_position_count": len(open_positions),
+                "paper_training_position_count": len(training_positions),
+            }
         )
         current_portfolio_risk = max(
             _safe_float(

@@ -224,14 +224,11 @@ class OpenPositionsExecutionApplier:
             position["current_management_contract"] = management
             position["execution_mode"] = "paper"
         if paper_training_lifecycle:
-            lifecycle = position.get("paper_training_lifecycle")
-            if not isinstance(lifecycle, dict):
-                lifecycle = dict(paper_training_lifecycle)
-                position["paper_training_lifecycle"] = lifecycle
+            lifecycle = dict(paper_training_lifecycle)
+            position["paper_training_lifecycle"] = lifecycle
             management = position.get("current_management_contract")
             management = dict(management) if isinstance(management, dict) else {}
-            if not isinstance(management.get("paper_training_lifecycle"), dict):
-                management["paper_training_lifecycle"] = dict(lifecycle)
+            management["paper_training_lifecycle"] = dict(lifecycle)
             position["current_management_contract"] = management
             position["execution_mode"] = "paper"
         if entry_exchange_order_id:

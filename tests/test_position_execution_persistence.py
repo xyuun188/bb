@@ -10,7 +10,10 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import OrderStatus
 from services.entry_fee_provider import proportional_fee
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
-from services.paper_training import build_paper_training_contract
+from services.paper_training import (
+    PAPER_TRAINING_ORDER_IDENTITY_VERSION,
+    build_paper_training_contract,
+)
 from services.position_execution_persistence import PositionExecutionPersistenceService
 
 
@@ -305,6 +308,56 @@ async def test_persist_entry_merges_same_symbol_side_add_into_okx_net_position()
     assert existing.stop_loss_price == pytest.approx(95.55)
     assert existing.take_profit_price == pytest.approx(101.4)
     assert repo.opened == []
+
+
+@pytest.mark.asyncio
+async def test_persist_entry_replaces_stale_training_lifecycle_on_new_net_entry() -> None:
+    session = FakeSession()
+    existing = _position(
+        id=1,
+        quantity=1.0,
+        entry_price=90.0,
+        entry_exchange_order_id="old-entry",
+        current_management_contract={
+            "paper_training_lifecycle": {
+                "decision_id": 10,
+                "expires_at": "2026-06-10T11:10:00+00:00",
+            }
+        },
+    )
+    repo = FakeTradeRepo([existing])
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "paper_training": build_paper_training_contract(
+            symbol=decision.symbol,
+            selected_side="long",
+            signal_source="test_model_direction",
+            horizon_minutes=10.0,
+        ),
+        "paper_training_order_identity": {
+            "version": PAPER_TRAINING_ORDER_IDENTITY_VERSION,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "decision_id": 42,
+            "client_order_id": "BBPT42",
+        },
+    }
+
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader",
+        decision=decision,
+        result=_result(
+            price=100.0,
+            quantity=3.0,
+            exchange_order_id="new-entry",
+        ),
+        execution_mode="paper",
+    )
+
+    lifecycle = existing.current_management_contract["paper_training_lifecycle"]
+    assert lifecycle["decision_id"] == 42
+    assert lifecycle["executed_at"] == "2026-06-10T12:00:00+00:00"
+    assert lifecycle["expires_at"] == "2026-06-10T12:10:00+00:00"
 
 
 @pytest.mark.asyncio

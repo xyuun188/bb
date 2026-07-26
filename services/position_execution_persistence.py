@@ -60,10 +60,7 @@ def _management_contract_with_lifecycles(
         dict,
     ):
         contract["paper_canary_lifecycle"] = dict(paper_canary_lifecycle)
-    if paper_training_lifecycle and not isinstance(
-        contract.get("paper_training_lifecycle"),
-        dict,
-    ):
+    if paper_training_lifecycle:
         contract["paper_training_lifecycle"] = dict(paper_training_lifecycle)
     return contract
 

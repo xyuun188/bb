@@ -7,7 +7,10 @@ from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
 )
-from services.paper_training import build_paper_training_contract
+from services.paper_training import (
+    PAPER_TRAINING_ORDER_IDENTITY_VERSION,
+    build_paper_training_contract,
+)
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -147,6 +150,60 @@ def test_open_positions_applier_merges_same_symbol_side_okx_net_entries() -> Non
         "okx-old",
         "okx-1",
     ]
+
+
+def test_open_positions_applier_replaces_stale_training_lifecycle_on_new_entry() -> None:
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "paper_training": build_paper_training_contract(
+            symbol=decision.symbol,
+            selected_side="long",
+            signal_source="test_model_direction",
+            horizon_minutes=10.0,
+        ),
+        "paper_training_order_identity": {
+            "version": PAPER_TRAINING_ORDER_IDENTITY_VERSION,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "decision_id": 42,
+            "client_order_id": "BBPT42",
+        },
+    }
+    stale_lifecycle = {
+        "decision_id": 10,
+        "expires_at": "2026-06-10T11:10:00+00:00",
+    }
+    open_positions = [
+        {
+            "model_name": "ensemble_trader",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "entry_price": 90.0,
+            "current_price": 90.0,
+            "quantity": 1.0,
+            "is_open": True,
+            "entry_exchange_order_id": "okx-old",
+            "paper_training_lifecycle": stale_lifecycle,
+            "current_management_contract": {
+                "paper_training_lifecycle": stale_lifecycle,
+            },
+        }
+    ]
+
+    result = _result(OrderStatus.FILLED, quantity=3.0)
+    _applier().apply(
+        open_positions,
+        "ensemble_trader",
+        decision,
+        result,
+    )
+
+    lifecycle = open_positions[0]["paper_training_lifecycle"]
+    assert lifecycle["decision_id"] == 42
+    assert lifecycle["executed_at"] == result.timestamp.isoformat()
+    assert open_positions[0]["current_management_contract"][
+        "paper_training_lifecycle"
+    ] == lifecycle
 
 
 def test_open_positions_applier_ignores_duplicate_entry_callback_for_same_order_id() -> None:

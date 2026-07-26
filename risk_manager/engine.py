@@ -180,8 +180,6 @@ class RiskEngine:
         )
         position_size = RiskEngine._safe_positive_float(sizing.get("position_size_pct"))
         leverage = RiskEngine._safe_positive_float(decision.suggested_leverage)
-        if sizing.get("production_eligible") is not True:
-            return "Dynamic account risk budget is not production eligible."
         if sizing.get("contract_lifecycle") == "paper_training":
             training = raw.get("paper_training")
             training = training if isinstance(training, dict) else {}
@@ -196,6 +194,9 @@ class RiskEngine:
                 or training.get("loss_tolerant_for_training") is not True
             ):
                 return "Paper training risk contract is not paper-only."
+            if sizing.get("production_eligible") is not True:
+                reason = str(sizing.get("reason") or "paper_training_risk_budget_ineligible")
+                return f"Paper training risk budget is not eligible: {reason}."
             if equity <= 0 or risk_budget > (
                 equity * PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8
             ):
@@ -204,6 +205,8 @@ class RiskEngine:
                 equity * PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
             ):
                 return "Paper cold-start exploration exceeds its portfolio risk cap."
+        elif sizing.get("production_eligible") is not True:
+            return "Dynamic account risk budget is not production eligible."
         if sizing.get("contract_lifecycle") == "paper_exploration":
             exploration = raw.get("paper_exploration")
             exploration = exploration if isinstance(exploration, dict) else {}
