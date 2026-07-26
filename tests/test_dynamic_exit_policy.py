@@ -342,7 +342,7 @@ def test_expired_paper_canary_horizon_does_not_force_full_close() -> None:
     assert "dynamic_exit_pressure_zero" in result.reason
 
 
-def test_expired_paper_training_horizon_settles_with_incomplete_takeover_evidence() -> None:
+def test_expired_paper_training_horizon_cannot_bypass_incomplete_takeover_evidence() -> None:
     position = _position(
         execution_mode="paper",
         current_management_contract={
@@ -367,15 +367,27 @@ def test_expired_paper_training_horizon_settles_with_incomplete_takeover_evidenc
 
     result = apply_dynamic_exit(_decision(), [position])
 
-    assert result.eligible is True
+    assert result.eligible is False
     assert result.paper_training_horizon_elapsed is True
     assert result.paper_training_horizon_minutes == 10.0
     assert result.current_management_contract_complete is False
-    assert result.close_fraction == 1.0
-    assert result.reason == "paper_training_prediction_horizon_settlement"
+    assert result.close_fraction == 0.0
+    assert "current_position_management_contract_incomplete" in result.reason
 
 
-def test_expired_paper_training_horizon_settles_with_complete_management_facts() -> None:
+def test_expired_paper_training_horizon_is_observation_only() -> None:
+    baseline = apply_dynamic_exit(
+        _decision(),
+        [
+            _position(
+                execution_mode="paper",
+                current_price=100.0,
+                notional_usdt=1000.0,
+                unrealized_pnl=0.0,
+                peak_unrealized_pnl=0.0,
+            )
+        ],
+    )
     position = _position(
         execution_mode="paper",
         current_price=100.0,
@@ -399,11 +411,11 @@ def test_expired_paper_training_horizon_settles_with_complete_management_facts()
 
     result = apply_dynamic_exit(_decision(), [position])
 
-    assert result.eligible is True
+    assert result.eligible is baseline.eligible
     assert result.current_management_contract_complete is True
     assert result.paper_training_horizon_elapsed is True
-    assert result.close_fraction == 1.0
-    assert result.reason == "paper_training_prediction_horizon_settlement"
+    assert result.close_fraction == baseline.close_fraction
+    assert result.reason == baseline.reason
 
 
 def test_expired_paper_canary_horizon_cannot_bypass_incomplete_takeover_contract() -> None:

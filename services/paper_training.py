@@ -413,7 +413,7 @@ def assess_paper_training_position_horizon(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Assess a paper-only training horizon without granting live exit authority."""
+    """Assess a paper-only training horizon without granting position-exit authority."""
 
     lifecycle = paper_training_position_lifecycle(position)
     current = _as_utc(now) or datetime.now(UTC)

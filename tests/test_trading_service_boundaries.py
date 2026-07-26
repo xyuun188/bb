@@ -3239,7 +3239,7 @@ async def test_expired_canary_does_not_force_exit_with_incomplete_takeover_contr
 
 
 @pytest.mark.asyncio
-async def test_expired_paper_training_horizon_forces_settlement_exit() -> None:
+async def test_expired_paper_training_horizon_does_not_force_settlement_exit() -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []
 
@@ -3308,9 +3308,8 @@ async def test_expired_paper_training_horizon_forces_settlement_exit() -> None:
 
     auto_closes = await service._enforce_sl_tp({}, open_positions=open_positions)
 
-    assert calls == [("PEPE/USDT", "paper_training_horizon", 1.0)]
-    assert len(auto_closes) == 1
-    assert auto_closes[0]["trigger"] == "paper_training_horizon"
+    assert calls == []
+    assert auto_closes == []
 
 
 def test_entry_policy_uses_injected_decision_freshness_boundary():
