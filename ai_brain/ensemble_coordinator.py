@@ -33,10 +33,6 @@ from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
 from services.paper_exploration import build_paper_exploration_contract
-from services.paper_training import (
-    build_paper_training_contract,
-    paper_training_mode_enabled,
-)
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -787,7 +783,7 @@ class EnsembleCoordinator:
         raw["ml_signal"] = context.get("ml_signal") or {}
         raw["portfolio_profit_protection"] = context.get("portfolio_profit_protection") or {}
 
-        if risk_vetoes and not current_side and not paper_training_mode_enabled(context):
+        if risk_vetoes and not current_side:
             reason = self._reason(
                 "风控专家否决新开仓", decision_score, disagreement, raw_opinions, resolution_brief
             )
@@ -888,68 +884,6 @@ class EnsembleCoordinator:
             "policy_provenance": policy_provenance,
         }
         if not production_eligible:
-            if paper_training_mode_enabled(context) and str(
-                candidate_evidence.get("preferred_exploration_side") or ""
-            ).lower() not in {"long", "short"}:
-                (
-                    training_side,
-                    training_source,
-                    training_expected,
-                    training_lcb,
-                    training_horizon,
-                ) = self._paper_training_side(context, normalized_score)
-                if training_side in {"long", "short"}:
-                    training_contract = build_paper_training_contract(
-                        symbol=features.symbol,
-                        selected_side=training_side,
-                        signal_source=training_source,
-                        expected_net_return_pct=training_expected,
-                        return_lcb_pct=training_lcb,
-                        feature_opportunity_score=self._safe_float(
-                            candidate_evidence.get("feature_opportunity_score"),
-                            0.0,
-                        ),
-                        horizon_minutes=training_horizon,
-                        policy_provenance=policy_provenance,
-                    )
-                    training_raw = self._raw(
-                        raw_opinions,
-                        decision_score,
-                        disagreement,
-                        cross_validations,
-                        consultation,
-                    )
-                    self._attach_expert_diversity_policy(training_raw, context)
-                    training_raw["authoritative_return_candidate"] = raw[
-                        "authoritative_return_candidate"
-                    ]
-                    training_raw["entry_candidate_evidence"] = candidate_evidence
-                    training_raw["paper_training"] = training_contract
-                    training_raw["paper_training_mode"] = "bootstrap"
-                    training_raw["base_weighted_score_observation"] = round(
-                        normalized_score,
-                        4,
-                    )
-                    training_raw["memory_feedback_observation"] = self._memory_feedback(context)
-                    training_raw["ml_signal"] = context.get("ml_signal") or {}
-                    training_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
-                    training_raw["direction_competition"] = (
-                        context.get("direction_competition") or {}
-                    )
-                    action = Action.LONG if training_side == "long" else Action.SHORT
-                    return self._entry_decision(
-                        features=features,
-                        context=context,
-                        action=action,
-                        confidence=min(max(abs(normalized_score), 0.05), 1.0),
-                        reasoning=(
-                            "模拟盘快速训练期按模型方向正常开多，暂不以预期盈亏拦截"
-                            if action == Action.LONG
-                            else "模拟盘快速训练期按模型方向正常开空，暂不以预期盈亏拦截"
-                        ),
-                        raw_response=training_raw,
-                        raw_opinions=raw_opinions,
-                    )
             exploration_side = str(
                 candidate_evidence.get("preferred_exploration_side") or ""
             ).lower()
@@ -1016,7 +950,10 @@ class EnsembleCoordinator:
                     raw_opinions=raw_opinions,
                 )
             reason = self._reason(
-                "当前模型没有给出扣除交易成本后仍为正的模拟盘机会，本轮保持观望",
+                (
+                    "当前候选未同时满足扣费后期望、收益置信下界、生产数据源和策略治理合同，"
+                    "本轮保持观望；训练预测只记录影子结果，不创建订单"
+                ),
                 decision_score,
                 disagreement,
                 raw_opinions,
@@ -1028,6 +965,11 @@ class EnsembleCoordinator:
             self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["authoritative_return_candidate"] = raw["authoritative_return_candidate"]
             hold_raw["entry_candidate_evidence"] = candidate_evidence
+            hold_raw["entry_permission"] = {
+                "granted": False,
+                "reason": "authoritative_return_candidate_not_production_eligible",
+                "training_policy": "shadow_prediction_only",
+            }
             hold_raw["base_weighted_score_observation"] = round(normalized_score, 4)
             hold_raw["memory_feedback_observation"] = self._memory_feedback(context)
             return self._hold(features, reason, hold_raw)
@@ -1341,153 +1283,6 @@ class EnsembleCoordinator:
     @staticmethod
     def _safe_dict(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
-
-    def _paper_training_side(
-        self,
-        context: dict[str, Any],
-        normalized_score: float,
-    ) -> tuple[str, str, float | None, float | None, float | None]:
-        """Choose the best available observed direction without a profit gate."""
-
-        competition = self._safe_dict(context.get("direction_competition"))
-        observed_side = str(
-            competition.get("training_preferred_side") or competition.get("preferred_side") or ""
-        ).lower()
-        training_rows = {
-            "long": self._safe_dict(competition.get("training_long")),
-            "short": self._safe_dict(competition.get("training_short")),
-        }
-        training_scores = {
-            side: self._finite_or_none(row.get("score")) for side, row in training_rows.items()
-        }
-        training_horizons = {
-            side: self._finite_or_none(row.get("horizon_minutes"))
-            for side, row in training_rows.items()
-        }
-        strategy_context = self._safe_dict(context.get("strategy_mode"))
-        strategy_routing = self._safe_dict(
-            context.get("continuous_strategy_routing")
-            or strategy_context.get("continuous_strategy_routing")
-        )
-        current_strategy_route = self._safe_dict(strategy_routing.get("current_route"))
-        routed_strategy = self._safe_dict(
-            current_strategy_route.get("primary") or current_strategy_route.get("training_primary")
-        )
-        strategy_side = str(current_strategy_route.get("recommended_side") or "").lower()
-        normalized_strategy_strength = min(
-            max(
-                self._safe_float(
-                    routed_strategy.get("normalized_current_regime_weight"),
-                    0.0,
-                ),
-                0.0,
-            ),
-            0.5 if current_strategy_route.get("primary") else 0.25,
-        )
-        absolute_strategy_weight = min(
-            max(
-                self._safe_float(
-                    routed_strategy.get("effective_weight"),
-                    1.0,
-                ),
-                0.0,
-            ),
-            1.0,
-        )
-        strategy_strength = normalized_strategy_strength * absolute_strategy_weight
-        if all(
-            training_scores[side] is not None
-            and training_horizons[side] is not None
-            and float(training_horizons[side]) > 0.0
-            for side in ("long", "short")
-        ):
-            long_score = float(training_scores["long"])
-            short_score = float(training_scores["short"])
-            quant_gap = long_score - short_score
-            quant_scale = max(abs(long_score) + abs(short_score), 1e-12)
-            quant_signal = max(min(quant_gap / quant_scale, 1.0), -1.0)
-            expert_signal = max(min(float(normalized_score), 1.0), -1.0)
-            strategy_signal = (
-                strategy_strength
-                if strategy_side == "long"
-                else -strategy_strength
-                if strategy_side == "short"
-                else 0.0
-            )
-            combined_signal = quant_signal + expert_signal + strategy_signal
-            if abs(combined_signal) <= 1e-12:
-                combined_side = observed_side
-            else:
-                combined_side = "long" if combined_signal > 0.0 else "short"
-            if combined_side in {"long", "short"}:
-                row = training_rows[combined_side]
-                return (
-                    combined_side,
-                    "continuous_weighted_quant_and_expert_observations",
-                    self._finite_or_none(row.get("raw_expected_return_pct")),
-                    self._finite_or_none(row.get("objective_expected_return_pct")),
-                    training_horizons[combined_side],
-                )
-        if observed_side in {"long", "short"}:
-            row = training_rows.get(observed_side, {})
-            horizon = self._finite_or_none(row.get("horizon_minutes"))
-            if horizon is not None and horizon > 0:
-                return (
-                    observed_side,
-                    "direction_competition_observation",
-                    self._finite_or_none(row.get("objective_expected_return_pct")),
-                    self._finite_or_none(row.get("objective_expected_return_pct")),
-                    horizon,
-                )
-
-        signal = self._safe_dict(context.get("ml_signal"))
-        predictions = signal.get("predictions")
-        predictions = predictions if isinstance(predictions, list) else []
-        primary = self._safe_dict(predictions[0] if predictions else {})
-        distribution = self._safe_dict(primary.get("return_distribution_contract"))
-        rows: dict[str, dict[str, Any]] = {
-            side: self._safe_dict(distribution.get(side)) for side in ("long", "short")
-        }
-        scores = {
-            side: self._finite_or_none(row.get("objective_expected_return_pct"))
-            for side, row in rows.items()
-        }
-        if all(value is None for value in scores.values()):
-            scores = {
-                side: self._finite_or_none(row.get("raw_expected_return_pct"))
-                for side, row in rows.items()
-            }
-        horizons = {
-            side: self._finite_or_none(
-                rows[side].get("horizon_minutes", primary.get("horizon_minutes"))
-            )
-            for side in ("long", "short")
-        }
-        available = {
-            side: value
-            for side, value in scores.items()
-            if value is not None and horizons.get(side) is not None and float(horizons[side]) > 0
-        }
-        if available:
-            side = max(available, key=lambda item: float(available[item]))
-            return (
-                side,
-                "local_ml_observation",
-                self._finite_or_none(rows[side].get("raw_expected_return_pct")),
-                self._finite_or_none(rows[side].get("objective_expected_return_pct")),
-                horizons[side],
-            )
-        primary_side = str(primary.get("best_side") or "").lower()
-        primary_horizon = self._finite_or_none(primary.get("horizon_minutes"))
-        if primary_side in {"long", "short"} and primary_horizon and primary_horizon > 0:
-            return (
-                primary_side,
-                "local_ml_best_side_observation",
-                None,
-                None,
-                primary_horizon,
-            )
-        return "neutral", "no_auditable_directional_horizon", None, None, None
 
     @staticmethod
     def _finite_or_none(value: Any) -> float | None:

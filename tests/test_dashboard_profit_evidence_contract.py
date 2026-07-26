@@ -16,6 +16,38 @@ HTML = (ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 STYLE = (ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
 
+def test_market_direction_without_execution_permission_is_displayed_as_observation() -> None:
+    decision = SimpleNamespace(
+        action="long",
+        was_executed=False,
+        position_size_pct=0.0,
+    )
+
+    display_action, observed_action, reasoning = dashboard._analysis_display_action(
+        decision,
+        "market",
+        "Dynamic account risk budget is not production eligible.",
+    )
+
+    assert display_action == "hold"
+    assert observed_action == "long"
+    assert reasoning == "方向模型仅给出看多观察，但本轮未获得新开仓许可；最终裁决为观望。"
+
+
+def test_executed_market_direction_keeps_its_directional_display() -> None:
+    decision = SimpleNamespace(
+        action="short",
+        was_executed=True,
+        position_size_pct=0.01,
+    )
+
+    assert dashboard._analysis_display_action(decision, "market", None) == (
+        "short",
+        None,
+        None,
+    )
+
+
 def test_position_risk_evidence_preserves_authoritative_contract_values() -> None:
     decision = SimpleNamespace(
         id=731,

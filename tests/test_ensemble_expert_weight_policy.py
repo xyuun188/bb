@@ -267,7 +267,7 @@ def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
     assert "paper_exploration" not in decision.raw_response
 
 
-def test_no_champion_uses_loss_tolerant_paper_training_direction() -> None:
+def test_no_champion_training_observation_cannot_create_entry_without_profit_permission() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -296,11 +296,13 @@ def test_no_champion_uses_loss_tolerant_paper_training_direction() -> None:
         _strong_long_opinions(),
     )
 
-    assert decision.action == Action.SHORT
-    assert decision.raw_response["paper_training"]["loss_tolerant_for_training"] is True
-    assert decision.raw_response["paper_training"]["production_permission"] is False
-    assert decision.raw_response["paper_training"]["expected_net_return_pct"] == -0.4
-    assert decision.raw_response["paper_training"]["valid_for_seconds"] == 600.0
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
+    assert decision.raw_response["entry_permission"] == {
+        "granted": False,
+        "reason": "authoritative_return_candidate_not_production_eligible",
+        "training_policy": "shadow_prediction_only",
+    }
 
 
 def test_paper_training_route_is_never_created_for_live_execution() -> None:
@@ -516,7 +518,7 @@ def test_continuous_weights_are_ignored_by_live_ensemble_path() -> None:
     assert "continuous_model_weights" not in with_report.raw_response
 
 
-def test_paper_bootstrap_combines_weighted_quant_and_expert_direction() -> None:
+def test_paper_bootstrap_direction_observations_remain_shadow_only() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -546,9 +548,10 @@ def test_paper_bootstrap_combines_weighted_quant_and_expert_direction() -> None:
 
     decision = _coordinator().combine(_features(), context, _strong_long_opinions())
 
-    assert decision.action == Action.LONG
-    assert decision.raw_response["paper_training"]["signal_source"] == (
-        "continuous_weighted_quant_and_expert_observations"
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
+    assert decision.raw_response["entry_permission"]["training_policy"] == (
+        "shadow_prediction_only"
     )
 
 
@@ -615,42 +618,3 @@ def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> 
         ]
         == "trend_up_long"
     )
-
-
-def test_low_absolute_training_strategy_weight_cannot_override_quant_direction() -> None:
-    context = {
-        "strategy_mode": {
-            "continuous_strategy_routing": {
-                "applied": True,
-                "current_route": {
-                    "recommended_side": "long",
-                    "primary": None,
-                    "training_primary": {
-                        "profile_id": "loss_making_long",
-                        "side": "long",
-                        "normalized_current_regime_weight": 1.0,
-                        "effective_weight": 0.1,
-                    },
-                },
-            }
-        },
-        "direction_competition": {
-            "training_preferred_side": "short",
-            "training_long": {
-                "score": 0.09,
-                "raw_expected_return_pct": 0.09,
-                "objective_expected_return_pct": 0.09,
-                "horizon_minutes": 10,
-            },
-            "training_short": {
-                "score": 0.11,
-                "raw_expected_return_pct": 0.11,
-                "objective_expected_return_pct": 0.11,
-                "horizon_minutes": 10,
-            },
-        },
-    }
-
-    side, *_rest = _coordinator()._paper_training_side(context, 0.0)
-
-    assert side == "short"

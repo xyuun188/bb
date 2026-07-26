@@ -1037,7 +1037,7 @@ function renderRecentDecisions(decisions) {
                             <tr>
                                 <td>${toBeijingTime(d.created_at)}</td>
                                 <td>${escHtml(d.symbol || '-')}</td>
-                                <td><span class="badge badge-${d.action || 'hold'}">${analysisActionLabel(d.action, d)}</span></td>
+                                <td><span class="badge badge-${analysisDisplayAction(d.action, d)}">${analysisActionLabel(d.action, d)}</span></td>
                                 <td style="color:${conf >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${(conf * 100).toFixed(0)}%</td>
                                 <td class="decision-size-cell">${decisionSizeCell(d)}</td>
                                 <td>${executedHtml}</td>
@@ -2422,9 +2422,26 @@ function analysisPositionSide(record) {
     return '';
 }
 
+function analysisDisplayAction(action, record = null) {
+    const value = String(action || '').toLowerCase() || 'hold';
+    if (!record || analysisRecordType(record) !== 'market') return value;
+    if (record.was_executed !== false || !['long', 'short'].includes(value)) return value;
+    const hasPositionSize = record.position_size_pct !== null && record.position_size_pct !== undefined;
+    const positionSize = Number(record.position_size_pct);
+    const zeroPositionSize = hasPositionSize && Number.isFinite(positionSize) && positionSize <= 0;
+    return zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value;
+}
+
 function analysisActionLabel(action, record = null) {
-    const value = String(action || '').toLowerCase();
-    if (!record || analysisRecordType(record) !== 'position') return actionLabel(action);
+    const originalValue = String(action || '').toLowerCase();
+    const value = analysisDisplayAction(action, record);
+    if (!record || analysisRecordType(record) !== 'position') {
+        const observed = String(record?.observed_action || originalValue).toLowerCase();
+        if (value === 'hold' && ['long', 'short'].includes(observed)) {
+            return observed === 'long' ? '观望（看多观察）' : '观望（看空观察）';
+        }
+        return actionLabel(value);
+    }
     const side = analysisPositionSide(record);
     const reviewResult = String(record?.position_review_policy?.result || '').toLowerCase();
     const labels = {
@@ -3318,7 +3335,7 @@ function renderAnalysisPage() {
             </td> 
             <td style="font-size:11px;color:${hasMajorConflict ? 'var(--red)' : 'var(--text-muted)'};">${crossText}</td> 
             <td style="font-size:11px;color:var(--text-muted);">${analysisConsultationLabel(r.consultation_status, hasMajorConflict)}</td>
-            <td><span class="badge badge-${r.final_action || 'hold'}">${analysisActionLabel(r.final_action, r)}</span></td>
+            <td><span class="badge badge-${analysisDisplayAction(r.final_action, r)}">${analysisActionLabel(r.final_action, r)}</span></td>
             <td style="color:${conf >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${(conf * 100).toFixed(0)}%</td>
             <td>${score}</td>
             <td>
@@ -8986,7 +9003,7 @@ function renderDecisionsPage(totalPagesOverride = null) {
         <tr>
             <td style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${toBeijingTime(d.created_at)}</td>
             <td>${escHtml(d.symbol || '-')}</td>
-            <td><span class="badge badge-${d.action || 'hold'}">${analysisActionLabel(d.action, d)}</span></td>
+            <td><span class="badge badge-${analysisDisplayAction(d.action, d)}">${analysisActionLabel(d.action, d)}</span></td>
             <td style="color:${(d.confidence || 0) >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${confPct}%</td>
             <td class="decision-size-cell">${decisionSizeCell(d)}</td>
             <td>${executedHtml}</td>

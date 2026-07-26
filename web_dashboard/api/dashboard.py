@@ -1808,6 +1808,31 @@ def _analysis_display_confidence(
     return _clamp_confidence(weighted_score)
 
 
+def _analysis_display_action(
+    decision: Any,
+    analysis_type: str,
+    execution_reason: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Separate an observed direction from a final executable market decision."""
+
+    action = str(getattr(decision, "action", "") or "hold").lower()
+    if analysis_type != "market" or action not in {"long", "short"}:
+        return action, None, None
+    if bool(getattr(decision, "was_executed", False)):
+        return action, None, None
+
+    position_size = _safe_float(getattr(decision, "position_size_pct", None), 0.0) or 0.0
+    if position_size > 0.0 and not execution_reason:
+        return action, None, None
+
+    observed_label = "看多" if action == "long" else "看空"
+    return (
+        "hold",
+        action,
+        f"方向模型仅给出{observed_label}观察，但本轮未获得新开仓许可；最终裁决为观望。",
+    )
+
+
 def _build_execution_account_status(
     mode: str,
     paper_summary: dict | None = None,
@@ -7190,9 +7215,21 @@ async def get_analysis_records(
             for e in expected_experts
             if e["expert_name"] not in returned_names
         ]
-        trade_confidence = _clamp_confidence(_safe_float(d.confidence, 0.0))
-        display_confidence = _analysis_display_confidence(d.action, trade_confidence, experts, raw)
         analysis_type, analysis_type_label = infer_analysis_type(d, raw)
+        trade_confidence = _clamp_confidence(_safe_float(d.confidence, 0.0))
+        display_execution_reason = _display_execution_reason(d)
+        display_action, observed_action, display_reasoning = _analysis_display_action(
+            d,
+            analysis_type,
+            display_execution_reason,
+        )
+        display_trade_confidence = 0.0 if observed_action else trade_confidence
+        display_confidence = _analysis_display_confidence(
+            display_action,
+            display_trade_confidence,
+            experts,
+            raw,
+        )
         position_lifecycle_status, position_lifecycle_label = infer_position_lifecycle(
             d, analysis_type
         )
@@ -7214,9 +7251,7 @@ async def get_analysis_records(
                 continue
             if len(records) >= effective_page_size:
                 continue
-
         local_ai_tools_payload = _normalized_local_ai_tools_payload(raw)
-        display_execution_reason = _display_execution_reason(d)
         vector_memory_context = (
             await get_vector_memory_service().similar_decision_context(d, raw)
             if include_detail and settings.vector_memory_enabled
@@ -7303,15 +7338,20 @@ async def get_analysis_records(
             "consultation_status": (
                 consultation.get("status") if isinstance(consultation, dict) else None
             ),
-            "final_action": d.action,
+            "final_action": display_action,
+            "observed_action": observed_action,
             "final_confidence": display_confidence,
-            "trade_confidence": trade_confidence,
+            "trade_confidence": display_trade_confidence,
+            "observed_trade_confidence": trade_confidence if observed_action else None,
             "confidence_note": (
-                "观望/不下单时，信心度显示专家加权平均分析信心；内部下单信心仍为 0，避免误触发交易。"
-                if d.action == "hold" and trade_confidence == 0.0
+                "观望/不下单时，信心度显示专家加权平均分析信心；最终下单信心为 0，避免误触发交易。"
+                if display_action == "hold" and display_trade_confidence == 0.0
                 else "信心度来自最终可执行裁决。"
             ),
-            "final_reasoning": sanitize_text(d.reasoning),
+            "final_reasoning": display_reasoning or sanitize_text(d.reasoning),
+            "observed_reasoning": (
+                sanitize_text(d.reasoning) if observed_action else None
+            ),
             "position_size_pct": d.position_size_pct,
             "weighted_score": raw.get("weighted_score"),
             "disagreement": raw.get("disagreement"),
