@@ -1163,7 +1163,7 @@ async def test_data_collection_status_keeps_config_when_governance_times_out(
 
 
 @pytest.mark.asyncio
-async def test_data_collection_status_runs_database_sections_serially(
+async def test_data_collection_status_runs_independent_database_sections_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     active_db_sections = 0
@@ -1220,8 +1220,8 @@ async def test_data_collection_status_runs_database_sections_serially(
     body = await data_collection_module.get_data_collection_status(include_feature_coverage=True)
 
     assert body["training"]["local_ai_tools"]["status"] == "ready"
-    assert max_active_db_sections == 1
-    assert events == [
+    assert max_active_db_sections == 4
+    assert set(events) == {
         "start:source_breakdown",
         "end:source_breakdown",
         "start:training_sample_quality",
@@ -1232,7 +1232,41 @@ async def test_data_collection_status_runs_database_sections_serially(
         "end:training_governance",
         "start:crypto_feature_coverage",
         "end:crypto_feature_coverage",
-    ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_data_collection_status_applies_deadline_to_every_observation_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_section() -> dict[str, Any]:
+        await asyncio.sleep(1)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(data_collection_module, "STATUS_SECTION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(data_collection_module, "_source_breakdown", slow_section)
+    monkeypatch.setattr(data_collection_module, "_training_sample_quality", slow_section)
+    monkeypatch.setattr(data_collection_module, "_local_ai_training_status", slow_section)
+    monkeypatch.setattr(data_collection_module, "_training_governance_snapshot", slow_section)
+
+    class FakeCryptoFeatureCoverageService:
+        async def report(self, *, hours: int = 24, limit: int = 1000) -> dict[str, Any]:
+            await asyncio.sleep(1)
+            return {"status": "ok"}
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "CryptoFeatureCoverageService",
+        lambda: FakeCryptoFeatureCoverageService(),
+    )
+
+    body = await data_collection_module.get_data_collection_status()
+
+    assert body["stats"]["status"] == "error"
+    assert body["training"]["text_sentiment_quality_sample"]["status"] == "error"
+    assert body["training"]["local_ai_tools"]["status"] == "error"
+    assert body["training"]["governance"]["status"] == "error"
+    assert body["feature_coverage"]["status"] == "error"
 
 
 async def _async_value(value: Any) -> Any:

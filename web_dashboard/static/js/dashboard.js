@@ -338,23 +338,39 @@ function apiErrorText(data, fallback = '未知错误') {
     return String(detail || fallback).trim() || fallback;
 }
 
+const inflightJSONRequests = new Map();
+
 async function fetchJSON(url) {
+    const requestKey = String(url);
+    const existingRequest = inflightJSONRequests.get(requestKey);
+    if (existingRequest) return existingRequest;
+
+    const request = (async () => {
+        try {
+            const res = await fetch(url, { cache: 'no-store' });
+            const data = await res.json().catch(() => ({}));
+            if (res.status === 401) {
+                const message = apiErrorText(data, '登录已过期，请重新登录。');
+                redirectToLogin(message);
+                throw new Error(message);
+            }
+            if (!res.ok) {
+                console.error(`Fetch failed: ${url}`, data);
+                throw new Error(apiErrorText(data, res.statusText || '请求失败'));
+            }
+            return data;
+        } catch (e) {
+            console.error(`Fetch failed: ${url}`, e);
+            throw e;
+        }
+    })();
+    inflightJSONRequests.set(requestKey, request);
     try {
-        const res = await fetch(url, { cache: 'no-store' });
-        const data = await res.json().catch(() => ({}));
-        if (res.status === 401) {
-            const message = apiErrorText(data, '登录已过期，请重新登录。');
-            redirectToLogin(message);
-            throw new Error(message);
+        return await request;
+    } finally {
+        if (inflightJSONRequests.get(requestKey) === request) {
+            inflightJSONRequests.delete(requestKey);
         }
-        if (!res.ok) {
-            console.error(`Fetch failed: ${url}`, data);
-            throw new Error(apiErrorText(data, res.statusText || '请求失败'));
-        }
-        return data;
-    } catch (e) {
-        console.error(`Fetch failed: ${url}`, e);
-        throw e;
     }
 }
 

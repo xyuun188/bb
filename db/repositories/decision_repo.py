@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -13,6 +14,39 @@ from services.decision_state import (
     is_decision_terminal_state,
 )
 from services.text_integrity import sanitize_runtime_text
+
+_DASHBOARD_RAW_PAYLOAD_KEYS = (
+    "opportunity_score",
+    "stage_status",
+    "execution_status",
+    "policy_blocker",
+    "skip_kind",
+    "untradable_exit_execution_error",
+    "execution_result",
+    "close_evidence",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionSummary:
+    """Read model for decision lists without hydrating large training/model payloads."""
+
+    id: int
+    model_name: str
+    symbol: str
+    action: str
+    confidence: float
+    reasoning: str | None
+    position_size_pct: float
+    suggested_leverage: float
+    was_executed: bool
+    execution_reason: str | None
+    executed_at: datetime | None
+    execution_price: float | None
+    created_at: datetime | None
+    outcome: str | None
+    is_paper: bool
+    raw_llm_response: dict[str, Any]
 
 
 class DecisionRepository(BaseRepository):
@@ -60,6 +94,92 @@ class DecisionRepository(BaseRepository):
             stmt = stmt.where(AIDecision.is_paper == is_paper)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_recent_decision_summaries(
+        self,
+        model_name: str | None = None,
+        symbol: str | None = None,
+        action: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        was_executed: bool | None = None,
+        is_paper: bool | None = None,
+    ) -> list[DecisionSummary]:
+        """Load the dashboard list contract without full decision JSON columns."""
+
+        columns = [
+            AIDecision.id,
+            AIDecision.model_name,
+            AIDecision.symbol,
+            AIDecision.action,
+            AIDecision.confidence,
+            AIDecision.reasoning,
+            AIDecision.position_size_pct,
+            AIDecision.suggested_leverage,
+            AIDecision.was_executed,
+            AIDecision.execution_reason,
+            AIDecision.executed_at,
+            AIDecision.execution_price,
+            AIDecision.created_at,
+            AIDecision.outcome,
+            AIDecision.is_paper,
+        ]
+        columns.extend(
+            AIDecision.raw_llm_response[key].label(f"raw_{key}")
+            for key in _DASHBOARD_RAW_PAYLOAD_KEYS
+        )
+        stmt = (
+            select(*columns)
+            .order_by(AIDecision.created_at.desc())
+            .offset(max(int(offset or 0), 0))
+            .limit(limit)
+        )
+        if model_name:
+            stmt = stmt.where(AIDecision.model_name == model_name)
+        if symbol:
+            stmt = stmt.where(AIDecision.symbol == symbol)
+        if action:
+            stmt = stmt.where(AIDecision.action == action)
+        if start_date:
+            stmt = stmt.where(AIDecision.created_at >= start_date)
+        if end_date:
+            stmt = stmt.where(AIDecision.created_at <= end_date)
+        if was_executed is not None:
+            stmt = stmt.where(AIDecision.was_executed == was_executed)
+        if is_paper is not None:
+            stmt = stmt.where(AIDecision.is_paper == is_paper)
+
+        result = await self.session.execute(stmt)
+        summaries: list[DecisionSummary] = []
+        for row in result.mappings().all():
+            raw_payload = {
+                key: row[f"raw_{key}"]
+                for key in _DASHBOARD_RAW_PAYLOAD_KEYS
+                if row[f"raw_{key}"] is not None
+            }
+            summaries.append(
+                DecisionSummary(
+                    id=row["id"],
+                    model_name=row["model_name"],
+                    symbol=row["symbol"],
+                    action=row["action"],
+                    confidence=row["confidence"],
+                    reasoning=row["reasoning"],
+                    position_size_pct=row["position_size_pct"],
+                    suggested_leverage=row["suggested_leverage"],
+                    was_executed=row["was_executed"],
+                    execution_reason=row["execution_reason"],
+                    executed_at=row["executed_at"],
+                    execution_price=row["execution_price"],
+                    created_at=row["created_at"],
+                    outcome=row["outcome"],
+                    is_paper=row["is_paper"],
+                    raw_llm_response=raw_payload,
+                )
+            )
+        return summaries
 
     async def mark_executed(self, decision_id: int, execution_price: float) -> AIDecision | None:
         decision = await self.get(decision_id)

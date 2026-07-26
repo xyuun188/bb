@@ -1055,24 +1055,41 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
 async def get_data_collection_status(
     include_feature_coverage: bool = True,
 ) -> dict[str, Any]:
-    # asyncpg does not allow concurrent operations on the same connection.
-    # Keep status sections serial so dashboard audits report real data
-    # problems instead of connection scheduling noise from nested probes.
-    source_stats_result = await _run_status_section(_source_breakdown)
-    quality_result = await _run_status_section(_training_sample_quality)
-    local_ai_status_result = await _run_status_section(_local_ai_training_status)
-    governance_result = await _run_status_section(
-        _training_governance_snapshot,
-        timeout=STATUS_SECTION_TIMEOUT_SECONDS,
-    )
-    feature_coverage_result: dict[str, Any] | Exception
-    if include_feature_coverage:
-        feature_coverage_result = await _run_status_section(
-            lambda: CryptoFeatureCoverageService().report(hours=24, limit=1000),
+    # Each section owns its own session, so independent status reads can run together.
+    section_calls = [
+        _run_status_section(
+            _source_breakdown,
             timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        ),
+        _run_status_section(
+            _training_sample_quality,
+            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        ),
+        _run_status_section(
+            _local_ai_training_status,
+            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        ),
+        _run_status_section(
+            _training_governance_snapshot,
+            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+        ),
+    ]
+    if include_feature_coverage:
+        section_calls.append(
+            _run_status_section(
+                lambda: CryptoFeatureCoverageService().report(hours=24, limit=1000),
+                timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+            )
         )
     else:
-        feature_coverage_result = _skipped_feature_coverage_status()
+        section_calls.append(asyncio.sleep(0, result=_skipped_feature_coverage_status()))
+    (
+        source_stats_result,
+        quality_result,
+        local_ai_status_result,
+        governance_result,
+        feature_coverage_result,
+    ) = await asyncio.gather(*section_calls)
     source_stats = _safe_status_section(
         source_stats_result,
         section="source_breakdown",

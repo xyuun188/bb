@@ -6496,7 +6496,7 @@ async def get_decisions(
 
     async with get_session_ctx() as session:
         repo = DecisionRepository(session)
-        rows = await repo.get_recent_decisions(
+        rows = await repo.get_recent_decision_summaries(
             model_name=model_name,
             action=action_filter,
             limit=effective_page_size,
@@ -6518,11 +6518,18 @@ async def get_decisions(
         decision_ids = [d.id for d in rows]
         if decision_ids:
             order_result = await session.execute(
-                select(Order)
+                select(
+                    Order.decision_id,
+                    Order.quantity,
+                    Order.price,
+                    Order.status,
+                    Order.exchange_order_id,
+                    Order.created_at,
+                )
                 .where(Order.decision_id.in_(decision_ids))
                 .order_by(Order.created_at.desc())
             )
-            for order in order_result.scalars().all():
+            for order in order_result.all():
                 if order.decision_id not in order_map:
                     order_map[order.decision_id] = order
 

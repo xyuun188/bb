@@ -14,6 +14,17 @@ def _u(escaped: str) -> str:
     return escaped.encode("ascii").decode("unicode_escape")
 
 
+def test_dashboard_deduplicates_identical_inflight_reads() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const inflightJSONRequests = new Map();" in script
+    assert "const existingRequest = inflightJSONRequests.get(requestKey);" in script
+    assert "if (existingRequest) return existingRequest;" in script
+    assert "inflightJSONRequests.delete(requestKey);" in script
+
+
 def test_main_dashboard_removes_manual_symbol_selector() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
