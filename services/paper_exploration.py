@@ -15,8 +15,9 @@ from math import isclose, isfinite, sqrt
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_direction_support import directional_entry_support_reasons
 
-PAPER_EXPLORATION_VERSION = "2026-07-25.complete-paper-exploration.v3"
+PAPER_EXPLORATION_VERSION = "2026-07-27.independent-paper-exploration.v4"
 PAPER_EXPLORATION_SIZING_VERSION = "2026-07-21.bounded-paper-risk.v1"
 PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0001
 PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION = 0.0003
@@ -92,6 +93,7 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "exploration_allocation_multiplier",
             "feature_opportunity_score",
             "information_value_score",
+            "independent_direction_support",
             "prediction_horizon_minutes",
             "valid_for_seconds",
             "single_trade_risk_fraction_cap",
@@ -266,11 +268,17 @@ def build_paper_exploration_contract(
     candidate_evidence: dict[str, Any],
     *,
     symbol: str,
+    independent_direction_support: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     exploration = _dict(candidate_evidence.get("paper_exploration"))
     selected = _dict(exploration.get("selected"))
     side = str(exploration.get("preferred_side") or "").lower()
-    if side not in {"long", "short"} or selected.get("eligible") is not True:
+    direction_support = _dict(independent_direction_support)
+    if (
+        side not in {"long", "short"}
+        or selected.get("eligible") is not True
+        or directional_entry_support_reasons(direction_support, side)
+    ):
         return {}
     generated_at = datetime.now(UTC).isoformat()
     contract = {
@@ -306,6 +314,7 @@ def build_paper_exploration_contract(
         ),
         "feature_opportunity_score": selected.get("feature_opportunity_score"),
         "information_value_score": selected.get("information_value_score"),
+        "independent_direction_support": direction_support,
         "prediction_horizon_minutes": selected.get("prediction_horizon_minutes"),
         "valid_for_seconds": selected.get("valid_for_seconds"),
         "single_trade_risk_fraction_cap": (
@@ -360,6 +369,12 @@ def paper_exploration_contract_reasons(contract_value: Any) -> list[str]:
         reasons.append("paper_exploration_production_permission_invalid")
     if contract.get("trade_is_normal") is not True:
         reasons.append("paper_exploration_normal_trade_contract_missing")
+    reasons.extend(
+        directional_entry_support_reasons(
+            contract.get("independent_direction_support"),
+            str(contract.get("selected_side") or ""),
+        )
+    )
     expected_net = _float(contract.get("expected_net_return_pct"), None)
     return_lcb = _float(contract.get("return_lcb_pct"), None)
     lcb_gap_ratio = _float(contract.get("lcb_gap_ratio"), None)

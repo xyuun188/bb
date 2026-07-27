@@ -143,7 +143,7 @@ def test_shadow_model_cannot_enter_direction_scores() -> None:
     assert context["production_source_count"] == 0
 
 
-def test_shadow_model_still_exposes_direction_for_paper_training() -> None:
+def test_negative_shadow_scores_do_not_create_an_intervention_direction() -> None:
     payload = _governed_ml(-0.4, -0.1)
     payload.update(
         {
@@ -157,7 +157,7 @@ def test_shadow_model_still_exposes_direction_for_paper_training() -> None:
 
     assert context["preferred_side"] == "neutral"
     assert context["production_source_count"] == 0
-    assert context["training_preferred_side"] == "short"
+    assert context["training_preferred_side"] == "neutral"
     assert context["training_short"]["observation_count"] == 1
     assert context["training_short"]["horizon_minutes"] == 30
     assert context["training_short"]["horizon_source_count"] == 1

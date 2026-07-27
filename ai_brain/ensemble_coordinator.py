@@ -23,6 +23,7 @@ from config.settings import (
     FIXED_AI_MODEL_SLOTS,
 )
 from services.dynamic_exit_policy import assess_dynamic_exit
+from services.entry_direction_support import assess_directional_entry_support
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     signal_production_eligible,
@@ -33,10 +34,6 @@ from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
 from services.paper_exploration import build_paper_exploration_contract
-from services.paper_training import (
-    build_paper_training_contract,
-    paper_training_mode_enabled,
-)
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -873,7 +870,7 @@ class EnsembleCoordinator:
                 "strategy_version",
             )
         )
-        production_eligible = bool(
+        return_candidate_eligible = bool(
             preferred_side in {"long", "short"}
             and side_evidence.get("production_eligible") is True
             and self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0) > 0.0
@@ -881,92 +878,37 @@ class EnsembleCoordinator:
             and self._safe_float(side_evidence.get("production_source_count"), 0.0) > 0.0
             and governance_complete
         )
+        direction_support = assess_directional_entry_support(
+            self._safe_dict(context.get("direction_competition")),
+            raw_opinions,
+            preferred_side,
+        )
+        production_eligible = bool(
+            return_candidate_eligible and direction_support.get("eligible") is True
+        )
         raw["authoritative_return_candidate"] = {
             "production_eligible": production_eligible,
+            "return_candidate_eligible": return_candidate_eligible,
             "preferred_side": preferred_side or "neutral",
             "side_evidence": side_evidence,
             "policy_provenance": policy_provenance,
+            "independent_direction_support": direction_support,
         }
         if not production_eligible:
-            training_admission = self._paper_training_admission(context, raw_opinions)
-            if training_admission["eligible"]:
-                training_side = str(training_admission["selected_side"])
-                training_contract = build_paper_training_contract(
-                    symbol=features.symbol,
-                    selected_side=training_side,
-                    signal_source=str(training_admission["signal_source"]),
-                    expected_net_return_pct=training_admission["raw_expected_return_pct"],
-                    return_lcb_pct=training_admission["objective_expected_return_pct"],
-                    feature_opportunity_score=self._safe_float(
-                        candidate_evidence.get("feature_opportunity_score"),
-                        0.0,
-                    ),
-                    horizon_minutes=training_admission["horizon_minutes"],
-                    policy_provenance=self._safe_dict(
-                        training_admission.get("policy_provenance")
-                    ),
-                )
-                training_raw = self._raw(
-                    raw_opinions,
-                    decision_score,
-                    disagreement,
-                    cross_validations,
-                    consultation,
-                )
-                self._attach_expert_diversity_policy(training_raw, context)
-                training_raw["authoritative_return_candidate"] = raw[
-                    "authoritative_return_candidate"
-                ]
-                training_raw["entry_candidate_evidence"] = candidate_evidence
-                training_raw["paper_training"] = training_contract
-                training_raw["paper_training_admission"] = training_admission
-                training_raw["paper_training_mode"] = "bootstrap"
-                training_raw["entry_permission"] = {
-                    "granted": True,
-                    "scope": "paper_training_only",
-                    "reason": "independent_training_evidence_ready",
-                    "production_permission": False,
-                }
-                training_raw["base_weighted_score_observation"] = round(
-                    normalized_score,
-                    4,
-                )
-                training_raw["memory_feedback_observation"] = self._memory_feedback(context)
-                training_raw["ml_signal"] = context.get("ml_signal") or {}
-                training_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
-                training_raw["direction_competition"] = (
-                    context.get("direction_competition") or {}
-                )
-                action = Action.LONG if training_side == "long" else Action.SHORT
-                support = int(training_admission["support_channel_count"])
-                opposition = int(training_admission["opposition_channel_count"])
-                reason = self._reason(
-                    (
-                        f"模拟盘受控训练介入：未晋升模型允许参与，{support} 个独立支持通道、"
-                        f"{opposition} 个反对通道；订单使用独立小风险训练合同"
-                    ),
-                    decision_score,
-                    disagreement,
-                    raw_opinions,
-                    resolution_brief,
-                )
-                return self._entry_decision(
-                    features=features,
-                    context=context,
-                    action=action,
-                    confidence=self._safe_float(training_admission.get("confidence"), 0.0),
-                    reasoning=reason,
-                    raw_response=training_raw,
-                    raw_opinions=raw_opinions,
-                )
             exploration_side = str(
                 candidate_evidence.get("preferred_exploration_side") or ""
             ).lower()
             execution_mode = str(context.get("execution_mode") or "").lower()
+            exploration_support = assess_directional_entry_support(
+                self._safe_dict(context.get("direction_competition")),
+                raw_opinions,
+                exploration_side,
+            )
             exploration_contract = (
                 build_paper_exploration_contract(
                     candidate_evidence,
                     symbol=features.symbol,
+                    independent_direction_support=exploration_support,
                 )
                 if execution_mode == "paper" and exploration_side in {"long", "short"}
                 else {}
@@ -1005,6 +947,13 @@ class EnsembleCoordinator:
                 ]
                 exploration_raw["entry_candidate_evidence"] = candidate_evidence
                 exploration_raw["paper_exploration"] = exploration_contract
+                exploration_raw["independent_direction_support"] = exploration_support
+                exploration_raw["entry_permission"] = {
+                    "granted": True,
+                    "scope": "bounded_unpromoted_model_intervention",
+                    "reason": "independent_positive_direction_support_ready",
+                    "production_permission": False,
+                }
                 exploration_raw["base_weighted_score_observation"] = round(
                     normalized_score,
                     4,
@@ -1040,10 +989,24 @@ class EnsembleCoordinator:
             self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["authoritative_return_candidate"] = raw["authoritative_return_candidate"]
             hold_raw["entry_candidate_evidence"] = candidate_evidence
-            hold_raw["paper_training_admission"] = training_admission
+            hold_raw["independent_direction_support"] = (
+                direction_support
+                if return_candidate_eligible
+                else exploration_support
+            )
+            hold_raw["paper_training_retirement"] = {
+                "retired": True,
+                "execution_permission": False,
+                "training_policy": "shadow_prediction_only",
+                "reason": "training_collection_cannot_create_orders",
+            }
             hold_raw["entry_permission"] = {
                 "granted": False,
-                "reason": training_admission["reason"],
+                "reason": (
+                    direction_support.get("reason")
+                    if return_candidate_eligible
+                    else exploration_support.get("reason")
+                ),
                 "training_policy": "shadow_prediction_only",
             }
             hold_raw["base_weighted_score_observation"] = round(normalized_score, 4)
@@ -1359,131 +1322,6 @@ class EnsembleCoordinator:
     @staticmethod
     def _safe_dict(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
-
-    def _paper_training_admission(
-        self,
-        context: dict[str, Any],
-        raw_opinions: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Authorize bounded paper training from independent directional evidence."""
-
-        competition = self._safe_dict(context.get("direction_competition"))
-        side = str(competition.get("training_preferred_side") or "").lower()
-        selected = self._safe_dict(competition.get(f"training_{side}"))
-        opposite_side = "short" if side == "long" else "long"
-        opposite = self._safe_dict(competition.get(f"training_{opposite_side}"))
-        selected_score = self._finite_or_none(selected.get("score"))
-        opposite_score = self._finite_or_none(opposite.get("score"))
-        horizon = self._finite_or_none(selected.get("horizon_minutes"))
-        declared_model_source_count = max(
-            int(self._safe_float(selected.get("observation_count"), 0.0)),
-            0,
-        )
-        side_evidence = self._safe_dict(competition.get(side))
-        evidence_rows = side_evidence.get("evidence")
-        if not isinstance(evidence_rows, list):
-            evidence_rows = []
-        model_sources = sorted(
-            {
-                str(item.get("source") or "").strip()
-                for item in evidence_rows
-                if isinstance(item, dict)
-                and str(item.get("source") or "").strip()
-                and (
-                    self._finite_or_none(item.get("objective_expected_return_pct"))
-                    is not None
-                    or self._finite_or_none(item.get("raw_expected_return_pct"))
-                    is not None
-                )
-                and (self._finite_or_none(item.get("horizon_minutes")) or 0.0) > 0.0
-            }
-        )
-        model_source_count = len(model_sources)
-        auditable_experts = [
-            item
-            for item in raw_opinions
-            if self._safe_float(item.get("effective_weight"), 0.0) > 0.0
-            and item.get("trace_only_fallback") is not True
-            and str(item.get("reasoning") or "").strip()
-            and str(item.get("action") or "").lower()
-            in {"long", "short", "hold"}
-        ]
-        aligned_expert_count = sum(
-            str(item.get("action") or "").lower() == side for item in auditable_experts
-        )
-        opposition_expert_count = sum(
-            str(item.get("action") or "").lower() == opposite_side
-            for item in auditable_experts
-        )
-        hold_expert_count = sum(
-            str(item.get("action") or "").lower() == "hold"
-            for item in auditable_experts
-        )
-        support_channel_count = model_source_count + aligned_expert_count
-        opposition_channel_count = opposition_expert_count
-        blockers: list[str] = []
-        if not paper_training_mode_enabled(context):
-            blockers.append("paper_training_mode_not_enabled")
-        if side not in {"long", "short"}:
-            blockers.append("paper_training_direction_missing")
-        if selected_score is None:
-            blockers.append("paper_training_direction_score_missing")
-        if horizon is None or horizon <= 0.0:
-            blockers.append("paper_training_prediction_horizon_missing")
-        if model_source_count <= 0:
-            blockers.append("paper_training_model_observation_missing")
-        if declared_model_source_count != model_source_count:
-            blockers.append("paper_training_model_evidence_incomplete")
-        if len(auditable_experts) < 3:
-            blockers.append("paper_training_expert_analysis_incomplete")
-        if opposite_score is not None and selected_score is not None:
-            if selected_score <= opposite_score:
-                blockers.append("paper_training_direction_not_preferred")
-        if support_channel_count < 2:
-            blockers.append("paper_training_independent_support_insufficient")
-        if support_channel_count <= opposition_channel_count:
-            blockers.append("paper_training_opposition_not_resolved")
-
-        evidence_total = (
-            support_channel_count + opposition_channel_count + hold_expert_count
-        )
-        confidence = (
-            support_channel_count / evidence_total if evidence_total > 0 else 0.0
-        )
-        return {
-            "version": "2026-07-26.controlled-paper-training-admission.v1",
-            "eligible": not blockers,
-            "reason": (
-                "controlled_paper_training_evidence_ready"
-                if not blockers
-                else blockers[0]
-            ),
-            "blockers": list(dict.fromkeys(blockers)),
-            "selected_side": side if side in {"long", "short"} else "neutral",
-            "signal_source": "independent_model_and_expert_training_evidence",
-            "model_sources": model_sources,
-            "model_source_count": model_source_count,
-            "declared_model_source_count": declared_model_source_count,
-            "aligned_expert_count": aligned_expert_count,
-            "opposition_expert_count": opposition_expert_count,
-            "hold_expert_count": hold_expert_count,
-            "auditable_expert_count": len(auditable_experts),
-            "support_channel_count": support_channel_count,
-            "opposition_channel_count": opposition_channel_count,
-            "confidence": round(min(max(confidence, 0.0), 1.0), 8),
-            "raw_expected_return_pct": self._finite_or_none(
-                selected.get("raw_expected_return_pct")
-            ),
-            "objective_expected_return_pct": self._finite_or_none(
-                selected.get("objective_expected_return_pct")
-            ),
-            "horizon_minutes": horizon,
-            "policy_provenance": self._safe_dict(
-                competition.get("policy_provenance")
-            ),
-            "production_permission": False,
-            "training_permission": not blockers,
-        }
 
     @staticmethod
     def _finite_or_none(value: Any) -> float | None:

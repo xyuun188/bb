@@ -79,6 +79,19 @@ def _return_context(**extra: object) -> dict[str, object]:
         "fallback_reason": "",
     }
     context: dict[str, object] = {
+        "direction_competition": {
+            "long": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "raw_expected_return_pct": 0.6,
+                        "objective_expected_return_pct": 0.4,
+                        "horizon_minutes": 30,
+                    }
+                ]
+            },
+            "short": {"evidence": []},
+        },
         "entry_candidate_evidence": {
             "preferred_side_by_evidence": "long",
             "long": {
@@ -145,6 +158,19 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
     }
     return {
         "execution_mode": execution_mode,
+        "direction_competition": {
+            "long": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "raw_expected_return_pct": 0.3,
+                        "objective_expected_return_pct": 0.1,
+                        "horizon_minutes": 30,
+                    }
+                ]
+            },
+            "short": {"evidence": []},
+        },
         "entry_candidate_evidence": evidence,
     }
 
@@ -206,11 +232,16 @@ def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote(
     assert "legacy_expert_vote_permission_enabled" not in candidate
 
 
-def test_authoritative_return_candidate_does_not_depend_on_expert_availability() -> None:
+def test_authoritative_return_candidate_requires_expert_direction_confirmation() -> None:
     decision = _coordinator().combine(_features(), _return_context(), {})
 
-    assert decision.action == Action.LONG
-    assert decision.raw_response["authoritative_return_candidate"]["production_eligible"] is True
+    assert decision.action == Action.HOLD
+    candidate = decision.raw_response["authoritative_return_candidate"]
+    assert candidate["return_candidate_eligible"] is True
+    assert candidate["production_eligible"] is False
+    assert candidate["independent_direction_support"]["reason"] == (
+        "direction_support_expert_analysis_incomplete"
+    )
 
 
 def test_paper_entry_aggregates_matching_model_trade_plan() -> None:
@@ -328,17 +359,14 @@ def test_single_source_training_observation_remains_blocked() -> None:
 
     assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    assert decision.raw_response["entry_permission"] == {
-        "granted": False,
-        "reason": "paper_training_independent_support_insufficient",
-        "training_policy": "shadow_prediction_only",
-    }
-    admission = decision.raw_response["paper_training_admission"]
-    assert admission["model_source_count"] == 1
-    assert admission["opposition_expert_count"] == 5
+    assert decision.raw_response["entry_permission"]["granted"] is False
+    assert decision.raw_response["paper_training_retirement"]["retired"] is True
+    assert decision.raw_response["paper_training_retirement"][
+        "training_policy"
+    ] == "shadow_prediction_only"
 
 
-def test_two_independent_model_sources_can_create_bounded_paper_training_entry() -> None:
+def test_negative_training_observations_cannot_create_orders() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -384,26 +412,14 @@ def test_two_independent_model_sources_can_create_bounded_paper_training_entry()
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.SHORT
-    assert decision.raw_response["entry_permission"] == {
-        "granted": True,
-        "scope": "paper_training_only",
-        "reason": "independent_training_evidence_ready",
-        "production_permission": False,
-    }
-    contract = decision.raw_response["paper_training"]
-    assert contract["authorized"] is True
-    assert contract["execution_scope"] == "paper_only"
-    assert contract["production_permission"] is False
-    assert contract["single_trade_risk_fraction_cap"] == 0.0001
-    assert contract["portfolio_risk_fraction_cap"] == 0.0003
-    admission = decision.raw_response["paper_training_admission"]
-    assert admission["model_source_count"] == 2
-    assert admission["aligned_expert_count"] == 0
-    assert admission["opposition_expert_count"] == 0
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
+    assert decision.raw_response["paper_training_retirement"][
+        "execution_permission"
+    ] is False
 
 
-def test_one_model_source_plus_one_aligned_expert_can_create_paper_training_entry() -> None:
+def test_negative_objective_with_one_aligned_expert_remains_shadow_only() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -446,12 +462,9 @@ def test_one_model_source_plus_one_aligned_expert_can_create_paper_training_entr
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.LONG
-    admission = decision.raw_response["paper_training_admission"]
-    assert admission["model_source_count"] == 1
-    assert admission["aligned_expert_count"] == 1
-    assert admission["support_channel_count"] == 2
-    assert admission["training_permission"] is True
+    assert decision.action == Action.HOLD
+    assert "paper_training" not in decision.raw_response
+    assert decision.raw_response["paper_training_retirement"]["retired"] is True
 
 
 def test_unresolved_expert_opposition_blocks_paper_training_entry() -> None:
@@ -492,10 +505,7 @@ def test_unresolved_expert_opposition_blocks_paper_training_entry() -> None:
 
     assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    admission = decision.raw_response["paper_training_admission"]
-    assert admission["support_channel_count"] == 2
-    assert admission["opposition_channel_count"] == 2
-    assert admission["reason"] == "paper_training_opposition_not_resolved"
+    assert decision.raw_response["paper_training_retirement"]["retired"] is True
 
 
 def test_paper_training_route_is_never_created_for_live_execution() -> None:

@@ -212,7 +212,9 @@ def _format_entry_candidate_evidence(evidence: dict[str, Any]) -> str:
         f"{side_line('long')} | {side_line('short')}. "
         "Only production-governed fee-after return sources may choose a side. "
         "Compare the selected side's net-return lower bound, expected downside, live costs, "
-        "and current account risk budget. Missing governance or non-positive lower bound means hold."
+        "and current account risk budget. Direction and timing specialists must still record "
+        "a long/short diagnosis when market evidence supports one; missing promotion or a "
+        "non-positive lower bound prevents execution, but does not erase directional analysis."
     )
 
 
@@ -657,7 +659,8 @@ def _calibrate_sentiment_decision(
 
 _FAST_EXPERT_SYSTEM_PROMPT = """FAST_EXPERT_JSON_V1. Return only one compact JSON object. No markdown, no prose, no <think>.
 Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":"positive number, account-capped later","stop_loss_pct":"0-1, derived from current market risk","take_profit_pct":"0-1, derived from current expected move","cross_check_for":null}
-Confidence is diagnostic only. Incomplete fee-after return or provenance => hold."""
+Confidence is diagnostic only. Direction/timing roles still report observable long/short
+evidence; incomplete fee-after return or provenance prevents execution, not diagnosis."""
 
 _PAPER_FAST_EXPERT_SYSTEM_PROMPT = """PAPER_FAST_EXPERT_JSON_V1. Return one compact JSON object only. No markdown, no prose, no <think>.
 Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"short Chinese text","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0-1,"take_profit_pct":0-1,"suggested_holding_minutes":1-10080,"maximum_holding_minutes":1-20000,"suggested_close_fraction":0-1,"cross_check_for":null}

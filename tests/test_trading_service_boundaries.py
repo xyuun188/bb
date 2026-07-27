@@ -5116,8 +5116,8 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     assert result["current_production_strategy"]["id"] == "cached_production_strategy"
     assert result["strategy_learning_cache_status"] == "stale_background_refresh"
     assert result["execution_mode"] == "paper"
-    assert result["paper_training_mode"] == "bootstrap"
-    assert paper_training_mode_enabled(result) is True
+    assert result["paper_training_mode"] == "shadow_only"
+    assert paper_training_mode_enabled(result) is False
     task = service._strategy_learning_context_refresh_tasks.get("paper")
     assert task is not None and not task.done()
     await asyncio.sleep(0)
@@ -5328,8 +5328,8 @@ async def test_strategy_mode_reuses_authoritative_empty_position_snapshot() -> N
 
     assert context["account_equity"] == 100.0
     assert context["execution_mode"] == "paper"
-    assert context["paper_training_mode"] == "bootstrap"
-    assert paper_training_mode_enabled(context) is True
+    assert context["paper_training_mode"] == "shadow_only"
+    assert paper_training_mode_enabled(context) is False
 
 
 def test_cached_promoted_champion_keeps_fast_training_disabled() -> None:
@@ -5352,8 +5352,8 @@ def test_cached_promoted_champion_keeps_fast_training_disabled() -> None:
 
     assert context is not None
     assert context["execution_mode"] == "paper"
-    assert context["paper_training_mode"] == "normal"
-    assert context["strategy_learning"]["paper_training_mode"] == "normal"
+    assert context["paper_training_mode"] == "shadow_only"
+    assert context["strategy_learning"]["paper_training_mode"] == "shadow_only"
     assert paper_training_mode_enabled(context) is False
 
 
@@ -5377,7 +5377,7 @@ def test_cached_continuous_primary_disables_fast_training_without_promotion() ->
     context = service._recent_strategy_learning_context("paper")
 
     assert context is not None
-    assert context["paper_training_mode"] == "normal"
+    assert context["paper_training_mode"] == "shadow_only"
     assert paper_training_mode_enabled(context) is False
 
 

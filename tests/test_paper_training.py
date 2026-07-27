@@ -97,7 +97,7 @@ async def _balance(_mode: str, _decision: DecisionOutput | None) -> float:
     return 1000.0
 
 
-def test_paper_training_contract_accepts_negative_expected_return() -> None:
+def test_historical_paper_training_contract_is_retired_from_execution() -> None:
     decision = _decision(expected_net=-5.0)
 
     assert paper_training_contract_reasons(
@@ -105,7 +105,10 @@ def test_paper_training_contract_accepts_negative_expected_return() -> None:
     ) == []
     assert decision.raw_response["paper_training"]["valid_for_seconds"] == 600.0
     assessment = assess_paper_training_entry(decision, "paper")
-    assert assessment.eligible is True
+    assert assessment.eligible is False
+    assert "paper_training_execution_retired_shadow_only" in (
+        assessment.blocking_reasons
+    )
     assert assessment.details["expected_net_return_pct"] == -5.0
 
     live = assess_paper_training_entry(decision, "live")
@@ -184,8 +187,8 @@ def test_paper_training_position_closes_at_model_prediction_horizon() -> None:
     assert assess_paper_training_position_horizon(position)["authorized"] is False
 
 
-def test_paper_training_mode_only_runs_without_paper_champion() -> None:
-    assert paper_training_mode_enabled(
+def test_paper_training_order_mode_is_retired_for_every_route() -> None:
+    assert not paper_training_mode_enabled(
         {
             "execution_mode": "paper",
             "paper_training_mode": "bootstrap",
@@ -262,8 +265,8 @@ async def test_promoted_paper_champion_immediately_disables_fast_training() -> N
         open_positions=[],
     )
 
-    assert context["paper_training_mode"] == "normal"
-    assert context["strategy_learning"]["paper_training_mode"] == "normal"
+    assert context["paper_training_mode"] == "shadow_only"
+    assert context["strategy_learning"]["paper_training_mode"] == "shadow_only"
     assert context["paper_strategy_champion"]["active"] is True
     assert paper_training_mode_enabled(context) is False
 

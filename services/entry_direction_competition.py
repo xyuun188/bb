@@ -228,6 +228,7 @@ class EntryDirectionCompetitionPolicy:
             side: score
             for side, score in training_scores.items()
             if _safe_float(score) is not None
+            and float(score) > 0.0
             and (_safe_float(
                 (long_training if side == "long" else short_training).get(
                     "horizon_minutes"

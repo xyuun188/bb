@@ -5090,7 +5090,9 @@ class TradingService:
             account_config=settings.get_execution_account_config(selected_mode),
         )
         context["execution_mode"] = selected_mode
-        context["paper_training_mode"] = "bootstrap" if selected_mode == "paper" else "disabled"
+        context["paper_training_mode"] = (
+            "shadow_only" if selected_mode == "paper" else "disabled"
+        )
         context["account_equity"] = account_equity
         context["strategy_context_performance"] = performance_snapshot
         if continuous_weight_report:
@@ -5287,23 +5289,8 @@ class TradingService:
             return None
         result = dict(context)
         result["execution_mode"] = selected_mode
-        champion = self._safe_dict(result.get("paper_strategy_champion"))
         learning = self._safe_dict(result.get("strategy_learning"))
-        if not champion:
-            champion = self._safe_dict(learning.get("paper_strategy_champion"))
-        routing = self._safe_dict(
-            result.get("continuous_strategy_routing") or learning.get("continuous_strategy_routing")
-        )
-        continuous_primary_ready = bool(
-            self._safe_dict(routing.get("current_route")).get("primary")
-        )
-        paper_training_mode = (
-            "disabled"
-            if selected_mode == "live"
-            else "normal"
-            if champion.get("active") is True or continuous_primary_ready
-            else "bootstrap"
-        )
+        paper_training_mode = "disabled" if selected_mode == "live" else "shadow_only"
         result["paper_training_mode"] = paper_training_mode
         learning["paper_training_mode"] = paper_training_mode
         result["strategy_learning"] = learning

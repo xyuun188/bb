@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
+from services.entry_direction_support import assess_directional_entry_support
 from services.okx_execution_slippage import (
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
     build_okx_fill_mark_slippage,
@@ -382,7 +383,49 @@ def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reas
             "reason": "bounded_paper_exploration_side_selected",
         },
     }
-    contract = build_paper_exploration_contract(evidence, symbol="BTC/USDT")
+    direction_support = assess_directional_entry_support(
+        {
+            "long": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "raw_expected_return_pct": 0.3,
+                        "objective_expected_return_pct": 0.1,
+                        "horizon_minutes": 30,
+                    }
+                ]
+            }
+        },
+        [
+            {
+                "model_name": "trend_expert",
+                "action": "long",
+                "reasoning": "trend supports long",
+                "effective_weight": 0.2,
+                "source_group": "llm:expert",
+            },
+            {
+                "model_name": "momentum_expert",
+                "action": "long",
+                "reasoning": "momentum supports long",
+                "effective_weight": 0.2,
+                "source_group": "llm:expert",
+            },
+            {
+                "model_name": "risk_expert",
+                "action": "hold",
+                "reasoning": "no hard risk",
+                "effective_weight": 0.1,
+                "source_group": "llm:expert",
+            },
+        ],
+        "long",
+    )
+    contract = build_paper_exploration_contract(
+        evidence,
+        symbol="BTC/USDT",
+        independent_direction_support=direction_support,
+    )
     lineage = _complete_lineage()
     lineage["decision_raw_by_order_id"]["entry-1"] = {
         "entry_candidate_evidence": evidence,

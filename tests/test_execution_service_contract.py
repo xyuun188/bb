@@ -9,7 +9,6 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
-from risk_manager.engine import RiskEngine
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
@@ -564,83 +563,38 @@ async def test_execution_service_persists_live_rules_canary_contract_before_subm
     assert raw_updates[-1]["live_rules_canary_contract"] == contract
 
 
-@pytest.mark.asyncio
-async def test_paper_training_entry_close_and_loss_reach_authoritative_training() -> None:
+def test_retired_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:
     decision = _paper_training_ready_decision()
     contract, reasons = validate_entry_execution_contract(decision.raw_response)
     assert reasons == []
     assert contract["contract_lifecycle"] == "paper_training"
-    assert RiskEngine._dynamic_risk_contract_reason(decision) is None
-    assert _return_entry_contract_result(decision, "paper").passed is True
+    entry_gate = _return_entry_contract_result(decision, "paper")
+    assert entry_gate.passed is False
+    assert entry_gate.blocker == "paper_training_contract_incomplete"
+    assert "paper_training_execution_retired_shadow_only" in str(entry_gate.reason)
 
-    class FilledExecutor:
-        async def place_order(
-            self,
-            current: DecisionOutput,
-            account_id: str | None = None,
-            override_balance: float | None = None,
-        ) -> ExecutionResult:
-            del account_id, override_balance
-            is_entry = current.action == Action.LONG
-            return ExecutionResult(
-                order_id="local-entry" if is_entry else "local-close",
-                exchange_order_id="okx-entry" if is_entry else "okx-close",
-                symbol=current.symbol,
-                side="buy" if is_entry else "sell",
-                order_type="market",
-                quantity=1.0,
-                price=100.0 if is_entry else 95.0,
-                status=OrderStatus.FILLED,
-                raw_response={},
-            )
-
-    executor = FilledExecutor()
-
-    async def executor_provider(_mode: str) -> FilledExecutor:
-        return executor
-
-    service = _test_execution_service(okx_executor_provider=executor_provider)
-    entry_result = await service.execute_candidate(
-        decision.symbol,
-        decision.model_name,
-        decision,
-        SimpleNamespace(warnings=[]),
-        321,
-        {"warnings": [], "decisions": [], "executions": []},
-        open_positions=[],
-    )
-    assert entry_result is not None and entry_result.status == OrderStatus.FILLED
-    assert decision.raw_response["paper_training_order_identity"]["client_order_id"] == (
-        "BBPT321"
-    )
-
-    close_decision = DecisionOutput(
-        model_name=decision.model_name,
+    entry_result = ExecutionResult(
+        order_id="historical-local-entry",
+        exchange_order_id="historical-okx-entry",
         symbol=decision.symbol,
-        action=Action.CLOSE_LONG,
-        confidence=0.0,
-        reasoning="authoritative paper close",
-        position_size_pct=1.0,
-        suggested_leverage=1.0,
+        side="buy",
+        order_type="market",
+        quantity=1.0,
+        price=100.0,
+        status=OrderStatus.FILLED,
         raw_response={},
     )
-    close_result = await service.execute_candidate(
-        close_decision.symbol,
-        close_decision.model_name,
-        close_decision,
-        SimpleNamespace(warnings=[]),
-        322,
-        {"warnings": [], "decisions": [], "executions": []},
-        open_positions=[
-            {
-                "symbol": decision.symbol,
-                "side": "long",
-                "quantity": 1.0,
-                "is_open": True,
-            }
-        ],
+    close_result = ExecutionResult(
+        order_id="historical-local-close",
+        exchange_order_id="historical-okx-close",
+        symbol=decision.symbol,
+        side="sell",
+        order_type="market",
+        quantity=1.0,
+        price=95.0,
+        status=OrderStatus.FILLED,
+        raw_response={},
     )
-    assert close_result is not None and close_result.status == OrderStatus.FILLED
 
     opened_at = datetime(2026, 7, 22, 1, tzinfo=UTC)
     history = SimpleNamespace(

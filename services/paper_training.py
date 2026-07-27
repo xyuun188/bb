@@ -1,9 +1,8 @@
-"""Paper-only bootstrap training contracts.
+"""Historical paper-training contracts and position lineage.
 
-When no validated paper strategy exists, paper trading must still be able to
-collect normal directional outcomes.  This module deliberately removes only
-the profitability gate for that bootstrap route; exchange facts, order
-identity, fill accounting and the live boundary remain mandatory.
+New training predictions are Shadow-only.  The contract readers remain for
+already-filled positions and authoritative training facts, but no paper-training
+decision may create another order.
 """
 
 from __future__ import annotations
@@ -86,28 +85,10 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
 
 
 def paper_training_mode_enabled(context: dict[str, Any] | None) -> bool:
-    """Return whether paper trading still lacks a future-stable strategy route."""
+    """Return false: real-order training collection was retired on 2026-07-27."""
 
-    payload = _dict(context)
-    if str(payload.get("execution_mode") or "").lower() != "paper":
-        return False
-    champion = _dict(payload.get("paper_strategy_champion"))
-    learning = _dict(payload.get("strategy_learning"))
-    nested_champion = _dict(learning.get("paper_strategy_champion"))
-    champion = champion or nested_champion
-    if champion.get("active") is True:
-        return False
-    routing = _dict(
-        payload.get("continuous_strategy_routing")
-        or _dict(payload.get("strategy_mode")).get("continuous_strategy_routing")
-        or learning.get("continuous_strategy_routing")
-    )
-    if _dict(routing.get("current_route")).get("primary"):
-        return False
-    explicit = str(payload.get("paper_training_mode") or "").lower()
-    if explicit:
-        return explicit == "bootstrap"
-    return champion.get("active") is not True
+    del context
+    return False
 
 
 def paper_training_client_order_id(decision_id: Any) -> str:
@@ -474,11 +455,12 @@ def assess_paper_training_entry(
     decision: DecisionOutput,
     model_mode: str,
 ) -> PaperTrainingAssessment:
-    """Validate paper training identity while intentionally ignoring profitability."""
+    """Reject retired training-order contracts while preserving their audit details."""
 
     raw = _dict(decision.raw_response)
     contract = _dict(raw.get("paper_training"))
     reasons = paper_training_selection_reasons(decision, model_mode)
+    reasons.append("paper_training_execution_retired_shadow_only")
     feature = _dict(decision.feature_snapshot)
     if _float(feature.get("current_price", feature.get("close")), 0.0) <= 0:
         reasons.append("paper_training_current_price_missing")

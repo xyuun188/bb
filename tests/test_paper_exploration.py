@@ -6,6 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from risk_manager.engine import RiskEngine
+from services.entry_direction_support import assess_directional_entry_support
 from services.entry_profit_risk_sizing import EntryProfitRiskSizingPolicy
 from services.paper_exploration import (
     PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
@@ -126,11 +127,53 @@ def _candidate_evidence() -> dict:
     }
 
 
+def _direction_support() -> dict:
+    return assess_directional_entry_support(
+        {
+            "long": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "raw_expected_return_pct": 0.30,
+                        "objective_expected_return_pct": 0.10,
+                        "horizon_minutes": 30,
+                    }
+                ]
+            }
+        },
+        [
+            {
+                "model_name": "trend_expert",
+                "action": "long",
+                "reasoning": "trend supports long",
+                "effective_weight": 0.2,
+                "source_group": "llm:expert",
+            },
+            {
+                "model_name": "momentum_expert",
+                "action": "long",
+                "reasoning": "momentum supports long",
+                "effective_weight": 0.2,
+                "source_group": "llm:expert",
+            },
+            {
+                "model_name": "risk_expert",
+                "action": "hold",
+                "reasoning": "no hard risk",
+                "effective_weight": 0.1,
+                "source_group": "llm:expert",
+            },
+        ],
+        "long",
+    )
+
+
 def _decision() -> DecisionOutput:
     candidate_evidence = _candidate_evidence()
     contract = build_paper_exploration_contract(
         candidate_evidence,
         symbol="BTC/USDT",
+        independent_direction_support=_direction_support(),
     )
     calibration = {
         "source_authority": "okx_position_history",
@@ -243,6 +286,7 @@ def test_exploration_contract_has_no_sample_quota_and_detects_tampering() -> Non
     contract = build_paper_exploration_contract(
         _candidate_evidence(),
         symbol="BTC/USDT",
+        independent_direction_support=_direction_support(),
     )
 
     assert paper_exploration_contract_reasons(contract) == []
