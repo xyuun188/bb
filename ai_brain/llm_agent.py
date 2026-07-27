@@ -664,7 +664,7 @@ evidence; incomplete fee-after return or provenance prevents execution, not diag
 
 _PAPER_FAST_EXPERT_SYSTEM_PROMPT = """PAPER_FAST_EXPERT_JSON_V1. Return one compact JSON object only. No markdown, no prose, no <think>.
 Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"short Chinese text","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0-1,"take_profit_pct":0-1,"suggested_holding_minutes":1-10080,"maximum_holding_minutes":1-20000,"suggested_close_fraction":0-1,"cross_check_for":null}
-Every field is required. Use hold and zero size when evidence is incomplete. Return no extra keys and no long field names."""
+Every field is required. Actions are diagnostic evidence, not execution permission. Direction and timing roles must report long or short when their own current market evidence supports one; missing model promotion, provenance, or execution permission does not force hold. Use hold only when that role's market evidence is neutral, contradictory, or unavailable. Keep size at zero when execution evidence is incomplete. Return no extra keys and no long field names."""
 
 _PAPER_MULTIDIMENSIONAL_PLAN_PROMPT = """PAPER_MULTIDIMENSIONAL_PLAN_V1.
 For simulated trading, the earlier exact JSON schema is extended: also return

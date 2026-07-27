@@ -67,6 +67,40 @@ def test_paper_batch_expert_prompt_requires_complete_trade_plan() -> None:
     assert "unified risk remains authoritative" in prompt
 
 
+def test_paper_batch_expert_prompt_exposes_cost_complete_unpromoted_summary() -> None:
+    prompt = build_batch_experts_user_prompt(
+        "symbol=BTC/USDT price=100",
+        {
+            "execution_mode": "paper",
+            "review_positions": False,
+            "direction_competition": {
+                "long": {
+                    "evidence": [
+                        {
+                            "source": "local_ml",
+                            "raw_expected_return_pct": 0.3,
+                            "objective_expected_return_pct": -0.2,
+                            "horizon_minutes": 10,
+                            "return_distribution_contract": {
+                                "tail_loss_probability": 0.35
+                            },
+                        }
+                    ]
+                }
+            },
+            "entry_candidate_evidence": {
+                "long": {"execution_cost": {"total_pct": 0.1}}
+            },
+        },
+        ["momentum_expert"],
+    )
+
+    assert '"unpromoted_quantitative_summary"' in prompt
+    assert '"expected_net_return_pct": 0.19999999999999998' in prompt
+    assert '"production_permission": false' in prompt
+    assert "lack of promotion alone does not force hold" in prompt
+
+
 def test_batch_expert_prompt_keeps_role_scoped_market_contexts() -> None:
     prompt = build_batch_experts_user_prompt(
         {

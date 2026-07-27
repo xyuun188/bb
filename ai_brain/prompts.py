@@ -7,6 +7,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.entry_direction_support import (
+    summarize_unpromoted_quantitative_evidence,
+)
+
 _SENSITIVE_KEY_PARTS = ("api", "key", "secret", "token", "password", "authorization")
 
 
@@ -521,8 +525,10 @@ def build_batch_experts_user_prompt(
             "return eligibility because momentum_expert owns that separate question."
         ),
         "momentum_expert": (
-            "Role=profit_quality. Use long/short only when that side has positive "
-            "cost-complete payoff quality; otherwise hold."
+            "Role=profit_quality. Use long/short when that side has positive cost-complete "
+            "payoff quality. In paper mode use unpromoted_quantitative_summary as the current "
+            "family-balanced model mean after live cost; lack of promotion alone does not force "
+            "hold. Otherwise hold."
         ),
         "sentiment_expert": (
             "Role=short_timeseries. Action is a diagnostic next-window path label, never execution "
@@ -597,6 +603,32 @@ def build_batch_experts_user_prompt(
             dict_limit=6,
         ),
     }
+    unpromoted_quantitative_summary: dict[str, dict[str, Any]] = {}
+    if str(context.get("execution_mode") or "").lower() == "paper":
+        candidate_evidence = (
+            context.get("entry_candidate_evidence")
+            if isinstance(context.get("entry_candidate_evidence"), dict)
+            else {}
+        )
+        for side in ("long", "short"):
+            side_evidence = (
+                candidate_evidence.get(side)
+                if isinstance(candidate_evidence.get(side), dict)
+                else {}
+            )
+            execution_cost = (
+                side_evidence.get("execution_cost")
+                if isinstance(side_evidence.get("execution_cost"), dict)
+                else {}
+            )
+            unpromoted_quantitative_summary[side] = (
+                summarize_unpromoted_quantitative_evidence(
+                    context.get("direction_competition"),
+                    side,
+                    execution_cost_pct=execution_cost.get("total_pct"),
+                )
+            )
+
     payload = {
         "market_by_expert": market_by_expert,
         "evidence": compact_value(
@@ -620,6 +652,12 @@ def build_batch_experts_user_prompt(
             depth=1,
             dict_limit=8,
         ),
+        "unpromoted_quantitative_summary": compact_value(
+            unpromoted_quantitative_summary,
+            depth=3,
+            dict_limit=16,
+            list_limit=2,
+        ),
         "ml_signal": (
             compact_value(context.get("ml_signal"), depth=1, dict_limit=8)
             if context.get("ml_signal_prompt_enabled", True)
@@ -639,6 +677,8 @@ def build_batch_experts_user_prompt(
             "Each expert reports an independent diagnostic verdict from only its scoped role and market context; these actions never authorize execution. "
             "Do not force every expert to hold solely because production permission or governed return evidence is absent. "
             "Only momentum_expert owns fee-after payoff quality and must hold when cost-complete positive return evidence is absent. "
+            "For paper mode, unpromoted_quantitative_summary is the current family-balanced model mean after live cost; momentum_expert may diagnose its positive side even without model promotion, while objective_net_return remains uncertainty rather than a promotion requirement. "
+            "The summary is diagnostic only and never grants execution, sizing, leverage or production permission. "
             "trend_expert and sentiment_expert use long/short as diagnostic bias labels whenever their scoped evidence has a net bias; they do not apply momentum_expert's return gate. "
             "Use a governed scheduled return profile only as a historical prior; it never replaces current symbol return evidence. "
             "Memory and expert history are observation-only; current return, costs and account risk own execution. "

@@ -419,6 +419,96 @@ def test_negative_training_observations_cannot_create_orders() -> None:
     ] is False
 
 
+def _unpromoted_positive_net_context() -> dict[str, object]:
+    context = _return_context(
+        execution_mode="paper",
+        direction_competition={
+            "preferred_side": "neutral",
+            "long": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "side": "long",
+                        "raw_expected_return_pct": 0.5,
+                        "objective_expected_return_pct": -0.05,
+                        "horizon_minutes": 30,
+                        "return_distribution_contract": {
+                            "tail_loss_probability": 0.3
+                        },
+                    }
+                ]
+            },
+            "short": {"evidence": []},
+        },
+    )
+    evidence = context["entry_candidate_evidence"]
+    assert isinstance(evidence, dict)
+    evidence["preferred_side_by_evidence"] = "neutral"
+    evidence["preferred_exploration_side"] = "neutral"
+    evidence["feature_opportunity_score"] = 8.0
+    evidence["paper_exploration"] = {
+        "preferred_side": "neutral",
+        "selected": {},
+        "reason": "no_bounded_paper_exploration_side",
+    }
+    for side in ("long", "short"):
+        side_evidence = evidence[side]
+        assert isinstance(side_evidence, dict)
+        side_evidence["execution_cost"] = {
+            "production_eligible": True,
+            "total_pct": 0.1,
+        }
+        side_evidence["exploration_maturity_evidence"] = {
+            "available": False,
+            "source": "validated_continuous_strategy_route",
+            "evidence_count": 0,
+        }
+    return context
+
+
+def test_unpromoted_positive_net_model_can_create_bounded_paper_exploration() -> None:
+    decision = _coordinator().combine(
+        _features(),
+        _unpromoted_positive_net_context(),
+        _strong_long_opinions(),
+    )
+
+    assert decision.action == Action.LONG
+    contract = decision.raw_response["paper_exploration"]
+    assert contract["intervention_scope"] == "bounded_unpromoted_model_intervention"
+    assert contract["expected_net_return_pct"] == 0.4
+    assert contract["return_lcb_pct"] == -0.15
+    assert contract["loss_probability"] == 0.3
+    assert decision.raw_response["entry_permission"]["granted"] is True
+    assert "paper_training" not in decision.raw_response
+
+
+def test_unpromoted_positive_net_model_with_all_hold_experts_stays_shadow_only() -> None:
+    opinions = {
+        name: _decision(name, Action.HOLD, confidence=0.5)
+        for name in (
+            "trend_expert",
+            "momentum_expert",
+            "sentiment_expert",
+            "position_expert",
+            "risk_expert",
+        )
+    }
+
+    decision = _coordinator().combine(
+        _features(),
+        _unpromoted_positive_net_context(),
+        opinions,
+    )
+
+    assert decision.action == Action.HOLD
+    support = decision.raw_response["unpromoted_model_intervention"][
+        "support_by_side"
+    ]["long"]
+    assert "direction_support_experts_all_hold" in support["blocking_reasons"]
+    assert "paper_exploration" not in decision.raw_response
+
+
 def test_negative_objective_with_one_aligned_expert_remains_shadow_only() -> None:
     context = _return_context(
         execution_mode="paper",

@@ -17,7 +17,7 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_direction_support import directional_entry_support_reasons
 
-PAPER_EXPLORATION_VERSION = "2026-07-27.independent-paper-exploration.v4"
+PAPER_EXPLORATION_VERSION = "2026-07-27.independent-paper-exploration.v5"
 PAPER_EXPLORATION_SIZING_VERSION = "2026-07-21.bounded-paper-risk.v1"
 PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0001
 PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION = 0.0003
@@ -25,6 +25,7 @@ PAPER_EXPLORATION_MAX_LCB_GAP_RATIO = 0.75
 PAPER_EXPLORATION_MAX_LOSS_PROBABILITY = 0.60
 PAPER_EXPLORATION_MAX_TAIL_RISK_SCORE = 0.60
 PAPER_EXPLORATION_MIN_RETURN_SOURCE_COUNT = 2
+UNPROMOTED_MODEL_INTERVENTION_SCOPE = "bounded_unpromoted_model_intervention"
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -79,7 +80,9 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "trade_kind",
             "symbol",
             "selected_side",
+            "intervention_scope",
             "expected_net_return_pct",
+            "objective_net_return_pct",
             "return_lcb_pct",
             "lcb_gap_ratio",
             "loss_probability",
@@ -114,6 +117,10 @@ def evaluate_paper_exploration_side(
     """Classify one side without granting execution permission."""
 
     evidence = _dict(side_evidence)
+    intervention_scope = str(evidence.get("intervention_scope") or "").strip()
+    unpromoted_intervention = (
+        intervention_scope == UNPROMOTED_MODEL_INTERVENTION_SCOPE
+    )
     expected_net = _float(evidence.get("expected_net_return_pct"), None)
     return_lcb = _float(evidence.get("return_lcb_pct"), None)
     loss_probability = _float(evidence.get("loss_probability"), 1.0) or 0.0
@@ -151,7 +158,7 @@ def evaluate_paper_exploration_side(
         reasons.append("paper_exploration_expected_net_return_not_positive")
     if return_lcb is None:
         reasons.append("paper_exploration_return_lcb_missing")
-    elif return_lcb > 0:
+    elif return_lcb > 0 and not unpromoted_intervention:
         reasons.append("paper_exploration_should_use_normal_profitable_entry")
     lcb_gap = max(-(return_lcb or 0.0), 0.0)
     lcb_gap_ratio = (
@@ -165,7 +172,10 @@ def evaluate_paper_exploration_side(
         reasons.append("paper_exploration_loss_probability_too_high")
     if tail_risk > PAPER_EXPLORATION_MAX_TAIL_RISK_SCORE:
         reasons.append("paper_exploration_tail_risk_too_high")
-    if source_count < PAPER_EXPLORATION_MIN_RETURN_SOURCE_COUNT:
+    minimum_return_sources = (
+        1 if unpromoted_intervention else PAPER_EXPLORATION_MIN_RETURN_SOURCE_COUNT
+    )
+    if source_count < minimum_return_sources:
         reasons.append("paper_exploration_return_sources_incomplete")
     if horizon_minutes <= 0:
         reasons.append("paper_exploration_prediction_horizon_missing")
@@ -187,7 +197,9 @@ def evaluate_paper_exploration_side(
     return {
         "eligible": not reasons,
         "reasons": list(dict.fromkeys(reasons)),
+        "intervention_scope": intervention_scope or "bounded_return_uncertainty",
         "expected_net_return_pct": round(expected_net, 8) if expected_net is not None else None,
+        "objective_net_return_pct": round(return_lcb, 8) if return_lcb is not None else None,
         "return_lcb_pct": round(return_lcb, 8) if return_lcb is not None else None,
         "lcb_gap_ratio": round(lcb_gap_ratio, 8) if isfinite(lcb_gap_ratio) else None,
         "loss_probability": round(loss_probability, 8),
@@ -264,6 +276,47 @@ def select_paper_exploration_side(
     }
 
 
+def select_unpromoted_model_intervention(
+    candidate_evidence: dict[str, Any],
+    support_by_side: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Expose cost-positive unpromoted observations to bounded paper exploration."""
+
+    feature_score = _float(candidate_evidence.get("feature_opportunity_score"), 0.0) or 0.0
+    side_evidence: dict[str, dict[str, Any]] = {}
+    for side in ("long", "short"):
+        support = _dict(support_by_side.get(side))
+        baseline = _dict(candidate_evidence.get(side))
+        side_evidence[side] = {
+            **baseline,
+            "production_eligible": False,
+            "intervention_scope": UNPROMOTED_MODEL_INTERVENTION_SCOPE,
+            "expected_net_return_pct": support.get("expected_net_return_pct"),
+            "return_lcb_pct": support.get("objective_net_return_pct"),
+            "loss_probability": support.get("loss_probability"),
+            "tail_risk_score": support.get("loss_probability"),
+            "production_source_count": len(
+                support.get("quant_evidence_families") or []
+            ),
+            "horizon_minutes": support.get("prediction_horizon_minutes"),
+            "return_distribution_ready": support.get("eligible") is True,
+            "policy_provenance": _dict(support.get("policy_provenance")),
+        }
+    selection = select_paper_exploration_side(
+        side_evidence,
+        feature_opportunity_score=feature_score,
+    )
+    return {
+        **candidate_evidence,
+        "preferred_exploration_side": selection["preferred_side"],
+        "paper_exploration": selection,
+        "unpromoted_model_intervention": {
+            "scope": UNPROMOTED_MODEL_INTERVENTION_SCOPE,
+            "support_by_side": support_by_side,
+        },
+    }
+
+
 def build_paper_exploration_contract(
     candidate_evidence: dict[str, Any],
     *,
@@ -292,7 +345,10 @@ def build_paper_exploration_contract(
         "purpose": "execute_positive_mean_uncertain_paper_opportunity_and_learn_after_settlement",
         "symbol": str(symbol or ""),
         "selected_side": side,
+        "intervention_scope": selected.get("intervention_scope")
+        or "bounded_return_uncertainty",
         "expected_net_return_pct": selected.get("expected_net_return_pct"),
+        "objective_net_return_pct": selected.get("objective_net_return_pct"),
         "return_lcb_pct": selected.get("return_lcb_pct"),
         "lcb_gap_ratio": selected.get("lcb_gap_ratio"),
         "loss_probability": selected.get("loss_probability"),
@@ -380,7 +436,11 @@ def paper_exploration_contract_reasons(contract_value: Any) -> list[str]:
     lcb_gap_ratio = _float(contract.get("lcb_gap_ratio"), None)
     if expected_net is None or expected_net <= 0:
         reasons.append("paper_exploration_expected_net_return_not_positive")
-    if return_lcb is None or return_lcb > 0:
+    intervention_scope = str(contract.get("intervention_scope") or "")
+    if return_lcb is None or (
+        return_lcb > 0
+        and intervention_scope != UNPROMOTED_MODEL_INTERVENTION_SCOPE
+    ):
         reasons.append("paper_exploration_return_lcb_not_uncertain")
     if (
         lcb_gap_ratio is None

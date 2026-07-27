@@ -23,7 +23,10 @@ from config.settings import (
     FIXED_AI_MODEL_SLOTS,
 )
 from services.dynamic_exit_policy import assess_dynamic_exit
-from services.entry_direction_support import assess_directional_entry_support
+from services.entry_direction_support import (
+    assess_directional_entry_support,
+    assess_unpromoted_model_intervention_support,
+)
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     signal_production_eligible,
@@ -33,7 +36,10 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
-from services.paper_exploration import build_paper_exploration_contract
+from services.paper_exploration import (
+    build_paper_exploration_contract,
+    select_unpromoted_model_intervention,
+)
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -899,6 +905,7 @@ class EnsembleCoordinator:
                 candidate_evidence.get("preferred_exploration_side") or ""
             ).lower()
             execution_mode = str(context.get("execution_mode") or "").lower()
+            exploration_candidate_evidence = candidate_evidence
             exploration_support = assess_directional_entry_support(
                 self._safe_dict(context.get("direction_competition")),
                 raw_opinions,
@@ -913,9 +920,53 @@ class EnsembleCoordinator:
                 if execution_mode == "paper" and exploration_side in {"long", "short"}
                 else {}
             )
+            intervention_support_by_side: dict[str, dict[str, Any]] = {}
+            if execution_mode == "paper" and not exploration_contract:
+                for side in ("long", "short"):
+                    cost = self._safe_dict(
+                        self._safe_dict(candidate_evidence.get(side)).get(
+                            "execution_cost"
+                        )
+                    )
+                    intervention_support_by_side[side] = (
+                        assess_unpromoted_model_intervention_support(
+                            self._safe_dict(context.get("direction_competition")),
+                            raw_opinions,
+                            side,
+                            execution_cost_pct=self._finite_or_none(
+                                cost.get("total_pct")
+                            ),
+                        )
+                    )
+                exploration_candidate_evidence = (
+                    select_unpromoted_model_intervention(
+                        candidate_evidence,
+                        intervention_support_by_side,
+                    )
+                )
+                exploration_side = str(
+                    exploration_candidate_evidence.get(
+                        "preferred_exploration_side"
+                    )
+                    or ""
+                ).lower()
+                exploration_support = self._safe_dict(
+                    intervention_support_by_side.get(exploration_side)
+                )
+                exploration_contract = (
+                    build_paper_exploration_contract(
+                        exploration_candidate_evidence,
+                        symbol=features.symbol,
+                        independent_direction_support=exploration_support,
+                    )
+                    if exploration_side in {"long", "short"}
+                    else {}
+                )
             if exploration_contract:
                 action = Action.LONG if exploration_side == "long" else Action.SHORT
-                exploration = self._safe_dict(candidate_evidence.get("paper_exploration"))
+                exploration = self._safe_dict(
+                    exploration_candidate_evidence.get("paper_exploration")
+                )
                 selected_exploration = self._safe_dict(exploration.get("selected"))
                 information_value = self._safe_float(
                     selected_exploration.get("information_value_score"),
@@ -945,12 +996,14 @@ class EnsembleCoordinator:
                 exploration_raw["authoritative_return_candidate"] = raw[
                     "authoritative_return_candidate"
                 ]
-                exploration_raw["entry_candidate_evidence"] = candidate_evidence
+                exploration_raw["entry_candidate_evidence"] = (
+                    exploration_candidate_evidence
+                )
                 exploration_raw["paper_exploration"] = exploration_contract
                 exploration_raw["independent_direction_support"] = exploration_support
                 exploration_raw["entry_permission"] = {
                     "granted": True,
-                    "scope": "bounded_unpromoted_model_intervention",
+                    "scope": exploration_contract.get("intervention_scope"),
                     "reason": "independent_positive_direction_support_ready",
                     "production_permission": False,
                 }
@@ -989,6 +1042,14 @@ class EnsembleCoordinator:
             self._attach_expert_diversity_policy(hold_raw, context)
             hold_raw["authoritative_return_candidate"] = raw["authoritative_return_candidate"]
             hold_raw["entry_candidate_evidence"] = candidate_evidence
+            hold_raw["unpromoted_model_intervention"] = {
+                "support_by_side": intervention_support_by_side,
+                "candidate_evidence": (
+                    exploration_candidate_evidence
+                    if intervention_support_by_side
+                    else {}
+                ),
+            }
             hold_raw["independent_direction_support"] = (
                 direction_support
                 if return_candidate_eligible
