@@ -1,9 +1,4 @@
-"""Independent directional confirmation for executable entries.
-
-Quant models may propose a side, but correlated outputs from the same runtime
-family count once.  Executable entries also require directional confirmation
-from the expert analysis; all-HOLD analysis remains Shadow-only.
-"""
+"""Auditable model direction and independent expert-conflict assessment."""
 
 from __future__ import annotations
 
@@ -13,12 +8,10 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = (
-    "2026-07-27.independent-direction-support.v2"
-)
-MIN_ALIGNED_EXPERT_COUNT = 2
-MIN_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
-UNPROMOTED_MODEL_INTERVENTION_SCOPE = "bounded_unpromoted_model_intervention"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-07-27.paper-model-direction.v3"
+PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
+MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
+MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -102,17 +95,22 @@ def _quant_family_summaries(
     for family, rows in sorted(grouped.items()):
         raw_expected = _weighted_mean(rows, "raw_expected_return_pct")
         objective_expected = _weighted_mean(rows, "objective_expected_return_pct")
+        explicit_net_expected = _weighted_mean(rows, "expected_net_return_pct")
         loss_probability = _weighted_mean(
             [
                 {
                     **item,
-                    "tail_loss_probability": _dict(
-                        item.get("return_distribution_contract")
-                    ).get("tail_loss_probability"),
+                    "resolved_loss_probability": (
+                        item.get("loss_probability")
+                        if _float(item.get("loss_probability")) is not None
+                        else _dict(item.get("return_distribution_contract")).get(
+                            "tail_loss_probability"
+                        )
+                    ),
                 }
                 for item in rows
             ],
-            "tail_loss_probability",
+            "resolved_loss_probability",
         )
         horizons = [
             value
@@ -129,7 +127,11 @@ def _quant_family_summaries(
                 ),
                 "raw_expected_return_pct": raw_expected,
                 "objective_expected_return_pct": objective_expected,
-                "expected_net_return_pct": raw_expected - execution_cost_pct,
+                "expected_net_return_pct": (
+                    explicit_net_expected
+                    if explicit_net_expected is not None
+                    else raw_expected - execution_cost_pct
+                ),
                 "objective_net_return_pct": objective_expected - execution_cost_pct,
                 "loss_probability": loss_probability,
                 "horizon_minutes": min(horizons),
@@ -138,7 +140,7 @@ def _quant_family_summaries(
     return summaries
 
 
-def summarize_unpromoted_quantitative_evidence(
+def summarize_paper_quantitative_evidence(
     direction_competition: dict[str, Any] | None,
     selected_side: str,
     *,
@@ -172,9 +174,8 @@ def summarize_unpromoted_quantitative_evidence(
         if (_float(item.get("horizon_minutes")) or 0.0) > 0.0
     ]
     expected_net_return_pct = (
-        sum(float(item["raw_expected_return_pct"]) for item in family_summaries)
+        sum(float(item["expected_net_return_pct"]) for item in family_summaries)
         / len(family_summaries)
-        - applied_cost
         if family_summaries
         else None
     )
@@ -187,7 +188,7 @@ def summarize_unpromoted_quantitative_evidence(
     )
     return {
         "version": INDEPENDENT_DIRECTION_SUPPORT_VERSION,
-        "scope": UNPROMOTED_MODEL_INTERVENTION_SCOPE,
+        "scope": PAPER_MODEL_TRADE_SCOPE,
         "selected_side": side if side in {"long", "short"} else "neutral",
         "execution_cost_pct": parsed_cost,
         "execution_cost_complete": execution_cost_complete,
@@ -240,6 +241,7 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "opposition_expert_groups",
             "independent_support_groups",
             "independent_support_group_count",
+            "strong_expert_opposition",
             "blocking_reasons",
             "production_permission",
         )
@@ -254,12 +256,12 @@ def assess_directional_entry_support(
     support_scope: str = "governed_return_candidate",
     execution_cost_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Require positive quant evidence plus non-HOLD expert confirmation."""
+    """Require one auditable model direction and block only strong opposition."""
 
     side = str(selected_side or "").lower()
     opposite_side = "short" if side == "long" else "long"
-    unpromoted_scope = support_scope == UNPROMOTED_MODEL_INTERVENTION_SCOPE
-    quantitative = summarize_unpromoted_quantitative_evidence(
+    paper_scope = support_scope == PAPER_MODEL_TRADE_SCOPE
+    quantitative = summarize_paper_quantitative_evidence(
         direction_competition,
         side,
         execution_cost_pct=execution_cost_pct,
@@ -267,27 +269,23 @@ def assess_directional_entry_support(
     parsed_cost = _float(quantitative.get("execution_cost_pct"))
     execution_cost_complete = quantitative.get("execution_cost_complete") is True
     family_summaries = list(quantitative.get("quant_family_summaries") or [])
-    if unpromoted_scope:
-        positive_families = [
-            item
-            for item in family_summaries
-            if (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
-        ]
+    if paper_scope:
+        directional_families = list(family_summaries)
     else:
-        positive_families = [
+        directional_families = [
             item
             for item in family_summaries
             if (_float(item.get("raw_expected_return_pct")) or 0.0) > 0.0
             and (_float(item.get("objective_expected_return_pct")) or 0.0) > 0.0
         ]
-    positive_quant_sources = sorted(
+    quantitative_sources = sorted(
         {
             source
-            for item in positive_families
+            for item in directional_families
             for source in item.get("sources") or []
         }
     )
-    quant_families = sorted(str(item["family"]) for item in positive_families)
+    quant_families = sorted(str(item["family"]) for item in directional_families)
     expected_net_return_pct = _float(quantitative.get("expected_net_return_pct"))
     objective_net_return_pct = _float(quantitative.get("objective_net_return_pct"))
     loss_probability = _float(quantitative.get("loss_probability"))
@@ -323,26 +321,33 @@ def assess_directional_entry_support(
         {f"quant:{family}" for family in quant_families}
         | {f"expert:{group}" for group in aligned_groups}
     )
+    strong_expert_opposition = bool(
+        len(opposition_groups) >= 2 and len(opposition) > len(aligned)
+    )
 
     blockers: list[str] = []
     if side not in {"long", "short"}:
         blockers.append("direction_support_side_missing")
-    if unpromoted_scope and not execution_cost_complete:
+    if paper_scope and not execution_cost_complete:
         blockers.append("direction_support_execution_cost_incomplete")
-    if unpromoted_scope and (expected_net_return_pct is None or expected_net_return_pct <= 0.0):
-        blockers.append("direction_support_expected_net_return_not_positive")
     if not quant_families:
-        blockers.append("direction_support_positive_quant_evidence_missing")
-    if len(auditable_experts) < 3:
-        blockers.append("direction_support_expert_analysis_incomplete")
-    if auditable_experts and len(holds) == len(auditable_experts):
-        blockers.append("direction_support_experts_all_hold")
-    if len(aligned) < MIN_ALIGNED_EXPERT_COUNT:
-        blockers.append("direction_support_aligned_experts_insufficient")
-    if len(aligned) <= len(opposition):
-        blockers.append("direction_support_expert_opposition_not_resolved")
-    if len(support_groups) < MIN_INDEPENDENT_SUPPORT_GROUP_COUNT:
-        blockers.append("direction_support_independent_groups_insufficient")
+        blockers.append("direction_support_quant_evidence_missing")
+    if prediction_horizon_minutes is None or prediction_horizon_minutes <= 0.0:
+        blockers.append("direction_support_prediction_horizon_missing")
+    if paper_scope:
+        if strong_expert_opposition:
+            blockers.append("direction_support_strong_expert_opposition")
+    else:
+        if len(auditable_experts) < 3:
+            blockers.append("direction_support_expert_analysis_incomplete")
+        if auditable_experts and len(holds) == len(auditable_experts):
+            blockers.append("direction_support_experts_all_hold")
+        if len(aligned) < MIN_GOVERNED_ALIGNED_EXPERT_COUNT:
+            blockers.append("direction_support_aligned_experts_insufficient")
+        if len(aligned) <= len(opposition):
+            blockers.append("direction_support_expert_opposition_not_resolved")
+        if len(support_groups) < MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT:
+            blockers.append("direction_support_independent_groups_insufficient")
 
     result = {
         "version": INDEPENDENT_DIRECTION_SUPPORT_VERSION,
@@ -360,7 +365,8 @@ def assess_directional_entry_support(
         "objective_net_return_pct": objective_net_return_pct,
         "loss_probability": loss_probability,
         "prediction_horizon_minutes": prediction_horizon_minutes,
-        "positive_quant_sources": positive_quant_sources,
+        "positive_quant_sources": quantitative_sources,
+        "quantitative_sources": quantitative_sources,
         "quant_evidence_families": quant_families,
         "quant_family_summaries": family_summaries,
         "aligned_expert_count": len(aligned),
@@ -371,6 +377,7 @@ def assess_directional_entry_support(
         "opposition_expert_groups": opposition_groups,
         "independent_support_groups": support_groups,
         "independent_support_group_count": len(support_groups),
+        "strong_expert_opposition": strong_expert_opposition,
         "blocking_reasons": list(dict.fromkeys(blockers)),
         "production_permission": False,
         "policy_provenance": {
@@ -386,7 +393,7 @@ def assess_directional_entry_support(
     return result
 
 
-def assess_unpromoted_model_intervention_support(
+def assess_paper_model_trade_support(
     direction_competition: dict[str, Any] | None,
     expert_opinions: list[dict[str, Any]] | None,
     selected_side: str,
@@ -397,7 +404,7 @@ def assess_unpromoted_model_intervention_support(
         direction_competition,
         expert_opinions,
         selected_side,
-        support_scope=UNPROMOTED_MODEL_INTERVENTION_SCOPE,
+        support_scope=PAPER_MODEL_TRADE_SCOPE,
         execution_cost_pct=execution_cost_pct,
     )
 
@@ -411,24 +418,30 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         reasons.append("direction_support_not_eligible")
     if support.get("selected_side") != str(selected_side or "").lower():
         reasons.append("direction_support_side_mismatch")
-    if support.get("support_scope") == UNPROMOTED_MODEL_INTERVENTION_SCOPE:
+    if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
         if support.get("execution_cost_complete") is not True:
             reasons.append("direction_support_execution_cost_incomplete")
-        expected_net = _float(support.get("expected_net_return_pct"))
-        if expected_net is None or expected_net <= 0.0:
-            reasons.append("direction_support_expected_net_return_not_positive")
     if not support.get("quant_evidence_families"):
-        reasons.append("direction_support_positive_quant_evidence_missing")
-    if int(support.get("aligned_expert_count") or 0) < MIN_ALIGNED_EXPERT_COUNT:
-        reasons.append("direction_support_aligned_experts_insufficient")
-    if int(support.get("aligned_expert_count") or 0) <= int(
-        support.get("opposition_expert_count") or 0
-    ):
-        reasons.append("direction_support_expert_opposition_not_resolved")
-    if int(support.get("independent_support_group_count") or 0) < (
-        MIN_INDEPENDENT_SUPPORT_GROUP_COUNT
-    ):
-        reasons.append("direction_support_independent_groups_insufficient")
+        reasons.append("direction_support_quant_evidence_missing")
+    horizon = _float(support.get("prediction_horizon_minutes"))
+    if horizon is None or horizon <= 0.0:
+        reasons.append("direction_support_prediction_horizon_missing")
+    if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
+        if support.get("strong_expert_opposition") is True:
+            reasons.append("direction_support_strong_expert_opposition")
+    else:
+        if int(support.get("aligned_expert_count") or 0) < (
+            MIN_GOVERNED_ALIGNED_EXPERT_COUNT
+        ):
+            reasons.append("direction_support_aligned_experts_insufficient")
+        if int(support.get("aligned_expert_count") or 0) <= int(
+            support.get("opposition_expert_count") or 0
+        ):
+            reasons.append("direction_support_expert_opposition_not_resolved")
+        if int(support.get("independent_support_group_count") or 0) < (
+            MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT
+        ):
+            reasons.append("direction_support_independent_groups_insufficient")
     if support.get("blocking_reasons"):
         reasons.append("direction_support_contains_blockers")
     if support.get("contract_fingerprint") != _fingerprint(

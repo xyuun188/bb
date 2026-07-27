@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
-from types import SimpleNamespace
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -21,10 +20,9 @@ from core.symbols import (
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from services.execution_result_classifier import is_native_full_close_backfill_pending_result
+from services.normal_paper_trade import build_normal_paper_position_lifecycle
 from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
-from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
-from services.paper_training import build_paper_training_position_lifecycle
 from services.position_settlement import (
     SETTLEMENT_STATUS_SETTLING,
     apply_position_settlement_snapshot,
@@ -49,19 +47,13 @@ POSITION_CLOSE_DUST_ABS_TOLERANCE = 1e-8
 POSITION_CLOSE_DUST_REL_TOLERANCE = 1e-9
 
 
-def _management_contract_with_lifecycles(
+def _management_contract_with_normal_paper(
     value: Any,
-    paper_canary_lifecycle: dict[str, Any],
-    paper_training_lifecycle: dict[str, Any],
+    normal_paper_lifecycle: dict[str, Any],
 ) -> dict[str, Any]:
     contract = dict(value) if isinstance(value, dict) else {}
-    if paper_canary_lifecycle and not isinstance(
-        contract.get("paper_canary_lifecycle"),
-        dict,
-    ):
-        contract["paper_canary_lifecycle"] = dict(paper_canary_lifecycle)
-    if paper_training_lifecycle:
-        contract["paper_training_lifecycle"] = dict(paper_training_lifecycle)
+    if normal_paper_lifecycle:
+        contract["normal_paper_lifecycle"] = dict(normal_paper_lifecycle)
     return contract
 
 
@@ -263,20 +255,10 @@ class PositionExecutionPersistenceService:
         entry_exchange_order_id = PositionExecutionPersistenceService._result_exchange_order_id(
             result
         )
-        lifecycle_decision = SimpleNamespace(
-            id=getattr(decision, "id", None),
-            symbol=symbol,
-            action=side,
-            raw_response=getattr(decision, "raw_response", None),
-            is_paper=execution_mode == "paper",
-            was_executed=True,
-            executed_at=getattr(result, "timestamp", None) or datetime.now(UTC),
-        )
-        paper_canary_lifecycle = build_paper_canary_position_lifecycle(
-            lifecycle_decision
-        )
-        paper_training_lifecycle = build_paper_training_position_lifecycle(
-            lifecycle_decision
+        normal_paper_lifecycle = (
+            build_normal_paper_position_lifecycle(decision)
+            if execution_mode == "paper"
+            else {}
         )
         stop_loss = (
             result.price * (1 - decision.stop_loss_pct)
@@ -309,11 +291,10 @@ class PositionExecutionPersistenceService:
             payload["okx_pos_id"] = okx_pos_id
         if entry_exchange_order_id:
             payload["entry_exchange_order_id"] = entry_exchange_order_id
-        if paper_canary_lifecycle or paper_training_lifecycle:
-            payload["current_management_contract"] = _management_contract_with_lifecycles(
+        if normal_paper_lifecycle:
+            payload["current_management_contract"] = _management_contract_with_normal_paper(
                 {},
-                paper_canary_lifecycle,
-                paper_training_lifecycle,
+                normal_paper_lifecycle,
             )
         existing_positions = await repo.get_matching_open_positions(
             model_name=model_name,
@@ -364,12 +345,11 @@ class PositionExecutionPersistenceService:
                     primary.okx_inst_id = okx_inst_id
                 if okx_pos_id:
                     primary.okx_pos_id = okx_pos_id
-                if paper_canary_lifecycle or paper_training_lifecycle:
+                if normal_paper_lifecycle:
                     primary.current_management_contract = (
-                        _management_contract_with_lifecycles(
+                        _management_contract_with_normal_paper(
                             getattr(primary, "current_management_contract", None),
-                            paper_canary_lifecycle,
-                            paper_training_lifecycle,
+                            normal_paper_lifecycle,
                         )
                     )
                 primary.stop_loss_price = (
@@ -417,11 +397,10 @@ class PositionExecutionPersistenceService:
                 primary.okx_inst_id = okx_inst_id
             if okx_pos_id:
                 primary.okx_pos_id = okx_pos_id
-            if paper_canary_lifecycle or paper_training_lifecycle:
-                primary.current_management_contract = _management_contract_with_lifecycles(
+            if normal_paper_lifecycle:
+                primary.current_management_contract = _management_contract_with_normal_paper(
                     getattr(primary, "current_management_contract", None),
-                    paper_canary_lifecycle,
-                    paper_training_lifecycle,
+                    normal_paper_lifecycle,
                 )
             primary.entry_exchange_order_id = _merge_exchange_order_ids(
                 getattr(primary, "entry_exchange_order_id", None),

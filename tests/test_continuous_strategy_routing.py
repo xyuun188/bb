@@ -137,9 +137,7 @@ def test_negative_but_improving_strategy_can_remain_training_primary() -> None:
 
     assert report["current_route"]["recommended_side"] == "short"
     assert report["current_route"]["primary"] is None
-    assert report["current_route"]["training_primary"]["profile_id"] == (
-        "negative_improving"
-    )
+    assert report["current_route"]["training_primary"]["profile_id"] == ("negative_improving")
     row = report["candidate_weights"][0]
     assert row["future_stable"] is True
     assert row["future_profitable"] is False
@@ -222,44 +220,6 @@ def test_cross_symbol_failure_keeps_profitable_strategy_out_of_primary_route() -
     assert row["routing_reason"] == "cross_symbol_generalization_failed"
 
 
-def test_validated_symbol_route_exposes_risk_only_exploration_maturity() -> None:
-    development = _metrics(
-        average=-0.1,
-        lcb=-0.2,
-        profit_factor=0.7,
-        drawdown=1.0,
-        tail=-0.8,
-        pnl=-12.0,
-        count=80,
-    )
-    exam = _metrics(
-        average=-0.05,
-        lcb=-0.1,
-        profit_factor=0.8,
-        drawdown=0.8,
-        tail=-0.6,
-        pnl=-4.0,
-        count=40,
-    )
-    candidate = _candidate(
-        "btc_long_maturity",
-        side="long",
-        scope="symbol_side",
-        development=development,
-        exam=exam,
-    )
-
-    report = _build(ContinuousStrategyRoutingPolicy(), [candidate], "trend_up")
-
-    evidence = report["exploration_maturity_by_symbol_side"]["BTC/USDT"]["long"]
-    assert evidence["source"] == "validated_continuous_strategy_route"
-    assert evidence["evidence_count"] == 40
-    assert evidence["development_sample_count"] == 80
-    assert evidence["exam_sample_count"] == 40
-    assert evidence["can_authorize_entry"] is False
-    assert evidence["can_change_size_or_leverage"] is False
-
-
 def test_market_regime_switches_primary_strategy() -> None:
     policy = ContinuousStrategyRoutingPolicy()
     candidates = [
@@ -300,9 +260,7 @@ def test_single_symbol_candidate_is_challenger_only() -> None:
         "range_bound",
     )
 
-    symbol_row = next(
-        row for row in report["candidate_weights"] if row["profile_id"] == "btc_only"
-    )
+    symbol_row = next(row for row in report["candidate_weights"] if row["profile_id"] == "btc_only")
     assert symbol_row["primary_eligible"] is False
     assert symbol_row["route_role"] == "challenger"
     assert report["current_route"]["primary"]["profile_id"] == "global_short"
@@ -345,11 +303,7 @@ async def test_strategy_routes_are_persisted_without_touching_champion_rows(
             session=session,
         )
     async with sessions() as session:
-        rows = list(
-            (
-                await session.execute(select(StrategyProfileSnapshot))
-            ).scalars().all()
-        )
+        rows = list((await session.execute(select(StrategyProfileSnapshot))).scalars().all())
 
     assert result["persisted"] is True
     assert len(rows) == 1

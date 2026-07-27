@@ -7,16 +7,27 @@ import pytest
 
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.entry_direction_support import assess_directional_entry_support
+from services.normal_paper_trade import (
+    build_normal_paper_trade_contract,
+    normal_paper_trade_contract_reasons,
+)
 from services.okx_execution_slippage import (
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
     build_okx_fill_mark_slippage,
 )
 from services.okx_training_facts import build_okx_history_training_sample
-from services.paper_exploration import build_paper_exploration_contract
-from services.paper_training import build_paper_training_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_normal_paper_trade_contract,
+)
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_paper_exploration_contract as build_paper_exploration_contract,
+)
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_paper_training_contract as build_paper_training_contract,
+)
 
 
 def _history(**overrides):
@@ -181,9 +192,7 @@ def _complete_lineage() -> dict:
                         "source_authority": "okx_algo_history_plus_fills_history",
                         "actual_side": "sl",
                         "stop_loss_slippage_pct": 0.1,
-                        "stop_loss_slippage_source": (
-                            "okx_configured_stop_trigger_to_fills_vwap"
-                        ),
+                        "stop_loss_slippage_source": ("okx_configured_stop_trigger_to_fills_vwap"),
                     },
                 },
             ),
@@ -239,9 +248,7 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["quantity"] == 2.0
     assert sample["quantity_unit"] == "contracts"
     assert sample["notional"] == 2000.0
-    assert sample["notional_source"] == (
-        "okx_entry_fill_base_quantity_and_average_price"
-    )
+    assert sample["notional_source"] == ("okx_entry_fill_base_quantity_and_average_price")
     assert sample["gross_return_price_consistent"] is True
     assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(8.5 / 2000.0 * 100.0)
     assert sample["okx_trade_ids"] == ["trade-entry", "trade-close"]
@@ -250,16 +257,12 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample["strategy_lineage_complete"] is True
     assert sample["profit_training_contract"]["eligible"] is True
     assert sample["profit_training_contract"]["outcome"] == "profit"
-    assert sample["profit_training_contract"]["target_value"] == pytest.approx(
-        8.5 / 2000.0 * 100.0
-    )
+    assert sample["profit_training_contract"]["target_value"] == pytest.approx(8.5 / 2000.0 * 100.0)
 
     outcome = _outcome(sample)
     label = outcome["training_label_contract"]
     assert label["execution_mode"] == "paper"
-    assert label["net_return_after_all_cost_pct"] == pytest.approx(
-        8.5 / 2000.0 * 100.0
-    )
+    assert label["net_return_after_all_cost_pct"] == pytest.approx(8.5 / 2000.0 * 100.0)
     assert label["realized_net_pnl_usdt"] == 8.5
 
 
@@ -325,9 +328,7 @@ def test_training_rejects_account_derived_contract_size_override() -> None:
             "base_quantity": 0.2,
             "contract_size": 0.1,
             "contract_size_verified": True,
-            "contract_size_source": (
-                "okx_account_position_margin_notional_crosscheck"
-            ),
+            "contract_size_source": ("okx_account_position_margin_notional_crosscheck"),
         }
     )
     sample = build_okx_history_training_sample(history, **lineage)
@@ -436,10 +437,9 @@ def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reas
 
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["strategy_training_role"] == "entry_strategy"
-    assert sample["strategy_entry_kind"] == "bounded_risk_paper_exploration"
-    assert sample["strategy_selection_reason"] == (
-        "bounded_paper_exploration_side_selected"
-    )
+    assert sample["strategy_entry_kind"] == "normal_strategy_trade"
+    assert sample["historical_entry_contract_kind"] == "paper_exploration"
+    assert sample["strategy_selection_reason"] == ("bounded_paper_exploration_side_selected")
     assert sample["paper_exploration_evidence"]["sample_target"] is None
     assert sample["paper_exploration_evidence"]["daily_sample_quota"] is None
 
@@ -482,16 +482,123 @@ def test_paper_training_loss_is_a_normal_authoritative_training_sample() -> None
 
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["strategy_training_role"] == "entry_strategy"
-    assert sample["strategy_entry_kind"] == "loss_tolerant_paper_training"
+    assert sample["strategy_entry_kind"] == "normal_strategy_trade"
+    assert sample["historical_entry_contract_kind"] == "paper_training"
     assert sample["paper_training_evidence"]["loss_tolerant_for_training"] is True
     assert raw_sample["profit_training_contract"]["eligible"] is True
     assert raw_sample["profit_training_contract"]["outcome"] == "loss"
     assert sample["paper_training_evidence"]["sample_target"] is None
     assert sample["paper_training_evidence"]["daily_sample_quota"] is None
     assert len(payload["trade_samples"]) == 1
-    assert payload["trade_samples"][0]["profit_learning_labels"][
-        "realized_net_pnl_usdt"
-    ] == -8.5
+    assert payload["trade_samples"][0]["profit_learning_labels"]["realized_net_pnl_usdt"] == -8.5
+
+
+@pytest.mark.parametrize(
+    ("selection_reason", "close_price", "realized_pnl", "expected_outcome"),
+    [
+        ("policy_exploitation", 100_500.0, 8.5, "profit"),
+        ("coverage_sampling", 99_650.0, -8.5, "loss"),
+    ],
+)
+def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
+    selection_reason: str,
+    close_price: float,
+    realized_pnl: float,
+    expected_outcome: str,
+) -> None:
+    lineage = _complete_lineage()
+    _set_close_fill_price(lineage, close_price)
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason=selection_reason,
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.2 if realized_pnl > 0 else -0.2,
+            "objective_net_return_pct": 0.1 if realized_pnl > 0 else -0.4,
+            "loss_probability": 0.3 if realized_pnl > 0 else 0.7,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    lineage["decision_raw_by_order_id"]["entry-1"] = {"normal_paper_trade": contract}
+    history = _history(
+        close_avg_px=close_price,
+        realized_pnl=realized_pnl,
+        pnl=10.0 if realized_pnl > 0 else -7.0,
+        pnl_ratio=0.0085 if realized_pnl > 0 else -0.0085,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "realizedPnl": str(realized_pnl),
+        "pnl": "10" if realized_pnl > 0 else "-7",
+        "pnlRatio": "0.0085" if realized_pnl > 0 else "-0.0085",
+    }
+
+    sample = build_okx_history_training_sample(history, **lineage)
+    outcome = _outcome(sample)
+    payload = annotate_training_payload(
+        shadow_samples=[],
+        trade_samples=[outcome],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+
+    assert sample["strategy_entry_kind"] == "normal_strategy_trade"
+    assert sample["strategy_selection_reason"] == selection_reason
+    assert sample["decision_authority"] == "ensemble"
+    assert sample["strategy_entry_supervision_eligible"] is True
+    assert sample["profit_training_contract"]["eligible"] is True
+    assert sample["profit_training_contract"]["outcome"] == expected_outcome
+    assert sample["normal_paper_trade_evidence"]["production_permission"] is False
+    assert len(payload["trade_samples"]) == 1
+
+
+def test_historical_normal_paper_v1_is_recovered_without_runtime_authority() -> None:
+    lineage = _complete_lineage()
+    historical_contract = build_legacy_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+    )
+    lineage["decision_raw_by_order_id"]["entry-1"] = {"normal_paper_trade": historical_contract}
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert normal_paper_trade_contract_reasons(historical_contract)
+    assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
+    assert sample["decision_authority"] == "ensemble"
+    assert sample["strategy_entry_kind"] == "normal_strategy_trade"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_v1"
+    assert sample["strategy_entry_supervision_eligible"] is True
+    assert sample["profit_training_contract"]["eligible"] is True
+    assert sample["normal_paper_trade_evidence"]["contract_generation"] == "historical_normal_v1"
+
+
+def test_historical_normal_wrapper_preserves_legacy_training_identity() -> None:
+    lineage = _complete_lineage()
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "normal_paper_trade": build_legacy_normal_paper_trade_contract(
+            symbol="BTC/USDT",
+            side="long",
+            route_kind="cold_start_exploration",
+        ),
+        "paper_training": build_paper_training_contract(
+            symbol="BTC/USDT",
+            selected_side="long",
+            signal_source="local_ml_observation",
+            horizon_minutes=30.0,
+        ),
+    }
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
+    assert sample["strategy_entry_kind"] == "normal_strategy_trade"
+    assert sample["historical_entry_contract_kind"] == "paper_training"
+    assert sample["decision_authority"] == "ensemble"
+    assert sample["profit_training_contract"]["eligible"] is True
 
 
 def test_paper_training_contract_is_never_trainable_as_a_live_trade() -> None:
@@ -572,9 +679,7 @@ def test_stale_contract_multiplier_is_quarantined_without_pnl_notional_fallback(
     assert sample["gross_price_return_pct"] == pytest.approx(-6.0)
     assert sample["gross_return_on_notional_pct"] is None
     assert sample["gross_return_price_consistent"] is False
-    assert "missing_authoritative_entry_fill_facts" in sample[
-        "training_evidence_gaps"
-    ]
+    assert "missing_authoritative_entry_fill_facts" in sample["training_evidence_gaps"]
     assert PROFIT_TRAINING_TARGET not in sample
     assert sample["profit_training_contract"]["eligible"] is False
 
@@ -621,9 +726,7 @@ def test_obsolete_sampling_entry_is_research_only() -> None:
     )
 
     assert sample["strategy_training_role"] == "obsolete_sampling_research_only"
-    assert "obsolete_sampling_entry_not_strategy_trainable" in sample[
-        "training_evidence_gaps"
-    ]
+    assert "obsolete_sampling_entry_not_strategy_trainable" in sample["training_evidence_gaps"]
     assert payload["trade_samples"] == []
 
 
@@ -785,39 +888,35 @@ def test_position_fallback_payload_is_not_misreported_as_exact_entry_lineage() -
 def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> None:
     lineage = _complete_lineage()
     _set_close_fill_price(lineage, 97_000.0)
-    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills[
-        "protection_submission"
-    ] = {
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"] = {
         "source_authority": "local_submit_plus_okx_create_order_response",
         "exchange_confirmation_recorded": True,
         "exchange_confirmed_at": "2026-07-11T01:00:01+00:00",
         "algo_ids": ["algo-stop-1"],
     }
-    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills[
-        "protection_execution"
-    ] = {
-            "source_authority": "okx_algo_history_plus_fills_history",
-            "lifecycle_complete": True,
-            "algo_id": "algo-stop-1",
-            "generated_order_id": "close-1",
-            "actual_side": "sl",
-            "configured_trigger_price": 97_500.0,
-            "actual_trigger_market_price": None,
-            "actual_trigger_market_price_available": False,
-            "exchange_confirmed_at_ms": 1783731601000,
-            "triggered_at_ms": 1783735200000,
-            "fill_started_at_ms": 1783735200025,
-            "fill_completed_at_ms": 1783735200030,
-            "trigger_to_first_fill_ms": 25.0,
-            "fill_mark_price": 97_450.0,
-            "fill_index_price": 97_460.0,
-            "fill_path_min_price": 96_950.0,
-            "fill_path_max_price": 97_100.0,
-            "fill_mark_slippage_pct": 0.461775,
-            "trigger_path_extrema_available": False,
-            "trigger_orderbook_snapshot_available": False,
-            "stop_loss_slippage_pct": (97_500.0 - 97_000.0) / 97_500.0 * 100.0,
-            "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills["protection_execution"] = {
+        "source_authority": "okx_algo_history_plus_fills_history",
+        "lifecycle_complete": True,
+        "algo_id": "algo-stop-1",
+        "generated_order_id": "close-1",
+        "actual_side": "sl",
+        "configured_trigger_price": 97_500.0,
+        "actual_trigger_market_price": None,
+        "actual_trigger_market_price_available": False,
+        "exchange_confirmed_at_ms": 1783731601000,
+        "triggered_at_ms": 1783735200000,
+        "fill_started_at_ms": 1783735200025,
+        "fill_completed_at_ms": 1783735200030,
+        "trigger_to_first_fill_ms": 25.0,
+        "fill_mark_price": 97_450.0,
+        "fill_index_price": 97_460.0,
+        "fill_path_min_price": 96_950.0,
+        "fill_path_max_price": 97_100.0,
+        "fill_mark_slippage_pct": 0.461775,
+        "trigger_path_extrema_available": False,
+        "trigger_orderbook_snapshot_available": False,
+        "stop_loss_slippage_pct": (97_500.0 - 97_000.0) / 97_500.0 * 100.0,
+        "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
     }
     lineage["decision_raw_by_order_id"]["entry-1"] = {
         "profit_risk_sizing": {
@@ -842,9 +941,7 @@ def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> No
 
     assert sample["stop_loss_fill_confirmed"] is True
     assert sample["slippage"] == pytest.approx((0.4 + 1.6) / 2_000.0 * 100.0)
-    assert sample["slippage"] != pytest.approx(
-        (97_500.0 - 97_000.0) / 97_500.0 * 100.0
-    )
+    assert sample["slippage"] != pytest.approx((97_500.0 - 97_000.0) / 97_500.0 * 100.0)
     assert sample["slippage_source"] == OKX_ROUND_TRIP_SLIPPAGE_SOURCE
     assert sample["execution_slippage_usdt"] == pytest.approx(2.0)
     assert sample["actual_trigger_market_price"] is None
@@ -857,9 +954,7 @@ def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> No
 def test_protection_execution_is_not_required_for_round_trip_slippage() -> None:
     lineage = _complete_lineage()
     _set_close_fill_price(lineage, 97_000.0)
-    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop(
-        "protection_execution"
-    )
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop("protection_execution")
 
     sample = build_okx_history_training_sample(
         _history(close_avg_px=97_000.0),
@@ -874,9 +969,7 @@ def test_protection_execution_is_not_required_for_round_trip_slippage() -> None:
 
 def test_missing_fill_mark_fact_cannot_create_slippage_label() -> None:
     lineage = _complete_lineage()
-    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop(
-        "execution_slippage"
-    )
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop("execution_slippage")
 
     sample = build_okx_history_training_sample(_history(), **lineage)
 
@@ -888,9 +981,7 @@ def test_missing_fill_mark_fact_cannot_create_slippage_label() -> None:
         "close": {"close-1": ["stored_slippage:fact_missing:fills_history"]},
     }
     assert sample["profit_training_contract"]["eligible"] is False
-    assert "slippage_missing_or_invalid" in sample["profit_training_contract"][
-        "blockers"
-    ]
+    assert "slippage_missing_or_invalid" in sample["profit_training_contract"]["blockers"]
 
 
 def test_legacy_fill_aliases_and_local_contract_count_cannot_authorize_training() -> None:
@@ -907,9 +998,7 @@ def test_legacy_fill_aliases_and_local_contract_count_cannot_authorize_training(
     assert sample["entry_fee"] is None
     assert sample["notional"] is None
     assert sample["fill_contracts"] is None
-    assert "missing_authoritative_entry_fill_facts" in sample[
-        "training_evidence_gaps"
-    ]
+    assert "missing_authoritative_entry_fill_facts" in sample["training_evidence_gaps"]
     assert sample["execution_slippage_failures"]["entry"] == {
         "entry-1": ["authoritative_fill_fact_missing"]
     }
@@ -930,6 +1019,4 @@ def test_execution_result_fill_fact_cannot_authorize_training() -> None:
 
     assert sample["entry_fee"] is None
     assert sample["notional"] is None
-    assert "missing_authoritative_entry_fill_facts" in sample[
-        "training_evidence_gaps"
-    ]
+    assert "missing_authoritative_entry_fill_facts" in sample["training_evidence_gaps"]

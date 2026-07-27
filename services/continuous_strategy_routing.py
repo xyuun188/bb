@@ -112,6 +112,8 @@ def _compact_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
             "tail_loss_pct",
         )
     }
+
+
 def _future_stable(development: dict[str, Any], exam: dict[str, Any]) -> bool:
     development_average = _float(development.get("average_net_return_pct"))
     development_lcb = _float(development.get("return_lcb_pct"))
@@ -156,54 +158,7 @@ def _strategy_quality_target(quality: float) -> float:
         return COLD_START_STRATEGY_WEIGHT + bounded * (
             MAX_STRATEGY_WEIGHT - COLD_START_STRATEGY_WEIGHT
         )
-    return COLD_START_STRATEGY_WEIGHT + bounded * (
-        COLD_START_STRATEGY_WEIGHT - MIN_STRATEGY_WEIGHT
-    )
-
-
-def _exploration_maturity_by_symbol_side(
-    rows: list[dict[str, Any]],
-) -> dict[str, dict[str, dict[str, Any]]]:
-    maturity: dict[str, dict[str, dict[str, Any]]] = {}
-    for row in rows:
-        selector = _dict(row.get("selector"))
-        scope = str(selector.get("scope") or "")
-        symbol = str(selector.get("symbol") or "").strip().upper()
-        side = str(selector.get("side") or "").strip().lower()
-        evidence_count = _int(row.get("evidence_count"))
-        if (
-            row.get("validated") is not True
-            or scope not in {"symbol_side", "symbol_side_horizon"}
-            or not symbol
-            or side not in {"long", "short"}
-            or evidence_count <= 0
-        ):
-            continue
-        candidate = {
-            "version": "2026-07-25.paper-exploration-maturity.v1",
-            "source": "validated_continuous_strategy_route",
-            "profile_id": row.get("profile_id"),
-            "profile_version": row.get("profile_version"),
-            "selector": selector,
-            "evidence_count": evidence_count,
-            "development_sample_count": _int(
-                _dict(row.get("development_metrics")).get("sample_count")
-            ),
-            "exam_sample_count": _int(
-                _dict(row.get("exam_metrics")).get("sample_count")
-            ),
-            "historical_sample_count": _int(
-                _dict(row.get("historical_metrics")).get("sample_count")
-            ),
-            "future_profitable": row.get("future_profitable") is True,
-            "cross_symbol_stable": row.get("cross_symbol_stable") is True,
-            "can_authorize_entry": False,
-            "can_change_size_or_leverage": False,
-        }
-        current = _dict(_dict(maturity.get(symbol)).get(side))
-        if evidence_count > _int(current.get("evidence_count")):
-            maturity.setdefault(symbol, {})[side] = candidate
-    return maturity
+    return COLD_START_STRATEGY_WEIGHT + bounded * (COLD_START_STRATEGY_WEIGHT - MIN_STRATEGY_WEIGHT)
 
 
 def _time_separated(candidate: dict[str, Any]) -> bool:
@@ -216,8 +171,7 @@ def _time_separated(candidate: dict[str, Any]) -> bool:
     if development_partition == "strategy_development":
         return bool(
             exam_partition == "strategy_exam"
-            and exam.get("validation_method")
-            == "exact_current_model_on_immutable_shadow_snapshot"
+            and exam.get("validation_method") == "exact_current_model_on_immutable_shadow_snapshot"
         )
     return bool(
         development_partition == "authoritative_closed_positions"
@@ -261,9 +215,7 @@ class ContinuousStrategyRoutingPolicy:
             selector = _selector(candidate)
             development = _metrics(candidate, "backtest")
             exam = _metrics(candidate, "shadow_validation")
-            historical = _dict(
-                _dict(candidate.get("params")).get("historical_return_distribution")
-            )
+            historical = _dict(_dict(candidate.get("params")).get("historical_return_distribution"))
             validated = _time_separated(candidate)
             development_count = _int(development.get("sample_count"))
             exam_count = _int(exam.get("sample_count"))
@@ -277,11 +229,7 @@ class ContinuousStrategyRoutingPolicy:
             target = (
                 _clamp(
                     COLD_START_STRATEGY_WEIGHT
-                    + confidence
-                    * (
-                        _strategy_quality_target(quality)
-                        - COLD_START_STRATEGY_WEIGHT
-                    ),
+                    + confidence * (_strategy_quality_target(quality) - COLD_START_STRATEGY_WEIGHT),
                     MIN_STRATEGY_WEIGHT,
                     MAX_STRATEGY_WEIGHT,
                 )
@@ -324,19 +272,15 @@ class ContinuousStrategyRoutingPolicy:
                     "future_profitable": future_profitable,
                     "cross_symbol_stable": cross_symbol_stable,
                     "development_cross_symbol_generalization": _dict(
-                        _dict(candidate.get("backtest")).get(
-                            "cross_symbol_generalization"
-                        )
+                        _dict(candidate.get("backtest")).get("cross_symbol_generalization")
                     ),
                     "exam_cross_symbol_generalization": _dict(
-                        _dict(candidate.get("shadow_validation")).get(
-                            "cross_symbol_generalization"
-                        )
+                        _dict(candidate.get("shadow_validation")).get("cross_symbol_generalization")
                     ),
                     "primary_eligible": primary_eligible,
-                    "historical_prior_context_eligible": _dict(
-                        candidate.get("promotion")
-                    ).get("historical_prior_context_eligible")
+                    "historical_prior_context_eligible": _dict(candidate.get("promotion")).get(
+                        "historical_prior_context_eligible"
+                    )
                     is True,
                     "development_metrics": _compact_metrics(development),
                     "exam_metrics": _compact_metrics(exam),
@@ -378,10 +322,7 @@ class ContinuousStrategyRoutingPolicy:
             reverse=True,
         )
         training_pool = [
-            row
-            for row in rows
-            if row["validated"]
-            and row["candidate_regime"] in {"all", regime}
+            row for row in rows if row["validated"] and row["candidate_regime"] in {"all", regime}
         ]
         training_pool.sort(
             key=lambda row: (float(row["effective_weight"]), -_int(row.get("rank"), 999_999)),
@@ -406,9 +347,7 @@ class ContinuousStrategyRoutingPolicy:
 
         total = sum(float(row["effective_weight"]) for row in training_pool)
         normalized = {
-            row["profile_id"]: (
-                float(row["effective_weight"]) / total if total > 0.0 else 0.0
-            )
+            row["profile_id"]: (float(row["effective_weight"]) / total if total > 0.0 else 0.0)
             for row in training_pool
         }
         for row in rows:
@@ -440,8 +379,7 @@ class ContinuousStrategyRoutingPolicy:
             )
             training_primary["route_role"] = (
                 "primary"
-                if primary
-                and training_primary["profile_id"] == primary["profile_id"]
+                if primary and training_primary["profile_id"] == primary["profile_id"]
                 else "training_primary"
             )
 
@@ -450,16 +388,13 @@ class ContinuousStrategyRoutingPolicy:
             "primary": primary,
             "training_primary": training_primary,
             "recommended_side": _dict(selected).get("side") or "neutral",
-            "prediction_horizon_minutes": _dict(selected).get(
-                "prediction_horizon_minutes"
-            ),
+            "prediction_horizon_minutes": _dict(selected).get("prediction_horizon_minutes"),
             "transition": transition,
             "previous_primary": previous_primary,
             "challengers": [
                 row
                 for row in rows
-                if row["route_role"] == "challenger"
-                and row["candidate_regime"] in {"all", regime}
+                if row["route_role"] == "challenger" and row["candidate_regime"] in {"all", regime}
             ][:MAX_ROUTE_CHALLENGERS],
         }
         routed_rows = sorted(
@@ -480,9 +415,6 @@ class ContinuousStrategyRoutingPolicy:
             "candidate_weights": routed_rows,
             "candidate_weight_count": len(rows),
             "candidate_weights_truncated": len(rows) > len(routed_rows),
-            "exploration_maturity_by_symbol_side": (
-                _exploration_maturity_by_symbol_side(rows)
-            ),
             "current_route": current_route,
             "validated_candidate_count": sum(row["validated"] for row in rows),
             "primary_candidate_count": sum(row["primary_eligible"] for row in rows),
@@ -491,7 +423,7 @@ class ContinuousStrategyRoutingPolicy:
             "risk_override_permission": False,
             "rollback": {
                 "previous_stable_primary": previous_primary,
-                "mode": "paper_training_prior_only",
+                "mode": "paper_champion_prior_only",
             },
             "generated_at": datetime.now(UTC).isoformat(),
         }
@@ -555,7 +487,7 @@ class ContinuousStrategyRoutingStore:
                 **_dict(candidate.get("promotion")),
                 "continuous_weight": route.get("effective_weight"),
                 "route_role": role,
-                "paper_training_influence": bool(route.get("validated")),
+                "paper_model_influence": bool(route.get("validated")),
                 "production_permission": False,
                 "live_execution_permission": False,
             }

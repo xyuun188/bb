@@ -196,7 +196,9 @@ def test_complete_paper_canary_is_a_ready_entry_not_a_production_gap() -> None:
 
     assert report["status"] == "ok"
     assert report["entry_contract_ready_count"] == 1
-    assert report["paper_canary_ready_count"] == 1
+    assert report["historical_entry_contracts"]["paper_bootstrap_canary"][
+        "ready_count"
+    ] == 1
     assert report["live_ml_ready_count"] == 0
     assert report["contract_blocker_counts"] == {}
 

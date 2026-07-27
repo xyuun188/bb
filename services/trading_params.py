@@ -48,6 +48,13 @@ class LocalMLTrainingParams:
     auto_train_check_interval_seconds: int = 30 * 60
     auto_quarantine_batch_size: int = 1000
     auto_quarantine_max_batches: int = 5
+    batch_decision_group_threshold: int = 50
+    minimum_decision_group_increment: int = 10
+    drift_minimum_decision_group_increment: int = 10
+    maximum_training_interval_seconds: int = 24 * 60 * 60
+    distribution_drift_threshold: float = 0.35
+    replay_half_life_days: float = 30.0
+    replay_minimum_recency_weight: float = 0.25
 
 
 @dataclass(frozen=True, slots=True)

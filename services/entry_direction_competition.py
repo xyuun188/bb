@@ -287,6 +287,7 @@ class EntryDirectionCompetitionPolicy:
         primary = _safe_dict(predictions[0] if predictions else {})
         influence = _safe_dict(signal.get("influence_policy"))
         eligibility = signal_production_eligibility(signal)
+        multitask = _safe_dict(primary.get("multitask_prediction"))
         for side in ("long", "short"):
             side_policy = _safe_dict(influence.get(side))
             distribution_eligibility = signal_return_distribution_eligibility(
@@ -294,6 +295,7 @@ class EntryDirectionCompetitionPolicy:
                 side,
             )
             contract = signal_return_distribution(signal, side)
+            side_multitask = _safe_dict(multitask.get(side))
             eligible = bool(
                 eligibility.get("eligible") is True
                 and side_policy.get("enabled") is True
@@ -320,6 +322,19 @@ class EntryDirectionCompetitionPolicy:
                     "objective_expected_return_pct": contract.get(
                         "objective_expected_return_pct"
                     ),
+                    "expected_net_return_pct": side_multitask.get(
+                        "expected_net_return_pct"
+                    ),
+                    "loss_probability": side_multitask.get("loss_probability"),
+                    "tail_loss_probability": side_multitask.get(
+                        "tail_loss_probability"
+                    ),
+                    "expected_execution_cost_pct": side_multitask.get(
+                        "expected_execution_cost_pct"
+                    ),
+                    "expected_mfe_pct": side_multitask.get("expected_mfe_pct"),
+                    "expected_mae_pct": side_multitask.get("expected_mae_pct"),
+                    "multitask_prediction_contract": side_multitask,
                     "horizon_minutes": contract.get("horizon_minutes"),
                     "objective_version": contract.get("objective_version"),
                     "label_version": contract.get("label_version"),

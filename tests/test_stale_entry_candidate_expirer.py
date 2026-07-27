@@ -12,7 +12,6 @@ from services.decision_state import (
     append_decision_stage,
     decision_state_from_raw,
 )
-from services.paper_training import build_paper_training_contract
 from services.stale_entry_candidate_expirer import (
     STALE_ENTRY_MAINTENANCE_BATCH_LIMIT,
     STALE_ENTRY_MAINTENANCE_LOOKBACK,
@@ -22,6 +21,9 @@ from services.stale_entry_candidate_expirer import (
     is_pending_execution_reason,
     pending_execution_failed_reason,
     pending_execution_is_stale,
+)
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_paper_training_contract as build_paper_training_contract,
 )
 
 
@@ -184,7 +186,7 @@ async def test_stale_candidate_loader_bounds_one_background_batch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stale_entry_projection_preserves_fresh_paper_canary_horizon() -> None:
+async def test_retired_paper_canary_candidate_expires_without_current_contract() -> None:
     now = datetime(2026, 7, 17, 10, 30, 0)
     canary = {
         "authorized": True,
@@ -217,13 +219,13 @@ async def test_stale_entry_projection_preserves_fresh_paper_canary_horizon() -> 
         order_count_provider=order_count_provider,
     )
 
-    assert expired == 0
+    assert expired == 1
     assert row.raw_llm_response["paper_bootstrap_canary"] == canary
-    assert row.execution_reason == "waiting"
+    assert "missing its model-bound validity horizon" in row.execution_reason
 
 
 @pytest.mark.asyncio
-async def test_stale_entry_projection_expires_paper_canary_by_model_horizon() -> None:
+async def test_old_paper_canary_horizon_cannot_restore_candidate_permission() -> None:
     now = datetime(2026, 7, 17, 10, 40, 0)
     row = _stale_entry_row_from_mapping(
         {
@@ -256,12 +258,12 @@ async def test_stale_entry_projection_expires_paper_canary_by_model_horizon() ->
     )
 
     assert expired == 1
-    assert "600-second model-bound validity horizon" in row.execution_reason
+    assert "missing its model-bound validity horizon" in row.execution_reason
     assert "0.0000%" not in row.execution_reason
 
 
 @pytest.mark.asyncio
-async def test_stale_entry_projection_preserves_fresh_paper_training_horizon() -> None:
+async def test_retired_paper_training_candidate_expires_without_current_contract() -> None:
     training = build_paper_training_contract(
         symbol="BTC/USDT",
         selected_side="long",
@@ -295,13 +297,13 @@ async def test_stale_entry_projection_preserves_fresh_paper_training_horizon() -
         order_count_provider=order_count_provider,
     )
 
-    assert expired == 0
+    assert expired == 1
     assert row.raw_llm_response["paper_training"] == training
-    assert row.execution_reason == "waiting"
+    assert "missing its model-bound validity horizon" in row.execution_reason
 
 
 @pytest.mark.asyncio
-async def test_stale_entry_projection_expires_paper_training_only_at_model_horizon() -> None:
+async def test_old_paper_training_horizon_cannot_restore_candidate_permission() -> None:
     training = build_paper_training_contract(
         symbol="BTC/USDT",
         selected_side="long",
@@ -336,7 +338,7 @@ async def test_stale_entry_projection_expires_paper_training_only_at_model_horiz
     )
 
     assert expired == 1
-    assert "600-second model-bound validity horizon" in row.execution_reason
+    assert "missing its model-bound validity horizon" in row.execution_reason
     assert "-1.0000%" not in row.execution_reason
 
 

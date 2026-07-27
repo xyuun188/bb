@@ -13,13 +13,19 @@ from services.authoritative_trade_outcome import build_authoritative_trade_outco
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_SIZING_VERSION,
+    build_normal_paper_trade_contract,
+)
 from services.okx_execution_slippage import build_okx_fill_mark_slippage
 from services.okx_training_facts import build_okx_history_training_sample
-from services.paper_training import build_paper_training_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import validate_entry_execution_contract
 from services.trading_policies import PolicyGateResult
 from services.training_data_quality import annotate_training_payload
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_paper_training_contract as build_paper_training_contract,
+)
 
 
 async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
@@ -125,7 +131,61 @@ def _entry_decision(symbol: str = "SPK/USDT") -> DecisionOutput:
 
 
 def _profit_first_ready_position_review_decision() -> DecisionOutput:
-    return _dynamic_return_ready_decision()
+    decision = _dynamic_return_ready_decision()
+    raw = decision.raw_response
+    raw.pop("production_trade_gate", None)
+    raw["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="short",
+        selection_reason="policy_exploitation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.8,
+            "objective_net_return_pct": 0.4,
+            "loss_probability": 0.25,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    raw["opportunity_score"]["execution_cost"].update(
+        {
+            "total_pct": 0.08,
+            "order_size_complete": True,
+            "order_notional_usdt": 40.0,
+        }
+    )
+    raw["profit_risk_sizing"].update(
+        {
+            "contract_version": NORMAL_PAPER_TRADE_SIZING_VERSION,
+            "contract_lifecycle": "normal_paper_trade",
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "production_eligible": True,
+            "account_equity_usdt": 1000.0,
+            "risk_budget_usdt": 0.5,
+            "portfolio_risk_budget_usdt": 1.5,
+            "planned_stressed_loss_usdt": 0.4,
+            "stressed_loss_fraction": 0.01,
+            "target_notional_usdt": 40.0,
+            "final_notional_usdt": 40.0,
+            "fill_notional_ceiling_usdt": 50.0,
+            "minimum_order_notional_usdt": 1.0,
+            "final_margin_usdt": 40.0,
+            "final_leverage": 1.0,
+        }
+    )
+    raw["execution_cost_sizing_pass"].update(
+        {
+            "order_size_complete": True,
+            "impact_basis_notional_usdt": 40.0,
+            "final_notional_usdt": 40.0,
+        }
+    )
+    decision.position_size_pct = 0.04
+    decision.suggested_leverage = 1.0
+    return decision
 
 
 def _dynamic_return_ready_decision() -> DecisionOutput:
@@ -563,15 +623,15 @@ async def test_execution_service_persists_live_rules_canary_contract_before_subm
     assert raw_updates[-1]["live_rules_canary_contract"] == contract
 
 
-def test_retired_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:
+def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:
     decision = _paper_training_ready_decision()
     contract, reasons = validate_entry_execution_contract(decision.raw_response)
     assert reasons == []
     assert contract["contract_lifecycle"] == "paper_training"
     entry_gate = _return_entry_contract_result(decision, "paper")
     assert entry_gate.passed is False
-    assert entry_gate.blocker == "paper_training_contract_incomplete"
-    assert "paper_training_execution_retired_shadow_only" in str(entry_gate.reason)
+    assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
+    assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
 
     entry_result = ExecutionResult(
         order_id="historical-local-entry",
@@ -765,7 +825,7 @@ def test_retired_paper_training_entry_is_blocked_but_history_remains_trainable()
     )
 
     assert outcome["outcome_complete"] is True
-    assert outcome["strategy_entry_kind"] == "loss_tolerant_paper_training"
+    assert outcome["strategy_entry_kind"] == "normal_strategy_trade"
     assert len(payload["trade_samples"]) == 1
     labels = payload["trade_samples"][0]["profit_learning_labels"]
     assert labels["training_supervision_ready"] is True

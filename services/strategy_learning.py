@@ -1358,12 +1358,6 @@ class StrategyLearningService:
             paper_strategy_champion=champion,
         )
         result["execution_mode"] = "live" if str(mode).lower() == "live" else "paper"
-        result["paper_training_mode"] = (
-            "disabled" if str(mode).lower() == "live" else "shadow_only"
-        )
-        result.setdefault("strategy_learning", {})["paper_training_mode"] = result[
-            "paper_training_mode"
-        ]
         return result
 
     async def _feedback(

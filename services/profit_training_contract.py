@@ -205,7 +205,7 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
         blockers.append("slippage_negative")
 
     authority = _text(sample.get("decision_authority")).lower()
-    if authority not in {"rules", "model", "manual", "system"}:
+    if authority not in {"rules", "model", "ensemble", "manual", "system"}:
         blockers.append("decision_authority_invalid")
 
     target_value = _safe_float(sample.get(PROFIT_TRAINING_TARGET))

@@ -21,6 +21,8 @@ from services.trade_execution_contract import (
 )
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
+
+
 class StrategySignalRootCauseAuditService:
     """Explain return, cost, risk-budget and provenance gaps without mutation."""
 
@@ -71,12 +73,8 @@ class StrategySignalRootCauseAuditService:
                 .order_by(ShadowBacktest.created_at.desc())
                 .limit(self.limit)
             )
-            decisions = [
-                SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()
-            ]
-            shadows = [
-                SimpleNamespace(**dict(row)) for row in shadow_result.mappings().all()
-            ]
+            decisions = [SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()]
+            shadows = [SimpleNamespace(**dict(row)) for row in shadow_result.mappings().all()]
         try:
             ml_status = self._ml_status_provider()
         except Exception as exc:  # pragma: no cover
@@ -125,7 +123,9 @@ class StrategySignalRootCauseAuditService:
             for code, count in blocker_counts.most_common()
         ]
         ml_readiness = _safe_dict(ml_status.get("readiness"))
-        shadow_missed_count = sum(bool(getattr(row, "missed_opportunity", False)) for row in shadows)
+        shadow_missed_count = sum(
+            bool(getattr(row, "missed_opportunity", False)) for row in shadows
+        )
         return {
             "status": "warning" if causes else "ok",
             "summary": (
@@ -147,32 +147,40 @@ class StrategySignalRootCauseAuditService:
             "high_quality_entry_count": lifecycle_ready_counts["live_ml"],
             "live_ml_ready_count": lifecycle_ready_counts["live_ml"],
             "live_ml_blocked_count": (
-                lifecycle_counts["live_ml"]
-                - lifecycle_ready_counts["live_ml"]
+                lifecycle_counts["live_ml"] - lifecycle_ready_counts["live_ml"]
             ),
-            "live_rules_canary_entry_count": lifecycle_counts[
-                "live_rules_canary"
-            ],
-            "live_rules_canary_ready_count": lifecycle_ready_counts[
-                "live_rules_canary"
-            ],
+            "live_rules_canary_entry_count": lifecycle_counts["live_rules_canary"],
+            "live_rules_canary_ready_count": lifecycle_ready_counts["live_rules_canary"],
             "live_rules_canary_blocked_count": (
-                lifecycle_counts["live_rules_canary"]
-                - lifecycle_ready_counts["live_rules_canary"]
+                lifecycle_counts["live_rules_canary"] - lifecycle_ready_counts["live_rules_canary"]
             ),
-            "paper_canary_entry_count": lifecycle_counts["paper_bootstrap_canary"],
-            "paper_canary_ready_count": lifecycle_ready_counts[
-                "paper_bootstrap_canary"
-            ],
+            "normal_paper_entry_count": lifecycle_counts["normal_paper_trade"],
+            "normal_paper_ready_count": lifecycle_ready_counts["normal_paper_trade"],
+            "normal_paper_blocked_count": (
+                lifecycle_counts["normal_paper_trade"]
+                - lifecycle_ready_counts["normal_paper_trade"]
+            ),
+            "historical_entry_contracts": {
+                lifecycle: {
+                    "entry_count": lifecycle_counts[lifecycle],
+                    "ready_count": lifecycle_ready_counts[lifecycle],
+                    "blocked_count": (
+                        lifecycle_counts[lifecycle] - lifecycle_ready_counts[lifecycle]
+                    ),
+                }
+                for lifecycle in (
+                    "paper_bootstrap_canary",
+                    "paper_training",
+                    "paper_exploration",
+                )
+            },
             "entry_contract_lifecycle_counts": dict(lifecycle_counts),
             "contract_blocker_counts": dict(blocker_counts),
             "expected_net_return_distribution": _distribution(expected_returns),
             "return_lcb_distribution": _distribution(return_lcbs),
             "ml": {
                 "status": ml_status.get("status") or "unknown",
-                "live_ml_ready": bool(
-                    ml_status.get("live_ml_ready")
-                ),
+                "live_ml_ready": bool(ml_status.get("live_ml_ready")),
                 "readiness": ml_readiness,
             },
             "server_profit": {"diagnostic_only": True},

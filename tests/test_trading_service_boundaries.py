@@ -39,10 +39,10 @@ from services.expert_memory_service import ExpertMemoryService
 from services.market_analysis_defer_tracker import MarketAnalysisDeferTracker
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
+from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.paper_training import (
     PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
-    paper_training_mode_enabled,
 )
 from services.position_margin import PositionMarginCalculator
 from services.position_profit_peaks import PositionProfitPeakTracker
@@ -114,6 +114,27 @@ async def test_local_ml_signal_context_offloads_and_serializes_predictions() -> 
     assert max_active_predictions == 1
     assert worker_thread_ids
     assert all(thread_id != main_thread_id for thread_id in worker_thread_ids)
+
+
+@pytest.mark.asyncio
+async def test_local_ml_signal_failure_is_isolated_from_other_analysis_sources() -> None:
+    service = TradingService.__new__(TradingService)
+    service._local_ml_inference_lock = asyncio.Lock()
+
+    class Predictor:
+        def predict(self, _features: dict[str, str]) -> dict[str, str]:
+            raise ValueError("artifact feature contract mismatch")
+
+    service.ml_signal_service = Predictor()
+
+    result = await service._local_ml_signal_context({"symbol": "BTC/USDT"})
+
+    assert result["available"] is False
+    assert result["status"] == "inference_unavailable"
+    assert result["reason"] == "local_ml_inference_failed"
+    assert result["production_permission"] is False
+    assert "artifact feature contract mismatch" in result["error"]
+    assert service._local_ml_inference_lock.locked() is False
 
 
 @pytest.mark.asyncio
@@ -581,13 +602,9 @@ async def test_okx_background_fact_syncs_are_serialized_before_operation_start()
         second_started.set()
         return "second"
 
-    first_task = asyncio.create_task(
-        service._run_serialized_okx_fact_sync(first_operation)
-    )
+    first_task = asyncio.create_task(service._run_serialized_okx_fact_sync(first_operation))
     await asyncio.wait_for(first_started.wait(), timeout=1.0)
-    second_task = asyncio.create_task(
-        service._run_serialized_okx_fact_sync(second_operation)
-    )
+    second_task = asyncio.create_task(service._run_serialized_okx_fact_sync(second_operation))
     await asyncio.sleep(0)
 
     assert second_started.is_set() is False
@@ -965,7 +982,9 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
 
 
 @pytest.mark.asyncio
-async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_stale_fact() -> None:
+async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_stale_fact() -> (
+    None
+):
     service = TradingService.__new__(TradingService)
     calls: list[dict[str, Any]] = []
     stale = SimpleNamespace(
@@ -2243,7 +2262,12 @@ async def test_local_ml_auto_train_process_isolated_from_trading_database_pool(
         returncode = 0
 
         async def communicate(self) -> tuple[bytes, bytes]:
-            return b'{"trained":false,"reason":"not_due"}', b""
+            return (
+                b'{"event":"refusing incompatible ML signal artifact"}\n'
+                b'BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON='
+                b'{"trained":false,"reason":"not_due"}\n',
+                b"",
+            )
 
     async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> FakeProcess:
         captured["args"] = args
@@ -2263,6 +2287,34 @@ async def test_local_ml_auto_train_process_isolated_from_trading_database_pool(
     script_path = str(captured["args"][1]).replace("\\", "/")
     assert script_path.endswith("scripts/run_local_ml_auto_train.py")
     assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
+
+
+@pytest.mark.asyncio
+async def test_local_ml_auto_train_requires_framed_machine_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"trained":false,"reason":"not_due"}', b""
+
+    async def fake_create_subprocess_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_local_ml_training_subprocess()
+
+    assert result["trained"] is False
+    assert result["reason"] == "error"
+    assert result["error"] == "local ML auto-train result frame missing"
 
 
 @pytest.mark.asyncio
@@ -3532,7 +3584,12 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
             "reported_max_leverage": 20.0,
             "target_inst_id": "BTC-USDT-SWAP",
             "contract_specs": {
-                "BTC-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
+                "BTC-USDT-SWAP": {
+                    "ctVal": "0.01",
+                    "ctMult": "1",
+                    "minSz": "1",
+                    "lotSz": "1",
+                },
             },
             "leverage_tiers": [
                 {"tier": "1", "minSz": "0", "maxSz": "1000", "maxLeverage": 20},
@@ -3586,6 +3643,23 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
             },
         },
     }
+    direction_support = {
+        "eligible": True,
+        "selected_side": "long",
+        "prediction_horizon_minutes": 15.0,
+        "expected_net_return_pct": 0.5,
+        "objective_net_return_pct": 0.3,
+        "loss_probability": 0.2,
+        "quant_evidence_families": ["local_ml"],
+        "strong_expert_opposition": False,
+    }
+    decision.raw_response["independent_direction_support"] = direction_support
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="policy_exploitation",
+        direction_support=direction_support,
+    )
 
     await service._prepare_entry_for_hard_risk(
         decision,
@@ -5116,8 +5190,7 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     assert result["current_production_strategy"]["id"] == "cached_production_strategy"
     assert result["strategy_learning_cache_status"] == "stale_background_refresh"
     assert result["execution_mode"] == "paper"
-    assert result["paper_training_mode"] == "shadow_only"
-    assert paper_training_mode_enabled(result) is False
+    assert "paper_training_mode" not in result
     task = service._strategy_learning_context_refresh_tasks.get("paper")
     assert task is not None and not task.done()
     await asyncio.sleep(0)
@@ -5328,17 +5401,15 @@ async def test_strategy_mode_reuses_authoritative_empty_position_snapshot() -> N
 
     assert context["account_equity"] == 100.0
     assert context["execution_mode"] == "paper"
-    assert context["paper_training_mode"] == "shadow_only"
-    assert paper_training_mode_enabled(context) is False
+    assert "paper_training_mode" not in context
 
 
-def test_cached_promoted_champion_keeps_fast_training_disabled() -> None:
+def test_cached_promoted_champion_context_is_preserved() -> None:
     service = TradingService.__new__(TradingService)
     service._strategy_learning_context_cache = {
         "paper": {
             "created_at": datetime.now(UTC),
             "context": {
-                "paper_training_mode": "bootstrap",
                 "paper_strategy_champion": {
                     "active": True,
                     "paper_execution_permission": True,
@@ -5352,18 +5423,15 @@ def test_cached_promoted_champion_keeps_fast_training_disabled() -> None:
 
     assert context is not None
     assert context["execution_mode"] == "paper"
-    assert context["paper_training_mode"] == "shadow_only"
-    assert context["strategy_learning"]["paper_training_mode"] == "shadow_only"
-    assert paper_training_mode_enabled(context) is False
+    assert context["paper_strategy_champion"]["active"] is True
 
 
-def test_cached_continuous_primary_disables_fast_training_without_promotion() -> None:
+def test_cached_continuous_primary_context_is_preserved_without_promotion() -> None:
     service = TradingService.__new__(TradingService)
     service._strategy_learning_context_cache = {
         "paper": {
             "created_at": datetime.now(UTC),
             "context": {
-                "paper_training_mode": "bootstrap",
                 "paper_strategy_champion": {"active": False},
                 "continuous_strategy_routing": {
                     "applied": True,
@@ -5377,8 +5445,9 @@ def test_cached_continuous_primary_disables_fast_training_without_promotion() ->
     context = service._recent_strategy_learning_context("paper")
 
     assert context is not None
-    assert context["paper_training_mode"] == "shadow_only"
-    assert paper_training_mode_enabled(context) is False
+    assert context["continuous_strategy_routing"]["current_route"]["primary"] == {
+        "profile_id": "future-stable-primary"
+    }
 
 
 @pytest.mark.asyncio
@@ -5591,55 +5660,6 @@ async def test_ml_signal_service_completed_shadow_sample_boundary_calls_internal
 
 
 @pytest.mark.asyncio
-async def test_ml_signal_auto_train_skips_when_authoritative_cursor_has_no_new_samples(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = MLSignalService()
-
-    async def completed_shadow_sample_count() -> int:
-        return 1050
-
-    def current_metadata() -> dict[str, Any]:
-        return {
-            "sample_count": 1000,
-            "last_trained_completed_shadow_sample_count": 1050,
-            "trained_at": datetime.now(UTC).isoformat(),
-            "test_count": 250,
-            "quality_report": {"data_quality_version": DATA_QUALITY_VERSION},
-            "metrics": {
-                "long_auc": 0.40,
-                "short_auc": 0.41,
-                "long_accuracy": 0.48,
-                "short_accuracy": 0.49,
-                "top_long_avg_return_pct": -0.10,
-                "top_short_avg_return_pct": -0.08,
-                "top_long_win_rate": 0.40,
-                "bottom_long_win_rate": 0.45,
-                "top_short_win_rate": 0.42,
-                "bottom_short_win_rate": 0.46,
-            },
-        }
-
-    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
-    service._current_metadata = current_metadata  # type: ignore[method-assign]
-
-    async def load_trade_samples() -> list[dict[str, Any]]:
-        return []
-
-    monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
-        load_trade_samples,
-    )
-
-    result = await service.maybe_auto_train()
-
-    assert result["reason"] == "not_due"
-    assert result["new_sample_count"] == 0
-    assert result["last_trained_completed_sample_count"] == 1050
-    assert result["training_policy"]["learning_only"] is True
-
-
-@pytest.mark.asyncio
 async def test_ml_signal_auto_train_quarantines_before_training(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5740,7 +5760,14 @@ async def test_ml_signal_auto_train_quarantines_before_training(
     assert result["trained"] is True
     assert result["completed_sample_count"] == 318
     assert result["training_quarantine"]["quarantined"] == 2
-    assert calls[:4] == ["quarantine", "load_rows", "quality_report", "build_frame"]
+    assert calls[:6] == [
+        "load_rows",
+        "build_frame",
+        "quarantine",
+        "load_rows",
+        "quality_report",
+        "build_frame",
+    ]
     assert calls[-2:] == ["train_frame:False", "train_frame:True"]
 
 

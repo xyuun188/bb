@@ -433,6 +433,8 @@ class ModelArtifactRegistry:
             "label_version",
             "cost_model_version",
             "profit_supervision_version",
+            "feature_contract_version",
+            "multitask_prediction_contract_version",
             "training_data_sha256",
             "source_code_sha256",
             "evaluation_group_policy",
@@ -442,6 +444,29 @@ class ModelArtifactRegistry:
             _required_text(metadata, field)
         if metadata.get("model_stage") != "candidate":
             raise ValueError("candidate artifact model_stage must be candidate")
+        label_contract_versions = metadata.get("label_contract_versions")
+        if not isinstance(label_contract_versions, list) or not all(
+            isinstance(value, str) and value.strip() for value in label_contract_versions
+        ):
+            raise ValueError("label_contract_versions must contain explicit versions")
+        task_manifest = metadata.get("training_task_manifest")
+        if not isinstance(task_manifest, dict) or any(
+            not isinstance(task_manifest.get(task), dict)
+            for task in ("market_opportunity", "entry_timing", "exit", "execution")
+        ):
+            raise ValueError("training_task_manifest is incomplete")
+        replay_manifest = metadata.get("replay_weight_manifest")
+        if not isinstance(replay_manifest, dict) or (
+            not replay_manifest.get("version")
+            or replay_manifest.get("validation_and_test_resampling") is not False
+        ):
+            raise ValueError("replay_weight_manifest is incomplete")
+        sample_sources = metadata.get("training_sample_sources")
+        if not isinstance(sample_sources, dict) or any(
+            int(sample_sources.get(source) or 0) < 0
+            for source in ("shadow_market_label", "authoritative_okx_trade")
+        ):
+            raise ValueError("training_sample_sources is incomplete")
         training_hash = metadata.get("training_data_sha256")
         source_hash = metadata.get("source_code_sha256")
         if not _is_sha256(training_hash):

@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import pytest
 
 from services.entry_direction_support import (
     assess_directional_entry_support,
-    assess_unpromoted_model_intervention_support,
+    assess_paper_model_trade_support,
     directional_entry_support_reasons,
-    summarize_unpromoted_quantitative_evidence,
+    summarize_paper_quantitative_evidence,
 )
 
 
@@ -14,10 +16,11 @@ def _row(source: str, *, raw: float = 0.4, objective: float = 0.2) -> dict:
         "raw_expected_return_pct": raw,
         "objective_expected_return_pct": objective,
         "horizon_minutes": 30,
+        "return_distribution_contract": {"tail_loss_probability": 0.3},
     }
 
 
-def _opinion(name: str, action: str, *, source_group: str = "llm:expert") -> dict:
+def _opinion(name: str, action: str, *, source_group: str) -> dict:
     return {
         "model_name": name,
         "action": action,
@@ -28,25 +31,24 @@ def _opinion(name: str, action: str, *, source_group: str = "llm:expert") -> dic
     }
 
 
-def test_positive_quant_family_and_two_aligned_experts_are_independent_support() -> None:
+def test_governed_candidate_still_requires_positive_objective_evidence() -> None:
     support = assess_directional_entry_support(
-        {"long": {"evidence": [_row("local_ml")]}},
+        {"long": {"evidence": [_row("local_ml")] }},
         [
-            _opinion("trend", "long"),
-            _opinion("momentum", "long"),
-            _opinion("risk", "hold"),
+            _opinion("trend", "long", source_group="llm:trend"),
+            _opinion("momentum", "long", source_group="llm:momentum"),
+            _opinion("risk", "hold", source_group="llm:risk"),
         ],
         "long",
     )
 
     assert support["eligible"] is True
     assert support["quant_evidence_families"] == ["local_ml"]
-    assert support["independent_support_group_count"] == 2
     assert directional_entry_support_reasons(support, "long") == []
 
 
 def test_correlated_local_ai_tools_outputs_count_as_one_family() -> None:
-    support = assess_directional_entry_support(
+    support = assess_paper_model_trade_support(
         {
             "long": {
                 "evidence": [
@@ -56,93 +58,118 @@ def test_correlated_local_ai_tools_outputs_count_as_one_family() -> None:
                 ]
             }
         },
-        [
-            _opinion("trend", "long"),
-            _opinion("momentum", "long"),
-            _opinion("risk", "hold"),
-        ],
+        [],
         "long",
+        execution_cost_pct=0.1,
     )
 
     assert support["eligible"] is True
     assert support["quant_evidence_families"] == ["local_ai_tools"]
-    assert support["positive_quant_sources"] == [
+    assert support["quantitative_sources"] == [
         "sentiment",
         "server_profit",
         "timeseries",
     ]
 
 
-def test_all_hold_experts_cannot_authorize_model_intervention() -> None:
-    support = assess_directional_entry_support(
-        {"long": {"evidence": [_row("local_ml"), _row("server_profit")]}},
+def test_all_hold_experts_do_not_block_auditable_paper_model_direction() -> None:
+    support = assess_paper_model_trade_support(
+        {"long": {"evidence": [_row("local_ml")] }},
         [
-            _opinion("trend", "hold"),
-            _opinion("momentum", "hold"),
-            _opinion("risk", "hold"),
+            _opinion("trend", "hold", source_group="llm:trend"),
+            _opinion("momentum", "hold", source_group="llm:momentum"),
+            _opinion("risk", "hold", source_group="llm:risk"),
         ],
         "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is True
+    assert support["hold_expert_count"] == 3
+    assert support["aligned_expert_count"] == 0
+    assert support["blocking_reasons"] == []
+
+
+def test_negative_net_paper_direction_remains_eligible_for_coverage_sampling() -> None:
+    support = assess_paper_model_trade_support(
+        {"long": {"evidence": [_row("local_ml", raw=0.05, objective=-0.2)]}},
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is True
+    assert support["expected_net_return_pct"] == pytest.approx(-0.05)
+    assert support["objective_net_return_pct"] == pytest.approx(-0.3)
+    assert support["quant_evidence_families"] == ["local_ml"]
+
+
+def test_two_independent_expert_groups_can_block_strong_opposition() -> None:
+    support = assess_paper_model_trade_support(
+        {"long": {"evidence": [_row("local_ml")] }},
+        [
+            _opinion("trend", "long", source_group="llm:trend"),
+            _opinion("sentiment", "short", source_group="llm:sentiment"),
+            _opinion("position", "short", source_group="llm:position"),
+        ],
+        "long",
+        execution_cost_pct=0.1,
     )
 
     assert support["eligible"] is False
-    assert "direction_support_experts_all_hold" in support["blocking_reasons"]
-    assert "direction_support_aligned_experts_insufficient" in support[
+    assert support["strong_expert_opposition"] is True
+    assert "direction_support_strong_expert_opposition" in support[
         "blocking_reasons"
     ]
 
 
-def test_negative_quant_observations_are_not_support() -> None:
-    support = assess_directional_entry_support(
-        {
-            "long": {
-                "evidence": [
-                    _row("local_ml", raw=0.2, objective=-0.1),
-                    _row("server_profit", raw=-0.2, objective=-0.3),
-                ]
-            }
-        },
-        [
-            _opinion("trend", "long"),
-            _opinion("momentum", "long"),
-            _opinion("risk", "hold"),
-        ],
+@pytest.mark.parametrize(
+    ("competition", "cost", "expected_reason"),
+    [
+        ({"long": {"evidence": []}}, 0.1, "direction_support_quant_evidence_missing"),
+        (
+            {"long": {"evidence": [_row("local_ml")] }},
+            None,
+            "direction_support_execution_cost_incomplete",
+        ),
+        (
+            {
+                "long": {
+                    "evidence": [
+                        {
+                            **_row("local_ml"),
+                            "horizon_minutes": None,
+                        }
+                    ]
+                }
+            },
+            0.1,
+            "direction_support_quant_evidence_missing",
+        ),
+    ],
+)
+def test_paper_support_rejects_incomplete_market_or_cost_facts(
+    competition: dict,
+    cost: float | None,
+    expected_reason: str,
+) -> None:
+    support = assess_paper_model_trade_support(
+        competition,
+        [],
         "long",
+        execution_cost_pct=cost,
     )
 
     assert support["eligible"] is False
-    assert support["quant_evidence_families"] == []
-    assert "direction_support_positive_quant_evidence_missing" in support[
-        "blocking_reasons"
-    ]
-
-
-def test_expert_opposition_must_be_resolved() -> None:
-    support = assess_directional_entry_support(
-        {"long": {"evidence": [_row("local_ml")]}},
-        [
-            _opinion("trend", "long"),
-            _opinion("momentum", "long"),
-            _opinion("sentiment", "short"),
-            _opinion("position", "short"),
-        ],
-        "long",
-    )
-
-    assert support["eligible"] is False
-    assert "direction_support_expert_opposition_not_resolved" in support[
-        "blocking_reasons"
-    ]
+    assert expected_reason in support["blocking_reasons"]
 
 
 def test_support_fingerprint_detects_tampering() -> None:
-    support = assess_directional_entry_support(
-        {"short": {"evidence": [_row("local_ml")]}},
-        [
-            _opinion("trend", "short"),
-            _opinion("momentum", "short"),
-            _opinion("risk", "hold"),
-        ],
+    support = assess_paper_model_trade_support(
+        {"short": {"evidence": [_row("local_ml")] }},
+        [],
         "short",
+        execution_cost_pct=0.1,
     )
     support["aligned_expert_count"] = 99
 
@@ -151,48 +178,7 @@ def test_support_fingerprint_detects_tampering() -> None:
     )
 
 
-def test_unpromoted_intervention_uses_positive_mean_after_execution_cost() -> None:
-    row = _row("local_ml", raw=0.4, objective=-0.2)
-    row["return_distribution_contract"] = {"tail_loss_probability": 0.3}
-    support = assess_unpromoted_model_intervention_support(
-        {"long": {"evidence": [row]}},
-        [
-            _opinion("trend", "long"),
-            _opinion("momentum", "long"),
-            _opinion("risk", "hold"),
-        ],
-        "long",
-        execution_cost_pct=0.1,
-    )
-
-    assert support["eligible"] is True
-    assert support["expected_net_return_pct"] == pytest.approx(0.3)
-    assert support["objective_net_return_pct"] == pytest.approx(-0.3)
-    assert support["loss_probability"] == pytest.approx(0.3)
-    assert directional_entry_support_reasons(support, "long") == []
-
-
-def test_unpromoted_intervention_rejects_mean_below_execution_cost() -> None:
-    row = _row("local_ml", raw=0.05, objective=-0.2)
-    row["return_distribution_contract"] = {"tail_loss_probability": 0.3}
-    support = assess_unpromoted_model_intervention_support(
-        {"long": {"evidence": [row]}},
-        [
-            _opinion("trend", "long"),
-            _opinion("momentum", "long"),
-            _opinion("risk", "hold"),
-        ],
-        "long",
-        execution_cost_pct=0.1,
-    )
-
-    assert support["eligible"] is False
-    assert "direction_support_expected_net_return_not_positive" in support[
-        "blocking_reasons"
-    ]
-
-
-def test_unpromoted_quantitative_summary_is_available_before_expert_support() -> None:
+def test_paper_quantitative_summary_is_available_before_expert_support() -> None:
     local_ml = _row("local_ml", raw=0.05, objective=-0.2)
     server_profit = _row("server_profit", raw=0.35, objective=-0.1)
     timeseries = _row("timeseries", raw=0.25, objective=0.05)
@@ -201,7 +187,7 @@ def test_unpromoted_quantitative_summary_is_available_before_expert_support() ->
             "tail_loss_probability": probability
         }
 
-    summary = summarize_unpromoted_quantitative_evidence(
+    summary = summarize_paper_quantitative_evidence(
         {"long": {"evidence": [local_ml, server_profit, timeseries]}},
         "long",
         execution_cost_pct=0.1,

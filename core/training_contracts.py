@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-SHADOW_LABEL_VERSION = "2026-07-14.native-shadow-label.v1"
+SHADOW_LABEL_VERSION = "2026-07-27.market-opportunity-multitask.v2"
 SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"
 AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-24.authoritative-trade-outcome.v3"
 AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-07-24.net-return-after-all-cost.v2"
@@ -92,6 +92,16 @@ def build_shadow_label_contract(
     market_fact_contract: Mapping[str, Any] | None,
     cost_facts: Mapping[str, Any] | None,
     label_timestamp: Any,
+    long_mfe_pct: float | None = None,
+    long_mae_pct: float | None = None,
+    short_mfe_pct: float | None = None,
+    short_mae_pct: float | None = None,
+    long_stop_loss_triggered: bool | None = None,
+    short_stop_loss_triggered: bool | None = None,
+    long_take_profit_triggered: bool | None = None,
+    short_take_profit_triggered: bool | None = None,
+    long_first_touch: str | None = None,
+    short_first_touch: str | None = None,
     version: str = SHADOW_LABEL_VERSION,
 ) -> dict[str, Any]:
     market_contract = _dict(market_fact_contract)
@@ -109,6 +119,17 @@ def build_shadow_label_contract(
         "short_return_pct": float(short_return_pct),
         "best_action": _text(best_action).lower(),
         "label_timestamp": _iso(label_timestamp),
+        "label_maturity_status": "matured",
+        "long_mfe_pct": _float(long_mfe_pct),
+        "long_mae_pct": _float(long_mae_pct),
+        "short_mfe_pct": _float(short_mfe_pct),
+        "short_mae_pct": _float(short_mae_pct),
+        "long_stop_loss_triggered": long_stop_loss_triggered,
+        "short_stop_loss_triggered": short_stop_loss_triggered,
+        "long_take_profit_triggered": long_take_profit_triggered,
+        "short_take_profit_triggered": short_take_profit_triggered,
+        "long_first_touch": _text(long_first_touch).lower(),
+        "short_first_touch": _text(short_first_touch).lower(),
     }
     if fee_after_complete:
         labels.update(
@@ -177,6 +198,17 @@ def compact_shadow_label_contract(
         "short_return_pct": labels.get("short_return_pct"),
         "best_action": labels.get("best_action"),
         "label_timestamp": labels.get("label_timestamp"),
+        "label_maturity_status": labels.get("label_maturity_status"),
+        "long_mfe_pct": labels.get("long_mfe_pct"),
+        "long_mae_pct": labels.get("long_mae_pct"),
+        "short_mfe_pct": labels.get("short_mfe_pct"),
+        "short_mae_pct": labels.get("short_mae_pct"),
+        "long_stop_loss_triggered": labels.get("long_stop_loss_triggered"),
+        "short_stop_loss_triggered": labels.get("short_stop_loss_triggered"),
+        "long_take_profit_triggered": labels.get("long_take_profit_triggered"),
+        "short_take_profit_triggered": labels.get("short_take_profit_triggered"),
+        "long_first_touch": labels.get("long_first_touch"),
+        "short_first_touch": labels.get("short_first_touch"),
         "market_fact_contract_version": lineage.get("contract_version"),
         "market_fact_data_fingerprint": lineage.get("data_fingerprint"),
         "entry_fact_id": lineage.get("entry_fact_id"),
@@ -274,6 +306,25 @@ def shadow_label_contract_reasons(
         reasons.append("shadow_best_action_label_invalid")
     if not _iso(labels.get("label_timestamp")):
         reasons.append("shadow_label_timestamp_missing")
+    if labels.get("label_maturity_status") != "matured":
+        reasons.append("shadow_label_not_matured")
+    for key in ("long_mfe_pct", "long_mae_pct", "short_mfe_pct", "short_mae_pct"):
+        if _float(labels.get(key)) is None:
+            reasons.append(f"shadow_path_label_missing:{key}")
+    for key in ("long_stop_loss_triggered", "short_stop_loss_triggered"):
+        if not isinstance(labels.get(key), bool):
+            reasons.append(f"shadow_stop_label_missing:{key}")
+    for key in ("long_take_profit_triggered", "short_take_profit_triggered"):
+        if not isinstance(labels.get(key), bool):
+            reasons.append(f"shadow_take_profit_label_missing:{key}")
+    for key in ("long_first_touch", "short_first_touch"):
+        if _text(labels.get(key)).lower() not in {
+            "none",
+            "stop_loss",
+            "take_profit",
+            "path_uncertain",
+        }:
+            reasons.append(f"shadow_first_touch_label_invalid:{key}")
 
     fee_after_declared = any(
         key in labels

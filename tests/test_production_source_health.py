@@ -10,9 +10,7 @@ def _decision(
     created_at: datetime,
     *,
     source_count: int = 0,
-    canary: bool = False,
     executed: bool = False,
-    sampling_plan_alert: bool = False,
     normal_paper: bool = False,
 ) -> SimpleNamespace:
     decision = SimpleNamespace(
@@ -23,16 +21,22 @@ def _decision(
             "authoritative_return_candidate": {
                 "side_evidence": {"production_source_count": source_count}
             },
-            "paper_bootstrap_canary": {
-                "requested": canary,
-                "trade_kind": "normal_strategy_trade" if normal_paper else None,
-            },
         },
     )
-    if canary:
-        decision.raw_llm_response["paper_bootstrap_canary"]["runtime_guard"] = {
-            "sampling_plan_alert_active": sampling_plan_alert,
-        }
+    if normal_paper:
+        from services.normal_paper_trade import build_normal_paper_trade_contract
+
+        decision.raw_llm_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+            symbol="BTC/USDT",
+            side="long",
+            selection_reason="policy_exploitation",
+            direction_support={
+                "eligible": True,
+                "selected_side": "long",
+                "prediction_horizon_minutes": 15,
+                "expected_net_return_pct": 0.1,
+            },
+        )
     return decision
 
 
@@ -60,18 +64,18 @@ def test_recent_production_source_clears_alert() -> None:
     assert report["alert_active"] is False
 
 
-def test_alert_reports_paper_bootstrap_recovery_progress() -> None:
+def test_old_bootstrap_contract_does_not_count_as_normal_paper_activity() -> None:
     now = datetime(2026, 7, 17, 12, tzinfo=UTC)
-    rows = [
-        _decision(now - timedelta(hours=2), canary=True, executed=True),
-        _decision(now - timedelta(hours=3)),
-    ]
+    row = _decision(now - timedelta(hours=2), executed=True)
+    row.raw_llm_response["paper_bootstrap_canary"] = {"authorized": True}
+    rows = [row, _decision(now - timedelta(hours=3))]
 
     report = summarize_production_source_health(rows, now=now)
 
     assert report["status"] == "critical"
-    assert report["recovery_state"] == "paper_bootstrap_collecting"
-    assert report["paper_bootstrap_executed_count"] == 1
+    assert report["recovery_state"] == "normal_paper_candidate_waiting"
+    assert report["normal_paper_executed_count"] == 0
+    assert report["paper_sampling_alert_active"] is True
 
 
 def test_normal_paper_trading_reports_continuous_training_without_sample_target() -> None:
@@ -79,7 +83,6 @@ def test_normal_paper_trading_reports_continuous_training_without_sample_target(
     rows = [
         _decision(
             now - timedelta(minutes=2),
-            canary=True,
             executed=True,
             normal_paper=True,
         ),
@@ -88,27 +91,24 @@ def test_normal_paper_trading_reports_continuous_training_without_sample_target(
 
     report = summarize_production_source_health(rows, now=now)
 
-    assert report["recovery_state"] == "paper_normal_trading"
-    assert report["paper_normal_executed_count"] == 1
+    assert report["recovery_state"] == "normal_paper_trading"
+    assert report["normal_paper_executed_count"] == 1
     assert report["continuous_training_after_settlement"] is True
-    assert report["sample_target"] is None
-    assert report["sampling_plan_alert_active"] is False
+    assert report["paper_sampling_alert_active"] is False
+    assert report["paper_sampling_status"] == "active"
 
 
-def test_unreachable_sampling_plan_is_promoted_to_health_alert() -> None:
+def test_continuous_no_normal_paper_candidate_is_reported_separately() -> None:
     now = datetime(2026, 7, 17, 12, tzinfo=UTC)
     rows = [
-        _decision(
-            now - timedelta(minutes=2),
-            canary=True,
-            sampling_plan_alert=True,
-        ),
-        _decision(now - timedelta(minutes=3)),
+        _decision(now - timedelta(hours=2)),
+        _decision(now - timedelta(hours=3)),
     ]
 
     report = summarize_production_source_health(rows, now=now)
 
     assert report["status"] == "critical"
-    assert report["reason"] == "paper_bootstrap_sampling_plan_unreachable"
-    assert report["sampling_plan_alert_active"] is True
-    assert report["recovery_state"] == "paper_bootstrap_plan_unreachable"
+    assert report["reason"] == "continuous_no_production_return_source"
+    assert report["paper_sampling_alert_active"] is True
+    assert report["paper_sampling_alert_reason"] == "continuous_no_normal_paper_candidate"
+    assert report["recovery_state"] == "normal_paper_candidate_waiting"

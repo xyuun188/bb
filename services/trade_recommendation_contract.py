@@ -64,49 +64,33 @@ def _decision_kind(decision: DecisionOutput) -> str:
 def _opportunity_sources(
     raw: dict[str, Any],
     side: str,
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     opportunity = _dict(raw.get("opportunity_score"))
     candidate = _dict(raw.get("entry_candidate_evidence"))
     side_candidate = _dict(candidate.get(side))
-    training = _dict(raw.get("paper_training"))
-    canary = _dict(_dict(raw.get("paper_bootstrap_canary")).get("selected_observation"))
-    exploration = _dict(raw.get("paper_exploration"))
-    return opportunity, side_candidate, training, canary, exploration
+    normal_paper = _dict(raw.get("normal_paper_trade"))
+    return opportunity, side_candidate, normal_paper
 
 
 def _return_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
-    opportunity, side_candidate, training, canary, exploration = _opportunity_sources(
-        raw,
-        side,
-    )
+    opportunity, side_candidate, normal_paper = _opportunity_sources(raw, side)
     distribution = _dict(opportunity.get("return_distribution_contract"))
     expected = _first_number(
         opportunity.get("expected_net_return_pct"),
         distribution.get("objective_expected_return_pct"),
         side_candidate.get("expected_net_return_pct"),
-        training.get("expected_net_return_pct"),
-        canary.get("observed_net_return_pct"),
-        exploration.get("expected_net_return_pct"),
+        normal_paper.get("expected_net_return_pct"),
     )
     lower = _first_number(
         opportunity.get("return_lcb_pct"),
         distribution.get("lower_quantile_return_pct"),
         side_candidate.get("return_lcb_pct"),
-        training.get("return_lcb_pct"),
-        canary.get("lower_quantile_net_return_pct"),
-        exploration.get("return_lcb_pct"),
+        normal_paper.get("objective_net_return_pct"),
     )
     uncertainty = _first_number(
         opportunity.get("return_uncertainty_pct"),
         distribution.get("return_uncertainty_pct"),
         distribution.get("uncertainty_penalty_pct"),
-        canary.get("dispersion_pct"),
     )
     upper = _first_number(
         distribution.get("upper_quantile_return_pct"),
@@ -124,12 +108,8 @@ def _return_plan(raw: dict[str, Any], side: str) -> dict[str, Any]:
         "source": (
             "authoritative_opportunity_return_distribution"
             if _finite(opportunity.get("expected_net_return_pct")) is not None
-            else "paper_training_return_contract"
-            if _finite(training.get("expected_net_return_pct")) is not None
-            else "paper_canary_empirical_distribution"
-            if _finite(canary.get("observed_net_return_pct")) is not None
-            else "paper_exploration_return_contract"
-            if _finite(exploration.get("expected_net_return_pct")) is not None
+            else "normal_paper_trade_contract"
+            if _finite(normal_paper.get("expected_net_return_pct")) is not None
             else "missing"
         ),
     }
@@ -140,20 +120,13 @@ def _holding_plan(
     side: str,
     decision: DecisionOutput | None = None,
 ) -> dict[str, Any]:
-    opportunity, side_candidate, training, canary, exploration = _opportunity_sources(
-        raw,
-        side,
-    )
+    opportunity, side_candidate, normal_paper = _opportunity_sources(raw, side)
     distribution = _dict(opportunity.get("return_distribution_contract"))
     target = _positive(
         getattr(decision, "suggested_holding_minutes", None),
         distribution.get("horizon_minutes"),
         side_candidate.get("horizon_minutes"),
-        training.get("prediction_horizon_minutes"),
-        training.get("horizon_minutes"),
-        canary.get("horizon_minutes"),
-        exploration.get("prediction_horizon_minutes"),
-        exploration.get("horizon_minutes"),
+        normal_paper.get("prediction_horizon_minutes"),
     )
     max_minutes = _positive(
         getattr(decision, "maximum_holding_minutes", None),
@@ -162,8 +135,7 @@ def _holding_plan(
         target,
     )
     valid_for_seconds = _positive(
-        training.get("valid_for_seconds"),
-        exploration.get("valid_for_seconds"),
+        normal_paper.get("valid_for_seconds"),
         min(target * 60.0, 300.0) if target is not None else None,
     )
     return {
@@ -205,10 +177,7 @@ def _entry_plan(decision: DecisionOutput) -> dict[str, Any]:
 
 def _loss_plan(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, Any]:
     side = _side(decision)
-    opportunity, side_candidate, training, canary, exploration = _opportunity_sources(
-        raw,
-        side,
-    )
+    opportunity, side_candidate, normal_paper = _opportunity_sources(raw, side)
     sizing = _dict(raw.get("profit_risk_sizing"))
     stop_fraction = _positive(
         decision.stop_loss_pct,
@@ -220,9 +189,7 @@ def _loss_plan(decision: DecisionOutput, raw: dict[str, Any]) -> dict[str, Any]:
         sizing.get("expected_loss_pct"),
         opportunity.get("expected_loss_pct"),
         side_candidate.get("expected_loss_pct"),
-        training.get("expected_loss_pct"),
-        canary.get("dispersion_pct"),
-        exploration.get("expected_loss_pct"),
+        normal_paper.get("expected_loss_pct"),
         abs(min(lower_return, 0.0)) if lower_return is not None else None,
         (stop_fraction or 0.0) * 100.0,
     )

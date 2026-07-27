@@ -4339,9 +4339,9 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     degraded: '证据未达标',
     learning_only: '仅学习观察',
     shadow_ready: '影子观察就绪',
-    paper_canary_ready: '模拟盘小仓观察就绪',
+    paper_canary_ready: 'Paper Canary 生命周期；模拟盘正常交易，实盘仍未授权',
     partial_ready: '部分方向就绪',
-    artifact_activation_not_production_authorized: '当前 Artifact 仅获模拟盘小仓观察授权，尚未获得生产影响权限',
+    artifact_activation_not_production_authorized: '当前 Artifact 可参与模拟盘，尚未获得实盘权限',
     shadow_market_opportunity_distribution_missing: '缺少影子市场机会收益分布',
     counterfactual_execution_cost_distribution_missing: '缺少反事实执行成本分布',
     authoritative_realized_return_distribution_missing: '缺少权威真实成交收益分布',
@@ -9814,6 +9814,8 @@ function mlLocalEvidenceHtml(status) {
     const blockers = Array.isArray(readiness.blocking_reasons)
         ? readiness.blocking_reasons : [];
     const authoritative = status.authoritative_trade_return_evidence || {};
+    const tasks = status.training_task_manifest || {};
+    const replay = status.replay_weight_manifest || {};
     const fingerprint = quality.market_fact_contract?.provenance?.data_fingerprint
         || diagnostics.provenance?.data_fingerprint
         || status.training_data_sha256;
@@ -9848,9 +9850,19 @@ function mlLocalEvidenceHtml(status) {
             ${mlEvidenceRow('源码 SHA256', evidenceValue(status.source_code_sha256))}
             ${mlEvidenceRow('Manifest 路径', evidenceValue(registry.manifest_path || status.artifact_manifest_path))}
         </section>`,
+        `<section class="ml-evidence-panel">
+            <div class="ml-evidence-head"><strong>多任务与重放池</strong><span>${escHtml(status.multitask_prediction_contract_version || '合同缺失')}</span></div>
+            ${mlEvidenceRow('机会 / 入场任务样本', `${mlSampleCountLabel(mlOptionalNumber(tasks.market_opportunity?.sample_count))} / ${mlSampleCountLabel(mlOptionalNumber(tasks.entry_timing?.sample_count))}`)}
+            ${mlEvidenceRow('退出 / 执行任务样本', `${mlSampleCountLabel(mlOptionalNumber(tasks.exit?.sample_count))} / ${mlSampleCountLabel(mlOptionalNumber(tasks.execution?.sample_count))}`)}
+            ${mlEvidenceRow('独立决策组', mlSampleCountLabel(mlOptionalNumber(status.completed_shadow_decision_group_count)))}
+            ${mlEvidenceRow('重放池有效样本量', mlEvidenceValue(mlOptionalNumber(replay.effective_sample_size)))}
+            ${mlEvidenceRow('标签合同', Array.isArray(status.label_contract_versions) ? status.label_contract_versions.join('，') : '证据缺失')}
+        </section>`,
         `<section class="ml-evidence-panel ${activation.live_ml_ready === true ? '' : 'warn'}">
             <div class="ml-evidence-head"><strong>晋升与激活证据</strong><span>${activation.live_ml_ready === true ? '已授权' : '未授权'}</span></div>
             ${mlEvidenceRow('激活阶段', evidenceValue(activation.activation_stage || status.artifact_lifecycle))}
+            ${mlEvidenceRow('模拟盘交易权限', status.paper_trading_permission === true ? '允许' : '不可用')}
+            ${mlEvidenceRow('实盘候选权限', status.live_trading_permission === true ? '允许逐笔检查' : '未晋升')}
             ${mlEvidenceRow('Walk-forward', evidenceValue(walkForward.status))}
             ${mlEvidenceRow('滚动折数', mlSampleCountLabel(mlOptionalNumber(walkForward.folds?.length)))}
             ${mlEvidenceRow('做多移除单币稳定', evidenceValue(symbolStability.long?.stable))}
@@ -9881,7 +9893,6 @@ function renderMLSignalOverview() {
         latestPrediction?.best_side,
     );
     const ready = status.available === true;
-    const mode = status.mode || latestSignal?.mode || 'learning_only';
     const unavailableReason = status.message || status.error || '本地 ML 模型尚未返回可用状态';
     const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
     const samples = mlSampleCounts();
@@ -9904,10 +9915,11 @@ function renderMLSignalOverview() {
     const readinessBlockers = Array.isArray(readiness.blocking_reasons) ? readiness.blocking_reasons : [];
     const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
     const allowLivePositionInfluence = status.live_ml_ready === true;
+    const allowPaperTrading = status.paper_trading_permission === true;
     const influenceEnabled = allowLivePositionInfluence;
     const controlledReadinessDegrade = ready && !allowLivePositionInfluence && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
     const readinessDisplayState = controlledReadinessDegrade
-        ? '学习观察'
+        ? '模拟盘可用'
         : dashboardReasonText(readinessState);
     const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
     const readinessReasonText = readinessBlockers.length
@@ -9926,7 +9938,7 @@ function renderMLSignalOverview() {
 
     if (updatedEl) {
         updatedEl.textContent = ready
-            ? `影子市场 ${mlSampleCountLabel(samples.mlShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.mlShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.mlActualReturn)} 条 · ${influenceEnabled ? '已介入' : '学习中'}`
+            ? `市场标签 ${mlSampleCountLabel(samples.mlShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.mlShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.mlActualReturn)} 条 · 模拟盘${allowPaperTrading ? '正常参与' : '不可用'} · 实盘${influenceEnabled ? '候选就绪' : '未授权'}`
             : `模型不可用 · ${unavailableReason}`;
     }
 
@@ -9946,13 +9958,14 @@ function renderMLSignalOverview() {
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">4</div>
-                <div><strong>${influenceEnabled ? '参与开仓过滤' : '学习观察中'}</strong><span>${influenceEnabled ? '生产端组合毛市场收益、实时成本与 OKX 实际滑点尾部' : '任一监督分布不完整时不影响生产交易'}</span></div>
+                <div><strong>${allowPaperTrading ? '参与模拟盘正常决策' : '模型当前不可用'}</strong><span>${influenceEnabled ? '实盘候选已就绪，每笔订单仍执行生产门禁' : '晋升状态只阻断实盘，不阻断模拟盘采样和训练'}</span></div>
             </div>
         </div>
         <div class="ml-overview-grid">
-            ${mlMetricCard('模型状态', ready ? (influenceEnabled ? '已介入' : '学习中') : '不可用', ready ? (mode === 'entry_profit_filter' ? '盈亏质量过滤中' : '暂不强制影响交易') : unavailableReason, ready ? (influenceEnabled ? 'good' : 'warn') : 'bad')}
+            ${mlMetricCard('模型状态', ready ? (allowPaperTrading ? '模拟盘参与中' : '仅加载') : '不可用', ready ? (influenceEnabled ? '实盘候选已就绪' : '实盘未晋升') : unavailableReason, ready ? (allowPaperTrading ? 'good' : 'warn') : 'bad')}
             ${mlMetricCard('就绪判断', readinessDisplayState, readinessReasonText, readinessTone)}
-            ${mlMetricCard('真实仓位影响', allowLivePositionInfluence ? '允许' : '禁止', allowLivePositionInfluence ? 'readiness 已达标' : '未达标前不允许参与真实仓位放大', allowLivePositionInfluence ? 'good' : 'warn')}
+            ${mlMetricCard('模拟盘交易权限', allowPaperTrading ? '允许' : '不可用', allowPaperTrading ? '晋升、LCB、PF 不参与模拟盘授权' : '模型制品或运行链不可用', allowPaperTrading ? 'good' : 'bad')}
+            ${mlMetricCard('实盘候选权限', allowLivePositionInfluence ? '允许逐笔检查' : '未晋升', allowLivePositionInfluence ? '仍须 production_trade_gate 逐笔授权' : '不影响模拟盘分析、交易和训练', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('影子市场机会样本', mlSampleCountLabel(samples.mlShadowMarket), '不代表实际成交或真实费后收益', Number.isFinite(samples.mlShadowMarket) ? 'good' : 'warn')}
             ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
             ${mlMetricCard('OKX 实际费后收益样本', mlSampleCountLabel(samples.mlActualReturn), '只统计可信已平仓生命周期', Number.isFinite(samples.mlActualReturn) ? 'good' : 'warn')}

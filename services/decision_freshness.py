@@ -9,10 +9,7 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
-from services.paper_training import (
-    PAPER_TRAINING_VERSION,
-    paper_training_contract_reasons,
-)
+from services.normal_paper_trade import normal_paper_trade_contract_reasons
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -45,28 +42,11 @@ def parse_utc_datetime(value: Any) -> datetime | None:
 
 def entry_validity_seconds_from_raw(raw_response: Any) -> float:
     raw = _safe_dict(raw_response)
-    paper_training = _safe_dict(raw.get("paper_training"))
-    if (
-        paper_training.get("version") == PAPER_TRAINING_VERSION
-        and not paper_training_contract_reasons(paper_training)
-    ):
-        valid_for_seconds = _safe_float(
-            paper_training.get("valid_for_seconds"),
-            0.0,
-        )
+    normal_paper = _safe_dict(raw.get("normal_paper_trade"))
+    if not normal_paper_trade_contract_reasons(normal_paper):
+        valid_for_seconds = _safe_float(normal_paper.get("valid_for_seconds"), 0.0)
         if valid_for_seconds > 0:
             return valid_for_seconds
-    paper_canary = _safe_dict(raw.get("paper_bootstrap_canary"))
-    if (
-        paper_canary.get("authorized") is True
-        and paper_canary.get("requested") is True
-        and paper_canary.get("execution_scope") == "paper_only"
-        and paper_canary.get("production_permission") is False
-    ):
-        observation = _safe_dict(paper_canary.get("selected_observation"))
-        horizon_minutes = _safe_float(observation.get("horizon_minutes"), 0.0)
-        if horizon_minutes > 0:
-            return horizon_minutes * 60.0
     opportunity = _safe_dict(raw.get("opportunity_score"))
     provenance = _safe_dict(opportunity.get("policy_provenance"))
     value = _safe_float(provenance.get("valid_for_seconds"), 0.0)
@@ -75,26 +55,9 @@ def entry_validity_seconds_from_raw(raw_response: Any) -> float:
 
 def entry_reference_time_from_raw(raw_response: Any) -> datetime | None:
     raw = _safe_dict(raw_response)
-    paper_training = _safe_dict(raw.get("paper_training"))
-    if (
-        paper_training.get("version") == PAPER_TRAINING_VERSION
-        and not paper_training_contract_reasons(paper_training)
-    ):
-        provenance = _safe_dict(paper_training.get("policy_provenance"))
-        generated_at = parse_utc_datetime(provenance.get("generated_at"))
-        if generated_at is not None:
-            return generated_at
-    paper_canary = _safe_dict(raw.get("paper_bootstrap_canary"))
-    if (
-        paper_canary.get("authorized") is True
-        and paper_canary.get("requested") is True
-        and paper_canary.get("execution_scope") == "paper_only"
-        and paper_canary.get("production_permission") is False
-    ):
-        provenance = _safe_dict(paper_canary.get("policy_provenance"))
-        generated_at = parse_utc_datetime(
-            provenance.get("generated_at") or paper_canary.get("generated_at")
-        )
+    normal_paper = _safe_dict(raw.get("normal_paper_trade"))
+    if not normal_paper_trade_contract_reasons(normal_paper):
+        generated_at = parse_utc_datetime(normal_paper.get("generated_at"))
         if generated_at is not None:
             return generated_at
     opportunity = _safe_dict(raw.get("opportunity_score"))

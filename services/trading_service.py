@@ -133,6 +133,7 @@ from services.ml_signal_service import (
     AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
     AUTO_TRAIN_LEASE_STALE_SECONDS,
     AUTO_TRAIN_RETRY_INTERVAL_SECONDS,
+    LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
     MODEL_TRAINING_STATE_STORE,
     MLSignalService,
 )
@@ -146,10 +147,7 @@ from services.okx_order_fact_sync import OkxOrderFactSyncService
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
-from services.paper_bootstrap_canary import (
-    PaperBootstrapCanaryPolicy,
-    assess_paper_canary_position_horizon,
-)
+from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
@@ -717,10 +715,6 @@ class TradingService:
             allocated_order_balance=self.allocated_order_balance,
             exchange_risk_facts=self.entry_exchange_risk_facts,
         )
-        self.paper_bootstrap_canary = PaperBootstrapCanaryPolicy(
-            allocated_order_balance=self.allocated_order_balance,
-            exchange_risk_facts=self.entry_exchange_risk_facts,
-        )
         self._open_positions_context_cache: dict[str, Any] = {}
         self._open_positions_context_refresh_task: asyncio.Task | None = None
         self._new_pair_pause_context_cache: dict[str, Any] = {}
@@ -752,7 +746,6 @@ class TradingService:
             entry_profit_risk_sizing=self.entry_profit_risk_sizing,
             entry_price_guard=self.entry_price_guard,
             entry_opportunity_gate=self.entry_opportunity_gate,
-            paper_bootstrap_canary=self.paper_bootstrap_canary,
         )
         self.entry_candidate_queue = EntryCandidateQueuePolicy(
             score_candidate=self.entry_policy.score_candidate,
@@ -3741,6 +3734,20 @@ class TradingService:
                 "reason": "local_ml_inference_queue_busy",
                 "production_permission": False,
             }
+        except Exception as exc:
+            error_text = safe_error_text(exc, limit=180)
+            logger.warning(
+                "local ML inference failed without blocking other analysis sources",
+                symbol=getattr(features, "symbol", None),
+                error=error_text,
+            )
+            return {
+                "available": False,
+                "status": "inference_unavailable",
+                "reason": "local_ml_inference_failed",
+                "error": error_text,
+                "production_permission": False,
+            }
         finally:
             if acquired:
                 lock.release()
@@ -5090,9 +5097,6 @@ class TradingService:
             account_config=settings.get_execution_account_config(selected_mode),
         )
         context["execution_mode"] = selected_mode
-        context["paper_training_mode"] = (
-            "shadow_only" if selected_mode == "paper" else "disabled"
-        )
         context["account_equity"] = account_equity
         context["strategy_context_performance"] = performance_snapshot
         if continuous_weight_report:
@@ -5290,9 +5294,6 @@ class TradingService:
         result = dict(context)
         result["execution_mode"] = selected_mode
         learning = self._safe_dict(result.get("strategy_learning"))
-        paper_training_mode = "disabled" if selected_mode == "live" else "shadow_only"
-        result["paper_training_mode"] = paper_training_mode
-        learning["paper_training_mode"] = paper_training_mode
         result["strategy_learning"] = learning
         return result
 
@@ -6638,11 +6639,7 @@ class TradingService:
                 )
         if executed.is_hold:
             executed_raw = executed.raw_response if isinstance(executed.raw_response, dict) else {}
-            hold_reason = (
-                executed.reasoning
-                if isinstance(executed_raw.get("paper_bootstrap_canary_observation"), dict)
-                else "多模型裁决结果为观望，未提交订单。"
-            )
+            hold_reason = "多模型裁决结果为观望，未提交订单。"
             if decision_db_id is not None:
                 if executed_raw:
                     await self._mark_decision_raw_response(decision_db_id, executed_raw)
@@ -8144,17 +8141,6 @@ class TradingService:
                     skills=market_agent_skills,
                     note="市场分析前的 Agent/Skills 证据快照。",
                 )
-                if self.paper_bootstrap_canary.is_claimed(decision):
-                    canary_preflight = await self.paper_bootstrap_canary.preflight(
-                        decision,
-                        model_mode,
-                        open_positions,
-                        timing_scope="market_decision_persistence",
-                    )
-                    self.paper_bootstrap_canary.demote_blocked_candidate_to_hold(
-                        decision,
-                        canary_preflight,
-                    )
                 decision_db_id = await self._log_decision(
                     decision, is_paper=(model_mode == "paper")
                 )
@@ -8782,13 +8768,25 @@ class TradingService:
             }
 
         try:
-            payload = json.loads(stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            stdout_text = stdout.decode("utf-8")
+            result_frame = next(
+                (
+                    line.removeprefix(LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX)
+                    for line in reversed(stdout_text.splitlines())
+                    if line.startswith(LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX)
+                ),
+                None,
+            )
+            if result_frame is None:
+                raise ValueError("local ML auto-train result frame missing")
+            payload = json.loads(result_frame)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
             return {
                 "trained": False,
                 "reason": "error",
                 "error": (
-                    safe_error_text(stderr.decode("utf-8", errors="replace"), limit=180)
+                    safe_error_text(stderr_text, limit=180, fallback="")
                     or safe_error_text(exc, limit=180)
                 ),
                 "training_process_isolated": True,

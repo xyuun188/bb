@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
@@ -99,6 +101,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                 "expected_net_return_pct": 0.6,
                 "return_lcb_pct": 0.4,
                 "production_source_count": 2,
+                "execution_cost": {"total_pct": 0.1},
                 "policy_provenance": provenance,
             },
             "short": {
@@ -106,6 +109,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                 "expected_net_return_pct": -0.2,
                 "return_lcb_pct": -0.3,
                 "production_source_count": 2,
+                "execution_cost": {"total_pct": 0.1},
                 "policy_provenance": provenance,
             },
             "policy_provenance": provenance,
@@ -146,6 +150,7 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
             "expected_net_return_pct": 0.3,
             "return_lcb_pct": -0.1,
             "production_source_count": 3,
+            "execution_cost": {"total_pct": 0.1},
             "policy_provenance": provenance,
         },
         "paper_exploration": {
@@ -302,10 +307,11 @@ def test_positive_mean_uncertain_candidate_can_only_create_bounded_paper_entry()
     assert (
         decision.raw_response["multidimensional_recommendation"]["execution_scope"] == "paper_only"
     )
-    contract = decision.raw_response["paper_exploration"]
+    contract = decision.raw_response["normal_paper_trade"]
     assert contract["execution_scope"] == "paper_only"
     assert contract["production_permission"] is False
-    assert contract["trade_is_normal"] is True
+    assert contract["entry_type"] == "normal_strategy_trade"
+    assert contract["selection_reason"] == "policy_exploitation"
     assert contract["sample_target"] is None
     assert contract["daily_sample_quota"] is None
 
@@ -321,7 +327,7 @@ def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
     assert "paper_exploration" not in decision.raw_response
 
 
-def test_single_source_training_observation_remains_blocked() -> None:
+def test_model_direction_is_blocked_by_strong_independent_expert_opposition() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -360,13 +366,11 @@ def test_single_source_training_observation_remains_blocked() -> None:
     assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
     assert decision.raw_response["entry_permission"]["granted"] is False
-    assert decision.raw_response["paper_training_retirement"]["retired"] is True
-    assert decision.raw_response["paper_training_retirement"][
-        "training_policy"
-    ] == "shadow_prediction_only"
+    support = decision.raw_response["paper_trade_selection"]["by_side"]["short"]
+    assert support["strong_expert_opposition"] is True
 
 
-def test_negative_training_observations_cannot_create_orders() -> None:
+def test_negative_model_observation_creates_coverage_sampling_order() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -412,11 +416,11 @@ def test_negative_training_observations_cannot_create_orders() -> None:
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.HOLD
+    assert decision.action == Action.SHORT
     assert "paper_training" not in decision.raw_response
-    assert decision.raw_response["paper_training_retirement"][
-        "execution_permission"
-    ] is False
+    contract = decision.raw_response["normal_paper_trade"]
+    assert contract["selection_reason"] == "coverage_sampling"
+    assert contract["production_permission"] is False
 
 
 def _unpromoted_positive_net_context() -> dict[str, object]:
@@ -466,7 +470,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
     return context
 
 
-def test_unpromoted_positive_net_model_can_create_bounded_paper_exploration() -> None:
+def test_unpromoted_positive_net_model_creates_normal_paper_trade() -> None:
     decision = _coordinator().combine(
         _features(),
         _unpromoted_positive_net_context(),
@@ -474,16 +478,17 @@ def test_unpromoted_positive_net_model_can_create_bounded_paper_exploration() ->
     )
 
     assert decision.action == Action.LONG
-    contract = decision.raw_response["paper_exploration"]
-    assert contract["intervention_scope"] == "bounded_unpromoted_model_intervention"
+    contract = decision.raw_response["normal_paper_trade"]
+    assert contract["entry_type"] == "normal_strategy_trade"
+    assert contract["selection_reason"] == "policy_exploitation"
     assert contract["expected_net_return_pct"] == 0.4
-    assert contract["return_lcb_pct"] == -0.15
+    assert contract["objective_net_return_pct"] == pytest.approx(-0.15)
     assert contract["loss_probability"] == 0.3
     assert decision.raw_response["entry_permission"]["granted"] is True
     assert "paper_training" not in decision.raw_response
 
 
-def test_unpromoted_positive_net_model_with_all_hold_experts_stays_shadow_only() -> None:
+def test_unpromoted_positive_net_model_trades_when_all_experts_hold() -> None:
     opinions = {
         name: _decision(name, Action.HOLD, confidence=0.5)
         for name in (
@@ -501,15 +506,14 @@ def test_unpromoted_positive_net_model_with_all_hold_experts_stays_shadow_only()
         opinions,
     )
 
-    assert decision.action == Action.HOLD
-    support = decision.raw_response["unpromoted_model_intervention"][
-        "support_by_side"
-    ]["long"]
-    assert "direction_support_experts_all_hold" in support["blocking_reasons"]
-    assert "paper_exploration" not in decision.raw_response
+    assert decision.action == Action.LONG
+    support = decision.raw_response["independent_direction_support"]
+    assert support["hold_expert_count"] == 5
+    assert support["blocking_reasons"] == []
+    assert decision.raw_response["normal_paper_trade"]["authorized"] is True
 
 
-def test_negative_objective_with_one_aligned_expert_remains_shadow_only() -> None:
+def test_negative_objective_with_one_aligned_expert_uses_coverage_sampling() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -552,12 +556,15 @@ def test_negative_objective_with_one_aligned_expert_remains_shadow_only() -> Non
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.HOLD
+    assert decision.action == Action.LONG
     assert "paper_training" not in decision.raw_response
-    assert decision.raw_response["paper_training_retirement"]["retired"] is True
+    assert (
+        decision.raw_response["normal_paper_trade"]["selection_reason"]
+        == "coverage_sampling"
+    )
 
 
-def test_unresolved_expert_opposition_blocks_paper_training_entry() -> None:
+def test_unresolved_expert_opposition_blocks_normal_paper_entry() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -595,7 +602,8 @@ def test_unresolved_expert_opposition_blocks_paper_training_entry() -> None:
 
     assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    assert decision.raw_response["paper_training_retirement"]["retired"] is True
+    support = decision.raw_response["paper_trade_selection"]["by_side"]["long"]
+    assert support["strong_expert_opposition"] is True
 
 
 def test_paper_training_route_is_never_created_for_live_execution() -> None:
@@ -811,7 +819,7 @@ def test_continuous_weights_are_ignored_by_live_ensemble_path() -> None:
     assert "continuous_model_weights" not in with_report.raw_response
 
 
-def test_paper_bootstrap_direction_observations_remain_shadow_only() -> None:
+def test_paper_model_direction_with_strong_opposition_remains_hold() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -850,9 +858,9 @@ def test_paper_bootstrap_direction_observations_remain_shadow_only() -> None:
 
     assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    assert decision.raw_response["entry_permission"]["training_policy"] == (
-        "shadow_prediction_only"
-    )
+    assert decision.raw_response["entry_permission"]["granted"] is False
+    support = decision.raw_response["paper_trade_selection"]["by_side"]["short"]
+    assert support["strong_expert_opposition"] is True
 
 
 def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> None:

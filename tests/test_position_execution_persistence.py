@@ -9,10 +9,9 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import OrderStatus
 from services.entry_fee_provider import proportional_fee
-from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
-from services.paper_training import (
-    PAPER_TRAINING_ORDER_IDENTITY_VERSION,
-    build_paper_training_contract,
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_VERSION,
+    build_normal_paper_trade_contract,
 )
 from services.position_execution_persistence import PositionExecutionPersistenceService
 
@@ -184,21 +183,11 @@ async def test_persist_entry_opens_position_with_protection_prices() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_entry_stores_immutable_paper_canary_lifecycle() -> None:
+async def test_persist_entry_stores_normal_paper_lineage() -> None:
     session = FakeSession()
     repo = FakeTradeRepo()
     decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "paper_bootstrap_canary": {
-            "version": PAPER_BOOTSTRAP_CANARY_VERSION,
-            "requested": True,
-            "authorized": True,
-            "execution_scope": "paper_only",
-            "production_permission": False,
-            "artifact_version": "artifact-1",
-            "selected_observation": {"horizon_minutes": 10},
-        }
-    }
+    _attach_normal_paper(decision)
 
     await _service(session=session, repo=repo).persist(
         model_name="ensemble_trader",
@@ -207,27 +196,18 @@ async def test_persist_entry_stores_immutable_paper_canary_lifecycle() -> None:
         execution_mode="paper",
     )
 
-    lifecycle = repo.opened[0]["current_management_contract"]["paper_canary_lifecycle"]
-    assert lifecycle["kind"] == "paper_bootstrap_canary_position"
-    assert lifecycle["symbol"] == "BTC/USDT"
-    assert lifecycle["side"] == "long"
-    assert lifecycle["horizon_minutes"] == 10
+    lifecycle = repo.opened[0]["current_management_contract"]["normal_paper_lifecycle"]
+    assert lifecycle["kind"] == "normal_strategy_position"
+    assert lifecycle["version"] == NORMAL_PAPER_TRADE_VERSION
+    assert lifecycle["selection_reason"] == "policy_exploitation"
 
 
 @pytest.mark.asyncio
-async def test_persist_entry_stores_paper_training_horizon_lifecycle() -> None:
+async def test_persist_entry_stores_coverage_sampling_in_normal_lineage() -> None:
     session = FakeSession()
     repo = FakeTradeRepo()
     decision = _decision(Action.SHORT)
-    decision.raw_response = {
-        "paper_training": build_paper_training_contract(
-            symbol=decision.symbol,
-            selected_side="short",
-            signal_source="test_model_direction",
-            expected_net_return_pct=-0.5,
-            horizon_minutes=10.0,
-        )
-    }
+    _attach_normal_paper(decision, selection_reason="coverage_sampling")
 
     await _service(session=session, repo=repo).persist(
         model_name="ensemble_trader",
@@ -237,14 +217,38 @@ async def test_persist_entry_stores_paper_training_horizon_lifecycle() -> None:
     )
 
     lifecycle = repo.opened[0]["current_management_contract"][
-        "paper_training_lifecycle"
+        "normal_paper_lifecycle"
     ]
-    assert lifecycle["kind"] == "normal_paper_training_position"
-    assert lifecycle["symbol"] == "BTC/USDT"
-    assert lifecycle["side"] == "short"
-    assert lifecycle["horizon_minutes"] == 10.0
-    assert lifecycle["loss_tolerant_for_training"] is True
+    assert lifecycle["kind"] == "normal_strategy_position"
+    assert lifecycle["selection_reason"] == "coverage_sampling"
+    assert lifecycle["prediction_horizon_minutes"] == 10.0
 
+
+def _attach_normal_paper(
+    decision: DecisionOutput,
+    *,
+    selection_reason: str = "policy_exploitation",
+) -> None:
+    side = "long" if decision.action == Action.LONG else "short"
+    decision.raw_response = {
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol=decision.symbol,
+            side=side,
+            selection_reason=selection_reason,
+            direction_support={
+                "eligible": True,
+                "selected_side": side,
+                "prediction_horizon_minutes": 10.0,
+                "expected_net_return_pct": (
+                    0.2 if selection_reason == "policy_exploitation" else -0.1
+                ),
+                "objective_net_return_pct": -0.2,
+                "loss_probability": 0.4,
+                "quant_evidence_families": ["local_ml"],
+                "strong_expert_opposition": False,
+            },
+        )
+    }
 
 @pytest.mark.asyncio
 async def test_persist_entry_uses_okx_inst_id_symbol_over_ccxt_alias() -> None:
@@ -311,7 +315,7 @@ async def test_persist_entry_merges_same_symbol_side_add_into_okx_net_position()
 
 
 @pytest.mark.asyncio
-async def test_persist_entry_replaces_stale_training_lifecycle_on_new_net_entry() -> None:
+async def test_persist_entry_adds_normal_lineage_without_rewriting_history() -> None:
     session = FakeSession()
     existing = _position(
         id=1,
@@ -327,21 +331,7 @@ async def test_persist_entry_replaces_stale_training_lifecycle_on_new_net_entry(
     )
     repo = FakeTradeRepo([existing])
     decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "paper_training": build_paper_training_contract(
-            symbol=decision.symbol,
-            selected_side="long",
-            signal_source="test_model_direction",
-            horizon_minutes=10.0,
-        ),
-        "paper_training_order_identity": {
-            "version": PAPER_TRAINING_ORDER_IDENTITY_VERSION,
-            "execution_scope": "paper_only",
-            "production_permission": False,
-            "decision_id": 42,
-            "client_order_id": "BBPT42",
-        },
-    }
+    _attach_normal_paper(decision)
 
     await _service(session=session, repo=repo).persist(
         model_name="ensemble_trader",
@@ -354,10 +344,12 @@ async def test_persist_entry_replaces_stale_training_lifecycle_on_new_net_entry(
         execution_mode="paper",
     )
 
-    lifecycle = existing.current_management_contract["paper_training_lifecycle"]
-    assert lifecycle["decision_id"] == 42
-    assert lifecycle["executed_at"] == "2026-06-10T12:00:00+00:00"
-    assert lifecycle["expires_at"] == "2026-06-10T12:10:00+00:00"
+    lifecycle = existing.current_management_contract["normal_paper_lifecycle"]
+    assert lifecycle["version"] == NORMAL_PAPER_TRADE_VERSION
+    assert existing.current_management_contract["paper_training_lifecycle"] == {
+        "decision_id": 10,
+        "expires_at": "2026-06-10T11:10:00+00:00",
+    }
 
 
 @pytest.mark.asyncio

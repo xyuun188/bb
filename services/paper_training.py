@@ -1,26 +1,20 @@
-"""Historical paper-training contracts and position lineage.
+"""Read-only support for retired paper-training orders and positions.
 
-New training predictions are Shadow-only.  The contract readers remain for
-already-filled positions and authoritative training facts, but no paper-training
-decision may create another order.
+This module may parse, validate, settle, and audit historical contracts. It must
+not construct or authorize a new order.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isclose, isfinite
 from typing import Any
 
-from ai_brain.base_model import Action, DecisionOutput
-
 PAPER_TRAINING_VERSION = "2026-07-22.paper-training-bootstrap.v1"
 PAPER_TRAINING_SIZING_VERSION = "2026-07-22.paper-training-sizing.v1"
-PAPER_TRAINING_POSITION_LIFECYCLE_VERSION = (
-    "2026-07-22.paper-training-position-lifecycle.v1"
-)
+PAPER_TRAINING_POSITION_LIFECYCLE_VERSION = "2026-07-22.paper-training-position-lifecycle.v1"
 PAPER_TRAINING_ORDER_IDENTITY_VERSION = "2026-07-22.paper-training-order-identity.v1"
 PAPER_TRAINING_CLIENT_ORDER_ID_PREFIX = "BBPT"
 PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0001
@@ -84,27 +78,8 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def paper_training_mode_enabled(context: dict[str, Any] | None) -> bool:
-    """Return false: real-order training collection was retired on 2026-07-27."""
-
-    del context
-    return False
-
-
-def paper_training_client_order_id(decision_id: Any) -> str:
-    """Build the stable OKX idempotency key for one paper-training decision."""
-
-    try:
-        normalized = int(decision_id or 0)
-    except (TypeError, ValueError):
-        return ""
-    if normalized <= 0:
-        return ""
-    return f"{PAPER_TRAINING_CLIENT_ORDER_ID_PREFIX}{normalized}"
-
-
 def paper_training_decision_id_from_client_order_id(value: Any) -> int | None:
-    """Recover the exact decision identity from an OKX client order id."""
+    """Recover a historical decision identity from an OKX client order id."""
 
     client_order_id = str(value or "").strip().upper()
     if not client_order_id.startswith(PAPER_TRAINING_CLIENT_ORDER_ID_PREFIX):
@@ -116,106 +91,9 @@ def paper_training_decision_id_from_client_order_id(value: Any) -> int | None:
     return decision_id if decision_id > 0 else None
 
 
-def attach_paper_training_order_identity(
-    decision: DecisionOutput,
-    decision_id: Any,
-    model_mode: str,
-) -> dict[str, Any]:
-    """Bind a paper-only training decision to an idempotent OKX order identity."""
-
-    if str(model_mode or "").lower() != "paper" or not is_paper_training_decision(decision):
-        return {}
-    client_order_id = paper_training_client_order_id(decision_id)
-    if not client_order_id:
-        return {}
-    identity = {
-        "version": PAPER_TRAINING_ORDER_IDENTITY_VERSION,
-        "execution_scope": "paper_only",
-        "production_permission": False,
-        "decision_id": int(decision_id),
-        "client_order_id": client_order_id,
-    }
-    raw = _dict(decision.raw_response)
-    raw["paper_training_order_identity"] = identity
-    decision.raw_response = raw
-    return identity
-
-
-def build_paper_training_contract(
-    *,
-    symbol: str,
-    selected_side: str,
-    signal_source: str,
-    expected_net_return_pct: float | None = None,
-    return_lcb_pct: float | None = None,
-    feature_opportunity_score: float | None = None,
-    horizon_minutes: float | None = None,
-    policy_provenance: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build a paper-only normal trade contract without a profit gate."""
-
-    side = str(selected_side or "").lower()
-    if side not in {"long", "short"}:
-        return {}
-    generated_at = datetime.now(UTC).isoformat()
-    provenance = _dict(policy_provenance)
-    prediction_horizon_minutes = max(_float(horizon_minutes, 0.0) or 0.0, 0.0)
-    valid_for_seconds = prediction_horizon_minutes * 60.0
-    contract = {
-        "version": PAPER_TRAINING_VERSION,
-        "authorized": True,
-        "execution_scope": "paper_only",
-        "production_permission": False,
-        "trade_kind": "normal_paper_training_trade",
-        "trade_is_normal": True,
-        "continuous_training_after_settlement": True,
-        "loss_tolerant_for_training": True,
-        "risk_profile": "cold_start_exploration",
-        "single_trade_risk_fraction_cap": (
-            PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION
-        ),
-        "portfolio_risk_fraction_cap": PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
-        "separate_sampling_order": False,
-        "purpose": "execute_one_normal_bounded_paper_trade_and_learn_after_settlement",
-        "symbol": str(symbol or ""),
-        "selected_side": side,
-        "signal_source": str(signal_source or "unknown"),
-        "expected_net_return_pct": _float(expected_net_return_pct, None),
-        "return_lcb_pct": _float(return_lcb_pct, None),
-        "feature_opportunity_score": _float(feature_opportunity_score, None),
-        "prediction_horizon_minutes": prediction_horizon_minutes,
-        "valid_for_seconds": valid_for_seconds,
-        "sample_target": None,
-        "daily_sample_quota": None,
-        "selection_reason": "paper_training_bootstrap_without_profit_gate",
-        "policy_provenance": {
-            "source": "paper_directional_observation_before_strategy_promotion",
-            "observation_window": "current_pre_order_paper_training_round",
-            "sample_count": 1,
-            "generated_at": generated_at,
-            "strategy_version": PAPER_TRAINING_VERSION,
-            "valid_for_seconds": valid_for_seconds,
-            "prediction_horizon_minutes": prediction_horizon_minutes,
-            "fallback_reason": "",
-            "upstream_return_provenance": provenance,
-        },
-    }
-    contract["contract_fingerprint"] = _fingerprint(
-        _contract_fingerprint_payload(contract)
-    )
-    return contract
-
-
-def is_paper_training_decision(decision: DecisionOutput) -> bool:
-    contract = _dict(_dict(decision.raw_response).get("paper_training"))
-    return bool(
-        decision.is_entry
-        and contract.get("version") == PAPER_TRAINING_VERSION
-        and contract.get("authorized") is True
-    )
-
-
 def paper_training_contract_reasons(value: Any) -> list[str]:
+    """Validate an immutable historical paper-training contract."""
+
     contract = _dict(value)
     reasons: list[str] = []
     if contract.get("version") != PAPER_TRAINING_VERSION:
@@ -274,7 +152,7 @@ def paper_training_contract_reasons(value: Any) -> list[str]:
         if not str(provenance.get(key) or "").strip():
             reasons.append("paper_training_provenance_incomplete")
             break
-    if _float(provenance.get("sample_count"), 0.0) <= 0:
+    if (_float(provenance.get("sample_count"), 0.0) or 0.0) <= 0:
         reasons.append("paper_training_provenance_sample_count_missing")
     if not isclose(
         _float(provenance.get("valid_for_seconds"), 0.0) or 0.0,
@@ -287,23 +165,6 @@ def paper_training_contract_reasons(value: Any) -> list[str]:
         _contract_fingerprint_payload(contract)
     ):
         reasons.append("paper_training_contract_fingerprint_mismatch")
-    return list(dict.fromkeys(reasons))
-
-
-def paper_training_selection_reasons(
-    decision: DecisionOutput,
-    model_mode: str,
-) -> list[str]:
-    raw = _dict(decision.raw_response)
-    contract = _dict(raw.get("paper_training"))
-    reasons = paper_training_contract_reasons(contract)
-    if str(model_mode or "").lower() != "paper":
-        reasons.append("paper_training_live_execution_forbidden")
-    side = "long" if decision.action == Action.LONG else "short"
-    if contract.get("selected_side") != side:
-        reasons.append("paper_training_side_mismatch")
-    if str(contract.get("symbol") or "") != str(decision.symbol or ""):
-        reasons.append("paper_training_symbol_mismatch")
     return list(dict.fromkeys(reasons))
 
 
@@ -332,7 +193,7 @@ def _normalized_symbol(value: Any) -> str:
 
 
 def build_paper_training_position_lifecycle(decision: Any) -> dict[str, Any]:
-    """Bind one filled paper training position to its model prediction horizon."""
+    """Recover a position lifecycle from one already-executed historical decision."""
 
     raw = _row_raw(decision)
     contract = _dict(raw.get("paper_training"))
@@ -394,7 +255,7 @@ def assess_paper_training_position_horizon(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Assess a paper-only training horizon without granting position-exit authority."""
+    """Observe a historical horizon without granting position-exit authority."""
 
     lifecycle = paper_training_position_lifecycle(position)
     current = _as_utc(now) or datetime.now(UTC)
@@ -433,47 +294,3 @@ def assess_paper_training_position_horizon(
         "decision_id": lifecycle.get("decision_id"),
         "version": lifecycle.get("version"),
     }
-
-
-@dataclass(frozen=True, slots=True)
-class PaperTrainingAssessment:
-    eligible: bool
-    reason: str
-    blocking_reasons: list[str]
-    details: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "eligible": self.eligible,
-            "reason": self.reason,
-            "blocking_reasons": list(self.blocking_reasons),
-            "details": dict(self.details),
-        }
-
-
-def assess_paper_training_entry(
-    decision: DecisionOutput,
-    model_mode: str,
-) -> PaperTrainingAssessment:
-    """Reject retired training-order contracts while preserving their audit details."""
-
-    raw = _dict(decision.raw_response)
-    contract = _dict(raw.get("paper_training"))
-    reasons = paper_training_selection_reasons(decision, model_mode)
-    reasons.append("paper_training_execution_retired_shadow_only")
-    feature = _dict(decision.feature_snapshot)
-    if _float(feature.get("current_price", feature.get("close")), 0.0) <= 0:
-        reasons.append("paper_training_current_price_missing")
-    if str(raw.get("paper_training_mode") or "bootstrap").lower() != "bootstrap":
-        reasons.append("paper_training_mode_not_bootstrap")
-    return PaperTrainingAssessment(
-        eligible=not reasons,
-        reason="paper_training_contract_ready" if not reasons else ",".join(dict.fromkeys(reasons)),
-        blocking_reasons=list(dict.fromkeys(reasons)),
-        details={
-            "contract": contract,
-            "expected_net_return_pct": contract.get("expected_net_return_pct"),
-            "return_lcb_pct": contract.get("return_lcb_pct"),
-            "loss_tolerant_for_training": True,
-        },
-    )

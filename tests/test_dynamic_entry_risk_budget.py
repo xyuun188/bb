@@ -9,6 +9,7 @@ from services.entry_profit_risk_sizing import (
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
 )
+from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 
 
@@ -28,7 +29,7 @@ def _decision() -> DecisionOutput:
             "upper_hinge": 0.05,
         },
     }
-    return DecisionOutput(
+    decision = DecisionOutput(
         model_name="ensemble_trader",
         symbol="BTC/USDT",
         action=Action.LONG,
@@ -118,6 +119,22 @@ def _decision() -> DecisionOutput:
             },
         },
     )
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="policy_exploitation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.82,
+            "objective_net_return_pct": 0.52,
+            "loss_probability": 0.25,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    return decision
 
 
 async def _balance(_mode: str, _decision: DecisionOutput | None) -> float:
@@ -220,6 +237,7 @@ async def test_legacy_probe_and_evidence_payload_cannot_change_dynamic_sizing() 
             sizing["risk_limited_target_notional_usdt"],
             sizing["model_requested_notional_cap_usdt"],
         )
+        / (1.0 + sizing["estimated_fill_drift_reserve_fraction"])
     )
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assert "final_position_size" not in sizing["audit_inputs"]
@@ -382,7 +400,7 @@ async def test_missing_production_cost_fails_closed_without_fixed_fallback() -> 
     assert decision.suggested_leverage == 1.0
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is False
-    assert "production_execution_cost_missing" in sizing["reason"]
+    assert "normal_paper_execution_cost_incomplete" in sizing["reason"]
 
 
 @pytest.mark.asyncio
@@ -396,7 +414,7 @@ async def test_missing_okx_leverage_tiers_fails_closed() -> None:
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is False
     assert sizing["leverage_tier_selection"]["production_eligible"] is False
-    assert "okx_leverage_tiers_missing" in sizing["reason"]
+    assert "normal_paper_leverage_tier_incomplete" in sizing["reason"]
     assert decision.position_size_pct == 0.0
 
 
@@ -463,7 +481,7 @@ async def test_lower_available_margin_cannot_increase_final_notional() -> None:
 
 
 @pytest.mark.asyncio
-async def test_portfolio_dependency_cannot_increase_risk_budget() -> None:
+async def test_existing_portfolio_stress_exhausts_normal_paper_risk_budget() -> None:
     baseline = _decision()
     pressured = _decision()
     pressured.raw_response["strategy_mode"]["portfolio_correlation"] = {
@@ -499,9 +517,10 @@ async def test_portfolio_dependency_cannot_increase_risk_budget() -> None:
 
     baseline_budget = baseline.raw_response["profit_risk_sizing"]["risk_budget_usdt"]
     pressured_sizing = pressured.raw_response["profit_risk_sizing"]
-    assert pressured_sizing["production_eligible"] is True
+    assert pressured_sizing["production_eligible"] is False
     assert pressured_sizing["risk_budget_usdt"] <= baseline_budget
-    assert pressured_sizing["budget_factors"]["portfolio_dependency_capacity"] < 1.0
+    assert pressured_sizing["remaining_portfolio_risk_budget_usdt"] == 0.0
+    assert "normal_paper_notional_zero" in pressured_sizing["reason"]
     assert pressured_sizing["current_portfolio_stressed_loss_usdt"] == pytest.approx(5.0)
 
 

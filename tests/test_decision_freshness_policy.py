@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_freshness import DecisionFreshnessPolicy
-from services.paper_training import build_paper_training_contract
+from services.normal_paper_trade import build_normal_paper_trade_contract
 
 
 def _decision(
@@ -90,22 +90,43 @@ def test_entry_freshness_fails_closed_without_dynamic_horizon() -> None:
     )
 
 
-def test_paper_canary_freshness_uses_version_bound_prediction_horizon() -> None:
+def _attach_normal_paper_contract(
+    decision: DecisionOutput,
+    *,
+    horizon_minutes: float,
+    generated_at: datetime,
+) -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="policy_exploitation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": horizon_minutes,
+            "expected_net_return_pct": 0.2,
+            "objective_net_return_pct": 0.1,
+            "loss_probability": 0.4,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    contract["generated_at"] = generated_at.isoformat()
+    decision.raw_response["normal_paper_trade"] = contract
+
+
+def test_normal_paper_freshness_uses_contract_prediction_horizon() -> None:
     now = datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
     decision = _decision(
         now=now,
         generated_at=datetime(2026, 7, 17, 8, 0, tzinfo=UTC),
         valid_for_seconds=0,
     )
-    decision.raw_response["paper_bootstrap_canary"] = {
-        "authorized": True,
-        "requested": True,
-        "execution_scope": "paper_only",
-        "production_permission": False,
-        "generated_at": "2026-07-17T09:56:00+00:00",
-        "selected_observation": {"horizon_minutes": 10},
-        "policy_provenance": {"generated_at": "2026-07-17T09:56:00+00:00"},
-    }
+    _attach_normal_paper_contract(
+        decision,
+        horizon_minutes=10.0,
+        generated_at=datetime(2026, 7, 17, 9, 56, tzinfo=UTC),
+    )
     policy = DecisionFreshnessPolicy(clock=lambda: now)
 
     assert policy.max_age_seconds(decision) == 600.0
@@ -114,25 +135,28 @@ def test_paper_canary_freshness_uses_version_bound_prediction_horizon() -> None:
     )
     assert policy.stale_decision_reason(decision) is None
 
-    decision.raw_response["paper_bootstrap_canary"]["policy_provenance"][
-        "generated_at"
-    ] = "2026-07-17T09:49:00+00:00"
+    decision.raw_response["normal_paper_trade"]["generated_at"] = (
+        "2026-07-17T09:49:00+00:00"
+    )
     assert policy.stale_decision_reason(decision) is not None
 
 
-def test_paper_training_freshness_uses_observed_model_horizon() -> None:
+def test_legacy_identity_cannot_override_normal_paper_freshness() -> None:
     now = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)
     decision = _decision(
         now=now,
         generated_at=now - timedelta(days=1),
         valid_for_seconds=0,
     )
-    decision.raw_response["paper_training"] = build_paper_training_contract(
-        symbol=decision.symbol,
-        selected_side="long",
-        signal_source="direction_competition_observation",
+    _attach_normal_paper_contract(
+        decision,
         horizon_minutes=10.0,
+        generated_at=now,
     )
+    decision.raw_response["paper_training"] = {
+        "authorized": True,
+        "valid_for_seconds": 86400.0,
+    }
     policy = DecisionFreshnessPolicy(clock=lambda: now)
     generated_at = policy.decision_reference_time(decision)
     policy.clock = lambda: generated_at + timedelta(seconds=599)

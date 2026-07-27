@@ -2,15 +2,11 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_VERSION,
+    build_normal_paper_trade_contract,
+)
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
-from services.paper_bootstrap_canary import (
-    PAPER_BOOTSTRAP_CANARY_VERSION,
-    PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION,
-)
-from services.paper_training import (
-    PAPER_TRAINING_ORDER_IDENTITY_VERSION,
-    build_paper_training_contract,
-)
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -80,17 +76,10 @@ def test_open_positions_applier_adds_filled_entry() -> None:
     }
 
 
-def test_open_positions_applier_attaches_paper_training_horizon() -> None:
+def test_open_positions_applier_attaches_normal_paper_lineage() -> None:
     open_positions: list[dict] = []
     decision = _decision(Action.SHORT)
-    decision.raw_response = {
-        "paper_training": build_paper_training_contract(
-            symbol=decision.symbol,
-            selected_side="short",
-            signal_source="test_model_direction",
-            horizon_minutes=10.0,
-        )
-    }
+    _attach_normal_paper(decision, selection_reason="coverage_sampling")
 
     _applier().apply(
         open_positions,
@@ -99,14 +88,41 @@ def test_open_positions_applier_attaches_paper_training_horizon() -> None:
         _result(OrderStatus.FILLED),
     )
 
-    lifecycle = open_positions[0]["paper_training_lifecycle"]
-    assert lifecycle["kind"] == "normal_paper_training_position"
-    assert lifecycle["side"] == "short"
-    assert lifecycle["horizon_minutes"] == 10.0
+    lifecycle = open_positions[0]["normal_paper_lifecycle"]
+    assert lifecycle["kind"] == "normal_strategy_position"
+    assert lifecycle["selection_reason"] == "coverage_sampling"
+    assert lifecycle["prediction_horizon_minutes"] == 10.0
+    assert lifecycle["horizon_is_exit_deadline"] is False
     assert open_positions[0]["current_management_contract"][
-        "paper_training_lifecycle"
+        "normal_paper_lifecycle"
     ] == lifecycle
 
+
+def _attach_normal_paper(
+    decision: DecisionOutput,
+    *,
+    selection_reason: str = "policy_exploitation",
+) -> None:
+    side = "long" if decision.action == Action.LONG else "short"
+    decision.raw_response = {
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol=decision.symbol,
+            side=side,
+            selection_reason=selection_reason,
+            direction_support={
+                "eligible": True,
+                "selected_side": side,
+                "prediction_horizon_minutes": 10.0,
+                "expected_net_return_pct": (
+                    0.2 if selection_reason == "policy_exploitation" else -0.1
+                ),
+                "objective_net_return_pct": -0.2,
+                "loss_probability": 0.4,
+                "quant_evidence_families": ["local_ml"],
+                "strong_expert_opposition": False,
+            },
+        )
+    }
 
 def test_open_positions_applier_merges_same_symbol_side_okx_net_entries() -> None:
     decision = _decision(Action.LONG)
@@ -152,23 +168,9 @@ def test_open_positions_applier_merges_same_symbol_side_okx_net_entries() -> Non
     ]
 
 
-def test_open_positions_applier_replaces_stale_training_lifecycle_on_new_entry() -> None:
+def test_open_positions_applier_adds_normal_lineage_without_rewriting_history() -> None:
     decision = _decision(Action.LONG)
-    decision.raw_response = {
-        "paper_training": build_paper_training_contract(
-            symbol=decision.symbol,
-            selected_side="long",
-            signal_source="test_model_direction",
-            horizon_minutes=10.0,
-        ),
-        "paper_training_order_identity": {
-            "version": PAPER_TRAINING_ORDER_IDENTITY_VERSION,
-            "execution_scope": "paper_only",
-            "production_permission": False,
-            "decision_id": 42,
-            "client_order_id": "BBPT42",
-        },
-    }
+    _attach_normal_paper(decision)
     stale_lifecycle = {
         "decision_id": 10,
         "expires_at": "2026-06-10T11:10:00+00:00",
@@ -198,12 +200,12 @@ def test_open_positions_applier_replaces_stale_training_lifecycle_on_new_entry()
         result,
     )
 
-    lifecycle = open_positions[0]["paper_training_lifecycle"]
-    assert lifecycle["decision_id"] == 42
-    assert lifecycle["executed_at"] == result.timestamp.isoformat()
+    lifecycle = open_positions[0]["normal_paper_lifecycle"]
+    assert lifecycle["version"] == NORMAL_PAPER_TRADE_VERSION
     assert open_positions[0]["current_management_contract"][
-        "paper_training_lifecycle"
+        "normal_paper_lifecycle"
     ] == lifecycle
+    assert open_positions[0]["paper_training_lifecycle"] == stale_lifecycle
 
 
 def test_open_positions_applier_ignores_duplicate_entry_callback_for_same_order_id() -> None:
@@ -253,20 +255,10 @@ def test_open_positions_applier_ignores_unconfirmed_entry() -> None:
     assert open_positions == []
 
 
-def test_open_positions_applier_preserves_canary_lifecycle_after_partial_exit() -> None:
+def test_open_positions_applier_preserves_normal_lineage_after_partial_exit() -> None:
     open_positions: list[dict] = []
     entry = _decision(Action.LONG)
-    entry.raw_response = {
-        "paper_bootstrap_canary": {
-            "version": PAPER_BOOTSTRAP_CANARY_VERSION,
-            "requested": True,
-            "authorized": True,
-            "execution_scope": "paper_only",
-            "production_permission": False,
-            "artifact_version": "artifact-1",
-            "selected_observation": {"horizon_minutes": 10},
-        }
-    }
+    _attach_normal_paper(entry)
 
     _applier().apply(
         open_positions,
@@ -274,7 +266,7 @@ def test_open_positions_applier_preserves_canary_lifecycle_after_partial_exit() 
         entry,
         _result(OrderStatus.FILLED, quantity=2.0),
     )
-    lifecycle = open_positions[0]["paper_canary_lifecycle"]
+    lifecycle = open_positions[0]["normal_paper_lifecycle"]
 
     _applier(exit_progress=True).apply(
         open_positions,
@@ -285,9 +277,9 @@ def test_open_positions_applier_preserves_canary_lifecycle_after_partial_exit() 
 
     assert open_positions[0]["quantity"] == pytest.approx(1.75)
     assert open_positions[0]["execution_mode"] == "paper"
-    assert open_positions[0]["paper_canary_lifecycle"] == lifecycle
-    assert lifecycle["version"] == PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
-    assert open_positions[0]["current_management_contract"]["paper_canary_lifecycle"] == lifecycle
+    assert open_positions[0]["normal_paper_lifecycle"] == lifecycle
+    assert lifecycle["version"] == NORMAL_PAPER_TRADE_VERSION
+    assert open_positions[0]["current_management_contract"]["normal_paper_lifecycle"] == lifecycle
 
 
 def test_open_positions_applier_reduces_matching_exit_progress() -> None:

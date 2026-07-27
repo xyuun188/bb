@@ -2084,14 +2084,16 @@ async def test_production_source_health_card_exposes_continuous_alert(
 ) -> None:
     class FakeProductionSourceHealthService:
         async def report(self, **_kwargs: object) -> dict[str, object]:
-            return {
-                "status": "critical",
-                "reason": "continuous_no_production_return_source",
-                "continuous_no_source_seconds": 7200.0,
-                "production_source_decision_count": 0,
-                "paper_bootstrap_executed_count": 1,
-                "recovery_state": "paper_bootstrap_collecting",
-            }
+                return {
+                    "status": "critical",
+                    "reason": "continuous_no_production_return_source",
+                    "continuous_no_source_seconds": 7200.0,
+                    "production_source_decision_count": 0,
+                    "normal_paper_executed_count": 1,
+                    "continuous_no_normal_paper_candidate_seconds": 120.0,
+                    "paper_sampling_alert_active": False,
+                    "recovery_state": "normal_paper_trading",
+                }
 
     monkeypatch.setattr(
         system_audit,
@@ -2103,24 +2105,26 @@ async def test_production_source_health_card_exposes_continuous_alert(
 
     assert card["key"] == "production_source_health"
     assert card["status"] == "critical"
-    assert "bootstrap canary" in card["summary"]
+    assert "模拟盘正常策略交易与持续训练正在运行" in card["summary"]
     assert card["details"]["continuous_no_source_seconds"] == 7200.0
+    assert card["details"]["normal_paper_executed_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_production_source_health_card_exposes_sampling_plan_alert(
+async def test_production_source_health_card_exposes_normal_paper_sampling_alert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeProductionSourceHealthService:
         async def report(self, **_kwargs: object) -> dict[str, object]:
             return {
                 "status": "critical",
-                "reason": "paper_bootstrap_sampling_plan_unreachable",
+                "reason": "continuous_no_normal_paper_candidate",
                 "continuous_no_source_seconds": 3600.0,
                 "production_source_decision_count": 0,
-                "paper_bootstrap_executed_count": 2,
-                "sampling_plan_alert_active": True,
-                "recovery_state": "paper_bootstrap_plan_unreachable",
+                "normal_paper_executed_count": 2,
+                "continuous_no_normal_paper_candidate_seconds": 3600.0,
+                "paper_sampling_alert_active": True,
+                "recovery_state": "normal_paper_candidate_waiting",
             }
 
     monkeypatch.setattr(
@@ -2133,8 +2137,8 @@ async def test_production_source_health_card_exposes_sampling_plan_alert(
 
     assert card["key"] == "production_source_health"
     assert card["status"] == "critical"
-    assert "sampling plan" in card["summary"]
-    assert card["details"]["sampling_plan_alert_active"] is True
+    assert "模拟盘持续没有生成正常策略候选" in card["summary"]
+    assert card["details"]["paper_sampling_alert_active"] is True
 
 
 

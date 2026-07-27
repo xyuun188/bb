@@ -15,10 +15,60 @@ from core.training_contracts import (
     shadow_label_contract_reasons,
 )
 from services.shadow_backtest_service import (
+    SHADOW_BACKTEST_HORIZONS_MINUTES,
     ShadowBacktestService,
     shadow_fee_after_outcome,
+    shadow_path_labels,
     side_label,
 )
+
+
+def test_market_label_horizons_match_the_versioned_training_contract() -> None:
+    assert SHADOW_BACKTEST_HORIZONS_MINUTES == (5, 15, 60, 240)
+
+
+def test_shadow_path_labels_capture_mfe_mae_and_stop_events() -> None:
+    labels = shadow_path_labels(
+        entry_price=100.0,
+        price_path={"path_low": 97.0, "path_high": 102.0},
+        stop_loss_fraction=0.025,
+    )
+
+    assert labels == {
+        "long_mfe_pct": 2.0,
+        "long_mae_pct": 3.0,
+        "short_mfe_pct": 3.0,
+        "short_mae_pct": 2.0,
+        "long_stop_loss_triggered": True,
+        "short_stop_loss_triggered": False,
+        "long_take_profit_triggered": False,
+        "short_take_profit_triggered": False,
+        "long_first_touch": "none",
+        "short_first_touch": "none",
+    }
+
+
+def test_shadow_path_labels_preserve_first_touch_uncertainty() -> None:
+    labels = shadow_path_labels(
+        entry_price=100.0,
+        price_path={
+            "path_low": 97.0,
+            "path_high": 103.0,
+            "_ordered_bar_ranges": [
+                {"open_time_ms": 1, "low": 99.0, "high": 101.0},
+                {"open_time_ms": 2, "low": 97.0, "high": 103.0},
+            ],
+        },
+        stop_loss_fraction=0.02,
+        take_profit_fraction=0.02,
+    )
+
+    assert labels["long_stop_loss_triggered"] is True
+    assert labels["long_take_profit_triggered"] is True
+    assert labels["long_first_touch"] == "path_uncertain"
+    assert labels["short_stop_loss_triggered"] is True
+    assert labels["short_take_profit_triggered"] is True
+    assert labels["short_first_touch"] == "path_uncertain"
 
 
 class _SessionCtx:

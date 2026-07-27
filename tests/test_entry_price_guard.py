@@ -6,8 +6,6 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_price_guard import EntryPriceGuardPolicy
-from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_CANARY_VERSION
-from services.paper_training import build_paper_training_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 
 
@@ -130,91 +128,37 @@ async def test_missing_authoritative_return_budget_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paper_canary_uses_empirical_distribution_drift_budget_only_in_paper() -> None:
+async def test_paper_uses_market_integrity_without_profit_drift_budget() -> None:
     decision = _decision(return_lcb=0.0, expected_net=-1.0)
-    decision.raw_response["paper_bootstrap_canary"] = {
-        "version": PAPER_BOOTSTRAP_CANARY_VERSION,
-        "authorized": True,
-        "requested": True,
-        "execution_scope": "paper_only",
-        "production_permission": False,
-        "source_sample_count": 1200,
-        "selected_observation": {
-            "objective_expected_return_pct": -1.0,
-            "lower_quantile_return_pct": -1.5,
-            "dispersion_pct": 0.8,
-        },
-    }
-
-    assert await _policy(latest=100.2).guard_reason(decision, "paper") is None
-    price_check = decision.raw_response["pre_execution_price_check"]
-    assert price_check["allowed_adverse_move_fraction"] == pytest.approx(0.005)
-    assert price_check["contract_lifecycle"] == "paper_bootstrap_canary"
-    assert price_check["production_permission"] is False
-
-    live_decision = _decision(return_lcb=0.0, expected_net=-1.0)
-    live_decision.raw_response["paper_bootstrap_canary"] = dict(
-        decision.raw_response["paper_bootstrap_canary"]
-    )
-    reason = await _policy(latest=100.0).guard_reason(live_decision, "live")
-    assert "fee-after return budget is missing" in reason
-
-
-@pytest.mark.asyncio
-async def test_paper_canary_rejects_drift_beyond_empirical_uncertainty_band() -> None:
-    decision = _decision(return_lcb=0.0, expected_net=-1.0)
-    decision.raw_response["paper_bootstrap_canary"] = {
-        "version": PAPER_BOOTSTRAP_CANARY_VERSION,
-        "authorized": True,
-        "requested": True,
-        "execution_scope": "paper_only",
-        "production_permission": False,
-        "source_sample_count": 1200,
-        "selected_observation": {
-            "objective_expected_return_pct": -1.0,
-            "lower_quantile_return_pct": -1.5,
-            "dispersion_pct": 0.8,
-        },
-    }
-
-    reason = await _policy(latest=100.6).guard_reason(decision, "paper")
-
-    assert "exceeds" in reason
-
-
-@pytest.mark.asyncio
-async def test_paper_training_checks_fresh_market_without_profit_drift_gate() -> None:
-    decision = _decision(return_lcb=-2.0, expected_net=-3.0)
-    decision.raw_response["paper_training"] = build_paper_training_contract(
-        symbol=decision.symbol,
-        selected_side="long",
-        signal_source="test_model_direction",
-        expected_net_return_pct=-3.0,
-        return_lcb_pct=-4.0,
-        horizon_minutes=10.0,
-    )
-    decision.raw_response["paper_training_mode"] = "bootstrap"
 
     assert await _policy(latest=150.0).guard_reason(decision, "paper") is None
     price_check = decision.raw_response["pre_execution_price_check"]
-    assert price_check["contract_lifecycle"] == "paper_training"
+    assert price_check["allowed_adverse_move_fraction"] is None
+    assert price_check["contract_lifecycle"] == "normal_paper_trade"
     assert price_check["production_permission"] is False
     assert price_check["profitability_gate_applied"] is False
     assert price_check["safety_scope"] == "market_integrity_only"
-    assert price_check["allowed_adverse_move_fraction"] is None
     assert decision.feature_snapshot["current_price"] == 150.0
 
 
 @pytest.mark.asyncio
-async def test_paper_training_still_fails_closed_without_fresh_market_fact() -> None:
+@pytest.mark.parametrize("legacy_key", ["paper_training", "paper_exploration", "paper_bootstrap_canary"])
+async def test_legacy_paper_identity_cannot_change_price_guard(
+    legacy_key: str,
+) -> None:
     decision = _decision(return_lcb=-2.0, expected_net=-3.0)
-    decision.raw_response["paper_training"] = build_paper_training_contract(
-        symbol=decision.symbol,
-        selected_side="long",
-        signal_source="test_model_direction",
-        horizon_minutes=10.0,
-    )
-    decision.raw_response["paper_training_mode"] = "bootstrap"
+    decision.raw_response[legacy_key] = {"authorized": True}
+
+    assert await _policy(latest=125.0).guard_reason(decision, "paper") is None
+    price_check = decision.raw_response["pre_execution_price_check"]
+    assert price_check["contract_lifecycle"] == "normal_paper_trade"
+    assert price_check["profitability_gate_applied"] is False
+    assert decision.feature_snapshot["current_price"] == 125.0
+
+
+@pytest.mark.asyncio
+async def test_paper_still_fails_closed_without_fresh_market_fact() -> None:
+    decision = _decision(return_lcb=-2.0, expected_net=-3.0)
 
     reason = await _policy(latest=0.0).guard_reason(decision, "paper")
 

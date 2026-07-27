@@ -27,7 +27,9 @@ from services.artifact_retirement_audit import (
 )
 from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
+    FEATURE_CONTRACT_VERSION,
     FEATURE_KEYS,
+    MULTITASK_PREDICTION_CONTRACT_VERSION,
     MLSignalService,
     _champion_comparison_inputs,
     _configure_single_row_inference,
@@ -97,6 +99,11 @@ def _with_return_objective(metadata: dict) -> dict:
         "separated_market_opportunity_and_execution_cost_tasks",
     )
     metadata.setdefault("profit_supervision_version", PROFIT_SUPERVISION_VERSION)
+    metadata.setdefault("feature_contract_version", FEATURE_CONTRACT_VERSION)
+    metadata.setdefault(
+        "multitask_prediction_contract_version",
+        MULTITASK_PREDICTION_CONTRACT_VERSION,
+    )
     metadata.setdefault(
         "profit_supervision_report",
         {
@@ -302,6 +309,16 @@ def _clean_training_label_contract(
             long_return_pct=long_return_pct,
             short_return_pct=short_return_pct,
             best_action=best_action,
+            long_mfe_pct=max(long_return_pct, 0.0),
+            long_mae_pct=max(-long_return_pct, 0.0),
+            short_mfe_pct=max(short_return_pct, 0.0),
+            short_mae_pct=max(-short_return_pct, 0.0),
+            long_stop_loss_triggered=False,
+            short_stop_loss_triggered=False,
+            long_take_profit_triggered=False,
+            short_take_profit_triggered=False,
+            long_first_touch="none",
+            short_first_touch="none",
             market_fact_contract=_clean_training_market_fact_contract(),
             cost_facts={"round_trip_fee_pct": 0.08},
             label_timestamp=due_at,
@@ -566,6 +583,19 @@ def _training_frame(row_count: int = 80) -> pd.DataFrame:
                 "short_win": int(idx % 4 == 1),
                 "long_execution_cost_pct": 0.08,
                 "short_execution_cost_pct": 0.08,
+                "long_mfe_pct": 0.24 if idx % 4 == 0 else 0.03,
+                "long_mae_pct": 0.03 if idx % 4 == 0 else 0.12,
+                "short_mfe_pct": 0.22 if idx % 4 == 1 else 0.03,
+                "short_mae_pct": 0.03 if idx % 4 == 1 else 0.11,
+                "long_stop_loss_triggered": int(idx % 4 != 0),
+                "short_stop_loss_triggered": int(idx % 4 != 1),
+                "long_take_profit_triggered": int(idx % 4 == 0),
+                "short_take_profit_triggered": int(idx % 4 == 1),
+                "long_first_touch": "take_profit" if idx % 4 == 0 else "stop_loss",
+                "short_first_touch": "take_profit" if idx % 4 == 1 else "stop_loss",
+                "label_contract_version": SHADOW_LABEL_VERSION,
+                "label_maturity_status": "matured",
+                "feature_contract_version": ml_signal_module.FEATURE_CONTRACT_VERSION,
                 "sample_weight": 1.0,
                 "data_quality_status": "included",
                 "data_quality_score": 1.0,
@@ -643,6 +673,14 @@ def _ml_training_metadata(
             "last_trained_completed_shadow_sample_count": completed_sample_count,
             "training_run_mode": "persist" if artifact_persisted else "dry_run",
             "artifact_persisted": artifact_persisted,
+            "feature_contract_version": ml_signal_module.FEATURE_CONTRACT_VERSION,
+            "multitask_prediction_contract_version": (
+                ml_signal_module.MULTITASK_PREDICTION_CONTRACT_VERSION
+            ),
+            "last_trained_completed_shadow_decision_group_count": 80,
+            "training_distribution_profile": ml_signal_module._training_distribution_profile(
+                _training_frame()
+            ),
             "quality_report": {
                 "data_quality_version": DATA_QUALITY_VERSION,
                 "totals": {"total": 1200, "included": 1200, "downweighted": 0, "excluded": 0},
@@ -995,6 +1033,7 @@ def test_champion_missing_separated_cost_model_cannot_block_candidate(
             "long_regressor": object(),
             "short_regressor": object(),
             "long_cost_regressor": object(),
+            "feature_keys": FEATURE_KEYS,
         },
         model_path,
         trusted_root=tmp_path,
@@ -1079,6 +1118,110 @@ def test_incompatible_registered_artifact_keeps_manifest_evidence_in_status(
     assert status["readiness"]["blocking_reasons"][0]["code"] == ("artifact_incompatible")
 
 
+def _service_with_registered_bundle(
+    tmp_path: Path,
+    *,
+    metadata: dict,
+    feature_keys: list[str],
+) -> MLSignalService:
+    bundle = {
+        "metadata": metadata,
+        "long_regressor": object(),
+        "short_regressor": object(),
+        "long_cost_regressor": object(),
+        "short_cost_regressor": object(),
+        "feature_keys": feature_keys,
+    }
+    model_path = tmp_path / "model.joblib"
+    dump_trusted_joblib(bundle, model_path, trusted_root=tmp_path)
+    pointer_path = tmp_path / "current.json"
+    pointer_path.write_text("{}", encoding="utf-8")
+    artifact = ResolvedModelArtifact(
+        model_id="local_ml_profit_quality",
+        version=str(metadata.get("artifact_version") or "test-artifact"),
+        model_path=model_path,
+        metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json",
+        sha256="d" * 64,
+        manifest=metadata,
+        pointer_role="current",
+        pointer_path=pointer_path,
+        activation_manifest={"activation_stage": "shadow", "live_ml_ready": False},
+    )
+    registry = SimpleNamespace(
+        model_root=tmp_path,
+        current_path=pointer_path,
+        resolve_current=lambda: artifact,
+    )
+    return MLSignalService(
+        artifact_registry=registry,
+        training_state_store=ModelTrainingStateStore(tmp_path / "training-state.json"),
+    )
+
+
+def test_old_feature_contract_is_rejected_before_sklearn_prediction(tmp_path: Path) -> None:
+    metadata = _with_return_objective({"artifact_version": "old-feature-contract"})
+    metadata["feature_contract_version"] = "2026-07-22.legacy-features.v1"
+    service = _service_with_registered_bundle(
+        tmp_path,
+        metadata=metadata,
+        feature_keys=FEATURE_KEYS,
+    )
+
+    prediction = service.predict({"symbol": "BTC/USDT", "current_price": 100.0})
+
+    assert prediction["available"] is False
+    assert prediction["status"] == "artifact_incompatible"
+    assert prediction["model_load_diagnostic"]["details"] == [
+        "artifact_feature_contract_version_mismatch"
+    ]
+
+
+def test_bundle_feature_columns_must_exactly_match_runtime_contract(tmp_path: Path) -> None:
+    metadata = _with_return_objective({"artifact_version": "wrong-feature-columns"})
+    service = _service_with_registered_bundle(
+        tmp_path,
+        metadata=metadata,
+        feature_keys=list(reversed(FEATURE_KEYS)),
+    )
+
+    status = service.status()
+
+    assert status["available"] is False
+    assert status["status"] == "artifact_incompatible"
+    assert status["model_load_diagnostic"]["details"] == [
+        "artifact_feature_keys_mismatch"
+    ]
+
+
+def test_incompatible_artifact_result_is_cached_until_pointer_or_file_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _with_return_objective({"artifact_version": "cached-incompatible"})
+    service = _service_with_registered_bundle(
+        tmp_path,
+        metadata=metadata,
+        feature_keys=list(reversed(FEATURE_KEYS)),
+    )
+    original_loader = ml_signal_module.load_trusted_joblib
+    load_count = 0
+
+    def tracked_loader(*args: object, **kwargs: object) -> dict:
+        nonlocal load_count
+        load_count += 1
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(ml_signal_module, "load_trusted_joblib", tracked_loader)
+
+    first = service.status()
+    second = service.predict({"symbol": "BTC/USDT", "current_price": 100.0})
+
+    assert first["status"] == "artifact_incompatible"
+    assert second["status"] == "artifact_incompatible"
+    assert load_count == 1
+
+
 def test_leave_one_symbol_out_detects_single_symbol_profit_support() -> None:
     rows = [
         {
@@ -1159,6 +1302,13 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
     assert frame.loc[0, "liquidation_risk_score"] == 0.42
     assert frame.loc[0, "direct_sentiment_data_available"] == 1.0
     assert frame.loc[0, "direct_news_item_count"] == 3.0
+    assert frame.loc[0, "label_maturity_status"] == "matured"
+    assert frame.loc[0, "label_contract_version"] == SHADOW_LABEL_VERSION
+    assert frame.loc[0, "short_mfe_pct"] == pytest.approx(0.18)
+    assert frame.loc[0, "short_mae_pct"] == pytest.approx(0.0)
+    assert frame.loc[0, "feature_contract_version"] == (
+        ml_signal_module.FEATURE_CONTRACT_VERSION
+    )
 
 
 @pytest.mark.asyncio
@@ -1440,7 +1590,7 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert calls == [False, True]
     assert ensure_load_calls == ["load"]
     assert result["trained"] is True
-    assert result["reason"] == "trained_paper_bootstrap_canary_activated"
+    assert result["reason"] == "trained_paper_canary_activated"
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["live_ml_ready"] is False
@@ -1532,6 +1682,59 @@ async def test_ml_signal_retrains_when_data_quality_contract_changes(
     assert result["training_policy"]["trigger"] == "training_data_contract_changed"
     assert result["training_policy"]["training_data_contract_stale"] is True
     assert len(promotion_evidence) == 2
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_auto_train_does_not_retrain_for_one_new_decision_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = MLSignalService(
+        artifact_registry=ModelArtifactRegistry(
+            root=tmp_path / "model_artifacts",
+            model_id=LOCAL_ML_MODEL_IDS[0],
+        ),
+        training_state_store=ModelTrainingStateStore(tmp_path / "training_state.json"),
+    )
+    metadata = _ml_training_metadata(
+        artifact_persisted=True,
+        ready=False,
+        completed_sample_count=80,
+    )
+    metadata["last_trained_completed_shadow_decision_group_count"] = 80
+    metadata["trained_at"] = datetime.now(UTC).isoformat()
+
+    async def load_rows() -> list[object]:
+        return [object()]
+
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
+
+    async def forbidden_quarantine(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("a single new decision group must not start training")
+
+    async def completed_shadow_sample_count() -> int:
+        return 81
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: metadata  # type: ignore[method-assign]
+    service._quarantine_dirty_training_samples = forbidden_quarantine  # type: ignore[method-assign]
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(
+        "services.ml_signal_service.build_training_frame",
+        lambda _rows: _training_frame(81),
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
+
+    result = await service.maybe_auto_train()
+
+    assert result["trained"] is False
+    assert result["reason"] == "not_due"
+    assert result["new_decision_group_count"] == 1
+    assert result["training_policy"]["trigger"] == "not_due"
 
 
 def test_authoritative_trade_return_evidence_prefers_profit_training_target() -> None:
@@ -1849,7 +2052,12 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert composition["decision_action_counts"] == {"hold": 20, "long": 20, "short": 20}
     assert composition["best_action_counts"] == {"short": 40, "long": 20}
     assert composition["data_quality_status_counts"] == {"included": 40, "downweighted": 20}
-    assert composition["effective_weight_ratio"] == pytest.approx((20 * 0.25 + 40) / 60)
+    replay = metadata["replay_weight_manifest"]
+    assert replay["raw_weight_total"] == pytest.approx(20 * 0.25 + 40)
+    assert composition["effective_weight_ratio"] == pytest.approx(
+        replay["final_weight_total"] / 60,
+        abs=1e-4,
+    )
     assert "top_long_tail_loss_rate" in metadata["metrics"]
     assert "top_short_tail_loss_rate" in metadata["metrics"]
     assert metadata["objective_name"] == RETURN_OBJECTIVE_NAME
@@ -2649,6 +2857,48 @@ def test_ml_signal_predict_uses_enabled_side_when_other_side_is_degraded() -> No
     assert prediction["predictions"][0]["best_side"] == "long"
     assert prediction["predictions"][0]["ml_prediction_eligible"] is True
     assert prediction["predictions"][0]["profit_signal"] is True
+
+
+def test_ml_signal_predict_emits_complete_paper_multitask_contract() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=False)
+    service = _service_with_metadata(metadata)
+    service._bundle.update(
+        {
+            "long_classifier": _Classifier(0.75),
+            "short_classifier": _Classifier(0.35),
+            "long_tail_classifier": _Classifier(0.12),
+            "short_tail_classifier": _Classifier(0.22),
+            "long_regressor": _Regressor(0.30, tree_predictions=(0.10, 0.30, 0.50)),
+            "short_regressor": _Regressor(0.12, tree_predictions=(-0.05, 0.12, 0.28)),
+            "long_cost_regressor": _Regressor(0.08, tree_predictions=(0.06, 0.08, 0.10)),
+            "short_cost_regressor": _Regressor(0.09, tree_predictions=(0.07, 0.09, 0.11)),
+            "long_mfe_regressor": _Regressor(0.62),
+            "long_mae_regressor": _Regressor(0.21),
+            "short_mfe_regressor": _Regressor(0.35),
+            "short_mae_regressor": _Regressor(0.44),
+        }
+    )
+
+    prediction = service.predict(
+        {"symbol": "BTC/USDT", "current_price": 100.0, "atr_14": 1.0},
+        horizons=(15,),
+    )
+
+    primary = prediction["predictions"][0]
+    long_task = primary["multitask_prediction"]["long"]
+    assert prediction["route_mode"] == "paper_analysis"
+    assert prediction["paper_ml_ready"] is True
+    assert primary["paper_prediction_eligible"] is True
+    assert long_task["expected_net_return_pct"] == pytest.approx(0.22)
+    assert long_task["return_q10"] <= long_task["return_q50"] <= long_task["return_q90"]
+    assert long_task["loss_probability"] == pytest.approx(0.25)
+    assert long_task["tail_loss_probability"] == pytest.approx(0.12)
+    assert long_task["expected_execution_cost_pct"] == pytest.approx(0.08)
+    assert long_task["expected_mfe_pct"] == pytest.approx(0.62)
+    assert long_task["expected_mae_pct"] == pytest.approx(0.21)
+    assert long_task["prediction_horizon"] == 15
+    assert long_task["model_version"]
+    assert long_task["calibration_version"]
 
 
 def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() -> None:

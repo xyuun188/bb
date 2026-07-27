@@ -13,15 +13,13 @@ from core.symbols import normalize_trading_symbol
 from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
-from services.paper_exploration import (
-    PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
-    PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
-)
-from services.paper_training import (
-    PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION,
-    PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION,
-    PAPER_TRAINING_SIZING_VERSION,
-    PAPER_TRAINING_VERSION,
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_LEVERAGE_CAP,
+    NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_SIZING_VERSION,
+    normal_paper_trade_contract_reasons,
 )
 
 logger = structlog.get_logger(__name__)
@@ -180,65 +178,40 @@ class RiskEngine:
         )
         position_size = RiskEngine._safe_positive_float(sizing.get("position_size_pct"))
         leverage = RiskEngine._safe_positive_float(decision.suggested_leverage)
-        if sizing.get("contract_lifecycle") == "paper_training":
-            training = raw.get("paper_training")
-            training = training if isinstance(training, dict) else {}
+        if sizing.get("contract_lifecycle") == "normal_paper_trade":
+            normal_trade = raw.get("normal_paper_trade")
+            normal_trade = normal_trade if isinstance(normal_trade, dict) else {}
             equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
-            if (
-                sizing.get("contract_version") != PAPER_TRAINING_SIZING_VERSION
-                or training.get("version") != PAPER_TRAINING_VERSION
-                or sizing.get("execution_scope") != "paper_only"
-                or sizing.get("production_permission") is not False
-                or training.get("execution_scope") != "paper_only"
-                or training.get("production_permission") is not False
-                or training.get("loss_tolerant_for_training") is not True
-            ):
-                return "Paper training risk contract is not paper-only."
-            if sizing.get("production_eligible") is not True:
-                reason = str(sizing.get("reason") or "paper_training_risk_budget_ineligible")
-                return f"Paper training risk budget is not eligible: {reason}."
-            if equity <= 0 or risk_budget > (
-                equity * PAPER_TRAINING_MAX_SINGLE_TRADE_RISK_FRACTION + 1e-8
-            ):
-                return "Paper cold-start exploration exceeds its single-trade risk cap."
-            if portfolio_budget > (
-                equity * PAPER_TRAINING_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
-            ):
-                return "Paper cold-start exploration exceeds its portfolio risk cap."
-        elif sizing.get("production_eligible") is not True:
-            return "Dynamic account risk budget is not production eligible."
-        if sizing.get("contract_lifecycle") == "paper_exploration":
-            exploration = raw.get("paper_exploration")
-            exploration = exploration if isinstance(exploration, dict) else {}
-            equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
-            single_cap = RiskEngine._safe_positive_float(
-                exploration.get("single_trade_risk_fraction_cap")
-            )
-            portfolio_cap = RiskEngine._safe_positive_float(
-                exploration.get("portfolio_risk_fraction_cap")
-            )
+            contract_reasons = normal_paper_trade_contract_reasons(normal_trade)
+            if contract_reasons:
+                return f"Normal paper trade contract is invalid: {','.join(contract_reasons)}."
+            if sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION:
+                return "Normal paper sizing version is invalid."
             if (
                 sizing.get("execution_scope") != "paper_only"
                 or sizing.get("production_permission") is not False
-                or exploration.get("execution_scope") != "paper_only"
-                or exploration.get("production_permission") is not False
             ):
-                return "Paper exploration risk contract is not paper-only."
-            if not isclose(leverage, 1.0, abs_tol=1e-8):
-                return "Paper exploration leverage must remain at one."
-            if (
-                single_cap <= 0
-                or single_cap > PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION
-                or equity <= 0
-                or risk_budget > equity * single_cap + 1e-8
+                return "Normal paper risk contract is not paper-only."
+            if sizing.get("production_eligible") is not True:
+                reason = str(sizing.get("reason") or "normal_paper_risk_budget_ineligible")
+                return f"Normal paper risk budget is not eligible: {reason}."
+            expected_single_cap = (
+                NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION
+                if normal_trade.get("selection_reason") == "coverage_sampling"
+                else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            )
+            if equity <= 0 or risk_budget > (
+                equity * expected_single_cap + 1e-8
             ):
-                return "Paper exploration exceeds its single-trade equity risk cap."
-            if (
-                portfolio_cap <= 0
-                or portfolio_cap > PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION
-                or portfolio_budget > equity * portfolio_cap + 1e-8
+                return "Normal paper trade exceeds its single-trade risk cap."
+            if portfolio_budget > (
+                equity * NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
             ):
-                return "Paper exploration exceeds its portfolio equity risk cap."
+                return "Normal paper trade exceeds its portfolio risk cap."
+            if not isclose(leverage, NORMAL_PAPER_TRADE_LEVERAGE_CAP, abs_tol=1e-8):
+                return "Normal paper leverage must remain at one."
+        elif sizing.get("production_eligible") is not True:
+            return "Dynamic account risk budget is not production eligible."
         if not provenance_complete:
             return "Dynamic account risk budget provenance is incomplete."
         if planned_loss <= 0 or risk_budget <= 0 or planned_loss > risk_budget + 1e-8:

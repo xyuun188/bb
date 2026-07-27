@@ -3076,17 +3076,12 @@ async def _production_source_health_audit() -> dict[str, Any]:
     duration = report.get("continuous_no_source_seconds")
     if status == "ok":
         summary = "近期存在通过治理的生产收益源。"
-    elif report.get("sampling_plan_alert_active"):
-        summary = (
-            "Paper bootstrap canary sampling plan is unreachable; the alert is active "
-            "while controlled collection continues."
-        )
-    elif report.get("recovery_state") == "paper_normal_trading":
+    elif report.get("paper_sampling_alert_active"):
+        summary = "模拟盘持续没有生成正常策略候选；实盘仍由生产晋升门禁独立控制。"
+    elif report.get("recovery_state") == "normal_paper_trading":
         summary = "正式生产收益源仍为空；模拟盘正常策略交易与持续训练正在运行，实盘继续保持关闭。"
-    elif report.get("recovery_state") == "paper_bootstrap_collecting":
-        summary = "正式生产收益源仍为空，模拟盘 bootstrap canary 正在采集恢复证据。"
     else:
-        summary = "连续没有通过治理的生产收益源，系统已告警并保持正式开仓失败关闭。"
+        summary = "正式生产收益源仍为空，模拟盘正在等待下一次正常策略候选；实盘保持关闭。"
     return _audit_card(
         "production_source_health",
         "连续无生产收益源",
@@ -3101,15 +3096,11 @@ async def _production_source_health_audit() -> dict[str, Any]:
             },
             {
                 "label": "模拟策略已执行",
-                "value": int(
-                    report.get("paper_normal_executed_count")
-                    or report.get("paper_bootstrap_executed_count")
-                    or 0
-                ),
+                "value": int(report.get("normal_paper_executed_count") or 0),
             },
             {
-                "label": "固定样本目标",
-                "value": report.get("sample_target"),
+                "label": "连续无模拟候选秒数",
+                "value": report.get("continuous_no_normal_paper_candidate_seconds"),
             },
         ],
         next_actions=[

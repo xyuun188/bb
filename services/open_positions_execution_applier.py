@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from types import SimpleNamespace
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
-from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
-from services.paper_training import build_paper_training_position_lifecycle
+from services.normal_paper_trade import build_normal_paper_position_lifecycle
 
 SymbolNormalizer = Callable[[Any], str]
 ExitProgressChecker = Callable[[ExecutionResult | None], bool]
@@ -63,21 +61,7 @@ class OpenPositionsExecutionApplier:
             return
         side = "long" if decision.action == Action.LONG else "short"
         entry_exchange_order_id = self._entry_exchange_order_id(execution_result)
-        lifecycle_decision = SimpleNamespace(
-            id=getattr(decision, "id", None),
-            symbol=decision.symbol,
-            action=side,
-            raw_response=getattr(decision, "raw_response", None),
-            is_paper=True,
-            was_executed=True,
-            executed_at=execution_result.timestamp,
-        )
-        paper_canary_lifecycle = build_paper_canary_position_lifecycle(
-            lifecycle_decision
-        )
-        paper_training_lifecycle = build_paper_training_position_lifecycle(
-            lifecycle_decision
-        )
+        normal_paper_lifecycle = build_normal_paper_position_lifecycle(decision)
         existing = self._matching_entry_position(
             open_positions,
             model_name,
@@ -96,8 +80,7 @@ class OpenPositionsExecutionApplier:
                 execution_result,
                 entry_exchange_order_id=entry_exchange_order_id,
                 add_execution=not is_replay,
-                paper_canary_lifecycle=paper_canary_lifecycle,
-                paper_training_lifecycle=paper_training_lifecycle,
+                normal_paper_lifecycle=normal_paper_lifecycle,
             )
             return
 
@@ -128,16 +111,12 @@ class OpenPositionsExecutionApplier:
                 "entry_exchange_order_id": entry_exchange_order_id,
                 "entry_legs": [entry_leg],
             }
-        if paper_canary_lifecycle or paper_training_lifecycle:
+        if normal_paper_lifecycle:
             position["execution_mode"] = "paper"
-            management: dict[str, Any] = {}
-            if paper_canary_lifecycle:
-                position["paper_canary_lifecycle"] = dict(paper_canary_lifecycle)
-                management["paper_canary_lifecycle"] = dict(paper_canary_lifecycle)
-            if paper_training_lifecycle:
-                position["paper_training_lifecycle"] = dict(paper_training_lifecycle)
-                management["paper_training_lifecycle"] = dict(paper_training_lifecycle)
-            position["current_management_contract"] = management
+            position["normal_paper_lifecycle"] = dict(normal_paper_lifecycle)
+            position["current_management_contract"] = {
+                "normal_paper_lifecycle": dict(normal_paper_lifecycle)
+            }
         open_positions.append(position)
 
     def _matching_entry_position(
@@ -170,8 +149,7 @@ class OpenPositionsExecutionApplier:
         *,
         entry_exchange_order_id: str,
         add_execution: bool,
-        paper_canary_lifecycle: dict[str, Any],
-        paper_training_lifecycle: dict[str, Any],
+        normal_paper_lifecycle: dict[str, Any],
     ) -> None:
         side = "long" if decision.action == Action.LONG else "short"
         if add_execution:
@@ -212,23 +190,12 @@ class OpenPositionsExecutionApplier:
             * (1 - decision.take_profit_pct)
         )
         position["is_open"] = True
-        if paper_canary_lifecycle:
-            lifecycle = position.get("paper_canary_lifecycle")
-            if not isinstance(lifecycle, dict):
-                lifecycle = dict(paper_canary_lifecycle)
-                position["paper_canary_lifecycle"] = lifecycle
+        if normal_paper_lifecycle:
+            lifecycle = dict(normal_paper_lifecycle)
+            position["normal_paper_lifecycle"] = lifecycle
             management = position.get("current_management_contract")
             management = dict(management) if isinstance(management, dict) else {}
-            if not isinstance(management.get("paper_canary_lifecycle"), dict):
-                management["paper_canary_lifecycle"] = dict(lifecycle)
-            position["current_management_contract"] = management
-            position["execution_mode"] = "paper"
-        if paper_training_lifecycle:
-            lifecycle = dict(paper_training_lifecycle)
-            position["paper_training_lifecycle"] = lifecycle
-            management = position.get("current_management_contract")
-            management = dict(management) if isinstance(management, dict) else {}
-            management["paper_training_lifecycle"] = dict(lifecycle)
+            management["normal_paper_lifecycle"] = dict(lifecycle)
             position["current_management_contract"] = management
             position["execution_mode"] = "paper"
         if entry_exchange_order_id:

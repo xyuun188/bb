@@ -15,14 +15,9 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.dynamic_exit_policy import apply_dynamic_exit
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.live_ml_profit_contract import apply_live_ml_profit_contract
-from services.normal_paper_trade import ensure_normal_paper_trade_contract
-from services.paper_exploration import (
-    assess_paper_exploration_entry,
-    is_paper_exploration_decision,
-)
-from services.paper_training import (
-    assess_paper_training_entry,
-    is_paper_training_decision,
+from services.normal_paper_trade import (
+    ensure_normal_paper_trade_contract,
+    normal_paper_trade_contract_reasons,
 )
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
 from services.production_trade_gate import validate_production_trade_gate
@@ -73,7 +68,6 @@ class EntryPolicy:
         entry_price_guard: Any | None = None,
         entry_opportunity_gate: Any | None = None,
         high_risk_review_gate: Any | None = None,
-        paper_bootstrap_canary: Any | None = None,
     ) -> None:
         self.decision_freshness = decision_freshness
         self.entry_priority = entry_priority
@@ -82,7 +76,6 @@ class EntryPolicy:
         self.entry_price_guard = entry_price_guard
         self.entry_opportunity_gate = entry_opportunity_gate
         self.high_risk_review_gate_policy = high_risk_review_gate
-        self.paper_bootstrap_canary = paper_bootstrap_canary
 
     def score_candidate(
         self,
@@ -212,52 +205,6 @@ class EntryPolicy:
         if not decision.is_entry:
             return
         ensure_normal_paper_trade_contract(decision, model_mode)
-        if (
-            self.paper_bootstrap_canary is not None
-            and self.paper_bootstrap_canary.is_claimed(decision)
-        ):
-            await self.paper_bootstrap_canary.prepare(
-                decision,
-                model_mode,
-                open_positions or [],
-            )
-            return
-        if is_paper_training_decision(decision) and str(model_mode).lower() == "paper":
-            self.ensure_opportunity_score(
-                decision,
-                self.strategy_context_from_decision(decision),
-            )
-            await self.apply_profit_risk_sizing(
-                decision,
-                model_mode,
-                open_positions=open_positions or [],
-            )
-            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-            sizing = raw.get("profit_risk_sizing")
-            sizing = sizing if isinstance(sizing, dict) else {}
-            planned_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
-            if planned_notional > 0:
-                snapshot = (
-                    dict(decision.feature_snapshot)
-                    if isinstance(decision.feature_snapshot, dict)
-                    else {}
-                )
-                snapshot["planned_order_notional_usdt"] = planned_notional
-                snapshot["planned_order_side"] = (
-                    "long" if decision.action == Action.LONG else "short"
-                )
-                decision.feature_snapshot = snapshot
-                self.score_candidate(
-                    decision,
-                    self.strategy_context_from_decision(decision),
-                )
-                await self.apply_profit_risk_sizing(
-                    decision,
-                    model_mode,
-                    open_positions=open_positions or [],
-                )
-            self._record_execution_cost_sizing_pass(decision, planned_notional)
-            return
         self.ensure_opportunity_score(
             decision,
             self.strategy_context_from_decision(decision),
@@ -425,39 +372,6 @@ class EntryPolicy:
                 {"pipeline_context": context.public_data()},
             )
 
-        if (
-            self.paper_bootstrap_canary is not None
-            and self.paper_bootstrap_canary.is_claimed(decision)
-        ):
-            await self.paper_bootstrap_canary.prepare(
-                decision,
-                model_mode,
-                open_positions or [],
-            )
-            paper_plan_gate = self._paper_trade_plan_gate(decision, model_mode, context)
-            if paper_plan_gate is not None:
-                return paper_plan_gate
-            paper_assessment = self.paper_bootstrap_canary.assess(decision, model_mode)
-            if not paper_assessment.eligible:
-                return PolicyGateResult.block(
-                    "paper_bootstrap_canary_policy",
-                    paper_assessment.reason,
-                    {
-                        "pipeline_context": context.public_data(),
-                        "stage_status": "skipped",
-                        "skip_kind": "paper_bootstrap_canary_policy",
-                        "paper_bootstrap_canary": paper_assessment.details,
-                    },
-                )
-            return PolicyGateResult.allow(
-                {
-                    "intent": "paper_bootstrap_entry",
-                    "pipeline_context": context.public_data(),
-                    "paper_bootstrap_canary": paper_assessment.details,
-                    "production_permission": False,
-                }
-            )
-
         await self.prepare_dynamic_risk_contract(
             decision,
             model_mode,
@@ -466,54 +380,38 @@ class EntryPolicy:
         paper_plan_gate = self._paper_trade_plan_gate(decision, model_mode, context)
         if paper_plan_gate is not None:
             return paper_plan_gate
-        if is_paper_exploration_decision(decision):
-            exploration_assessment = assess_paper_exploration_entry(
-                decision,
-                model_mode,
-            )
+        if str(model_mode or "").lower() == "paper":
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-            raw["paper_exploration_assessment"] = exploration_assessment.to_dict()
-            decision.raw_response = raw
-            if not exploration_assessment.eligible:
+            contract = raw.get("normal_paper_trade")
+            contract_reasons = normal_paper_trade_contract_reasons(contract)
+            sizing = raw.get("profit_risk_sizing")
+            sizing = sizing if isinstance(sizing, dict) else {}
+            if sizing.get("contract_lifecycle") != "normal_paper_trade":
+                contract_reasons.append("normal_paper_sizing_lifecycle_invalid")
+            if sizing.get("production_permission") is not False:
+                contract_reasons.append("normal_paper_sizing_permission_invalid")
+            if sizing.get("production_eligible") is not True:
+                contract_reasons.append(
+                    str(sizing.get("reason") or "normal_paper_sizing_ineligible")
+                )
+            contract_reasons = list(dict.fromkeys(contract_reasons))
+            if contract_reasons:
                 return PolicyGateResult.block(
-                    "paper_exploration_policy",
-                    exploration_assessment.reason,
+                    "normal_paper_trade_policy",
+                    ",".join(contract_reasons),
                     {
                         "pipeline_context": context.public_data(),
-                        "stage_status": "skipped",
-                        "skip_kind": "paper_exploration_policy",
-                        "paper_exploration": exploration_assessment.to_dict(),
+                        "stage_status": "blocked",
+                        "block_reasons": contract_reasons,
+                        "normal_paper_trade": contract,
+                        "profit_risk_sizing": sizing,
                     },
                 )
             return PolicyGateResult.allow(
                 {
-                    "intent": "paper_exploration_entry",
+                    "intent": "normal_paper_strategy_entry",
                     "pipeline_context": context.public_data(),
-                    "paper_exploration": exploration_assessment.to_dict(),
-                    "production_permission": False,
-                }
-            )
-        if is_paper_training_decision(decision):
-            assessment = assess_paper_training_entry(decision, model_mode)
-            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-            raw["paper_training_assessment"] = assessment.to_dict()
-            decision.raw_response = raw
-            if not assessment.eligible:
-                return PolicyGateResult.block(
-                    "paper_training_policy",
-                    assessment.reason,
-                    {
-                        "pipeline_context": context.public_data(),
-                        "stage_status": "skipped",
-                        "skip_kind": "paper_training_policy",
-                        "paper_training": assessment.to_dict(),
-                    },
-                )
-            return PolicyGateResult.allow(
-                {
-                    "intent": "paper_training_entry",
-                    "pipeline_context": context.public_data(),
-                    "paper_training": assessment.to_dict(),
+                    "normal_paper_trade": contract,
                     "production_permission": False,
                 }
             )

@@ -9,7 +9,6 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
-from services.paper_exploration import select_paper_exploration_side
 
 CandidateScorer = Callable[[DecisionOutput, dict[str, Any] | None], float]
 FeatureOpportunityScorer = Callable[[Any], float]
@@ -105,39 +104,6 @@ def _scheduled_return_prior(
     }
 
 
-def _exploration_maturity_evidence(
-    strategy: dict[str, Any] | None,
-    *,
-    symbol: str,
-    side: str,
-) -> dict[str, Any]:
-    strategy_context = _safe_dict(strategy)
-    learning = _safe_dict(strategy_context.get("strategy_learning"))
-    runtime = _safe_dict(learning.get("runtime"))
-    routing = _safe_dict(
-        strategy_context.get("continuous_strategy_routing")
-        or learning.get("continuous_strategy_routing")
-        or runtime.get("continuous_strategy_routing")
-    )
-    by_symbol = _safe_dict(routing.get("exploration_maturity_by_symbol_side"))
-    evidence = _safe_dict(_safe_dict(by_symbol.get(symbol.upper())).get(side))
-    if not evidence:
-        return {
-            "available": False,
-            "source": "validated_continuous_strategy_route",
-            "reason": "no_validated_symbol_side_maturity_evidence",
-            "evidence_count": 0,
-            "can_authorize_entry": False,
-            "can_change_size_or_leverage": False,
-        }
-    return {
-        **evidence,
-        "available": True,
-        "can_authorize_entry": False,
-        "can_change_size_or_leverage": False,
-    }
-
-
 @dataclass(frozen=True, slots=True)
 class EntryCandidateEvidencePolicy:
     """Compare both sides without granting execution or probe permission."""
@@ -164,26 +130,16 @@ class EntryCandidateEvidencePolicy:
             "memory_feedback": memory_feedback or {},
             "pre_ai_candidate_evidence": True,
         }
-        long_evidence = self._build_side(
-            "long", symbol, feature_vector, strategy, base_raw
-        )
-        short_evidence = self._build_side(
-            "short", symbol, feature_vector, strategy, base_raw
-        )
+        long_evidence = self._build_side("long", symbol, feature_vector, strategy, base_raw)
+        short_evidence = self._build_side("short", symbol, feature_vector, strategy, base_raw)
         feature_score = _safe_float(self.feature_opportunity_score(feature_vector), 0.0)
         eligible_sides = [
-            item
-            for item in (long_evidence, short_evidence)
-            if item["production_eligible"]
+            item for item in (long_evidence, short_evidence) if item["production_eligible"]
         ]
         preferred = (
             max(eligible_sides, key=lambda item: item["return_lcb_pct"])["side"]
             if eligible_sides
             else "neutral"
-        )
-        exploration = select_paper_exploration_side(
-            {"long": long_evidence, "short": short_evidence},
-            feature_opportunity_score=feature_score,
         )
         generated_at = datetime.now(UTC).isoformat()
         return {
@@ -192,27 +148,20 @@ class EntryCandidateEvidencePolicy:
             "is_entry_gate": False,
             "symbol": symbol,
             "preferred_side_by_evidence": preferred,
-            "preferred_exploration_side": exploration["preferred_side"],
             "feature_opportunity_score": round(feature_score, 8),
             "long": long_evidence,
             "short": short_evidence,
-            "paper_exploration": exploration,
             "memory_feedback_observation": _safe_dict(memory_feedback),
             "policy_provenance": {
                 "source": "authoritative_side_return_opportunity_snapshots",
                 "observation_window": "current_pre_ai_candidate_round",
                 "sample_count": sum(
-                    int(item["production_source_count"])
-                    for item in (long_evidence, short_evidence)
+                    int(item["production_source_count"]) for item in (long_evidence, short_evidence)
                 ),
                 "generated_at": generated_at,
                 "strategy_version": "2026-07-12.candidate-return-evidence.v1",
                 "fallback_reason": (
-                    ""
-                    if eligible_sides
-                    else "bounded_paper_exploration_available"
-                    if exploration["preferred_side"] in {"long", "short"}
-                    else "no_production_or_bounded_exploration_side"
+                    "" if eligible_sides else "production_return_candidate_unavailable"
                 ),
             },
             "policy": (
@@ -291,11 +240,6 @@ class EntryCandidateEvidencePolicy:
             ),
             "execution_cost": _safe_dict(opportunity.get("execution_cost")),
             "scheduled_return_prior": _scheduled_return_prior(
-                strategy,
-                symbol=symbol,
-                side=side,
-            ),
-            "exploration_maturity_evidence": _exploration_maturity_evidence(
                 strategy,
                 symbol=symbol,
                 side=side,

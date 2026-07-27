@@ -766,6 +766,14 @@ def verify_market_fact_path(
         "result_reachable": result_reachable,
         "identity_match": identity_match,
         "reasons": list(dict.fromkeys(reasons)),
+        "_ordered_bar_ranges": [
+            {
+                "open_time_ms": item["open_time_ms"],
+                "high": item["high"],
+                "low": item["low"],
+            }
+            for item in path_bars
+        ],
     }
     payload["status"] = "clean" if not payload["reasons"] else "quarantined"
     payload["path_fingerprint"] = f"sha256:{_fingerprint({**payload, 'bars': path_bars})}"
@@ -781,7 +789,11 @@ def build_shadow_market_fact_contract(
 ) -> dict[str, Any]:
     entry = _dict(entry_fact)
     result = _dict(result_fact)
-    path = _dict(price_path)
+    path = {
+        key: item
+        for key, item in _dict(price_path).items()
+        if key != "_ordered_bar_ranges"
+    }
     reasons = [f"entry:{reason}" for reason in market_fact_reasons(entry)]
     if not result:
         reasons.append("result_market_fact_missing")

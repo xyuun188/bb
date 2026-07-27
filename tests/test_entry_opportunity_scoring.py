@@ -258,17 +258,16 @@ def test_live_models_use_equal_empirical_observations_and_live_cost() -> None:
     assert opportunity["policy_provenance"]["fallback_reason"] == ""
 
 
-def test_scoring_path_persists_lifecycle_specific_paper_canary_score() -> None:
+def test_legacy_paper_canary_cannot_override_current_opportunity_score() -> None:
     decision = _decision()
     decision.raw_response = complete_paper_canary_raw()
 
     score = _scorer().score_candidate(decision)
 
     opportunity = decision.raw_response["opportunity_score"]
-    assert score == pytest.approx(0.27)
-    assert opportunity["score"] == pytest.approx(0.27)
-    assert opportunity["production_score"] is None
-    assert opportunity["contract_lifecycle"] == "paper_bootstrap_canary"
+    assert score == float("-inf")
+    assert opportunity["score"] is None
+    assert "contract_lifecycle" not in opportunity
     assert opportunity["production_eligible"] is False
 
 

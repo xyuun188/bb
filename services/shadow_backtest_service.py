@@ -30,7 +30,7 @@ from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
 logger = structlog.get_logger(__name__)
 
-SHADOW_BACKTEST_HORIZONS_MINUTES = (10, 30, 60)
+SHADOW_BACKTEST_HORIZONS_MINUTES = (5, 15, 60, 240)
 SHADOW_LEVERAGE_SCENARIOS = (1, 2, 3, 5, 10)
 SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION = "2026-07-22.shadow-leverage-counterfactual.v1"
 
@@ -96,6 +96,86 @@ def side_label(side: str) -> str:
     if side_value == "short":
         return "做空"
     return str(side)
+
+
+def shadow_path_labels(
+    *,
+    entry_price: float,
+    price_path: dict[str, Any] | None,
+    stop_loss_fraction: float | None,
+    take_profit_fraction: float | None = None,
+) -> dict[str, Any]:
+    """Derive direction-neutral path labels from the verified native 1m path."""
+
+    path = price_path if isinstance(price_path, dict) else {}
+    path_low = _safe_shadow_number(path.get("path_low"))
+    path_high = _safe_shadow_number(path.get("path_high"))
+    if entry_price <= 0 or path_low is None or path_high is None:
+        return {}
+    long_mfe = max((path_high - entry_price) / entry_price * 100.0, 0.0)
+    long_mae = max((entry_price - path_low) / entry_price * 100.0, 0.0)
+    short_mfe = long_mae
+    short_mae = long_mfe
+    stop = _safe_shadow_number(stop_loss_fraction)
+    stop = stop if stop is not None and stop > 0.0 else None
+    take = _safe_shadow_number(take_profit_fraction)
+    take = take if take is not None and take > 0.0 else None
+
+    def first_touch(side: str) -> tuple[bool, bool, str]:
+        stop_triggered = False
+        take_triggered = False
+        first = "none"
+        bars = path.get("_ordered_bar_ranges")
+        if not isinstance(bars, list) or stop is None or take is None:
+            return stop_triggered, take_triggered, first
+        for raw_bar in bars:
+            bar = raw_bar if isinstance(raw_bar, dict) else {}
+            low = _safe_shadow_number(bar.get("low"))
+            high = _safe_shadow_number(bar.get("high"))
+            if low is None or high is None:
+                continue
+            if side == "long":
+                touches_stop = low <= entry_price * (1.0 - stop)
+                touches_take = high >= entry_price * (1.0 + take)
+            else:
+                touches_stop = high >= entry_price * (1.0 + stop)
+                touches_take = low <= entry_price * (1.0 - take)
+            stop_triggered = stop_triggered or touches_stop
+            take_triggered = take_triggered or touches_take
+            if first == "none" and touches_stop and touches_take:
+                first = "path_uncertain"
+            elif first == "none" and touches_stop:
+                first = "stop_loss"
+            elif first == "none" and touches_take:
+                first = "take_profit"
+        return stop_triggered, take_triggered, first
+
+    long_stop, long_take, long_first = first_touch("long")
+    short_stop, short_take, short_first = first_touch("short")
+    return {
+        "long_mfe_pct": long_mfe,
+        "long_mae_pct": long_mae,
+        "short_mfe_pct": short_mfe,
+        "short_mae_pct": short_mae,
+        "long_stop_loss_triggered": (
+            long_stop
+            if stop is not None and take is not None
+            else path_low <= entry_price * (1.0 - stop)
+            if stop is not None
+            else False
+        ),
+        "short_stop_loss_triggered": (
+            short_stop
+            if stop is not None and take is not None
+            else path_high >= entry_price * (1.0 + stop)
+            if stop is not None
+            else False
+        ),
+        "long_take_profit_triggered": long_take,
+        "short_take_profit_triggered": short_take,
+        "long_first_touch": long_first,
+        "short_first_touch": short_first,
+    }
 
 
 def _safe_shadow_number(value: Any) -> float | None:
@@ -419,6 +499,16 @@ class ShadowBacktestService:
                 )
                 feature_snapshot["model_shadow_action"] = shadow_action
                 feature_snapshot["model_shadow_action_source"] = shadow_source
+                feature_snapshot["shadow_label_inputs"] = {
+                    "version": SHADOW_LABEL_VERSION,
+                    "stop_loss_fraction": _safe_shadow_number(
+                        decision.stop_loss_pct
+                    ),
+                    "take_profit_fraction": _safe_shadow_number(
+                        decision.take_profit_pct
+                    ),
+                    "horizons_minutes": list(self.horizons_minutes),
+                }
                 local_ai_shadow = compact_local_ai_tools_shadow(local_ai_tools_context)
                 if local_ai_shadow:
                     feature_snapshot["local_ai_tools_shadow"] = local_ai_shadow
@@ -601,6 +691,18 @@ class ShadowBacktestService:
                 feature_snapshot["training_leverage_counterfactuals"] = (
                     compact_shadow_leverage_counterfactuals(fee_after_outcome)
                 )
+                label_inputs = feature_snapshot.get("shadow_label_inputs")
+                label_inputs = label_inputs if isinstance(label_inputs, dict) else {}
+                path_labels = shadow_path_labels(
+                    entry_price=entry_price,
+                    price_path=price_path,
+                    stop_loss_fraction=_safe_shadow_number(
+                        label_inputs.get("stop_loss_fraction")
+                    ),
+                    take_profit_fraction=_safe_shadow_number(
+                        label_inputs.get("take_profit_fraction")
+                    ),
+                )
                 long_net = fee_after_outcome.get("long_net_return_after_all_cost_pct")
                 short_net = fee_after_outcome.get("short_net_return_after_all_cost_pct")
                 best_action = "hold"
@@ -625,6 +727,7 @@ class ShadowBacktestService:
                         ),
                         cost_facts=fee_after_outcome,
                         label_timestamp=getattr(row, "due_at", None),
+                        **path_labels,
                     )
                 )
                 completions[row_id] = {

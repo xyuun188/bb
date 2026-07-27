@@ -23,6 +23,7 @@ import structlog
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sqlalchemy import and_, func, or_, select
@@ -100,19 +101,25 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
     Path(settings.data_dir) / "model_training_scheduler_state.json"
 )
 LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
+LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX = "BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
+FEATURE_CONTRACT_VERSION = "2026-07-27.global-point-in-time-features.v1"
+MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-07-27.paper-multitask-prediction.v1"
+REPLAY_WEIGHT_POLICY_VERSION = "2026-07-27.recency-tail-hard-example.v1"
 
 
 def _training_source_code_version() -> str:
     digest = hashlib.sha256()
     source_paths = (
         Path(__file__),
+        Path(__file__).parents[1] / "core" / "training_contracts.py",
         Path(__file__).with_name("training_data_quality.py"),
         Path(__file__).with_name("ml_readiness.py"),
         Path(__file__).with_name("return_objective.py"),
         Path(__file__).with_name("model_artifact_registry.py"),
+        Path(__file__).with_name("trading_params.py"),
     )
     for path in source_paths:
         digest.update(path.name.encode("utf-8"))
@@ -171,6 +178,12 @@ FEATURE_KEYS = [
     "sequence_length",
     "decision_confidence",
     "horizon_minutes",
+    "regime_trending",
+    "regime_volatile",
+    "regime_ranging",
+    "liquidity_regime_high",
+    "news_shock_present",
+    "major_asset",
 ]
 
 
@@ -240,6 +253,11 @@ def _feature_row_from_snapshot(
     bid_depth = _safe_float(snapshot.get("orderbook_bid_depth"), 0.0)
     ask_depth = _safe_float(snapshot.get("orderbook_ask_depth"), 0.0)
     depth_total = max(bid_depth + ask_depth, 1e-9)
+    regime = _market_regime_label(snapshot)
+    symbol = str(snapshot.get("symbol") or snapshot.get("instrument") or "").upper()
+    base_asset = symbol.split("/")[0].split("-")[0]
+    notional_24h = _safe_float(snapshot.get("notional_24h_usdt"), 0.0)
+    direct_news_count = _safe_float(snapshot.get("direct_news_item_count"), 0.0)
     values = {
         "abnormal_wick_count_72h": _safe_float(snapshot.get("abnormal_wick_count_72h")),
         "abnormal_wick_max_pct": _safe_float(snapshot.get("abnormal_wick_max_pct")),
@@ -299,6 +317,12 @@ def _feature_row_from_snapshot(
         "sequence_length": _safe_float(snapshot.get("sequence_length")),
         "decision_confidence": _safe_float(decision_confidence),
         "horizon_minutes": float(horizon_minutes),
+        "regime_trending": 1.0 if regime == "trending" else 0.0,
+        "regime_volatile": 1.0 if regime == "volatile" else 0.0,
+        "regime_ranging": 1.0 if regime == "ranging" else 0.0,
+        "liquidity_regime_high": 1.0 if notional_24h >= 100_000_000.0 else 0.0,
+        "news_shock_present": 1.0 if direct_news_count > 0.0 else 0.0,
+        "major_asset": 1.0 if base_asset in {"BTC", "ETH", "SOL", "BNB"} else 0.0,
     }
     return {key: float(values.get(key, 0.0)) for key in FEATURE_KEYS}
 
@@ -320,6 +344,12 @@ def _feature_row_from_feature_vector(
 def _make_classifier(y: pd.Series) -> Pipeline:
     if int(y.nunique()) < 2:
         estimator = DummyClassifier(strategy="prior")
+    elif len(y) < 250:
+        estimator = LogisticRegression(
+            class_weight="balanced",
+            max_iter=1000,
+            random_state=42,
+        )
     else:
         estimator = RandomForestClassifier(
             n_estimators=220,
@@ -340,6 +370,8 @@ def _make_classifier(y: pd.Series) -> Pipeline:
 def _make_regressor(y: pd.Series) -> Pipeline:
     if int(y.nunique()) < 2:
         estimator = DummyRegressor(strategy="mean")
+    elif len(y) < 250:
+        estimator = Ridge(alpha=1.0)
     else:
         estimator = RandomForestRegressor(
             n_estimators=220,
@@ -517,6 +549,79 @@ def _standardized_model_return_distribution(
         cost_model_version=COST_MODEL_VERSION,
         profit_supervision_version=PROFIT_SUPERVISION_VERSION,
     )
+
+
+def _optional_regression_value(
+    bundle: dict[str, Any],
+    model_key: str,
+    x: pd.DataFrame,
+    *,
+    index: int = 0,
+) -> float | None:
+    model = bundle.get(model_key)
+    if model is None:
+        return None
+    try:
+        value = float(np.asarray(model.predict(x), dtype=float)[index])
+    except Exception as exc:
+        logger.debug(
+            "failed to score optional multitask regression head",
+            model_key=model_key,
+            error=safe_error_text(exc),
+        )
+        return None
+    return max(value, 0.0) if math.isfinite(value) else None
+
+
+def _multitask_side_prediction(
+    *,
+    side: str,
+    horizon_minutes: int,
+    model_version: str,
+    calibration_version: str,
+    return_contract: dict[str, Any],
+    cost_distribution: dict[str, Any],
+    win_probability: float,
+    tail_loss_probability: float | None,
+    expected_mfe_pct: float | None,
+    expected_mae_pct: float | None,
+) -> dict[str, Any]:
+    gross_expected = _safe_float(return_contract.get("raw_expected_return_pct"), 0.0)
+    gross_q10 = _safe_float(return_contract.get("lower_quantile_return_pct"), gross_expected)
+    gross_q50 = _safe_float(return_contract.get("median_return_pct"), gross_expected)
+    gross_q90 = _safe_float(return_contract.get("upper_quantile_return_pct"), gross_expected)
+    cost_expected = max(float(cost_distribution["expected"][0]), 0.0)
+    cost_q10 = max(float(cost_distribution["lower_quantile"][0]), 0.0)
+    cost_q90 = max(float(cost_distribution["upper_quantile"][0]), 0.0)
+    ordered_quantiles = sorted(
+        (
+            gross_q10 - cost_q90,
+            gross_q50 - cost_expected,
+            gross_q90 - cost_q10,
+        )
+    )
+    return {
+        "version": MULTITASK_PREDICTION_CONTRACT_VERSION,
+        "side": side,
+        "expected_net_return_pct": gross_expected - cost_expected,
+        "return_q10": ordered_quantiles[0],
+        "return_q50": ordered_quantiles[1],
+        "return_q90": ordered_quantiles[2],
+        "loss_probability": 1.0 - _clamp(win_probability),
+        "tail_loss_probability": (
+            _clamp(tail_loss_probability)
+            if tail_loss_probability is not None
+            else None
+        ),
+        "expected_execution_cost_pct": cost_expected,
+        "expected_mfe_pct": expected_mfe_pct,
+        "expected_mae_pct": expected_mae_pct,
+        "prediction_horizon": int(horizon_minutes),
+        "model_version": model_version,
+        "calibration_version": calibration_version,
+        "return_semantics": "net_after_counterfactual_execution_cost",
+        "quantile_monotonic": True,
+    }
 
 
 def _actual_calibration_ready(profile: dict[str, Any]) -> bool:
@@ -998,6 +1103,152 @@ def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
         "missed_opportunity_share": round(missed_count / max(sample_count, 1), 4),
         "effective_weight": round(weight_total, 4),
         "effective_weight_ratio": round(weight_total / max(sample_count, 1), 4),
+    }
+
+
+def _training_distribution_profile(frame: pd.DataFrame) -> dict[str, Any]:
+    profile: dict[str, Any] = {}
+    columns = (
+        "returns_5",
+        "returns_20",
+        "volatility_20",
+        "spread_pct",
+        "orderbook_imbalance",
+        "long_return_pct",
+        "short_return_pct",
+        "long_execution_cost_pct",
+        "short_execution_cost_pct",
+    )
+    for column in columns:
+        if column not in frame:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        profile[column] = {
+            "count": int(len(values)),
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=0)),
+        }
+    return {
+        "version": "2026-07-27.training-distribution-profile.v1",
+        "features": profile,
+    }
+
+
+def _training_distribution_drift(
+    current: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    current_features = _safe_dict(current.get("features"))
+    previous_features = _safe_dict(_safe_dict(previous).get("features"))
+    shifts: dict[str, float] = {}
+    for key, current_row_value in current_features.items():
+        current_row = _safe_dict(current_row_value)
+        previous_row = _safe_dict(previous_features.get(key))
+        if not previous_row:
+            continue
+        current_mean = _safe_float(current_row.get("mean"), float("nan"))
+        previous_mean = _safe_float(previous_row.get("mean"), float("nan"))
+        scale = max(
+            _safe_float(current_row.get("std"), 0.0),
+            _safe_float(previous_row.get("std"), 0.0),
+            1e-9,
+        )
+        if math.isfinite(current_mean) and math.isfinite(previous_mean):
+            shifts[key] = abs(current_mean - previous_mean) / scale
+    maximum_shift = max(shifts.values(), default=0.0)
+    threshold = float(_LOCAL_ML_PARAMS.distribution_drift_threshold)
+    return {
+        "version": "2026-07-27.standardized-mean-shift.v1",
+        "detected": bool(shifts and maximum_shift >= threshold),
+        "threshold": threshold,
+        "maximum_shift": round(maximum_shift, 6),
+        "feature_shifts": {key: round(value, 6) for key, value in shifts.items()},
+    }
+
+
+def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    weighted = train.copy()
+    if weighted.empty:
+        return weighted, {
+            "version": REPLAY_WEIGHT_POLICY_VERSION,
+            "sample_count": 0,
+            "effective_sample_size": 0.0,
+        }
+    timestamps = pd.to_datetime(weighted["label_timestamp"], utc=True, errors="raise")
+    latest = timestamps.max()
+    ages_days = (latest - timestamps).dt.total_seconds().clip(lower=0.0) / 86400.0
+    half_life_days = max(float(_LOCAL_ML_PARAMS.replay_half_life_days), 1.0)
+    minimum_recency = max(
+        min(float(_LOCAL_ML_PARAMS.replay_minimum_recency_weight), 1.0),
+        0.01,
+    )
+    recency = np.maximum(np.power(0.5, ages_days / half_life_days), minimum_recency)
+    base = pd.to_numeric(
+        weighted.get("sample_weight", pd.Series([1.0] * len(weighted))),
+        errors="coerce",
+    ).fillna(0.0).clip(lower=0.0)
+    tail = (
+        weighted.get("long_tail_loss", pd.Series([0] * len(weighted))).astype(bool)
+        | weighted.get("short_tail_loss", pd.Series([0] * len(weighted))).astype(bool)
+    )
+    decision_action = weighted.get("decision_action", pd.Series([""] * len(weighted))).astype(str)
+    best_action = weighted.get("best_action", pd.Series([""] * len(weighted))).astype(str)
+    confidence = pd.to_numeric(
+        weighted.get("decision_confidence", pd.Series([0.0] * len(weighted))),
+        errors="coerce",
+    ).fillna(0.0)
+    hard_error = (confidence >= 0.7) & (decision_action != best_action)
+    cost_consumed_edge = (
+        (
+            pd.to_numeric(weighted["long_return_pct"], errors="coerce") > 0.0
+        )
+        & (
+            pd.to_numeric(weighted["long_return_pct"], errors="coerce")
+            - pd.to_numeric(weighted["long_execution_cost_pct"], errors="coerce")
+            <= 0.0
+        )
+    ) | (
+        (
+            pd.to_numeric(weighted["short_return_pct"], errors="coerce") > 0.0
+        )
+        & (
+            pd.to_numeric(weighted["short_return_pct"], errors="coerce")
+            - pd.to_numeric(weighted["short_execution_cost_pct"], errors="coerce")
+            <= 0.0
+        )
+    )
+    multiplier = (
+        1.0
+        + tail.astype(float) * 0.25
+        + hard_error.astype(float) * 0.25
+        + cost_consumed_edge.astype(float) * 0.15
+    )
+    final_weights = (base * recency * multiplier).clip(lower=0.01, upper=2.0)
+    weighted["sample_weight"] = final_weights
+    weighted["replay_recency_weight"] = recency
+    weighted["replay_tail_emphasis"] = tail.astype(int)
+    weighted["replay_hard_error_emphasis"] = hard_error.astype(int)
+    weighted["replay_cost_error_emphasis"] = cost_consumed_edge.astype(int)
+    total = float(final_weights.sum())
+    squared_total = float(np.square(final_weights).sum())
+    effective = total * total / squared_total if squared_total > 0.0 else 0.0
+    return weighted, {
+        "version": REPLAY_WEIGHT_POLICY_VERSION,
+        "validation_and_test_resampling": False,
+        "recency_half_life_days": half_life_days,
+        "minimum_recency_weight": minimum_recency,
+        "tail_multiplier": 1.25,
+        "hard_error_multiplier": 1.25,
+        "cost_consumed_edge_multiplier": 1.15,
+        "sample_count": int(len(weighted)),
+        "raw_weight_total": round(float(base.sum()), 6),
+        "final_weight_total": round(total, 6),
+        "effective_sample_size": round(effective, 6),
+        "tail_sample_count": int(tail.sum()),
+        "hard_error_sample_count": int(hard_error.sum()),
+        "cost_consumed_edge_sample_count": int(cost_consumed_edge.sum()),
     }
 
 
@@ -1590,6 +1841,8 @@ def local_ml_artifact_compatibility_errors(
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "label_version": RETURN_LABEL_VERSION,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "feature_contract_version": FEATURE_CONTRACT_VERSION,
+        "multitask_prediction_contract_version": MULTITASK_PREDICTION_CONTRACT_VERSION,
     }
     for key, expected in expected_values.items():
         if metadata.get(key) != expected:
@@ -1600,6 +1853,11 @@ def local_ml_artifact_compatibility_errors(
             for key in _REQUIRED_LOCAL_ML_BUNDLE_KEYS
             if key not in bundle
         )
+        bundle_feature_keys = bundle.get("feature_keys")
+        if not isinstance(bundle_feature_keys, (list, tuple)):
+            errors.append("artifact_feature_keys_missing")
+        elif list(bundle_feature_keys) != FEATURE_KEYS:
+            errors.append("artifact_feature_keys_mismatch")
     return errors
 
 
@@ -1699,6 +1957,45 @@ def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
     return DecisionGroupPartition(train, holdout, report)
 
 
+def _mature_shadow_multitask_labels(
+    snapshot: dict[str, Any],
+    *,
+    expected_label_version: str,
+) -> dict[str, Any]:
+    contract = _safe_dict(snapshot.get("training_label_contract"))
+    if (
+        not contract
+        or str(contract.get("version") or "") != expected_label_version
+        or contract.get("label_maturity_status") != "matured"
+    ):
+        return {}
+    result: dict[str, Any] = {
+        "label_contract_version": str(contract.get("version") or ""),
+        "label_maturity_status": "matured",
+    }
+    for key in ("long_mfe_pct", "long_mae_pct", "short_mfe_pct", "short_mae_pct"):
+        value = _safe_float(contract.get(key), float("nan"))
+        if not math.isfinite(value) or value < 0.0:
+            return {}
+        result[key] = value
+    for key in (
+        "long_stop_loss_triggered",
+        "short_stop_loss_triggered",
+        "long_take_profit_triggered",
+        "short_take_profit_triggered",
+    ):
+        value = contract.get(key)
+        if not isinstance(value, bool):
+            return {}
+        result[key] = int(value)
+    for key in ("long_first_touch", "short_first_touch"):
+        value = str(contract.get(key) or "").lower()
+        if value not in {"none", "stop_loss", "take_profit", "path_uncertain"}:
+            return {}
+        result[key] = value
+    return result
+
+
 def build_training_frame(rows: list[Any]) -> pd.DataFrame:
     data: list[dict[str, Any]] = []
     annotated_by_id = {
@@ -1719,6 +2016,13 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         sample_id = int(getattr(row, "id", 0) or 0)
         quality_sample = annotated_by_id.get(sample_id, {})
         if not quality_sample or quality_sample.get("exclude_from_training"):
+            continue
+        label_version = str(getattr(row, "label_version", "") or "")
+        multitask_labels = _mature_shadow_multitask_labels(
+            snapshot,
+            expected_label_version=label_version,
+        )
+        if not multitask_labels:
             continue
         horizon_minutes = int(getattr(row, "horizon_minutes", 10) or 10)
         supervision = _safe_dict(quality_sample.get("profit_supervision"))
@@ -1743,7 +2047,10 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             continue
         feature_row: dict[str, Any] = dict(
             _feature_row_from_snapshot(
-                snapshot,
+                {
+                    **snapshot,
+                    "symbol": str(getattr(row, "symbol", "") or snapshot.get("symbol") or ""),
+                },
                 decision_confidence=_safe_float(getattr(row, "decision_confidence", 0.0)),
                 horizon_minutes=horizon_minutes,
             )
@@ -1755,9 +2062,21 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "decision_group": _safe_dict(quality_sample.get("correlation_weight")).get(
                     "correlation_group"
                 ),
+                "decision_timestamp": getattr(row, "created_at", None),
                 "label_timestamp": getattr(row, "due_at", None) or getattr(row, "created_at", None),
                 "symbol": str(getattr(row, "symbol", "") or ""),
                 "market_regime": _market_regime_label(snapshot),
+                "liquidity_regime": (
+                    "high"
+                    if feature_row["liquidity_regime_high"] == 1.0
+                    else "low"
+                ),
+                "asset_group": "major" if feature_row["major_asset"] == 1.0 else "alt",
+                "news_regime": (
+                    "news_shock"
+                    if feature_row["news_shock_present"] == 1.0
+                    else "no_news_shock"
+                ),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
                 "best_action": str(getattr(row, "best_action", "") or ""),
                 "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
@@ -1773,6 +2092,10 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "data_quality_status": quality_sample.get("data_quality_status"),
                 "data_quality_score": quality_sample.get("data_quality_score"),
                 "quality_reasons": list(quality_sample.get("quality_reasons") or []),
+                "sample_source": "shadow_market_label",
+                "training_tasks": ["market_opportunity", "entry_timing"],
+                "feature_contract_version": FEATURE_CONTRACT_VERSION,
+                **multitask_labels,
             }
         )
         data.append(feature_row)
@@ -1796,6 +2119,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         tail_policy[side] = boundary.to_dict()
     frame.attrs["tail_loss_policy"] = tail_policy
     frame.attrs["profit_supervision_version"] = PROFIT_SUPERVISION_VERSION
+    frame.attrs["feature_contract_version"] = FEATURE_CONTRACT_VERSION
     return frame
 
 
@@ -1840,6 +2164,28 @@ def train_from_frame(
     trade_samples: list[dict[str, Any]] | None = None,
     persist_artifact: bool = True,
 ) -> dict[str, Any]:
+    required_multitask_columns = {
+        "label_contract_version",
+        "label_maturity_status",
+        "long_mfe_pct",
+        "long_mae_pct",
+        "short_mfe_pct",
+        "short_mae_pct",
+        "long_stop_loss_triggered",
+        "short_stop_loss_triggered",
+        "long_take_profit_triggered",
+        "short_take_profit_triggered",
+        "long_first_touch",
+        "short_first_touch",
+    }
+    missing_multitask_columns = sorted(required_multitask_columns - set(frame.columns))
+    if missing_multitask_columns:
+        raise ValueError(
+            "mature multitask market labels are required: "
+            + ", ".join(missing_multitask_columns)
+        )
+    if not frame["label_maturity_status"].eq("matured").all():
+        raise ValueError("unmatured market labels cannot enter training")
     partition = decision_group_partition(frame)
     if not partition.report["ready"]:
         raise ValueError(
@@ -1873,6 +2219,7 @@ def train_from_frame(
         tail_scales[side] = max(abs(boundary), float(np.finfo(float).eps))
     train = frame.loc[partition.train.index].copy()
     test = frame.loc[partition.holdout.index].copy()
+    train, replay_weight_manifest = _apply_training_replay_weights(train)
     training_data_sha256 = _training_data_sha256(frame)
     source_code_version = _training_source_code_version()
     source_code_sha256 = source_code_version.removeprefix("source-sha256:")
@@ -1899,6 +2246,10 @@ def train_from_frame(
     short_regressor = _make_regressor(train["short_return_pct"])
     long_cost_regressor = _make_regressor(train["long_execution_cost_pct"])
     short_cost_regressor = _make_regressor(train["short_execution_cost_pct"])
+    long_mfe_regressor = _make_regressor(train["long_mfe_pct"])
+    long_mae_regressor = _make_regressor(train["long_mae_pct"])
+    short_mfe_regressor = _make_regressor(train["short_mfe_pct"])
+    short_mae_regressor = _make_regressor(train["short_mae_pct"])
 
     long_classifier.fit(x_train, train["long_win"], model__sample_weight=train_weights)
     short_classifier.fit(x_train, train["short_win"], model__sample_weight=train_weights)
@@ -1916,6 +2267,10 @@ def train_from_frame(
         train["short_execution_cost_pct"],
         model__sample_weight=train_weights,
     )
+    long_mfe_regressor.fit(x_train, train["long_mfe_pct"], model__sample_weight=train_weights)
+    long_mae_regressor.fit(x_train, train["long_mae_pct"], model__sample_weight=train_weights)
+    short_mfe_regressor.fit(x_train, train["short_mfe_pct"], model__sample_weight=train_weights)
+    short_mae_regressor.fit(x_train, train["short_mae_pct"], model__sample_weight=train_weights)
 
     long_scores = _positive_proba(long_classifier, x_test)
     short_scores = _positive_proba(short_classifier, x_test)
@@ -1996,6 +2351,59 @@ def train_from_frame(
         **supervision_report,
         "actual_trade_calibration_fingerprint": actual_trade_calibration.get("data_fingerprint"),
     }
+    trade_samples = trade_samples or []
+    execution_task_count = sum(
+        1
+        for sample in trade_samples
+        if _safe_dict(
+            _safe_dict(_safe_dict(sample.get("profit_supervision")).get("tasks")).get(
+                COUNTERFACTUAL_EXECUTION_COST_TASK
+            )
+        ).get("eligible")
+        is True
+    )
+    exit_task_count = sum(
+        1
+        for sample in trade_samples
+        if _safe_dict(
+            _safe_dict(_safe_dict(sample.get("profit_supervision")).get("tasks")).get(
+                AUTHORITATIVE_REALIZED_RETURN_TASK
+            )
+        ).get("eligible")
+        is True
+    )
+    task_manifest = {
+        "market_opportunity": {
+            "source": "mature_shadow_market_labels",
+            "sample_count": int(len(train)),
+            "decision_group_count": int(train["decision_group"].nunique()),
+            "targets": [
+                "gross_return_pct",
+                "mfe_pct",
+                "mae_pct",
+                "tail_loss",
+                "stop_loss_triggered",
+                "take_profit_triggered",
+                "first_touch",
+            ],
+        },
+        "entry_timing": {
+            "source": "mature_shadow_market_labels_with_counterfactual_cost",
+            "sample_count": int(len(train)),
+            "decision_group_count": int(train["decision_group"].nunique()),
+            "targets": ["fee_after_fixed_horizon_return_pct", "mfe_pct", "mae_pct"],
+        },
+        "exit": {
+            "source": "authoritative_okx_settled_positions",
+            "sample_count": exit_task_count,
+            "trained_in_shared_artifact": False,
+        },
+        "execution": {
+            "source": "authoritative_okx_order_and_settlement_facts",
+            "sample_count": execution_task_count,
+            "trained_in_shared_artifact": True,
+        },
+    }
     frame_quality_report = {
         **frame_quality_report,
         "profit_supervision": supervision_report,
@@ -2015,6 +2423,13 @@ def train_from_frame(
         "completed_trade_sample_count": len(trade_samples or []),
         "last_trained_completed_trade_sample_count": len(trade_samples or []),
         "training_window_composition": _training_window_composition(train),
+        "training_task_manifest": task_manifest,
+        "training_sample_sources": {
+            "shadow_market_label": int(len(frame)),
+            "authoritative_okx_trade": len(trade_samples),
+        },
+        "replay_weight_manifest": replay_weight_manifest,
+        "training_distribution_profile": _training_distribution_profile(frame),
         "quality_report": frame_quality_report,
         "market_fact_contract": _safe_dict(frame_quality_report.get("market_fact_contract")),
         "governance_report": artifact_bound_governance_report(
@@ -2025,6 +2440,12 @@ def train_from_frame(
         "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
         "test_count": int(len(test)),
         "feature_count": len(FEATURE_KEYS),
+        "feature_contract_version": FEATURE_CONTRACT_VERSION,
+        "label_contract_versions": sorted(
+            str(value)
+            for value in frame["label_contract_version"].dropna().unique().tolist()
+        ),
+        "multitask_prediction_contract_version": MULTITASK_PREDICTION_CONTRACT_VERSION,
         "horizons": sorted(int(v) for v in frame["horizon_minutes"].dropna().unique().tolist()),
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
@@ -2064,6 +2485,10 @@ def train_from_frame(
         },
         "train_decision_group_count": int(train["decision_group"].nunique()),
         "test_decision_group_count": int(test["decision_group"].nunique()),
+        "completed_shadow_decision_group_count": int(frame["decision_group"].nunique()),
+        "last_trained_completed_shadow_decision_group_count": int(
+            frame["decision_group"].nunique()
+        ),
         "prediction_distribution": {
             "lower_bound": "tree_prediction_lower_hinge",
             "uncertainty_source": "random_forest_tree_empirical_order_statistics",
@@ -2144,6 +2569,10 @@ def train_from_frame(
         "short_regressor": short_regressor,
         "long_cost_regressor": long_cost_regressor,
         "short_cost_regressor": short_cost_regressor,
+        "long_mfe_regressor": long_mfe_regressor,
+        "long_mae_regressor": long_mae_regressor,
+        "short_mfe_regressor": short_mfe_regressor,
+        "short_mae_regressor": short_mae_regressor,
         "metadata": metadata,
         "feature_keys": FEATURE_KEYS,
     }
@@ -2227,6 +2656,9 @@ class MLSignalService:
                 "readiness_state": readiness["state"],
                 "readiness": readiness,
                 "live_ml_ready": False,
+                "paper_analysis_permission": False,
+                "paper_trading_permission": False,
+                "live_trading_permission": False,
                 "model_path": str(self.model_path),
                 "artifact_registry": self._artifact_registry_status(),
                 "artifact_lifecycle": activation.get("activation_stage")
@@ -2290,26 +2722,21 @@ class MLSignalService:
             "mode": (
                 "entry_profit_filter"
                 if live_ml_ready
-                else (
-                    "advisory"
-                    if advisory_enabled
-                    else str(readiness.get("state") or "learning_only")
-                )
+                else "paper_model"
             ),
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
             "live_ml_ready": live_ml_ready,
+            "paper_analysis_permission": True,
+            "paper_trading_permission": True,
+            "live_trading_permission": live_ml_ready,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_note": model_note,
             "note": (
-                "ML 指标达标，当前允许参与开仓过滤、加分和机会排序。"
+                "模型已获得实盘候选资格；实盘订单仍需逐笔通过生产门禁。"
                 if live_ml_ready
-                else (
-                    "ML 硬指标有效但样本成熟度不足，当前按小权重提供收益解释，不做硬否决。"
-                    if influence.get("advisory_enabled")
-                    else "ML 指标未达标，当前只学习不介入；继续预测、影子复盘和自动训练，达标后自动恢复。"
-                )
+                else "模型可正常参与模拟盘分析和交易；晋升状态只阻断实盘权限。"
             ),
             **auto_status,
         }
@@ -2554,21 +2981,94 @@ class MLSignalService:
                     required_training_data_version
                     and training_data_version != required_training_data_version
                 )
+                training_data_contract_stale = bool(
+                    training_data_contract_stale
+                    or (
+                        metadata
+                        and metadata.get("feature_contract_version")
+                        != FEATURE_CONTRACT_VERSION
+                    )
+                    or (
+                        metadata
+                        and metadata.get("multitask_prediction_contract_version")
+                        != MULTITASK_PREDICTION_CONTRACT_VERSION
+                    )
+                )
                 learning_only = not bool(readiness.get("live_ml_ready"))
                 new_samples = max(completed_count - last_completed_count, 0)
                 new_trade_samples = max(
                     completed_trade_count - last_completed_trade_count,
                     0,
                 )
+                trigger_rows = await load_shadow_training_rows()
+                trigger_frame = build_training_frame(trigger_rows)
+                completed_decision_group_count = (
+                    int(trigger_frame["decision_group"].nunique())
+                    if not trigger_frame.empty
+                    else 0
+                )
+                previous_group_count = int(
+                    cursor_metadata.get(
+                        "last_trained_completed_shadow_decision_group_count"
+                    )
+                    or _safe_dict(
+                        cursor_metadata.get("decision_group_partition")
+                    ).get("decision_group_count")
+                    or 0
+                )
+                new_decision_group_count = max(
+                    completed_decision_group_count - previous_group_count,
+                    0,
+                )
+                current_distribution_profile = _training_distribution_profile(
+                    trigger_frame
+                )
+                distribution_drift = _training_distribution_drift(
+                    current_distribution_profile,
+                    _safe_dict(cursor_metadata.get("training_distribution_profile")),
+                )
+                last_trained_at = self._parse_datetime(cursor_metadata.get("trained_at"))
+                seconds_since_training = (
+                    max((now - last_trained_at).total_seconds(), 0.0)
+                    if last_trained_at is not None
+                    else None
+                )
+                batch_due = bool(
+                    new_decision_group_count
+                    >= _LOCAL_ML_PARAMS.batch_decision_group_threshold
+                )
+                interval_due = bool(
+                    new_decision_group_count
+                    >= _LOCAL_ML_PARAMS.minimum_decision_group_increment
+                    and seconds_since_training is not None
+                    and seconds_since_training
+                    >= _LOCAL_ML_PARAMS.maximum_training_interval_seconds
+                )
+                drift_due = bool(
+                    distribution_drift.get("detected") is True
+                    and new_decision_group_count
+                    >= _LOCAL_ML_PARAMS.drift_minimum_decision_group_increment
+                )
+                trigger_reason = (
+                    "forced"
+                    if force
+                    else "initial_artifact"
+                    if not metadata
+                    else "training_data_contract_changed"
+                    if training_data_contract_stale
+                    else "mature_decision_group_batch"
+                    if batch_due
+                    else "daily_minimum_increment"
+                    if interval_due
+                    else "distribution_drift_with_new_labels"
+                    if drift_due
+                    else "not_due"
+                )
                 training_policy = {
                     "learning_only": learning_only,
                     "readiness_state": readiness.get("state"),
                     "readiness_blocking_reasons": readiness.get("blocking_reasons") or [],
-                    "trigger": (
-                        "training_data_contract_changed"
-                        if training_data_contract_stale
-                        else "new_cost_complete_authoritative_sample_or_forced_rebuild"
-                    ),
+                    "trigger": trigger_reason,
                     "training_data_contract_stale": training_data_contract_stale,
                     "training_data_version": training_data_version or None,
                     "required_training_data_version": required_training_data_version or None,
@@ -2577,13 +3077,28 @@ class MLSignalService:
                     "candidate_artifact_persisted": False,
                     "persist_artifact_only_when_readiness_allows_live_influence": False,
                     "persist_latest_artifact_even_when_readiness_blocks_live_influence": True,
+                    "completed_mature_decision_group_count": completed_decision_group_count,
+                    "last_trained_mature_decision_group_count": previous_group_count,
+                    "new_mature_decision_group_count": new_decision_group_count,
+                    "batch_decision_group_threshold": (
+                        _LOCAL_ML_PARAMS.batch_decision_group_threshold
+                    ),
+                    "minimum_decision_group_increment": (
+                        _LOCAL_ML_PARAMS.minimum_decision_group_increment
+                    ),
+                    "maximum_training_interval_seconds": (
+                        _LOCAL_ML_PARAMS.maximum_training_interval_seconds
+                    ),
+                    "seconds_since_last_successful_training": seconds_since_training,
+                    "distribution_drift": distribution_drift,
                 }
                 should_train = (
                     force
                     or not metadata
                     or training_data_contract_stale
-                    or new_samples > 0
-                    or new_trade_samples > 0
+                    or batch_due
+                    or interval_due
+                    or drift_due
                 )
                 if not should_train:
                     result = {
@@ -2595,8 +3110,13 @@ class MLSignalService:
                         "new_sample_count": new_samples,
                         "completed_trade_sample_count": completed_trade_count,
                         "new_trade_sample_count": new_trade_samples,
+                        "completed_decision_group_count": completed_decision_group_count,
+                        "new_decision_group_count": new_decision_group_count,
                         "training_policy": training_policy,
-                        "message": "没有新增成本完整权威样本，当前 artifact 无需重复训练。",
+                        "message": (
+                            "尚未达到独立决策组批次、每日最小增量或漂移训练条件，"
+                            "继续使用当前 paper champion。"
+                        ),
                     }
                     self._last_train_result = result
                     return result
@@ -2608,15 +3128,7 @@ class MLSignalService:
                         scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
                         model_ids=LOCAL_ML_MODEL_IDS,
                         run_id=self._active_training_run_id,
-                        trigger_reason=(
-                            "forced"
-                            if force
-                            else (
-                                "training_data_contract_changed"
-                                if training_data_contract_stale
-                                else "training_due"
-                            )
-                        ),
+                        trigger_reason=trigger_reason,
                         sample_cursor={
                             "shadow": completed_count,
                             "trade": completed_trade_count,
@@ -2928,7 +3440,7 @@ class MLSignalService:
                             "trained_canary_activated"
                             if production_authorized
                             else (
-                                "trained_paper_bootstrap_canary_activated"
+                                "trained_paper_canary_activated"
                                 if paper_canary_authorized
                                 else "trained_shadow_activated"
                             )
@@ -2974,7 +3486,7 @@ class MLSignalService:
                             if production_authorized
                             else (
                                 "本地 ML 候选已通过数据治理与时间滚动完整性检查，原子激活为"
-                                "仅限模拟盘的 bootstrap canary；该阶段不拥有生产权限。"
+                                "模拟盘 Paper Canary；可参与正常模拟盘分析和交易，但不拥有实盘权限。"
                                 if paper_canary_authorized
                                 else "本地 ML 候选已完成完整性验证并原子激活为 shadow；"
                                 "生产影响保持关闭，等待收益证据达标。"
@@ -3161,7 +3673,12 @@ class MLSignalService:
             )
         return results
 
-    def predict(self, features: Any, *, horizons: tuple[int, ...] = (10, 30)) -> dict[str, Any]:
+    def predict(
+        self,
+        features: Any,
+        *,
+        horizons: tuple[int, ...] = (5, 15, 60, 240),
+    ) -> dict[str, Any]:
         self._ensure_loaded()
         if not self._bundle:
             diagnostic = self._model_unavailable_diagnostic()
@@ -3198,6 +3715,16 @@ class MLSignalService:
         tail_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
         long_tail_scale = max(_safe_float(tail_scales.get("long"), 0.0), 0.0)
         short_tail_scale = max(_safe_float(tail_scales.get("short"), 0.0), 0.0)
+        model_version = str(
+            self._artifact_version(metadata)
+            or metadata.get("artifact_version")
+            or metadata.get("version")
+            or ""
+        )
+        calibration_version = str(
+            _safe_dict(metadata.get("actual_trade_calibration")).get("data_fingerprint")
+            or "uncalibrated_time_series_v1"
+        )
         feature_symbol = (
             str(features.get("symbol") or "")
             if isinstance(features, dict)
@@ -3222,6 +3749,10 @@ class MLSignalService:
             short_cost_distribution = _regression_prediction_distribution(
                 self._bundle["short_cost_regressor"], x
             )
+            long_mfe = _optional_regression_value(self._bundle, "long_mfe_regressor", x)
+            long_mae = _optional_regression_value(self._bundle, "long_mae_regressor", x)
+            short_mfe = _optional_regression_value(self._bundle, "short_mfe_regressor", x)
+            short_mae = _optional_regression_value(self._bundle, "short_mae_regressor", x)
             raw_long_expected = float(long_distribution["expected"][0])
             raw_short_expected = float(short_distribution["expected"][0])
             long_lower_quantile = float(long_distribution["lower_quantile"][0])
@@ -3274,6 +3805,33 @@ class MLSignalService:
                 tail_loss_probability=short_tail_loss_probability,
                 tail_loss_scale_pct=short_tail_scale,
             )
+            multitask_prediction = {
+                "version": MULTITASK_PREDICTION_CONTRACT_VERSION,
+                "long": _multitask_side_prediction(
+                    side="long",
+                    horizon_minutes=int(horizon),
+                    model_version=model_version,
+                    calibration_version=calibration_version,
+                    return_contract=long_return_contract,
+                    cost_distribution=long_cost_distribution,
+                    win_probability=long_win_rate,
+                    tail_loss_probability=long_tail_loss_probability,
+                    expected_mfe_pct=long_mfe,
+                    expected_mae_pct=long_mae,
+                ),
+                "short": _multitask_side_prediction(
+                    side="short",
+                    horizon_minutes=int(horizon),
+                    model_version=model_version,
+                    calibration_version=calibration_version,
+                    return_contract=short_return_contract,
+                    cost_distribution=short_cost_distribution,
+                    win_probability=short_win_rate,
+                    tail_loss_probability=short_tail_loss_probability,
+                    expected_mfe_pct=short_mfe,
+                    expected_mae_pct=short_mae,
+                ),
+            }
             long_market_distribution_ready = bool(long_return_contract.get("production_eligible"))
             short_market_distribution_ready = bool(short_return_contract.get("production_eligible"))
             long_objective_expected = _safe_float(
@@ -3364,6 +3922,18 @@ class MLSignalService:
             risk_score = _clamp(
                 downside / max(return_scale, 1e-9) + float(best_tail_loss_probability or 0.0)
             )
+            paper_prediction_eligible = bool(
+                best_side in {"long", "short"}
+                and math.isfinite(best_raw_expected)
+                and math.isfinite(
+                    _safe_float(
+                        _safe_dict(multitask_prediction.get(best_side)).get(
+                            "expected_execution_cost_pct"
+                        ),
+                        float("nan"),
+                    )
+                )
+            )
             predictions.append(
                 {
                     "horizon_minutes": int(horizon),
@@ -3375,6 +3945,7 @@ class MLSignalService:
                         "long": long_return_contract,
                         "short": short_return_contract,
                     },
+                    "multitask_prediction": multitask_prediction,
                     "counterfactual_execution_cost_distribution": {
                         "long": {
                             "expected_pct": round(float(long_cost_distribution["expected"][0]), 4),
@@ -3414,6 +3985,7 @@ class MLSignalService:
                         and profit_edge > 0.0
                     ),
                     "risk_score": round(risk_score, 4),
+                    "paper_prediction_eligible": paper_prediction_eligible,
                     "ml_prediction_eligible": bool(
                         live_ml_ready
                         and side_influence.get("enabled")
@@ -3446,6 +4018,9 @@ class MLSignalService:
             and primary.get("actual_trade_calibration_ready") is True
         )
         live_prediction_influence = bool(live_ml_ready and current_prediction_ready)
+        paper_ml_ready = bool(
+            primary and primary.get("paper_prediction_eligible") is True
+        )
         activation = _safe_dict(
             self._resolved_artifact.activation_manifest
             if self._resolved_artifact is not None
@@ -3466,7 +4041,8 @@ class MLSignalService:
         )
         return {
             "available": True,
-            "route_mode": ("live" if live_prediction_influence else "shadow_observation"),
+            "route_mode": ("live" if live_prediction_influence else "paper_analysis"),
+            "paper_ml_ready": paper_ml_ready,
             "live_ml_ready": live_ml_ready,
             "objective_name": metadata.get("objective_name"),
             "objective_version": metadata.get("objective_version"),
@@ -3569,11 +4145,15 @@ class MLSignalService:
                     else None
                 )
                 if (
-                    self._bundle is not None
-                    and self._resolved_artifact is not None
+                    self._resolved_artifact is not None
                     and self._loaded_pointer_mtime_ns == pointer_mtime_ns
                     and self.model_path.exists()
                     and self._loaded_mtime == self.model_path.stat().st_mtime
+                    and (
+                        self._bundle is not None
+                        or _safe_dict(self._load_diagnostic).get("code")
+                        == "artifact_incompatible"
+                    )
                 ):
                     return
                 current = self.artifact_registry.resolve_current()
@@ -3608,7 +4188,10 @@ class MLSignalService:
                 }
                 return
             mtime = self.model_path.stat().st_mtime
-            if self._bundle is not None and self._loaded_mtime == mtime:
+            if self._loaded_mtime == mtime and (
+                self._bundle is not None
+                or _safe_dict(self._load_diagnostic).get("code") == "artifact_incompatible"
+            ):
                 return
             self._bundle = load_trusted_joblib(
                 self.model_path,
@@ -3623,7 +4206,7 @@ class MLSignalService:
             )
             if compatibility_errors:
                 self._bundle = None
-                self._loaded_mtime = None
+                self._loaded_mtime = mtime
                 self._load_diagnostic = {
                     "code": "artifact_incompatible",
                     "message": "当前已注册模型与运行时收益监督合同不兼容，已禁止加载。",
@@ -3685,7 +4268,9 @@ class MLSignalService:
         return {
             "auto_train_enabled": True,
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
-            "auto_train_trigger": "new_cost_complete_authoritative_sample_or_forced_rebuild",
+            "auto_train_trigger": (
+                "50_new_mature_decision_groups_or_10_after_24h_or_drift_with_10"
+            ),
             "auto_train_distribution_requirement": (
                 "chronological_purged_holdout_with_minimum_fit_distribution"
             ),
@@ -3747,7 +4332,17 @@ class MLSignalService:
         challenger_trade_cursor = int(
             challenger_metadata.get("last_trained_completed_trade_sample_count") or 0
         )
-        if (challenger_cursor, challenger_trade_cursor) > (
+        current_group_cursor = int(
+            selected.get("last_trained_completed_shadow_decision_group_count") or 0
+        )
+        challenger_group_cursor = int(
+            challenger_metadata.get(
+                "last_trained_completed_shadow_decision_group_count"
+            )
+            or 0
+        )
+        if (challenger_group_cursor, challenger_cursor, challenger_trade_cursor) > (
+            current_group_cursor,
             current_cursor,
             current_trade_cursor,
         ):

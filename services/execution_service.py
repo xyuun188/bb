@@ -22,19 +22,12 @@ from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.okx_error_classifier import is_okx_temporary_service_error
-from services.paper_bootstrap_canary import PaperBootstrapCanaryPolicy
-from services.paper_exploration import (
-    assess_paper_exploration_entry,
-    is_paper_exploration_decision,
-)
-from services.paper_training import (
-    assess_paper_training_entry,
-    attach_paper_training_order_identity,
-    is_paper_training_decision,
-)
 from services.production_trade_gate import validate_production_trade_gate
 from services.strategy_arbitration import arbitrate_decision
-from services.trade_execution_contract import build_live_rules_canary_entry_contract
+from services.trade_execution_contract import (
+    build_live_rules_canary_entry_contract,
+    validate_normal_paper_entry_contract,
+)
 from services.trade_recommendation_contract import attach_trade_execution_result
 from services.trading_policies import PolicyGateResult
 
@@ -78,64 +71,27 @@ def _return_entry_contract_result(
     if not decision.is_entry:
         return PolicyGateResult.allow({"return_execution_contract": "not_entry"})
 
-    if PaperBootstrapCanaryPolicy.is_claimed(decision):
-        assessment = PaperBootstrapCanaryPolicy.assess(decision, model_mode)
-        if assessment.eligible:
-            return PolicyGateResult.allow(
-                {
-                    "return_execution_contract": "paper_bootstrap_canary",
-                    "production_permission": False,
-                    "paper_bootstrap_canary": assessment.details,
-                }
-            )
-        return PolicyGateResult.block(
-            "paper_bootstrap_canary_contract_incomplete",
-            assessment.reason,
-            {
-                "stage_status": "blocked",
-                "paper_bootstrap_canary": assessment.details,
-            },
-        )
-
-    if is_paper_exploration_decision(decision):
-        assessment = assess_paper_exploration_entry(decision, model_mode)
-        if assessment.eligible:
-            return PolicyGateResult.allow(
-                {
-                    "return_execution_contract": "paper_exploration",
-                    "production_permission": False,
-                    "paper_exploration": assessment.to_dict(),
-                }
-            )
-        return PolicyGateResult.block(
-            "paper_exploration_contract_incomplete",
-            assessment.reason,
-            {
-                "stage_status": "blocked",
-                "paper_exploration": assessment.to_dict(),
-            },
-        )
-
-    if is_paper_training_decision(decision):
-        assessment = assess_paper_training_entry(decision, model_mode)
-        if assessment.eligible:
-            return PolicyGateResult.allow(
-                {
-                    "return_execution_contract": "paper_training",
-                    "production_permission": False,
-                    "paper_training": assessment.to_dict(),
-                }
-            )
-        return PolicyGateResult.block(
-            "paper_training_contract_incomplete",
-            assessment.reason,
-            {
-                "stage_status": "blocked",
-                "paper_training": assessment.to_dict(),
-            },
-        )
-
     raw = _safe_dict(decision.raw_response)
+    if str(model_mode or "").lower() == "paper":
+        contract, reasons = validate_normal_paper_entry_contract(raw)
+        if not reasons:
+            return PolicyGateResult.allow(
+                {
+                    "return_execution_contract": "normal_paper_trade",
+                    "production_permission": False,
+                    "normal_paper_trade": contract,
+                }
+            )
+        return PolicyGateResult.block(
+            "normal_paper_trade_contract_incomplete",
+            ",".join(reasons),
+            {
+                "stage_status": "blocked",
+                "block_reasons": reasons,
+                "normal_paper_trade": contract,
+            },
+        )
+
     production_gate: dict[str, Any] | None = None
     if str(model_mode or "").lower() != "paper":
         gate_validation = validate_production_trade_gate(
@@ -1171,13 +1127,6 @@ class ExecutionService:
             arbitration.data,
         )
         if decision.is_entry or decision.is_exit:
-            paper_training_order_identity = attach_paper_training_order_identity(
-                decision,
-                decision_db_id,
-                model_mode,
-            )
-            if paper_training_order_identity and decision_db_id is not None:
-                await mark_decision_raw_response(decision_db_id, decision.raw_response)
             await mark_stage(
                 DecisionStage.RISK_CHECK,
                 DecisionStageStatus.PENDING,

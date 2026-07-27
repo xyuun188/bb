@@ -17,7 +17,10 @@ if str(ROOT) not in sys.path:
 
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db  # noqa: E402
-from services.ml_signal_service import MLSignalService  # noqa: E402
+from services.ml_signal_service import (  # noqa: E402
+    LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
+    MLSignalService,
+)
 
 
 async def run_once(
@@ -48,7 +51,10 @@ async def _main() -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     result = await run_once(force=bool(args.force))
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    print(
+        LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX
+        + json.dumps(result, ensure_ascii=False, sort_keys=True)
+    )
     return 0
 
 

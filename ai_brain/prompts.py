@@ -7,9 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.entry_direction_support import (
-    summarize_unpromoted_quantitative_evidence,
-)
+from services.entry_direction_support import summarize_paper_quantitative_evidence
 
 _SENSITIVE_KEY_PARTS = ("api", "key", "secret", "token", "password", "authorization")
 
@@ -622,7 +620,7 @@ def build_batch_experts_user_prompt(
                 else {}
             )
             unpromoted_quantitative_summary[side] = (
-                summarize_unpromoted_quantitative_evidence(
+                summarize_paper_quantitative_evidence(
                     context.get("direction_competition"),
                     side,
                     execution_cost_pct=execution_cost.get("total_pct"),

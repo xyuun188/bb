@@ -228,7 +228,7 @@ def test_no_positive_production_lcb_returns_neutral() -> None:
     assert evidence["short"]["production_eligible"] is False
 
 
-def test_positive_mean_near_threshold_candidate_is_exposed_for_bounded_paper_exploration() -> None:
+def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
     def near_threshold_score(decision: DecisionOutput, _strategy: dict | None) -> float:
         expected_net = 0.30 if decision.action == Action.LONG else -0.10
         raw = dict(decision.raw_response)
@@ -258,12 +258,13 @@ def test_positive_mean_near_threshold_candidate_is_exposed_for_bounded_paper_exp
     evidence = _policy(near_threshold_score).build(_Feature(), {}, {}, {}, {}, {})
 
     assert evidence["preferred_side_by_evidence"] == "neutral"
-    assert evidence["preferred_exploration_side"] == "long"
-    assert evidence["paper_exploration"]["selected"]["eligible"] is True
+    assert "preferred_exploration_side" not in evidence
+    assert "paper_exploration" not in evidence
+    assert evidence["long"]["expected_net_return_pct"] == 0.3
     assert evidence["long"]["return_distribution_ready"] is True
 
 
-def test_blocked_strategy_evidence_only_reduces_exploration_risk() -> None:
+def test_legacy_exploration_maturity_is_not_exposed_to_new_entry_context() -> None:
     strategy = {
         "continuous_strategy_routing": {
             "exploration_maturity_by_symbol_side": {
@@ -283,11 +284,7 @@ def test_blocked_strategy_evidence_only_reduces_exploration_risk() -> None:
 
     evidence = _policy().build(_Feature(), strategy, {}, {}, {}, {})
 
-    maturity = evidence["long"]["exploration_maturity_evidence"]
-    assert maturity["available"] is True
-    assert maturity["evidence_count"] == 400
-    assert maturity["can_authorize_entry"] is False
-    assert maturity["can_change_size_or_leverage"] is False
+    assert "exploration_maturity_evidence" not in evidence["long"]
     assert evidence["long"]["scheduled_return_prior"]["available"] is False
 
 

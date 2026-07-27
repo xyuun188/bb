@@ -9,6 +9,13 @@ from math import isclose, isfinite
 from types import SimpleNamespace
 from typing import Any
 
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_LEVERAGE_CAP,
+    NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
+    NORMAL_PAPER_TRADE_SIZING_VERSION,
+    normal_paper_trade_contract_reasons,
+)
 from services.okx_native_facts import (
     OKX_PROTECTION_EXECUTION_VERSION,
     okx_minimum_order_notional_usdt,
@@ -425,16 +432,15 @@ def _okx_execution_confirmation_source(fact: dict[str, Any]) -> str | None:
 def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     """Classify an entry contract before validating lifecycle-specific invariants."""
 
+    normal_paper = _safe_dict(raw.get("normal_paper_trade"))
     exploration = _safe_dict(raw.get("paper_exploration"))
     training = _safe_dict(raw.get("paper_training"))
     canary = _safe_dict(raw.get("paper_bootstrap_canary"))
-    rules_gate_validation = validate_production_trade_gate(
-        raw.get("production_trade_gate"),
-        required_mode="live_rules_canary",
-    )
     rules_canary_contract = _safe_dict(raw.get("live_rules_canary_contract"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
+    if normal_paper or sizing.get("contract_lifecycle") == "normal_paper_trade":
+        return "normal_paper_trade"
     if (
         training
         or sizing.get("contract_lifecycle") == "paper_training"
@@ -460,7 +466,10 @@ def entry_contract_lifecycle(raw: dict[str, Any]) -> str:
     ):
         return "paper_bootstrap_canary"
     if (
-        rules_gate_validation.valid
+        validate_production_trade_gate(
+            raw.get("production_trade_gate"),
+            required_mode="live_rules_canary",
+        ).valid
         or rules_canary_contract.get("execution_scope") == "live_rules_canary"
         or sizing.get("execution_scope") == "live_rules_canary"
     ):
@@ -484,6 +493,12 @@ def entry_opportunity_evidence_score(raw: dict[str, Any]) -> float | None:
         return _finite_value(
             _safe_dict(raw.get("paper_exploration")).get("information_value_score")
         )
+    if entry_contract_lifecycle(raw) == "normal_paper_trade":
+        return _finite_value(
+            _safe_dict(raw.get("normal_paper_trade")).get(
+                "expected_net_return_pct"
+            )
+        )
     return _finite_value(_safe_dict(raw.get("opportunity_score")).get("score"))
 
 
@@ -498,6 +513,13 @@ def validate_entry_execution_contract(
     """Validate the persisted contract for its declared execution lifecycle."""
 
     lifecycle = entry_contract_lifecycle(raw)
+    if lifecycle == "normal_paper_trade":
+        return validate_normal_paper_entry_contract(
+            raw,
+            filled_notional_usdt=filled_notional_usdt,
+            executed=executed,
+            filled_order_present=filled_order_present,
+        )
     if lifecycle == "paper_bootstrap_canary":
         return validate_paper_canary_entry_contract(
             raw,
@@ -875,6 +897,160 @@ def _bounded_confirmed_fill_drift(
             else "legacy_cost_bound_and_okx_reconciliations"
         ),
     }
+
+
+def validate_normal_paper_entry_contract(
+    raw: dict[str, Any],
+    *,
+    filled_notional_usdt: float = 0.0,
+    executed: bool = False,
+    filled_order_present: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate a normal paper trade without production-performance gates."""
+
+    normal_trade = _safe_dict(raw.get("normal_paper_trade"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    execution_cost = _safe_dict(opportunity.get("execution_cost"))
+    pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
+    sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
+    reasons = normal_paper_trade_contract_reasons(normal_trade)
+
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
+    portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"), 0.0)
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
+    stress = _safe_float(sizing.get("stressed_loss_fraction"), 0.0)
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    target_notional = _safe_float(sizing.get("target_notional_usdt"), 0.0)
+    fill_ceiling = _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0)
+    minimum_notional = _safe_float(sizing.get("minimum_order_notional_usdt"), 0.0)
+    equity = _safe_float(sizing.get("account_equity_usdt"), 0.0)
+    leverage = _safe_float(sizing.get("final_leverage"), 0.0)
+    single_cap = _safe_float(
+        normal_trade.get("single_trade_risk_fraction_cap"), 0.0
+    )
+    portfolio_cap = _safe_float(
+        normal_trade.get("portfolio_risk_fraction_cap"), 0.0
+    )
+    filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
+
+    bounded_fill_drift = _bounded_confirmed_fill_drift(
+        observation={
+            "current_execution_cost_pct": execution_cost.get("total_pct"),
+        },
+        opportunity=opportunity,
+        sizing=sizing,
+        minimum_reserve_fraction=(
+            NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION
+        ),
+    )
+    bounded_fill_drift_accepted = bool(
+        executed and bounded_fill_drift.get("accepted") is True
+    )
+
+    if sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION:
+        reasons.append("normal_paper_sizing_version_invalid")
+    if sizing.get("contract_lifecycle") != "normal_paper_trade":
+        reasons.append("normal_paper_sizing_lifecycle_invalid")
+    if sizing.get("execution_scope") != "paper_only":
+        reasons.append("normal_paper_sizing_scope_invalid")
+    if sizing.get("production_permission") is not False:
+        reasons.append("normal_paper_sizing_production_permission_invalid")
+    if sizing.get("production_eligible") is not True:
+        reasons.append("normal_paper_sizing_ineligible")
+    if not _provenance_complete(sizing.get("policy_provenance")):
+        reasons.append("normal_paper_sizing_provenance_incomplete")
+    if not str(
+        _safe_dict(sizing.get("policy_provenance")).get("contract_fingerprint")
+        or ""
+    ):
+        reasons.append("normal_paper_sizing_fingerprint_missing")
+    if equity <= 0.0 or risk_budget <= 0.0 or portfolio_budget <= 0.0:
+        reasons.append("normal_paper_account_risk_budget_incomplete")
+    if planned_loss <= 0.0 or planned_loss > risk_budget + 1e-8:
+        reasons.append("normal_paper_planned_loss_invalid")
+    if single_cap <= 0.0 or risk_budget > equity * single_cap + 1e-8:
+        reasons.append("normal_paper_single_trade_risk_cap_exceeded")
+    if (
+        portfolio_cap <= 0.0
+        or portfolio_cap > NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION
+        or portfolio_budget > equity * portfolio_cap + 1e-8
+    ):
+        reasons.append("normal_paper_portfolio_risk_cap_exceeded")
+    if stress <= 0.0 or not isclose(
+        planned_loss,
+        final_notional * stress,
+        rel_tol=1e-9,
+        abs_tol=1e-8,
+    ):
+        reasons.append("normal_paper_stressed_loss_algebra_mismatch")
+    if (
+        final_notional <= 0.0
+        or target_notional <= 0.0
+        or (
+            final_notional > target_notional + 1e-8
+            and not bounded_fill_drift_accepted
+        )
+    ):
+        reasons.append("normal_paper_notional_invalid")
+    if fill_ceiling <= 0.0 or final_notional > fill_ceiling + 1e-8:
+        reasons.append("normal_paper_fill_ceiling_invalid")
+    if minimum_notional <= 0.0 or final_notional + 1e-8 < minimum_notional:
+        reasons.append("normal_paper_minimum_order_invalid")
+    if not isclose(leverage, NORMAL_PAPER_TRADE_LEVERAGE_CAP, abs_tol=1e-8):
+        reasons.append("normal_paper_leverage_invalid")
+    if execution_cost.get("production_eligible") is not True or (
+        _safe_float(execution_cost.get("total_pct"), 0.0) <= 0.0
+    ):
+        reasons.append("normal_paper_execution_cost_incomplete")
+    if execution_cost.get("order_size_complete") is not True:
+        reasons.append("normal_paper_order_size_cost_incomplete")
+    if (
+        _safe_float(execution_cost.get("order_notional_usdt"), 0.0) + 1e-8
+        < final_notional
+        and not bounded_fill_drift_accepted
+    ):
+        reasons.append("normal_paper_execution_cost_notional_too_small")
+    if pre_order.get("production_eligible") is not True or not str(
+        pre_order.get("input_fingerprint") or ""
+    ).strip():
+        reasons.append("normal_paper_pre_order_facts_incomplete")
+    if sizing_pass.get("order_size_complete") is not True:
+        reasons.append("normal_paper_size_aware_cost_incomplete")
+    if (
+        executed
+        and filled_notional > fill_ceiling + 1e-8
+        and not bounded_fill_drift_accepted
+    ):
+        reasons.append("normal_paper_filled_notional_exceeds_risk_budget")
+    if executed and filled_order_present is False:
+        reasons.append("executed_entry_without_filled_order")
+
+    reasons = list(dict.fromkeys(reasons))
+    return (
+        {
+            "contract_lifecycle": "normal_paper_trade",
+            "contract_complete": not reasons,
+            "execution_scope": normal_trade.get("execution_scope"),
+            "production_permission": normal_trade.get("production_permission"),
+            "entry_type": normal_trade.get("entry_type"),
+            "selection_reason": normal_trade.get("selection_reason"),
+            "decision_authority": normal_trade.get("decision_authority"),
+            "expected_net_return_pct": _finite_value(
+                normal_trade.get("expected_net_return_pct")
+            ),
+            "objective_net_return_pct": _finite_value(
+                normal_trade.get("objective_net_return_pct")
+            ),
+            "planned_stressed_loss_usdt": planned_loss,
+            "final_notional_usdt": final_notional,
+            "minimum_order_notional_usdt": minimum_notional,
+            "filled_notional_usdt": filled_notional,
+            "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
+            "fill_drift_evidence": bounded_fill_drift,
+        },
+        reasons,
+    )
 
 
 def validate_paper_training_entry_contract(

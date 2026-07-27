@@ -28,8 +28,8 @@
     learning_only: '仅学习观察，不影响生产交易',
     ready: '收益证据已达到生产就绪标准',
     shadow_ready: '影子观察就绪',
-    paper_canary_ready: '模拟盘小仓观察就绪',
-    artifact_activation_not_production_authorized: '当前 Artifact 仅获模拟盘观察授权，尚未获得生产影响权限',
+    paper_canary_ready: '模型处于 Paper Canary 生命周期；模拟盘正常交易，实盘仍未授权',
+    artifact_activation_not_production_authorized: '当前 Artifact 可参与模拟盘，尚未获得实盘权限',
     average_net_return_after_all_cost_not_positive: '平均费后收益不为正',
     average_fee_after_return_not_positive: '平均费后收益不为正',
     empirical_return_lower_hinge_not_positive: '费后收益经验下界不为正',
@@ -52,7 +52,7 @@
     unavailable: '当前不可用',
   });
   const lifecycleText = Object.freeze({
-    active: '已激活', live: '已介入生产', canary: '模拟盘小仓验证', trained: '已训练',
+    active: '已激活', live: '已介入生产', canary: 'Paper Canary', trained: '已训练',
     training: '训练中', promotion_blocked: '晋升阻断', shadow_evaluating: '影子评估',
     inference_only: '仅推理', not_trained: '未训练', not_evaluated: '未评估',
     service_unavailable: '服务不可用', unavailable: '不可用', running: '运行中',
@@ -156,7 +156,8 @@
     const code = diagnostic.code || ml.status || 'unavailable';
     if (ml.available !== true) return localizedReason(code);
     if (ml.live_ml_ready === true) return '已生产就绪';
-    if (code === 'degraded' || ml.readiness_state === 'degraded') return '可用，证据未达标';
+    if (ml.paper_trading_permission === true) return '模拟盘可用，实盘未晋升';
+    if (code === 'degraded' || ml.readiness_state === 'degraded') return '模型可用，实盘证据未达标';
     return localizedReason(code);
   }
 
@@ -185,8 +186,8 @@
     setText('[data-metric="pending-samples"]', fmt(pending));
     setText('[data-detail="pending-samples"]', pending === null ? '接口未提供新增样本游标' : '相对最近已训练游标');
     setText('[data-metric="quarantined-samples"]', fmt(quarantined));
-    setText('[data-metric="model-influence"]', ml.live_ml_ready === true ? '允许' : '禁止');
-    setText('[data-detail="model-influence"]', ml.live_ml_ready === true ? '收益证据已达到生产标准' : '继续模拟盘学习，不参与生产放大');
+    setText('[data-metric="model-influence"]', ml.paper_trading_permission === true ? '模拟盘允许' : '模拟盘不可用');
+    setText('[data-detail="model-influence"]', ml.live_ml_ready === true ? '实盘候选已就绪，逐笔生产门禁仍生效' : '实盘未授权；不阻断模拟盘分析和正常交易');
     setText('[data-metric="last-training"]', time(ml.trained_at));
     setText('[data-detail="last-training"]', ml.artifact_version ? `Artifact ${ml.artifact_version}` : 'Artifact 版本未提供');
   }
@@ -199,6 +200,9 @@
     const shadow = quality.by_kind?.shadow || {};
     const trade = quality.by_kind?.trade || {};
     const supervision = ml.profit_supervision_report || quality.profit_supervision || {};
+    const tasks = ml.training_task_manifest || {};
+    const replay = ml.replay_weight_manifest || {};
+    const policy = ml.auto_train_last_result?.training_policy || {};
     const values = [
       ['治理状态', governance.status === 'ok' ? '治理快照正常' : localizedReason(governance.status || 'unavailable')],
       ['数据质量版本', quality.data_quality_version || '未提供'],
@@ -208,6 +212,12 @@
       ['市场机会 / 反事实成本 / 权威收益', `${fmt(supervision.shadow_market_sample_count)} / ${fmt(supervision.shadow_counterfactual_cost_sample_count)} / ${fmt(supervision.actual_realized_return_sample_count)}`],
       ['隔离原因类型', fmt(Array.isArray(quality.top_reasons) ? quality.top_reasons.length : null)],
       ['训练策略', governance.training_policy || localTools.training_policy || '未提供'],
+      ['机会 / 入场任务样本', `${fmt(tasks.market_opportunity?.sample_count)} / ${fmt(tasks.entry_timing?.sample_count)}`],
+      ['退出 / 执行任务样本', `${fmt(tasks.exit?.sample_count)} / ${fmt(tasks.execution?.sample_count)}`],
+      ['成熟独立决策组', fmt(ml.completed_shadow_decision_group_count ?? policy.completed_mature_decision_group_count)],
+      ['新增独立决策组', fmt(policy.new_mature_decision_group_count)],
+      ['重放池有效样本量', fmt(replay.effective_sample_size, 2)],
+      ['标签合同', Array.isArray(ml.label_contract_versions) ? ml.label_contract_versions.join('，') : '未提供'],
     ];
     const container = $('#data-quality');
     container.classList.remove('empty');
@@ -260,6 +270,8 @@
       <div class="evidence-grid">
         ${evidenceItem('Artifact 版本', ml.artifact_version || '未提供')}
         ${evidenceItem('激活阶段', lifecycleText[activation.activation_stage] || activation.activation_stage || ml.artifact_lifecycle || '未提供')}
+        ${evidenceItem('模拟盘交易权限', ml.paper_trading_permission === true ? '允许' : '不可用', ml.paper_trading_permission === true ? 'good' : 'warn')}
+        ${evidenceItem('实盘候选权限', ml.live_trading_permission === true ? '允许逐笔检查' : '未晋升', ml.live_trading_permission === true ? 'good' : 'warn')}
         ${evidenceItem('训练 / 留出决策组', `${fmt(ml.train_decision_group_count)} / ${fmt(ml.test_decision_group_count)}`)}
         ${evidenceItem('Walk-forward', `${walkForward.status === 'complete' ? '已完成' : walkForward.status || '未提供'} · ${fmt(walkForward.fold_count ?? walkForward.folds?.length)} 折`)}
         ${evidenceItem('做多逐币移除稳定', present(symbol.long?.stable) ? (symbol.long.stable ? '通过' : '未通过') : '未提供', symbol.long?.stable === false ? 'warn' : '')}
@@ -317,7 +329,9 @@
     }
     table.innerHTML = models.map((model) => {
       const blockers = Array.isArray(model.blocking_reasons) ? model.blocking_reasons : [];
-      const influence = model.live_ml_ready ? '影响生产交易' : model.trainable ? '不影响生产' : '仅推理或评估';
+      const influence = model.live_ml_ready
+        ? '模拟盘正常参与；实盘逐笔门禁'
+        : model.trainable ? '模拟盘正常参与；实盘未授权' : '仅推理或评估';
       const localizedModel = modelText[model.model_id] || [];
       return `<tr>
         <td><span class="model-name">${esc(localizedModel[0] || model.display_name || model.model_id || '未命名模型')}</span><span class="model-role">${esc(localizedModel[1] || '模型类型未登记')}</span></td>

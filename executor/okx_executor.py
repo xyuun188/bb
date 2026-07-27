@@ -39,11 +39,6 @@ from services.entry_profit_risk_sizing import (
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
-from services.paper_training import (
-    PAPER_TRAINING_ORDER_IDENTITY_VERSION,
-    is_paper_training_decision,
-    paper_training_client_order_id,
-)
 
 logger = structlog.get_logger(__name__)
 
@@ -586,7 +581,6 @@ class OKXExecutor(AbstractExecutor):
         okx_order_rules: dict[str, Any] = {}
         params: dict[str, Any] = {}
         leverage_check: dict[str, Any] | None = None
-        paper_training_margin_reserve: dict[str, Any] = {}
         protection_submit_requested_at: datetime | None = None
         protection_submission: dict[str, Any] = {}
 
@@ -621,21 +615,6 @@ class OKXExecutor(AbstractExecutor):
                 position_value = max(
                     self._safe_float(sizing.get("final_notional_usdt"), 0.0),
                     0.0,
-                )
-                paper_training_margin_reserve = (
-                    self._paper_training_margin_execution_reserve(
-                        decision,
-                        available_balance_usdt=balance,
-                        leverage=decision.suggested_leverage,
-                        planned_notional_usdt=position_value,
-                    )
-                )
-                position_value = self._safe_float(
-                    paper_training_margin_reserve.get(
-                        "executable_notional_usdt",
-                        position_value,
-                    ),
-                    position_value,
                 )
 
             exit_position_snapshot: list[dict[str, Any]] | None = None
@@ -725,10 +704,6 @@ class OKXExecutor(AbstractExecutor):
                     planned_notional_usdt=position_value,
                     final_contracts=order_quantity,
                 )
-                if paper_training_margin_reserve:
-                    okx_order_rules["paper_training_margin_execution_reserve"] = dict(
-                        paper_training_margin_reserve
-                    )
             else:
                 okx_order_rules = {}
 
@@ -1112,21 +1087,6 @@ class OKXExecutor(AbstractExecutor):
                         self._safe_float(sizing.get("final_notional_usdt"), 0.0),
                         0.0,
                     )
-                    paper_training_margin_reserve = (
-                        self._paper_training_margin_execution_reserve(
-                            decision,
-                            available_balance_usdt=balance,
-                            leverage=decision.suggested_leverage,
-                            planned_notional_usdt=position_value,
-                        )
-                    )
-                    position_value = self._safe_float(
-                        paper_training_margin_reserve.get(
-                            "executable_notional_usdt",
-                            position_value,
-                        ),
-                        position_value,
-                    )
                     order_quantity, base_quantity = self._entry_order_amount(
                         ccxt,
                         market,
@@ -1143,10 +1103,6 @@ class OKXExecutor(AbstractExecutor):
                         planned_notional_usdt=position_value,
                         final_contracts=order_quantity,
                     )
-                    if paper_training_margin_reserve:
-                        okx_order_rules[
-                            "paper_training_margin_execution_reserve"
-                        ] = dict(paper_training_margin_reserve)
                     if order_quantity <= 0:
                         return ExecutionResult(
                             order_id="rejected",
@@ -1224,10 +1180,6 @@ class OKXExecutor(AbstractExecutor):
                     planned_notional_usdt=position_value,
                     final_contracts=order_quantity,
                 )
-                if paper_training_margin_reserve:
-                    okx_order_rules["paper_training_margin_execution_reserve"] = dict(
-                        paper_training_margin_reserve
-                    )
                 okx_order_rules["pre_submit_price_refresh"] = {
                     "source": "okx_native_ticker_immediately_before_submit",
                     "previous_price": round(previous_price, 12),
@@ -1357,34 +1309,6 @@ class OKXExecutor(AbstractExecutor):
                         price=price,
                         status=OrderStatus.REJECTED,
                         raw_response=protection,
-                    )
-                paper_training_identity = (
-                    decision.raw_response.get("paper_training_order_identity")
-                    if isinstance(decision.raw_response, dict)
-                    else {}
-                )
-                paper_training_identity = (
-                    paper_training_identity
-                    if isinstance(paper_training_identity, dict)
-                    else {}
-                )
-                paper_training_decision_id = paper_training_identity.get("decision_id")
-                client_order_id = str(
-                    paper_training_identity.get("client_order_id") or ""
-                ).strip()
-                if (
-                    self.executor_mode == "paper"
-                    and is_paper_training_decision(decision)
-                    and paper_training_identity.get("version")
-                    == PAPER_TRAINING_ORDER_IDENTITY_VERSION
-                    and paper_training_identity.get("execution_scope") == "paper_only"
-                    and paper_training_identity.get("production_permission") is False
-                    and client_order_id
-                    == paper_training_client_order_id(paper_training_decision_id)
-                ):
-                    params["clOrdId"] = client_order_id
-                    okx_order_rules["client_order_identity"] = dict(
-                        paper_training_identity
                     )
                 params["attachAlgoOrds"] = [
                     {
@@ -3434,61 +3358,6 @@ class OKXExecutor(AbstractExecutor):
         contracts = self._normalize_order_contracts(ccxt, market, contracts, min_contracts)
 
         return contracts, contracts * contract_size
-
-    def _paper_training_margin_execution_reserve(
-        self,
-        decision: DecisionOutput,
-        *,
-        available_balance_usdt: float,
-        leverage: float,
-        planned_notional_usdt: float,
-    ) -> dict[str, Any]:
-        """Reserve current modeled execution costs without imposing a training risk cap."""
-
-        if self.executor_mode != "paper" or not is_paper_training_decision(decision):
-            return {}
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        opportunity = raw.get("opportunity_score")
-        opportunity = opportunity if isinstance(opportunity, dict) else {}
-        sizing = raw.get("profit_risk_sizing")
-        sizing = sizing if isinstance(sizing, dict) else {}
-        execution_cost = opportunity.get("execution_cost")
-        if not isinstance(execution_cost, dict) or not execution_cost:
-            execution_cost = sizing.get("execution_cost")
-        execution_cost = execution_cost if isinstance(execution_cost, dict) else {}
-        fee_pct = max(self._safe_float(execution_cost.get("fee_pct"), 0.0), 0.0)
-        slippage_pct = max(
-            self._safe_float(execution_cost.get("slippage_pct"), 0.0),
-            0.0,
-        )
-        total_pct = max(
-            self._safe_float(execution_cost.get("total_pct"), 0.0),
-            fee_pct + slippage_pct,
-            0.0,
-        )
-        reserve_fraction = total_pct / 100.0
-        balance = max(self._safe_float(available_balance_usdt, 0.0), 0.0)
-        effective_leverage = max(self._safe_float(leverage, 1.0), 1.0)
-        planned = max(self._safe_float(planned_notional_usdt, 0.0), 0.0)
-        denominator = (1.0 / effective_leverage) + reserve_fraction
-        margin_feasible = balance / denominator if denominator > 0 else 0.0
-        executable = min(planned, margin_feasible)
-        return {
-            "version": "2026-07-22.paper-training-margin-reserve.v1",
-            "execution_scope": "paper_only",
-            "production_permission": False,
-            "risk_cap_applied": False,
-            "reserve_source": "current_size_aware_execution_cost",
-            "available_balance_usdt": round(balance, 8),
-            "leverage": round(effective_leverage, 8),
-            "planned_notional_usdt": round(planned, 8),
-            "execution_cost_pct": round(total_pct, 8),
-            "execution_cost_reserve_fraction": round(reserve_fraction, 10),
-            "margin_feasible_notional_usdt": round(margin_feasible, 8),
-            "executable_notional_usdt": round(executable, 8),
-            "reserve_usdt": round(max(planned - executable, 0.0), 8),
-            "applied": executable + 1e-8 < planned,
-        }
 
     def _entry_order_rule_snapshot(
         self,

@@ -39,6 +39,15 @@ def test_profit_training_contract_accepts_closed_loss_as_training_label() -> Non
 
     assert contract.eligible is True
     assert contract.outcome == "loss"
+
+
+def test_profit_training_contract_accepts_ensemble_authority() -> None:
+    contract = validate_profit_training_sample(
+        _closed_trade_sample(decision_authority="ensemble")
+    )
+
+    assert contract.eligible is True
+    assert contract.decision_authority == "ensemble"
     assert contract.target == "net_return_after_all_cost_pct"
     assert contract.target_value == -1.2
     assert contract.model_shadow_alignment == "avoided_losing_side"

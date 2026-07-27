@@ -25,7 +25,7 @@ from config.settings import (
 from services.dynamic_exit_policy import assess_dynamic_exit
 from services.entry_direction_support import (
     assess_directional_entry_support,
-    assess_unpromoted_model_intervention_support,
+    assess_paper_model_trade_support,
 )
 from services.entry_signal_extraction import (
     enrich_signal_payload,
@@ -36,9 +36,9 @@ from services.entry_signal_extraction import (
 from services.entry_signal_extraction import (
     payload_side as signal_payload_side,
 )
-from services.paper_exploration import (
-    build_paper_exploration_contract,
-    select_unpromoted_model_intervention,
+from services.normal_paper_trade import (
+    build_normal_paper_trade_contract,
+    select_normal_paper_trade_side,
 )
 
 if TYPE_CHECKING:
@@ -863,7 +863,145 @@ class EnsembleCoordinator:
             return self._hold(features, reason, hold_raw)
 
         candidate_evidence = self._safe_dict(context.get("entry_candidate_evidence"))
-        preferred_side = str(candidate_evidence.get("preferred_side_by_evidence") or "").lower()
+        direction_competition = self._safe_dict(context.get("direction_competition"))
+        execution_mode = str(context.get("execution_mode") or "").lower()
+
+        if execution_mode == "paper":
+            support_by_side: dict[str, dict[str, Any]] = {}
+            for side in ("long", "short"):
+                cost = self._safe_dict(
+                    self._safe_dict(candidate_evidence.get(side)).get("execution_cost")
+                )
+                support_by_side[side] = assess_paper_model_trade_support(
+                    direction_competition,
+                    raw_opinions,
+                    side,
+                    execution_cost_pct=self._finite_or_none(cost.get("total_pct")),
+                )
+            paper_selection = select_normal_paper_trade_side(support_by_side)
+            selected_side = str(paper_selection.get("selected_side") or "neutral")
+            selected_support = self._safe_dict(
+                paper_selection.get("selected_support")
+            )
+            normal_contract = (
+                build_normal_paper_trade_contract(
+                    symbol=features.symbol,
+                    side=selected_side,
+                    selection_reason=str(
+                        paper_selection.get("selection_reason") or ""
+                    ),
+                    direction_support=selected_support,
+                    decision_authority="ensemble",
+                )
+                if paper_selection.get("selected") is True
+                else {}
+            )
+            if normal_contract:
+                action = Action.LONG if selected_side == "long" else Action.SHORT
+                loss_probability = self._finite_or_none(
+                    selected_support.get("loss_probability")
+                )
+                confidence = min(
+                    max(1.0 - loss_probability, 0.05),
+                    0.95,
+                ) if loss_probability is not None else 0.5
+                selection_reason = str(normal_contract["selection_reason"])
+                reason = self._reason(
+                    (
+                        "模型方向明确且扣费后期望为正，按模拟盘正常策略做多"
+                        if action == Action.LONG
+                        else "模型方向明确且扣费后期望为正，按模拟盘正常策略做空"
+                    )
+                    if selection_reason == "policy_exploitation"
+                    else (
+                        "模型方向明确但收益仍待校准，按受控覆盖采样做多"
+                        if action == Action.LONG
+                        else "模型方向明确但收益仍待校准，按受控覆盖采样做空"
+                    ),
+                    decision_score,
+                    disagreement,
+                    raw_opinions,
+                    resolution_brief,
+                )
+                paper_raw = self._raw(
+                    raw_opinions,
+                    decision_score,
+                    disagreement,
+                    cross_validations,
+                    consultation,
+                )
+                self._attach_expert_diversity_policy(paper_raw, context)
+                paper_raw["entry_candidate_evidence"] = candidate_evidence
+                paper_raw["direction_competition"] = direction_competition
+                paper_raw["paper_trade_selection"] = {
+                    **paper_selection,
+                    "decision_authority": "ensemble",
+                }
+                paper_raw["normal_paper_trade"] = normal_contract
+                paper_raw["independent_direction_support"] = selected_support
+                paper_raw["entry_permission"] = {
+                    "granted": True,
+                    "scope": "paper_only",
+                    "reason": selection_reason,
+                    "production_permission": False,
+                }
+                paper_raw["base_weighted_score_observation"] = round(
+                    normalized_score,
+                    4,
+                )
+                paper_raw["memory_feedback_observation"] = self._memory_feedback(
+                    context
+                )
+                paper_raw["ml_signal"] = context.get("ml_signal") or {}
+                paper_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
+                return self._entry_decision(
+                    features=features,
+                    context=context,
+                    action=action,
+                    confidence=confidence,
+                    reasoning=reason,
+                    raw_response=paper_raw,
+                    raw_opinions=raw_opinions,
+                )
+
+            hold_raw = self._raw(
+                raw_opinions,
+                decision_score,
+                disagreement,
+                cross_validations,
+                consultation,
+            )
+            self._attach_expert_diversity_policy(hold_raw, context)
+            hold_raw["entry_candidate_evidence"] = candidate_evidence
+            hold_raw["direction_competition"] = direction_competition
+            hold_raw["paper_trade_selection"] = {
+                **paper_selection,
+                "decision_authority": "ensemble",
+            }
+            hold_raw["entry_permission"] = {
+                "granted": False,
+                "reason": str(
+                    paper_selection.get("selection_reason") or "no_direction"
+                ),
+                "production_permission": False,
+            }
+            hold_raw["base_weighted_score_observation"] = round(
+                normalized_score,
+                4,
+            )
+            hold_raw["memory_feedback_observation"] = self._memory_feedback(context)
+            reason = self._reason(
+                "当前没有可审计的模型方向，或存在明确强反向风险证据，本轮保持观望",
+                decision_score,
+                disagreement,
+                raw_opinions,
+                resolution_brief,
+            )
+            return self._hold(features, reason, hold_raw)
+
+        preferred_side = str(
+            candidate_evidence.get("preferred_side_by_evidence") or ""
+        ).lower()
         side_evidence = self._safe_dict(candidate_evidence.get(preferred_side))
         policy_provenance = self._safe_dict(side_evidence.get("policy_provenance"))
         governance_complete = all(
@@ -879,13 +1017,15 @@ class EnsembleCoordinator:
         return_candidate_eligible = bool(
             preferred_side in {"long", "short"}
             and side_evidence.get("production_eligible") is True
-            and self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0) > 0.0
+            and self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0)
+            > 0.0
             and self._safe_float(side_evidence.get("return_lcb_pct"), 0.0) > 0.0
-            and self._safe_float(side_evidence.get("production_source_count"), 0.0) > 0.0
+            and self._safe_float(side_evidence.get("production_source_count"), 0.0)
+            > 0.0
             and governance_complete
         )
         direction_support = assess_directional_entry_support(
-            self._safe_dict(context.get("direction_competition")),
+            direction_competition,
             raw_opinions,
             preferred_side,
         )
@@ -901,177 +1041,31 @@ class EnsembleCoordinator:
             "independent_direction_support": direction_support,
         }
         if not production_eligible:
-            exploration_side = str(
-                candidate_evidence.get("preferred_exploration_side") or ""
-            ).lower()
-            execution_mode = str(context.get("execution_mode") or "").lower()
-            exploration_candidate_evidence = candidate_evidence
-            exploration_support = assess_directional_entry_support(
-                self._safe_dict(context.get("direction_competition")),
-                raw_opinions,
-                exploration_side,
-            )
-            exploration_contract = (
-                build_paper_exploration_contract(
-                    candidate_evidence,
-                    symbol=features.symbol,
-                    independent_direction_support=exploration_support,
-                )
-                if execution_mode == "paper" and exploration_side in {"long", "short"}
-                else {}
-            )
-            intervention_support_by_side: dict[str, dict[str, Any]] = {}
-            if execution_mode == "paper" and not exploration_contract:
-                for side in ("long", "short"):
-                    cost = self._safe_dict(
-                        self._safe_dict(candidate_evidence.get(side)).get(
-                            "execution_cost"
-                        )
-                    )
-                    intervention_support_by_side[side] = (
-                        assess_unpromoted_model_intervention_support(
-                            self._safe_dict(context.get("direction_competition")),
-                            raw_opinions,
-                            side,
-                            execution_cost_pct=self._finite_or_none(
-                                cost.get("total_pct")
-                            ),
-                        )
-                    )
-                exploration_candidate_evidence = (
-                    select_unpromoted_model_intervention(
-                        candidate_evidence,
-                        intervention_support_by_side,
-                    )
-                )
-                exploration_side = str(
-                    exploration_candidate_evidence.get(
-                        "preferred_exploration_side"
-                    )
-                    or ""
-                ).lower()
-                exploration_support = self._safe_dict(
-                    intervention_support_by_side.get(exploration_side)
-                )
-                exploration_contract = (
-                    build_paper_exploration_contract(
-                        exploration_candidate_evidence,
-                        symbol=features.symbol,
-                        independent_direction_support=exploration_support,
-                    )
-                    if exploration_side in {"long", "short"}
-                    else {}
-                )
-            if exploration_contract:
-                action = Action.LONG if exploration_side == "long" else Action.SHORT
-                exploration = self._safe_dict(
-                    exploration_candidate_evidence.get("paper_exploration")
-                )
-                selected_exploration = self._safe_dict(exploration.get("selected"))
-                information_value = self._safe_float(
-                    selected_exploration.get("information_value_score"),
-                    0.0,
-                )
-                reason = self._reason(
-                    (
-                        "模拟盘候选扣费后期望为正但收益下界仍有轻微不确定，"
-                        "按独立小风险预算执行做多探索"
-                        if action == Action.LONG
-                        else "模拟盘候选扣费后期望为正但收益下界仍有轻微不确定，"
-                        "按独立小风险预算执行做空探索"
-                    ),
-                    decision_score,
-                    disagreement,
-                    raw_opinions,
-                    resolution_brief,
-                )
-                exploration_raw = self._raw(
-                    raw_opinions,
-                    decision_score,
-                    disagreement,
-                    cross_validations,
-                    consultation,
-                )
-                self._attach_expert_diversity_policy(exploration_raw, context)
-                exploration_raw["authoritative_return_candidate"] = raw[
-                    "authoritative_return_candidate"
-                ]
-                exploration_raw["entry_candidate_evidence"] = (
-                    exploration_candidate_evidence
-                )
-                exploration_raw["paper_exploration"] = exploration_contract
-                exploration_raw["independent_direction_support"] = exploration_support
-                exploration_raw["entry_permission"] = {
-                    "granted": True,
-                    "scope": exploration_contract.get("intervention_scope"),
-                    "reason": "independent_positive_direction_support_ready",
-                    "production_permission": False,
-                }
-                exploration_raw["base_weighted_score_observation"] = round(
-                    normalized_score,
-                    4,
-                )
-                exploration_raw["memory_feedback_observation"] = self._memory_feedback(context)
-                exploration_raw["ml_signal"] = context.get("ml_signal") or {}
-                exploration_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
-                exploration_raw["direction_competition"] = (
-                    context.get("direction_competition") or {}
-                )
-                return self._entry_decision(
-                    features=features,
-                    context=context,
-                    action=action,
-                    confidence=min(max(information_value, 0.0), 1.0),
-                    reasoning=reason,
-                    raw_response=exploration_raw,
-                    raw_opinions=raw_opinions,
-                )
             reason = self._reason(
-                (
-                    "当前候选未同时满足扣费后期望、收益置信下界、生产数据源和策略治理合同，"
-                    "本轮保持观望；训练预测只记录影子结果，不创建订单"
-                ),
+                "实盘候选未满足生产收益、方向和治理合同，本轮保持观望",
                 decision_score,
                 disagreement,
                 raw_opinions,
                 resolution_brief,
             )
             hold_raw = self._raw(
-                raw_opinions, decision_score, disagreement, cross_validations, consultation
+                raw_opinions,
+                decision_score,
+                disagreement,
+                cross_validations,
+                consultation,
             )
             self._attach_expert_diversity_policy(hold_raw, context)
-            hold_raw["authoritative_return_candidate"] = raw["authoritative_return_candidate"]
+            hold_raw["authoritative_return_candidate"] = raw[
+                "authoritative_return_candidate"
+            ]
             hold_raw["entry_candidate_evidence"] = candidate_evidence
-            hold_raw["unpromoted_model_intervention"] = {
-                "support_by_side": intervention_support_by_side,
-                "candidate_evidence": (
-                    exploration_candidate_evidence
-                    if intervention_support_by_side
-                    else {}
-                ),
-            }
-            hold_raw["independent_direction_support"] = (
-                direction_support
-                if return_candidate_eligible
-                else exploration_support
-            )
-            hold_raw["paper_training_retirement"] = {
-                "retired": True,
-                "execution_permission": False,
-                "training_policy": "shadow_prediction_only",
-                "reason": "training_collection_cannot_create_orders",
-            }
+            hold_raw["independent_direction_support"] = direction_support
             hold_raw["entry_permission"] = {
                 "granted": False,
-                "reason": (
-                    direction_support.get("reason")
-                    if return_candidate_eligible
-                    else exploration_support.get("reason")
-                ),
-                "training_policy": "shadow_prediction_only",
+                "reason": direction_support.get("reason"),
+                "production_permission": False,
             }
-            hold_raw["base_weighted_score_observation"] = round(normalized_score, 4)
-            hold_raw["memory_feedback_observation"] = self._memory_feedback(context)
             return self._hold(features, reason, hold_raw)
 
         action = Action.LONG if preferred_side == "long" else Action.SHORT
@@ -1156,13 +1150,10 @@ class EnsembleCoordinator:
         side = "long" if action == Action.LONG else "short"
         candidate_evidence = self._safe_dict(context.get("entry_candidate_evidence"))
         side_evidence = self._safe_dict(candidate_evidence.get(side))
-        exploration = self._safe_dict(candidate_evidence.get("paper_exploration"))
-        exploration_selected = self._safe_dict(exploration.get("selected"))
         direction = self._safe_dict(context.get("direction_competition"))
         direction_side = self._safe_dict(direction.get(f"training_{side}"))
         horizon_candidates = (
             side_evidence.get("horizon_minutes"),
-            exploration_selected.get("horizon_minutes"),
             direction_side.get("horizon_minutes"),
         )
         evidence_horizon = next(
@@ -1175,7 +1166,6 @@ class EnsembleCoordinator:
         )
         expected_return_pct = max(
             self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0),
-            self._safe_float(exploration_selected.get("expected_net_return_pct"), 0.0),
             self._safe_float(direction_side.get("objective_expected_return_pct"), 0.0),
             0.0,
         )

@@ -11,11 +11,6 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import okx_inst_id_from_symbol
-from services.paper_bootstrap_canary import (
-    PAPER_BOOTSTRAP_CANARY_VERSION,
-    PaperBootstrapCanaryPolicy,
-)
-from services.paper_training import is_paper_training_decision
 from services.production_trade_gate import validate_production_trade_gate
 
 
@@ -105,39 +100,27 @@ class EntryPriceGuardPolicy:
         if latest_price <= 0:
             return "Fresh pre-order native price is unavailable; entry fails closed."
 
-        paper_canary = bool(
-            str(model_mode or "").lower() == "paper"
-            and PaperBootstrapCanaryPolicy.is_claimed(decision)
-        )
-        paper_training = bool(
-            str(model_mode or "").lower() == "paper"
-            and is_paper_training_decision(decision)
-        )
-        gate_validation = validate_production_trade_gate(
-            _safe_dict(decision.raw_response).get("production_trade_gate"),
-            required_mode="live_rules_canary",
-        )
-        live_rules_canary = bool(
-            str(model_mode or "").lower() != "paper" and gate_validation.valid
-        )
-        return_budget = None if paper_training or live_rules_canary else (
-            self._paper_canary_price_budget_fraction(decision)
-            if paper_canary
+        paper_trade = str(model_mode or "").lower() == "paper"
+        live_rules_canary = False
+        if not paper_trade:
+            gate_validation = validate_production_trade_gate(
+                _safe_dict(decision.raw_response).get("production_trade_gate"),
+                required_mode="live_rules_canary",
+            )
+            live_rules_canary = gate_validation.valid
+        return_budget = (
+            None
+            if paper_trade or live_rules_canary
             else self._return_budget_fraction(decision)
         )
-        if not paper_training and not live_rules_canary and (
+        if not paper_trade and not live_rules_canary and (
             return_budget is None or return_budget <= 0
         ):
-            return (
-                "Authoritative paper bootstrap distribution drift budget is missing; "
-                "entry fails closed."
-                if paper_canary
-                else "Authoritative fee-after return budget is missing; entry fails closed."
-            )
+            return "Authoritative fee-after return budget is missing; entry fails closed."
 
         move = (latest_price - snapshot_price) / snapshot_price
         adverse = self._adverse_move(decision.action, move)
-        allowed = None if paper_training or live_rules_canary else return_budget
+        allowed = None if paper_trade or live_rules_canary else return_budget
         raw = _safe_dict(decision.raw_response)
         analysis_fact = _safe_dict(snapshot.get("market_fact"))
         fresh_fact = _safe_dict(fresh.get("market_fact"))
@@ -153,38 +136,31 @@ class EntryPriceGuardPolicy:
             ),
             "decision_age_seconds": round(self.decision_age_seconds_provider(decision), 3),
             "contract_lifecycle": (
-                "paper_training"
-                if paper_training
-                else "paper_bootstrap_canary"
-                if paper_canary
+                "normal_paper_trade"
+                if paper_trade
                 else "live_rules_canary"
                 if live_rules_canary
                 else "live_ml"
             ),
-            "production_permission": False if paper_canary or paper_training else True,
-            "profitability_gate_applied": not paper_training and not live_rules_canary,
+            "production_permission": False if paper_trade else True,
+            "profitability_gate_applied": not paper_trade and not live_rules_canary,
             "safety_scope": (
                 "market_integrity_only"
-                if paper_training or live_rules_canary
+                if paper_trade or live_rules_canary
                 else "market_integrity_and_return_budget"
             ),
             "policy_provenance": {
                 "source": (
-                    "paper_training_market_integrity_only"
-                    if paper_training
-                    else
-                    "paper_bootstrap_empirical_distribution_uncertainty"
-                    if paper_canary
+                    "normal_paper_market_integrity_only"
+                    if paper_trade
                     else "live_rules_canary_market_integrity"
                     if live_rules_canary
                     else "authoritative_fee_after_return_lcb"
                 ),
                 "observation_window": "current_pre_order_refresh",
                 "sample_count": (
-                    self._paper_training_sample_count(decision)
-                    if paper_training
-                    else self._paper_canary_sample_count(decision)
-                    if paper_canary
+                    1
+                    if paper_trade
                     else self._return_sample_count(decision)
                 ),
                 "generated_at": raw.get("generated_at") or "decision_runtime",
@@ -207,7 +183,7 @@ class EntryPriceGuardPolicy:
                 or _safe_dict(execution_facts.get("policy_provenance")).get("source"),
             },
         }
-        if paper_training or live_rules_canary or (allowed is not None and adverse <= allowed):
+        if paper_trade or live_rules_canary or (allowed is not None and adverse <= allowed):
             public_execution_facts = {
                 key: value
                 for key, value in execution_facts.items()
@@ -279,42 +255,5 @@ class EntryPriceGuardPolicy:
             return 0.0
         return min(expected_net, return_lcb) / 100.0
 
-    @staticmethod
-    def _paper_canary_contract(decision: DecisionOutput) -> dict[str, Any]:
-        raw = _safe_dict(decision.raw_response)
-        contract = _safe_dict(raw.get("paper_bootstrap_canary"))
-        if (
-            contract.get("version") != PAPER_BOOTSTRAP_CANARY_VERSION
-            or contract.get("authorized") is not True
-            or contract.get("requested") is not True
-            or contract.get("execution_scope") != "paper_only"
-            or contract.get("production_permission") is not False
-        ):
-            return {}
-        return contract
-
-    def _paper_canary_price_budget_fraction(self, decision: DecisionOutput) -> float:
-        observation = _safe_dict(
-            self._paper_canary_contract(decision).get("selected_observation")
-        )
-        dispersion_pct = max(_safe_float(observation.get("dispersion_pct")), 0.0)
-        objective_pct = _safe_float(observation.get("objective_expected_return_pct"))
-        lower_quantile_pct = _safe_float(observation.get("lower_quantile_return_pct"))
-        quantile_gap_pct = abs(objective_pct - lower_quantile_pct)
-        if dispersion_pct <= 0 or quantile_gap_pct <= 0:
-            return 0.0
-        return min(dispersion_pct, quantile_gap_pct) / 100.0
-
-    def _paper_canary_sample_count(self, decision: DecisionOutput) -> int:
-        contract = self._paper_canary_contract(decision)
-        return max(int(_safe_float(contract.get("source_sample_count"))), 0)
-
     def _return_sample_count(self, decision: DecisionOutput) -> int:
         return max(int(_safe_float(self._side_evidence(decision).get("production_source_count"))), 0)
-
-    @staticmethod
-    def _paper_training_sample_count(decision: DecisionOutput) -> int:
-        raw = _safe_dict(decision.raw_response)
-        contract = _safe_dict(raw.get("paper_training"))
-        provenance = _safe_dict(contract.get("policy_provenance"))
-        return max(int(_safe_float(provenance.get("sample_count"))), 0)

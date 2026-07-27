@@ -10,7 +10,12 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_PROMOTION_FLOW,
     ArtifactRetirementAuditService,
 )
-from services.ml_signal_service import MLSignalService
+from services.ml_signal_service import (
+    FEATURE_CONTRACT_VERSION,
+    MULTITASK_PREDICTION_CONTRACT_VERSION,
+    REPLAY_WEIGHT_POLICY_VERSION,
+    MLSignalService,
+)
 from services.ml_training_contract import DECISION_GROUP_PARTITION_VERSION
 from services.model_artifact_registry import (
     ARTIFACT_REGISTRY_VERSION,
@@ -49,6 +54,23 @@ def _metadata() -> dict:
         "label_version": RETURN_LABEL_VERSION,
         "cost_model_version": COST_MODEL_VERSION,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "feature_contract_version": FEATURE_CONTRACT_VERSION,
+        "label_contract_versions": ["2026-07-27.market-opportunity-multitask.v2"],
+        "multitask_prediction_contract_version": MULTITASK_PREDICTION_CONTRACT_VERSION,
+        "training_task_manifest": {
+            "market_opportunity": {"sample_count": 128},
+            "entry_timing": {"sample_count": 128},
+            "exit": {"sample_count": 16},
+            "execution": {"sample_count": 16},
+        },
+        "training_sample_sources": {
+            "shadow_market_label": 256,
+            "authoritative_okx_trade": 16,
+        },
+        "replay_weight_manifest": {
+            "version": REPLAY_WEIGHT_POLICY_VERSION,
+            "validation_and_test_resampling": False,
+        },
         "evaluation_group_policy": "chronological_disjoint_decision_groups",
         "train_decision_group_count": 64,
         "test_decision_group_count": 64,

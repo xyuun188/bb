@@ -1,4 +1,4 @@
-"""Detect sustained loss of governed production return sources."""
+"""Report live return-source health and normal-paper sampling continuity."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
+from services.normal_paper_trade import normal_paper_trade_contract_reasons
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -56,9 +57,9 @@ def _source_count(raw: dict[str, Any]) -> int:
     return max(total, 0)
 
 
-def _paper_bootstrap_guard(raw: dict[str, Any]) -> dict[str, Any]:
-    contract = _safe_dict(raw.get("paper_bootstrap_canary"))
-    return _safe_dict(contract.get("runtime_guard"))
+def _is_normal_paper_candidate(raw: dict[str, Any]) -> bool:
+    contract = _safe_dict(raw.get("normal_paper_trade"))
+    return bool(contract) and not normal_paper_trade_contract_reasons(contract)
 
 
 def summarize_production_source_health(
@@ -87,48 +88,35 @@ def summarize_production_source_health(
     )
     warning_after = max(int(decision_interval_seconds or 60) * 6, 600)
     critical_after = max(int(decision_interval_seconds or 60) * 30, 3600)
-    canary_rows = [
-        row
-        for row in market_rows
-        if _safe_dict(_raw(row).get("paper_bootstrap_canary")).get("requested") is True
-    ]
-    normal_paper_rows = [
-        row
-        for row in canary_rows
-        if _safe_dict(_raw(row).get("paper_bootstrap_canary")).get("trade_kind")
-        == "normal_strategy_trade"
-    ]
-    canary_executed = sum(bool(_row_value(row, "was_executed")) for row in canary_rows)
-    normal_paper_executed = sum(
-        bool(_row_value(row, "was_executed")) for row in normal_paper_rows
+    normal_paper_rows = [row for row in market_rows if _is_normal_paper_candidate(_raw(row))]
+    normal_paper_executed = sum(bool(_row_value(row, "was_executed")) for row in normal_paper_rows)
+    latest_normal_paper_at = (
+        _as_utc(_row_value(normal_paper_rows[0], "created_at")) if normal_paper_rows else None
     )
-    latest_canary_at = (
-        _as_utc(_row_value(canary_rows[0], "created_at")) if canary_rows else None
-    )
-    latest_canary_guard = (
-        _paper_bootstrap_guard(_raw(canary_rows[0])) if canary_rows else {}
-    )
-    sampling_plan_alert_active = bool(
-        latest_canary_guard.get("sampling_plan_alert_active") is True
-        and latest_canary_at is not None
-        and (checked_at - latest_canary_at).total_seconds() <= critical_after
-    )
-    sampling_plan_alert_reason = (
-        "paper_bootstrap_sampling_plan_unreachable"
-        if sampling_plan_alert_active
+    no_normal_paper_since = latest_normal_paper_at or oldest_at
+    no_normal_paper_seconds = (
+        max((checked_at - no_normal_paper_since).total_seconds(), 0.0)
+        if no_normal_paper_since is not None
         else None
+    )
+    paper_sampling_alert_active = bool(
+        market_rows
+        and no_normal_paper_seconds is not None
+        and no_normal_paper_seconds >= critical_after
+    )
+    paper_sampling_alert_reason = (
+        "continuous_no_normal_paper_candidate" if paper_sampling_alert_active else None
     )
     if not market_rows:
         status = "warning"
         reason = "market_decision_evidence_unavailable"
-    elif sampling_plan_alert_active and not (
-        source_rows and no_source_seconds is not None and no_source_seconds < warning_after
-    ):
-        status = "critical"
-        reason = sampling_plan_alert_reason
     elif source_rows and no_source_seconds is not None and no_source_seconds < warning_after:
-        status = "ok"
-        reason = "governed_production_return_source_recent"
+        if paper_sampling_alert_active:
+            status = "warning"
+            reason = paper_sampling_alert_reason
+        else:
+            status = "ok"
+            reason = "governed_production_return_source_recent"
     elif no_source_seconds is not None and no_source_seconds >= critical_after:
         status = "critical"
         reason = "continuous_no_production_return_source"
@@ -148,27 +136,28 @@ def summarize_production_source_health(
         ),
         "warning_after_seconds": warning_after,
         "critical_after_seconds": critical_after,
-        "paper_bootstrap_candidate_count": len(canary_rows),
-        "paper_bootstrap_executed_count": canary_executed,
-        "paper_normal_candidate_count": len(normal_paper_rows),
-        "paper_normal_executed_count": normal_paper_executed,
-        "continuous_training_after_settlement": bool(normal_paper_rows),
-        "sample_target": None if normal_paper_rows else "legacy",
-        "sampling_plan_alert_active": sampling_plan_alert_active,
-        "sampling_plan_alert_reason": sampling_plan_alert_reason,
-        "sampling_plan_alert_observed_at": (
-            latest_canary_at.isoformat() if sampling_plan_alert_active and latest_canary_at else None
+        "normal_paper_candidate_count": len(normal_paper_rows),
+        "normal_paper_executed_count": normal_paper_executed,
+        "latest_normal_paper_candidate_at": (
+            latest_normal_paper_at.isoformat() if latest_normal_paper_at else None
         ),
+        "continuous_no_normal_paper_candidate_seconds": (
+            round(no_normal_paper_seconds, 3) if no_normal_paper_seconds is not None else None
+        ),
+        "continuous_training_after_settlement": bool(normal_paper_rows),
+        "paper_sampling_status": (
+            "active"
+            if latest_normal_paper_at is not None
+            and no_normal_paper_seconds is not None
+            and no_normal_paper_seconds < warning_after
+            else "stale"
+            if paper_sampling_alert_active
+            else "waiting"
+        ),
+        "paper_sampling_alert_active": paper_sampling_alert_active,
+        "paper_sampling_alert_reason": paper_sampling_alert_reason,
         "recovery_state": (
-            "paper_bootstrap_plan_unreachable"
-            if sampling_plan_alert_active
-            else "paper_normal_trading"
-            if normal_paper_rows
-            else "paper_bootstrap_collecting"
-            if canary_executed
-            else "paper_bootstrap_waiting"
-            if canary_rows
-            else "no_bootstrap_candidate"
+            "normal_paper_trading" if normal_paper_rows else "normal_paper_candidate_waiting"
         ),
         "checked_at": checked_at.isoformat(),
     }

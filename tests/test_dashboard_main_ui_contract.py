@@ -86,7 +86,9 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260726-market-analysis-permission" in html
+    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
+    assert "模拟盘交易权限" in script
+    assert "实盘候选权限" in script
 
 
 def test_dashboard_refreshes_auth_status_in_topbar() -> None:
@@ -527,7 +529,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260726-market-analysis-permission" in html
+    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -667,7 +669,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260726-market-analysis-permission" in html
+    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -824,7 +826,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260726-market-analysis-permission" in html
+    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1024,7 +1026,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "learning_only: '仅学习观察'" in reason_block
     assert (
         "artifact_activation_not_production_authorized: "
-        "'当前 Artifact 仅获模拟盘小仓观察授权，尚未获得生产影响权限'"
+        "'当前 Artifact 可参与模拟盘，尚未获得实盘权限'"
         in reason_block
     )
     assert "okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据'" in reason_block
@@ -1036,6 +1038,8 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "当前干净完成 ${samples.completedMl} - 最近已训练游标" in overview_block
     assert "map(dashboardReasonText)" in overview_block
     assert "mlMetricCard('就绪判断'" in script
+    assert "mlMetricCard('模拟盘交易权限'" in script
+    assert "mlMetricCard('实盘候选权限'" in script
     assert "const SYSTEM_AUDIT_NODE_LABELS" in script
     assert "upstream.map(systemAuditNodeLabel)" in script
     assert "downstream.map(systemAuditNodeLabel)" in script
@@ -1050,7 +1054,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260726-market-analysis-permission" in html
+    assert "/static/js/dashboard.js?v=20260727-paper-live-training-contract" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
