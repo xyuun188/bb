@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -68,15 +68,11 @@ def _test_artifact_metadata(
         "folds": [
             {
                 "decision_group_overlap_count": 0,
-                "sides": {
-                    side: dict(ready_evidence) for side in ("long", "short")
-                },
+                "sides": {side: dict(ready_evidence) for side in ("long", "short")},
             },
             {
                 "decision_group_overlap_count": 0,
-                "sides": {
-                    side: dict(ready_evidence) for side in ("long", "short")
-                },
+                "sides": {side: dict(ready_evidence) for side in ("long", "short")},
             },
         ],
         "sides": {
@@ -101,8 +97,9 @@ def _test_artifact_metadata(
         "label_name": module.RETURN_LABEL_NAME,
         "label_version": module.RETURN_LABEL_VERSION,
         "cost_model_version": module.COST_MODEL_VERSION,
+        "training_cost_policy": ("shadow_market_opportunity_plus_authoritative_okx_execution_cost"),
         "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
-        "time_split_policy": "chronological_disjoint_decision_groups",
+        "time_split_policy": "independent_chronological_disjoint_decision_groups",
         "quality_report": {
             "market_fact_contract": {
                 "status": "clean",
@@ -132,18 +129,21 @@ def _test_artifact_metadata(
             "requires_artifact_refresh": False,
         },
         "walk_forward_report": walk_forward_report,
-        "leave_one_symbol_out_report": {
-            side: dict(ready_loso) for side in ("long", "short")
-        },
-        "oos_return_evaluation": {
-            side: dict(ready_evidence) for side in ("long", "short")
+        "leave_one_symbol_out_report": {side: dict(ready_loso) for side in ("long", "short")},
+        "oos_return_evaluation": {side: dict(ready_evidence) for side in ("long", "short")},
+        "execution_cost_holdout_report": {
+            "source_authority": "okx_fills_fees_funding",
+            "chronological": True,
+            "decision_group_disjoint": True,
+            "sample_count": 12,
+            "sides": {side: {"sample_count": 6, "mae_pct": 0.01} for side in ("long", "short")},
         },
         "authoritative_trade_return_evidence": {
             "version": "2026-07-15.authoritative-trade-return-evidence.v1",
+            "source_authority": "okx_position_history_profit_supervision",
+            "sample_count": 33,
             "data_fingerprint": "d" * 64,
-            "sides": {
-                side: dict(ready_evidence) for side in ("long", "short")
-            },
+            "sides": {side: dict(ready_evidence) for side in ("long", "short")},
         },
     }
     metadata.update(metadata_overrides)
@@ -171,10 +171,11 @@ def test_local_ai_tools_generated_service_requires_api_key_or_loopback() -> None
     assert "Bearer {LOCAL_AI_TOOLS_API_KEY}" in SERVICE_CODE
 
 
-def test_local_ai_tools_training_uses_per_sample_costs_and_empirical_tail_policy() -> None:
+def test_local_ai_tools_training_separates_authoritative_cost_and_tail_policy() -> None:
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in SERVICE_CODE
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in SERVICE_CODE
-    assert "def cost_complete_net_returns(" in SERVICE_CODE
+    assert "def cost_complete_net_returns(" not in SERVICE_CODE
+    assert "def _authoritative_cost_training_rows(" in SERVICE_CODE
     assert "def empirical_lower_hinge(" in SERVICE_CODE
     assert "legacy_fixed_training_thresholds_enabled" not in SERVICE_CODE
     assert "def _dynamic_min_samples_leaf(sample_count: int)" in SERVICE_CODE
@@ -224,13 +225,8 @@ def test_local_ai_tools_loaded_bundle_forces_single_worker_inference(
         "long_cost_model",
         "short_cost_model",
     )
-    bundle = {
-        name: ExtraTreesRegressor(n_estimators=2, n_jobs=-1)
-        for name in estimator_names
-    }
-    bundle["horizon_models"] = {
-        10: {"long_model": ExtraTreesRegressor(n_estimators=2, n_jobs=-1)}
-    }
+    bundle = {name: ExtraTreesRegressor(n_estimators=2, n_jobs=-1) for name in estimator_names}
+    bundle["horizon_models"] = {10: {"long_model": ExtraTreesRegressor(n_estimators=2, n_jobs=-1)}}
     module.persist_candidate_bundle(bundle, _test_artifact_metadata(module))
     module.activate_candidate_shadow({"test": "shadow"})
 
@@ -279,20 +275,12 @@ def test_compact_native_sequence_transport_expands_all_windows_lazily() -> None:
     assert windows[0]["close_sequence"] == closes[:31]
     assert windows[1]["close_sequence"] == closes[:32]
     assert windows[0]["long_return_pct"] == pytest.approx((131.0 - 130.0) / 130.0 * 100.0)
-    assert windows[0]["short_return_pct"] == pytest.approx(
-        -windows[0]["long_return_pct"]
-    )
-    assert list(
-        module._iter_sequence_training_windows(
-            [{**sample, "observation_count": 1}]
-        )
-    ) == []
+    assert windows[0]["short_return_pct"] == pytest.approx(-windows[0]["long_return_pct"])
+    assert list(module._iter_sequence_training_windows([{**sample, "observation_count": 1}])) == []
 
 
 def test_training_upload_uses_scheduler_deadline_instead_of_http_write_timeout() -> None:
-    source = (ROOT / "scripts" / "train_local_ai_tools_models.py").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "scripts" / "train_local_ai_tools_models.py").read_text(encoding="utf-8")
 
     assert "write=None" in source
     assert "read=None" in source
@@ -375,9 +363,7 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
             "model": "local-profit-artifact-required-v3",
             "best_side": "hold",
             "return_semantics": "gross_market_opportunity_before_execution",
-            "return_distribution_input_version": (
-                module.RETURN_DISTRIBUTION_INPUT_VERSION
-            ),
+            "return_distribution_input_version": (module.RETURN_DISTRIBUTION_INPUT_VERSION),
             "return_distribution_inputs": {"long": {"production_eligible": False}},
             "loss_probability": 0.18,
             "profit_quality_score": 0.25,
@@ -398,6 +384,33 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert "expected_return_pct" not in payload["shadow_payload"]
     assert "adjusted_expected_return_pct" not in payload["shadow_payload"]
     assert payload["shadow_payload"]["loss_probability"] == 0.18
+
+
+def test_local_ai_tools_unavailable_profit_response_has_explicit_permission_contract() -> None:
+    module = ModuleType("local_ai_tools_api_unavailable_profit_contract_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.load_bundle = lambda: None
+
+    payload = module.profit_predict(
+        SimpleNamespace(
+            symbol="BTC/USDT",
+            features={"current_price": 100.0, "returns_5": 0.01},
+        )
+    )
+
+    quality = payload["prediction_quality"]
+    assert quality["contract_complete"] is False
+    assert quality["paper_eligible"] is False
+    assert quality["production_eligible"] is False
+    assert quality["anomalous"] is True
+    assert quality["reason"] == "trained_profit_model_unavailable"
+    assert quality["production_blockers"] == ["trained_profit_model_unavailable"]
+    assert all(
+        item["contract_complete"] is False
+        and item["paper_eligible"] is False
+        and item["production_eligible"] is False
+        for item in payload["return_distribution_inputs"].values()
+    )
 
 
 def test_generated_service_without_artifact_fails_closed_without_heuristic_returns() -> None:
@@ -447,9 +460,7 @@ def test_generated_service_status_does_not_advertise_heuristic_fallback(
 
     assert status["available"] is False
     assert status["status"] == "artifact_unavailable"
-    assert status["return_distribution_input_version"] == (
-        module.RETURN_DISTRIBUTION_INPUT_VERSION
-    )
+    assert status["return_distribution_input_version"] == (module.RETURN_DISTRIBUTION_INPUT_VERSION)
     assert endpoint["status"] == "artifact_unavailable"
     assert "heuristic" not in endpoint["message"].lower()
 
@@ -474,7 +485,7 @@ def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> 
             "label_version": module.RETURN_LABEL_VERSION,
             "cost_model_version": module.COST_MODEL_VERSION,
             "training_cost_policy": (
-                "separated_market_opportunity_and_execution_cost_tasks"
+                "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
             ),
             "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
             "profit_supervision_report": supervision,
@@ -510,7 +521,7 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
                 "label_name": module.RETURN_LABEL_NAME,
                 "label_version": module.RETURN_LABEL_VERSION,
                 "training_cost_policy": (
-                    "separated_market_opportunity_and_execution_cost_tasks"
+                    "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
                 ),
                 "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
                 "artifact_persisted": True,
@@ -527,12 +538,9 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
             "trained": True,
             "model": "trained-test-model",
             "return_semantics": "gross_market_opportunity_before_execution",
-            "return_distribution_input_version": (
-                module.RETURN_DISTRIBUTION_INPUT_VERSION
-            ),
+            "return_distribution_input_version": (module.RETURN_DISTRIBUTION_INPUT_VERSION),
             "return_distribution_inputs": {
-                side: {"production_eligible": True}
-                for side in ("long", "short")
+                side: {"production_eligible": True} for side in ("long", "short")
             },
             "prediction_quality": {
                 "production_eligible": True,
@@ -546,19 +554,100 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
     assert payload["objective_name"] == module.RETURN_OBJECTIVE_NAME
     assert payload["label_name"] == module.RETURN_LABEL_NAME
     assert payload["training_cost_policy"] == (
-        "separated_market_opportunity_and_execution_cost_tasks"
+        "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
     )
     assert payload["profit_supervision_version"] == module.PROFIT_SUPERVISION_VERSION
     assert payload["model_stage"] == "shadow"
-    assert payload["route_mode"] == "shadow_observation"
+    assert payload["route_mode"] == "paper_analysis"
     assert payload["production_permission"] is False
     assert payload["live_ml_ready"] is False
+    assert payload["paper_trading_permission"] is True
     assert payload["prediction_quality"]["production_eligible"] is False
+    assert payload["prediction_quality"]["paper_eligible"] is True
+    assert payload["prediction_quality"]["contract_complete"] is True
+    assert payload["prediction_quality"]["anomalous"] is False
+    assert payload["prediction_quality"]["blockers"] == []
+    assert (
+        "artifact_activation_not_production_authorized"
+        in payload["prediction_quality"]["production_blockers"]
+    )
     assert all(
         item["production_eligible"] is False
-        and "artifact_activation_not_production_authorized" in item["blockers"]
+        and item["paper_eligible"] is True
+        and item["contract_complete"] is True
+        and item["blockers"] == []
+        and "artifact_activation_not_production_authorized" in item["production_blockers"]
         for item in payload["return_distribution_inputs"].values()
     )
+
+
+def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -> None:
+    module = ModuleType("local_ai_tools_api_idempotent_metadata_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(
+        module,
+        "load_bundle",
+        lambda: {
+            "metadata": {
+                "objective_name": module.RETURN_OBJECTIVE_NAME,
+                "objective_version": module.RETURN_OBJECTIVE_VERSION,
+                "label_name": module.RETURN_LABEL_NAME,
+                "label_version": module.RETURN_LABEL_VERSION,
+                "training_cost_policy": (
+                    "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+                ),
+                "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
+                "artifact_persisted": True,
+                "model_stage": "canary",
+                "artifact_lifecycle": "canary",
+            }
+        },
+    )
+    initial = {
+        "available": True,
+        "trained": True,
+        "model": "trained-timeseries-model",
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "return_distribution_input_version": module.RETURN_DISTRIBUTION_INPUT_VERSION,
+        "return_distribution_inputs": {
+            side: {"production_eligible": True, "blockers": []}
+            for side in ("long", "short")
+        },
+        "prediction_quality": {
+            "production_eligible": True,
+            "anomalous": False,
+            "blockers": [],
+        },
+    }
+
+    first = module.with_model_metadata("time_series_prediction", initial)
+    second = module.with_model_metadata("time_series_prediction", first)
+
+    for payload in (first, second):
+        assert payload["paper_trading_permission"] is True
+        assert payload["production_permission"] is False
+        assert payload["live_ml_ready"] is False
+        assert payload["prediction_quality"]["contract_complete"] is True
+        assert payload["prediction_quality"]["paper_eligible"] is True
+        assert payload["prediction_quality"]["production_eligible"] is False
+        assert payload["prediction_quality"]["anomalous"] is False
+        assert payload["prediction_quality"]["blockers"] == []
+        assert all(
+            item["contract_complete"] is True
+            and item["paper_eligible"] is True
+            and item["production_eligible"] is False
+            for item in payload["return_distribution_inputs"].values()
+        )
+
+
+def test_deploy_smoke_verifies_timeseries_permission_contract() -> None:
+    command = deploy._remote_smoke_command()
+
+    assert "timeseries = post('/timeseries/predict'" in command
+    assert "timeseries.get('prediction_quality', {}).get('paper_eligible')" in command
+    assert "timeseries.get('prediction_quality', {}).get('production_eligible')" in command
+    assert "timeseries.get('production_permission') is live" in command
+    assert "'timeseries_contract':" in command
 
 
 def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Path) -> None:
@@ -584,9 +673,7 @@ def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Pat
     assert status["metadata_loaded"] is True
     assert status["status_endpoint_uses_metadata_only"] is True
     assert status["artifact_activation_manifest"]["activation_stage"] == "shadow"
-    assert status["artifact_activation_manifest"][
-        "live_ml_ready"
-    ] is False
+    assert status["artifact_activation_manifest"]["live_ml_ready"] is False
 
 
 def test_local_ai_tools_status_payload_is_bounded_and_exposes_child_contracts(
@@ -601,22 +688,17 @@ def test_local_ai_tools_status_payload_is_bounded_and_exposes_child_contracts(
             "version": module.PROFIT_SUPERVISION_VERSION,
             "shadow_market_sample_count": 100,
             "shadow_events": [
-                {"symbol": f"TOKEN-{index}", "payload": "x" * 4096}
-                for index in range(300)
+                {"symbol": f"TOKEN-{index}", "payload": "x" * 4096} for index in range(300)
             ],
             "authoritative_evidence": [
-                {"symbol": f"TOKEN-{index}", "payload": "y" * 4096}
-                for index in range(300)
+                {"symbol": f"TOKEN-{index}", "payload": "y" * 4096} for index in range(300)
             ],
         },
     )
     activation_path = current["version_root"] / "activation-shadow.json"
     activation = module.read_json_object(activation_path)
     activation["return_evidence_report"] = {
-        "rows": [
-            {"symbol": f"TOKEN-{index}", "payload": "z" * 4096}
-            for index in range(300)
-        ]
+        "rows": [{"symbol": f"TOKEN-{index}", "payload": "z" * 4096} for index in range(300)]
     }
     module.write_json_atomic(activation_path, activation)
     pointer = module.read_json_object(module.CURRENT_POINTER_PATH)
@@ -637,9 +719,7 @@ def test_local_ai_tools_status_payload_is_bounded_and_exposes_child_contracts(
     assert status["child_endpoints"]["time_series_prediction"]["probe_mode"] == (
         "metadata_contract"
     )
-    assert status["child_endpoints"]["sentiment_analysis"][
-        "actual_inference_probe"
-    ] is False
+    assert status["child_endpoints"]["sentiment_analysis"]["actual_inference_probe"] is False
 
 
 def test_load_bundle_reuses_verified_unchanged_artifact(tmp_path: Path) -> None:
@@ -729,15 +809,21 @@ def test_local_ai_candidate_activation_is_atomic_and_rollbackable(tmp_path: Path
         _test_artifact_metadata(module, training_data_sha256="c" * 64),
     )
 
-    assert module._resolve_artifact_pointer(
-        module.CURRENT_POINTER_PATH,
-        role="current",
-    )["version"] == first["version"]
+    assert (
+        module._resolve_artifact_pointer(
+            module.CURRENT_POINTER_PATH,
+            role="current",
+        )["version"]
+        == first["version"]
+    )
     assert second_candidate["version"] != first["version"]
 
     second = module.activate_candidate_shadow({"test": "second-shadow"})
 
     assert second["version"] == second_candidate["version"]
+    assert second["activation_manifest"]["execution_scope"] == "paper_only"
+    assert second["activation_manifest"]["paper_execution_permission"] is True
+    assert second["activation_manifest"]["production_permission"] is False
     module._BUNDLE_CACHE = None
     module._CURRENT_POINTER_MTIME_NS = None
     module._CURRENT_MODEL_MTIME_NS = None
@@ -746,16 +832,22 @@ def test_local_ai_candidate_activation_is_atomic_and_rollbackable(tmp_path: Path
     assert runtime_bundle["metadata"]["model_stage"] == "shadow"
     assert runtime_bundle["metadata"]["live_ml_ready"] is False
     assert runtime_bundle["metadata"]["artifact_version"] == second["version"]
-    assert module._resolve_artifact_pointer(
-        module.ROLLBACK_POINTER_PATH,
-        role="rollback",
-    )["version"] == first["version"]
+    assert (
+        module._resolve_artifact_pointer(
+            module.ROLLBACK_POINTER_PATH,
+            role="rollback",
+        )["version"]
+        == first["version"]
+    )
     restored = module.rollback_current_artifact()
     assert restored["version"] == first["version"]
-    assert module._resolve_artifact_pointer(
-        module.ROLLBACK_POINTER_PATH,
-        role="rollback",
-    )["version"] == second["version"]
+    assert (
+        module._resolve_artifact_pointer(
+            module.ROLLBACK_POINTER_PATH,
+            role="rollback",
+        )["version"]
+        == second["version"]
+    )
 
 
 def test_local_ai_registry_rejects_tampered_candidate_manifest(tmp_path: Path) -> None:
@@ -960,9 +1052,7 @@ def test_local_ai_registry_rejects_regressive_active_challenger(
     assert not module.CANDIDATE_POINTER_PATH.exists()
     assert module.CHALLENGER_POINTER_PATH.exists()
     assert champion_pointer_after["version"] == champion["version"]
-    assert champion_pointer_after["artifact_sha256"] == champion_pointer_before[
-        "artifact_sha256"
-    ]
+    assert champion_pointer_after["artifact_sha256"] == champion_pointer_before["artifact_sha256"]
 
 
 def test_local_ai_registry_accepts_strictly_improved_active_challenger(
@@ -1011,15 +1101,62 @@ def test_local_ai_registry_accepts_strictly_improved_active_challenger(
     assert comparison["accepted"] is True
     assert comparison["reason"] == "challenger_quality_improved"
 
-    module.activate_candidate_shadow(
-        {**evidence, "champion_comparison": comparison}
-    )
+    module.activate_candidate_shadow({**evidence, "champion_comparison": comparison})
     module.transition_current_artifact(evidence, activation_stage="canary")
     current = module.transition_current_artifact(evidence, activation_stage="active")
 
     assert current["version"] == candidate["version"]
     assert current["version"] != champion["version"]
     assert current["activation_manifest"]["activation_stage"] == "active"
+
+
+def test_local_ai_registry_replaces_only_incompatible_champion_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_api_registry_contract_migration_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+
+    def incompatible(*_args: object, **_kwargs: object) -> object:
+        raise module.IncompatibleArtifactContractError("old objective version")
+
+    monkeypatch.setattr(module, "_resolve_artifact_pointer", incompatible)
+    comparison = module._compare_candidate_to_current(
+        _test_artifact_metadata(module),
+        candidate_stage="shadow",
+    )
+
+    assert comparison["accepted"] is True
+    assert comparison["reason"] == "incompatible_champion_contract_replaced"
+    assert comparison["replaced_champion_reason"] == "old objective version"
+
+    def corrupted(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("model hash verification failed")
+
+    monkeypatch.setattr(module, "_resolve_artifact_pointer", corrupted)
+    with pytest.raises(ValueError, match="model hash verification failed"):
+        module._replaceable_current_artifact()
+
+
+def test_local_ai_registry_replaces_incompatible_activation_permission_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_api_activation_contract_migration_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    current = _persist_test_shadow_artifact(module, tmp_path)
+    assert current["activation_manifest"]["paper_execution_permission"] is True
+
+    monkeypatch.setattr(
+        module,
+        "ARTIFACT_ACTIVATION_MANIFEST_VERSION",
+        "2026-07-27.next-permission-contract.v5",
+    )
+    replacement, reason = module._replaceable_current_artifact()
+
+    assert replacement is None
+    assert reason == "Local AI activation belongs to an incompatible permission contract."
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -1115,11 +1252,11 @@ def test_local_ai_tools_generated_deep_endpoints_expose_professional_shadow_chai
     assert timeseries["specialist_artifacts_ready"] is True
     assert timeseries["specialist_inference_active"] is False
     assert timeseries["professional_model_shadow"]["baseline_response"] is True
-    assert timeseries["shadow_payload"]["specialist_primary_model"] == "google/timesfm-2.5-200m-pytorch"
     assert (
-        timeseries["fallback_reason"]
-        == "specialist_timeseries_adapter_not_promoted"
+        timeseries["shadow_payload"]["specialist_primary_model"]
+        == "google/timesfm-2.5-200m-pytorch"
     )
+    assert timeseries["fallback_reason"] == "specialist_timeseries_adapter_not_promoted"
 
     assert sentiment["specialist_primary_model"] == "ProsusAI/finbert"
     assert sentiment["specialist_challenger_model"] == "yiyanghkust/finbert-tone"
@@ -1263,9 +1400,7 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
         module.FeatureRequest(
             symbol="BTC/USDT",
             features={
-                "recent_closes": [
-                    99.0 + index * ((101.2 - 99.0) / 59) for index in range(60)
-                ],
+                "recent_closes": [99.0 + index * ((101.2 - 99.0) / 59) for index in range(60)],
                 "returns_1": 0.01,
                 "returns_5": 0.02,
                 "returns_20": 0.03,
@@ -1279,9 +1414,7 @@ def test_local_ai_tools_timesfm_shadow_adapter_marks_timeseries_shadow_only(
     assert result["fallback_reason"] == "specialist_timeseries_shadow_only"
     assert result["professional_model_shadow"]["actual_inference"] is True
     assert result["professional_model_shadow"]["baseline_response"] is True
-    assert result["professional_model_shadow"]["shadow_result"]["model"] == (
-        "timesfm-2.5-primary"
-    )
+    assert result["professional_model_shadow"]["shadow_result"]["model"] == ("timesfm-2.5-primary")
     assert result["specialist_response_applied"] is False
     assert result["specialist_applied_model"] is None
     assert result["timesfm_shadow_expected_return_pct"] == pytest.approx(0.790514)
@@ -1392,9 +1525,7 @@ def test_local_ai_tools_chronos_shadow_adapter_records_primary_and_challenger(
         module.FeatureRequest(
             symbol="BTC/USDT",
             features={
-                "recent_closes": [
-                    99.0 + index * ((101.0 - 99.0) / 59) for index in range(60)
-                ],
+                "recent_closes": [99.0 + index * ((101.0 - 99.0) / 59) for index in range(60)],
                 "returns_1": 0.01,
                 "returns_5": 0.02,
                 "returns_20": 0.03,
@@ -1510,9 +1641,7 @@ def test_local_ai_tools_chronos_shadow_adapter_falls_back_to_direct_predict(
         module.FeatureRequest(
             symbol="BTC/USDT",
             features={
-                "recent_closes": [
-                    99.0 + index * ((101.0 - 99.0) / 59) for index in range(60)
-                ],
+                "recent_closes": [99.0 + index * ((101.0 - 99.0) / 59) for index in range(60)],
                 "returns_1": 0.01,
                 "returns_5": 0.02,
                 "returns_20": 0.03,
@@ -1812,7 +1941,7 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
             "label_version": module.RETURN_LABEL_VERSION,
             "cost_model_version": module.COST_MODEL_VERSION,
             "training_cost_policy": (
-                "separated_market_opportunity_and_execution_cost_tasks"
+                "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
             ),
             "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
             "tail_loss_scale_pct": {"long": 0.4, "short": 0.3},
@@ -1855,9 +1984,7 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
         "distribution_ready": True,
         "source_authority": "extra_trees_empirical_distribution",
     }
-    module.predict_proba_positive = lambda model, _x: (
-        0.95 if model is long_loss_model else 0.85
-    )
+    module.predict_proba_positive = lambda model, _x: 0.95 if model is long_loss_model else 0.85
 
     payload = module.profit_predict(
         module.FeatureRequest(
@@ -1934,9 +2061,7 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
     assert invalid_long["production_eligible"] is False
     assert "lower_quantile_above_raw_expected" in invalid_long["blockers"]
     assert invalid_ordering["prediction_quality"]["production_eligible"] is False
-    assert invalid_ordering["prediction_quality"]["reason"] == (
-        "lower_quantile_above_raw_expected"
-    )
+    assert invalid_ordering["prediction_quality"]["reason"] == ("lower_quantile_above_raw_expected")
 
     module.regression_prediction_distribution = lambda model, _x: {
         "expected": 0.4 if model is long_model else 0.2,
@@ -1959,14 +2084,19 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
 
     assert missing_calibration["prediction_quality"]["production_eligible"] is False
     assert missing_calibration["prediction_quality"]["reason"] == (
-        "actual_trade_calibration_not_ready"
+        "standardized_return_distribution_ready_for_paper"
     )
-    assert "actual_trade_calibration_not_ready" in missing_calibration[
-        "prediction_quality"
-    ]["blockers"]
-    assert "artifact_activation_not_production_authorized" in missing_calibration[
-        "prediction_quality"
-    ]["blockers"]
+    assert missing_calibration["prediction_quality"]["paper_eligible"] is True
+    assert missing_calibration["prediction_quality"]["anomalous"] is False
+    assert missing_calibration["prediction_quality"]["blockers"] == []
+    assert (
+        "actual_trade_calibration_not_ready"
+        in missing_calibration["prediction_quality"]["production_blockers"]
+    )
+    assert (
+        "artifact_activation_not_production_authorized"
+        in missing_calibration["prediction_quality"]["production_blockers"]
+    )
 
 
 def test_local_ai_tools_generated_exit_contract_uses_only_phase3_actions() -> None:
@@ -2025,8 +2155,7 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
     assert '"model_stage": "candidate"' in SERVICE_CODE
     assert '"promotion_recommendation": req.promotion_recommendation or {}' in SERVICE_CODE
     assert (
-        'PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"'
-        in SERVICE_CODE
+        'PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"' in SERVICE_CODE
     )
     assert '"promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW' in SERVICE_CODE
     assert '"live_mutation"' not in SERVICE_CODE
@@ -2039,27 +2168,34 @@ def test_local_ai_tools_generated_service_persists_phase3_artifact_policy() -> N
     assert '"phase": "phase3_model_factory"' in SERVICE_CODE
     assert '"training_policy": CURRENT_TRAINING_EPOCH_POLICY' in SERVICE_CODE
     assert '"trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY' in SERVICE_CODE
-    assert '"artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild)' in SERVICE_CODE
-    assert '"preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild)' in SERVICE_CODE
+    assert (
+        '"artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild)'
+        in SERVICE_CODE
+    )
+    assert (
+        '"preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild)'
+        in SERVICE_CODE
+    )
     assert '"persist_artifact_requested": bool(req.persist_artifact)' in SERVICE_CODE
     assert '"confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild)' in SERVICE_CODE
-    assert 'if not req.persist_artifact:' in SERVICE_CODE
+    assert "if not req.persist_artifact:" in SERVICE_CODE
     assert '"reason": "phase3_preflight_no_artifact_write"' in SERVICE_CODE
-    assert 'if not req.confirm_phase3_rebuild:' in SERVICE_CODE
+    assert "if not req.confirm_phase3_rebuild:" in SERVICE_CODE
     assert '"reason": "phase3_rebuild_confirmation_required"' in SERVICE_CODE
     assert "evaluation_policy" not in SERVICE_CODE
 
 
 def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_targets() -> None:
-    assert 'RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"' in SERVICE_CODE
+    assert (
+        'RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"' in SERVICE_CODE
+    )
     assert '"objective_name": RETURN_OBJECTIVE_NAME' in SERVICE_CODE
     assert '"label_version": RETURN_LABEL_VERSION' in SERVICE_CODE
     assert 'metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION' in SERVICE_CODE
     assert 'max(r["long_return"], r["short_return"], key=abs)' not in SERVICE_CODE
     assert (
         'max(net_return_pct(f(sample, "long_return_pct")), '
-        'net_return_pct(f(sample, "short_return_pct")))'
-        not in SERVICE_CODE
+        'net_return_pct(f(sample, "short_return_pct")))' not in SERVICE_CODE
     )
     assert '"long_model": long_model' in SERVICE_CODE
     assert '"short_model": short_model' in SERVICE_CODE
@@ -2067,7 +2203,9 @@ def test_local_ai_tools_generated_service_uses_side_specific_fee_after_return_ta
     assert '"return_distribution_inputs": return_distribution_inputs' in SERVICE_CODE
     assert '"training_data_sha256": training_data_sha256' in SERVICE_CODE
     assert '"source_code_sha256": source_code_sha256' in SERVICE_CODE
-    assert '"time_split_policy": "chronological_disjoint_decision_groups"' in SERVICE_CODE
+    assert (
+        '"time_split_policy": "independent_chronological_disjoint_decision_groups"' in SERVICE_CODE
+    )
     assert "persist_candidate_bundle(bundle, metadata)" in SERVICE_CODE
     assert "activate_candidate_shadow(" in SERVICE_CODE
     assert "local_quant_models.joblib" not in SERVICE_CODE
@@ -2118,9 +2256,7 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
                 "decision_id": index + 1,
                 "symbol": "BTC/USDT",
                 "horizon_minutes": 10,
-                "label_timestamp": (
-                    first_label_at + timedelta(minutes=index * 11)
-                ).isoformat(),
+                "label_timestamp": (first_label_at + timedelta(minutes=index * 11)).isoformat(),
                 "features": {
                     "symbol": "BTC/USDT",
                     "current_price": 100.0 + index * 0.01,
@@ -2150,9 +2286,8 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
                             "short_gross_market_return_pct": -0.15,
                         },
                         "execution_cost_and_slippage_distribution": {
-                            "eligible": True,
-                            "long_total_cost_pct": 0.12,
-                            "short_total_cost_pct": 0.08,
+                            "eligible": False,
+                            "reason": "shadow_cost_is_not_authoritative_training_data",
                         },
                         "authoritative_realized_return_distribution": {
                             "eligible": False,
@@ -2164,6 +2299,70 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
     return samples
 
 
+def _training_trade_samples(count: int = 20) -> list[dict[str, object]]:
+    samples: list[dict[str, object]] = []
+    first_opened_at = datetime(2026, 7, 14, tzinfo=UTC)
+    for index in range(count):
+        opened_at = first_opened_at + timedelta(minutes=index * 60)
+        side = "long" if index % 2 == 0 else "short"
+        samples.append(
+            {
+                "id": index + 1,
+                "position_id": index + 101,
+                "lifecycle_key": f"paper|BTC-USDT-SWAP|{index + 1}|{side}",
+                "symbol": "BTC/USDT",
+                "side": side,
+                "decision_timestamp": opened_at.isoformat(),
+                "label_timestamp": (opened_at + timedelta(minutes=30)).isoformat(),
+                "holding_minutes": 30.0,
+                "sample_weight": 1.0,
+                "features": {
+                    "symbol": "BTC/USDT",
+                    "current_price": 100.0 + index * 0.01,
+                    "returns_1": 0.01,
+                    "returns_5": 0.02,
+                    "returns_20": 0.03,
+                    "rsi_14": 55.0,
+                    "volume_ratio": 1.1,
+                    "spread_pct": 0.02,
+                    "funding_rate": 0.0001,
+                    "horizon_minutes": 60,
+                },
+                "profit_supervision": {
+                    "version": PROFIT_SUPERVISION_VERSION,
+                    "tasks": {
+                        "market_opportunity_distribution": {"eligible": False},
+                        "execution_cost_and_slippage_distribution": {
+                            "eligible": True,
+                            "source_authority": "okx_fills_fees_funding",
+                            "total_cost_pct": 0.08 + index * 0.001,
+                        },
+                        "authoritative_realized_return_distribution": {
+                            "eligible": True,
+                            "side": side,
+                            "net_return_after_all_cost_pct": (0.2 if index % 3 else -0.1),
+                        },
+                    },
+                },
+            }
+        )
+    return samples
+
+
+def _training_request(
+    module: ModuleType,
+    *,
+    shadow_samples: list[dict[str, object]],
+    trade_samples: list[dict[str, object]] | None = None,
+    **kwargs: object,
+) -> object:
+    return module.TrainRequest(
+        shadow_samples=shadow_samples,
+        trade_samples=trade_samples or _training_trade_samples(),
+        **kwargs,
+    )
+
+
 def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
     tmp_path: Path,
 ) -> None:
@@ -2172,7 +2371,7 @@ def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
         "preflight must not write a model bundle"
     )
 
-    result = module.train(module.TrainRequest(shadow_samples=_training_shadow_samples()))
+    result = module.train(_training_request(module, shadow_samples=_training_shadow_samples()))
 
     assert result["trained"] is False
     assert result["reason"] == "phase3_preflight_no_artifact_write"
@@ -2184,7 +2383,7 @@ def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
     assert not module.CURRENT_POINTER_PATH.exists()
 
 
-def test_local_ai_tools_training_marks_positive_gross_but_negative_net_as_hold(
+def test_local_ai_tools_training_does_not_require_shadow_execution_cost(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2201,15 +2400,14 @@ def test_local_ai_tools_training_marks_positive_gross_but_negative_net_as_hold(
         tasks = sample["profit_supervision"]["tasks"]
         tasks[module.MARKET_OPPORTUNITY_TASK]["long_gross_market_return_pct"] = 0.05
         tasks[module.MARKET_OPPORTUNITY_TASK]["short_gross_market_return_pct"] = -0.05
-        tasks[module.EXECUTION_COST_TASK]["long_total_cost_pct"] = 0.12
-        tasks[module.EXECUTION_COST_TASK]["short_total_cost_pct"] = 0.08
+        assert tasks[module.EXECUTION_COST_TASK]["eligible"] is False
 
-    module.train(module.TrainRequest(shadow_samples=samples))
+    module.train(_training_request(module, shadow_samples=samples))
 
-    assert captured
-    assert all(row["long_net_return"] < 0.0 for row in captured)
-    assert all(row["short_net_return"] < 0.0 for row in captured)
-    assert all(row["best_side"] == "hold" for row in captured)
+    market_rows = [row for row in captured if "best_side" in row]
+    assert market_rows
+    assert all("long_execution_cost" not in row for row in market_rows)
+    assert all(row["best_side"] == "long" for row in market_rows)
 
 
 def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
@@ -2218,7 +2416,7 @@ def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
     module = _local_ai_tools_training_module(tmp_path)
 
     result = module.train(
-        module.TrainRequest(shadow_samples=_training_shadow_samples(count=2))
+        _training_request(module, shadow_samples=_training_shadow_samples(count=2))
     )
 
     assert result["horizons"] == [10]
@@ -2230,7 +2428,7 @@ def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
     module = _local_ai_tools_training_module(tmp_path)
 
     result = module.train(
-        module.TrainRequest(shadow_samples=_training_shadow_samples(count=20))
+        _training_request(module, shadow_samples=_training_shadow_samples(count=20))
     )
 
     report = result["walk_forward_report"]
@@ -2240,9 +2438,7 @@ def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
     assert report["chronological_label_disjoint"] is True
     assert report["chronological"] is True
     assert report["folds"]
-    assert all(
-        fold["decision_group_overlap_count"] == 0 for fold in report["folds"]
-    )
+    assert all(fold["decision_group_overlap_count"] == 0 for fold in report["folds"])
     assert all(
         fold["training_label_end"] < fold["validation_decision_start"]
         and fold["label_timestamp_overlap_count"] == 0
@@ -2254,9 +2450,7 @@ def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
         for fold in report["folds"]
         for side_report in fold["sides"].values()
     )
-    assert result["evaluation_report_hashes"] == module._evaluation_report_hashes(
-        result
-    )
+    assert result["evaluation_report_hashes"] == module._evaluation_report_hashes(result)
     assert result["artifact_return_evidence_sha256"] == module.canonical_sha256(
         result["evaluation_report_hashes"]
     )
@@ -2280,9 +2474,7 @@ def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
                     "decision_id": decision_index + 1,
                     "horizon_minutes": horizon,
                     "decision_timestamp": decision_at.isoformat(),
-                    "label_timestamp": (
-                        decision_at + timedelta(minutes=horizon)
-                    ).isoformat(),
+                    "label_timestamp": (decision_at + timedelta(minutes=horizon)).isoformat(),
                     "correlation_weight": {
                         "correlation_group": f"shadow_decision:{decision_index + 1}"
                     },
@@ -2290,15 +2482,12 @@ def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
             )
             samples.append(sample)
 
-    result = module.train(module.TrainRequest(shadow_samples=samples))
+    result = module.train(_training_request(module, shadow_samples=samples))
     report = result["walk_forward_report"]
 
     assert report["status"] == "complete"
     assert report["chronological_label_disjoint"] is True
-    assert any(
-        fold["purged_training_decision_group_count"] > 0
-        for fold in report["folds"]
-    )
+    assert any(fold["purged_training_decision_group_count"] > 0 for fold in report["folds"])
     assert all(
         fold["training_label_end"] < fold["validation_decision_start"]
         and fold["decision_group_overlap_count"] == 0
@@ -2318,16 +2507,63 @@ def test_local_ai_training_rejects_missing_label_or_decision_identity(
     missing_decision[0]["correlation_weight"] = {}
 
     for samples in (missing_label, missing_decision):
-        result = module.train(module.TrainRequest(shadow_samples=samples))
+        result = module.train(_training_request(module, shadow_samples=samples))
         assert result["trained"] is False
-        assert result["reason"] == "chronological_training_identity_incomplete"
+        assert result["reason"] == "chronological_market_training_identity_incomplete"
+
+
+def test_local_ai_training_requires_authoritative_trade_cost_rows(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+
+    missing = module.train(module.TrainRequest(shadow_samples=_training_shadow_samples(count=2)))
+    wrong_authority = _training_trade_samples(count=2)
+    for sample in wrong_authority:
+        sample["profit_supervision"]["tasks"][module.EXECUTION_COST_TASK]["source_authority"] = (
+            "shadow_counterfactual"
+        )
+    rejected = module.train(
+        module.TrainRequest(
+            shadow_samples=_training_shadow_samples(count=2),
+            trade_samples=wrong_authority,
+        )
+    )
+
+    assert missing["reason"] == "authoritative_execution_cost_distribution_unavailable"
+    assert missing["shadow_sample_count"] == 2
+    assert missing["authoritative_cost_sample_count"] == 0
+    assert rejected["reason"] == "authoritative_execution_cost_distribution_unavailable"
+
+
+def test_local_ai_training_reports_cost_identity_failure_separately(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    trades = _training_trade_samples(count=2)
+    trades[0]["label_timestamp"] = None
+
+    result = module.train(
+        _training_request(
+            module,
+            shadow_samples=_training_shadow_samples(count=2),
+            trade_samples=trades,
+        )
+    )
+
+    assert result["reason"] == "chronological_cost_training_identity_incomplete"
+    assert result["shadow_sample_count"] == 2
+    assert result["authoritative_cost_sample_count"] == 2
 
 
 def test_local_ai_tools_generated_service_uses_profit_target_distribution(
     tmp_path: Path,
 ) -> None:
     module = _local_ai_tools_training_module(tmp_path)
-    assert module.f({module.PROFIT_TRAINING_TARGET: 0.0}, module.PROFIT_TRAINING_TARGET, float("nan")) == 0.0
+    assert (
+        module.f({module.PROFIT_TRAINING_TARGET: 0.0}, module.PROFIT_TRAINING_TARGET, float("nan"))
+        == 0.0
+    )
 
     sample = _training_shadow_samples(count=1)[0]
     sample["profit_supervision"]["tasks"][module.AUTHORITATIVE_REALIZED_RETURN_TASK] = {
@@ -2347,9 +2583,7 @@ def test_local_ai_tools_generated_service_uses_profit_target_distribution(
     assert "net_return_after_cost_pct" not in profile
 
     old_only = deepcopy(sample)
-    realized = old_only["profit_supervision"]["tasks"][
-        module.AUTHORITATIVE_REALIZED_RETURN_TASK
-    ]
+    realized = old_only["profit_supervision"]["tasks"][module.AUTHORITATIVE_REALIZED_RETURN_TASK]
     del realized[module.PROFIT_TRAINING_TARGET]
     realized["realized_net_return_pct"] = 9.99
 
@@ -2362,9 +2596,7 @@ def test_local_ai_walk_forward_tail_policy_ignores_future_extreme_returns(
     module = _local_ai_tools_training_module(tmp_path)
     baseline = _training_shadow_samples(count=18)
     for index, sample in enumerate(baseline):
-        market_task = sample["profit_supervision"]["tasks"][
-            module.MARKET_OPPORTUNITY_TASK
-        ]
+        market_task = sample["profit_supervision"]["tasks"][module.MARKET_OPPORTUNITY_TASK]
         market_task["long_gross_market_return_pct"] = -0.4 if index < 6 else 0.5
     changed = [
         {
@@ -2373,8 +2605,7 @@ def test_local_ai_walk_forward_tail_policy_ignores_future_extreme_returns(
             "profit_supervision": {
                 **sample["profit_supervision"],
                 "tasks": {
-                    key: dict(value)
-                    for key, value in sample["profit_supervision"]["tasks"].items()
+                    key: dict(value) for key, value in sample["profit_supervision"]["tasks"].items()
                 },
             },
         }
@@ -2385,20 +2616,16 @@ def test_local_ai_walk_forward_tail_policy_ignores_future_extreme_returns(
             "long_gross_market_return_pct"
         ] = -999.0
 
-    baseline_report = module.train(
-        module.TrainRequest(shadow_samples=baseline)
-    )["walk_forward_report"]
-    changed_report = module.train(
-        module.TrainRequest(shadow_samples=changed)
-    )["walk_forward_report"]
+    baseline_report = module.train(_training_request(module, shadow_samples=baseline))[
+        "walk_forward_report"
+    ]
+    changed_report = module.train(_training_request(module, shadow_samples=changed))[
+        "walk_forward_report"
+    ]
 
     assert (
-        baseline_report["folds"][0]["sides"]["long"][
-            "training_tail_loss_policy"
-        ]
-        == changed_report["folds"][0]["sides"]["long"][
-            "training_tail_loss_policy"
-        ]
+        baseline_report["folds"][0]["sides"]["long"]["training_tail_loss_policy"]
+        == changed_report["folds"][0]["sides"]["long"]["training_tail_loss_policy"]
     )
 
 
@@ -2411,7 +2638,8 @@ def test_local_ai_training_data_hash_binds_features_and_text_inputs(
     changed_features[0]["features"]["returns_1"] = 9.5
 
     baseline_hash = module.train(
-        module.TrainRequest(
+        _training_request(
+            module,
             shadow_samples=baseline,
             text_sentiment_samples=[
                 {"id": 1, "text": "cost is controlled", "sentiment_score": 0.2}
@@ -2419,7 +2647,8 @@ def test_local_ai_training_data_hash_binds_features_and_text_inputs(
         )
     )["training_data_sha256"]
     feature_hash = module.train(
-        module.TrainRequest(
+        _training_request(
+            module,
             shadow_samples=changed_features,
             text_sentiment_samples=[
                 {"id": 1, "text": "cost is controlled", "sentiment_score": 0.2}
@@ -2427,7 +2656,8 @@ def test_local_ai_training_data_hash_binds_features_and_text_inputs(
         )
     )["training_data_sha256"]
     text_hash = module.train(
-        module.TrainRequest(
+        _training_request(
+            module,
             shadow_samples=baseline,
             text_sentiment_samples=[
                 {"id": 1, "text": "tail loss expanded", "sentiment_score": -0.2}
@@ -2483,9 +2713,7 @@ def test_local_ai_leave_one_symbol_out_blocks_single_symbol_profit_support() -> 
     ]
 
     report = module._leave_one_symbol_out_stability(rows)
-    robo_removed = next(
-        row for row in report["rows"] if row["excluded_symbol"] == "ROBO/USDT"
-    )
+    robo_removed = next(row for row in report["rows"] if row["excluded_symbol"] == "ROBO/USDT")
 
     assert report["stable"] is False
     assert robo_removed["evidence"]["promotion_math_ready"] is False
@@ -2501,7 +2729,8 @@ def test_local_ai_tools_generated_service_requires_confirmed_phase3_rebuild(
     )
 
     result = module.train(
-        module.TrainRequest(
+        _training_request(
+            module,
             shadow_samples=_training_shadow_samples(),
             persist_artifact=True,
         )
@@ -2535,7 +2764,8 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
     module.load_trusted_joblib_bundle = lambda _path: stored["bundle"]
 
     result = module.train(
-        module.TrainRequest(
+        _training_request(
+            module,
             shadow_samples=_training_shadow_samples(),
             persist_artifact=True,
             confirm_phase3_rebuild=True,
@@ -2560,12 +2790,27 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
     assert metadata["walk_forward_report"]["decision_group_disjoint"] is True
     assert set(metadata["leave_one_symbol_out_report"]) == {"long", "short"}
     assert set(metadata["oos_return_evaluation"]) == {"long", "short"}
-    assert metadata["authoritative_trade_return_evidence"]["sample_count"] == 0
-    assert metadata["evaluation_report_hashes"] == module._evaluation_report_hashes(
-        metadata
+    assert metadata["authoritative_trade_return_evidence"]["sample_count"] == 20
+    assert metadata["authoritative_cost_sample_count"] == 20
+    assert metadata["execution_cost_holdout_report"]["source_authority"] == (
+        "okx_fills_fees_funding"
     )
+    assert metadata["completed_market_decision_group_count"] == 200
+    assert metadata["completed_authoritative_cost_decision_group_count"] == 20
+    assert metadata["completed_training_decision_group_count"] == 220
+    assert metadata["last_trained_completed_training_decision_group_count"] == 220
+    assert metadata["training_distribution_profile"]["features"]
+    assert metadata["evaluation_report_hashes"] == module._evaluation_report_hashes(metadata)
     assert current["activation_manifest"]["activation_stage"] == "shadow"
+    assert current["activation_manifest"]["execution_scope"] == "paper_only"
+    assert current["activation_manifest"]["paper_execution_permission"] is True
     assert current["activation_manifest"]["live_ml_ready"] is False
+    activation_evidence = current["activation_manifest"]["return_evidence_report"]
+    assert set(module.EVALUATION_REPORT_FIELDS).issubset(activation_evidence)
+    assert (
+        activation_evidence["execution_cost_holdout_report"]
+        == metadata["execution_cost_holdout_report"]
+    )
     assert current["activation_manifest"]["return_evidence_ready"] is False
     assert current["activation_manifest"]["return_evidence_blockers"]
     assert not module.CANDIDATE_POINTER_PATH.exists()

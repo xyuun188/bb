@@ -688,8 +688,42 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     assert "deferred_stages=1" in row["note"]
     assert row["order_fact_sync"]["unverified_count"] == 0
     assert factory_kwargs["limit"] == 100
-    assert factory_kwargs["priority_only"] is True
+    assert factory_kwargs["priority_only"] is False
     assert factory_kwargs["timeout_seconds"] == 30.0
+    assert row["sync_scope"] == "account_discovery"
+    service._okx_order_fact_sync_last_row = row
+    assert service._okx_order_fact_sync_status_payload()["sync_scope"] == "account_discovery"
+
+
+@pytest.mark.asyncio
+async def test_okx_order_fact_sync_uses_priority_scope_after_recent_account_discovery() -> None:
+    service = TradingService.__new__(TradingService)
+    factory_kwargs: dict[str, Any] = {}
+
+    class FakeOrderFactSyncService:
+        async def sync(self) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "okx_pull_available": True,
+                "confirmed_count": 0,
+                "unverified_count": 0,
+                "backfilled_count": 0,
+                "deferred_stages": [],
+            }
+
+    def factory(**kwargs: Any) -> FakeOrderFactSyncService:
+        factory_kwargs.update(kwargs)
+        return FakeOrderFactSyncService()
+
+    service.okx_order_fact_sync_factory = factory
+    service._okx_order_fact_discovery_last_finished_at = datetime.now(UTC)
+
+    row = await service._sync_okx_order_facts_for_loop()
+
+    assert factory_kwargs["priority_only"] is True
+    assert row["sync_scope"] == "priority"
+    service._okx_order_fact_sync_last_row = row
+    assert service._okx_order_fact_sync_status_payload()["sync_scope"] == "priority"
 
 
 @pytest.mark.asyncio
@@ -2264,7 +2298,7 @@ async def test_local_ml_auto_train_process_isolated_from_trading_database_pool(
         async def communicate(self) -> tuple[bytes, bytes]:
             return (
                 b'{"event":"refusing incompatible ML signal artifact"}\n'
-                b'BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON='
+                b"BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="
                 b'{"trained":false,"reason":"not_due"}\n',
                 b"",
             )
@@ -2621,7 +2655,7 @@ async def test_local_ai_tools_auto_train_checks_cursors_before_loading_training_
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_auto_train_runs_due_training_outside_trading_process(
+async def test_local_ai_tools_auto_train_waits_for_independent_group_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from scripts import train_local_ai_tools_models as train_script
@@ -2645,6 +2679,8 @@ async def test_local_ai_tools_auto_train_runs_due_training_outside_trading_proce
                 "model_bundle_available": True,
                 "last_trained_completed_shadow_sample_count": 10,
                 "last_trained_completed_trade_sample_count": 3,
+                "last_trained_completed_training_decision_group_count": 155,
+                "trained_at": datetime.now(UTC).isoformat(),
             }
 
     async def fail_heavy_load(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
@@ -2667,6 +2703,8 @@ async def test_local_ai_tools_auto_train_runs_due_training_outside_trading_proce
             "reason": "cursor_probe_complete",
             "completed_shadow_sample_count": 11,
             "completed_trade_sample_count": 3,
+            "completed_training_decision_group_count": 156,
+            "training_distribution_profile": {"features": {}},
         }
     )
     service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
@@ -2682,22 +2720,12 @@ async def test_local_ai_tools_auto_train_runs_due_training_outside_trading_proce
 
     result = await service._maybe_train_local_ai_tools_process(force=False)
 
-    assert result["trained"] is True
+    assert result["trained"] is False
+    assert result["reason"] == "not_due"
     assert result["training_process_isolated"] is True
     assert result["new_shadow_sample_count"] == 1
-    assert result["last_trained_completed_shadow_sample_count"] == 12
-    assert result["last_trained_completed_trade_sample_count"] == 4
-    assert service._local_tools_last_completed_shadow_count == 12
-    assert started_runs == [
-        {
-            "scheduler_id": "local_ai_tools_auto_train",
-            "model_ids": trading_service.LOCAL_AI_TOOL_MODEL_IDS,
-            "run_id": "isolated-training-run",
-            "trigger_reason": "training_due",
-            "sample_cursor": {"shadow": 11, "trade": 3},
-            "timeout_seconds": trading_service.AUTO_TRAIN_LEASE_STALE_SECONDS,
-        }
-    ]
+    assert result["new_decision_group_count"] == 1
+    assert started_runs == []
     assert result["training_policy"]["process_boundary"] == ("dedicated_training_subprocess")
 
 
@@ -2720,6 +2748,7 @@ async def test_local_ai_tools_auto_train_rebuilds_when_clean_view_rebases(
                 "model_bundle_available": True,
                 "last_trained_completed_shadow_sample_count": 11,
                 "last_trained_completed_trade_sample_count": 3,
+                "last_trained_completed_training_decision_group_count": 11,
             }
 
     monkeypatch.setattr(
@@ -2737,6 +2766,8 @@ async def test_local_ai_tools_auto_train_rebuilds_when_clean_view_rebases(
             "reason": "cursor_probe_complete",
             "completed_shadow_sample_count": 10,
             "completed_trade_sample_count": 3,
+            "completed_training_decision_group_count": 10,
+            "training_distribution_profile": {"features": {}},
         }
     )
     service._run_local_ai_tools_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
@@ -3499,6 +3530,25 @@ async def test_entry_policy_allows_live_rules_canary_without_live_ml_profit_cont
 async def test_entry_policy_reprices_execution_cost_with_planned_order_notional() -> None:
     events: list[tuple[str, float]] = []
 
+    class FakePriceGuard:
+        async def guard_reason(
+            self,
+            decision: DecisionOutput,
+            _model_mode: str,
+        ) -> None:
+            events.append(("refresh", 0.0))
+            snapshot = dict(decision.feature_snapshot or {})
+            snapshot.update(
+                {
+                    "bid": 99.9,
+                    "ask": 100.1,
+                    "contract_value_base": 1.0,
+                    "orderbook_bids": [[99.9, 10.0]],
+                    "orderbook_asks": [[100.1, 10.0]],
+                }
+            )
+            decision.feature_snapshot = snapshot
+
     def fake_score(decision: DecisionOutput, _strategy: dict[str, Any] | None) -> float:
         planned = float((decision.feature_snapshot or {}).get("planned_order_notional_usdt") or 0.0)
         events.append(("score", planned))
@@ -3529,6 +3579,7 @@ async def test_entry_policy_reprices_execution_cost_with_planned_order_notional(
     policy = EntryPolicy(
         entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
         entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_price_guard=FakePriceGuard(),
     )
     decision = _decision(Action.LONG)
     decision.feature_snapshot = {"current_price": 100.0}
@@ -3536,6 +3587,7 @@ async def test_entry_policy_reprices_execution_cost_with_planned_order_notional(
     await policy.prepare_dynamic_risk_contract(decision, "paper", [])
 
     assert events == [
+        ("refresh", 0.0),
         ("score", 0.0),
         ("sizing", 100.0),
         ("score", 100.0),
@@ -3790,6 +3842,33 @@ async def test_entry_policy_uses_injected_price_guard_boundary():
 
     assert reason == "price-blocked"
     assert calls == ["BTC/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_risk_contract_blocks_before_sizing_when_price_guard_fails() -> None:
+    events: list[str] = []
+
+    class FakePriceGuard:
+        async def guard_reason(self, _decision, _model_mode):
+            events.append("price_guard")
+            return "price-blocked"
+
+    async def fake_sizing(_decision, _model_mode, _open_positions):
+        events.append("sizing")
+
+    policy = EntryPolicy(
+        entry_price_guard=FakePriceGuard(),
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+    )
+
+    reason = await policy.prepare_dynamic_risk_contract(
+        _decision(Action.LONG),
+        "paper",
+        [],
+    )
+
+    assert reason == "price-blocked"
+    assert events == ["price_guard"]
 
 
 def test_trading_service_dashboard_runtime_boundaries_expose_public_state():

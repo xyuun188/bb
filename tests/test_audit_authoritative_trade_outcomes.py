@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from scripts.audit_authoritative_trade_outcomes import (
     _compact_gap_summary,
     _gap_summary,
+    _realized_pnl_sign_counts,
     _slippage_integrity_summary,
     _slippage_storage_summary,
     _strategy_entry_kind_counts,
@@ -93,6 +94,17 @@ def test_trade_audit_distinguishes_normal_exploration_and_fast_training() -> Non
         "normal_strategy_trade": 1,
         "bounded_risk_paper_exploration": 1,
     }
+
+
+def test_trade_audit_counts_profit_and_loss_without_filtering_either_side() -> None:
+    assert _realized_pnl_sign_counts(
+        [
+            {"realized_pnl": 1.25},
+            {"realized_pnl": -0.5},
+            {"realized_pnl": 0.0},
+            {"realized_pnl": None},
+        ]
+    ) == {"profit": 1, "loss": 1, "flat": 2}
 
 
 def test_slippage_integrity_summary_reports_exact_side_and_order_failures() -> None:

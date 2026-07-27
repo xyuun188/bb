@@ -29,7 +29,7 @@ from services.entry_direction_support import (
 )
 from services.entry_signal_extraction import (
     enrich_signal_payload,
-    signal_production_eligible,
+    signal_paper_eligibility,
     signal_return_distribution,
     unwrap_tool_payload,
 )
@@ -1344,7 +1344,7 @@ class EnsembleCoordinator:
         if side not in {"long", "short"}:
             return False
         profit = self._local_profit_signal(context)
-        if not profit or not signal_production_eligible(profit):
+        if not profit or signal_paper_eligibility(profit, side).get("eligible") is not True:
             return False
         expected = self._local_expected_return(profit, side)
         best_side = signal_payload_side(profit) or str(profit.get("best_side") or "").lower()
@@ -1355,7 +1355,10 @@ class EnsembleCoordinator:
         if side not in {"long", "short"}:
             return False
         prediction = self._local_timeseries_signal(context)
-        if not prediction or not signal_production_eligible(prediction):
+        if (
+            not prediction
+            or signal_paper_eligibility(prediction, side).get("eligible") is not True
+        ):
             return False
         best_side = signal_payload_side(prediction)
         expected = self._local_expected_return(prediction, side)

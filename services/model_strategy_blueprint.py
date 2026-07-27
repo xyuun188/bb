@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-07-21.trained-model-strategy.v2"
+MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-07-27.paper-live-permission.v3"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -60,21 +60,21 @@ def build_model_strategy_blueprint(
         for side in _safe_list(paper_gate.get("eligible_sides"))
         if str(side).lower() in {"long", "short"}
     }
-    live_ml_ready = bool(
-        stage in {"canary", "active"}
-        and active.get("live_ml_ready") is True
-        and production_sides
+    artifact_sides = {
+        str(side).lower()
+        for side in _safe_dict(model.get("oos_return_evaluation"))
+        if str(side).lower() in {"long", "short"}
+    }
+    eligible_sides = sorted(production_sides or paper_sides or artifact_sides)
+    artifact_complete = bool(
+        version != "unversioned"
+        and str(model.get("trained_at") or model.get("artifact_version") or "")
+        and int(model.get("test_count") or 0) > 0
     )
-    paper_canary_authorized = bool(
-        stage == "canary"
-        and active.get("paper_canary_authorized") is True
-        and paper_gate.get("authorized") is True
-        and paper_gate.get("execution_scope") == "paper_only"
-        and paper_sides
-    )
-    eligible_sides = sorted(production_sides or paper_sides)
     paper_execution_eligible = bool(
-        live_ml_ready or paper_canary_authorized
+        artifact_complete
+        and eligible_sides
+        and stage in {"candidate", "shadow", "canary", "active"}
     )
     champion_comparison = _safe_dict(active.get("champion_comparison"))
     oos_evaluation = _safe_dict(model.get("oos_return_evaluation"))
@@ -99,8 +99,8 @@ def build_model_strategy_blueprint(
         "eligible_sides": eligible_sides,
     }
     blockers: list[str] = []
-    if stage not in {"canary", "active"}:
-        blockers.append("trained_model_not_canary_or_active")
+    if stage not in {"candidate", "shadow", "canary", "active"}:
+        blockers.append("trained_model_lifecycle_not_paper_eligible")
     if not eligible_sides:
         blockers.append("trained_model_has_no_governed_side")
     if not paper_execution_eligible:
@@ -128,10 +128,11 @@ def build_model_strategy_blueprint(
         },
         "entry_policy": {
             "direction_source": "trained_model_return_distribution",
-            "require_current_fee_after_expected_return_positive": True,
-            "require_current_fee_after_return_lcb_positive": True,
+            "require_current_fee_after_expected_return_positive": False,
+            "require_current_fee_after_return_lcb_positive": False,
             "require_current_execution_cost_complete": True,
-            "require_actual_trade_calibration": True,
+            "require_actual_trade_calibration": False,
+            "negative_expected_return_uses_coverage_risk": True,
             "historical_replay_uses_exact_model_inference": True,
         },
         "exit_policy": {
@@ -255,7 +256,7 @@ def paper_strategy_authorization(
     if not model_version or model_version != champion_version:
         return {**result, "reason": "paper_strategy_model_version_mismatch"}
     lifecycle = str(model_signal.get("artifact_lifecycle") or "").lower()
-    if lifecycle not in {"canary", "active"}:
+    if lifecycle not in {"candidate", "shadow", "canary", "active"}:
         return {**result, "reason": "paper_strategy_model_lifecycle_ineligible"}
 
     live_ml_ready = model_signal.get("live_ml_ready") is True
@@ -270,7 +271,13 @@ def paper_strategy_authorization(
             for value in _safe_list(paper_gate.get("eligible_sides"))
         }
     )
-    if not live_ml_ready and not canary_ready:
+    quality = _safe_dict(model_signal.get("prediction_quality"))
+    paper_quality_ready = bool(
+        quality.get("contract_complete") is True
+        and quality.get("paper_eligible") is True
+        and quality.get("anomalous") is not True
+    )
+    if not live_ml_ready and not canary_ready and not paper_quality_ready:
         return {**result, "reason": "paper_strategy_model_authorization_missing"}
     return {
         **result,

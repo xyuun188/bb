@@ -76,9 +76,10 @@ def test_paper_batch_expert_prompt_exposes_cost_complete_unpromoted_summary() ->
             "direction_competition": {
                 "long": {
                     "evidence": [
-                        {
-                            "source": "local_ml",
-                            "raw_expected_return_pct": 0.3,
+                            {
+                                "source": "local_ml",
+                                "decision_eligible": True,
+                                "raw_expected_return_pct": 0.3,
                             "objective_expected_return_pct": -0.2,
                             "horizon_minutes": 10,
                             "return_distribution_contract": {
@@ -556,7 +557,10 @@ class _ProviderBatchExpert(AbstractAIModel):
         if not self.allow_individual:
             raise AssertionError("provider batch tests should not call individual decide")
         assert context.get("_force_independent_expert") is True
-        assert context.get("_force_fast_independent_expert") is True
+        if str(context.get("execution_mode") or "").lower() == "paper":
+            assert context.get("_force_fast_independent_expert") is not True
+        else:
+            assert context.get("_force_fast_independent_expert") is True
         assert context.get("_provider_independent_expert_mode")
         type(self).individual_calls.append((self._model_name, self.name))
         return DecisionOutput(
@@ -1056,7 +1060,7 @@ async def test_paper_complete_plans_skip_oversized_multi_expert_batch(
     assert len(_ProviderBatchExpert.individual_calls) == 5
     assert all(row.get("batch_expert", False) is False for row in context["_model_timings"])
     assert context["_force_independent_expert"] is True
-    assert context["_force_fast_independent_expert"] is True
+    assert "_force_fast_independent_expert" not in context
     assert context["_provider_independent_expert_mode"] is True
 
 

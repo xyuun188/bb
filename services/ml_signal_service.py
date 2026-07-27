@@ -4021,6 +4021,29 @@ class MLSignalService:
         paper_ml_ready = bool(
             primary and primary.get("paper_prediction_eligible") is True
         )
+        prediction_contract_complete = bool(
+            paper_ml_ready
+            and primary_return_distribution.get("production_eligible") is True
+        )
+        structural_blockers = list(
+            primary_return_distribution.get("blockers") or []
+        )
+        if not paper_ml_ready:
+            structural_blockers.append("paper_prediction_contract_incomplete")
+        production_blockers = [
+            *structural_blockers,
+            *(
+                []
+                if primary_cost_distribution.get("distribution_ready") is True
+                else ["counterfactual_execution_cost_distribution_incomplete"]
+            ),
+            *(
+                []
+                if primary.get("actual_trade_calibration_ready") is True
+                else ["authoritative_actual_trade_calibration_incomplete"]
+            ),
+            *([] if live_ml_ready else ["model_not_promoted_for_live"]),
+        ]
         activation = _safe_dict(
             self._resolved_artifact.activation_manifest
             if self._resolved_artifact is not None
@@ -4044,6 +4067,7 @@ class MLSignalService:
             "route_mode": ("live" if live_prediction_influence else "paper_analysis"),
             "paper_ml_ready": paper_ml_ready,
             "live_ml_ready": live_ml_ready,
+            "production_permission": live_prediction_influence,
             "objective_name": metadata.get("objective_name"),
             "objective_version": metadata.get("objective_version"),
             "label_name": metadata.get("label_name"),
@@ -4061,30 +4085,19 @@ class MLSignalService:
             "strategy_blueprint": strategy_blueprint,
             "return_distribution_contract_version": (RETURN_DISTRIBUTION_CONTRACT_VERSION),
             "prediction_quality": {
+                "contract_complete": prediction_contract_complete,
+                "paper_eligible": prediction_contract_complete,
                 "production_eligible": live_prediction_influence,
-                "anomalous": not live_prediction_influence,
+                "anomalous": not prediction_contract_complete,
                 "reason": (
                     "separated_market_cost_and_actual_calibration_ready"
                     if live_prediction_influence
-                    else (
-                        "current_prediction_contract_incomplete"
-                        if live_ml_ready
-                        else "ml_readiness_blocks_live_influence"
-                    )
+                    else "standardized_return_distribution_ready_for_paper"
+                    if prediction_contract_complete
+                    else "current_prediction_contract_incomplete"
                 ),
-                "blockers": [
-                    *list(primary_return_distribution.get("blockers") or []),
-                    *(
-                        []
-                        if primary_cost_distribution.get("distribution_ready") is True
-                        else ["counterfactual_execution_cost_distribution_incomplete"]
-                    ),
-                    *(
-                        []
-                        if primary.get("actual_trade_calibration_ready") is True
-                        else ["authoritative_actual_trade_calibration_incomplete"]
-                    ),
-                ],
+                "blockers": list(dict.fromkeys(structural_blockers)),
+                "production_blockers": list(dict.fromkeys(production_blockers)),
             },
             "status": (
                 "entry_profit_filter"

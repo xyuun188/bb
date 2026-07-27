@@ -502,6 +502,7 @@ def build_okx_history_training_sample(
     orders_by_exchange_id: dict[str, Any] | None = None,
     decision_raw_by_position_id: dict[int, dict[str, Any]] | None = None,
     decision_raw_by_order_id: dict[str, dict[str, Any]] | None = None,
+    decision_feature_by_order_id: dict[str, dict[str, Any]] | None = None,
     decision_execution_by_order_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Convert one mirrored OKX positions-history lifecycle into one sample."""
@@ -510,6 +511,7 @@ def build_okx_history_training_sample(
     orders_by_exchange_id = orders_by_exchange_id or {}
     decision_raw_by_position_id = decision_raw_by_position_id or {}
     decision_raw_by_order_id = decision_raw_by_order_id or {}
+    decision_feature_by_order_id = decision_feature_by_order_id or {}
     decision_execution_by_order_id = decision_execution_by_order_id or {}
     raw = dict(_value(history, "raw_row", {}) or {})
     position_ids = [
@@ -711,6 +713,7 @@ def build_okx_history_training_sample(
         }
     )
     raw_llm_response: dict[str, Any] = {}
+    entry_feature_snapshot: dict[str, Any] = {}
     decision_id = entry_decision_ids[0] if len(entry_decision_ids) == 1 else 0
     decision_lineage_source = (
         "exact_entry_order_decision_id"
@@ -728,6 +731,10 @@ def build_okx_history_training_sample(
             if isinstance(candidate, dict) and candidate:
                 raw_llm_response = candidate
                 decision_lineage_source = "exact_entry_order_decision_payload"
+            feature_candidate = decision_feature_by_order_id.get(order_id)
+            if isinstance(feature_candidate, dict) and feature_candidate:
+                entry_feature_snapshot = dict(feature_candidate)
+            if raw_llm_response and entry_feature_snapshot:
                 break
     if not raw_llm_response:
         raw_llm_response = next(
@@ -917,6 +924,8 @@ def build_okx_history_training_sample(
         "entry_decision_ids": entry_decision_ids,
         "entry_decision_count": len(entry_decision_ids),
         "decision_lineage_source": decision_lineage_source,
+        "features": entry_feature_snapshot,
+        "decision_timestamp": opened_at.isoformat() if opened_at else None,
         "position_ids": position_ids,
         "okx_pos_id": _text(_value(history, "pos_id")),
         "entry_order_ids": entry_order_ids,

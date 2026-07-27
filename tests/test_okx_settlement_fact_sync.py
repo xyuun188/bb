@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from config.settings import settings
-from db.session import close_db, get_session_ctx, init_db
+from db.session import close_db, get_engine, get_session_ctx, init_db
 from models.account import OkxAccountBill
 from models.trade import OkxPositionHistory
 from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
@@ -160,6 +160,87 @@ async def test_settlement_fact_sync_mirrors_history_and_funding_bills(
         assert history.raw_row["_bb_contract_spec"]["ctVal"] == "1"
         assert stored_bill.source == "okx_settlement_fact_mirror"
         assert stored_bill.funding_fee == pytest.approx(-0.03)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_settlement_fact_sync_bulk_loads_existing_rows_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "settlement-facts-bulk.db")
+    now = datetime.now(UTC)
+    history_rows = [
+        {
+            "instId": "ADA-USDT-SWAP",
+            "posId": f"ada-pos-{index}",
+            "posSide": "long",
+            "type": "2",
+            "cTime": _ms(now - timedelta(minutes=30 + index)),
+            "uTime": _ms(now - timedelta(minutes=5 + index)),
+            "openAvgPx": "0.6",
+            "closeAvgPx": "0.64",
+            "openMaxPos": "100",
+            "closeTotalPos": "100",
+            "realizedPnl": "4.2",
+            "fundingFee": "-0.03",
+            "fee": "-0.11",
+        }
+        for index in range(3)
+    ]
+    bills = [
+        {
+            "billId": f"funding-{index}",
+            "instId": "ADA-USDT-SWAP",
+            "posSide": "long",
+            "type": "8",
+            "subType": "173",
+            "balChg": "-0.03",
+            "ts": _ms(now - timedelta(minutes=10 + index)),
+        }
+        for index in range(3)
+    ]
+    service = OkxSettlementFactSyncService(
+        mode="paper",
+        executor_factory=_executor_factory(_FakeCcxt(history_rows=history_rows, bills=bills)),
+    )
+    try:
+        first = await service.sync_once()
+        assert first["position_history_inserted_count"] == 3
+        assert first["account_bill_inserted_count"] == 3
+
+        engine = await get_engine()
+        target_selects: list[str] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement: str,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            normalized = statement.lstrip().lower()
+            if normalized.startswith("select") and (
+                "okx_position_history" in normalized
+                or "okx_account_bills" in normalized
+            ):
+                target_selects.append(normalized)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
+        try:
+            second = await service.sync_once()
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
+
+        assert second["position_history_unchanged_count"] == 3
+        assert (
+            second["account_bill_updated_count"]
+            + second["account_bill_unchanged_count"]
+            == 3
+        )
+        assert len(target_selects) == 3
     finally:
         await close_db()
 

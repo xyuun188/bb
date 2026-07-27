@@ -23,6 +23,13 @@ from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api import dashboard, symbols
 
 
+class _FixedDashboardDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        fixed = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
+        return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
+
+
 def test_trade_reflection_authority_status_distinguishes_pending_and_linkage_failure() -> None:
     pending = dashboard._trade_reflection_authority_status(
         position=SimpleNamespace(
@@ -1098,6 +1105,7 @@ async def test_daily_pnl_records_include_okx_authoritative_ledger_positions(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(dashboard, "datetime", _FixedDashboardDatetime)
     await close_db()
     monkeypatch.setattr(
         settings,
@@ -1244,6 +1252,7 @@ async def test_daily_pnl_records_include_phase3_closed_position_even_if_opened_b
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(dashboard, "datetime", _FixedDashboardDatetime)
     await close_db()
     monkeypatch.setattr(
         settings,
@@ -1341,6 +1350,7 @@ async def test_daily_pnl_records_exclude_local_position_without_okx_confirmed_or
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(dashboard, "datetime", _FixedDashboardDatetime)
     await close_db()
     monkeypatch.setattr(
         settings,

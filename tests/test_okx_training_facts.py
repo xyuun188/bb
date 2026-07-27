@@ -209,6 +209,14 @@ def _complete_lineage() -> dict:
                 "opportunity_score": {"expected_net_return_pct": 0.8},
             }
         },
+        "decision_feature_by_order_id": {
+            "entry-1": {
+                "symbol": "BTC/USDT",
+                "returns_1": 0.01,
+                "spread_pct": 0.02,
+                "horizon_minutes": 60,
+            }
+        },
     }
 
 
@@ -253,6 +261,8 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(8.5 / 2000.0 * 100.0)
     assert sample["okx_trade_ids"] == ["trade-entry", "trade-close"]
     assert sample["trade_fact_trusted"] is True
+    assert sample["features"]["spread_pct"] == pytest.approx(0.02)
+    assert sample["decision_timestamp"] == "2026-07-11T01:00:00+00:00"
     assert sample["training_evidence_gaps"] == []
     assert sample["strategy_lineage_complete"] is True
     assert sample["profit_training_contract"]["eligible"] is True
@@ -390,6 +400,7 @@ def test_valid_paper_exploration_is_a_normal_trainable_trade_with_selection_reas
                 "evidence": [
                     {
                         "source": "local_ml",
+                        "decision_eligible": True,
                         "raw_expected_return_pct": 0.3,
                         "objective_expected_return_pct": 0.1,
                         "horizon_minutes": 30,

@@ -1164,11 +1164,16 @@ class OKXExecutor(AbstractExecutor):
                     )
                 price = self._safe_float(submit_ticker.get("last"), 0.0)
                 ticker = {**submit_ticker, **submit_price_limit}
+                fill_risk_price = self._entry_market_fill_risk_price(
+                    side=side,
+                    reference_price=price,
+                    price_limit=submit_price_limit,
+                )
                 order_quantity, base_quantity = self._entry_order_amount(
                     ccxt,
                     market,
                     position_value,
-                    price,
+                    fill_risk_price,
                     balance,
                     decision.suggested_leverage,
                 )
@@ -1179,6 +1184,7 @@ class OKXExecutor(AbstractExecutor):
                     leverage=decision.suggested_leverage,
                     planned_notional_usdt=position_value,
                     final_contracts=order_quantity,
+                    fill_risk_price=fill_risk_price,
                 )
                 okx_order_rules["pre_submit_price_refresh"] = {
                     "source": "okx_native_ticker_immediately_before_submit",
@@ -1240,6 +1246,10 @@ class OKXExecutor(AbstractExecutor):
                     okx_order_rules["final_base_quantity"] = round(base_quantity, 12)
                     okx_order_rules["final_notional_usdt"] = round(
                         order_quantity * contract_size * max(price, 0.0),
+                        8,
+                    )
+                    okx_order_rules["maximum_fill_notional_usdt"] = round(
+                        order_quantity * contract_size * max(fill_risk_price, 0.0),
                         8,
                     )
                     okx_order_rules["market_order_within_max_size"] = True
@@ -3359,6 +3369,24 @@ class OKXExecutor(AbstractExecutor):
 
         return contracts, contracts * contract_size
 
+    def _entry_market_fill_risk_price(
+        self,
+        *,
+        side: str,
+        reference_price: float,
+        price_limit: dict[str, Any],
+    ) -> float:
+        """Use the exchange's worst executable buy price for entry sizing."""
+
+        price = max(self._safe_float(reference_price, 0.0), 0.0)
+        if str(side or "").lower() != "buy":
+            return price
+        buy_limit = max(
+            self._safe_float(price_limit.get("buy_price_limit"), 0.0),
+            0.0,
+        )
+        return max(price, buy_limit)
+
     def _entry_order_rule_snapshot(
         self,
         market: dict[str, Any],
@@ -3368,22 +3396,33 @@ class OKXExecutor(AbstractExecutor):
         leverage: float,
         planned_notional_usdt: float,
         final_contracts: float,
+        fill_risk_price: float | None = None,
     ) -> dict[str, Any]:
         contract_size = self._contract_size(market)
         amount_min = self._amount_min(market)
         amount_step = self._amount_step(market)
         amount_market_max = self._amount_market_max(market)
+        sizing_price = max(float(fill_risk_price or price or 0.0), 0.0)
         planned_contracts = (
-            planned_notional_usdt / (price * contract_size)
-            if price > 0 and contract_size > 0 and planned_notional_usdt > 0
+            planned_notional_usdt / (sizing_price * contract_size)
+            if sizing_price > 0 and contract_size > 0 and planned_notional_usdt > 0
             else 0.0
         )
         min_notional = amount_min * contract_size * price if price > 0 else 0.0
         final_notional = max(final_contracts, 0.0) * contract_size * max(price, 0.0)
+        maximum_fill_notional = (
+            max(final_contracts, 0.0) * contract_size * sizing_price
+        )
         effective_leverage = max(float(leverage or 1.0), 1.0)
         return {
             "okx_symbol": market.get("symbol"),
             "price": round(max(price, 0.0), 12),
+            "fill_risk_price": round(sizing_price, 12),
+            "fill_risk_price_source": (
+                "okx_buy_price_limit"
+                if sizing_price > max(price, 0.0) + 1e-12
+                else "current_reference_price"
+            ),
             "contract_size": round(contract_size, 12),
             "amount_min_contracts": round(amount_min, 12),
             "amount_step_contracts": round(amount_step, 12),
@@ -3397,6 +3436,7 @@ class OKXExecutor(AbstractExecutor):
             "final_contracts": round(max(final_contracts, 0.0), 12),
             "final_base_quantity": round(max(final_contracts, 0.0) * contract_size, 12),
             "final_notional_usdt": round(final_notional, 8),
+            "maximum_fill_notional_usdt": round(maximum_fill_notional, 8),
             "required_margin_usdt": round(final_notional / effective_leverage, 8),
             "planned_below_minimum_contracts": bool(
                 amount_min > 0 and 0 < planned_contracts < amount_min
@@ -3408,6 +3448,7 @@ class OKXExecutor(AbstractExecutor):
                 final_contracts > 0
                 and (amount_min <= 0 or final_contracts >= amount_min)
                 and (amount_market_max <= 0 or final_contracts <= amount_market_max)
+                and maximum_fill_notional <= max(planned_notional_usdt, 0.0) + 1e-8
             ),
         }
 

@@ -134,7 +134,9 @@ class EntryCandidateEvidencePolicy:
         short_evidence = self._build_side("short", symbol, feature_vector, strategy, base_raw)
         feature_score = _safe_float(self.feature_opportunity_score(feature_vector), 0.0)
         eligible_sides = [
-            item for item in (long_evidence, short_evidence) if item["production_eligible"]
+            item
+            for item in (long_evidence, short_evidence)
+            if item["decision_eligible"] and item["score"] is not None
         ]
         preferred = (
             max(eligible_sides, key=lambda item: item["return_lcb_pct"])["side"]
@@ -156,12 +158,13 @@ class EntryCandidateEvidencePolicy:
                 "source": "authoritative_side_return_opportunity_snapshots",
                 "observation_window": "current_pre_ai_candidate_round",
                 "sample_count": sum(
-                    int(item["production_source_count"]) for item in (long_evidence, short_evidence)
+                    int(item["decision_source_count"])
+                    for item in (long_evidence, short_evidence)
                 ),
                 "generated_at": generated_at,
                 "strategy_version": "2026-07-12.candidate-return-evidence.v1",
                 "fallback_reason": (
-                    "" if eligible_sides else "production_return_candidate_unavailable"
+                    "" if eligible_sides else "execution_scoped_return_candidate_unavailable"
                 ),
             },
             "policy": (
@@ -203,10 +206,22 @@ class EntryCandidateEvidencePolicy:
                 0.0,
             )
         )
+        decision_eligible = opportunity.get("decision_eligible") is True
+        positive_edge = bool(expected_net > 0.0 and return_lcb > 0.0)
+        components = _safe_dict(opportunity.get("expected_net_breakdown")).get(
+            "components"
+        )
+        components = components if isinstance(components, list) else []
+        production_source_count = sum(
+            1
+            for component in components
+            if isinstance(component, dict)
+            and component.get("production_eligible") is True
+            and component.get("included_in_return_distribution") is True
+        )
+        paper_eligible = opportunity.get("paper_eligible") is True
         production_eligible = bool(
-            opportunity.get("production_eligible") is True
-            and expected_net > 0.0
-            and return_lcb > 0.0
+            opportunity.get("production_eligible") is True and positive_edge
         )
         return {
             "side": side,
@@ -244,13 +259,21 @@ class EntryCandidateEvidencePolicy:
                 symbol=symbol,
                 side=side,
             ),
-            "production_source_count": source_count,
-            "return_distribution_ready": opportunity.get("production_eligible") is True,
+            "execution_scope": opportunity.get("execution_scope"),
+            "decision_source_count": source_count,
+            "paper_source_count": source_count if paper_eligible else 0,
+            "production_source_count": production_source_count,
+            "return_distribution_ready": decision_eligible,
+            "decision_eligible": decision_eligible,
+            "paper_eligible": paper_eligible,
             "production_eligible": production_eligible,
+            "positive_fee_after_return_edge": positive_edge,
             "recommendation": (
                 "positive_fee_after_return_lcb"
-                if production_eligible
-                else "observation_only_or_non_positive_return_lcb"
+                if positive_edge
+                else "coverage_candidate_or_non_positive_return_lcb"
+                if decision_eligible
+                else "return_distribution_ineligible"
             ),
             "policy_provenance": _safe_dict(opportunity.get("policy_provenance")),
         }

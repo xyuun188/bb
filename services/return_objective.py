@@ -14,15 +14,21 @@ from typing import Any
 
 import numpy as np
 
-RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
-RETURN_OBJECTIVE_VERSION = "2026-07-14.separated-supervision.v2"
-RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
-RETURN_LABEL_VERSION = "2026-07-14.separated-supervision.v2"
-COST_MODEL_VERSION = "okx_live_cost_and_authoritative_slippage_distribution_v2"
-RETURN_DISTRIBUTION_CONTRACT_VERSION = (
-    "2026-07-15.standardized-return-distribution.v1"
+from services.local_ai_training_contract import (
+    COST_MODEL_VERSION,
+    RETURN_LABEL_VERSION,
+    RETURN_OBJECTIVE_VERSION,
 )
+from services.local_ai_training_contract import (
+    RETURN_LABEL_NAME as RETURN_LABEL_NAME,
+)
+from services.local_ai_training_contract import (
+    RETURN_OBJECTIVE_NAME as RETURN_OBJECTIVE_NAME,
+)
+
+RETURN_DISTRIBUTION_CONTRACT_VERSION = "2026-07-15.standardized-return-distribution.v1"
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
+PAPER_RETURN_COMBINATION_VERSION = "2026-07-27.paper-current-cost-return-combination.v1"
 
 
 def safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -238,8 +244,9 @@ def validate_return_distribution_contract(
     }
 
 
-def combine_production_return_distribution(
+def _combine_execution_return_distribution(
     *,
+    execution_scope: str,
     side: str,
     model_contracts: Iterable[dict[str, Any]],
     live_execution_cost_pct: Any,
@@ -251,7 +258,11 @@ def combine_production_return_distribution(
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the sole fee-after production distribution and transformation audit."""
+    """Combine governed market distributions under an explicit execution scope."""
+
+    if execution_scope not in {"paper", "live"}:
+        raise ValueError("execution_scope_must_be_paper_or_live")
+    live_scope = execution_scope == "live"
 
     contracts = [item for item in model_contracts if isinstance(item, dict)]
     requested_weights = list(model_weights) if model_weights is not None else None
@@ -297,8 +308,7 @@ def combine_production_return_distribution(
         weights = eligible_weights[: len(values)]
         total = sum(weights)
         return (
-            sum(value * weight for value, weight in zip(values, weights, strict=False))
-            / total
+            sum(value * weight for value, weight in zip(values, weights, strict=False)) / total
             if total > 0.0
             else sum(values) / len(values)
         )
@@ -390,33 +400,34 @@ def combine_production_return_distribution(
     )
 
     historical_cost_uncertainties: list[float] = []
-    for row in cost_rows:
-        expected_cost = safe_float(row.get("expected_pct"), None)
-        upper_cost = safe_float(row.get("upper_tail_pct"), None)
-        uncertainty = safe_float(row.get("uncertainty_pct"), None)
-        if (
-            expected_cost is None
-            or upper_cost is None
-            or uncertainty is None
-            or expected_cost < 0
-            or upper_cost < expected_cost
-            or uncertainty < 0
-            or row.get("distribution_ready") is not True
-            or row.get("source_authority")
-            != "shadow_counterfactual_live_microstructure"
-        ):
-            blockers.append("counterfactual_execution_cost_distribution_invalid")
-            continue
-        historical_cost_uncertainties.append(
-            max(upper_cost - expected_cost, uncertainty)
-        )
-    if not historical_cost_uncertainties:
-        blockers.append("counterfactual_execution_cost_distribution_missing")
+    if live_scope:
+        for row in cost_rows:
+            expected_cost = safe_float(row.get("expected_pct"), None)
+            upper_cost = safe_float(row.get("upper_tail_pct"), None)
+            uncertainty = safe_float(row.get("uncertainty_pct"), None)
+            if (
+                expected_cost is None
+                or upper_cost is None
+                or uncertainty is None
+                or expected_cost < 0
+                or upper_cost < expected_cost
+                or uncertainty < 0
+                or row.get("distribution_ready") is not True
+                or row.get("source_authority")
+                != "shadow_counterfactual_live_microstructure"
+            ):
+                blockers.append("counterfactual_execution_cost_distribution_invalid")
+                continue
+            historical_cost_uncertainties.append(
+                max(upper_cost - expected_cost, uncertainty)
+            )
+        if not historical_cost_uncertainties:
+            blockers.append("counterfactual_execution_cost_distribution_missing")
 
     actual_uncertainties: list[float] = []
     slippage_expected_values: list[float] = []
     slippage_upper_values: list[float] = []
-    for row in calibration_rows:
+    for row in calibration_rows if live_scope else []:
         realized = row.get("net_return_after_all_cost_pct")
         slippage = row.get("slippage_pct")
         realized = realized if isinstance(realized, dict) else {}
@@ -449,12 +460,14 @@ def combine_production_return_distribution(
         actual_uncertainties.append(actual_expected - actual_lower)
         slippage_expected_values.append(slippage_expected)
         slippage_upper_values.append(slippage_upper)
-    if not actual_uncertainties:
+    if live_scope and not actual_uncertainties:
         blockers.append("authoritative_realized_return_or_slippage_distribution_missing")
 
     live_cost = safe_float(live_execution_cost_pct, None)
     live_slippage = safe_float(live_slippage_pct, None)
-    if live_cost is None or live_cost < 0 or live_slippage is None or live_slippage < 0:
+    if live_cost is None or live_cost < 0:
+        blockers.append("live_execution_cost_distribution_missing")
+    if live_scope and (live_slippage is None or live_slippage < 0):
         blockers.append("live_execution_cost_distribution_missing")
     authoritative_slippage_upper = max(slippage_upper_values) if slippage_upper_values else None
     slippage_tail_excess = (
@@ -465,29 +478,28 @@ def combine_production_return_distribution(
         else 0.0
         if authoritative_slippage_upper is not None and live_slippage is not None
         else None
-    )
+    ) if live_scope else 0.0
 
     net_expected = (
         gross_expected - live_cost - slippage_tail_excess
-        if gross_expected is not None
-        and live_cost is not None
-        and slippage_tail_excess is not None
+        if gross_expected is not None and live_cost is not None and slippage_tail_excess is not None
         else None
     )
     net_median = (
         gross_median - live_cost - slippage_tail_excess
-        if gross_median is not None
-        and live_cost is not None
-        and slippage_tail_excess is not None
+        if gross_median is not None and live_cost is not None and slippage_tail_excess is not None
         else None
     )
     total_dispersion = (
         market_dispersion
         + max(historical_cost_uncertainties)
         + max(actual_uncertainties)
-        if market_dispersion is not None
+        if live_scope
+        and market_dispersion is not None
         and historical_cost_uncertainties
         and actual_uncertainties
+        else market_dispersion
+        if not live_scope
         else None
     )
     net_lower = (
@@ -497,22 +509,14 @@ def combine_production_return_distribution(
     )
     net_upper = (
         max(
-            float(weighted_mean(gross_upper_values))
-            - live_cost
-            - slippage_tail_excess,
+            float(weighted_mean(gross_upper_values)) - live_cost - slippage_tail_excess,
             net_median if net_median is not None else float("-inf"),
             net_expected if net_expected is not None else float("-inf"),
         )
-        if gross_upper_values
-        and live_cost is not None
-        and slippage_tail_excess is not None
+        if gross_upper_values and live_cost is not None and slippage_tail_excess is not None
         else None
     )
-    horizon = (
-        contracts[0].get("horizon_minutes")
-        if contracts and len(signatures) == 1
-        else None
-    )
+    horizon = contracts[0].get("horizon_minutes") if contracts and len(signatures) == 1 else None
     member_count = sum(
         int(safe_float(contract.get("distribution_member_count"), 0.0) or 0)
         for contract in contracts
@@ -528,7 +532,11 @@ def combine_production_return_distribution(
         tail_loss_probability=max(tail_probabilities) if tail_probabilities else None,
         tail_loss_scale_pct=max(tail_scales) if tail_scales else None,
         distribution_member_count=member_count,
-        return_semantics="realized_net_return_after_live_cost_and_authoritative_slippage",
+        return_semantics=(
+            "realized_net_return_after_live_cost_and_authoritative_slippage"
+            if live_scope
+            else "paper_net_return_after_current_estimated_execution_cost"
+        ),
         source_authority=source_authority,
         profit_supervision_version=profit_supervision_version,
     )
@@ -541,7 +549,11 @@ def combine_production_return_distribution(
         )
     )
     contract["blockers"] = merged_blockers
-    contract["production_eligible"] = not merged_blockers
+    decision_eligible = not merged_blockers
+    contract["execution_scope"] = execution_scope
+    contract["decision_eligible"] = decision_eligible
+    contract["paper_eligible"] = bool(not live_scope and decision_eligible)
+    contract["production_eligible"] = bool(live_scope and decision_eligible)
     contract["gross_market_distribution"] = {
         "raw_expected_return_pct": gross_expected,
         "median_return_pct": gross_median,
@@ -552,8 +564,9 @@ def combine_production_return_distribution(
     }
     contract["transformations"] = {
         "formula": (
-            "gross_market_expected-live_execution_cost-"
-            "authoritative_slippage_tail_excess"
+            "gross_market_expected-live_execution_cost-authoritative_slippage_tail_excess"
+            if live_scope
+            else "gross_market_expected-current_estimated_execution_cost"
         ),
         "live_execution_cost_pct": live_cost,
         "live_slippage_pct": live_slippage,
@@ -566,17 +579,13 @@ def combine_production_return_distribution(
         "authoritative_slippage_tail_excess_pct": slippage_tail_excess,
         "market_dispersion_pct": market_dispersion,
         "counterfactual_cost_uncertainty_pct": (
-            max(historical_cost_uncertainties)
-            if historical_cost_uncertainties
-            else None
+            max(historical_cost_uncertainties) if historical_cost_uncertainties else None
         ),
         "actual_trade_calibration_uncertainty_pct": (
             max(actual_uncertainties) if actual_uncertainties else None
         ),
         "cost_deduction_count": (
-            1
-            if live_cost is not None and slippage_tail_excess is not None
-            else 0
+            1 if live_cost is not None and slippage_tail_excess is not None else 0
         ),
     }
     if requested_weights is not None:
@@ -595,6 +604,64 @@ def combine_production_return_distribution(
             "rollback": "omit_model_weights_for_equal_weighting",
         }
     return contract
+
+
+def combine_production_return_distribution(
+    *,
+    side: str,
+    model_contracts: Iterable[dict[str, Any]],
+    live_execution_cost_pct: Any,
+    live_slippage_pct: Any,
+    counterfactual_cost_distributions: Iterable[dict[str, Any]],
+    actual_trade_calibrations: Iterable[dict[str, Any]],
+    profit_supervision_version: str,
+    source_authority: str,
+    input_blockers: Iterable[str] = (),
+    model_weights: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Build the fee-after live distribution with production evidence gates."""
+
+    return _combine_execution_return_distribution(
+        execution_scope="live",
+        side=side,
+        model_contracts=model_contracts,
+        live_execution_cost_pct=live_execution_cost_pct,
+        live_slippage_pct=live_slippage_pct,
+        counterfactual_cost_distributions=counterfactual_cost_distributions,
+        actual_trade_calibrations=actual_trade_calibrations,
+        profit_supervision_version=profit_supervision_version,
+        source_authority=source_authority,
+        input_blockers=input_blockers,
+        model_weights=model_weights,
+    )
+
+
+def combine_paper_return_distribution(
+    *,
+    side: str,
+    model_contracts: Iterable[dict[str, Any]],
+    current_execution_cost_pct: Any,
+    current_slippage_pct: Any,
+    profit_supervision_version: str,
+    source_authority: str,
+    input_blockers: Iterable[str] = (),
+    model_weights: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Build a paper decision distribution without live promotion evidence."""
+
+    return _combine_execution_return_distribution(
+        execution_scope="paper",
+        side=side,
+        model_contracts=model_contracts,
+        live_execution_cost_pct=current_execution_cost_pct,
+        live_slippage_pct=current_slippage_pct,
+        counterfactual_cost_distributions=(),
+        actual_trade_calibrations=(),
+        profit_supervision_version=profit_supervision_version,
+        source_authority=source_authority,
+        input_blockers=input_blockers,
+        model_weights=model_weights,
+    )
 
 
 def profit_factor(returns: Iterable[float]) -> float | None:

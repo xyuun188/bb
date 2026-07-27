@@ -9,10 +9,54 @@ from ai_brain.llm_agent import (
     LLMAgent,
     _backup_model_names,
     _extract_json,
+    _format_local_ai_tools,
     _provider_response_contract,
 )
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.return_objective import standardized_return_distribution
+
+
+def test_shadow_quant_model_is_visible_to_llm_analysis_without_live_permission() -> None:
+    contract = standardized_return_distribution(
+        side="long",
+        horizon_minutes=30,
+        raw_expected_return_pct=0.4,
+        median_return_pct=0.35,
+        lower_quantile_return_pct=0.1,
+        upper_quantile_return_pct=0.7,
+        dispersion_pct=0.3,
+        tail_loss_probability=0.2,
+        tail_loss_scale_pct=0.1,
+        distribution_member_count=32,
+        return_semantics="gross_market_opportunity_before_execution",
+        source_authority="test_shadow_model",
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+    text = _format_local_ai_tools(
+        {
+            "enabled": True,
+            "status": "ok",
+            "profit_prediction": {
+                "available": True,
+                "route_mode": "paper_analysis",
+                "live_ml_ready": False,
+                "production_permission": False,
+                "best_side": "long",
+                "prediction_quality": {
+                    "contract_complete": True,
+                    "paper_eligible": True,
+                    "production_eligible": False,
+                    "anomalous": False,
+                },
+                "return_distribution_contract": {"long": contract},
+            },
+        }
+    )
+
+    assert "Profit model: best_side=long" in text
+    assert "expected_return_pct=" in text
 
 
 def test_paper_parser_preserves_multidimensional_recommendation() -> None:

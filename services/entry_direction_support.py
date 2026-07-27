@@ -77,9 +77,11 @@ def _quant_family_summaries(
     evidence_rows: list[dict[str, Any]],
     execution_cost_pct: float,
 ) -> list[dict[str, Any]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, float], list[dict[str, Any]]] = {}
     for item in evidence_rows:
         if not isinstance(item, dict):
+            continue
+        if item.get("decision_eligible") is not True:
             continue
         family = _quant_family(str(item.get("source") or ""))
         if not family:
@@ -89,10 +91,10 @@ def _quant_family_summaries(
         horizon = _float(item.get("horizon_minutes"))
         if raw_expected is None or objective_expected is None or not horizon or horizon <= 0:
             continue
-        grouped.setdefault(family, []).append(item)
+        grouped.setdefault((family, horizon), []).append(item)
 
     summaries: list[dict[str, Any]] = []
-    for family, rows in sorted(grouped.items()):
+    for (family, horizon), rows in sorted(grouped.items()):
         raw_expected = _weighted_mean(rows, "raw_expected_return_pct")
         objective_expected = _weighted_mean(rows, "objective_expected_return_pct")
         explicit_net_expected = _weighted_mean(rows, "expected_net_return_pct")
@@ -112,12 +114,7 @@ def _quant_family_summaries(
             ],
             "resolved_loss_probability",
         )
-        horizons = [
-            value
-            for item in rows
-            if (value := _float(item.get("horizon_minutes"))) is not None and value > 0
-        ]
-        if raw_expected is None or objective_expected is None or not horizons:
+        if raw_expected is None or objective_expected is None:
             continue
         summaries.append(
             {
@@ -134,7 +131,7 @@ def _quant_family_summaries(
                 ),
                 "objective_net_return_pct": objective_expected - execution_cost_pct,
                 "loss_probability": loss_probability,
-                "horizon_minutes": min(horizons),
+                "horizon_minutes": horizon,
             }
         )
     return summaries
@@ -158,6 +155,54 @@ def summarize_paper_quantitative_evidence(
     execution_cost_complete = bool(parsed_cost is not None and parsed_cost > 0.0)
     applied_cost = float(parsed_cost or 0.0)
     family_summaries = _quant_family_summaries(evidence_rows, applied_cost)
+    by_horizon: dict[float, list[dict[str, Any]]] = {}
+    for item in family_summaries:
+        horizon = _float(item.get("horizon_minutes"))
+        if horizon is not None and horizon > 0.0:
+            by_horizon.setdefault(horizon, []).append(item)
+    horizon_candidates = [
+        {
+            "horizon_minutes": horizon,
+            "family_summaries": rows,
+            "expected_net_return_pct": sum(
+                float(item["expected_net_return_pct"]) for item in rows
+            )
+            / len(rows),
+            "objective_net_return_pct": sum(
+                float(item["objective_net_return_pct"]) for item in rows
+            )
+            / len(rows),
+            "loss_probability": _weighted_mean(
+                [
+                    {
+                        "loss_probability": item.get("loss_probability"),
+                        "continuous_weight_multiplier": 1.0,
+                    }
+                    for item in rows
+                ],
+                "loss_probability",
+            ),
+        }
+        for horizon, rows in sorted(by_horizon.items())
+        if rows
+    ]
+    selected_horizon = (
+        max(
+            horizon_candidates,
+            key=lambda item: (
+                float(item["expected_net_return_pct"]),
+                float(item["objective_net_return_pct"]),
+                len(item["family_summaries"]),
+                -float(item["loss_probability"] or 1.0),
+                -float(item["horizon_minutes"]),
+            ),
+        )
+        if horizon_candidates
+        else None
+    )
+    family_summaries = list(
+        _dict(selected_horizon).get("family_summaries") or []
+    )
     positive_families = [
         item
         for item in family_summaries
@@ -167,11 +212,6 @@ def summarize_paper_quantitative_evidence(
         float(value)
         for item in family_summaries
         if (value := _float(item.get("loss_probability"))) is not None
-    ]
-    horizons = [
-        float(item["horizon_minutes"])
-        for item in family_summaries
-        if (_float(item.get("horizon_minutes")) or 0.0) > 0.0
     ]
     expected_net_return_pct = (
         sum(float(item["expected_net_return_pct"]) for item in family_summaries)
@@ -199,7 +239,11 @@ def summarize_paper_quantitative_evidence(
             if loss_probabilities
             else None
         ),
-        "prediction_horizon_minutes": min(horizons) if horizons else None,
+        "prediction_horizon_minutes": _dict(selected_horizon).get(
+            "horizon_minutes"
+        ),
+        "available_prediction_horizons": sorted(by_horizon),
+        "horizon_selection_policy": "best_fee_after_return_coherent_horizon",
         "positive_quant_sources": sorted(
             {
                 source
@@ -230,6 +274,8 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "objective_net_return_pct",
             "loss_probability",
             "prediction_horizon_minutes",
+            "available_prediction_horizons",
+            "horizon_selection_policy",
             "positive_quant_sources",
             "quant_evidence_families",
             "quant_family_summaries",
@@ -365,6 +411,12 @@ def assess_directional_entry_support(
         "objective_net_return_pct": objective_net_return_pct,
         "loss_probability": loss_probability,
         "prediction_horizon_minutes": prediction_horizon_minutes,
+        "available_prediction_horizons": list(
+            quantitative.get("available_prediction_horizons") or []
+        ),
+        "horizon_selection_policy": quantitative.get(
+            "horizon_selection_policy"
+        ),
         "positive_quant_sources": quantitative_sources,
         "quantitative_sources": quantitative_sources,
         "quant_evidence_families": quant_families,

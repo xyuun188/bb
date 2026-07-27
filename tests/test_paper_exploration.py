@@ -12,6 +12,7 @@ def _contract() -> dict:
                 "evidence": [
                     {
                         "source": "local_ml",
+                        "decision_eligible": True,
                         "raw_expected_return_pct": 0.30,
                         "objective_expected_return_pct": 0.10,
                         "horizon_minutes": 30,

@@ -86,6 +86,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                 "evidence": [
                     {
                         "source": "local_ml",
+                        "decision_eligible": True,
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
@@ -168,6 +169,7 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
                 "evidence": [
                     {
                         "source": "local_ml",
+                        "decision_eligible": True,
                         "raw_expected_return_pct": 0.3,
                         "objective_expected_return_pct": 0.1,
                         "horizon_minutes": 30,
@@ -214,6 +216,7 @@ def _training_evidence(
             {
                 "source": source,
                 "side": side,
+                "decision_eligible": True,
                 "raw_expected_return_pct": raw_return,
                 "objective_expected_return_pct": objective_return,
                 "horizon_minutes": horizon_minutes,
@@ -433,6 +436,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                     {
                         "source": "local_ml",
                         "side": "long",
+                        "decision_eligible": True,
                         "raw_expected_return_pct": 0.5,
                         "objective_expected_return_pct": -0.05,
                         "horizon_minutes": 30,

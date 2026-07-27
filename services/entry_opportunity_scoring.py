@@ -1,11 +1,9 @@
-"""Authoritative realized-net-return opportunity aggregation.
+"""Execution-scoped realized-net-return opportunity aggregation.
 
-Only governed models may contribute gross market-opportunity observations.
-Shadow and recovery predictions remain visible observations with zero production
-weight. Production realized-net return combines the governed market distribution,
-current executable cost, counterfactual cost uncertainty, and authoritative OKX
-trade slippage calibration. AI confidence, expert votes, and memory cannot alter
-that distribution or grant production permission.
+Structurally valid Candidate and Shadow models may influence normal paper
+decisions. Live decisions additionally require production governance, promotion,
+counterfactual cost evidence, and authoritative OKX trade calibration. Both paths
+use the same model return contracts and current executable-cost estimate.
 """
 
 from __future__ import annotations
@@ -24,6 +22,7 @@ from services.entry_signal_extraction import (
     safe_float,
     safe_list,
     signal_available,
+    signal_paper_eligibility,
     signal_production_eligibility,
     signal_return_distribution,
     signal_return_distribution_eligibility,
@@ -34,7 +33,11 @@ from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
 )
-from services.return_objective import combine_production_return_distribution
+from services.return_objective import (
+    PAPER_RETURN_COMBINATION_VERSION,
+    combine_paper_return_distribution,
+    combine_production_return_distribution,
+)
 
 NormalizeSymbol = Callable[[str | None], str]
 DecisionAnnotator = Callable[[DecisionOutput], None]
@@ -91,9 +94,14 @@ def _paper_quant_multipliers(strategy: dict[str, Any] | None) -> dict[str, float
     return weights
 
 
+def _execution_scope(strategy: dict[str, Any] | None) -> str:
+    mode = str(safe_dict(strategy).get("execution_mode") or "live").strip().lower()
+    return "paper" if mode == "paper" else "live"
+
+
 @dataclass(slots=True)
 class EntryOpportunityScoringPolicy:
-    """Build and rank the current production return distribution."""
+    """Build and rank the current execution-scoped return distribution."""
 
     normalize_symbol: NormalizeSymbol
     annotate_decision_source: DecisionAnnotator
@@ -109,6 +117,7 @@ class EntryOpportunityScoringPolicy:
         signal = safe_dict(raw.get("ml_signal"))
         predictions = safe_list(signal.get("predictions"))
         primary = safe_dict(predictions[0] if predictions else {})
+        execution_scope = _execution_scope(strategy)
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
         live_claimed = bool(
@@ -120,49 +129,90 @@ class EntryOpportunityScoringPolicy:
             symbol=symbol,
             side=side,
         )
-        paper_claimed = paper_authorization.get("eligible") is True
-        production_claimed = bool(live_claimed or paper_claimed)
+        quality = safe_dict(signal.get("prediction_quality"))
+        paper_quality_claimed = bool(
+            quality.get("anomalous") is not True
+            and (
+                (
+                    quality.get("contract_complete") is True
+                    and quality.get("paper_eligible") is True
+                )
+                or quality.get("production_eligible") is True
+            )
+        )
+        paper_claimed = bool(
+            signal_available(signal)
+            and (
+                paper_quality_claimed
+                or paper_authorization.get("eligible") is True
+            )
+        )
         governance = signal_production_eligibility(signal)
+        paper_governance = signal_paper_eligibility(signal, side)
         distribution_eligibility = signal_return_distribution_eligibility(
             signal,
             side,
         )
         contract = signal_return_distribution(signal, side)
         production_eligible = bool(
-            production_claimed
-            and (governance.get("eligible") is True or paper_claimed)
+            live_claimed
+            and governance.get("eligible") is True
             and distribution_eligibility.get("eligible") is True
         )
-        observation_only = bool(not production_eligible and primary and contract)
+        paper_eligible = bool(
+            paper_claimed
+            and distribution_eligibility.get("eligible") is True
+            and (
+                paper_governance.get("eligible") is True
+                or paper_authorization.get("eligible") is True
+            )
+        )
         cost_distribution = safe_dict(
             safe_dict(primary.get("counterfactual_execution_cost_distribution")).get(
                 side
             )
         )
-        if cost_distribution.get("distribution_ready") is not True:
+        if (
+            execution_scope == "live"
+            and cost_distribution.get("distribution_ready") is not True
+        ):
             production_eligible = False
+        decision_claimed = paper_claimed if execution_scope == "paper" else live_claimed
+        decision_eligible = (
+            paper_eligible if execution_scope == "paper" else production_eligible
+        )
+        observation_only = bool(not decision_eligible and primary and contract)
         actual_calibration = safe_dict(
             safe_dict(primary.get("actual_trade_calibration")).get(side)
+        )
+        governance_reason = (
+            paper_governance.get("reason")
+            if execution_scope == "paper"
+            else governance.get("reason")
         )
         return {
             "key": "local_ml",
             "available": bool(primary),
-            "production_claimed": production_claimed,
+            "decision_claimed": decision_claimed,
+            "decision_eligible": decision_eligible,
+            "paper_claimed": paper_claimed,
+            "paper_eligible": paper_eligible,
+            "production_claimed": live_claimed,
             "production_eligible": production_eligible,
             "observation_only": observation_only,
             "eligibility_reason": (
-                "active_trained_model_paper_strategy"
-                if production_eligible and paper_claimed
+                "contract_complete_model_allows_paper_influence"
+                if execution_scope == "paper" and decision_eligible
                 else "standardized_distribution_and_side_readiness_confirmed"
-                if production_eligible
+                if execution_scope == "live" and decision_eligible
                 else str(
                     distribution_eligibility.get("reason")
-                    or governance.get("reason")
+                    or governance_reason
                     or "local_ml_production_governance_incomplete"
                 )
             ),
             "side": side,
-            "execution_scope": "paper_only" if paper_claimed else "live",
+            "execution_scope": execution_scope,
             "paper_strategy_authorization": paper_authorization,
             "return_distribution_contract": contract,
             "raw_market_return_pct": contract.get("raw_expected_return_pct"),
@@ -189,41 +239,80 @@ class EntryOpportunityScoringPolicy:
         key: str,
         side: str,
         aliases: tuple[str, ...],
+        strategy: dict[str, Any] | None,
     ) -> dict[str, Any]:
         payload = first_tool_payload(raw, *aliases)
+        execution_scope = _execution_scope(strategy)
         governance = signal_production_eligibility(payload)
+        paper_governance = signal_paper_eligibility(payload, side)
         distribution_eligibility = signal_return_distribution_eligibility(
             payload,
             side,
         )
         contract = signal_return_distribution(payload, side)
-        production_claimed = bool(
+        live_claimed = bool(
             signal_available(payload)
             and str(payload.get("route_mode") or "").lower() == "live"
             and payload.get("live_ml_ready") is True
         )
+        quality = safe_dict(payload.get("prediction_quality"))
+        paper_claimed = bool(
+            signal_available(payload)
+            and quality.get("anomalous") is not True
+            and (
+                (
+                    quality.get("contract_complete") is True
+                    and quality.get("paper_eligible") is True
+                )
+                or quality.get("production_eligible") is True
+            )
+        )
         production_eligible = bool(
-            production_claimed
+            live_claimed
             and governance.get("eligible") is True
             and distribution_eligibility.get("eligible") is True
         )
+        paper_eligible = bool(
+            paper_claimed
+            and paper_governance.get("eligible") is True
+            and distribution_eligibility.get("eligible") is True
+        )
+        decision_claimed = paper_claimed if execution_scope == "paper" else live_claimed
+        decision_eligible = (
+            paper_eligible if execution_scope == "paper" else production_eligible
+        )
         observation_only = bool(
-            not production_eligible
+            not decision_eligible
             and signal_available(payload)
             and contract
         )
         return {
             "key": key,
             "available": signal_available(payload),
-            "production_claimed": production_claimed,
+            "decision_claimed": decision_claimed,
+            "decision_eligible": decision_eligible,
+            "paper_claimed": paper_claimed,
+            "paper_eligible": paper_eligible,
+            "production_claimed": live_claimed,
             "production_eligible": production_eligible,
             "observation_only": observation_only,
-            "eligibility_reason": str(
-                distribution_eligibility.get("reason")
-                or governance.get("reason")
-                or "server_model_production_governance_incomplete"
+            "eligibility_reason": (
+                "contract_complete_model_allows_paper_influence"
+                if execution_scope == "paper" and decision_eligible
+                else "production_governance_allows_live_influence"
+                if execution_scope == "live" and decision_eligible
+                else str(
+                    distribution_eligibility.get("reason")
+                    or (
+                        paper_governance.get("reason")
+                        if execution_scope == "paper"
+                        else governance.get("reason")
+                    )
+                    or "server_model_execution_governance_incomplete"
+                )
             ),
             "side": side,
+            "execution_scope": execution_scope,
             "reported_best_side": payload_side(payload) or "unknown",
             "return_distribution_contract": contract,
             "raw_market_return_pct": contract.get("raw_expected_return_pct"),
@@ -258,6 +347,7 @@ class EntryOpportunityScoringPolicy:
             return float("-inf")
 
         side = "long" if decision.action == Action.LONG else "short"
+        execution_scope = _execution_scope(strategy)
         raw = safe_dict(decision.raw_response)
         execution_cost = execution_cost_estimate(
             decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
@@ -280,6 +370,7 @@ class EntryOpportunityScoringPolicy:
                     "server_profit_model",
                     "profit",
                 ),
+                strategy=strategy,
             ),
             self._server_component(
                 raw,
@@ -292,14 +383,30 @@ class EntryOpportunityScoringPolicy:
                     "timeseries",
                     "time_series",
                 ),
+                strategy=strategy,
             ),
         ]
         selected_components = [
-            component for component in components if component["production_eligible"]
+            component for component in components if component["decision_eligible"]
         ]
         claimed_components = [
-            component for component in components if component["production_claimed"]
+            component for component in components if component["decision_claimed"]
         ]
+        selected_paper_horizon = None
+        if execution_scope == "paper":
+            normal_paper_trade = safe_dict(raw.get("normal_paper_trade"))
+            selected_paper_horizon = _finite(
+                normal_paper_trade.get("prediction_horizon_minutes")
+            )
+            if selected_paper_horizon is not None:
+                selected_components = [
+                    component
+                    for component in selected_components
+                    if _finite(component.get("horizon_minutes"))
+                    == selected_paper_horizon
+                ]
+            if selected_components:
+                claimed_components = list(selected_components)
         claimed_contracts = [
             safe_dict(component.get("return_distribution_contract"))
             for component in claimed_components
@@ -461,31 +568,56 @@ class EntryOpportunityScoringPolicy:
             if valid_calibrations
             else None
         )
-        production_distribution = combine_production_return_distribution(
-            side=side,
-            model_contracts=claimed_contracts,
-            live_execution_cost_pct=(
-                execution_cost.total_pct
-                if execution_cost.production_eligible
-                else None
-            ),
-            live_slippage_pct=(
-                execution_cost.slippage_pct
-                if execution_cost.production_eligible
-                else None
-            ),
-            counterfactual_cost_distributions=cost_distributions,
-            actual_trade_calibrations=valid_calibrations,
-            profit_supervision_version=PROFIT_SUPERVISION_VERSION,
-            source_authority=(
-                "governed_model_contracts_live_orderbook_and_okx_position_history"
-            ),
-            input_blockers=input_blockers,
-            model_weights=claimed_model_weights,
+        combination = (
+            combine_paper_return_distribution(
+                side=side,
+                model_contracts=claimed_contracts,
+                current_execution_cost_pct=(
+                    execution_cost.total_pct
+                    if execution_cost.production_eligible
+                    else None
+                ),
+                current_slippage_pct=(
+                    execution_cost.slippage_pct
+                    if execution_cost.production_eligible
+                    else None
+                ),
+                profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+                source_authority=(
+                    "contract_complete_model_distributions_and_current_orderbook_cost"
+                ),
+                input_blockers=input_blockers,
+                model_weights=claimed_model_weights,
+            )
+            if execution_scope == "paper"
+            else combine_production_return_distribution(
+                side=side,
+                model_contracts=claimed_contracts,
+                live_execution_cost_pct=(
+                    execution_cost.total_pct
+                    if execution_cost.production_eligible
+                    else None
+                ),
+                live_slippage_pct=(
+                    execution_cost.slippage_pct
+                    if execution_cost.production_eligible
+                    else None
+                ),
+                counterfactual_cost_distributions=cost_distributions,
+                actual_trade_calibrations=valid_calibrations,
+                profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+                source_authority=(
+                    "governed_model_contracts_live_orderbook_and_okx_position_history"
+                ),
+                input_blockers=input_blockers,
+                model_weights=claimed_model_weights,
+            )
         )
-        combination_ready = production_distribution.get("production_eligible") is True
+        combination_ready = combination.get("decision_eligible") is True
         distribution_mode = (
-            "governed_market_opportunity" if combination_ready else "unavailable"
+            f"{execution_scope}_market_opportunity"
+            if combination_ready
+            else "unavailable"
         )
         selected_weight_total = sum(
             quant_multipliers.get(str(component.get("key") or ""), 1.0)
@@ -494,57 +626,75 @@ class EntryOpportunityScoringPolicy:
         for component in components:
             included = bool(combination_ready and component in selected_components)
             component["included_in_return_distribution"] = included
+            component["aggregate_eligible"] = bool(included)
             component_weight = quant_multipliers.get(
                 str(component.get("key") or ""),
                 1.0,
             )
-            component["production_weight"] = (
+            decision_weight = (
                 component_weight / selected_weight_total
                 if included and selected_weight_total > 0.0
                 else 0.0
             )
+            component["decision_weight"] = decision_weight
+            component["paper_weight"] = (
+                decision_weight if execution_scope == "paper" else 0.0
+            )
+            component["production_weight"] = (
+                decision_weight if execution_scope == "live" else 0.0
+            )
             if quant_multipliers:
                 component["continuous_weight_multiplier"] = component_weight
             if component in selected_components and not combination_ready:
-                component["production_eligible"] = False
                 component["observation_only"] = True
                 component["eligibility_reason"] = (
                     "aggregate_return_distribution_contract_blocked"
                 )
+            elif (
+                execution_scope == "paper"
+                and selected_paper_horizon is not None
+                and component.get("decision_eligible") is True
+                and _finite(component.get("horizon_minutes"))
+                != selected_paper_horizon
+            ):
+                component["observation_only"] = True
+                component["eligibility_reason"] = (
+                    "paper_prediction_horizon_not_selected"
+                )
 
         gross_distribution = safe_dict(
-            production_distribution.get("gross_market_distribution")
+            combination.get("gross_market_distribution")
         )
-        transformations = safe_dict(production_distribution.get("transformations"))
+        transformations = safe_dict(combination.get("transformations"))
         gross_return = _finite(gross_distribution.get("raw_expected_return_pct"))
         valid_for_seconds = (
-            float(production_distribution["horizon_minutes"]) * 60.0
-            if _finite(production_distribution.get("horizon_minutes")) is not None
+            float(combination["horizon_minutes"]) * 60.0
+            if _finite(combination.get("horizon_minutes")) is not None
             else 0.0
         )
         expected_net = (
-            _finite(production_distribution.get("raw_expected_return_pct"))
+            _finite(combination.get("raw_expected_return_pct"))
             if combination_ready
             else None
         )
         return_lcb = (
-            _finite(production_distribution.get("objective_expected_return_pct"))
+            _finite(combination.get("objective_expected_return_pct"))
             if combination_ready
             else None
         )
         uncertainty = (
-            _finite(production_distribution.get("uncertainty_penalty_pct"))
+            _finite(combination.get("uncertainty_penalty_pct"))
             if combination_ready
             else None
         )
         expected_loss = (
-            _finite(production_distribution.get("tail_loss_penalty_pct"))
+            _finite(combination.get("tail_loss_penalty_pct"))
             if combination_ready
             else None
         )
         score = return_lcb if return_lcb is not None else float("-inf")
         loss_probability = _finite(
-            production_distribution.get("tail_loss_probability")
+            combination.get("tail_loss_probability")
         )
         tail_risk = loss_probability
         profit_quality = (
@@ -555,24 +705,34 @@ class EntryOpportunityScoringPolicy:
             else None
         )
         generated_at = datetime.now(UTC).isoformat()
-        blockers = list(production_distribution.get("blockers") or [])
+        blockers = list(combination.get("blockers") or [])
+        combination_version = (
+            PAPER_RETURN_COMBINATION_VERSION
+            if execution_scope == "paper"
+            else PRODUCTION_RETURN_COMBINATION_VERSION
+        )
         provenance = {
             "source": (
-                "governed_market_live_cost_and_okx_trade_calibration"
+                "contract_complete_models_and_current_orderbook_cost"
+                if execution_scope == "paper" and combination_ready
+                else "governed_market_live_cost_and_okx_trade_calibration"
                 if combination_ready
                 else "return_distribution_unavailable"
             ),
             "observation_window": (
-                "current_governed_model_outputs_orderbook_and_authoritative_trade_history"
+                "current_model_outputs_and_orderbook"
+                if execution_scope == "paper"
+                else "current_governed_model_outputs_orderbook_and_authoritative_trade_history"
             ),
             "sample_count": len(selected_components) if combination_ready else 0,
             "generated_at": generated_at,
-            "strategy_version": PRODUCTION_RETURN_COMBINATION_VERSION,
+            "strategy_version": combination_version,
             "fallback_reason": ",".join(blockers),
             "valid_for_seconds": round(valid_for_seconds, 8),
             "return_distribution_mode": distribution_mode,
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
-            "return_combination_version": PRODUCTION_RETURN_COMBINATION_VERSION,
+            "return_combination_version": combination_version,
+            "execution_scope": execution_scope,
         }
         raw["opportunity_score"] = {
             "score": round(score, 8) if isfinite(score) else None,
@@ -608,19 +768,14 @@ class EntryOpportunityScoringPolicy:
                 round(tail_risk, 8) if tail_risk is not None else None
             ),
             "score_policy": "standardized_objective_expected_return",
+            "execution_scope": execution_scope,
             "return_distribution_mode": distribution_mode,
-            "return_distribution_contract": production_distribution,
+            "return_distribution_contract": combination,
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
-            "return_combination_version": PRODUCTION_RETURN_COMBINATION_VERSION,
+            "return_combination_version": combination_version,
             "execution_cost": execution_cost.to_dict(),
             "expected_net_breakdown": {
-                "formula": (
-                    "weighted_mean(governed_gross_market_returns)-live_execution_cost-"
-                    if quant_multipliers
-                    else "mean(governed_gross_market_returns)-live_execution_cost-"
-                ) + (
-                    "authoritative_slippage_tail_excess"
-                ),
+                "formula": transformations.get("formula"),
                 "unit": "pct",
                 "components": components,
                 "net_pct": round(expected_net, 8) if expected_net is not None else None,
@@ -682,7 +837,13 @@ class EntryOpportunityScoringPolicy:
                     ),
                 },
             },
-            "production_eligible": combination_ready,
+            "decision_eligible": combination_ready,
+            "paper_eligible": bool(
+                execution_scope == "paper" and combination_ready
+            ),
+            "production_eligible": bool(
+                execution_scope == "live" and combination_ready
+            ),
             "policy_provenance": provenance,
             "strategy_context_observation_only": safe_dict(strategy),
         }

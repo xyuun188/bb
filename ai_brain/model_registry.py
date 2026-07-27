@@ -471,7 +471,6 @@ class ModelRegistry:
 
         if str(context.get("execution_mode") or "").lower() == "paper":
             context["_force_independent_expert"] = True
-            context["_force_fast_independent_expert"] = True
             context["_provider_independent_expert_mode"] = True
 
         def _timeout_fallback_decision(

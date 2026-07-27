@@ -1540,13 +1540,15 @@ Artifact 注册表必须拒绝：
 
 ### 36.2 本地验证证据
 
-- 全量测试：`2875 passed, 4 skipped`。
+- 全量测试：`2913 passed, 4 skipped`。
 - 定向删除回归：`19 passed`。
 - 全目录 Ruff lint：通过。
 - Python `compileall`：通过。
 - `training.js` 与 `dashboard.js` Node 语法检查：通过。
 - 禁止的新单 API 搜索结果为 0，包括旧 policy、builder、assess、prepare 和 preflight 入口。
 - 生产目录中 `preferred_exploration_side` 与 `exploration_maturity_by_symbol_side` 搜索结果为 0。
+- 模拟盘协调路径在 live 收益下界和晋升门禁之前独立返回；生产资格字段仅保留在 live 分支、当前 OKX 硬事实完整性和历史审计语义中。
+- 自动训练游标已按清洗后的市场标签 decision_group 与 OKX 持仓生命周期组计数；新增单笔结果不会绕过最小独立组增量直接触发训练。
 
 仓库存在既有 Ruff 格式基线差异，因此没有对整个仓库做无关的全量格式化；本次最后手工修改的文件已经单独格式化并通过检查。全量测试曾出现一次 aiosqlite 线程清理时序警告，对应测试随后以 `PytestUnhandledThreadExceptionWarning` 提升为错误单独复跑并通过。
 
@@ -1559,16 +1561,22 @@ Artifact 注册表必须拒绝：
 - 同一不兼容 Artifact 的判定按注册指针和文件版本缓存，不再在每次分析时反复读取 joblib；指针或模型文件变更后会自动重新校验。
 - 自动训练子进程已使用带前缀的机器结果帧，普通结构化日志不再污染 JSON 结果；线上已从误报 `error/str` 恢复为真实的 `decision_group_training_partition_immature`。
 - 新标签合同已开始自然积累，最新训练检查已识别 2 条样本，但尚未形成可用时间分区，因此未写入伪造或不成熟 Artifact。
-- 权威结果审计保持 533 条结果、64 条完整且可训练、469 条因真实事实缺口隔离；可训练记录的入口身份全部为 `normal_strategy_trade`，旧 exploration/training 训练身份计数为 0。
+- 最新权威结果审计已增长到 550 条结果，其中 73 条事实完整且可训练、477 条因真实事实缺口隔离；73 条可训练记录包含 15 条盈利和 58 条亏损，全部为 `normal_strategy_trade`，合同违规为 0，证明亏损不会被隔离或停止训练。
+- 5/15/60/240 分钟市场标签已经自然成熟 175/176/142/49 条；线上训练游标累计 279 个市场 decision_group、63 个权威成本 decision_group，共 342 个独立训练组。
+- Challenger `20260727T184337004884Z-4dc3dd13` 已在 304 个独立组时自然完成训练，并因时间外平均费后收益和最大回撤均劣于 Champion 自动拒绝；Champion `20260727T180222094811Z-d9d8a676` 保持原子只读，模拟盘分析和交易未被拒绝结果阻断。
+- 未晋升 canary 模型已自然参与决策 `133061` 并开出 ETH short；订单身份为 `normal_strategy_trade`、`production_permission=false`、`decision_authority=ensemble`，5 个专家全部 HOLD 也未再形成隐式否决。
+- 决策 `133061` 已自然部分平仓 0.021 ETH，OKX 权威部分生命周期的手续费、数量、开平订单和结算事实闭合，`evidence_gaps=[]`；剩余 0.005 ETH 仍由数量完全匹配的 OKX OCO 保护单管理，未人工平仓。
+- 部署后自然决策 `133554` 开出 PEPE short 并自然完整平仓；开平订单、数量、手续费、滑点和资金费全部来自 OKX 权威事实，`evidence_gaps=[]`。对应 Position 5389 的亏损 `-0.43552145 USDT` 已以 `training_status=included` 进入权威训练记录，结果总数和可训练数分别从 549/72 增长到 550/73。
+- PEPE 自然运行暴露出退出公式把 `adverse_move / total_move` 直接当作平仓压力：三个极小幅度收益只要方向一致不利就会得到 1.0 并立即全平。公式已从底层改为“方向一致度 × 已消耗止损风险预算”，策略版本升级为 `2026-07-27.dynamic-exit-risk-scaled-continuation.v8`；硬止损仍全平，盈利回撤、模型退出、组合压力和替代机会合同保持不变。
+- ENA 历史平仓发现并修复同一 OKX 生命周期因本地时间戳差异形成的重复 Position：生命周期身份现由交易所身份、symbol/side、开平订单和数量决定，重复行自动退役，官方净实现盈亏不再重复累计。
+- 市价买入的最大提交数量现按 OKX 当时 `buyLmt` 最坏成交价裁剪，并记录 `fill_risk_price`、来源和最大成交名义金额；历史 FIL 超限事实保留为违规证据，部署后 30/60 分钟合同窗口违规为 0。
+- 最近 60 分钟线上自然产生 30 条市场决策、覆盖 15 个币种，以及 290 条持仓复盘；候选覆盖无逾期。交易和 Dashboard 服务均为 active，最近部署重启后的连续运行窗口仍在积累。
 
 ### 36.4 尚未完成的线上验收
 
 以下项目必须在部署后由自然运行态证明，未完成前不得把总计划标记为完成：
 
-- 未晋升模型自然参与分析并产生新的 `normal_strategy_trade`，不得产生旧订单身份。
-- 至少观察一笔自然开仓和一笔自然平仓，不得通过人工造单绕过风险门禁。
-- 新订单的 OKX 成交、手续费、滑点、资金费、持仓数量和结算事实闭合。
-- 完整盈利和亏损结果都进入正确训练任务，缺失事实仍明确隔离。
-- 5/15/60/240 分钟市场标签按自然时间成熟。
-- Live 仍由晋升状态、`live_ml_ready` 和逐笔 `production_trade_gate` 失败关闭。
-- Dashboard 和生产源健康页面显示 normal paper 新口径，不再把历史 bootstrap 状态当成当前交易状态。
+- 等待部署后新的自然买入开仓，验证 `fill_risk_price_source=okx_buy_price_limit` 且 `maximum_fill_notional_usdt <= planned_notional_usdt`，并在成交结算后复核合同完整性。
+- 等待 `dynamic-exit-risk-scaled-continuation.v8` 部署后的自然退出，确认单次微小同向不利收益不会再次形成 `continuation_deterioration=1.0` 和无硬风险全平；ETH 剩余 0.005 ETH 可继续由完整 OCO 保护自然管理，不为验收人工平仓。
+- 部署后的交易和 Dashboard 服务需要继续积累完整连续运行窗口；重新执行线上覆盖审计后，`trading_service_continuity_unproven`、`dashboard_service_continuity_unproven` 和市场活动间隔告警必须消失或具有可解释的真实运行原因。
+- 完整自然生命周期验收后重新执行 30/60 分钟交易合同审计，要求部署后新增订单合同违规为 0，并再次确认 live 仍由晋升状态、`live_ml_ready` 和逐笔 `production_trade_gate` 失败关闭。

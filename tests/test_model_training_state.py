@@ -87,6 +87,77 @@ def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
         assert [event["event"] for event in row["history"]] == ["started", "succeeded"]
 
 
+def test_skipped_check_does_not_advance_last_successful_training_cursor(tmp_path) -> None:
+    now = [datetime(2026, 7, 27, 1, 0, tzinfo=UTC)]
+    store = ModelTrainingStateStore(
+        tmp_path / "model_training_state.json",
+        now_provider=lambda: now[0],
+    )
+    first = store.try_acquire_lease(
+        scheduler_id="local_ai_tools_auto_train",
+        stale_after_seconds=3600,
+    )
+    assert first.lease is not None
+    store.record_check(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=first.lease.run_id,
+        force=False,
+    )
+    store.start_run(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=first.lease.run_id,
+        trigger_reason="mature_decision_group_batch",
+        sample_cursor={"shadow": 100, "trade": 50, "decision_group": 150},
+    )
+    store.finish_check(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=first.lease.run_id,
+        result={
+            "trained": True,
+            "last_trained_completed_shadow_sample_count": 100,
+            "last_trained_completed_trade_sample_count": 50,
+            "last_trained_completed_training_decision_group_count": 150,
+        },
+        next_check_at=now[0] + timedelta(minutes=30),
+    )
+    first.lease.release()
+
+    second = store.try_acquire_lease(
+        scheduler_id="local_ai_tools_auto_train",
+        stale_after_seconds=3600,
+    )
+    assert second.lease is not None
+    store.record_check(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=second.lease.run_id,
+        force=False,
+    )
+    store.finish_check(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=second.lease.run_id,
+        result={
+            "trained": False,
+            "reason": "not_due",
+            "completed_shadow_sample_count": 101,
+            "completed_trade_sample_count": 50,
+            "completed_training_decision_group_count": 151,
+        },
+        next_check_at=now[0] + timedelta(minutes=30),
+    )
+
+    for row in store.read()["models"].values():
+        assert row["sample_cursor"] == {
+            "shadow": 100,
+            "trade": 50,
+            "decision_group": 150,
+        }
+
+
 def test_missing_state_is_unavailable_until_first_persistent_heartbeat(tmp_path) -> None:
     store = ModelTrainingStateStore(tmp_path / "model_training_state.json")
 

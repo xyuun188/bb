@@ -70,7 +70,7 @@ from web_dashboard.api.dashboard import (
 from web_dashboard.api.data_collection import get_data_collection_status
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
-from models.trade import Order
+from models.trade import OkxPositionHistory, Order, Position
 from sqlalchemy import select, text
 
 WINDOW_MINUTES = __WINDOW_MINUTES__
@@ -121,6 +121,181 @@ async def _read_positions_and_protection():
         await executor.shutdown()
 
 
+async def _read_selected_decision():
+    if DECISION_ID <= 0:
+        return None
+    async with get_read_session_ctx() as session:
+        decision = await session.get(AIDecision, DECISION_ID)
+        order_rows = list(
+            (
+                await session.execute(
+                    select(Order).where(Order.decision_id == DECISION_ID).order_by(Order.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        decision_raw = (
+            decision.raw_llm_response
+            if decision is not None and isinstance(decision.raw_llm_response, dict)
+            else {}
+        )
+        execution_result = decision_raw.get("execution_result")
+        execution_result = (
+            execution_result if isinstance(execution_result, dict) else {}
+        )
+        execution_order_ids = {
+            str(value).strip()
+            for value in (
+                execution_result.get("exchange_order_id"),
+                execution_result.get("order_id"),
+            )
+            if str(value or "").strip()
+        }
+        if execution_order_ids:
+            recovered_order_rows = list(
+                (
+                    await session.execute(
+                        select(Order)
+                        .where(Order.exchange_order_id.in_(execution_order_ids))
+                        .order_by(Order.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            order_rows = list(
+                {row.id: row for row in [*order_rows, *recovered_order_rows]}.values()
+            )
+        exchange_order_ids = {
+            str(row.exchange_order_id).strip()
+            for row in order_rows
+            if str(row.exchange_order_id or "").strip()
+        }
+        position_rows = []
+        history_rows = []
+        if decision is not None and exchange_order_ids:
+            position_rows = list(
+                (
+                    await session.execute(
+                        select(Position)
+                        .where(
+                            Position.execution_mode == "paper",
+                            Position.symbol == decision.symbol,
+                            Position.entry_exchange_order_id.in_(exchange_order_ids),
+                        )
+                        .order_by(Position.id.desc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            history_candidates = list(
+                (
+                    await session.execute(
+                        select(OkxPositionHistory)
+                        .where(
+                            OkxPositionHistory.mode == "paper",
+                            OkxPositionHistory.symbol == decision.symbol,
+                        )
+                        .order_by(OkxPositionHistory.updated_at_okx.desc())
+                        .limit(100)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            history_rows = [
+                row
+                for row in history_candidates
+                if exchange_order_ids.intersection(
+                    str(value).strip()
+                    for value in (row.entry_order_ids or [])
+                    if str(value).strip()
+                )
+            ]
+    if decision is None:
+        return None
+    return {
+        "id": decision.id,
+        "model_name": decision.model_name,
+        "symbol": decision.symbol,
+        "action": decision.action,
+        "was_executed": decision.was_executed,
+        "execution_reason": decision.execution_reason,
+        "created_at": decision.created_at,
+        "executed_at": decision.executed_at,
+        "execution_price": decision.execution_price,
+        "raw_llm_response": decision.raw_llm_response,
+        "orders": [
+            {
+                "id": row.id,
+                "decision_id": row.decision_id,
+                "status": row.status,
+                "side": row.side,
+                "quantity": row.quantity,
+                "price": row.price,
+                "exchange_order_id": row.exchange_order_id,
+                "okx_inst_id": row.okx_inst_id,
+                "okx_state": row.okx_state,
+                "okx_sync_status": row.okx_sync_status,
+                "okx_raw_fills": row.okx_raw_fills,
+                "created_at": row.created_at,
+                "filled_at": row.filled_at,
+            }
+            for row in order_rows
+        ],
+        "positions": [
+            {
+                "id": row.id,
+                "symbol": row.symbol,
+                "side": row.side,
+                "quantity": row.quantity,
+                "entry_price": row.entry_price,
+                "current_price": row.current_price,
+                "is_open": row.is_open,
+                "realized_pnl": row.realized_pnl,
+                "entry_fee": row.entry_fee,
+                "close_fee": row.close_fee,
+                "funding_fee": row.funding_fee,
+                "settlement_status": row.settlement_status,
+                "settlement_source": row.settlement_source,
+                "settlement_synced_at": row.settlement_synced_at,
+                "entry_exchange_order_id": row.entry_exchange_order_id,
+                "close_exchange_order_id": row.close_exchange_order_id,
+                "closed_at": row.closed_at,
+            }
+            for row in position_rows
+        ],
+        "authoritative_position_history": [
+            {
+                "row_identity": row.row_identity,
+                "pos_id": row.pos_id,
+                "symbol": row.symbol,
+                "side": row.side,
+                "close_status": row.close_status,
+                "opened_at": row.opened_at,
+                "updated_at_okx": row.updated_at_okx,
+                "open_avg_px": row.open_avg_px,
+                "close_avg_px": row.close_avg_px,
+                "open_max_pos": row.open_max_pos,
+                "close_total_pos": row.close_total_pos,
+                "realized_pnl": row.realized_pnl,
+                "pnl": row.pnl,
+                "funding_fee": row.funding_fee,
+                "fee": row.fee,
+                "entry_order_ids": row.entry_order_ids,
+                "close_order_ids": row.close_order_ids,
+                "match_status": row.match_status,
+                "evidence_gaps": row.evidence_gaps,
+                "sync_status": row.sync_status,
+                "synced_at": row.synced_at,
+            }
+            for row in history_rows
+        ],
+    }
+
+
 async def main():
     if REPLAY_ONLY:
         started = time.perf_counter()
@@ -143,6 +318,21 @@ async def main():
         return
     since = datetime.now(UTC) - timedelta(minutes=WINDOW_MINUTES)
     contract = await TradeExecutionContractService().report(since=since, limit=5000)
+    if ENTRY_ONLY and DECISION_ID > 0:
+        print(json.dumps({
+            "generated_at": datetime.now(UTC).isoformat(),
+            "window_minutes": WINDOW_MINUTES,
+            "audit_only": True,
+            "optimization_target": PROFIT_TRAINING_TARGET,
+            "trade_execution_contract": {
+                "summary": contract.get("summary", {}),
+                "violation_reason_counts": contract.get("violation_reason_counts", {}),
+                "violations": contract.get("violations", []),
+                "policy": contract.get("policy", {}),
+            },
+            "selected_decision": await _read_selected_decision(),
+        }, ensure_ascii=False, default=str))
+        return
     try:
         ml_status = MLSignalService().status()
     except Exception as exc:
@@ -224,50 +414,7 @@ async def main():
         "migration_complete": not removed_memory_policy_columns,
     }
     if DECISION_ID > 0:
-        async with get_read_session_ctx() as session:
-            decision = await session.get(AIDecision, DECISION_ID)
-            order_rows = list(
-                (
-                    await session.execute(
-                        select(Order).where(Order.decision_id == DECISION_ID).order_by(Order.id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        payload["selected_decision"] = (
-            {
-                "id": decision.id,
-                "model_name": decision.model_name,
-                "symbol": decision.symbol,
-                "action": decision.action,
-                "was_executed": decision.was_executed,
-                "execution_reason": decision.execution_reason,
-                "created_at": decision.created_at,
-                "executed_at": decision.executed_at,
-                "execution_price": decision.execution_price,
-                "raw_llm_response": decision.raw_llm_response,
-                "orders": [
-                    {
-                        "id": row.id,
-                        "status": row.status,
-                        "side": row.side,
-                        "quantity": row.quantity,
-                        "price": row.price,
-                        "exchange_order_id": row.exchange_order_id,
-                        "okx_inst_id": row.okx_inst_id,
-                        "okx_state": row.okx_state,
-                        "okx_sync_status": row.okx_sync_status,
-                        "okx_raw_fills": row.okx_raw_fills,
-                        "created_at": row.created_at,
-                        "filled_at": row.filled_at,
-                    }
-                    for row in order_rows
-                ],
-            }
-            if decision is not None
-            else None
-        )
+        payload["selected_decision"] = await _read_selected_decision()
     if SUMMARY_ONLY or MARKET_SYMBOL_ONLY or ENTRY_ONLY:
         payload = {
             **payload,
@@ -422,8 +569,328 @@ def _summarize_report(report: dict) -> dict:
             for row in models
             if isinstance(row, dict) and row.get("trainable") is True
         ],
-        "selected_decision": report.get("selected_decision"),
+        "selected_decision": _summarize_selected_decision(
+            report.get("selected_decision")
+        ),
         "expert_memory_schema": report.get("expert_memory_schema"),
+    }
+
+
+def _selected_fields(value: object, fields: tuple[str, ...]) -> dict:
+    payload = value if isinstance(value, dict) else {}
+    return {field: payload.get(field) for field in fields if field in payload}
+
+
+def _summarize_return_distribution(value: object) -> dict:
+    payload = value if isinstance(value, dict) else {}
+    return _selected_fields(
+        payload,
+        (
+            "side",
+            "horizon_minutes",
+            "raw_expected_return_pct",
+            "lower_quantile_return_pct",
+            "median_return_pct",
+            "upper_quantile_return_pct",
+            "loss_probability",
+            "tail_loss_probability",
+            "expected_execution_cost_pct",
+            "contract_complete",
+            "paper_eligible",
+            "production_eligible",
+            "blockers",
+            "production_blockers",
+        ),
+    )
+
+
+def _summarize_local_ai_tools(value: object) -> dict:
+    tools = value if isinstance(value, dict) else {}
+    summarized: dict[str, dict] = {}
+    fields = (
+        "available",
+        "artifact_version",
+        "model_stage",
+        "model_version",
+        "route_mode",
+        "horizon_minutes",
+        "best_side",
+        "objective_name",
+        "objective_version",
+        "label_version",
+        "profit_supervision_version",
+        "training_cost_policy",
+        "return_semantics",
+        "return_distribution_input_version",
+        "live_ml_ready",
+        "paper_trading_permission",
+        "production_permission",
+    )
+    for name, raw_tool in tools.items():
+        if not isinstance(raw_tool, dict):
+            continue
+        tool = _selected_fields(raw_tool, fields)
+        tool["prediction_quality"] = _selected_fields(
+            raw_tool.get("prediction_quality"),
+            (
+                "contract_complete",
+                "paper_eligible",
+                "production_eligible",
+                "anomalous",
+                "reason",
+                "blockers",
+                "production_blockers",
+            ),
+        )
+        distributions = raw_tool.get("return_distribution_contract")
+        distributions = distributions if isinstance(distributions, dict) else {}
+        tool["return_distribution"] = {
+            side: _summarize_return_distribution(distributions.get(side))
+            for side in ("long", "short")
+            if isinstance(distributions.get(side), dict)
+        }
+        summarized[str(name)] = tool
+    return summarized
+
+
+def _summarize_okx_fills(value: object) -> list[dict]:
+    fills = value if isinstance(value, list) else []
+    fields = (
+        "tradeId",
+        "ordId",
+        "instId",
+        "side",
+        "fillPx",
+        "fillSz",
+        "fee",
+        "feeCcy",
+        "ts",
+    )
+    return [_selected_fields(fill, fields) for fill in fills if isinstance(fill, dict)]
+
+
+def _summarize_selected_decision(value: object) -> dict | None:
+    decision = value if isinstance(value, dict) else None
+    if decision is None:
+        return None
+    raw = decision.get("raw_llm_response")
+    raw = raw if isinstance(raw, dict) else {}
+    opinions = raw.get("opinions")
+    opinions = opinions if isinstance(opinions, list) else []
+    order_fields = (
+        "id",
+        "decision_id",
+        "status",
+        "side",
+        "quantity",
+        "price",
+        "exchange_order_id",
+        "okx_inst_id",
+        "okx_state",
+        "okx_sync_status",
+        "created_at",
+        "filled_at",
+    )
+    orders = []
+    for order_value in decision.get("orders") or []:
+        if not isinstance(order_value, dict):
+            continue
+        order = _selected_fields(order_value, order_fields)
+        order["okx_fills"] = _summarize_okx_fills(order_value.get("okx_raw_fills"))
+        orders.append(order)
+    return {
+        **_selected_fields(
+            decision,
+            (
+                "id",
+                "model_name",
+                "symbol",
+                "action",
+                "was_executed",
+                "execution_reason",
+                "created_at",
+                "executed_at",
+                "execution_price",
+            ),
+        ),
+        "normal_paper_trade": raw.get("normal_paper_trade") or {},
+        "entry_permission": raw.get("entry_permission") or {},
+        "paper_trade_selection": _selected_fields(
+            raw.get("paper_trade_selection"),
+            (
+                "version",
+                "selected",
+                "selected_side",
+                "selection_reason",
+                "eligible_side_count",
+                "decision_authority",
+                "production_permission",
+            ),
+        ),
+        "independent_direction_support": _selected_fields(
+            raw.get("independent_direction_support"),
+            (
+                "version",
+                "support_scope",
+                "eligible",
+                "reason",
+                "selected_side",
+                "execution_cost_pct",
+                "execution_cost_complete",
+                "expected_net_return_pct",
+                "objective_net_return_pct",
+                "loss_probability",
+                "prediction_horizon_minutes",
+                "quantitative_sources",
+                "quant_evidence_families",
+                "aligned_expert_count",
+                "opposition_expert_count",
+                "hold_expert_count",
+                "strong_expert_opposition",
+                "blocking_reasons",
+                "production_permission",
+            ),
+        ),
+        "opportunity_score": _selected_fields(
+            raw.get("opportunity_score"),
+            (
+                "side",
+                "score",
+                "decision_eligible",
+                "paper_eligible",
+                "production_eligible",
+                "expected_gross_return_pct",
+                "expected_net_return_pct",
+                "return_lcb_pct",
+                "loss_probability",
+                "tail_loss_probability",
+                "horizon_minutes",
+                "blockers",
+                "production_blockers",
+            ),
+        ),
+        "profit_risk_sizing": _summarize_profit_risk_sizing(
+            raw.get("profit_risk_sizing")
+        ),
+        "local_ai_tools": _summarize_local_ai_tools(raw.get("local_ai_tools")),
+        "expert_opinions": [
+            _selected_fields(
+                opinion,
+                (
+                    "model_name",
+                    "role",
+                    "action",
+                    "confidence",
+                    "effective_weight",
+                    "entry_support_eligible",
+                    "excluded_reason",
+                    "timeout_fallback",
+                    "trace_only_fallback",
+                    "reasoning",
+                ),
+            )
+            for opinion in opinions
+            if isinstance(opinion, dict)
+        ],
+        "orders": orders,
+        "positions": [
+            dict(item)
+            for item in decision.get("positions") or []
+            if isinstance(item, dict)
+        ],
+        "authoritative_position_history": [
+            dict(item)
+            for item in decision.get("authoritative_position_history") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _summarize_profit_risk_sizing(value: object) -> dict:
+    sizing = value if isinstance(value, dict) else {}
+    summary = _selected_fields(
+        sizing,
+        (
+            "contract_version",
+            "contract_lifecycle",
+            "execution_scope",
+            "production_permission",
+            "reason",
+            "account_equity_usdt",
+            "available_margin_usdt",
+            "risk_budget_usdt",
+            "single_trade_risk_budget_usdt",
+            "portfolio_risk_budget_usdt",
+            "remaining_portfolio_risk_budget_usdt",
+            "current_portfolio_stressed_loss_usdt",
+            "planned_stressed_loss_usdt",
+            "target_notional_usdt",
+            "minimum_order_notional_usdt",
+            "minimum_order_supported",
+            "fill_notional_ceiling_usdt",
+            "final_notional_usdt",
+            "final_margin_usdt",
+            "final_leverage",
+            "expected_net_return_pct",
+            "expected_profit_usdt",
+            "paper_profitability_gate_applied",
+            "selection_reason",
+            "single_trade_risk_fraction_cap",
+            "portfolio_risk_fraction_cap",
+            "return_lcb_pct",
+        ),
+    )
+    summary["execution_cost"] = _selected_fields(
+        sizing.get("execution_cost"),
+        (
+            "fee_pct",
+            "slippage_pct",
+            "total_pct",
+            "spread_pct",
+            "market_impact_pct",
+            "order_notional_usdt",
+            "order_side",
+            "order_size_complete",
+            "estimated_vwap",
+            "reference_price",
+            "production_eligible",
+            "reason",
+        ),
+    )
+    reconciliations = sizing.get("execution_reconciliations")
+    reconciliations = reconciliations if isinstance(reconciliations, list) else []
+    summary["execution_reconciliations"] = [
+        _selected_fields(
+            item,
+            (
+                "source",
+                "generated_at",
+                "final_notional_usdt",
+                "final_leverage",
+                "eligible",
+                "reasons",
+            ),
+        )
+        for item in reconciliations
+        if isinstance(item, dict)
+    ]
+    return summary
+
+
+def _summarize_entry_report(report: dict) -> dict:
+    contract = report.get("trade_execution_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    return {
+        "generated_at": report.get("generated_at"),
+        "window_minutes": report.get("window_minutes"),
+        "optimization_target": PROFIT_TRAINING_TARGET,
+        "contract_summary": contract.get("summary") or {},
+        "contract_violations": contract.get("violation_reason_counts") or {},
+        "contract_violation_rows": contract.get("violations") or [],
+        "contract_policy": contract.get("policy") or {},
+        "selected_decision": _summarize_selected_decision(
+            report.get("selected_decision")
+        ),
     }
 
 
@@ -837,7 +1304,9 @@ def main() -> None:
         payload = _decode_remote_json(output)
         safe_print(
             json.dumps(
-                _summarize_report(payload)
+                _summarize_entry_report(payload)
+                if args.summary and args.entry_only and not args.replay_only
+                else _summarize_report(payload)
                 if args.summary and not args.replay_only
                 else payload,
                 ensure_ascii=False,

@@ -190,9 +190,7 @@ class LocalAIToolsClient:
         async with self._inference_lock:
             core_specs = tool_specs[:3]
             results.extend(
-                await asyncio.gather(
-                    *(call_tool(name, path) for name, path in core_specs)
-                )
+                await asyncio.gather(*(call_tool(name, path) for name, path in core_specs))
             )
             for name, path in tool_specs[len(core_specs) :]:
                 results.append(await call_tool(name, path))
@@ -284,37 +282,19 @@ class LocalAIToolsClient:
             contract = standardized_return_distribution(
                 side=side,
                 horizon_minutes=distribution_input.get("horizon_minutes"),
-                raw_expected_return_pct=distribution_input.get(
-                    "raw_expected_return_pct"
-                ),
+                raw_expected_return_pct=distribution_input.get("raw_expected_return_pct"),
                 median_return_pct=distribution_input.get("median_return_pct"),
-                lower_quantile_return_pct=distribution_input.get(
-                    "lower_quantile_return_pct"
-                ),
-                upper_quantile_return_pct=distribution_input.get(
-                    "upper_quantile_return_pct"
-                ),
+                lower_quantile_return_pct=distribution_input.get("lower_quantile_return_pct"),
+                upper_quantile_return_pct=distribution_input.get("upper_quantile_return_pct"),
                 dispersion_pct=distribution_input.get("dispersion_pct"),
-                tail_loss_probability=distribution_input.get(
-                    "tail_loss_probability"
-                ),
+                tail_loss_probability=distribution_input.get("tail_loss_probability"),
                 tail_loss_scale_pct=distribution_input.get("tail_loss_scale_pct"),
-                distribution_member_count=distribution_input.get(
-                    "distribution_member_count"
-                ),
-                return_semantics=str(
-                    distribution_input.get("return_semantics") or ""
-                ),
-                source_authority=str(
-                    distribution_input.get("source_authority") or ""
-                ),
-                objective_version=str(
-                    distribution_input.get("objective_version") or ""
-                ),
+                distribution_member_count=distribution_input.get("distribution_member_count"),
+                return_semantics=str(distribution_input.get("return_semantics") or ""),
+                source_authority=str(distribution_input.get("source_authority") or ""),
+                objective_version=str(distribution_input.get("objective_version") or ""),
                 label_version=str(distribution_input.get("label_version") or ""),
-                cost_model_version=str(
-                    distribution_input.get("cost_model_version") or ""
-                ),
+                cost_model_version=str(distribution_input.get("cost_model_version") or ""),
                 profit_supervision_version=str(
                     distribution_input.get("profit_supervision_version") or ""
                 ),
@@ -331,9 +311,7 @@ class LocalAIToolsClient:
                 contract["production_eligible"] = False
             contracts[side] = contract
 
-        normalized["return_distribution_contract_version"] = (
-            RETURN_DISTRIBUTION_CONTRACT_VERSION
-        )
+        normalized["return_distribution_contract_version"] = RETURN_DISTRIBUTION_CONTRACT_VERSION
         normalized["return_distribution_contract"] = {
             "version": RETURN_DISTRIBUTION_CONTRACT_VERSION,
             **contracts,
@@ -348,9 +326,7 @@ class LocalAIToolsClient:
             for side, contract in contracts.items()
         }
         ready_sides = [
-            side
-            for side, validation in validations.items()
-            if validation.get("eligible") is True
+            side for side, validation in validations.items() if validation.get("eligible") is True
         ]
         reported_side = payload_side(normalized)
         selected_side = reported_side if reported_side in ready_sides else ""
@@ -368,46 +344,68 @@ class LocalAIToolsClient:
             normalized["raw_expected_return_pct"] = contracts[selected_side].get(
                 "raw_expected_return_pct"
             )
-            normalized["objective_expected_return_pct"] = contracts[
-                selected_side
-            ].get("objective_expected_return_pct")
+            normalized["objective_expected_return_pct"] = contracts[selected_side].get(
+                "objective_expected_return_pct"
+            )
 
         quality = normalized.get("prediction_quality")
         quality = dict(quality) if isinstance(quality, dict) else {}
-        remote_ready = bool(
-            quality.get("production_eligible") is True
+        remote_contract_ready = bool(
+            quality.get(
+                "contract_complete",
+                quality.get("paper_eligible", quality.get("production_eligible")),
+            )
+            is True
             and quality.get("anomalous") is not True
         )
         contract_ready = len(ready_sides) == 2
         remote_blockers = quality.get("blockers")
         remote_blockers = remote_blockers if isinstance(remote_blockers, list) else []
-        all_blockers = [
+        structural_blockers = [
             *boundary_blockers,
             *remote_blockers,
         ]
         for validation in validations.values():
-            all_blockers.extend(validation.get("blockers") or [])
-        all_blockers = list(dict.fromkeys(str(item) for item in all_blockers if item))
-        production_eligible = bool(remote_ready and contract_ready and not all_blockers)
+            structural_blockers.extend(validation.get("blockers") or [])
+        structural_blockers = list(dict.fromkeys(str(item) for item in structural_blockers if item))
+        contract_complete = bool(
+            remote_contract_ready and contract_ready and not structural_blockers
+        )
+        live_authorized = bool(
+            normalized.get("production_permission") is True
+            and normalized.get("live_ml_ready") is True
+        )
+        production_eligible = bool(
+            contract_complete and quality.get("production_eligible") is True and live_authorized
+        )
+        production_blockers = list(quality.get("production_blockers") or [])
+        if not live_authorized:
+            production_blockers.append("artifact_activation_not_production_authorized")
         normalized["prediction_quality"] = {
             **quality,
+            "contract_complete": contract_complete,
+            "paper_eligible": contract_complete,
             "production_eligible": production_eligible,
-            "anomalous": not production_eligible,
+            "anomalous": not contract_complete,
             "reason": (
                 "standardized_return_distribution_ready"
                 if production_eligible
-                else all_blockers[0]
-                if all_blockers
+                else "standardized_return_distribution_ready_for_paper"
+                if contract_complete
+                else structural_blockers[0]
+                if structural_blockers
                 else str(quality.get("reason") or "remote_prediction_quality_blocked")
             ),
-            "blockers": all_blockers,
+            "blockers": structural_blockers,
+            "production_blockers": list(
+                dict.fromkeys([*structural_blockers, *production_blockers])
+            ),
         }
         predictions = normalized.get("predictions")
         if isinstance(predictions, list):
             normalized["predictions"] = [
                 self._attach_return_distribution_contract(item)
-                if isinstance(item, dict)
-                and item.get("return_distribution_inputs")
+                if isinstance(item, dict) and item.get("return_distribution_inputs")
                 else item
                 for item in predictions
             ]
@@ -649,9 +647,7 @@ class LocalAIToolsClient:
             shadow_samples=shadow_samples,
         )
         profit_supervision_report = (
-            quality_report.get("profit_supervision", {})
-            if isinstance(quality_report, dict)
-            else {}
+            quality_report.get("profit_supervision", {}) if isinstance(quality_report, dict) else {}
         )
         effective_promotion = promotion_recommendation or build_phase3_promotion_recommendation(
             training_mode=training_mode,

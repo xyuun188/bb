@@ -234,6 +234,34 @@ def test_loss_uses_planned_stop_budget_continuously() -> None:
     assert result.close_fraction == pytest.approx(result.stop_risk_usage)
 
 
+def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
+    decision = _decision()
+    decision.feature_snapshot = {
+        "returns_1": -0.0002,
+        "returns_5": -0.0004,
+        "returns_20": -0.0008,
+    }
+    position = _position(
+        current_price=99.9,
+        notional_usdt=999.0,
+        unrealized_pnl=-1.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(decision, [position])
+
+    assert result.eligible is True
+    assert 0.0 < result.stop_risk_usage < 1.0
+    assert result.continuation_deterioration == pytest.approx(
+        result.stop_risk_usage
+    )
+    assert result.close_fraction > result.stop_risk_usage
+    assert result.close_fraction < 1.0
+    assert result.policy_provenance["strategy_version"] == (
+        "2026-07-27.dynamic-exit-risk-scaled-continuation.v8"
+    )
+
+
 def test_legacy_hard_risk_flag_without_position_economics_fails_closed() -> None:
     decision = _decision({"close_evidence": {"hard_risk": True}, "fast_risk_trigger": "stop_loss"})
 

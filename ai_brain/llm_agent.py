@@ -46,7 +46,8 @@ from core.safe_output import safe_error_text
 from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
-    signal_production_eligible,
+    signal_analysis_eligibility,
+    signal_paper_eligibility,
     signal_return_distribution,
 )
 
@@ -115,8 +116,8 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "server_profit_model",
         "profit",
     )
-    if signal_production_eligible(profit):
-        best_side = payload_side(profit) or profit.get("direction")
+    best_side = payload_side(profit) or profit.get("direction")
+    if signal_paper_eligibility(profit, str(best_side or "")).get("eligible") is True:
         distribution = signal_return_distribution(profit, str(best_side or ""))
         expected = distribution.get("objective_expected_return_pct")
         edge = profit.get("profit_edge_pct", profit.get("edge_pct"))
@@ -137,13 +138,13 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "timeseries",
         "time_series",
     )
-    if signal_production_eligible(ts):
-        trend = (
-            payload_side(ts)
-            or ts.get("trend")
-            or ts.get("direction")
-            or ts.get("forecast_direction")
-        )
+    trend = (
+        payload_side(ts)
+        or ts.get("trend")
+        or ts.get("direction")
+        or ts.get("forecast_direction")
+    )
+    if signal_paper_eligibility(ts, str(trend or "")).get("eligible") is True:
         distribution = signal_return_distribution(ts, str(trend or ""))
         move = distribution.get("objective_expected_return_pct")
         confidence = ts.get("confidence", ts.get("score"))
@@ -161,7 +162,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "sentiment_model",
         "sentiment",
     )
-    if signal_production_eligible(sentiment):
+    if signal_analysis_eligibility(sentiment).get("eligible") is True:
         label = sentiment.get("label") or sentiment.get("sentiment") or payload_side(sentiment)
         score = sentiment.get("score", sentiment.get("sentiment_score"))
         risk = sentiment.get("risk_level", sentiment.get("risk"))

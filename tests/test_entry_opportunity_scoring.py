@@ -11,6 +11,7 @@ from services.profit_supervision import (
 )
 from services.return_objective import (
     COST_MODEL_VERSION,
+    PAPER_RETURN_COMBINATION_VERSION,
     RETURN_DISTRIBUTION_CONTRACT_VERSION,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
@@ -386,11 +387,189 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
     opportunity = decision.raw_response["opportunity_score"]
     component = opportunity["expected_net_breakdown"]["components"][0]
     assert score == pytest.approx(opportunity["return_lcb_pct"])
-    assert opportunity["production_eligible"] is True
-    assert component["production_eligible"] is True
-    assert component["execution_scope"] == "paper_only"
+    assert opportunity["decision_eligible"] is True
+    assert opportunity["paper_eligible"] is True
+    assert opportunity["production_eligible"] is False
+    assert opportunity["return_combination_version"] == PAPER_RETURN_COMBINATION_VERSION
+    assert component["decision_eligible"] is True
+    assert component["paper_eligible"] is True
+    assert component["production_eligible"] is False
+    assert component["execution_scope"] == "paper"
     assert component["paper_strategy_authorization"]["eligible"] is True
     assert "paper_bootstrap_canary" not in decision.raw_response
+
+
+def _paper_payload(*, side: str, long_return: float, short_return: float) -> dict:
+    payload = _live_payload(
+        side=side,
+        long_return=long_return,
+        short_return=short_return,
+    )
+    payload.update(
+        {
+            "route_mode": "paper_analysis",
+            "live_ml_ready": False,
+            "production_permission": False,
+            "prediction_quality": {
+                "contract_complete": True,
+                "paper_eligible": True,
+                "production_eligible": False,
+                "anomalous": False,
+                "production_blockers": [
+                    "artifact_activation_not_production_authorized"
+                ],
+            },
+        }
+    )
+    payload.pop("counterfactual_execution_cost_distribution", None)
+    payload.pop("actual_trade_calibration", None)
+    return payload
+
+
+def test_shadow_server_models_participate_in_normal_paper_scoring() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": _paper_payload(
+            side="long",
+            long_return=1.0,
+            short_return=-0.4,
+        ),
+        "time_series_prediction": _paper_payload(
+            side="long",
+            long_return=0.6,
+            short_return=-0.1,
+        ),
+    }
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert score == pytest.approx(opportunity["return_lcb_pct"])
+    assert opportunity["decision_eligible"] is True
+    assert opportunity["paper_eligible"] is True
+    assert opportunity["production_eligible"] is False
+    assert opportunity["expected_gross_return_pct"] == pytest.approx(0.8)
+    assert opportunity["expected_net_breakdown"][
+        "counterfactual_cost_distribution_count"
+    ] == 0
+    assert opportunity["expected_net_breakdown"][
+        "authoritative_trade_calibration_count"
+    ] == 0
+    components = opportunity["expected_net_breakdown"]["components"]
+    assert all(component["paper_eligible"] is True for component in components[1:])
+    assert all(component["included_in_return_distribution"] is True for component in components[1:])
+
+
+def test_paper_scoring_uses_only_the_authorized_prediction_horizon() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    profit = _paper_payload(side="long", long_return=0.5, short_return=-0.2)
+    timeseries = _paper_payload(side="long", long_return=1.2, short_return=-0.4)
+    for side in ("long", "short"):
+        timeseries["return_distribution_contract"][side]["horizon_minutes"] = 60
+    timeseries["horizon_minutes"] = 60
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": profit,
+        "time_series_prediction": timeseries,
+    }
+    decision.raw_response["normal_paper_trade"] = {
+        "prediction_horizon_minutes": 30,
+    }
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    components = {
+        item["key"]: item
+        for item in opportunity["expected_net_breakdown"]["components"]
+    }
+    assert score == pytest.approx(opportunity["return_lcb_pct"])
+    assert opportunity["paper_eligible"] is True
+    assert opportunity["return_distribution_contract"]["gross_market_distribution"][
+        "model_count"
+    ] == 1
+    assert components["server_profit"]["included_in_return_distribution"] is True
+    assert components["timeseries"]["included_in_return_distribution"] is False
+    assert components["timeseries"]["observation_only"] is True
+    assert components["timeseries"]["eligibility_reason"] == (
+        "paper_prediction_horizon_not_selected"
+    )
+
+
+def test_shadow_server_models_remain_blocked_in_live_scoring() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": _paper_payload(
+            side="long",
+            long_return=1.0,
+            short_return=-0.4,
+        ),
+        "time_series_prediction": _paper_payload(
+            side="long",
+            long_return=0.6,
+            short_return=-0.1,
+        ),
+    }
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "live"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert isinf(score) and score < 0
+    assert opportunity["decision_eligible"] is False
+    assert opportunity["production_eligible"] is False
+    assert all(
+        component["production_eligible"] is False
+        for component in opportunity["expected_net_breakdown"]["components"]
+    )
+
+
+def test_paper_scoring_rejects_structurally_invalid_shadow_distribution() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    payload = _paper_payload(side="long", long_return=1.0, short_return=-0.4)
+    payload["return_distribution_contract"]["long"][
+        "lower_quantile_return_pct"
+    ] = 2.0
+    decision.raw_response["local_ai_tools"] = {"profit_prediction": payload}
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert isinf(score) and score < 0
+    assert opportunity["paper_eligible"] is False
+    assert "lower_quantile_above_raw_expected" in opportunity[
+        "return_distribution_contract"
+    ]["blockers"]
+
+
+def test_paper_permission_does_not_depend_on_historical_profitability() -> None:
+    first = _decision()
+    first.raw_response["ml_signal"] = {}
+    payload = _paper_payload(side="long", long_return=1.0, short_return=-0.4)
+    payload["actual_trade_calibration"] = {
+        "long": {
+            **_trade_calibration("long"),
+            "net_return_after_all_cost_pct": {
+                "count": 200,
+                "expected": -5.0,
+                "lower_hinge": -8.0,
+            },
+        }
+    }
+    first.raw_response["local_ai_tools"] = {"profit_prediction": payload}
+    second = deepcopy(first)
+    second.raw_response["local_ai_tools"]["profit_prediction"].pop(
+        "actual_trade_calibration"
+    )
+
+    first_score = _scorer().score_candidate(first, {"execution_mode": "paper"})
+    second_score = _scorer().score_candidate(second, {"execution_mode": "paper"})
+
+    assert first_score == pytest.approx(second_score)
+    assert first.raw_response["opportunity_score"]["paper_eligible"] is True
+    assert second.raw_response["opportunity_score"]["paper_eligible"] is True
 
 
 def test_paper_strategy_cannot_authorize_same_model_in_live_mode() -> None:
@@ -663,6 +842,10 @@ def test_mismatched_model_horizons_make_all_sources_observation_only() -> None:
         "return_distribution_contract"
     ]["blockers"]
     assert all(
-        component["production_eligible"] is False
+        component["aggregate_eligible"] is False
+        for component in opportunity["expected_net_breakdown"]["components"]
+    )
+    assert all(
+        component["included_in_return_distribution"] is False
         for component in opportunity["expected_net_breakdown"]["components"]
     )

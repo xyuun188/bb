@@ -739,10 +739,27 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     safe["live_exit_mutation"] = False
     safe["can_bypass_risk_controls"] = False
     policy = _safe_dict(safe.get("policy"))
+    for retired_key in (
+        "entry_requires_positive_fee_after_return",
+        "entry_requires_positive_return_lcb",
+        "normal_entry_requires_positive_fee_after_return",
+        "normal_entry_requires_positive_return_lcb",
+        "paper_exploration_requires_positive_expected_fee_after_return",
+        "paper_exploration_allows_only_bounded_lcb_uncertainty",
+        "paper_exploration_live_permission",
+        "entry_requires_live_execution_cost",
+    ):
+        policy.pop(retired_key, None)
     policy["optimization_target"] = PROFIT_TRAINING_TARGET
-    policy["entry_requires_positive_fee_after_return"] = True
-    policy["entry_requires_positive_return_lcb"] = True
-    policy["entry_requires_live_execution_cost"] = True
+    policy["paper_entry_requires_model_promotion"] = False
+    policy["paper_entry_requires_positive_return_lcb"] = False
+    policy["paper_entry_requires_profit_factor"] = False
+    policy["paper_entry_allows_controlled_coverage_sampling"] = True
+    policy["paper_entry_requires_current_execution_cost"] = True
+    policy["live_entry_requires_production_trade_gate"] = True
+    policy["live_entry_requires_positive_fee_after_return"] = True
+    policy["live_entry_requires_positive_return_lcb"] = True
+    policy["live_entry_requires_current_execution_cost"] = True
     policy["entry_requires_dynamic_risk_budget"] = True
     policy["entry_requires_complete_provenance"] = True
     policy["exit_requires_position_economics"] = True

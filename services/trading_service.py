@@ -120,6 +120,10 @@ from services.forced_exit import ForcedExitPolicy
 from services.high_risk_review_service import HighRiskReviewService
 from services.live_rules_canary_signal import apply_live_rules_canary_signal
 from services.local_ai_tools_client import LocalAIToolsClient
+from services.local_ai_training_contract import (
+    decision_group_training_trigger,
+    training_distribution_drift,
+)
 from services.manual_trade_execution import ManualTradeExecutionProcessor
 from services.manual_trade_risk_assessment import ManualTradeRiskAssessmentPolicy
 from services.market_analysis_defer_tracker import MarketAnalysisDeferTracker
@@ -883,6 +887,7 @@ class TradingService:
         self._okx_order_fact_sync_task: asyncio.Task | None = None
         self._okx_order_fact_sync_last_started_at: datetime | None = None
         self._okx_order_fact_sync_last_finished_at: datetime | None = None
+        self._okx_order_fact_discovery_last_finished_at: datetime | None = None
         self._okx_order_fact_sync_last_row: dict[str, Any] | None = None
         self._okx_order_fact_sync_last_error: str | None = None
         self._okx_order_fact_sync_success_count = 0
@@ -1129,6 +1134,32 @@ class TradingService:
 
         return max(240.0, self.okx_authoritative_sync_interval_seconds() * 8.0)
 
+    def okx_order_fact_discovery_interval_seconds(self) -> float:
+        """Return the cadence for discovering exchange-created order ids.
+
+        Attached TP/SL orders receive a new OKX ordId only after they trigger.
+        Priority sync cannot know that id in advance, so account-wide discovery
+        must run periodically even when every local order is already complete.
+        """
+
+        return max(180.0, self.okx_order_fact_sync_interval_seconds() * 2.0)
+
+    def _okx_order_fact_account_discovery_due(
+        self,
+        now: datetime | None = None,
+    ) -> bool:
+        now = now or datetime.now(UTC)
+        last_finished_at = getattr(
+            self,
+            "_okx_order_fact_discovery_last_finished_at",
+            None,
+        )
+        if not isinstance(last_finished_at, datetime):
+            return True
+        return (now - last_finished_at).total_seconds() >= (
+            self.okx_order_fact_discovery_interval_seconds()
+        )
+
     def okx_order_fact_sync_timeout_seconds(self) -> float:
         """Keep background order facts independent from the current-position gate budget."""
 
@@ -1354,10 +1385,20 @@ class TradingService:
         task = getattr(self, "_okx_order_fact_sync_task", None)
         started_at = getattr(self, "_okx_order_fact_sync_last_started_at", None)
         finished_at = getattr(self, "_okx_order_fact_sync_last_finished_at", None)
+        discovery_finished_at = getattr(
+            self,
+            "_okx_order_fact_discovery_last_finished_at",
+            None,
+        )
         last_row = getattr(self, "_okx_order_fact_sync_last_row", None)
         last_finished_age_seconds = (
             max((now - finished_at).total_seconds(), 0.0)
             if isinstance(finished_at, datetime)
+            else None
+        )
+        discovery_age_seconds = (
+            max((now - discovery_finished_at).total_seconds(), 0.0)
+            if isinstance(discovery_finished_at, datetime)
             else None
         )
         status = "pending"
@@ -1367,8 +1408,14 @@ class TradingService:
             status = str(last_row.get("status") or "ok").lower() or "ok"
         elif getattr(self, "_okx_order_fact_sync_last_error", None):
             status = "degraded"
+        sync_scope = (
+            str(last_row.get("sync_scope") or "").strip() or None
+            if isinstance(last_row, dict)
+            else None
+        )
         return {
             "status": status,
+            "sync_scope": sync_scope,
             "task_running": bool(task is not None and not task.done()),
             "force_pending": bool(getattr(self, "_okx_order_fact_sync_force_pending", False)),
             "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
@@ -1379,6 +1426,18 @@ class TradingService:
                 round(last_finished_age_seconds, 3)
                 if last_finished_age_seconds is not None
                 else None
+            ),
+            "account_discovery_last_finished_at": (
+                discovery_finished_at.isoformat()
+                if isinstance(discovery_finished_at, datetime)
+                else None
+            ),
+            "account_discovery_age_seconds": (
+                round(discovery_age_seconds, 3) if discovery_age_seconds is not None else None
+            ),
+            "account_discovery_interval_seconds": round(
+                self.okx_order_fact_discovery_interval_seconds(),
+                3,
             ),
             "last_error": getattr(self, "_okx_order_fact_sync_last_error", None),
             "success_count": int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0),
@@ -1524,15 +1583,18 @@ class TradingService:
                 "order_fact_sync": {"status": "skipped", "reason": "factory_not_configured"},
             }
         mode = "live" if mode_manager.mode.value == "live" else "paper"
+        account_discovery = self._okx_order_fact_account_discovery_due()
         report = await self._run_serialized_okx_fact_sync(
             lambda: factory(
                 mode=mode,
                 lookback_hours=24,
                 limit=100,
-                priority_only=True,
+                priority_only=not account_discovery,
                 timeout_seconds=self.okx_order_fact_sync_timeout_seconds(),
             ).sync()
         )
+        report = dict(report if isinstance(report, dict) else {})
+        report["sync_scope"] = "account_discovery" if account_discovery else "priority"
         status = str(report.get("status") or "unknown").lower()
         unverified_count = int(report.get("unverified_count") or 0)
         okx_pull_available = bool(report.get("okx_pull_available") is not False)
@@ -1540,6 +1602,8 @@ class TradingService:
         pull_error = (
             safe_error_text(report.get("error"), limit=180) if report.get("error") else None
         )
+        if account_discovery and okx_pull_available and status == "ok":
+            self._okx_order_fact_discovery_last_finished_at = datetime.now(UTC)
         degraded = not okx_pull_available
         requires_attention = unverified_count > 0 or (
             okx_pull_available and status in {"critical", "error", "unavailable"}
@@ -1581,6 +1645,7 @@ class TradingService:
             "okx_pull_available": okx_pull_available,
             "error": pull_error,
             "note": note,
+            "sync_scope": report["sync_scope"],
             "order_fact_sync": report,
         }
 
@@ -4375,9 +4440,7 @@ class TradingService:
                 symbol=symbol,
                 source=source,
                 diagnostic_code=getattr(quality_issue, "code", "market_data_quality"),
-                diagnostic_reason_codes=str(
-                    quality_details.get("market_fact_reason_codes") or ""
-                ),
+                diagnostic_reason_codes=str(quality_details.get("market_fact_reason_codes") or ""),
                 diagnostic_details=quality_details,
             )
             return None, quality_issue
@@ -5517,11 +5580,13 @@ class TradingService:
             )
             raw["production_trade_gate"] = gate
             decision.raw_response = raw
-        await self.entry_policy.prepare_dynamic_risk_contract(
+        preparation_block_reason = await self.entry_policy.prepare_dynamic_risk_contract(
             decision,
             model_mode,
             open_positions=open_positions or [],
         )
+        if preparation_block_reason:
+            raise RuntimeError(preparation_block_reason)
         if str(model_mode or "").lower() == "paper":
             raw = self._safe_dict(decision.raw_response)
             contract = self._safe_dict(raw.get("trade_recommendation_contract"))
@@ -8940,6 +9005,10 @@ class TradingService:
                 cursor_result.get("completed_trade_sample_count"),
                 0,
             )
+            completed_group_total = self._safe_int(
+                cursor_result.get("completed_training_decision_group_count"),
+                0,
+            )
             previous_completed_trade_total = int(
                 (status or {}).get("last_trained_completed_trade_sample_count")
                 or (status or {}).get("completed_trade_sample_count")
@@ -8952,13 +9021,78 @@ class TradingService:
             learning_only = not bool(
                 (status or {}).get("model_bundle_available", (status or {}).get("available"))
             )
+            previous_group_total = self._safe_int(
+                (status or {}).get("last_trained_completed_training_decision_group_count"),
+                0,
+            )
+            if previous_group_total <= 0:
+                previous_group_total = sum(
+                    self._safe_int((status or {}).get(field), 0)
+                    for field in (
+                        "train_decision_group_count",
+                        "holdout_decision_group_count",
+                        "purged_holdout_decision_group_count",
+                        "train_cost_decision_group_count",
+                        "holdout_cost_decision_group_count",
+                        "purged_cost_holdout_decision_group_count",
+                    )
+                )
+            training_state_cursor = 0
+            training_state_trained_at = None
+            state_store = self._model_training_state()
+            read_training_state = getattr(state_store, "read", None)
+            if callable(read_training_state):
+                state_payload = read_training_state()
+                model_rows = state_payload.get("models") or {}
+                for model_id in LOCAL_AI_TOOL_MODEL_IDS:
+                    model_row = model_rows.get(model_id) or {}
+                    training_state_cursor = max(
+                        training_state_cursor,
+                        self._safe_int(
+                            (model_row.get("sample_cursor") or {}).get("decision_group"),
+                            0,
+                        ),
+                    )
+                    if model_row.get("sample_cursor"):
+                        finished_at = model_row.get("last_finished_at")
+                        if finished_at and (
+                            training_state_trained_at is None
+                            or str(finished_at) > str(training_state_trained_at)
+                        ):
+                            training_state_trained_at = finished_at
+            previous_group_total = max(
+                previous_group_total,
+                training_state_cursor,
+            )
+            distribution_drift = training_distribution_drift(
+                cursor_result.get("training_distribution_profile") or {},
+                (status or {}).get("training_distribution_profile") or {},
+                threshold=LOCAL_ML_TRAINING_PARAMS.distribution_drift_threshold,
+            )
+            trigger = decision_group_training_trigger(
+                force=False,
+                has_artifact=not learning_only,
+                completed_group_count=completed_group_total,
+                previous_group_count=previous_group_total,
+                trained_at=(training_state_trained_at or (status or {}).get("trained_at")),
+                now=datetime.now(UTC),
+                distribution_drift=distribution_drift,
+                batch_threshold=(LOCAL_ML_TRAINING_PARAMS.batch_decision_group_threshold),
+                minimum_increment=(LOCAL_ML_TRAINING_PARAMS.minimum_decision_group_increment),
+                drift_minimum_increment=(
+                    LOCAL_ML_TRAINING_PARAMS.drift_minimum_decision_group_increment
+                ),
+                maximum_interval_seconds=(
+                    LOCAL_ML_TRAINING_PARAMS.maximum_training_interval_seconds
+                ),
+            )
             training_policy = {
                 "learning_only": learning_only,
-                "trigger": "new_clean_cost_complete_sample_or_training_view_rebase",
+                "trigger": trigger["reason"],
+                "trigger_contract": trigger,
                 "distribution_requirement": "non_empty_train_and_holdout",
                 "training_window_policy": CURRENT_TRAINING_EPOCH_POLICY,
-                "cursor_source": "last_trained_completed_shadow_sample_count",
-                "trade_cursor_source": "last_trained_completed_trade_sample_count",
+                "cursor_source": "completed_training_decision_group_count",
                 "trade_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 "process_boundary": "dedicated_training_subprocess",
                 "cursor_process_isolated": True,
@@ -8967,9 +9101,7 @@ class TradingService:
             if status_probe_error:
                 training_policy["status_probe_error"] = status_probe_error
                 training_policy["status_probe_fallback"] = "train_when_due_from_local_counts"
-            if not (
-                learning_only or shadow_training_view_rebased or new_shadow > 0 or new_trade > 0
-            ):
+            if not trigger["due"]:
                 return {
                     "trained": False,
                     "reason": "not_due",
@@ -8980,7 +9112,11 @@ class TradingService:
                     "last_trained_completed_trade_sample_count": previous_completed_trade_total,
                     "new_shadow_sample_count": new_shadow,
                     "new_trade_sample_count": new_trade,
+                    "completed_training_decision_group_count": completed_group_total,
+                    "last_trained_completed_training_decision_group_count": (previous_group_total),
+                    "new_decision_group_count": trigger["new_mature_decision_group_count"],
                     "training_policy": training_policy,
+                    "training_process_isolated": True,
                 }
 
             active_run_id = getattr(self, "_local_tools_active_training_run_id", None)
@@ -8993,6 +9129,7 @@ class TradingService:
                     sample_cursor={
                         "shadow": completed_shadow_total,
                         "trade": completed_trade_total,
+                        "decision_group": completed_group_total,
                     },
                     timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
                 )
@@ -9012,15 +9149,29 @@ class TradingService:
                 reported_trade_total,
                 completed_trade_total,
             )
+            reported_group_total = result.get(
+                "last_trained_completed_training_decision_group_count"
+            )
+            if reported_group_total is None:
+                reported_group_total = result.get("completed_training_decision_group_count")
+            authoritative_group_total = self._safe_int(
+                reported_group_total,
+                completed_group_total,
+            )
             result["completed_shadow_sample_count"] = authoritative_shadow_total
             result["completed_trade_sample_count"] = authoritative_trade_total
+            result["completed_training_decision_group_count"] = authoritative_group_total
             result["new_shadow_sample_count"] = new_shadow
             result["new_trade_sample_count"] = new_trade
+            result["new_decision_group_count"] = trigger["new_mature_decision_group_count"]
             result["training_policy"] = training_policy
             result["training_process_isolated"] = True
             if result.get("trained"):
                 result["last_trained_completed_shadow_sample_count"] = authoritative_shadow_total
                 result["last_trained_completed_trade_sample_count"] = authoritative_trade_total
+                result["last_trained_completed_training_decision_group_count"] = (
+                    authoritative_group_total
+                )
                 self._local_tools_last_completed_shadow_count = authoritative_shadow_total
             return result
 
@@ -10271,10 +10422,7 @@ class TradingService:
                 take_profit_pct=0.0,
                 raw_response={
                     "fast_risk_trigger": trigger,
-                    "forced_exit": bool(
-                        stop_crossed
-                        or target_crossed
-                    ),
+                    "forced_exit": bool(stop_crossed or target_crossed),
                     "close_evidence": {
                         "hard_risk": stop_crossed,
                         "paper_canary_horizon": canary_horizon,

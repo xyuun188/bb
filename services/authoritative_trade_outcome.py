@@ -499,6 +499,14 @@ async def load_authoritative_trade_outcomes(
         for order in orders
         if str(order.exchange_order_id or "").strip() and int(order.decision_id or 0) > 0
     }
+    decision_feature_by_order_id = {
+        str(order.exchange_order_id): dict(decision.feature_snapshot or {})
+        for order in orders
+        if str(order.exchange_order_id or "").strip()
+        and int(order.decision_id or 0) > 0
+        and (decision := decisions_by_id.get(int(order.decision_id or 0))) is not None
+        and isinstance(decision.feature_snapshot, dict)
+    }
     decision_execution_by_order_id = {
         str(order.exchange_order_id): {
             "decision_id": int(decision.id or 0),
@@ -523,6 +531,7 @@ async def load_authoritative_trade_outcomes(
             positions_by_id=positions_by_id,
             orders_by_exchange_id=orders_by_exchange_id,
             decision_raw_by_order_id=decision_raw_by_order_id,
+            decision_feature_by_order_id=decision_feature_by_order_id,
             decision_execution_by_order_id=decision_execution_by_order_id,
         )
         reflection = next(

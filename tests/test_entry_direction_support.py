@@ -13,6 +13,7 @@ from services.entry_direction_support import (
 def _row(source: str, *, raw: float = 0.4, objective: float = 0.2) -> dict:
     return {
         "source": source,
+        "decision_eligible": True,
         "raw_expected_return_pct": raw,
         "objective_expected_return_pct": objective,
         "horizon_minutes": 30,
@@ -198,3 +199,35 @@ def test_paper_quantitative_summary_is_available_before_expert_support() -> None
     assert summary["execution_cost_complete"] is True
     assert summary["expected_net_return_pct"] == pytest.approx(0.075)
     assert summary["quant_evidence_families"] == ["local_ai_tools"]
+
+
+def test_paper_quantitative_summary_never_averages_different_horizons() -> None:
+    server_profit = _row("server_profit", raw=0.2, objective=0.1)
+    server_profit["horizon_minutes"] = 10
+    timeseries = _row("timeseries", raw=0.8, objective=0.4)
+    timeseries["horizon_minutes"] = 60
+
+    summary = summarize_paper_quantitative_evidence(
+        {"long": {"evidence": [server_profit, timeseries]}},
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert summary["available_prediction_horizons"] == [10.0, 60.0]
+    assert summary["prediction_horizon_minutes"] == 60.0
+    assert summary["expected_net_return_pct"] == pytest.approx(0.7)
+    assert summary["objective_net_return_pct"] == pytest.approx(0.3)
+    assert summary["quant_family_summaries"][0]["sources"] == ["timeseries"]
+    assert summary["horizon_selection_policy"] == (
+        "best_fee_after_return_coherent_horizon"
+    )
+
+    support = assess_paper_model_trade_support(
+        {"long": {"evidence": [server_profit, timeseries]}},
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+    assert support["prediction_horizon_minutes"] == 60.0
+    assert support["available_prediction_horizons"] == [10.0, 60.0]
+    assert directional_entry_support_reasons(support, "long") == []

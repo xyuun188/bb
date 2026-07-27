@@ -472,12 +472,16 @@ def test_local_ai_tools_builds_standard_contract_from_remote_distribution_inputs
         {
             "available": True,
             "best_side": "long",
+            "production_permission": True,
+            "live_ml_ready": True,
             "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
             "return_distribution_inputs": {
                 "long": _distribution_input("long", 0.8, 0.5),
                 "short": _distribution_input("short", 0.2, 0.1),
             },
             "prediction_quality": {
+                "contract_complete": True,
+                "paper_eligible": True,
                 "production_eligible": True,
                 "anomalous": False,
             },
@@ -485,14 +489,50 @@ def test_local_ai_tools_builds_standard_contract_from_remote_distribution_inputs
     )
 
     contract = profit["return_distribution_contract"]["long"]
-    assert profit["return_distribution_contract_version"] == (
-        RETURN_DISTRIBUTION_CONTRACT_VERSION
-    )
+    assert profit["return_distribution_contract_version"] == (RETURN_DISTRIBUTION_CONTRACT_VERSION)
     assert contract["raw_expected_return_pct"] == pytest.approx(0.8)
     assert contract["lower_quantile_return_pct"] == pytest.approx(0.5)
     assert contract["objective_expected_return_pct"] == pytest.approx(0.47)
     assert contract["production_eligible"] is True
     assert profit["prediction_quality"]["production_eligible"] is True
+
+
+def test_local_ai_tools_keeps_valid_shadow_prediction_paper_eligible(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    profit = client._normalize_signal(
+        "profit_prediction",
+        {
+            "available": True,
+            "best_side": "long",
+            "route_mode": "paper_analysis",
+            "production_permission": False,
+            "live_ml_ready": False,
+            "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+            "return_distribution_inputs": {
+                "long": _distribution_input("long", 0.8, 0.5),
+                "short": _distribution_input("short", 0.2, 0.1),
+            },
+            "prediction_quality": {
+                "contract_complete": True,
+                "paper_eligible": True,
+                "production_eligible": False,
+                "anomalous": False,
+                "blockers": [],
+                "production_blockers": ["artifact_activation_not_production_authorized"],
+            },
+        },
+    )
+
+    quality = profit["prediction_quality"]
+    assert quality["contract_complete"] is True
+    assert quality["paper_eligible"] is True
+    assert quality["production_eligible"] is False
+    assert quality["anomalous"] is False
+    assert quality["blockers"] == []
+    assert quality["production_blockers"] == ["artifact_activation_not_production_authorized"]
 
 
 def test_local_ai_tools_blocks_remote_lower_above_expected_without_clamping(
@@ -550,12 +590,8 @@ def test_local_ai_tools_preserves_remote_distribution_blockers(
     )
 
     assert profit["prediction_quality"]["production_eligible"] is False
-    assert profit["prediction_quality"]["reason"] == (
-        "actual_trade_calibration_not_ready"
-    )
-    assert profit["prediction_quality"]["blockers"] == [
-        "actual_trade_calibration_not_ready"
-    ]
+    assert profit["prediction_quality"]["reason"] == ("actual_trade_calibration_not_ready")
+    assert profit["prediction_quality"]["blockers"] == ["actual_trade_calibration_not_ready"]
 
 
 def test_local_ai_tools_blocks_obsolete_distribution_provenance(
@@ -583,9 +619,10 @@ def test_local_ai_tools_blocks_obsolete_distribution_provenance(
     )
 
     assert profit["prediction_quality"]["production_eligible"] is False
-    assert "return_distribution_cost_model_version_mismatch" in profit[
-        "prediction_quality"
-    ]["blockers"]
+    assert (
+        "return_distribution_cost_model_version_mismatch"
+        in profit["prediction_quality"]["blockers"]
+    )
 
 
 def test_local_ai_tools_preserves_server_reported_model_metadata(
@@ -698,7 +735,7 @@ async def test_local_ai_tools_enrich_failure_fields_are_redacted(
     assert result["errors"]["profit_prediction"] == "Authorization: *** failed"
     assert result["profit_prediction"]["error"] == "Authorization: *** failed"
     assert client._last_failure == (
-        "Authorization: *** failed; Authorization: *** failed; " "Authorization: *** failed"
+        "Authorization: *** failed; Authorization: *** failed; Authorization: *** failed"
     )
 
 
@@ -774,9 +811,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     assert result["enabled_for_trading"] is True
     assert result["status"] == "artifact_unavailable"
     assert result["child_endpoints"]["profit_prediction"]["available"] is False
-    assert result["child_endpoints"]["profit_prediction"]["probe_mode"] == (
-        "metadata_contract"
-    )
+    assert result["child_endpoints"]["profit_prediction"]["probe_mode"] == ("metadata_contract")
     assert result["child_endpoints"]["profit_prediction"]["actual_inference_probe"] is False
 
 

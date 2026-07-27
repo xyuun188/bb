@@ -1,4 +1,4 @@
-"""Observation of long-vs-short gross market opportunity from governed models."""
+"""Execution-scoped long-vs-short gross market opportunity competition."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 from services.entry_signal_extraction import (
     first_tool_payload,
     signal_available,
+    signal_paper_eligibility,
     signal_production_eligibility,
     signal_return_distribution,
     signal_return_distribution_eligibility,
@@ -56,6 +57,11 @@ def _paper_quant_weights(strategy_mode: dict[str, Any] | None) -> dict[str, floa
     }
 
 
+def _execution_scope(strategy_mode: dict[str, Any] | None) -> str:
+    mode = str(_safe_dict(strategy_mode).get("execution_mode") or "live").lower()
+    return "paper" if mode == "paper" else "live"
+
+
 def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     eligible_objective = [
         (
@@ -63,7 +69,7 @@ def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
-        if item.get("production_eligible") is True
+        if item.get("decision_eligible") is True
         and _safe_float(item.get("objective_expected_return_pct")) is not None
     ]
     eligible_raw = [
@@ -72,14 +78,14 @@ def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
-        if item.get("production_eligible") is True
+        if item.get("decision_eligible") is True
         and _safe_float(item.get("raw_expected_return_pct")) is not None
     ]
     return {
-        "score": _weighted_mean(eligible_objective) or 0.0,
+        "score": _weighted_mean(eligible_objective),
         "raw_expected_return_pct": _weighted_mean(eligible_raw),
         "objective_expected_return_pct": _weighted_mean(eligible_objective),
-        "production_source_count": len(eligible_objective),
+        "decision_source_count": len(eligible_objective),
         "evidence": values,
     }
 
@@ -93,7 +99,8 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
-        if _safe_float(item.get("objective_expected_return_pct")) is not None
+        if item.get("paper_eligible") is True
+        and _safe_float(item.get("objective_expected_return_pct")) is not None
     ]
     raw_values = [
         (
@@ -101,12 +108,14 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
-        if _safe_float(item.get("raw_expected_return_pct")) is not None
+        if item.get("paper_eligible") is True
+        and _safe_float(item.get("raw_expected_return_pct")) is not None
     ]
     horizon_values = [
         float(item["horizon_minutes"])
         for item in values
-        if (_safe_float(item.get("horizon_minutes")) or 0.0) > 0
+        if item.get("paper_eligible") is True
+        and (_safe_float(item.get("horizon_minutes")) or 0.0) > 0
     ]
     selected = objective_values or raw_values
     return {
@@ -126,7 +135,7 @@ def _enforce_aggregate_contract_consistency(
         item
         for side in ("long", "short")
         for item in evidence[side]
-        if item.get("production_eligible") is True
+        if item.get("decision_eligible") is True
     ]
     signatures = {
         (
@@ -153,7 +162,8 @@ def _enforce_aggregate_contract_consistency(
         if len({signature[index] for signature in signatures}) > 1
     ]
     for item in eligible:
-        item["production_eligible"] = False
+        item["decision_eligible"] = False
+        item["aggregate_eligible"] = False
         item["observation_only"] = True
         item["eligibility_reason"] = blockers[0]
     return blockers
@@ -161,10 +171,10 @@ def _enforce_aggregate_contract_consistency(
 
 @dataclass(frozen=True, slots=True)
 class EntryDirectionCompetitionPolicy:
-    """Compare only governed gross market-opportunity observations.
+    """Compare gross market-opportunity observations for the active scope.
 
     This context may guide the model toward the better side, but it cannot grant
-    execution permission. The selected side must still pass the live realized-net
+    execution permission. The selected side still passes the execution-scoped net
     return, cost, validity, sizing, account, and exchange contracts.
     """
 
@@ -177,13 +187,15 @@ class EntryDirectionCompetitionPolicy:
         strategy_mode: dict[str, Any] | None,
     ) -> dict[str, Any]:
         del feature_vector, market_regime
+        execution_scope = _execution_scope(strategy_mode)
         evidence = {"long": [], "short": []}
-        self._append_local_ml(evidence, ml_signal_context)
+        self._append_local_ml(evidence, ml_signal_context, execution_scope)
         self._append_server_tool(
             evidence,
             local_ai_tools_context,
             key="server_profit",
             aliases=("profit_prediction", "profit_model", "server_profit", "server_profit_model"),
+            execution_scope=execution_scope,
         )
         self._append_server_tool(
             evidence,
@@ -196,6 +208,7 @@ class EntryDirectionCompetitionPolicy:
                 "timeseries",
                 "time_series",
             ),
+            execution_scope=execution_scope,
         )
         quant_weights = _paper_quant_weights(strategy_mode)
         if quant_weights:
@@ -208,18 +221,31 @@ class EntryDirectionCompetitionPolicy:
         short_side = _side_summary(evidence["short"])
         long_training = _training_side_summary(evidence["long"])
         short_training = _training_side_summary(evidence["short"])
-        long_score = float(long_side["score"])
-        short_score = float(short_side["score"])
-        source_count = int(long_side["production_source_count"]) + int(
-            short_side["production_source_count"]
+        long_score = _safe_float(long_side.get("score"))
+        short_score = _safe_float(short_side.get("score"))
+        source_count = int(long_side["decision_source_count"]) + int(
+            short_side["decision_source_count"]
         )
-        preferred_side = (
-            "neutral"
-            if source_count <= 0 or long_score == short_score
-            else "long"
-            if long_score > short_score
-            else "short"
+        production_source_count = sum(
+            1
+            for side in ("long", "short")
+            for item in evidence[side]
+            if item.get("production_eligible") is True
+            and item.get("decision_eligible") is True
         )
+        available_scores = {
+            side: score
+            for side, score in (("long", long_score), ("short", short_score))
+            if score is not None
+        }
+        preferred_side = "neutral"
+        if available_scores:
+            preferred_side = max(
+                available_scores,
+                key=lambda side: float(available_scores[side]),
+            )
+            if len(available_scores) == 2 and long_score == short_score:
+                preferred_side = "neutral"
         training_scores = {
             "long": long_training.get("score"),
             "short": short_training.get("score"),
@@ -248,24 +274,31 @@ class EntryDirectionCompetitionPolicy:
                 training_preferred_side = "neutral"
         result = {
             "enabled": bool(source_count),
+            "execution_scope": execution_scope,
             "preferred_side": preferred_side,
-            "score_gap": abs(long_score - short_score),
+            "score_gap": (
+                abs(float(long_score) - float(short_score))
+                if long_score is not None and short_score is not None
+                else None
+            ),
             "long": long_side,
             "short": short_side,
             "training_preferred_side": training_preferred_side,
             "training_long": long_training,
             "training_short": short_training,
             "training_permission": False,
-            "production_source_count": source_count,
+            "decision_source_count": source_count,
+            "paper_source_count": source_count if execution_scope == "paper" else 0,
+            "production_source_count": production_source_count,
             "production_permission": False,
-            "policy": "governed_gross_market_observation_only_no_fixed_gap",
+            "policy": "execution_scoped_gross_market_observation_only_no_fixed_gap",
             "aggregate_blockers": aggregate_blockers,
             "policy_provenance": {
-                "source": "live_influence_gross_market_models",
+                "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
                 "strategy_version": "2026-07-14.gross-market-direction-observation.v2",
-                "fallback_reason": "" if source_count else "governed_return_models_unavailable",
+                "fallback_reason": "" if source_count else "eligible_return_models_unavailable",
             },
         }
         if quant_weights:
@@ -281,12 +314,13 @@ class EntryDirectionCompetitionPolicy:
     def _append_local_ml(
         evidence: dict[str, list[dict[str, Any]]],
         ml_signal_context: dict[str, Any] | None,
+        execution_scope: str,
     ) -> None:
         signal = _safe_dict(ml_signal_context)
         predictions = _safe_list(signal.get("predictions"))
         primary = _safe_dict(predictions[0] if predictions else {})
         influence = _safe_dict(signal.get("influence_policy"))
-        eligibility = signal_production_eligibility(signal)
+        production = signal_production_eligibility(signal)
         multitask = _safe_dict(primary.get("multitask_prediction"))
         for side in ("long", "short"):
             side_policy = _safe_dict(influence.get(side))
@@ -295,24 +329,38 @@ class EntryDirectionCompetitionPolicy:
                 side,
             )
             contract = signal_return_distribution(signal, side)
+            paper = signal_paper_eligibility(signal, side)
             side_multitask = _safe_dict(multitask.get(side))
-            eligible = bool(
-                eligibility.get("eligible") is True
+            production_eligible = bool(
+                production.get("eligible") is True
                 and side_policy.get("enabled") is True
                 and distribution_eligibility.get("eligible") is True
+            )
+            paper_eligible = bool(
+                paper.get("eligible") is True
+                and distribution_eligibility.get("eligible") is True
+            )
+            eligible = (
+                paper_eligible if execution_scope == "paper" else production_eligible
             )
             evidence[side].append(
                 {
                     "source": "local_ml",
                     "side": side,
                     "available": bool(primary),
-                    "production_eligible": eligible,
+                    "decision_eligible": eligible,
+                    "paper_eligible": paper_eligible,
+                    "production_eligible": production_eligible,
                     "observation_only": bool(contract and not eligible),
                     "eligibility_reason": (
                         "live_influence_and_side_readiness_confirmed"
                         if eligible
                         else str(
-                            eligibility.get("reason")
+                            (
+                                paper.get("reason")
+                                if execution_scope == "paper"
+                                else production.get("reason")
+                            )
                             or "local_ml_production_governance_incomplete"
                         )
                     ),
@@ -353,28 +401,43 @@ class EntryDirectionCompetitionPolicy:
         *,
         key: str,
         aliases: tuple[str, ...],
+        execution_scope: str,
     ) -> None:
         tools = _safe_dict(local_ai_tools_context)
         payload = first_tool_payload({"local_ai_tools": tools}, *aliases)
-        eligibility = signal_production_eligibility(payload)
+        production = signal_production_eligibility(payload)
         for side in ("long", "short"):
             distribution_eligibility = signal_return_distribution_eligibility(
                 payload,
                 side,
             )
             contract = signal_return_distribution(payload, side)
-            eligible = bool(
-                eligibility.get("eligible") is True
+            paper = signal_paper_eligibility(payload, side)
+            production_eligible = bool(
+                production.get("eligible") is True
                 and distribution_eligibility.get("eligible") is True
+            )
+            paper_eligible = bool(
+                paper.get("eligible") is True
+                and distribution_eligibility.get("eligible") is True
+            )
+            eligible = (
+                paper_eligible if execution_scope == "paper" else production_eligible
             )
             evidence[side].append(
                 {
                     "source": key,
                     "side": side,
                     "available": signal_available(payload),
-                    "production_eligible": eligible,
+                    "decision_eligible": eligible,
+                    "paper_eligible": paper_eligible,
+                    "production_eligible": production_eligible,
                     "observation_only": bool(contract and not eligible),
-                    "eligibility_reason": eligibility.get("reason"),
+                    "eligibility_reason": (
+                        paper.get("reason")
+                        if execution_scope == "paper"
+                        else production.get("reason")
+                    ),
                     "raw_expected_return_pct": contract.get(
                         "raw_expected_return_pct"
                     ),

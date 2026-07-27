@@ -88,17 +88,30 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         trade.get("summary")
     )
     trade_policy = _safe_dict(trade.get("policy"))
-    required_trade_policy = (
-        "entry_requires_positive_fee_after_return",
-        "entry_requires_positive_return_lcb",
-        "entry_requires_live_execution_cost",
+    required_true_trade_policy = (
+        "paper_entry_allows_controlled_coverage_sampling",
+        "paper_entry_requires_current_execution_cost",
+        "live_entry_requires_production_trade_gate",
+        "live_entry_requires_positive_fee_after_return",
+        "live_entry_requires_positive_return_lcb",
+        "live_entry_requires_current_execution_cost",
         "entry_requires_dynamic_risk_budget",
         "entry_requires_complete_provenance",
         "exit_requires_position_economics",
         "exit_requires_dynamic_close_fraction",
         "filled_order_link_required",
     )
-    missing_policy = [key for key in required_trade_policy if trade_policy.get(key) is not True]
+    required_false_trade_policy = (
+        "paper_entry_requires_model_promotion",
+        "paper_entry_requires_positive_return_lcb",
+        "paper_entry_requires_profit_factor",
+    )
+    missing_policy = [
+        key for key in required_true_trade_policy if trade_policy.get(key) is not True
+    ]
+    missing_policy.extend(
+        key for key in required_false_trade_policy if trade_policy.get(key) is not False
+    )
     if trade.get("report_available") is False:
         blockers.append(
             _blocker(

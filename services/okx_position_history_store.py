@@ -17,6 +17,8 @@ from sqlalchemy import select
 from core.symbols import normalize_trading_symbol, symbol_from_okx_inst_id
 from models.trade import OkxPositionHistory
 
+_EXISTING_RECORD_NOT_LOADED = object()
+
 
 def okx_position_history_row_identity(row: dict[str, Any], *, mode: str | None = None) -> str:
     inst_id = _inst_id(row)
@@ -49,19 +51,23 @@ async def upsert_okx_position_history_row(
     evidence_gaps: Iterable[Any] | None = None,
     synced_at: datetime | None = None,
     last_sync_error: str | None = None,
+    existing_record: OkxPositionHistory | None | object = _EXISTING_RECORD_NOT_LOADED,
 ) -> OkxPositionHistory | None:
     if not isinstance(row, dict):
         return None
     identity = okx_position_history_row_identity(row, mode=mode)
     if not identity.strip("|"):
         return None
-    existing_result = await session.execute(
-        select(OkxPositionHistory).where(
-            OkxPositionHistory.mode == mode,
-            OkxPositionHistory.row_identity == identity,
+    if existing_record is _EXISTING_RECORD_NOT_LOADED:
+        existing_result = await session.execute(
+            select(OkxPositionHistory).where(
+                OkxPositionHistory.mode == mode,
+                OkxPositionHistory.row_identity == identity,
+            )
         )
-    )
-    existing = existing_result.scalars().first()
+        existing = existing_result.scalars().first()
+    else:
+        existing = existing_record
     payload = _payload_from_row(
         row,
         mode=mode,

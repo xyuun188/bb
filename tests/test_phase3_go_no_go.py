@@ -15,9 +15,15 @@ def _cards() -> list[dict]:
             "details": {
                 "report_available": True,
                 "policy": {
-                    "entry_requires_positive_fee_after_return": True,
-                    "entry_requires_positive_return_lcb": True,
-                    "entry_requires_live_execution_cost": True,
+                    "paper_entry_requires_model_promotion": False,
+                    "paper_entry_requires_positive_return_lcb": False,
+                    "paper_entry_requires_profit_factor": False,
+                    "paper_entry_allows_controlled_coverage_sampling": True,
+                    "paper_entry_requires_current_execution_cost": True,
+                    "live_entry_requires_production_trade_gate": True,
+                    "live_entry_requires_positive_fee_after_return": True,
+                    "live_entry_requires_positive_return_lcb": True,
+                    "live_entry_requires_current_execution_cost": True,
                     "entry_requires_dynamic_risk_budget": True,
                     "entry_requires_complete_provenance": True,
                     "exit_requires_position_economics": True,
@@ -67,7 +73,7 @@ def test_phase3_go_no_go_fails_closed_when_required_audit_is_missing() -> None:
 def test_phase3_go_no_go_rejects_incomplete_return_contract_policy() -> None:
     cards = deepcopy(_cards())
     trade = next(card for card in cards if card["key"] == "trade_execution_contract")
-    del trade["details"]["policy"]["entry_requires_live_execution_cost"]
+    del trade["details"]["policy"]["live_entry_requires_current_execution_cost"]
 
     report = evaluate_phase3_go_no_go_cards(cards)
 

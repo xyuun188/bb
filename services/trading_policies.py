@@ -199,11 +199,17 @@ class EntryPolicy:
         decision: DecisionOutput,
         model_mode: str,
         open_positions: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """Build the dynamic sizing contract before the hard risk engine runs."""
+    ) -> str | None:
+        """Refresh executable market facts before building the risk contract."""
 
         if not decision.is_entry:
-            return
+            return None
+        price_guard_reason = await self.pre_execution_price_guard_reason(
+            decision,
+            model_mode,
+        )
+        if price_guard_reason:
+            return price_guard_reason
         ensure_normal_paper_trade_contract(decision, model_mode)
         self.ensure_opportunity_score(
             decision,
@@ -215,7 +221,7 @@ class EntryPolicy:
                 model_mode,
                 open_positions=open_positions or [],
             )
-            return
+            return None
 
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
@@ -238,7 +244,7 @@ class EntryPolicy:
                 0.0,
             )
         if impact_basis_notional <= 0:
-            return
+            return None
 
         snapshot = (
             dict(decision.feature_snapshot)
@@ -275,6 +281,7 @@ class EntryPolicy:
                 },
             )
         self._record_execution_cost_sizing_pass(decision, impact_basis_notional)
+        return None
 
     async def high_risk_review_gate(
         self,
@@ -342,14 +349,6 @@ class EntryPolicy:
                 {"intent": "not_entry", "pipeline_context": context.public_data()}
             )
 
-        price_guard_reason = await self.pre_execution_price_guard_reason(decision, model_mode)
-        if price_guard_reason:
-            return PolicyGateResult.block(
-                "pre_execution_price_guard",
-                price_guard_reason,
-                {"pipeline_context": context.public_data()},
-            )
-
         if self.entry_opportunity_score is not None:
             self.score_candidate(
                 decision,
@@ -372,11 +371,17 @@ class EntryPolicy:
                 {"pipeline_context": context.public_data()},
             )
 
-        await self.prepare_dynamic_risk_contract(
+        price_guard_reason = await self.prepare_dynamic_risk_contract(
             decision,
             model_mode,
             open_positions=open_positions or [],
         )
+        if price_guard_reason:
+            return PolicyGateResult.block(
+                "pre_execution_price_guard",
+                price_guard_reason,
+                {"pipeline_context": context.public_data()},
+            )
         paper_plan_gate = self._paper_trade_plan_gate(decision, model_mode, context)
         if paper_plan_gate is not None:
             return paper_plan_gate

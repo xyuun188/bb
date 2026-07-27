@@ -32,6 +32,11 @@ from services.exchange_exit_decision_lineage import (
     decision_exit_exchange_order_ids,
     load_exit_decision_lineage,
 )
+from services.okx_position_settlement_sync import (
+    DUPLICATE_CLOSED_POSITION_REASON,
+    SUPERSEDED_POSITION_REASON,
+    SUPERSEDED_POSITION_STATUS,
+)
 
 REMOTE_APP_DIR = "/data/bb/app"
 
@@ -80,20 +85,73 @@ def _fingerprint(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _audit_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded terminal evidence without weakening the full-state guard."""
+
+    decisions = []
+    for decision in state.get("decisions", []):
+        raw = decision.get("raw_llm_response")
+        raw_json = json.dumps(raw, ensure_ascii=True, sort_keys=True, default=str)
+        decisions.append(
+            {
+                key: value
+                for key, value in decision.items()
+                if key != "raw_llm_response"
+            }
+            | {
+                "system_sync": isinstance(raw, dict) and raw.get("system_sync") is True,
+                "exit_exchange_order_ids": sorted(
+                    decision_exit_exchange_order_ids(
+                        type("DecisionSnapshot", (), {"raw_llm_response": raw})()
+                    )
+                ),
+                "raw_llm_response_sha256": hashlib.sha256(
+                    raw_json.encode("utf-8")
+                ).hexdigest(),
+                "raw_llm_response_bytes": len(raw_json.encode("utf-8")),
+            }
+        )
+    return {
+        key: value
+        for key, value in state.items()
+        if key != "decisions"
+    } | {"decisions": decisions}
+
+
 def _select_settlement_positions(
     candidates: list[Position],
     close_order_id: str,
 ) -> list[Position]:
-    exact = [
+    active = [
         position
         for position in candidates
+        if str(getattr(position, "settlement_status", "") or "").strip()
+        != SUPERSEDED_POSITION_STATUS
+        and str(
+            (
+                getattr(position, "settlement_raw", None)
+                if isinstance(getattr(position, "settlement_raw", None), dict)
+                else {}
+            ).get("reason")
+            or ""
+        ).strip()
+        not in {SUPERSEDED_POSITION_REASON, DUPLICATE_CLOSED_POSITION_REASON}
+    ]
+    exact = [
+        position
+        for position in active
         if str(position.close_exchange_order_id or "").strip() == close_order_id
     ]
-    if exact:
+    if len(exact) == 1:
         return exact
-    if len(candidates) == 1:
-        return candidates
-    if candidates:
+    if len(exact) > 1:
+        raise RuntimeError(
+            "More than one active closed position claims the exact OKX close order id; "
+            "settlement lineage must be deduplicated before exit repair"
+        )
+    if len(active) == 1:
+        return active
+    if active:
         raise RuntimeError(
             "More than one closed position contains the OKX close order id and none is an "
             "exact lifecycle slice; refusing to aggregate duplicate settlement evidence"
@@ -183,9 +241,18 @@ async def _load_plan(session: Any, args: argparse.Namespace) -> dict[str, Any]:
         "positions": [
             {
                 "id": int(position.id),
+                "settlement_status": position.settlement_status,
+                "settlement_source": position.settlement_source,
+                "okx_pos_id": position.okx_pos_id,
+                "entry_exchange_order_id": position.entry_exchange_order_id,
                 "quantity": position.quantity,
                 "entry_price": position.entry_price,
                 "realized_pnl": position.realized_pnl,
+                "close_fill_pnl": position.close_fill_pnl,
+                "entry_fee": position.entry_fee,
+                "close_fee": position.close_fee,
+                "funding_fee": position.funding_fee,
+                "created_at": _json_safe(position.created_at),
                 "closed_at": _json_safe(position.closed_at),
                 "close_exchange_order_id": position.close_exchange_order_id,
             }
@@ -216,7 +283,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "apply": bool(args.apply),
             "repair_ready": plan["repair_ready"],
             "input_fingerprint": plan["fingerprint"],
-            "before": plan["state"],
+            "before": _audit_state(plan["state"]),
         }
         if not args.apply:
             return output

@@ -43,6 +43,9 @@ class EntryCandidateQueuePolicy:
         rules_signal = raw.get("live_rules_canary_signal")
         rules_signal = rules_signal if isinstance(rules_signal, dict) else {}
         if (
+            str((strategy_context or {}).get("execution_mode") or "").lower()
+            == "live"
+            and
             gate_validation.valid
             and rules_signal.get("production_eligible") is True
         ):

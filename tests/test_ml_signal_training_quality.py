@@ -2888,6 +2888,11 @@ def test_ml_signal_predict_emits_complete_paper_multitask_contract() -> None:
     long_task = primary["multitask_prediction"]["long"]
     assert prediction["route_mode"] == "paper_analysis"
     assert prediction["paper_ml_ready"] is True
+    assert prediction["production_permission"] is False
+    assert prediction["prediction_quality"]["contract_complete"] is True
+    assert prediction["prediction_quality"]["paper_eligible"] is True
+    assert prediction["prediction_quality"]["production_eligible"] is False
+    assert prediction["prediction_quality"]["anomalous"] is False
     assert primary["paper_prediction_eligible"] is True
     assert long_task["expected_net_return_pct"] == pytest.approx(0.22)
     assert long_task["return_q10"] <= long_task["return_q50"] <= long_task["return_q90"]
@@ -2936,6 +2941,9 @@ def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() 
     assert "lower_quantile_above_raw_expected" in long_distribution["blockers"]
     assert prediction["live_ml_ready"] is True
     assert prediction["prediction_eligible"] is False
+    assert prediction["prediction_quality"]["contract_complete"] is False
+    assert prediction["prediction_quality"]["paper_eligible"] is False
+    assert prediction["prediction_quality"]["anomalous"] is True
     assert prediction["prediction_quality"]["production_eligible"] is False
 
 

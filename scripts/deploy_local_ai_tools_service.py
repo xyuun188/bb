@@ -66,7 +66,9 @@ MODEL_DIR = Path(
     )
 )
 ARTIFACT_REGISTRY_VERSION = "2026-07-24.local-ai-tools.v3"
-ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-24.local-ai-tools-activation.v3"
+ARTIFACT_ACTIVATION_MANIFEST_VERSION = (
+    "2026-07-27.paper-live-permission-activation.v4"
+)
 ARTIFACT_MODEL_ID = "local_ai_tools_quant_bundle"
 VERSIONS_ROOT = MODEL_DIR / "versions"
 CANDIDATE_POINTER_PATH = MODEL_DIR / "candidate.json"
@@ -99,10 +101,10 @@ FEATURE_KEYS = [
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
-RETURN_OBJECTIVE_VERSION = "2026-07-14.separated-supervision.v2"
+RETURN_OBJECTIVE_VERSION = "2026-07-27.separated-source-supervision.v3"
 RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
-RETURN_LABEL_VERSION = "2026-07-14.separated-supervision.v2"
-COST_MODEL_VERSION = "okx_live_cost_and_authoritative_slippage_distribution_v2"
+RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
+COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
 PROFIT_SUPERVISION_VERSION = "2026-07-24.separated-profit-supervision.v2"
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
@@ -112,6 +114,7 @@ EVALUATION_REPORT_FIELDS = (
     "walk_forward_report",
     "leave_one_symbol_out_report",
     "oos_return_evaluation",
+    "execution_cost_holdout_report",
     "authoritative_trade_return_evidence",
 )
 COMPACT_SEQUENCE_SERIES_FORMAT = "compact_native_kline_series.v1"
@@ -164,6 +167,17 @@ _STATUS_METADATA_KEYS = (
     "train_decision_group_count",
     "holdout_decision_group_count",
     "purged_holdout_decision_group_count",
+    "authoritative_cost_sample_count",
+    "train_authoritative_cost_sample_count",
+    "holdout_authoritative_cost_sample_count",
+    "train_cost_decision_group_count",
+    "holdout_cost_decision_group_count",
+    "purged_cost_holdout_decision_group_count",
+    "completed_market_decision_group_count",
+    "completed_authoritative_cost_decision_group_count",
+    "completed_training_decision_group_count",
+    "last_trained_completed_training_decision_group_count",
+    "training_distribution_profile",
     "completed_shadow_sample_count",
     "last_trained_completed_shadow_sample_count",
     "trade_sample_count",
@@ -213,6 +227,7 @@ _STATUS_METADATA_KEYS = (
     "walk_forward_report",
     "leave_one_symbol_out_report",
     "oos_return_evaluation",
+    "execution_cost_holdout_report",
     "authoritative_trade_return_evidence",
     "evaluation_report_hashes",
     "artifact_return_evidence_sha256",
@@ -330,46 +345,6 @@ def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
-
-
-def cost_complete_net_returns(
-    sample: dict[str, Any],
-    features: dict[str, Any],
-    *,
-    horizon_minutes: int,
-    long_gross_return_pct: float,
-    short_gross_return_pct: float,
-) -> tuple[float, float, dict[str, float]] | None:
-    spread_pct = f(features, "spread_pct", float("nan"))
-    fee_pct = f(sample, "round_trip_fee_pct", f(features, "round_trip_fee_pct", float("nan")))
-    funding_rate = f(features, "funding_rate", float("nan"))
-    funding_interval_minutes = f(features, "funding_interval_minutes", float("nan"))
-    if not math.isfinite(funding_interval_minutes):
-        funding_interval_hours = f(features, "funding_interval_hours", float("nan"))
-        if math.isfinite(funding_interval_hours):
-            funding_interval_minutes = funding_interval_hours * 60.0
-    if (
-        not math.isfinite(spread_pct)
-        or spread_pct <= 0
-        or not math.isfinite(fee_pct)
-        or fee_pct <= 0
-        or not math.isfinite(funding_rate)
-        or not math.isfinite(funding_interval_minutes)
-        or funding_interval_minutes <= 0
-    ):
-        return None
-    slippage_pct = spread_pct / 2.0
-    funding_drag_pct = funding_rate * 100.0 * horizon_minutes / funding_interval_minutes
-    return (
-        long_gross_return_pct - fee_pct - slippage_pct - funding_drag_pct,
-        short_gross_return_pct - fee_pct - slippage_pct + funding_drag_pct,
-        {
-            "spread_pct": spread_pct,
-            "fee_pct": fee_pct,
-            "slippage_pct": slippage_pct,
-            "funding_drag_pct": funding_drag_pct,
-        },
-    )
 
 
 def empirical_lower_hinge(values: list[float]) -> float:
@@ -529,6 +504,16 @@ def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
         dtype=float,
     )
     values = values[np.isfinite(values)]
+    return_semantics = str(
+        next(
+            (
+                row.get("return_semantics")
+                for row in ordered
+                if row.get("return_semantics")
+            ),
+            "authoritative_realized_net_return_after_all_cost",
+        )
+    )
     if values.size == 0:
         return {
             "count": 0,
@@ -545,7 +530,7 @@ def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "observation_window": "current_oos_evidence_only",
             },
             "promotion_math_ready": False,
-            "return_semantics": "net_return_after_counterfactual_execution_cost",
+            "return_semantics": return_semantics,
         }
     negatives = values[values < 0].tolist()
     tail_boundary = empirical_lower_hinge(negatives) if negatives else None
@@ -585,8 +570,7 @@ def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
             and math.isfinite(cvar_value)
             and max_drawdown is not None
         ),
-        "return_semantics": "net_return_after_counterfactual_execution_cost",
-        "cost_deduction_count": 1,
+        "return_semantics": return_semantics,
     }
 
 
@@ -667,33 +651,24 @@ def _fit_walk_forward_side(
     *,
     side: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    net_key = f"{side}_net_return"
     return_key = f"{side}_return"
-    cost_key = f"{side}_execution_cost"
-    negatives = [float(row[net_key]) for row in train_rows if row[net_key] < 0]
+    negatives = [float(row[return_key]) for row in train_rows if row[return_key] < 0]
     tail_boundary = empirical_lower_hinge(negatives) if negatives else 0.0
     tail_scale = abs(float(tail_boundary))
     x_train = [row["x"] for row in train_rows]
     x_validation = [row["x"] for row in validation_rows]
     weights = [float(row["sample_weight"]) for row in train_rows]
     market_model = _make_regressor(len(train_rows))
-    cost_model = _make_regressor(len(train_rows))
-    tail_labels = [int(row[net_key] < tail_boundary) for row in train_rows]
+    tail_labels = [int(row[return_key] < tail_boundary) for row in train_rows]
     tail_model = _make_classifier(tail_labels)
     market_model.fit(
         x_train,
         [row[return_key] for row in train_rows],
         model__sample_weight=weights,
     )
-    cost_model.fit(
-        x_train,
-        [row[cost_key] for row in train_rows],
-        model__sample_weight=weights,
-    )
     tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
     scores = (
         np.asarray(market_model.predict(x_validation), dtype=float)
-        - np.asarray(cost_model.predict(x_validation), dtype=float)
         - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
     )
     evaluated_rows = [
@@ -702,15 +677,15 @@ def _fit_walk_forward_side(
                 "market_regime": str(row.get("market_regime") or "unknown"),
                 "decision_group": str(row.get("decision_group") or ""),
             "label_timestamp": str(row.get("label_timestamp") or ""),
-            "return_pct": float(row[net_key]),
+            "return_pct": float(row[return_key]),
             "gross_market_return_pct": float(row[return_key]),
-            "execution_cost_pct": float(row[cost_key]),
+            "return_semantics": "gross_fixed_horizon_market_opportunity",
             "score": float(scores[index]),
         }
         for index, row in enumerate(validation_rows)
     ]
     return evaluated_rows, {
-        "source": "walk_forward_training_net_negative_return_lower_hinge",
+        "source": "walk_forward_training_gross_market_negative_return_lower_hinge",
         "value": tail_boundary if negatives else None,
         "scale_pct": tail_scale,
         "observation_window": "walk_forward_training_groups_only",
@@ -938,7 +913,10 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         blockers.append("training_data_fingerprint_invalid")
     if not _is_sha256(metadata.get("source_code_sha256")):
         blockers.append("source_code_fingerprint_invalid")
-    if metadata.get("time_split_policy") != "chronological_disjoint_decision_groups":
+    if (
+        metadata.get("time_split_policy")
+        != "independent_chronological_disjoint_decision_groups"
+    ):
         blockers.append("chronological_decision_group_policy_missing")
     governance = metadata.get("governance_report") or {}
     if (
@@ -989,6 +967,14 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         or len(folds) < 2
     ):
         blockers.append("walk_forward_evidence_incomplete")
+    cost_holdout = metadata.get("execution_cost_holdout_report") or {}
+    if (
+        cost_holdout.get("source_authority") != "okx_fills_fees_funding"
+        or cost_holdout.get("chronological") is not True
+        or cost_holdout.get("decision_group_disjoint") is not True
+        or int(cost_holdout.get("sample_count") or 0) <= 0
+    ):
+        blockers.append("authoritative_execution_cost_holdout_incomplete")
     loso_report = metadata.get("leave_one_symbol_out_report") or {}
     oos_report = metadata.get("oos_return_evaluation") or {}
     walk_sides = walk_forward.get("sides") or {}
@@ -1023,6 +1009,17 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
             )
         ):
             blockers.append(f"{side}_oos_tail_evidence_incomplete")
+    authoritative = metadata.get("authoritative_trade_return_evidence") or {}
+    if (
+        authoritative.get("source_authority")
+        != "okx_position_history_profit_supervision"
+        or int(authoritative.get("sample_count") or 0) <= 0
+    ):
+        blockers.append("authoritative_realized_return_evidence_incomplete")
+    for side in ("long", "short"):
+        evidence = ((authoritative.get("sides") or {}).get(side) or {})
+        if evidence.get("promotion_math_ready") is not True:
+            blockers.append(f"{side}_authoritative_return_evidence_not_ready")
     return list(dict.fromkeys(blockers))
 
 
@@ -1239,6 +1236,10 @@ def _is_sha256(value: Any) -> bool:
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
 
 
+class IncompatibleArtifactContractError(ValueError):
+    """A verified artifact belongs to an older, non-loadable model contract."""
+
+
 def _resolve_artifact_pointer(
     pointer_path: Path,
     *,
@@ -1284,6 +1285,25 @@ def _resolve_artifact_pointer(
     if metadata_hash != manifest.get("metadata_sha256") or sha256_file(metadata_path) != metadata_hash:
         raise ValueError("Local AI artifact metadata hash verification failed.")
     metadata = read_json_object(metadata_path)
+    contract_expectations = {
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "cost_model_version": COST_MODEL_VERSION,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "time_split_policy": "independent_chronological_disjoint_decision_groups",
+        "training_cost_policy": (
+            "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+        ),
+    }
+    for field, expected in contract_expectations.items():
+        if metadata.get(field) != manifest.get(field):
+            raise ValueError(f"Local AI artifact metadata/manifest {field} mismatch.")
+        if metadata.get(field) != expected:
+            raise IncompatibleArtifactContractError(
+                f"Local AI artifact {field} belongs to an incompatible contract."
+            )
     expected_report_hashes = _evaluation_report_hashes(metadata)
     if metadata.get("evaluation_report_hashes") != expected_report_hashes:
         raise ValueError("Local AI artifact evaluation report hash mismatch.")
@@ -1309,6 +1329,7 @@ def _resolve_artifact_pointer(
         "cost_model_version",
         "profit_supervision_version",
         "time_split_policy",
+        "training_cost_policy",
         "model_stage",
         "market_fact_contract",
         "governance_report",
@@ -1332,7 +1353,12 @@ def _resolve_artifact_pointer(
         if (
             activation.get("activation_manifest_version")
             != ARTIFACT_ACTIVATION_MANIFEST_VERSION
-            or activation.get("artifact_model_id") != ARTIFACT_MODEL_ID
+        ):
+            raise IncompatibleArtifactContractError(
+                "Local AI activation belongs to an incompatible permission contract."
+            )
+        if (
+            activation.get("artifact_model_id") != ARTIFACT_MODEL_ID
             or activation.get("artifact_version") != version
             or activation.get("artifact_sha256") != artifact_hash
         ):
@@ -1452,6 +1478,7 @@ def persist_candidate_bundle(
         "cost_model_version",
         "profit_supervision_version",
         "time_split_policy",
+        "training_cost_policy",
     ):
         _required_text(metadata, field)
     for field in EVALUATION_REPORT_FIELDS:
@@ -1575,16 +1602,27 @@ def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
     }
 
 
+def _replaceable_current_artifact(
+    *,
+    deserialize_bundle: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        current = _resolve_artifact_pointer(
+            CURRENT_POINTER_PATH,
+            role="current",
+            deserialize_bundle=deserialize_bundle,
+        )
+        return current, None
+    except IncompatibleArtifactContractError as exc:
+        return None, str(exc)
+
+
 def _compare_candidate_to_current(
     candidate_metadata: dict[str, Any],
     *,
     candidate_stage: str,
 ) -> dict[str, Any]:
-    current = _resolve_artifact_pointer(
-        CURRENT_POINTER_PATH,
-        role="current",
-        deserialize_bundle=False,
-    )
+    current, incompatible_reason = _replaceable_current_artifact()
     report: dict[str, Any] = {
         "policy": "local_ai_tools_fee_after_champion_v1",
         "candidate_stage": candidate_stage,
@@ -1592,7 +1630,16 @@ def _compare_candidate_to_current(
         "blocking_reasons": [],
     }
     if current is None:
-        return {**report, "accepted": True, "reason": "initial_champion"}
+        return {
+            **report,
+            "accepted": True,
+            "reason": (
+                "incompatible_champion_contract_replaced"
+                if incompatible_reason
+                else "initial_champion"
+            ),
+            "replaced_champion_reason": incompatible_reason,
+        }
     current_stage = str(
         (current.get("activation_manifest") or {}).get("activation_stage") or ""
     ).lower()
@@ -1686,9 +1733,8 @@ def _local_activation_manifest(
             "production"
             if activation_stage == "active"
             else "paper_only"
-            if activation_stage == "canary"
-            else "observation_only"
         ),
+        "paper_execution_permission": True,
         "production_permission": production_authorized,
         "canary_authorized": activation_stage == "canary",
         "promotion_recommendation": promotion_recommendation,
@@ -1720,10 +1766,10 @@ def activate_candidate_shadow(
         "shadow",
     )
     write_json_atomic(activation_path, activation)
-    if CURRENT_POINTER_PATH.exists():
-        current = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
-        if current is None:
-            raise ValueError("Local AI current pointer disappeared during activation.")
+    current, _incompatible_reason = _replaceable_current_artifact(
+        deserialize_bundle=True
+    )
+    if current is not None:
         write_json_atomic(
             ROLLBACK_POINTER_PATH,
             {
@@ -2321,7 +2367,7 @@ def execution_cost_distribution_contract(
         "uncertainty_pct": distribution.get("std"),
         "distribution_member_count": distribution.get("sample_count"),
         "distribution_ready": distribution.get("distribution_ready") is True,
-        "source_authority": "shadow_counterfactual_live_microstructure",
+        "source_authority": "okx_fills_fees_funding_model",
     }
 
 
@@ -2402,6 +2448,7 @@ def model_return_distribution_input(
     if not str(distribution.get("source_authority") or "").strip():
         blockers.append("return_distribution_source_authority_missing")
     blockers = list(dict.fromkeys(blockers))
+    contract_complete = not blockers
     return {
         "side": side,
         "horizon_minutes": int(horizon_minutes),
@@ -2413,7 +2460,9 @@ def model_return_distribution_input(
         "label_version": metadata.get("label_version"),
         "cost_model_version": metadata.get("cost_model_version"),
         "profit_supervision_version": metadata.get("profit_supervision_version"),
-        "production_eligible": not blockers,
+        "contract_complete": contract_complete,
+        "paper_eligible": contract_complete,
+        "production_eligible": contract_complete,
         "blockers": blockers,
     }
 
@@ -3679,34 +3728,60 @@ def with_model_metadata(
             and metadata.get("live_ml_ready") is True
             and not _production_return_evidence_blockers(metadata)
         )
-        if not live_authorized:
-            for side in ("long", "short"):
-                distribution_input = distribution_inputs.get(side)
-                if not isinstance(distribution_input, dict):
-                    continue
-                blockers = list(distribution_input.get("blockers") or [])
-                blockers.append("artifact_activation_not_production_authorized")
-                distribution_input["blockers"] = list(dict.fromkeys(blockers))
-                distribution_input["production_eligible"] = False
-            payload["route_mode"] = f"{activation_stage}_observation"
-            payload["production_permission"] = False
-            payload["live_ml_ready"] = False
-        else:
-            payload["route_mode"] = "live"
-            payload["production_permission"] = True
-            payload["live_ml_ready"] = True
-        distribution_inputs_ready = all(
-            isinstance(distribution_inputs.get(side), dict)
-            and distribution_inputs[side].get("production_eligible") is True
-            for side in ("long", "short")
-        )
+        distribution_inputs_ready = True
+        for side in ("long", "short"):
+            distribution_input = distribution_inputs.get(side)
+            if not isinstance(distribution_input, dict):
+                distribution_inputs_ready = False
+                continue
+            structural_blockers = list(distribution_input.get("blockers") or [])
+            distribution_input["blockers"] = structural_blockers
+            if "contract_complete" in distribution_input:
+                structurally_eligible = distribution_input.get("contract_complete") is True
+            elif "paper_eligible" in distribution_input:
+                structurally_eligible = distribution_input.get("paper_eligible") is True
+            else:
+                structurally_eligible = (
+                    distribution_input.get("production_eligible") is True
+                )
+            contract_complete = bool(
+                structurally_eligible and not structural_blockers
+            )
+            distribution_input["contract_complete"] = contract_complete
+            distribution_input["paper_eligible"] = contract_complete
+            distribution_input["production_eligible"] = bool(
+                contract_complete and live_authorized
+            )
+            distribution_input["production_blockers"] = (
+                []
+                if live_authorized and contract_complete
+                else list(
+                    dict.fromkeys(
+                        [
+                            *structural_blockers,
+                            *(
+                                ["artifact_activation_not_production_authorized"]
+                                if not live_authorized
+                                else []
+                            ),
+                        ]
+                    )
+                )
+            )
+            distribution_inputs_ready = bool(
+                distribution_inputs_ready and contract_complete
+            )
+        payload["route_mode"] = "live" if live_authorized else "paper_analysis"
+        payload["production_permission"] = live_authorized
+        payload["live_ml_ready"] = live_authorized
+        payload["paper_trading_permission"] = distribution_inputs_ready
         contract_ready = bool(
             payload.get("objective_name") == RETURN_OBJECTIVE_NAME
             and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
             and payload.get("label_name") == RETURN_LABEL_NAME
             and payload.get("label_version") == RETURN_LABEL_VERSION
             and payload.get("training_cost_policy")
-            == "separated_market_opportunity_and_execution_cost_tasks"
+            == "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
             and payload.get("profit_supervision_version")
             == PROFIT_SUPERVISION_VERSION
             and payload.get("return_semantics")
@@ -3720,28 +3795,53 @@ def with_model_metadata(
         if not isinstance(prediction_quality, dict):
             prediction_quality = {
                 "production_eligible": False,
+                "contract_complete": False,
+                "paper_eligible": False,
                 "anomalous": True,
                 "reason": "current_prediction_distribution_missing",
+                "blockers": ["current_prediction_distribution_missing"],
             }
             payload["prediction_quality"] = prediction_quality
+        quality_blockers = list(prediction_quality.get("blockers") or [])
         if not contract_ready:
-            prediction_quality["production_eligible"] = False
-            prediction_quality["anomalous"] = True
-            contract_blockers = list(
-                dict.fromkeys(
-                    [
-                        *(prediction_quality.get("blockers") or []),
-                        *(
-                            ["artifact_activation_not_production_authorized"]
-                            if not live_authorized
-                            else []
-                        ),
-                        "runtime_return_artifact_contract_incomplete",
-                    ]
-                )
+            quality_blockers.append("runtime_return_artifact_contract_incomplete")
+        quality_blockers = list(dict.fromkeys(quality_blockers))
+        quality_contract_complete = bool(
+            contract_ready
+            and prediction_quality.get("anomalous") is not True
+            and not quality_blockers
+        )
+        original_production_eligible = bool(
+            prediction_quality.get("production_eligible") is True
+        )
+        prediction_quality["contract_complete"] = quality_contract_complete
+        prediction_quality["paper_eligible"] = quality_contract_complete
+        prediction_quality["production_eligible"] = bool(
+            quality_contract_complete
+            and original_production_eligible
+            and live_authorized
+        )
+        prediction_quality["anomalous"] = not quality_contract_complete
+        prediction_quality["blockers"] = quality_blockers
+        production_blockers = list(
+            prediction_quality.get("production_blockers") or []
+        )
+        if not live_authorized:
+            production_blockers.append(
+                "artifact_activation_not_production_authorized"
             )
-            prediction_quality["blockers"] = contract_blockers
-            prediction_quality["reason"] = contract_blockers[0]
+        prediction_quality["production_blockers"] = list(
+            dict.fromkeys([*quality_blockers, *production_blockers])
+        )
+        prediction_quality["reason"] = (
+            "standardized_return_distribution_ready"
+            if prediction_quality["production_eligible"]
+            else "standardized_return_distribution_ready_for_paper"
+            if quality_contract_complete
+            else quality_blockers[0]
+            if quality_blockers
+            else "current_prediction_distribution_missing"
+        )
     if not isinstance(payload.get("shadow_payload"), dict):
         payload["shadow_payload"] = _shadow_payload(tool, payload)
     return payload
@@ -4275,23 +4375,22 @@ def specialist_preflight(kind: str | None = None) -> dict[str, Any]:
     return _specialist_adapter_preflight(kind)
 
 
-@app.post("/train")
-def train(req: TrainRequest) -> dict[str, Any]:
-    rows = []
-    for sample in req.shadow_samples or []:
+def _market_training_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
         if bool(sample.get("exclude_from_training")):
             continue
         features = sample.get("features") or {}
         horizon = int(sample.get("horizon_minutes") or features.get("horizon_minutes") or 10)
-        if not features:
-            continue
         supervision = sample.get("profit_supervision") or {}
-        if supervision.get("version") != PROFIT_SUPERVISION_VERSION:
-            continue
         tasks = supervision.get("tasks") or {}
         market_task = tasks.get(MARKET_OPPORTUNITY_TASK) or {}
-        cost_task = tasks.get(EXECUTION_COST_TASK) or {}
-        if market_task.get("eligible") is not True or cost_task.get("eligible") is not True:
+        if (
+            not features
+            or horizon <= 0
+            or supervision.get("version") != PROFIT_SUPERVISION_VERSION
+            or market_task.get("eligible") is not True
+        ):
             continue
         long_return = f(
             market_task,
@@ -4303,15 +4402,8 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "short_gross_market_return_pct",
             float("nan"),
         )
-        long_cost = f(cost_task, "long_total_cost_pct", float("nan"))
-        short_cost = f(cost_task, "short_total_cost_pct", float("nan"))
-        if not all(
-            math.isfinite(value)
-            for value in (long_return, short_return, long_cost, short_cost)
-        ):
+        if not all(math.isfinite(value) for value in (long_return, short_return)):
             continue
-        long_net_return = long_return - long_cost
-        short_net_return = short_return - short_cost
         sample_weight = max(0.0, f(sample, "sample_weight", 1.0))
         if sample_weight <= 0.0:
             continue
@@ -4331,51 +4423,134 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "decision_group": decision_group,
             "decision_timestamp": _timestamp_text(sample.get("decision_timestamp")),
             "label_timestamp": _timestamp_text(sample.get("label_timestamp")),
-            "raw_long_return": long_return,
-            "raw_short_return": short_return,
             "long_return": long_return,
             "short_return": short_return,
-            "long_net_return": long_net_return,
-            "short_net_return": short_net_return,
-            "long_execution_cost": long_cost,
-            "short_execution_cost": short_cost,
             "best_side": (
                 "long"
-                if long_net_return > 0.0 and long_net_return >= short_net_return
+                if long_return > 0.0 and long_return >= short_return
                 else "short"
-                if short_net_return > 0.0 and short_net_return > long_net_return
+                if short_return > 0.0 and short_return > long_return
                 else "hold"
             ),
-            "best_net_return": max(long_net_return, short_net_return),
-            "execution_cost": cost_task,
+            "best_market_return": max(long_return, short_return),
             "features": features,
             "sample_weight": sample_weight,
+            "return_semantics": "gross_fixed_horizon_market_opportunity",
         })
-    if len(rows) <= 1:
-        return {
-            "trained": False,
-            "reason": "separated_supervision_distribution_unavailable",
-            "shadow_sample_count": len(rows),
-            "message": "Need market-opportunity and execution-cost tasks from separate decision groups.",
-        }
+    return rows
 
-    try:
-        rows = _chronological_rows(rows)
-    except ValueError as exc:
-        return {
-            "trained": False,
-            "reason": "chronological_training_identity_incomplete",
-            "shadow_sample_count": len(rows),
-            "message": str(exc),
-        }
-    ordered_groups, group_bounds = _decision_group_availability(rows)
+
+def _authoritative_cost_training_rows(
+    samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        features = sample.get("features") or {}
+        supervision = sample.get("profit_supervision") or {}
+        tasks = supervision.get("tasks") or {}
+        cost_task = tasks.get(EXECUTION_COST_TASK) or {}
+        side = str(sample.get("side") or "").strip().lower()
+        total_cost = f(cost_task, "total_cost_pct", float("nan"))
+        sample_weight = max(0.0, f(sample, "sample_weight", 1.0))
+        holding_minutes = max(1, int(math.ceil(f(sample, "holding_minutes", 1.0))))
+        lifecycle = str(
+            sample.get("lifecycle_key")
+            or sample.get("position_id")
+            or sample.get("id")
+            or ""
+        ).strip()
+        if (
+            not features
+            or supervision.get("version") != PROFIT_SUPERVISION_VERSION
+            or cost_task.get("eligible") is not True
+            or cost_task.get("source_authority") != "okx_fills_fees_funding"
+            or side not in {"long", "short"}
+            or not math.isfinite(total_cost)
+            or sample_weight <= 0.0
+        ):
+            continue
+        prediction_horizon = int(
+            features.get("horizon_minutes")
+            or sample.get("prediction_horizon_minutes")
+            or holding_minutes
+        )
+        rows.append({
+            "x": model_x(features, horizon_minutes=max(prediction_horizon, 1)),
+            "id": int(sample.get("id") or 0),
+            "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
+            "side": side,
+            "horizon": holding_minutes,
+            "decision_group": f"okx_lifecycle:{lifecycle}" if lifecycle else "",
+            "decision_timestamp": _timestamp_text(
+                sample.get("decision_timestamp") or sample.get("opened_at")
+            ),
+            "label_timestamp": _timestamp_text(
+                sample.get("label_timestamp")
+                or sample.get("closed_at")
+                or sample.get("updated_at")
+            ),
+            "execution_cost": total_cost,
+            "sample_weight": sample_weight,
+            "source_authority": cost_task.get("source_authority"),
+        })
+    return rows
+
+
+def _training_distribution_profile(
+    market_rows: list[dict[str, Any]],
+    cost_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    values: dict[str, list[float]] = {
+        key: []
+        for key in (
+            "returns_5",
+            "returns_20",
+            "volatility_20",
+            "spread_pct",
+            "orderbook_imbalance",
+            "long_return_pct",
+            "short_return_pct",
+            "authoritative_execution_cost_pct",
+        )
+    }
+    for row in market_rows:
+        features = row.get("features") or {}
+        for key in (
+            "returns_5",
+            "returns_20",
+            "volatility_20",
+            "spread_pct",
+            "orderbook_imbalance",
+        ):
+            value = f(features, key, float("nan"))
+            if math.isfinite(value):
+                values[key].append(value)
+        values["long_return_pct"].append(float(row["long_return"]))
+        values["short_return_pct"].append(float(row["short_return"]))
+    values["authoritative_execution_cost_pct"].extend(
+        float(row["execution_cost"]) for row in cost_rows
+    )
+    return {
+        "version": "2026-07-27.training-distribution-profile.v1",
+        "features": {
+            key: {
+                "count": len(rows),
+                "mean": float(np.mean(rows)),
+                "std": float(np.std(rows)),
+            }
+            for key, rows in values.items()
+            if rows
+        },
+    }
+
+
+def _purged_chronological_holdout(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = _chronological_rows(rows)
+    ordered_groups, group_bounds = _decision_group_availability(ordered)
     if len(ordered_groups) <= 1:
-        return {
-            "trained": False,
-            "reason": "decision_group_holdout_unavailable",
-            "shadow_sample_count": len(rows),
-            "decision_group_count": len(ordered_groups),
-        }
+        raise ValueError("decision_group_holdout_unavailable")
     split = len(ordered_groups) // 2
     holdout_candidates = ordered_groups[split:]
     holdout_decision_start = min(
@@ -4387,31 +4562,87 @@ def train(req: TrainRequest) -> dict[str, Any]:
         if group_bounds[group]["end"] < holdout_decision_start
     }
     holdout_groups = set(holdout_candidates)
-    purged_holdout_group_count = split - len(train_groups)
-    train_rows = [row for row in rows if str(row["decision_group"]) in train_groups]
-    holdout_rows = [row for row in rows if str(row["decision_group"]) in holdout_groups]
+    train_rows = [row for row in ordered if str(row["decision_group"]) in train_groups]
+    holdout_rows = [
+        row for row in ordered if str(row["decision_group"]) in holdout_groups
+    ]
     if not train_rows or not holdout_rows or train_groups & holdout_groups:
+        raise ValueError("decision_group_holdout_unavailable")
+    return {
+        "rows": ordered,
+        "train_rows": train_rows,
+        "holdout_rows": holdout_rows,
+        "train_groups": train_groups,
+        "holdout_groups": holdout_groups,
+        "purged_group_count": split - len(train_groups),
+    }
+
+
+@app.post("/train")
+def train(req: TrainRequest) -> dict[str, Any]:
+    rows = _market_training_rows(req.shadow_samples or [])
+    cost_rows = _authoritative_cost_training_rows(req.trade_samples or [])
+    if len(rows) <= 1:
         return {
             "trained": False,
-            "reason": "decision_group_holdout_unavailable",
+            "reason": "market_opportunity_distribution_unavailable",
             "shadow_sample_count": len(rows),
+            "authoritative_cost_sample_count": len(cost_rows),
+            "message": "Need fixed-horizon market labels from separate decision groups.",
         }
+    if len(cost_rows) <= 1:
+        return {
+            "trained": False,
+            "reason": "authoritative_execution_cost_distribution_unavailable",
+            "shadow_sample_count": len(rows),
+            "authoritative_cost_sample_count": len(cost_rows),
+            "message": "Need OKX fills, fees, funding, slippage, and entry features.",
+        }
+    try:
+        market_split = _purged_chronological_holdout(rows)
+    except ValueError as exc:
+        return {
+            "trained": False,
+            "reason": "chronological_market_training_identity_incomplete",
+            "shadow_sample_count": len(rows),
+            "message": str(exc),
+        }
+    try:
+        cost_split = _purged_chronological_holdout(cost_rows)
+    except ValueError as exc:
+        return {
+            "trained": False,
+            "reason": "chronological_cost_training_identity_incomplete",
+            "shadow_sample_count": len(rows),
+            "authoritative_cost_sample_count": len(cost_rows),
+            "message": str(exc),
+        }
+    rows = market_split["rows"]
+    train_rows = market_split["train_rows"]
+    holdout_rows = market_split["holdout_rows"]
+    train_groups = market_split["train_groups"]
+    holdout_groups = market_split["holdout_groups"]
+    purged_holdout_group_count = market_split["purged_group_count"]
+    cost_rows = cost_split["rows"]
+    cost_train_rows = cost_split["train_rows"]
+    cost_holdout_rows = cost_split["holdout_rows"]
+    cost_train_groups = cost_split["train_groups"]
+    cost_holdout_groups = cost_split["holdout_groups"]
+    purged_cost_holdout_group_count = cost_split["purged_group_count"]
 
     long_tail_boundary = empirical_lower_hinge(
-        [row["long_net_return"] for row in train_rows if row["long_net_return"] < 0]
+        [row["long_return"] for row in train_rows if row["long_return"] < 0]
     )
     short_tail_boundary = empirical_lower_hinge(
-        [row["short_net_return"] for row in train_rows if row["short_net_return"] < 0]
+        [row["short_return"] for row in train_rows if row["short_return"] < 0]
     )
     for row in rows:
-        row["lossy_long"] = int(row["long_net_return"] < long_tail_boundary)
-        row["lossy_short"] = int(row["short_net_return"] < short_tail_boundary)
+        row["lossy_long"] = int(row["long_return"] < long_tail_boundary)
+        row["lossy_short"] = int(row["short_return"] < short_tail_boundary)
 
     X = [r["x"] for r in train_rows]
     long_y = [r["long_return"] for r in train_rows]
     short_y = [r["short_return"] for r in train_rows]
-    long_cost_y = [r["long_execution_cost"] for r in train_rows]
-    short_cost_y = [r["short_execution_cost"] for r in train_rows]
     long_loss_y = [r["lossy_long"] for r in train_rows]
     short_loss_y = [r["lossy_short"] for r in train_rows]
     sample_weights = [
@@ -4420,16 +4651,61 @@ def train(req: TrainRequest) -> dict[str, Any]:
 
     long_return_model = _make_regressor(len(train_rows))
     short_return_model = _make_regressor(len(train_rows))
-    long_cost_model = _make_regressor(len(train_rows))
-    short_cost_model = _make_regressor(len(train_rows))
     long_loss_model = _make_classifier(long_loss_y)
     short_loss_model = _make_classifier(short_loss_y)
     long_return_model.fit(X, long_y, model__sample_weight=sample_weights)
     short_return_model.fit(X, short_y, model__sample_weight=sample_weights)
-    long_cost_model.fit(X, long_cost_y, model__sample_weight=sample_weights)
-    short_cost_model.fit(X, short_cost_y, model__sample_weight=sample_weights)
     long_loss_model.fit(X, long_loss_y, model__sample_weight=sample_weights)
     short_loss_model.fit(X, short_loss_y, model__sample_weight=sample_weights)
+
+    cost_side_training_counts: dict[str, int] = {}
+    cost_side_fallbacks: dict[str, str | None] = {}
+
+    def fit_cost_model(side: str) -> Any:
+        side_rows = [row for row in cost_train_rows if row["side"] == side]
+        selected_rows = side_rows if len(side_rows) > 1 else cost_train_rows
+        cost_side_training_counts[side] = len(selected_rows)
+        cost_side_fallbacks[side] = (
+            None if len(side_rows) > 1 else "global_authoritative_cost_distribution"
+        )
+        model = _make_regressor(len(selected_rows))
+        model.fit(
+            [row["x"] for row in selected_rows],
+            [row["execution_cost"] for row in selected_rows],
+            model__sample_weight=[
+                max(0.0, float(row.get("sample_weight") or 0.0))
+                for row in selected_rows
+            ],
+        )
+        return model
+
+    long_cost_model = fit_cost_model("long")
+    short_cost_model = fit_cost_model("short")
+    cost_models = {"long": long_cost_model, "short": short_cost_model}
+    cost_holdout_errors: dict[str, list[float]] = {"long": [], "short": []}
+    for row in cost_holdout_rows:
+        side = str(row["side"])
+        prediction = float(cost_models[side].predict([row["x"]])[0])
+        cost_holdout_errors[side].append(
+            abs(prediction - float(row["execution_cost"]))
+        )
+    execution_cost_holdout_report = {
+        "source_authority": "okx_fills_fees_funding",
+        "chronological": True,
+        "decision_group_disjoint": not bool(
+            cost_train_groups & cost_holdout_groups
+        ),
+        "sample_count": len(cost_holdout_rows),
+        "sides": {
+            side: {
+                "sample_count": len(errors),
+                "mae_pct": float(np.mean(errors)) if errors else None,
+                "training_sample_count": cost_side_training_counts[side],
+                "fallback": cost_side_fallbacks[side],
+            }
+            for side, errors in cost_holdout_errors.items()
+        },
+    }
 
     horizon_models: dict[int, dict[str, Any]] = {}
     for horizon in sorted({int(r["horizon"]) for r in train_rows}):
@@ -4531,12 +4807,25 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 "horizon": row.get("horizon"),
                 "long_return_pct": row.get("long_return"),
                 "short_return_pct": row.get("short_return"),
-                "long_execution_cost_pct": row.get("long_execution_cost"),
-                "short_execution_cost_pct": row.get("short_execution_cost"),
                 "sample_weight": row.get("sample_weight"),
                 "feature_vector": row.get("x"),
             }
             for row in rows
+        ],
+        "authoritative_cost": [
+            {
+                "id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "decision_group": row.get("decision_group"),
+                "decision_timestamp": row.get("decision_timestamp"),
+                "label_timestamp": row.get("label_timestamp"),
+                "execution_cost_pct": row.get("execution_cost"),
+                "sample_weight": row.get("sample_weight"),
+                "feature_vector": row.get("x"),
+                "source_authority": row.get("source_authority"),
+            }
+            for row in cost_rows
         ],
         "trades": sorted([
             {
@@ -4625,6 +4914,36 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "train_decision_group_count": len(train_groups),
         "holdout_decision_group_count": len(holdout_groups),
         "purged_holdout_decision_group_count": purged_holdout_group_count,
+        "authoritative_cost_sample_count": len(cost_rows),
+        "train_authoritative_cost_sample_count": len(cost_train_rows),
+        "holdout_authoritative_cost_sample_count": len(cost_holdout_rows),
+        "train_cost_decision_group_count": len(cost_train_groups),
+        "holdout_cost_decision_group_count": len(cost_holdout_groups),
+        "purged_cost_holdout_decision_group_count": (
+            purged_cost_holdout_group_count
+        ),
+        "completed_market_decision_group_count": len(
+            {str(row["decision_group"]) for row in rows}
+        ),
+        "completed_authoritative_cost_decision_group_count": len(
+            {str(row["decision_group"]) for row in cost_rows}
+        ),
+        "completed_training_decision_group_count": len(
+            {
+                str(row["decision_group"])
+                for row in [*rows, *cost_rows]
+            }
+        ),
+        "last_trained_completed_training_decision_group_count": len(
+            {
+                str(row["decision_group"])
+                for row in [*rows, *cost_rows]
+            }
+        ),
+        "training_distribution_profile": _training_distribution_profile(
+            rows,
+            cost_rows,
+        ),
         "completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows)),
         "last_trained_completed_shadow_sample_count": int(
             req.completed_shadow_sample_count or len(rows)
@@ -4644,7 +4963,10 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "feature_count": len(FEATURE_KEYS),
         "horizons": sorted(horizon_models),
         "profile_count": len(profiles),
-        "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "training_cost_policy": (
+            "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+        ),
+        "execution_cost_holdout_report": execution_cost_holdout_report,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "profit_supervision_report": req.profit_supervision_report or {},
         "market_fact_contract": (req.quality_report or {}).get(
@@ -4653,12 +4975,12 @@ def train(req: TrainRequest) -> dict[str, Any]:
         ),
         "tail_loss_policy": {
             "long": {
-                "source": "chronological_training_net_negative_return_lower_hinge",
+                "source": "chronological_training_gross_market_negative_return_lower_hinge",
                 "value": long_tail_boundary,
                 "observation_window": "chronological_training_groups_only",
             },
             "short": {
-                "source": "chronological_training_net_negative_return_lower_hinge",
+                "source": "chronological_training_gross_market_negative_return_lower_hinge",
                 "value": short_tail_boundary,
                 "observation_window": "chronological_training_groups_only",
             },
@@ -4674,7 +4996,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "cost_model_version": COST_MODEL_VERSION,
         "training_data_sha256": training_data_sha256,
         "source_code_sha256": source_code_sha256,
-        "time_split_policy": "chronological_disjoint_decision_groups",
+        "time_split_policy": "independent_chronological_disjoint_decision_groups",
         "walk_forward_report": walk_forward_report,
         "leave_one_symbol_out_report": leave_one_symbol_out_report,
         "oos_return_evaluation": oos_return_evaluation,
@@ -4703,14 +5025,14 @@ def train(req: TrainRequest) -> dict[str, Any]:
             "live_ml_ready": False,
         },
         "training_objective": (
-            "Predict shadow market opportunity and counterfactual execution cost as "
-            "separate tasks; calibrate realized net return and slippage only from "
+            "Predict fixed-horizon market opportunity only from shadow market paths; "
+            "predict execution cost and calibrate realized net return only from "
             "authoritative OKX lifecycles."
         ),
         "models": {
             "profit": "ExtraTreesRegressor long/short gross market opportunity",
-            "execution_cost": "ExtraTreesRegressor long/short counterfactual execution cost",
-            "loss_filter": "ExtraTreesClassifier side-specific loss probability",
+            "execution_cost": "ExtraTreesRegressor authoritative OKX long/short execution cost",
+            "loss_filter": "ExtraTreesClassifier fixed-horizon market tail probability",
             "timeseries": "Per-horizon long/short ExtraTreesRegressor return distributions",
             "deep_timeseries": (
                 "Torch PatchTST/TFT-style sequence model"
@@ -4773,15 +5095,15 @@ def train(req: TrainRequest) -> dict[str, Any]:
         }
     candidate = persist_candidate_bundle(bundle, metadata)
     activation_evidence = {
-            "walk_forward_report": walk_forward_report,
-            "leave_one_symbol_out_report": leave_one_symbol_out_report,
-            "oos_return_evaluation": oos_return_evaluation,
-            "authoritative_trade_return_evidence": authoritative_trade_return_evidence,
-            "evaluation_report_hashes": metadata["evaluation_report_hashes"],
-            "blocking_reasons": return_evidence_blockers,
-            "promotion_recommendation": req.promotion_recommendation or {},
-            "training_mode": str(req.training_mode or "shadow"),
-        }
+        field: metadata[field]
+        for field in EVALUATION_REPORT_FIELDS
+    }
+    activation_evidence.update({
+        "evaluation_report_hashes": metadata["evaluation_report_hashes"],
+        "blocking_reasons": return_evidence_blockers,
+        "promotion_recommendation": req.promotion_recommendation or {},
+        "training_mode": str(req.training_mode or "shadow"),
+    })
     activation_stage = _governed_candidate_activation_stage(
         req.promotion_recommendation or {},
         return_evidence_blockers,
@@ -4921,15 +5243,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 and int((profile.get("slippage_pct") or {}).get("count") or 0) > 0
                 for profile in (long_profile, short_profile)
             )
-            prediction_blockers = list(return_input_blockers)
-            if not long_cost_distribution["distribution_ready"] or not short_cost_distribution[
-                "distribution_ready"
-            ]:
-                prediction_blockers.append(
-                    "counterfactual_execution_cost_distribution_not_ready"
-                )
-            if not actual_calibration_ready:
-                prediction_blockers.append("actual_trade_calibration_not_ready")
+            contract_blockers = list(return_input_blockers)
             if not all(
                 math.isfinite(value)
                 for value in (
@@ -4939,9 +5253,20 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     short_lower_bound,
                 )
             ):
-                prediction_blockers.append("return_distribution_values_not_finite")
-            prediction_blockers = list(dict.fromkeys(prediction_blockers))
-            prediction_ready = not prediction_blockers
+                contract_blockers.append("return_distribution_values_not_finite")
+            contract_blockers = list(dict.fromkeys(contract_blockers))
+            production_blockers = list(contract_blockers)
+            if not long_cost_distribution["distribution_ready"] or not short_cost_distribution[
+                "distribution_ready"
+            ]:
+                production_blockers.append(
+                    "counterfactual_execution_cost_distribution_not_ready"
+                )
+            if not actual_calibration_ready:
+                production_blockers.append("actual_trade_calibration_not_ready")
+            production_blockers = list(dict.fromkeys(production_blockers))
+            contract_ready = not contract_blockers
+            production_ready = not production_blockers
             return _attach_baseline_only_shadow("profit_prediction", {
                 "available": True,
                 "trained": True,
@@ -4967,7 +5292,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "short": execution_cost_distribution_contract(
                         short_cost_distribution
                     ),
-                    "source_authority": "shadow_counterfactual_live_microstructure",
+                    "source_authority": "okx_fills_fees_funding_model",
                 },
                 "actual_trade_calibration": {
                     "long": long_profile,
@@ -4978,15 +5303,20 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "short_loss_probability": round(short_loss_prob, 4),
                 "loss_probability": round(loss_prob, 4),
                 "prediction_quality": {
-                    "production_eligible": prediction_ready,
-                    "anomalous": not prediction_ready,
+                    "contract_complete": contract_ready,
+                    "paper_eligible": contract_ready,
+                    "production_eligible": production_ready,
+                    "anomalous": not contract_ready,
                     "reason": (
                         "separated_market_cost_and_actual_calibration_ready"
-                        if prediction_ready
-                        else prediction_blockers[0]
+                        if production_ready
+                        else "market_opportunity_distribution_ready_for_paper"
+                        if contract_ready
+                        else contract_blockers[0]
                     ),
                     "source": "current_extra_trees_prediction_distribution",
-                    "blockers": prediction_blockers,
+                    "blockers": contract_blockers,
+                    "production_blockers": production_blockers,
                     "long": long_distribution,
                     "short": short_distribution,
                 },
@@ -5018,10 +5348,13 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             source_authority="artifact_unavailable",
         ),
         "prediction_quality": {
+            "contract_complete": False,
+            "paper_eligible": False,
             "production_eligible": False,
             "anomalous": True,
             "reason": fallback_reason,
             "blockers": [fallback_reason],
+            "production_blockers": [fallback_reason],
         },
         "fallback_error": fallback_error,
         "note": "A persisted governed artifact is required before return inference.",
@@ -5131,9 +5464,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                         "short": execution_cost_distribution_contract(
                             short_cost_distribution
                         ),
-                        "source_authority": (
-                            "shadow_counterfactual_live_microstructure"
-                        ),
+                        "source_authority": "okx_fills_fees_funding_model",
                     },
                     "actual_trade_calibration": actual_calibration,
                     "best_side": best_side,
@@ -5195,16 +5526,20 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     is True
                     for side in ("long", "short")
                 )
-                prediction_blockers = list(
+                contract_blockers = list(
                     primary.get("prediction_distribution_blockers") or []
                 )
+                production_blockers = list(contract_blockers)
                 if not cost_distribution_ready:
-                    prediction_blockers.append(
+                    production_blockers.append(
                         "counterfactual_execution_cost_distribution_not_ready"
                     )
                 if not actual_calibration_ready:
-                    prediction_blockers.append("actual_trade_calibration_not_ready")
-                prediction_blockers = list(dict.fromkeys(prediction_blockers))
+                    production_blockers.append("actual_trade_calibration_not_ready")
+                contract_blockers = list(dict.fromkeys(contract_blockers))
+                production_blockers = list(dict.fromkeys(production_blockers))
+                contract_ready = not contract_blockers
+                production_ready = not production_blockers
                 payload = with_model_metadata("time_series_prediction", {
                     "available": True,
                     "trained": True,
@@ -5231,26 +5566,17 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "confidence": round(confidence, 4),
                     "predictions": predictions,
                     "prediction_quality": {
-                        "production_eligible": primary[
-                            "prediction_distribution_ready"
-                        ]
-                        and cost_distribution_ready
-                        and actual_calibration_ready
-                        and not prediction_blockers,
-                        "anomalous": not (
-                            primary["prediction_distribution_ready"]
-                            and cost_distribution_ready
-                            and actual_calibration_ready
-                            and not prediction_blockers
-                        ),
+                        "contract_complete": contract_ready,
+                        "paper_eligible": contract_ready,
+                        "production_eligible": production_ready,
+                        "anomalous": not contract_ready,
                         "reason": (
                             "separated_market_cost_and_actual_calibration_ready"
-                            if primary["prediction_distribution_ready"]
-                            and cost_distribution_ready
-                            and actual_calibration_ready
-                            and not prediction_blockers
-                            else prediction_blockers[0]
-                            if prediction_blockers
+                            if production_ready
+                            else "market_opportunity_distribution_ready_for_paper"
+                            if contract_ready
+                            else contract_blockers[0]
+                            if contract_blockers
                             else (
                                 "current_tree_prediction_distribution_degenerate"
                                 if primary["prediction_sample_count"] > 0
@@ -5259,7 +5585,8 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                         ),
                         "source": "current_horizon_extra_trees_prediction_distribution",
                         "sample_count": primary["prediction_sample_count"],
-                        "blockers": prediction_blockers,
+                        "blockers": contract_blockers,
+                        "production_blockers": production_blockers,
                     },
                 }, features=features)
                 return _attach_timeseries_specialist_shadow(payload, features=features)
@@ -5766,22 +6093,22 @@ def _stop_legacy_8101_holder_command() -> str:
             f"new_app={sh(PHASE3_APP_DIR + '/local_ai_tools_api.py')}",
             "holders=$(ss -ltnp 'sport = :8101' 2>/dev/null | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u || true)",
             "for pid in ${holders}; do",
-            "  [ -n \"${pid}\" ] || continue",
+            '  [ -n "${pid}" ] || continue',
             "  cmdline=$(tr '\\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true)",
             "  unit=$(systemctl status ${pid} --no-pager 2>/dev/null | sed -n 's/^.*CGroup: \\/system.slice\\/\\([^ ]*\\.service\\).*$/\\1/p' | head -1 || true)",
-            "  if printf '%s' \"${cmdline}\" | grep -F \"$new_app\" >/dev/null; then",
+            '  if printf \'%s\' "${cmdline}" | grep -F "$new_app" >/dev/null; then',
             "    continue",
             "  fi",
-            "  if [ -n \"${unit}\" ] && [ \"${unit}\" != \"$new_service\" ]; then",
-            "    sudo systemctl stop \"${unit}\" || true",
-            "    sudo systemctl disable \"${unit}\" || true",
+            '  if [ -n "${unit}" ] && [ "${unit}" != "$new_service" ]; then',
+            '    sudo systemctl stop "${unit}" || true',
+            '    sudo systemctl disable "${unit}" || true',
             "  fi",
-            "  if kill -0 \"${pid}\" 2>/dev/null; then",
-            "    sudo kill \"${pid}\" || true",
+            '  if kill -0 "${pid}" 2>/dev/null; then',
+            '    sudo kill "${pid}" || true',
             "    sleep 2",
             "  fi",
-            "  if kill -0 \"${pid}\" 2>/dev/null; then",
-            "    sudo kill -9 \"${pid}\" || true",
+            '  if kill -0 "${pid}" 2>/dev/null; then',
+            '    sudo kill -9 "${pid}" || true',
             "  fi",
             "done",
         ]
@@ -5851,6 +6178,7 @@ def _remote_smoke_command() -> str:
         "has_artifact = lifecycle in {'shadow', 'canary', 'active'}\n"
         "live = lifecycle == 'active'\n"
         "profit = post('/profit/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
+        "timeseries = post('/timeseries/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
         "exit_advice = post('/exit/advise', {'symbol': 'BTC/USDT', 'features': features, 'open_positions': []})\n"
         "assert health.get('service') == 'phase3_quant_api', health\n"
         "assert health.get('root') == '/data/BB', health\n"
@@ -5860,6 +6188,8 @@ def _remote_smoke_command() -> str:
         "if has_artifact:\n"
         "    assert activation.get('activation_stage') == lifecycle, health\n"
         "    assert activation.get('live_ml_ready') is live, health\n"
+        "    assert activation.get('execution_scope') == ('production' if live else 'paper_only'), health\n"
+        "    assert activation.get('paper_execution_permission') is True, health\n"
         "else:\n"
         "    assert not activation, health\n"
         "assert profit.get('trained') is has_artifact, profit\n"
@@ -5867,9 +6197,22 @@ def _remote_smoke_command() -> str:
         "assert profit.get('production_permission') is live, profit\n"
         "assert profit.get('live_ml_ready') is live, profit\n"
         "assert profit.get('prediction_quality', {}).get('production_eligible') is live, profit\n"
+        "assert profit.get('prediction_quality', {}).get('paper_eligible') is has_artifact, profit\n"
+        "assert profit.get('prediction_quality', {}).get('anomalous') is (not has_artifact), profit\n"
         "assert profit.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', profit\n"
         "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
         "assert all(item.get('production_eligible') is live for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
+        "assert all(item.get('paper_eligible') is has_artifact for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
+        "assert timeseries.get('trained') is has_artifact, timeseries\n"
+        "assert timeseries.get('production_permission') is live, timeseries\n"
+        "assert timeseries.get('live_ml_ready') is live, timeseries\n"
+        "assert timeseries.get('prediction_quality', {}).get('production_eligible') is live, timeseries\n"
+        "assert timeseries.get('prediction_quality', {}).get('paper_eligible') is has_artifact, timeseries\n"
+        "assert timeseries.get('prediction_quality', {}).get('anomalous') is (not has_artifact), timeseries\n"
+        "assert timeseries.get('return_distribution_input_version') == '2026-07-15.model-return-distribution-input.v1', timeseries\n"
+        "assert set((timeseries.get('return_distribution_inputs') or {})) == {'long', 'short'}, timeseries\n"
+        "assert all(item.get('production_eligible') is live for item in (timeseries.get('return_distribution_inputs') or {}).values()), timeseries\n"
+        "assert all(item.get('paper_eligible') is has_artifact for item in (timeseries.get('return_distribution_inputs') or {}).values()), timeseries\n"
         "if has_artifact:\n"
         "    assert 'loss_probability' in profit, profit\n"
         "else:\n"
@@ -5893,6 +6236,11 @@ def _remote_smoke_command() -> str:
         "        'production_eligible': profit.get('prediction_quality', {}).get('production_eligible'),\n"
         "        'production_permission': profit.get('production_permission'),\n"
         "    },\n"
+        "    'timeseries_contract': {\n"
+        "        'production_eligible': timeseries.get('prediction_quality', {}).get('production_eligible'),\n"
+        "        'paper_eligible': timeseries.get('prediction_quality', {}).get('paper_eligible'),\n"
+        "        'production_permission': timeseries.get('production_permission'),\n"
+        "    },\n"
         "    'exit_contract': {\n"
         "        'action': exit_advice.get('action'),\n"
         "        'no_matching_position': exit_advice.get('no_matching_position'),\n"
@@ -5903,7 +6251,9 @@ def _remote_smoke_command() -> str:
 
 
 def deploy_phase3_quant_api(*, plan_only: bool = False, start: bool = True) -> None:
-    safe_print(json.dumps(render_phase3_deploy_plan(), ensure_ascii=False, indent=2, sort_keys=True))
+    safe_print(
+        json.dumps(render_phase3_deploy_plan(), ensure_ascii=False, indent=2, sort_keys=True)
+    )
     if plan_only:
         return
 

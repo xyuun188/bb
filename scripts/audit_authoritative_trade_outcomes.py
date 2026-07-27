@@ -103,6 +103,18 @@ def _strategy_entry_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(counts.most_common())
 
 
+def _realized_pnl_sign_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"profit": 0, "loss": 0, "flat": 0}
+    for row in rows:
+        try:
+            realized_pnl = float(row.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            realized_pnl = 0.0
+        key = "profit" if realized_pnl > 0.0 else "loss" if realized_pnl < 0.0 else "flat"
+        counts[key] += 1
+    return counts
+
+
 def _gap_summary(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
     gap_counts: Counter[str] = Counter()
     gap_set_counts: Counter[tuple[str, ...]] = Counter()
@@ -356,7 +368,9 @@ async def audit(
     gap_summary = _gap_summary(outcomes)
     slippage_integrity = _slippage_integrity_summary(outcomes)
     slippage_integrity["storage"] = _slippage_storage_summary(order_rows)
-    if summary_only:
+    # A position-targeted audit keeps the selected lifecycle details below; the
+    # global gap combinations are unrelated bulk data and can exceed SSH output limits.
+    if summary_only or position_id is not None:
         gap_summary = _compact_gap_summary(gap_summary)
     return {
         "status": "ok" if not violations else "blocked",
@@ -367,6 +381,7 @@ async def audit(
         "incomplete_count": sum(item.get("outcome_complete") is not True for item in outcomes),
         "training_integrity": {
             "trainable_count": len(trainable),
+            "trainable_realized_pnl_sign_counts": _realized_pnl_sign_counts(trainable),
             "all_outcome_entry_kind_counts": _strategy_entry_kind_counts(outcomes),
             "trainable_entry_kind_counts": _strategy_entry_kind_counts(trainable),
             "loss_tolerant_paper_training_count": sum(

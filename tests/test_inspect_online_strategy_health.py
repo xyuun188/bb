@@ -60,6 +60,20 @@ def test_replay_only_command_skips_unrelated_online_audits() -> None:
     assert 'get_strategy_learning(mode="paper", detail="summary")' in command
 
 
+def test_entry_only_decision_command_has_early_targeted_return() -> None:
+    command = inspect_online_strategy_health._build_remote_command(
+        60,
+        token="entry123",
+        entry_only=True,
+        decision_id=133061,
+    )
+
+    assert "ENTRY_ONLY = True" in command
+    assert "DECISION_ID = 133061" in command
+    assert "if ENTRY_ONLY and DECISION_ID > 0:" in command
+    assert '"selected_decision": await _read_selected_decision()' in command
+
+
 def test_remote_command_keeps_paths_scoped_and_quotes_output() -> None:
     result_path = inspect_online_strategy_health._remote_result_path(120, "abc123")
     command = inspect_online_strategy_health._build_remote_command(
@@ -97,7 +111,7 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
             "trade_execution_contract": {
                 "summary": {"contract_violation_count": 2},
                 "violation_reason_counts": {"live_execution_cost_incomplete": 2},
-                "policy": {"entry_requires_positive_return_lcb": True},
+                "policy": {"live_entry_requires_positive_return_lcb": True},
             },
             "local_ml_readiness": {
                 "readiness_state": "degraded",
@@ -224,3 +238,141 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
     ] == []
     assert closed_loop["okx_reconciliation"]["can_refresh_training"] is True
     assert summary["trainable_models"][0]["model_id"] == "local_ml_profit_quality"
+
+
+def test_summary_compacts_selected_decision_model_and_okx_evidence() -> None:
+    summary = inspect_online_strategy_health._summarize_report(
+        {
+            "selected_decision": {
+                "id": 133061,
+                "symbol": "ETH/USDT",
+                "action": "short",
+                "was_executed": True,
+                "raw_llm_response": {
+                    "normal_paper_trade": {
+                        "entry_type": "normal_strategy_trade",
+                        "production_permission": False,
+                    },
+                    "paper_trade_selection": {
+                        "selected": True,
+                        "selected_side": "short",
+                        "selection_reason": "policy_exploitation",
+                        "selected_support": {"large": "discarded"},
+                    },
+                    "local_ai_tools": {
+                        "profit_prediction": {
+                            "artifact_version": "v1",
+                            "route_mode": "paper_analysis",
+                            "live_ml_ready": False,
+                            "prediction_quality": {
+                                "contract_complete": True,
+                                "paper_eligible": True,
+                                "production_eligible": False,
+                                "anomalous": False,
+                            },
+                            "return_distribution_contract": {
+                                "long": {
+                                    "raw_expected_return_pct": -0.2,
+                                    "paper_eligible": True,
+                                },
+                                "short": {
+                                    "raw_expected_return_pct": 0.3,
+                                    "paper_eligible": True,
+                                },
+                                "large_training_report": {"discarded": True},
+                            },
+                        }
+                    },
+                    "opinions": [
+                        {
+                            "model_name": "trend_expert",
+                            "action": "hold",
+                            "reasoning": "quant context reviewed",
+                            "raw_payload": {"discarded": True},
+                        }
+                    ],
+                },
+                "orders": [
+                    {
+                        "id": 9001,
+                        "decision_id": 133061,
+                        "status": "filled",
+                        "okx_raw_fills": [
+                            {
+                                "tradeId": "t1",
+                                "ordId": "o1",
+                                "fillPx": "3500",
+                                "fillSz": "0.01",
+                                "fee": "-0.014",
+                                "irrelevant": "discarded",
+                            }
+                        ],
+                    }
+                ],
+                "positions": [
+                    {
+                        "id": 77,
+                        "is_open": False,
+                        "realized_pnl": -0.12,
+                    }
+                ],
+                "authoritative_position_history": [
+                    {
+                        "row_identity": "history-1",
+                        "fee": -0.03,
+                        "evidence_gaps": [],
+                    }
+                ],
+            }
+        }
+    )
+
+    decision = summary["selected_decision"]
+    assert decision["normal_paper_trade"]["entry_type"] == "normal_strategy_trade"
+    assert "selected_support" not in decision["paper_trade_selection"]
+    quality = decision["local_ai_tools"]["profit_prediction"]["prediction_quality"]
+    assert quality["paper_eligible"] is True
+    assert quality["production_eligible"] is False
+    assert "large_training_report" not in decision["local_ai_tools"][
+        "profit_prediction"
+    ]["return_distribution"]
+    assert decision["expert_opinions"][0]["reasoning"] == "quant context reviewed"
+    assert decision["orders"][0]["okx_fills"] == [
+        {
+            "tradeId": "t1",
+            "ordId": "o1",
+            "fillPx": "3500",
+            "fillSz": "0.01",
+            "fee": "-0.014",
+        }
+    ]
+    assert decision["orders"][0]["decision_id"] == 133061
+    assert decision["positions"][0]["is_open"] is False
+    assert decision["authoritative_position_history"][0]["evidence_gaps"] == []
+
+
+def test_entry_summary_omits_unrequested_global_sections() -> None:
+    summary = inspect_online_strategy_health._summarize_entry_report(
+        {
+            "generated_at": "2026-07-27T00:00:00Z",
+            "window_minutes": 60,
+            "trade_execution_contract": {
+                "summary": {"executed_entry_count": 1},
+                "violation_reason_counts": {},
+                "violations": [
+                    {
+                        "decision_id": 101,
+                        "reason": "executed_exit_without_filled_order",
+                    }
+                ],
+                "policy": {"paper_entry_requires_model_promotion": False},
+            },
+            "selected_decision": {"id": 133061, "orders": []},
+        }
+    )
+
+    assert summary["selected_decision"]["id"] == 133061
+    assert summary["contract_summary"]["executed_entry_count"] == 1
+    assert summary["contract_violation_rows"][0]["decision_id"] == 101
+    assert "profit_closed_loop" not in summary
+    assert "model_training_summary" not in summary

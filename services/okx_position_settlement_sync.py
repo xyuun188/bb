@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from core.symbols import (
     normalize_trading_symbol,
@@ -38,7 +38,6 @@ from services.position_settlement import (
     SETTLEMENT_STATUS_EXCEPTION,
     apply_position_settlement_snapshot,
     build_position_settlement_snapshot,
-    final_settlement_status_values,
     is_final_settlement_status,
 )
 
@@ -47,15 +46,20 @@ logger = structlog.get_logger(__name__)
 DEFAULT_SETTLEMENT_LOOKBACK_HOURS = 72
 DEFAULT_SETTLEMENT_LIMIT = 20
 DEFAULT_SETTLEMENT_RETRY_SECONDS = 10.0
+MINIMUM_CLOSED_LIFECYCLE_SCAN_ROWS = 500
 POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS = 45 * 60
 POSITION_HISTORY_CLOSE_EARLY_TOLERANCE_SECONDS = 2 * 60
 POSITION_HISTORY_OPEN_MATCH_WINDOW_SECONDS = 24 * 60 * 60
 POSITION_HISTORY_MATCH_MAX_ATTEMPTS = 30
 POSITION_HISTORY_MATCH_MAX_AGE_HOURS = 6.0
+POSITION_HISTORY_QUARANTINE_RETRY_SECONDS = 15 * 60.0
 SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_SOURCE = "okx_current_position_deduplication"
 SUPERSEDED_POSITION_REASON = "duplicate_local_open_position_for_same_okx_pos_id"
 DUPLICATE_CLOSED_POSITION_REASON = "duplicate_local_closed_position_for_same_okx_lifecycle"
+SUPERSEDED_POSITION_REASONS = frozenset(
+    {SUPERSEDED_POSITION_REASON, DUPLICATE_CLOSED_POSITION_REASON}
+)
 SETTLEMENT_STATUS_QUARANTINED = "settlement_quarantined"
 SETTLEMENT_QUARANTINE_SOURCE = "okx_position_history_identity_quarantine"
 NON_RETRYABLE_SETTLEMENT_STATUSES = frozenset(
@@ -164,16 +168,23 @@ class OkxPositionSettlementSyncService:
                 samples=tuple(decision_outcome_changes[-10:]),
             ).as_dict()
 
+        position_history_rows = await self._load_position_history_rows()
+
         samples: list[dict[str, Any]] = []
         checked = 0
         reconciled = 0
         decision_outcome_count = len(decision_outcome_changes)
         exceptions = 0
         skipped = 0
+        failures: list[tuple[SettlementCandidate, SettlementFailure]] = []
         samples.extend(decision_outcome_changes[-10:])
         for candidate in candidates:
             checked += 1
-            result = await self._settle_candidate(candidate, started_at)
+            result = await self._settle_candidate(
+                candidate,
+                started_at,
+                position_history_rows=position_history_rows,
+            )
             if isinstance(result, SettlementSuccess):
                 changed, outcome_change = await self._apply_success(
                     candidate,
@@ -201,7 +212,11 @@ class OkxPositionSettlementSyncService:
                 else:
                     skipped += 1
                 continue
-            quarantined = await self._apply_failure(candidate, result, started_at)
+            failures.append((candidate, result))
+
+        failure_results = await self._apply_failures(failures, started_at)
+        for candidate, result in failures:
+            quarantined = failure_results.get(candidate.position_id, False)
             exceptions += 1
             sample = {
                 "kind": (
@@ -215,7 +230,9 @@ class OkxPositionSettlementSyncService:
                 "error_code": result.code,
                 "error_message": result.message,
             }
-            sample["next_retry_seconds"] = self.retry_seconds
+            sample["next_retry_seconds"] = self._failure_retry_seconds(
+                quarantined=quarantined
+            )
             samples.append(sample)
 
         status = "warning" if exceptions else "ok"
@@ -231,6 +248,22 @@ class OkxPositionSettlementSyncService:
             error=None,
         ).as_dict()
 
+    async def _load_position_history_rows(self) -> list[dict[str, Any]]:
+        """Load the shared OKX history mirror once for an entire sync batch."""
+
+        async with self.session_context_factory() as session:
+            records = await load_okx_position_history_records(
+                session,
+                mode=self.mode,
+                limit=5000,
+            )
+        return okx_position_history_records_to_rows(records)
+
+    def _failure_retry_seconds(self, *, quarantined: bool) -> float:
+        if quarantined:
+            return max(self.retry_seconds, POSITION_HISTORY_QUARANTINE_RETRY_SECONDS)
+        return self.retry_seconds
+
     async def _backfill_decision_outcomes(self, now: datetime) -> list[dict[str, Any]]:
         async with self.session_context_factory() as session:
             return await backfill_settled_entry_decision_outcomes(
@@ -242,7 +275,6 @@ class OkxPositionSettlementSyncService:
 
     async def _load_candidates(self, now: datetime) -> list[SettlementCandidate]:
         since = now - timedelta(hours=self.lookback_hours)
-        final_statuses = final_settlement_status_values()
         async with self.session_context_factory() as session:
             result = await session.execute(
                 select(Position)
@@ -251,20 +283,9 @@ class OkxPositionSettlementSyncService:
                     Position.is_open.is_(False),
                     Position.closed_at.is_not(None),
                     Position.closed_at >= _db_naive(since),
-                    or_(
-                        Position.settlement_status.is_(None),
-                        Position.settlement_status.not_in(
-                            tuple(sorted(NON_RETRYABLE_SETTLEMENT_STATUSES))
-                        ),
-                    ),
-                    or_(
-                        Position.settlement_status.is_(None),
-                        Position.settlement_status == "",
-                        Position.settlement_status.not_in(final_statuses),
-                    ),
                 )
                 .order_by(Position.closed_at.desc(), Position.id.desc())
-                .limit(self.limit * 5)
+                .limit(max(self.limit * 25, MINIMUM_CLOSED_LIFECYCLE_SCAN_ROWS))
             )
             rows = list(result.scalars().all())
             rows, duplicate_rows = _deduplicate_closed_lifecycle_rows(rows, now=now)
@@ -276,6 +297,10 @@ class OkxPositionSettlementSyncService:
                 if _has_superseded_position_metadata(row, raw):
                     _restore_superseded_position_status(row, raw, now=now)
                     restored_superseded = True
+                    continue
+                if is_final_settlement_status(getattr(row, "settlement_status", None)):
+                    continue
+                if _is_non_retryable_settlement_status(row):
                     continue
                 if _retry_after(raw, now):
                     continue
@@ -289,6 +314,8 @@ class OkxPositionSettlementSyncService:
         self,
         candidate: SettlementCandidate,
         now: datetime,
+        *,
+        position_history_rows: list[dict[str, Any]] | None = None,
     ) -> SettlementSuccess | SettlementFailure:
         inst_id = candidate.okx_inst_id or okx_inst_id_from_symbol(candidate.symbol)
         if not inst_id:
@@ -300,13 +327,11 @@ class OkxPositionSettlementSyncService:
         closed_at = _aware_utc(candidate.closed_at) or now
         created_at = _aware_utc(candidate.created_at) or closed_at
         since = min(created_at, closed_at) - timedelta(hours=1)
-        async with self.session_context_factory() as session:
-            records = await load_okx_position_history_records(
-                session,
-                mode=self.mode,
-                limit=5000,
-            )
-        rows = okx_position_history_records_to_rows(records)
+        rows = (
+            position_history_rows
+            if position_history_rows is not None
+            else await self._load_position_history_rows()
+        )
         if not rows:
             return SettlementFailure(
                 code="position_history_mirror_no_rows",
@@ -538,96 +563,129 @@ class OkxPositionSettlementSyncService:
         failure: SettlementFailure,
         now: datetime,
     ) -> bool:
-        next_retry_at = now + timedelta(seconds=self.retry_seconds)
-        async with self.session_context_factory() as session:
-            position = await session.get(Position, candidate.position_id)
-            if position is None or bool(position.is_open):
-                return False
-            raw = getattr(position, "settlement_raw", None)
-            raw = raw if isinstance(raw, dict) else {}
-            if _has_superseded_position_metadata(position, raw):
-                _restore_superseded_position_status(position, raw, now=now)
-                await session.flush()
-                return False
-            if is_final_settlement_status(getattr(position, "settlement_status", None)):
-                return False
-            if _is_non_retryable_settlement_status(position):
-                return False
-            attempts = _safe_int(raw.get("settlement_attempt_count"), 0) + 1
-            closed_at = _aware_utc(candidate.closed_at)
-            closed_age_hours = (
-                max((now - closed_at).total_seconds() / 3600.0, 0.0)
-                if closed_at is not None
-                else 0.0
-            )
-            quarantine_triggers: list[str] = []
-            if attempts >= POSITION_HISTORY_MATCH_MAX_ATTEMPTS:
-                quarantine_triggers.append("attempt_limit")
-            if closed_age_hours >= POSITION_HISTORY_MATCH_MAX_AGE_HOURS:
-                quarantine_triggers.append("closed_age_limit")
-            quarantined = bool(
-                failure.code == "positions_history_no_matching_row" and quarantine_triggers
-            )
-            status = (
-                SETTLEMENT_STATUS_QUARANTINED
-                if quarantined
-                else SETTLEMENT_STATUS_EXCEPTION
-            )
-            source = (
-                SETTLEMENT_QUARANTINE_SOURCE
-                if quarantined
-                else "okx_position_history_settlement"
-            )
-            position.settlement_status = status
-            position.settlement_source = source
-            position.settlement_synced_at = now
-            updated_raw = {
-                **raw,
-                "status": status,
-                "source": source,
-                "formula": SETTLEMENT_FORMULA,
-                "funding_fee_status": "unknown_until_official_settlement",
-                "last_error_code": failure.code,
-                "last_error_message": failure.message,
-                "last_error_context": failure.context,
-                "last_settlement_attempt_at": now.isoformat(),
-                "settlement_attempt_count": attempts,
-            }
-            if quarantined:
-                updated_raw.update(
-                    {
-                        "next_settlement_retry_at": next_retry_at.isoformat(),
-                        "quarantine_reason": "official_position_history_identity_unresolved",
-                        "quarantined_at": now.isoformat(),
-                        "quarantine_evidence": {
-                            "triggers": quarantine_triggers,
-                            "attempt_count": attempts,
-                            "max_attempts": POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
-                            "closed_at": _iso(closed_at),
-                            "closed_age_hours": closed_age_hours,
-                            "max_age_hours": POSITION_HISTORY_MATCH_MAX_AGE_HOURS,
-                        },
-                        "retry_policy": (
-                            f"quarantined from authority; retry every {self.retry_seconds:g}s "
-                            "until OKX official settlement identity is available"
-                        ),
-                    }
-                )
-            else:
-                updated_raw.update(
-                    {
-                        "next_settlement_retry_at": next_retry_at.isoformat(),
-                        "retry_policy": (
-                            f"retry every {self.retry_seconds:g}s until OKX official "
-                            "settlement is available"
-                        ),
-                    }
-                )
-            position.settlement_raw = updated_raw
-            position.updated_at = now
-            await session.flush()
-            return quarantined
+        results = await self._apply_failures([(candidate, failure)], now)
+        return results.get(candidate.position_id, False)
 
+    async def _apply_failures(
+        self,
+        failures: list[tuple[SettlementCandidate, SettlementFailure]],
+        now: datetime,
+    ) -> dict[int, bool]:
+        if not failures:
+            return {}
+        candidate_ids = {candidate.position_id for candidate, _failure in failures}
+        async with self.session_context_factory() as session:
+            result = await session.execute(
+                select(Position)
+                .where(Position.id.in_(candidate_ids))
+                .with_for_update(skip_locked=True)
+            )
+            positions = {int(position.id): position for position in result.scalars().all()}
+            outcomes: dict[int, bool] = {}
+            for candidate, failure in failures:
+                outcomes[candidate.position_id] = self._apply_failure_to_position(
+                    positions.get(candidate.position_id),
+                    candidate=candidate,
+                    failure=failure,
+                    now=now,
+                )
+            await session.flush()
+            return outcomes
+
+    def _apply_failure_to_position(
+        self,
+        position: Position | None,
+        *,
+        candidate: SettlementCandidate,
+        failure: SettlementFailure,
+        now: datetime,
+    ) -> bool:
+        if position is None or bool(position.is_open):
+            return False
+        raw = getattr(position, "settlement_raw", None)
+        raw = raw if isinstance(raw, dict) else {}
+        if _has_superseded_position_metadata(position, raw):
+            _restore_superseded_position_status(position, raw, now=now)
+            return False
+        if is_final_settlement_status(getattr(position, "settlement_status", None)):
+            return False
+        if _is_non_retryable_settlement_status(position):
+            return False
+        attempts = _safe_int(raw.get("settlement_attempt_count"), 0) + 1
+        closed_at = _aware_utc(candidate.closed_at)
+        closed_age_hours = (
+            max((now - closed_at).total_seconds() / 3600.0, 0.0)
+            if closed_at is not None
+            else 0.0
+        )
+        quarantine_triggers: list[str] = []
+        if attempts >= POSITION_HISTORY_MATCH_MAX_ATTEMPTS:
+            quarantine_triggers.append("attempt_limit")
+        if closed_age_hours >= POSITION_HISTORY_MATCH_MAX_AGE_HOURS:
+            quarantine_triggers.append("closed_age_limit")
+        quarantined = bool(
+            failure.code == "positions_history_no_matching_row" and quarantine_triggers
+        )
+        retry_seconds = self._failure_retry_seconds(quarantined=quarantined)
+        next_retry_at = now + timedelta(seconds=retry_seconds)
+        status = (
+            SETTLEMENT_STATUS_QUARANTINED
+            if quarantined
+            else SETTLEMENT_STATUS_EXCEPTION
+        )
+        source = (
+            SETTLEMENT_QUARANTINE_SOURCE
+            if quarantined
+            else "okx_position_history_settlement"
+        )
+        position.settlement_status = status
+        position.settlement_source = source
+        position.settlement_synced_at = now
+        updated_raw = {
+            **raw,
+            "status": status,
+            "source": source,
+            "formula": SETTLEMENT_FORMULA,
+            "funding_fee_status": "unknown_until_official_settlement",
+            "last_error_code": failure.code,
+            "last_error_message": failure.message,
+            "last_error_context": failure.context,
+            "last_settlement_attempt_at": now.isoformat(),
+            "settlement_attempt_count": attempts,
+        }
+        if quarantined:
+            updated_raw.update(
+                {
+                    "next_settlement_retry_at": next_retry_at.isoformat(),
+                    "quarantine_reason": "official_position_history_identity_unresolved",
+                    "quarantined_at": now.isoformat(),
+                    "quarantine_evidence": {
+                        "triggers": quarantine_triggers,
+                        "attempt_count": attempts,
+                        "max_attempts": POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
+                        "closed_at": _iso(closed_at),
+                        "closed_age_hours": closed_age_hours,
+                        "max_age_hours": POSITION_HISTORY_MATCH_MAX_AGE_HOURS,
+                    },
+                    "retry_policy": (
+                        f"quarantined from authority; retry every {retry_seconds:g}s "
+                        "until OKX official settlement identity is available"
+                    ),
+                }
+            )
+        else:
+            updated_raw.update(
+                {
+                    "next_settlement_retry_at": next_retry_at.isoformat(),
+                    "retry_policy": (
+                        f"retry every {retry_seconds:g}s until OKX official "
+                        "settlement is available"
+                    ),
+                }
+            )
+        position.settlement_raw = updated_raw
+        position.updated_at = now
+        return quarantined
 
 def _deduplicate_closed_lifecycle_rows(
     rows: list[Position],
@@ -683,19 +741,17 @@ def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
     close_ids = tuple(
         sorted(_split_exchange_order_ids(getattr(position, "close_exchange_order_id", None)))
     )
-    created_at = _aware_utc(getattr(position, "created_at", None))
-    closed_at = _aware_utc(getattr(position, "closed_at", None))
     quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
-    if not pos_id or not entry_ids or not close_ids or created_at is None or closed_at is None:
+    if not pos_id or not entry_ids or not close_ids or quantity <= 0:
         return None
     return (
         str(getattr(position, "execution_mode", "") or "").lower(),
         pos_id,
+        normalize_trading_symbol(str(getattr(position, "symbol", "") or "")),
+        str(getattr(position, "side", "") or "").lower(),
         entry_ids,
         close_ids,
         round(quantity, 12),
-        created_at.isoformat(),
-        closed_at.isoformat(),
     )
 
 
@@ -872,7 +928,7 @@ def _has_superseded_position_metadata(position: Position, raw: dict[str, Any]) -
     if str(getattr(position, "settlement_status", "") or "") == SUPERSEDED_POSITION_STATUS:
         return True
     return bool(
-        str(raw.get("reason") or "") == SUPERSEDED_POSITION_REASON
+        str(raw.get("reason") or "") in SUPERSEDED_POSITION_REASONS
         and _safe_int(raw.get("canonical_position_id"), 0) > 0
     )
 

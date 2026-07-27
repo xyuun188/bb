@@ -30,6 +30,9 @@ def _score(decision: DecisionOutput, _strategy: dict | None) -> float:
         "profit_quality_ratio": expected_net / 0.05,
         "server_profit_loss_probability": 0.2,
         "tail_risk_score": 0.1,
+        "execution_scope": "live",
+        "decision_eligible": True,
+        "paper_eligible": False,
         "production_eligible": True,
         "execution_cost": {"production_eligible": True, "total_pct": 0.05},
         "policy_provenance": {
@@ -215,6 +218,8 @@ def test_no_positive_production_lcb_returns_neutral() -> None:
             "score": -0.2,
             "expected_net_return_pct": 0.1,
             "return_lcb_pct": -0.1,
+            "execution_scope": "live",
+            "decision_eligible": True,
             "production_eligible": True,
             "policy_provenance": {"sample_count": 1},
         }
@@ -223,7 +228,7 @@ def test_no_positive_production_lcb_returns_neutral() -> None:
 
     evidence = _policy(ineligible_score).build(_Feature(), {}, {}, {}, {}, {})
 
-    assert evidence["preferred_side_by_evidence"] == "neutral"
+    assert evidence["preferred_side_by_evidence"] == "long"
     assert evidence["long"]["production_eligible"] is False
     assert evidence["short"]["production_eligible"] is False
 
@@ -240,6 +245,8 @@ def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
             "expected_loss_pct": 0.20,
             "server_profit_loss_probability": 0.30,
             "tail_risk_score": 0.20,
+            "execution_scope": "live",
+            "decision_eligible": True,
             "production_eligible": True,
             "return_distribution_contract": {"horizon_minutes": 30.0},
             "execution_cost": {"production_eligible": True, "total_pct": 0.08},
@@ -257,7 +264,7 @@ def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
 
     evidence = _policy(near_threshold_score).build(_Feature(), {}, {}, {}, {}, {})
 
-    assert evidence["preferred_side_by_evidence"] == "neutral"
+    assert evidence["preferred_side_by_evidence"] == "long"
     assert "preferred_exploration_side" not in evidence
     assert "paper_exploration" not in evidence
     assert evidence["long"]["expected_net_return_pct"] == 0.3
@@ -295,6 +302,8 @@ def test_missing_return_distribution_never_persists_non_finite_score() -> None:
             "score": None,
             "expected_net_return_pct": None,
             "return_lcb_pct": None,
+            "execution_scope": "live",
+            "decision_eligible": False,
             "production_eligible": False,
             "policy_provenance": {"sample_count": 0},
         }

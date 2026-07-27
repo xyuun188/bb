@@ -338,26 +338,31 @@ class OkxSettlementFactSyncService:
             for row in rows
             if (identity := okx_position_history_row_identity(row, mode=self.mode)).strip("|")
         ]
-        existing_fingerprints: dict[str, tuple[Any, ...]] = {}
-        if identities:
-            async with self.session_context_factory() as session:
-                result = await session.execute(
-                    select(OkxPositionHistory).where(
-                        OkxPositionHistory.mode == self.mode,
-                        OkxPositionHistory.row_identity.in_(identities),
-                    )
-                )
-                existing_fingerprints = {
-                    str(record.row_identity): _history_record_fact_fingerprint(record)
-                    for record in result.scalars().all()
-                }
         stats = {"inserted": 0, "updated": 0, "unchanged": 0}
         samples: list[dict[str, Any]] = []
         async with self.session_context_factory() as session:
+            existing_records: dict[str, OkxPositionHistory] = {}
+            if identities:
+                result = await session.execute(
+                    select(OkxPositionHistory).where(
+                        OkxPositionHistory.mode == self.mode,
+                        OkxPositionHistory.row_identity.in_(set(identities)),
+                    )
+                )
+                existing_records = {
+                    str(record.row_identity): record
+                    for record in result.scalars().all()
+                }
             for row in rows:
                 identity = okx_position_history_row_identity(row, mode=self.mode)
                 if not identity.strip("|"):
                     continue
+                existing = existing_records.get(identity)
+                previous = (
+                    _history_record_fact_fingerprint(existing)
+                    if existing is not None
+                    else None
+                )
                 record = await upsert_okx_position_history_row(
                     session,
                     row,
@@ -365,10 +370,10 @@ class OkxSettlementFactSyncService:
                     source="okx_settlement_fact_mirror",
                     match_status="okx_account_position_history",
                     synced_at=checked_at,
+                    existing_record=existing,
                 )
                 if record is None:
                     continue
-                previous = existing_fingerprints.get(identity)
                 current = _history_record_fact_fingerprint(record)
                 if previous is None:
                     operation = "inserted"
@@ -377,7 +382,7 @@ class OkxSettlementFactSyncService:
                 else:
                     operation = "unchanged"
                 stats[operation] += 1
-                existing_fingerprints[identity] = current
+                existing_records[identity] = record
                 if len(samples) < 6:
                     samples.append(_history_sample(row, operation=operation))
         return stats, samples
@@ -391,21 +396,29 @@ class OkxSettlementFactSyncService:
     ) -> tuple[dict[str, int], list[dict[str, Any]]]:
         stats = {"inserted": 0, "updated": 0, "unchanged": 0}
         samples: list[dict[str, Any]] = []
+        valid_bills = [
+            (bill, bill_id, bill_time)
+            for bill in bills
+            if (bill_id := str(bill.bill_id or "").strip())
+            and (bill_time := _aware_utc(bill.timestamp)) is not None
+            and bill_time >= since
+        ]
         async with self.session_context_factory() as session:
-            for bill in bills:
-                bill_id = str(bill.bill_id or "").strip()
-                bill_time = _aware_utc(bill.timestamp)
-                if not bill_id or bill_time is None or bill_time < since:
-                    continue
+            existing_by_id: dict[str, OkxAccountBill] = {}
+            if valid_bills:
                 result = await session.execute(
-                    select(OkxAccountBill)
-                    .where(
+                    select(OkxAccountBill).where(
                         OkxAccountBill.mode == self.mode,
-                        OkxAccountBill.bill_id == bill_id,
+                        OkxAccountBill.bill_id.in_(
+                            {bill_id for _bill, bill_id, _bill_time in valid_bills}
+                        ),
                     )
-                    .limit(1)
                 )
-                existing = result.scalar_one_or_none()
+                existing_by_id = {
+                    str(record.bill_id): record for record in result.scalars().all()
+                }
+            for bill, bill_id, bill_time in valid_bills:
+                existing = existing_by_id.get(bill_id)
                 payload = {
                     "mode": self.mode,
                     "bill_id": bill_id,
@@ -423,7 +436,9 @@ class OkxSettlementFactSyncService:
                     "raw_bill": dict(bill.raw),
                 }
                 if existing is None:
-                    session.add(OkxAccountBill(**payload))
+                    existing = OkxAccountBill(**payload)
+                    session.add(existing)
+                    existing_by_id[bill_id] = existing
                     operation = "inserted"
                 else:
                     changed = False

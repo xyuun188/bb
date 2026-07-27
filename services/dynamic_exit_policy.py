@@ -274,7 +274,13 @@ def assess_dynamic_exit(
         for value in market_returns
         if (target_side == "long" and value < 0.0) or (target_side == "short" and value > 0.0)
     )
-    continuation = _clamp(adverse_move / total_move) if total_move > 0.0 else 0.0
+    adverse_direction_share = (
+        _clamp(adverse_move / total_move) if total_move > 0.0 else 0.0
+    )
+    # Directional agreement is not loss magnitude. Scale it by the fraction of
+    # the position's planned stop budget already consumed so tiny aligned moves
+    # cannot force a full close in one review.
+    continuation = adverse_direction_share * stop_usage
     replacement = _safe_dict(raw.get("stronger_opportunity"))
     replacement_cost = _safe_dict(replacement.get("execution_cost"))
     replacement_expected = max(
@@ -396,7 +402,7 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-07-27.dynamic-exit-training-observation.v7",
+        "strategy_version": "2026-07-27.dynamic-exit-risk-scaled-continuation.v8",
         "fallback_reason": ",".join(reasons),
     }
     return DynamicExitAssessment(

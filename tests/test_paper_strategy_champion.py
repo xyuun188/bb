@@ -136,6 +136,36 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
     assert "leverage" not in blueprint
 
 
+def test_shadow_artifact_is_paper_eligible_without_live_promotion() -> None:
+    blueprint = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "shadow-v1",
+            "trained_at": "2026-07-27T00:00:00+00:00",
+            "test_count": 12,
+            "oos_return_evaluation": {
+                "long": {"return_lcb_pct": -0.2},
+                "short": {"return_lcb_pct": -0.1},
+            },
+        },
+        readiness={"paper_canary": {"authorized": False}},
+        activation={
+            "activation_stage": "shadow",
+            "live_ml_ready": False,
+            "paper_canary_authorized": False,
+        },
+    )
+
+    assert blueprint["artifact_stage"] == "shadow"
+    assert blueprint["paper_execution_eligible"] is True
+    assert blueprint["live_execution_permission"] is False
+    assert blueprint["eligible_sides"] == ["long", "short"]
+    assert blueprint["entry_policy"][
+        "require_current_fee_after_return_lcb_positive"
+    ] is False
+    assert blueprint["entry_policy"]["require_actual_trade_calibration"] is False
+    assert blueprint["blocking_reasons"] == []
+
+
 def test_challenger_requires_strict_improvement_or_strictly_better_model() -> None:
     champion = build_trained_model_strategy_candidates(
         _blueprint("v1"),

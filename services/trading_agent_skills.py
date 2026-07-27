@@ -16,7 +16,8 @@ from ai_brain.base_model import DecisionOutput
 from services.entry_signal_extraction import (
     first_tool_payload,
     payload_side,
-    signal_production_eligible,
+    signal_analysis_eligibility,
+    signal_paper_eligibility,
     signal_return_distribution,
 )
 
@@ -255,7 +256,7 @@ class TradingAgentSkillBook:
             distribution,
             "objective_expected_return_pct",
         )
-        ready = signal_production_eligible(signal)
+        ready = signal_paper_eligibility(signal, side).get("eligible") is True
         decision = side if ready and side in {"long", "short"} else "neutral"
         if not ready:
             status = "learning"
@@ -308,8 +309,8 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到服务器盈利模型预测。",
             )
-        available = signal_production_eligible(profit)
         side = payload_side(profit)
+        available = signal_paper_eligibility(profit, side).get("eligible") is True
         distribution = signal_return_distribution(profit, side)
         expected = self._first_number(
             distribution,
@@ -374,8 +375,8 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到时序预测。",
             )
-        available = signal_production_eligible(series)
         side = payload_side(series)
+        available = signal_paper_eligibility(series, side).get("eligible") is True
         distribution = signal_return_distribution(series, side)
         expected = self._first_number(
             distribution,
@@ -435,7 +436,7 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到情绪模型预测。",
             )
-        available = signal_production_eligible(sentiment)
+        available = signal_analysis_eligibility(sentiment).get("eligible") is True
         side = payload_side(sentiment)
         score = self._first_number(sentiment, "score", "sentiment_score")
         return SkillResult(

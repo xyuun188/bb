@@ -107,6 +107,9 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "new_sample_count",
         "new_shadow_sample_count",
         "new_trade_sample_count",
+        "completed_training_decision_group_count",
+        "last_trained_completed_training_decision_group_count",
+        "new_decision_group_count",
         "cost_complete_sample_count",
         "decision_group_count",
         "train_sample_count",
@@ -302,9 +305,7 @@ class ModelTrainingStateStore:
             if not isinstance(raw, dict):
                 continue
             scheduler_model_ids[str(scheduler_id)] = {
-                str(model_id)
-                for model_id in raw.get("model_ids") or []
-                if str(model_id)
+                str(model_id) for model_id in raw.get("model_ids") or [] if str(model_id)
             }
             heartbeat = _parse_datetime(raw.get("heartbeat_at"))
             interval = max(float(raw.get("interval_seconds") or 0.0), 1.0)
@@ -333,9 +334,7 @@ class ModelTrainingStateStore:
             superseded = bool(raw.get("heartbeat_stale") and covered_by)
             raw["heartbeat_superseded"] = superseded
             raw["heartbeat_superseded_by"] = covered_by
-            raw["heartbeat_effective_stale"] = bool(
-                raw.get("heartbeat_stale") and not superseded
-            )
+            raw["heartbeat_effective_stale"] = bool(raw.get("heartbeat_stale") and not superseded)
             if superseded:
                 superseded_ids.append(normalized_id)
             elif raw["heartbeat_effective_stale"]:
@@ -438,7 +437,7 @@ class ModelTrainingStateStore:
                         "trigger_reason": trigger_reason,
                         "last_started_at": _iso(now),
                         "active_run_id": run_id,
-                        "sample_cursor": dict(sample_cursor or {}),
+                        "active_sample_cursor": dict(sample_cursor or {}),
                         "timeout_seconds": max(float(timeout_seconds), 0.0),
                         "owner_pid": os.getpid(),
                         "owner_host": self.hostname,
@@ -483,11 +482,14 @@ class ModelTrainingStateStore:
                         "state": state,
                         "triggered": bool(started or trained),
                         "trigger_reason": row.get("trigger_reason") if started else reason,
-                        "last_finished_at": _iso(now) if started or failed else row.get("last_finished_at"),
+                        "last_finished_at": _iso(now)
+                        if started or failed
+                        else row.get("last_finished_at"),
                         "last_result": summary,
                         "last_error": error or None,
                         "next_check_at": _iso(next_check_at),
                         "active_run_id": None,
+                        "active_sample_cursor": None,
                         "retry_count": retry_count + 1 if failed else 0,
                     }
                 )
@@ -497,8 +499,15 @@ class ModelTrainingStateStore:
                     or summary.get("completed_shadow_sample_count"),
                     "trade": summary.get("last_trained_completed_trade_sample_count")
                     or summary.get("completed_trade_sample_count"),
+                    "decision_group": summary.get(
+                        "last_trained_completed_training_decision_group_count"
+                    )
+                    or summary.get("completed_training_decision_group_count"),
                 }
-                row["sample_cursor"] = {key: int(value) for key, value in cursor.items() if value is not None}
+                if trained:
+                    row["sample_cursor"] = {
+                        key: int(value) for key, value in cursor.items() if value is not None
+                    }
                 self._append_history(
                     row,
                     {
@@ -551,6 +560,7 @@ class ModelTrainingStateStore:
                         "last_finished_at": _iso(now),
                         "last_error": "training_process_interrupted",
                         "active_run_id": None,
+                        "active_sample_cursor": None,
                         "retry_count": int(row.get("retry_count") or 0) + 1,
                     }
                 )
@@ -596,7 +606,9 @@ class ModelTrainingStateStore:
                 except (OSError, json.JSONDecodeError):
                     existing = {}
                 acquired_at = _parse_datetime(existing.get("acquired_at"))
-                age = (now - acquired_at).total_seconds() if acquired_at is not None else float("inf")
+                age = (
+                    (now - acquired_at).total_seconds() if acquired_at is not None else float("inf")
+                )
                 owner_host = str(existing.get("owner_host") or "")
                 owner_pid = int(existing.get("owner_pid") or 0)
                 owner_alive = owner_host == self.hostname and _pid_alive(owner_pid)

@@ -109,7 +109,7 @@ def test_rules_canary_queue_uses_rule_score_without_calling_profit_scorer() -> N
     ranked = EntryCandidateQueuePolicy(
         forbidden_profit_score,
         wait_sort_reason,
-    ).ranked([first, second], None)
+    ).ranked([first, second], {"execution_mode": "live"})
 
     assert [item.candidate[0] for item in ranked] == ["ETH/USDT", "BTC/USDT"]
     assert [item.score for item in ranked] == [1.0, 0.8]

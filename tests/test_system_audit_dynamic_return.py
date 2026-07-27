@@ -12,6 +12,23 @@ from web_dashboard.api import system_audit
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_safe_trade_execution_policy_removes_retired_paper_gate_labels() -> None:
+    report = system_audit._safe_trade_execution_contract_report(
+        {
+            "policy": {
+                "paper_exploration_live_permission": False,
+                "entry_requires_positive_return_lcb": True,
+            }
+        }
+    )
+
+    policy = report["policy"]
+    assert "paper_exploration_live_permission" not in policy
+    assert "entry_requires_positive_return_lcb" not in policy
+    assert policy["paper_entry_requires_model_promotion"] is False
+    assert policy["live_entry_requires_positive_return_lcb"] is True
+
+
 def test_removed_fixed_policy_and_global_fallback_tokens_cannot_return_to_production() -> None:
     forbidden = {
         "max_position_pct",
@@ -181,9 +198,15 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
             "details": {
                 "report_available": True,
                 "policy": {
-                    "entry_requires_positive_fee_after_return": True,
-                    "entry_requires_positive_return_lcb": True,
-                    "entry_requires_live_execution_cost": True,
+                    "paper_entry_requires_model_promotion": False,
+                    "paper_entry_requires_positive_return_lcb": False,
+                    "paper_entry_requires_profit_factor": False,
+                    "paper_entry_allows_controlled_coverage_sampling": True,
+                    "paper_entry_requires_current_execution_cost": True,
+                    "live_entry_requires_production_trade_gate": True,
+                    "live_entry_requires_positive_fee_after_return": True,
+                    "live_entry_requires_positive_return_lcb": True,
+                    "live_entry_requires_current_execution_cost": True,
                     "entry_requires_dynamic_risk_budget": True,
                     "entry_requires_complete_provenance": True,
                     "exit_requires_position_economics": True,

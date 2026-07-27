@@ -48,6 +48,8 @@ _WRAPPER_METADATA_KEYS = (
     "model_version",
     "route_mode",
     "live_ml_ready",
+    "production_permission",
+    "execution_scope",
     "readiness",
     "objective",
     "objective_name",
@@ -232,6 +234,95 @@ def signal_return_distribution_eligibility(
         return_semantics="gross_market_opportunity_before_execution",
         profit_supervision_version=PROFIT_SUPERVISION_VERSION,
     )
+
+
+def signal_paper_eligibility(
+    payload: dict[str, Any],
+    side: str,
+) -> dict[str, Any]:
+    """Validate model output for normal paper decisions without live promotion gates."""
+
+    if not signal_available(payload):
+        return {"eligible": False, "reason": "signal_unavailable", "side": side}
+
+    quality_seen = False
+    quality_approved = False
+    for node in _signal_governance_nodes(payload):
+        quality = safe_dict(node.get("prediction_quality"))
+        if not quality:
+            continue
+        quality_seen = True
+        if quality.get("anomalous") is True:
+            return {
+                "eligible": False,
+                "reason": str(quality.get("reason") or "prediction_quality_anomalous"),
+                "side": side,
+            }
+        quality_approved = bool(
+            quality.get("contract_complete") is True
+            and quality.get("paper_eligible") is True
+        ) or bool(quality.get("production_eligible") is True)
+        if not quality_approved:
+            return {
+                "eligible": False,
+                "reason": str(quality.get("reason") or "paper_prediction_quality_blocked"),
+                "side": side,
+            }
+
+    if not quality_seen or not quality_approved:
+        return {
+            "eligible": False,
+            "reason": "paper_prediction_quality_missing",
+            "side": side,
+        }
+
+    distribution = signal_return_distribution_eligibility(payload, side)
+    if distribution.get("eligible") is not True:
+        return distribution
+    return {
+        "eligible": True,
+        "reason": "contract_complete_prediction_allows_paper_influence",
+        "side": side,
+        "return_distribution": distribution.get("contract"),
+    }
+
+
+def signal_analysis_eligibility(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate a non-authorizing analysis signal such as sentiment."""
+
+    if not signal_available(payload):
+        return {"eligible": False, "reason": "signal_unavailable"}
+    quality = safe_dict(payload.get("prediction_quality"))
+    if quality:
+        eligible = bool(
+            quality.get("anomalous") is not True
+            and (
+                quality.get("contract_complete") is True
+                or quality.get("paper_eligible") is True
+                or quality.get("production_eligible") is True
+            )
+        )
+        return {
+            "eligible": eligible,
+            "reason": (
+                "prediction_quality_allows_analysis"
+                if eligible
+                else str(quality.get("reason") or "prediction_quality_blocks_analysis")
+            ),
+        }
+    metadata_complete = bool(
+        str(payload.get("route_mode") or "").strip()
+        and str(payload.get("model_version") or "").strip()
+        and str(payload.get("primary_model") or payload.get("model") or "").strip()
+    )
+    return {
+        "eligible": metadata_complete,
+        "reason": (
+            "model_identity_allows_observation_only_analysis"
+            if metadata_complete
+            else "analysis_model_identity_incomplete"
+        ),
+    }
 
 
 def _signal_contract_side(payload: dict[str, Any]) -> str:

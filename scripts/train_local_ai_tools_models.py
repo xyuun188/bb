@@ -521,7 +521,13 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
 async def _load_trade_samples() -> list[dict[str, Any]]:
     """Load the only trainable realized-trade source."""
 
-    return await load_authoritative_trade_outcomes(since=load_training_epoch_start())
+    samples = await load_authoritative_trade_outcomes(since=load_training_epoch_start())
+    for sample in samples:
+        features = _compact_local_ai_tools_features(_snapshot(sample.get("features")))
+        if features:
+            features.setdefault("symbol", sample.get("symbol"))
+            sample["features"] = features
+    return samples
 
 
 async def _completed_shadow_sample_count() -> int:

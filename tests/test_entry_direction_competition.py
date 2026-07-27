@@ -63,6 +63,27 @@ def _governed_payload(long_return: float, short_return: float) -> dict:
     }
 
 
+def _paper_payload(long_return: float, short_return: float) -> dict:
+    payload = _governed_payload(long_return, short_return)
+    payload.update(
+        {
+            "route_mode": "paper_analysis",
+            "live_ml_ready": False,
+            "production_permission": False,
+            "prediction_quality": {
+                "contract_complete": True,
+                "paper_eligible": True,
+                "production_eligible": False,
+                "anomalous": False,
+                "production_blockers": [
+                    "artifact_activation_not_production_authorized"
+                ],
+            },
+        }
+    )
+    return payload
+
+
 def _governed_ml(long_return: float, short_return: float) -> dict:
     return {
         **_governed_payload(long_return, short_return),
@@ -112,7 +133,9 @@ def test_only_governed_return_models_choose_observed_side() -> None:
     assert context["short"]["objective_expected_return_pct"] == pytest.approx(-0.28)
     assert context["production_source_count"] == 4
     assert context["production_permission"] is False
-    assert context["policy"] == "governed_gross_market_observation_only_no_fixed_gap"
+    assert context["policy"] == (
+        "execution_scoped_gross_market_observation_only_no_fixed_gap"
+    )
 
 
 def test_missing_governance_cannot_enter_direction_scores() -> None:
@@ -141,6 +164,42 @@ def test_shadow_model_cannot_enter_direction_scores() -> None:
 
     assert context["preferred_side"] == "neutral"
     assert context["production_source_count"] == 0
+
+
+def test_shadow_models_choose_direction_in_paper_scope_without_live_permission() -> None:
+    context = _context(
+        tools={"profit_prediction": _paper_payload(0.7, -0.2)},
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["execution_scope"] == "paper"
+    assert context["preferred_side"] == "long"
+    assert context["decision_source_count"] == 2
+    assert context["paper_source_count"] == 2
+    assert context["production_source_count"] == 0
+    assert all(
+        item["paper_eligible"] is True
+        and item["production_eligible"] is False
+        for side in ("long", "short")
+        for item in context[side]["evidence"]
+        if item["source"] == "server_profit"
+    )
+
+
+def test_structurally_invalid_shadow_model_cannot_choose_paper_direction() -> None:
+    payload = _paper_payload(0.7, -0.2)
+    payload["return_distribution_contract"]["long"][
+        "lower_quantile_return_pct"
+    ] = 1.0
+
+    context = _context(
+        tools={"profit_prediction": payload},
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["preferred_side"] == "short"
+    assert context["long"]["decision_source_count"] == 0
+    assert context["short"]["decision_source_count"] == 1
 
 
 def test_negative_shadow_scores_do_not_create_an_intervention_direction() -> None:

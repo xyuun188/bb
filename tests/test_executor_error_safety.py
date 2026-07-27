@@ -1951,6 +1951,7 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
     assert result.status.value == "filled"
     assert exchange.ticker_calls == 2
+    assert exchange.create_calls[0][3] == pytest.approx(50.0 / 1.3)
     request_params = exchange.create_calls[0][5]
     protection = request_params["attachAlgoOrds"][0]
     assert float(protection["slTriggerPx"]) < 1.1
@@ -1962,6 +1963,11 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
     assert refresh["buy_price_limit"] == 1.3
     assert refresh["sell_price_limit"] == 1.1
     assert refresh["price_limit_timestamp_ms"] == 1730000000001
+    rules = result.raw_response["okx_order_rules"]
+    assert rules["fill_risk_price"] == 1.3
+    assert rules["fill_risk_price_source"] == "okx_buy_price_limit"
+    assert rules["maximum_fill_notional_usdt"] == pytest.approx(50.0)
+    assert rules["pre_submit_valid"] is True
 
 
 @pytest.mark.asyncio
