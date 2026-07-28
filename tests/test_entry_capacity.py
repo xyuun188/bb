@@ -18,7 +18,7 @@ def _normalize(symbol: object) -> str | None:
     return None if symbol is None else str(symbol).replace("/", "-").upper()
 
 
-def test_position_count_never_grants_or_blocks_entry() -> None:
+def test_unrelated_position_count_does_not_block_entry() -> None:
     policy = EntryCapacityPolicy(_normalize)
     positions = [
         {
@@ -35,6 +35,26 @@ def test_position_count_never_grants_or_blocks_entry() -> None:
         positions,
         policy.empty_staged_counts(),
     ) is None
+
+
+def test_existing_or_staged_symbol_blocks_duplicate_entry() -> None:
+    policy = EntryCapacityPolicy(_normalize)
+    staged = policy.empty_staged_counts()
+    decision = _decision("BTC/USDT")
+
+    existing_reason = policy.reason(
+        "ensemble_trader",
+        decision,
+        [{"symbol": "BTC-USDT", "side": "short", "quantity": 1.0}],
+        staged,
+    )
+    assert existing_reason is not None
+    assert "已有未平仓仓位" in existing_reason
+
+    policy.reserve_slot("ensemble_trader", decision, staged)
+    staged_reason = policy.reason("ensemble_trader", decision, [], staged)
+    assert staged_reason is not None
+    assert "本轮已有待提交开仓" in staged_reason
 
 
 def test_reservations_only_track_current_round_deduplication() -> None:

@@ -256,7 +256,7 @@ def test_summary_compacts_selected_decision_model_and_okx_evidence() -> None:
                     "paper_trade_selection": {
                         "selected": True,
                         "selected_side": "short",
-                        "selection_reason": "policy_exploitation",
+                        "selection_reason": "strategy_edge_selected",
                         "selected_support": {"large": "discarded"},
                     },
                     "local_ai_tools": {

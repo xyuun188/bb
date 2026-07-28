@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-07-28.paper-model-direction.v4"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-07-28.paper-model-direction.v5"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
@@ -333,7 +333,11 @@ def assess_directional_entry_support(
     execution_cost_complete = quantitative.get("execution_cost_complete") is True
     family_summaries = list(quantitative.get("quant_family_summaries") or [])
     if paper_scope:
-        directional_families = list(family_summaries)
+        directional_families = [
+            item
+            for item in family_summaries
+            if (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
+        ]
     else:
         directional_families = [
             item
@@ -393,6 +397,10 @@ def assess_directional_entry_support(
         blockers.append("direction_support_side_missing")
     if paper_scope and not execution_cost_complete:
         blockers.append("direction_support_execution_cost_incomplete")
+    if paper_scope and (
+        expected_net_return_pct is None or expected_net_return_pct <= 0.0
+    ):
+        blockers.append("direction_support_expected_net_not_positive")
     if not quant_families:
         blockers.append("direction_support_quant_evidence_missing")
     if prediction_horizon_minutes is None or prediction_horizon_minutes <= 0.0:
@@ -490,6 +498,9 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
     if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
         if support.get("execution_cost_complete") is not True:
             reasons.append("direction_support_execution_cost_incomplete")
+        expected_net = _float(support.get("expected_net_return_pct"))
+        if expected_net is None or expected_net <= 0.0:
+            reasons.append("direction_support_expected_net_not_positive")
     if not support.get("quant_evidence_families"):
         reasons.append("direction_support_quant_evidence_missing")
     horizon = _float(support.get("prediction_horizon_minutes"))

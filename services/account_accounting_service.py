@@ -120,11 +120,9 @@ def allocatable_balance_from_snapshot(snapshot: dict[str, Any] | None) -> float:
 def tradeable_balance_from_snapshot(snapshot: dict[str, Any] | None) -> float:
     if not isinstance(snapshot, dict):
         return 0.0
-    free = _safe_float(snapshot.get("free"), 0.0)
-    if free > 0:
-        return free
-    # OKX demo/swap accounts can report free=0 while equity/cash is usable.
-    return allocatable_balance_from_snapshot(snapshot)
+    # Entries consume free margin, not total equity. A present zero value is a
+    # real account constraint and must never be promoted to allocatable equity.
+    return max(_safe_float(snapshot.get("free"), 0.0), 0.0)
 
 
 def balance_from_snapshot(snapshot: dict[str, Any] | None) -> float:

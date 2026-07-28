@@ -59,6 +59,7 @@ def _processor(
     pre_execution_capacity_reason: str | None = None,
     execute_error: BaseException | None = None,
     execution_result: ExecutionResult | None = None,
+    capacity_checks_staged_reservation: bool = False,
 ) -> MarketAutoEntryProcessor:
     def score_candidate(decision: DecisionOutput, strategy: dict[str, Any] | None) -> float:
         calls.append(("score", decision.symbol, strategy))
@@ -80,6 +81,11 @@ def _processor(
         staged_counts: dict[str, dict[Any, int]],
     ) -> str | None:
         calls.append(("capacity", model_name, len(open_positions)))
+        if capacity_checks_staged_reservation and staged_counts.get("reserved", {}).get(
+            model_name,
+            0,
+        ) > 0:
+            return "duplicate staged symbol"
         return capacity_reason
 
     def pre_execution_capacity(
@@ -413,13 +419,44 @@ async def test_market_auto_entry_processor_keeps_capacity_on_confirmed_execution
     assert result.execution_attempted is True
     assert result.execution_confirmed is True
     assert staged_counts["reserved"]["ensemble_trader"] == 1
-    assert ("release", "ensemble_trader", "BTC/USDT") not in calls
+    assert calls.count(("reserve", "ensemble_trader", "BTC/USDT")) == 2
+    assert calls.count(("release", "ensemble_trader", "BTC/USDT")) == 1
     assert (
         "reason",
         9,
         "本轮还在分析或排队中：开仓候选已进入执行队列，正在等待执行链路空闲并继续完成风控复核；尚未开始向 OKX 提交订单。",
     ) in calls
     assert ("ensure", 9, "BTC/USDT", "ensemble_trader", "long") in calls
+
+
+@pytest.mark.asyncio
+async def test_market_auto_entry_processor_does_not_reject_its_own_reservation() -> None:
+    calls: list[tuple[str, Any]] = []
+    staged_counts: dict[str, dict[Any, int]] = {}
+
+    result = await _processor(
+        calls,
+        execution_result=_filled_result(),
+        capacity_checks_staged_reservation=True,
+    ).process(
+        symbol="ADA/USDT",
+        model_name="ensemble_trader",
+        decision=_decision("ADA/USDT"),
+        assessment=object(),
+        decision_db_id=15,
+        results={"decisions": []},
+        model_mode="paper",
+        open_positions=[],
+        staged_entry_counts=staged_counts,
+        strategy_mode_context=None,
+    )
+
+    assert result.execution_attempted is True
+    assert result.execution_confirmed is True
+    assert staged_counts["reserved"]["ensemble_trader"] == 1
+    assert calls.count(("reserve", "ensemble_trader", "ADA/USDT")) == 2
+    assert calls.count(("release", "ensemble_trader", "ADA/USDT")) == 1
+    assert ("execute", "ADA/USDT", "ensemble_trader", "long", True) in calls
 
 
 @pytest.mark.asyncio

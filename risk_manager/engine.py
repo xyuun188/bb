@@ -14,7 +14,6 @@ from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     normal_paper_trade_contract_reasons,
@@ -194,11 +193,7 @@ class RiskEngine:
             if sizing.get("production_eligible") is not True:
                 reason = str(sizing.get("reason") or "normal_paper_risk_budget_ineligible")
                 return f"Normal paper risk budget is not eligible: {reason}."
-            expected_single_cap = (
-                NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION
-                if normal_trade.get("selection_reason") == "coverage_sampling"
-                else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-            )
+            expected_single_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
             if equity <= 0 or risk_budget > (
                 equity * expected_single_cap + 1e-8
             ):
@@ -214,7 +209,7 @@ class RiskEngine:
                 return "Normal paper leverage must be a positive exchange integer."
             if tier_max < 1.0 or leverage > tier_max + 1e-8:
                 return "Normal paper leverage exceeds the selected OKX tier."
-            if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v4":
+            if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v5":
                 return "Normal paper dynamic leverage evidence is missing."
             if (
                 sizing.get("model_leverage_is_explicit") is True

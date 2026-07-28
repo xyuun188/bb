@@ -46,7 +46,7 @@ def _trade_contract_details_ok() -> dict[str, Any]:
             "paper_entry_requires_model_promotion": False,
             "paper_entry_requires_positive_return_lcb": False,
             "paper_entry_requires_profit_factor": False,
-            "paper_entry_allows_controlled_coverage_sampling": True,
+            "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
             "live_entry_requires_production_trade_gate": True,
             "live_entry_requires_positive_fee_after_return": True,
@@ -2097,7 +2097,7 @@ async def test_production_source_health_card_exposes_continuous_alert(
                     "production_source_decision_count": 0,
                     "normal_paper_executed_count": 1,
                     "continuous_no_normal_paper_candidate_seconds": 120.0,
-                    "paper_sampling_alert_active": False,
+                    "paper_trade_alert_active": False,
                     "recovery_state": "normal_paper_trading",
                 }
 
@@ -2117,7 +2117,7 @@ async def test_production_source_health_card_exposes_continuous_alert(
 
 
 @pytest.mark.asyncio
-async def test_production_source_health_card_exposes_normal_paper_sampling_alert(
+async def test_production_source_health_card_exposes_normal_paper_trade_alert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeProductionSourceHealthService:
@@ -2129,7 +2129,7 @@ async def test_production_source_health_card_exposes_normal_paper_sampling_alert
                 "production_source_decision_count": 0,
                 "normal_paper_executed_count": 2,
                 "continuous_no_normal_paper_candidate_seconds": 3600.0,
-                "paper_sampling_alert_active": True,
+                "paper_trade_alert_active": True,
                 "recovery_state": "normal_paper_candidate_waiting",
             }
 
@@ -2144,7 +2144,7 @@ async def test_production_source_health_card_exposes_normal_paper_sampling_alert
     assert card["key"] == "production_source_health"
     assert card["status"] == "critical"
     assert "模拟盘持续没有生成正常策略候选" in card["summary"]
-    assert card["details"]["paper_sampling_alert_active"] is True
+    assert card["details"]["paper_trade_alert_active"] is True
 
 
 

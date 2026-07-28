@@ -99,7 +99,7 @@ def _attach_normal_paper_contract(
     contract = build_normal_paper_trade_contract(
         symbol=decision.symbol,
         side="long",
-        selection_reason="policy_exploitation",
+        selection_reason="strategy_edge_selected",
         direction_support={
             "eligible": True,
             "selected_side": "long",

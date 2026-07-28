@@ -89,7 +89,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     )
     trade_policy = _safe_dict(trade.get("policy"))
     required_true_trade_policy = (
-        "paper_entry_allows_controlled_coverage_sampling",
+        "paper_entry_requires_positive_expected_net_return",
         "paper_entry_requires_current_execution_cost",
         "live_entry_requires_production_trade_gate",
         "live_entry_requires_positive_fee_after_return",

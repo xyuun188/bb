@@ -505,14 +505,13 @@ def test_paper_training_loss_is_a_normal_authoritative_training_sample() -> None
 
 
 @pytest.mark.parametrize(
-    ("selection_reason", "close_price", "realized_pnl", "expected_outcome"),
+    ("close_price", "realized_pnl", "expected_outcome"),
     [
-        ("policy_exploitation", 100_500.0, 8.5, "profit"),
-        ("coverage_sampling", 99_650.0, -8.5, "loss"),
+        (100_500.0, 8.5, "profit"),
+        (99_650.0, -8.5, "loss"),
     ],
 )
 def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
-    selection_reason: str,
     close_price: float,
     realized_pnl: float,
     expected_outcome: str,
@@ -522,14 +521,14 @@ def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="long",
-        selection_reason=selection_reason,
+        selection_reason="strategy_edge_selected",
         direction_support={
             "eligible": True,
             "selected_side": "long",
             "prediction_horizon_minutes": 30.0,
-            "expected_net_return_pct": 0.2 if realized_pnl > 0 else -0.2,
-            "objective_net_return_pct": 0.1 if realized_pnl > 0 else -0.4,
-            "loss_probability": 0.3 if realized_pnl > 0 else 0.7,
+            "expected_net_return_pct": 0.2,
+            "objective_net_return_pct": 0.1,
+            "loss_probability": 0.3,
             "quant_evidence_families": ["local_ml"],
             "strong_expert_opposition": False,
         },
@@ -558,7 +557,7 @@ def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
     )
 
     assert sample["strategy_entry_kind"] == "normal_strategy_trade"
-    assert sample["strategy_selection_reason"] == selection_reason
+    assert sample["strategy_selection_reason"] == "strategy_edge_selected"
     assert sample["decision_authority"] == "ensemble"
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True

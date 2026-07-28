@@ -12,7 +12,7 @@ StagedEntryCounts = dict[str, dict[Any, int]]
 
 @dataclass(frozen=True, slots=True)
 class EntryCapacityPolicy:
-    """Track current-round reservations without imposing a position-count gate."""
+    """Prevent duplicate symbol exposure while tracking current-round reservations."""
 
     normalize_symbol: NormalizeSymbol
 
@@ -28,7 +28,23 @@ class EntryCapacityPolicy:
         open_positions: list[dict],
         staged_entry_counts: StagedEntryCounts,
     ) -> str | None:
-        del model_name, decision, open_positions, staged_entry_counts
+        if not decision.is_entry:
+            return None
+        symbol = self.normalize_symbol(decision.symbol)
+        if not symbol:
+            return "交易对无法规范化，系统未创建新的模拟盘仓位。"
+        for position in open_positions or []:
+            if not isinstance(position, dict) or not self._is_effective_open_position(position):
+                continue
+            if self.normalize_symbol(position.get("symbol")) == symbol:
+                return (
+                    f"{symbol} 已有未平仓仓位；新观点保留为分析记录，"
+                    "由持仓管理链处理现有仓位，不重复或反向开仓。"
+                )
+        staged_symbol_side = self._stage_dict(staged_entry_counts, "symbol_side")
+        if any(key[1] == symbol and count > 0 for key, count in staged_symbol_side.items()):
+            return f"{symbol} 本轮已有待提交开仓，系统不重复提交。"
+        del model_name
         return None
 
     @staticmethod

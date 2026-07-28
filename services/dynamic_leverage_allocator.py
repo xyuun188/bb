@@ -69,7 +69,7 @@ class DynamicLeverageDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": "dynamic_leverage_allocator_v4",
+            "version": "dynamic_leverage_allocator_v5",
             "requested_leverage": round(self.requested_leverage, 6),
             "theoretical_leverage": round(self.theoretical_leverage, 6),
             "final_integer_leverage": self.final_integer_leverage,
@@ -237,16 +237,30 @@ class DynamicLeverageAllocator:
             positive_edge + downside + execution_cost,
             1e-12,
         )
-        quality = max(data.profit_quality_ratio, 0.0)
-        quality_component = _clamp(quality, 0.0, 1.0)
         survival_component = (1.0 - _clamp(data.loss_probability, 0.0, 1.0)) * (
             1.0 - _clamp(data.tail_risk_score, 0.0, 1.0)
         )
-        components = [
-            expected_component,
-            quality_component,
-            survival_component,
-        ]
+        if str(data.policy_scope or "live").lower() == "paper":
+            # Paper leverage is determined by the current trade's edge and risk.
+            # Historical profitability is evidence for promotion, not permission
+            # or a leverage multiplier for an unpromoted model.
+            components = [expected_component, survival_component]
+            history_quality_observation = _clamp(
+                max(data.profit_quality_ratio, 0.0),
+                0.0,
+                1.0,
+            )
+        else:
+            history_quality_observation = _clamp(
+                max(data.profit_quality_ratio, 0.0),
+                0.0,
+                1.0,
+            )
+            components = [
+                expected_component,
+                history_quality_observation,
+                survival_component,
+            ]
         quality_index = 1.0
         for component in components:
             quality_index *= max(component, 0.0)
@@ -257,6 +271,13 @@ class DynamicLeverageAllocator:
                 "factor": "continuous_signal_quality",
                 "quality_index": round(quality_index, 6),
                 "components": [round(component, 6) for component in components],
+                "historical_profit_quality_observation": round(
+                    history_quality_observation,
+                    6,
+                ),
+                "historical_profit_quality_is_gate": not (
+                    str(data.policy_scope or "live").lower() == "paper"
+                ),
             }
         )
         return _clamp(leverage, 1.0, system_max)

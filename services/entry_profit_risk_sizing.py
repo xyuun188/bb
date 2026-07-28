@@ -20,7 +20,6 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
@@ -1466,11 +1465,7 @@ class EntryProfitRiskSizingPolicy:
                 _safe_float(normal_trade.get("single_trade_risk_fraction_cap"), 0.0),
                 0.0,
             ),
-            (
-                NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION
-                if normal_trade.get("selection_reason") == "coverage_sampling"
-                else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-            ),
+            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
         risk_budget = single_trade_risk_budget

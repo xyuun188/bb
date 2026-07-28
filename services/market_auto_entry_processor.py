@@ -124,14 +124,13 @@ class MarketAutoEntryProcessor:
             )
             return MarketAutoEntryProcessResult(handled=True, reason=reason)
 
-        capacity_reason = self._pre_execution_capacity_reason(
+        capacity_reason = self._refresh_pre_execution_capacity_reason(
             model_name=model_name,
             decision=decision,
             open_positions=open_positions,
             staged_entry_counts=staged_entry_counts,
         )
         if capacity_reason:
-            self._release_capacity(model_name, decision, staged_entry_counts)
             reason = f"开仓信号执行前容量复核未通过：{capacity_reason}"
             await self._record_skip(
                 symbol=symbol,
@@ -280,7 +279,7 @@ class MarketAutoEntryProcessor:
         if self.capacity_releaser is not None:
             self.capacity_releaser(model_name, decision, staged_entry_counts)
 
-    def _pre_execution_capacity_reason(
+    def _refresh_pre_execution_capacity_reason(
         self,
         *,
         model_name: str,
@@ -291,7 +290,21 @@ class MarketAutoEntryProcessor:
         provider = self.pre_execution_capacity_reason
         if provider is None:
             provider = self.immediate_execution.capacity_reason_provider
-        return provider(model_name, decision, open_positions, staged_entry_counts)
+        if self.capacity_releaser is None:
+            return provider(model_name, decision, open_positions, staged_entry_counts)
+
+        # The planner has already reserved this candidate. Remove that one
+        # reservation during the duplicate check, then restore it before the
+        # executor can yield control to another entry task.
+        self._release_capacity(model_name, decision, staged_entry_counts)
+        reason = provider(model_name, decision, open_positions, staged_entry_counts)
+        if reason is None:
+            self.immediate_execution.capacity_reserver(
+                model_name,
+                decision,
+                staged_entry_counts,
+            )
+        return reason
 
     def _execution_confirmed(self, execution_result: Any) -> bool:
         if self.execution_confirmed_checker is not None:

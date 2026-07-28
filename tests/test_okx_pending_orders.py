@@ -133,6 +133,26 @@ class FakeCcxt:
     async def fetch_ticker(self, _symbol):
         raise AssertionError("execution sizing must use OKX native ticker API")
 
+    async def privateGetAccountBalance(self, params):
+        assert params == {"ccy": "USDT"}
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "details": [
+                        {
+                            "ccy": "USDT",
+                            "cashBal": "1000",
+                            "eq": "1000",
+                            "availBal": "1000",
+                            "availEq": "1000",
+                            "frozenBal": "0",
+                        }
+                    ]
+                }
+            ],
+        }
+
     async def publicGetMarketTicker(self, params):
         inst_id = str(params.get("instId") or "HOME-USDT-SWAP").strip().upper()
         return {

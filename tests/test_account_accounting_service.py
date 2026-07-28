@@ -25,7 +25,7 @@ def test_balance_snapshot_parsers_prefer_tradeable_free_then_equity() -> None:
     }
 
     assert tradeable_balance_from_snapshot({"free": 25.0, "equity": 125.0}) == 25.0
-    assert tradeable_balance_from_snapshot(snapshot) == 125.0
+    assert tradeable_balance_from_snapshot(snapshot) == 0.0
     assert allocatable_balance_from_snapshot(snapshot) == 125.0
     assert balance_from_snapshot({"free": 10.0, "cash": 70.0}) == 70.0
     assert tradeable_balance_from_snapshot(None) == 0.0

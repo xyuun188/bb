@@ -14,13 +14,13 @@ from tests.paper_canary_fixtures import (
 )
 
 
-def test_execution_policy_separates_paper_sampling_from_live_promotion() -> None:
+def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -> None:
     policy = summarize_trade_execution_contract([])["policy"]
 
     assert policy["paper_entry_requires_model_promotion"] is False
     assert policy["paper_entry_requires_positive_return_lcb"] is False
     assert policy["paper_entry_requires_profit_factor"] is False
-    assert policy["paper_entry_allows_controlled_coverage_sampling"] is True
+    assert policy["paper_entry_requires_positive_expected_net_return"] is True
     assert policy["live_entry_requires_production_trade_gate"] is True
     assert policy["live_entry_requires_positive_return_lcb"] is True
     assert "paper_exploration_live_permission" not in policy

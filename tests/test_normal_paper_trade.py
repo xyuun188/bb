@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     build_normal_paper_trade_contract,
     ensure_normal_paper_trade_contract,
@@ -54,7 +53,7 @@ def test_positive_net_direction_builds_normal_policy_trade() -> None:
     assert normal_paper_trade_contract_reasons(contract) == []
     assert contract["entry_type"] == "normal_strategy_trade"
     assert contract["trade_kind"] == "normal_strategy_trade"
-    assert contract["selection_reason"] == "policy_exploitation"
+    assert contract["selection_reason"] == "strategy_edge_selected"
     assert (
         contract["single_trade_risk_fraction_cap"]
         == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
@@ -66,7 +65,7 @@ def test_positive_net_direction_builds_normal_policy_trade() -> None:
     assert "leverage_cap" not in contract
 
 
-def test_negative_net_direction_uses_bounded_coverage_in_same_order_pipeline() -> None:
+def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:
     selection = select_normal_paper_trade_side(
         {"short": _support("short", expected_net=-0.05)}
     )
@@ -77,16 +76,9 @@ def test_negative_net_direction_uses_bounded_coverage_in_same_order_pipeline() -
         direction_support=selection["selected_support"],
     )
 
-    assert normal_paper_trade_contract_reasons(contract) == []
-    assert contract["selection_reason"] == "coverage_sampling"
-    assert (
-        contract["single_trade_risk_fraction_cap"]
-        == NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION
-    )
-    assert contract["uses_shared_order_pipeline"] is True
-    assert contract["uses_shared_position_ledger"] is True
-    assert contract["separate_sampling_order"] is False
-    assert "portfolio_risk_fraction_cap" not in contract
+    assert selection["selected"] is False
+    assert selection["selected_side"] == "neutral"
+    assert contract == {}
 
 
 def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:
@@ -94,13 +86,13 @@ def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="long",
-        selection_reason="policy_exploitation",
+        selection_reason="strategy_edge_selected",
         direction_support=support,
     )
     decision = _decision(
         {
             "paper_trade_selection": {
-                "selection_reason": "policy_exploitation",
+                "selection_reason": "strategy_edge_selected",
                 "decision_authority": "ensemble",
             },
             "independent_direction_support": support,
@@ -125,7 +117,7 @@ def test_legacy_paper_identities_cannot_authorize_a_new_trade() -> None:
 def test_normal_paper_contract_never_attaches_to_live() -> None:
     decision = _decision(
         {
-            "paper_trade_selection": {"selection_reason": "policy_exploitation"},
+            "paper_trade_selection": {"selection_reason": "strategy_edge_selected"},
             "independent_direction_support": _support("long", expected_net=0.2),
         }
     )

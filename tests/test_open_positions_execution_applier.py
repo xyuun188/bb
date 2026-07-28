@@ -79,7 +79,7 @@ def test_open_positions_applier_adds_filled_entry() -> None:
 def test_open_positions_applier_attaches_normal_paper_lineage() -> None:
     open_positions: list[dict] = []
     decision = _decision(Action.SHORT)
-    _attach_normal_paper(decision, selection_reason="coverage_sampling")
+    _attach_normal_paper(decision)
 
     _applier().apply(
         open_positions,
@@ -90,7 +90,7 @@ def test_open_positions_applier_attaches_normal_paper_lineage() -> None:
 
     lifecycle = open_positions[0]["normal_paper_lifecycle"]
     assert lifecycle["kind"] == "normal_strategy_position"
-    assert lifecycle["selection_reason"] == "coverage_sampling"
+    assert lifecycle["selection_reason"] == "strategy_edge_selected"
     assert lifecycle["prediction_horizon_minutes"] == 10.0
     assert lifecycle["horizon_is_exit_deadline"] is False
     assert open_positions[0]["current_management_contract"][
@@ -101,7 +101,7 @@ def test_open_positions_applier_attaches_normal_paper_lineage() -> None:
 def _attach_normal_paper(
     decision: DecisionOutput,
     *,
-    selection_reason: str = "policy_exploitation",
+    selection_reason: str = "strategy_edge_selected",
 ) -> None:
     side = "long" if decision.action == Action.LONG else "short"
     decision.raw_response = {
@@ -113,9 +113,7 @@ def _attach_normal_paper(
                 "eligible": True,
                 "selected_side": side,
                 "prediction_horizon_minutes": 10.0,
-                "expected_net_return_pct": (
-                    0.2 if selection_reason == "policy_exploitation" else -0.1
-                ),
+                "expected_net_return_pct": 0.2,
                 "objective_net_return_pct": -0.2,
                 "loss_probability": 0.4,
                 "quant_evidence_families": ["local_ml"],

@@ -199,15 +199,15 @@ async def test_persist_entry_stores_normal_paper_lineage() -> None:
     lifecycle = repo.opened[0]["current_management_contract"]["normal_paper_lifecycle"]
     assert lifecycle["kind"] == "normal_strategy_position"
     assert lifecycle["version"] == NORMAL_PAPER_TRADE_VERSION
-    assert lifecycle["selection_reason"] == "policy_exploitation"
+    assert lifecycle["selection_reason"] == "strategy_edge_selected"
 
 
 @pytest.mark.asyncio
-async def test_persist_entry_stores_coverage_sampling_in_normal_lineage() -> None:
+async def test_persist_short_entry_stores_normal_strategy_lineage() -> None:
     session = FakeSession()
     repo = FakeTradeRepo()
     decision = _decision(Action.SHORT)
-    _attach_normal_paper(decision, selection_reason="coverage_sampling")
+    _attach_normal_paper(decision)
 
     await _service(session=session, repo=repo).persist(
         model_name="ensemble_trader",
@@ -220,14 +220,14 @@ async def test_persist_entry_stores_coverage_sampling_in_normal_lineage() -> Non
         "normal_paper_lifecycle"
     ]
     assert lifecycle["kind"] == "normal_strategy_position"
-    assert lifecycle["selection_reason"] == "coverage_sampling"
+    assert lifecycle["selection_reason"] == "strategy_edge_selected"
     assert lifecycle["prediction_horizon_minutes"] == 10.0
 
 
 def _attach_normal_paper(
     decision: DecisionOutput,
     *,
-    selection_reason: str = "policy_exploitation",
+    selection_reason: str = "strategy_edge_selected",
 ) -> None:
     side = "long" if decision.action == Action.LONG else "short"
     decision.raw_response = {
@@ -239,9 +239,7 @@ def _attach_normal_paper(
                 "eligible": True,
                 "selected_side": side,
                 "prediction_horizon_minutes": 10.0,
-                "expected_net_return_pct": (
-                    0.2 if selection_reason == "policy_exploitation" else -0.1
-                ),
+                "expected_net_return_pct": 0.2,
                 "objective_net_return_pct": -0.2,
                 "loss_probability": 0.4,
                 "quant_evidence_families": ["local_ml"],

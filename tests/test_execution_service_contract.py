@@ -137,7 +137,7 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
     raw["normal_paper_trade"] = build_normal_paper_trade_contract(
         symbol=decision.symbol,
         side="short",
-        selection_reason="policy_exploitation",
+        selection_reason="strategy_edge_selected",
         direction_support={
             "eligible": True,
             "selected_side": "short",
@@ -177,7 +177,7 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
             "model_requested_leverage": 1.0,
             "model_leverage_is_explicit": True,
             "dynamic_leverage_decision": {
-                "version": "dynamic_leverage_allocator_v4",
+                "version": "dynamic_leverage_allocator_v5",
                 "final_integer_leverage": 1,
             },
             "leverage_tier_selection": {

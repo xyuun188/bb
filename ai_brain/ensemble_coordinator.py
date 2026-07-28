@@ -905,18 +905,11 @@ class EnsembleCoordinator:
                     max(1.0 - loss_probability, 0.05),
                     0.95,
                 ) if loss_probability is not None else 0.5
-                selection_reason = str(normal_contract["selection_reason"])
                 reason = self._reason(
                     (
                         "模型方向明确且扣费后期望为正，按模拟盘正常策略做多"
                         if action == Action.LONG
                         else "模型方向明确且扣费后期望为正，按模拟盘正常策略做空"
-                    )
-                    if selection_reason == "policy_exploitation"
-                    else (
-                        "模型方向明确但收益仍待校准，按受控覆盖采样做多"
-                        if action == Action.LONG
-                        else "模型方向明确但收益仍待校准，按受控覆盖采样做空"
                     ),
                     decision_score,
                     disagreement,
@@ -942,7 +935,7 @@ class EnsembleCoordinator:
                 paper_raw["entry_permission"] = {
                     "granted": True,
                     "scope": "paper_only",
-                    "reason": selection_reason,
+                    "reason": normal_contract["selection_reason"],
                     "production_permission": False,
                 }
                 paper_raw["base_weighted_score_observation"] = round(

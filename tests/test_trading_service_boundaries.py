@@ -3478,11 +3478,16 @@ def test_entry_policy_strategy_context_recovers_valid_normal_paper_contract() ->
         "normal_paper_trade": build_normal_paper_trade_contract(
             symbol=decision.symbol,
             side="long",
-            selection_reason="coverage_sampling",
+            selection_reason="strategy_edge_selected",
             direction_support={
                 "eligible": True,
                 "selected_side": "long",
                 "prediction_horizon_minutes": 5,
+                "expected_net_return_pct": 0.2,
+                "objective_net_return_pct": 0.1,
+                "loss_probability": 0.3,
+                "quant_evidence_families": ["local_ml"],
+                "strong_expert_opposition": False,
             },
         )
     }
@@ -3773,7 +3778,7 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
     decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
         symbol=decision.symbol,
         side="long",
-        selection_reason="policy_exploitation",
+        selection_reason="strategy_edge_selected",
         direction_support=direction_support,
     )
 

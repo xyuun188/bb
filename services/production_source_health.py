@@ -1,4 +1,4 @@
-"""Report live return-source health and normal-paper sampling continuity."""
+"""Report live return-source health and normal paper-trading continuity."""
 
 from __future__ import annotations
 
@@ -99,21 +99,21 @@ def summarize_production_source_health(
         if no_normal_paper_since is not None
         else None
     )
-    paper_sampling_alert_active = bool(
+    paper_trade_alert_active = bool(
         market_rows
         and no_normal_paper_seconds is not None
         and no_normal_paper_seconds >= critical_after
     )
-    paper_sampling_alert_reason = (
-        "continuous_no_normal_paper_candidate" if paper_sampling_alert_active else None
+    paper_trade_alert_reason = (
+        "continuous_no_normal_paper_candidate" if paper_trade_alert_active else None
     )
     if not market_rows:
         status = "warning"
         reason = "market_decision_evidence_unavailable"
     elif source_rows and no_source_seconds is not None and no_source_seconds < warning_after:
-        if paper_sampling_alert_active:
+        if paper_trade_alert_active:
             status = "warning"
-            reason = paper_sampling_alert_reason
+            reason = paper_trade_alert_reason
         else:
             status = "ok"
             reason = "governed_production_return_source_recent"
@@ -145,17 +145,17 @@ def summarize_production_source_health(
             round(no_normal_paper_seconds, 3) if no_normal_paper_seconds is not None else None
         ),
         "continuous_training_after_settlement": bool(normal_paper_rows),
-        "paper_sampling_status": (
+        "paper_trade_status": (
             "active"
             if latest_normal_paper_at is not None
             and no_normal_paper_seconds is not None
             and no_normal_paper_seconds < warning_after
             else "stale"
-            if paper_sampling_alert_active
+            if paper_trade_alert_active
             else "waiting"
         ),
-        "paper_sampling_alert_active": paper_sampling_alert_active,
-        "paper_sampling_alert_reason": paper_sampling_alert_reason,
+        "paper_trade_alert_active": paper_trade_alert_active,
+        "paper_trade_alert_reason": paper_trade_alert_reason,
         "recovery_state": (
             "normal_paper_trading" if normal_paper_rows else "normal_paper_candidate_waiting"
         ),

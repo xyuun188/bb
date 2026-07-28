@@ -201,7 +201,7 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                     "paper_entry_requires_model_promotion": False,
                     "paper_entry_requires_positive_return_lcb": False,
                     "paper_entry_requires_profit_factor": False,
-                    "paper_entry_allows_controlled_coverage_sampling": True,
+                    "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,
                     "live_entry_requires_production_trade_gate": True,
                     "live_entry_requires_positive_fee_after_return": True,

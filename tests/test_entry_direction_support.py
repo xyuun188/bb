@@ -91,7 +91,7 @@ def test_all_hold_experts_do_not_block_auditable_paper_model_direction() -> None
     assert support["blocking_reasons"] == []
 
 
-def test_negative_net_paper_direction_remains_eligible_for_coverage_sampling() -> None:
+def test_negative_net_paper_direction_is_analysis_only() -> None:
     support = assess_paper_model_trade_support(
         {"long": {"evidence": [_row("local_ml", raw=0.05, objective=-0.2)]}},
         [],
@@ -99,10 +99,11 @@ def test_negative_net_paper_direction_remains_eligible_for_coverage_sampling() -
         execution_cost_pct=0.1,
     )
 
-    assert support["eligible"] is True
+    assert support["eligible"] is False
     assert support["expected_net_return_pct"] == pytest.approx(-0.05)
     assert support["objective_net_return_pct"] == pytest.approx(-0.3)
-    assert support["quant_evidence_families"] == ["local_ml"]
+    assert support["quant_evidence_families"] == []
+    assert "direction_support_expected_net_not_positive" in support["blocking_reasons"]
 
 
 def test_two_independent_expert_groups_can_block_strong_opposition() -> None:

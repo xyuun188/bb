@@ -11,10 +11,13 @@ from typing import Any
 
 from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     legacy_normal_paper_v2_trade_contract_reasons,
+    legacy_normal_paper_v3_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import (
@@ -253,7 +256,7 @@ def summarize_trade_execution_contract(
             "paper_entry_requires_model_promotion": False,
             "paper_entry_requires_positive_return_lcb": False,
             "paper_entry_requires_profit_factor": False,
-            "paper_entry_allows_controlled_coverage_sampling": True,
+            "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
             "live_entry_requires_production_trade_gate": True,
             "live_entry_requires_positive_fee_after_return": True,
@@ -919,9 +922,14 @@ def validate_normal_paper_entry_contract(
     legacy_fixed_leverage = (
         normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_VERSION
     )
+    legacy_dynamic_v3 = (
+        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V3_VERSION
+    )
     reasons = (
         legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
         if legacy_fixed_leverage
+        else legacy_normal_paper_v3_trade_contract_reasons(normal_trade)
+        if legacy_dynamic_v3
         else normal_paper_trade_contract_reasons(normal_trade)
     )
 
@@ -956,6 +964,8 @@ def validate_normal_paper_entry_contract(
     expected_sizing_version = (
         LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION
         if legacy_fixed_leverage
+        else LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION
+        if legacy_dynamic_v3
         else NORMAL_PAPER_TRADE_SIZING_VERSION
     )
     if sizing.get("contract_version") != expected_sizing_version:
@@ -1018,7 +1028,12 @@ def validate_normal_paper_entry_contract(
             reasons.append("normal_paper_leverage_invalid")
         if tier_max_leverage < 1.0 or leverage > tier_max_leverage + 1e-8:
             reasons.append("normal_paper_leverage_exceeds_okx_tier")
-        if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v4":
+        expected_dynamic_leverage_version = (
+            "dynamic_leverage_allocator_v4"
+            if legacy_dynamic_v3
+            else "dynamic_leverage_allocator_v5"
+        )
+        if dynamic_leverage.get("version") != expected_dynamic_leverage_version:
             reasons.append("normal_paper_dynamic_leverage_contract_missing")
         if (
             sizing.get("model_leverage_is_explicit") is True

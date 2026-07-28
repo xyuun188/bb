@@ -754,7 +754,7 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     policy["paper_entry_requires_model_promotion"] = False
     policy["paper_entry_requires_positive_return_lcb"] = False
     policy["paper_entry_requires_profit_factor"] = False
-    policy["paper_entry_allows_controlled_coverage_sampling"] = True
+    policy["paper_entry_requires_positive_expected_net_return"] = True
     policy["paper_entry_requires_current_execution_cost"] = True
     policy["live_entry_requires_production_trade_gate"] = True
     policy["live_entry_requires_positive_fee_after_return"] = True
@@ -3093,7 +3093,7 @@ async def _production_source_health_audit() -> dict[str, Any]:
     duration = report.get("continuous_no_source_seconds")
     if status == "ok":
         summary = "近期存在通过治理的生产收益源。"
-    elif report.get("paper_sampling_alert_active"):
+    elif report.get("paper_trade_alert_active"):
         summary = "模拟盘持续没有生成正常策略候选；实盘仍由生产晋升门禁独立控制。"
     elif report.get("recovery_state") == "normal_paper_trading":
         summary = "正式生产收益源仍为空；模拟盘正常策略交易与持续训练正在运行，实盘继续保持关闭。"

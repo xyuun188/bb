@@ -123,7 +123,7 @@ def _decision() -> DecisionOutput:
     decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
         symbol=decision.symbol,
         side="long",
-        selection_reason="policy_exploitation",
+        selection_reason="strategy_edge_selected",
         direction_support={
             "eligible": True,
             "selected_side": "long",
@@ -288,7 +288,7 @@ async def test_normal_paper_uses_dynamic_leverage_for_positive_edge() -> None:
     assert sizing["production_eligible"] is True
     assert decision.suggested_leverage > 1.0
     assert decision.suggested_leverage <= 8.0
-    assert sizing["dynamic_leverage_decision"]["version"] == "dynamic_leverage_allocator_v4"
+    assert sizing["dynamic_leverage_decision"]["version"] == "dynamic_leverage_allocator_v5"
     assert sizing["dynamic_leverage_decision"]["policy_provenance"]["policy_scope"] == "paper"
 
 
@@ -328,22 +328,21 @@ async def test_explicit_one_x_model_recommendation_remains_an_upper_bound() -> N
 
 
 @pytest.mark.asyncio
-async def test_coverage_sampling_with_negative_edge_stays_at_one_x() -> None:
+async def test_missing_historical_profit_quality_does_not_force_paper_leverage_to_one_x() -> None:
     decision = _decision()
     opportunity = decision.raw_response["opportunity_score"]
-    opportunity["expected_net_return_pct"] = -0.1
-    opportunity["return_distribution_contract"]["raw_expected_return_pct"] = -0.1
+    opportunity["profit_quality_ratio"] = 0.0
     decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
         symbol=decision.symbol,
         side="long",
-        selection_reason="coverage_sampling",
+        selection_reason="strategy_edge_selected",
         direction_support={
             "eligible": True,
             "selected_side": "long",
             "prediction_horizon_minutes": 30.0,
-            "expected_net_return_pct": -0.1,
-            "objective_net_return_pct": -0.2,
-            "loss_probability": 0.7,
+            "expected_net_return_pct": 0.82,
+            "objective_net_return_pct": 0.52,
+            "loss_probability": 0.25,
             "quant_evidence_families": ["local_ml"],
             "strong_expert_opposition": False,
         },
@@ -353,7 +352,7 @@ async def test_coverage_sampling_with_negative_edge_stays_at_one_x() -> None:
     await policy.apply(decision, "paper", [])
 
     assert decision.raw_response["profit_risk_sizing"]["production_eligible"] is True
-    assert decision.suggested_leverage == 1.0
+    assert decision.suggested_leverage > 1.0
 
 
 @pytest.mark.asyncio

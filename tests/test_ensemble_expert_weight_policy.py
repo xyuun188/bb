@@ -314,9 +314,9 @@ def test_positive_mean_uncertain_candidate_can_only_create_bounded_paper_entry()
     assert contract["execution_scope"] == "paper_only"
     assert contract["production_permission"] is False
     assert contract["entry_type"] == "normal_strategy_trade"
-    assert contract["selection_reason"] == "policy_exploitation"
-    assert contract["sample_target"] is None
-    assert contract["daily_sample_quota"] is None
+    assert contract["selection_reason"] == "strategy_edge_selected"
+    assert "sample_target" not in contract
+    assert "daily_sample_quota" not in contract
 
 
 def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
@@ -373,7 +373,7 @@ def test_model_direction_is_blocked_by_strong_independent_expert_opposition() ->
     assert support["strong_expert_opposition"] is True
 
 
-def test_negative_model_observation_creates_coverage_sampling_order() -> None:
+def test_negative_model_observation_remains_hold_without_sampling_order() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -419,11 +419,9 @@ def test_negative_model_observation_creates_coverage_sampling_order() -> None:
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.SHORT
+    assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    contract = decision.raw_response["normal_paper_trade"]
-    assert contract["selection_reason"] == "coverage_sampling"
-    assert contract["production_permission"] is False
+    assert "normal_paper_trade" not in decision.raw_response
 
 
 def _unpromoted_positive_net_context() -> dict[str, object]:
@@ -484,7 +482,7 @@ def test_unpromoted_positive_net_model_creates_normal_paper_trade() -> None:
     assert decision.action == Action.LONG
     contract = decision.raw_response["normal_paper_trade"]
     assert contract["entry_type"] == "normal_strategy_trade"
-    assert contract["selection_reason"] == "policy_exploitation"
+    assert contract["selection_reason"] == "strategy_edge_selected"
     assert contract["expected_net_return_pct"] == 0.4
     assert contract["objective_net_return_pct"] == pytest.approx(-0.15)
     assert contract["loss_probability"] == 0.3
@@ -517,7 +515,7 @@ def test_unpromoted_positive_net_model_trades_when_all_experts_hold() -> None:
     assert decision.raw_response["normal_paper_trade"]["authorized"] is True
 
 
-def test_negative_objective_with_one_aligned_expert_uses_coverage_sampling() -> None:
+def test_positive_expected_net_with_negative_objective_can_trade_in_paper() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -528,13 +526,13 @@ def test_negative_objective_with_one_aligned_expert_uses_coverage_sampling() -> 
             "long": _training_evidence(
                 "long",
                 1,
-                raw_return=0.1,
+                raw_return=0.3,
                 objective_return=-0.2,
                 horizon_minutes=15,
             ),
             "training_long": {
                 "score": -0.2,
-                "raw_expected_return_pct": 0.1,
+                "raw_expected_return_pct": 0.3,
                 "objective_expected_return_pct": -0.2,
                 "horizon_minutes": 15,
                 "observation_count": 1,
@@ -564,7 +562,7 @@ def test_negative_objective_with_one_aligned_expert_uses_coverage_sampling() -> 
     assert "paper_training" not in decision.raw_response
     assert (
         decision.raw_response["normal_paper_trade"]["selection_reason"]
-        == "coverage_sampling"
+        == "strategy_edge_selected"
     )
 
 

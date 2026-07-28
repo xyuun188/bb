@@ -1296,6 +1296,54 @@ class OKXExecutor(AbstractExecutor):
                             "okx_order_rules": okx_order_rules,
                         },
                     )
+                final_balance_snapshot = await self.get_balance_snapshot()
+                final_available_margin = max(
+                    self._safe_float(final_balance_snapshot.get("free"), 0.0),
+                    0.0,
+                )
+                final_balance_error = str(final_balance_snapshot.get("error") or "").strip()
+                required_margin = max(
+                    self._safe_float(
+                        okx_order_rules.get("maximum_fill_notional_usdt"),
+                        okx_order_rules.get("final_notional_usdt"),
+                    )
+                    / max(self._safe_float(decision.suggested_leverage, 1.0), 1.0),
+                    0.0,
+                )
+                okx_order_rules["final_balance_recheck"] = {
+                    "available_margin_usdt": round(final_available_margin, 8),
+                    "required_margin_usdt": round(required_margin, 8),
+                    "checked_immediately_before_submit": True,
+                    "source": "okx_native_account_balance",
+                }
+                if (
+                    final_balance_error
+                    or final_available_margin <= 0
+                    or required_margin <= 0
+                    or required_margin > final_available_margin + 1e-8
+                ):
+                    return ExecutionResult(
+                        order_id="insufficient_margin",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0.0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "OKX 提交前最新可用保证金不足或不可用，系统已保留模型观点，"
+                                "但未发送开仓订单。"
+                            ),
+                            "execution_blocker": "okx_pre_submit_available_margin",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "available_margin_usdt": round(final_available_margin, 8),
+                            "required_margin_usdt": round(required_margin, 8),
+                            "balance_error": final_balance_error or None,
+                            "okx_order_rules": okx_order_rules,
+                        },
+                    )
                 stop_loss_px, take_profit_px = self._attached_sl_tp_prices(
                     decision,
                     price,
@@ -1324,8 +1372,10 @@ class OKXExecutor(AbstractExecutor):
                     {
                         "tpTriggerPx": protection["take_profit_price"],
                         "tpOrdPx": "-1",
+                        "tpTriggerPxType": "last",
                         "slTriggerPx": protection["stop_loss_price"],
                         "slOrdPx": "-1",
+                        "slTriggerPxType": "last",
                     }
                 ]
             elif decision.is_exit:
@@ -5079,12 +5129,13 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(symbol)
         inst_id = okx_inst_id_from_symbol(symbol)
         ccxt = await self._get_ccxt()
-        ticker, book, mark_response, specs, fee = await asyncio.gather(
+        ticker, book, mark_response, specs, fee, balance_snapshot = await asyncio.gather(
             self._fetch_native_ticker(symbol),
             self._with_retry(ccxt.fetch_order_book, okx_symbol),
             self._with_retry(ccxt.publicGetPublicMarkPrice, {"instId": inst_id}),
             self._native_facts_client().fetch_contract_specs(symbols=[symbol]),
             self.fetch_account_fee_snapshot(),
+            self.get_balance_snapshot(),
         )
         mark_rows = mark_response.get("data") if isinstance(mark_response, dict) else []
         mark_row = mark_rows[0] if isinstance(mark_rows, list) and mark_rows else {}
@@ -5130,6 +5181,12 @@ class OKXExecutor(AbstractExecutor):
             reasons.append("okx_pre_order_orderbook_incomplete")
         if not fee.get("taker_fee_rate"):
             reasons.append("okx_pre_order_account_fee_missing")
+        account_equity = max(self._safe_float(balance_snapshot.get("equity"), 0.0), 0.0)
+        available_margin = max(self._safe_float(balance_snapshot.get("free"), 0.0), 0.0)
+        if account_equity <= 0:
+            reasons.append("okx_pre_order_account_equity_missing")
+        if available_margin <= 0:
+            reasons.append("okx_pre_order_available_margin_missing")
         generated_at = datetime.now(UTC).isoformat()
         feature_snapshot = {
             "current_price": max(self._safe_float(ticker.get("last"), 0.0), 0.0),
@@ -5169,13 +5226,16 @@ class OKXExecutor(AbstractExecutor):
             "mark_source_timestamp_ms": self._safe_float(mark_row.get("ts"), 0.0),
             "contract_spec": spec,
             "fee_snapshot": fee,
+            "balance_snapshot": balance_snapshot,
+            "account_equity_usdt": account_equity,
+            "available_margin_usdt": available_margin,
             "feature_snapshot": feature_snapshot,
             "policy_provenance": {
-                "source": "okx_native_ticker_orderbook_mark_contract_and_account_fee",
+                "source": "okx_native_ticker_orderbook_mark_contract_fee_and_balance",
                 "observation_window": "current_immediate_pre_order_refresh",
                 "sample_count": len(bids) + len(asks) + int(mark_price > 0) + int(bool(spec)),
                 "generated_at": generated_at,
-                "strategy_version": "2026-07-15.okx-pre-order-execution-facts.v1",
+                "strategy_version": "2026-07-28.okx-pre-order-execution-facts.v2",
                 "fallback_reason": "" if not reasons else ",".join(reasons),
             },
         }

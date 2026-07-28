@@ -1145,6 +1145,20 @@ def _executor(exchange: Any) -> OKXExecutor:
     executor = OKXExecutor(mode="paper")
     executor._connected = True
     executor._exchange = exchange
+    if not callable(getattr(exchange, "privateGetAccountBalance", None)) and not callable(
+        getattr(exchange, "fetch_balance", None)
+    ):
+        async def fixed_balance_snapshot(_asset: str = "USDT") -> dict[str, Any]:
+            return {
+                "free": 1000.0,
+                "used": 0.0,
+                "total": 1000.0,
+                "cash": 1000.0,
+                "equity": 1000.0,
+                "allocatable": 1000.0,
+            }
+
+        executor.get_balance_snapshot = fixed_balance_snapshot  # type: ignore[method-assign]
     return executor
 
 
@@ -1956,6 +1970,8 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
     protection = request_params["attachAlgoOrds"][0]
     assert float(protection["slTriggerPx"]) < 1.1
     assert float(protection["tpTriggerPx"]) > 1.3
+    assert protection["slTriggerPxType"] == "last"
+    assert protection["tpTriggerPxType"] == "last"
     refresh = result.raw_response["okx_order_rules"]["pre_submit_price_refresh"]
     assert refresh["previous_price"] == 1.0
     assert refresh["refreshed_price"] == 1.2
@@ -1968,6 +1984,25 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
     assert rules["fill_risk_price_source"] == "okx_buy_price_limit"
     assert rules["maximum_fill_notional_usdt"] == pytest.approx(50.0)
     assert rules["pre_submit_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_rechecks_fresh_available_margin_before_submit() -> None:
+    exchange = _EntryMaxMarketSizeCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+
+    async def low_balance(_asset: str = "USDT") -> dict[str, Any]:
+        return {"free": 9.0, "equity": 1000.0, "total": 1000.0}
+
+    executor.get_balance_snapshot = low_balance  # type: ignore[method-assign]
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status.value == "rejected"
+    assert result.raw_response["execution_blocker"] == "okx_pre_submit_available_margin"
+    assert result.raw_response["available_margin_usdt"] == 9.0
+    assert result.raw_response["required_margin_usdt"] > 9.0
+    assert exchange.create_calls == []
 
 
 @pytest.mark.asyncio

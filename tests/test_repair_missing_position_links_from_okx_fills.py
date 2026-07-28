@@ -2283,7 +2283,7 @@ async def test_orphan_open_position_quarantine_plan_requires_okx_absence(
     )
     await init_db()
     try:
-        opened_at = datetime(2026, 6, 28, 1, 0, tzinfo=UTC)
+        opened_at = datetime.now(UTC) - timedelta(days=2)
         async with get_session_ctx() as session:
             missing = Position(
                 model_name="ensemble_trader",
