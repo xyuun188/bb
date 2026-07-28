@@ -168,6 +168,7 @@ class OkxNativeFactsClient:
         target_orders_first: bool = False,
         target_orders_only: bool = False,
         target_order_query_limit: int | None = None,
+        include_historical: bool = True,
         strict: bool = False,
     ) -> list[OkxNativeFillGroup]:
         ccxt = await self.executor._get_ccxt()
@@ -177,7 +178,11 @@ class OkxNativeFactsClient:
             raise RuntimeError(
                 "OKX native recent and historical fills APIs are both required"
             )
-        fill_endpoints = (fetch_recent_fills, fetch_historical_fills)
+        fill_endpoints = (
+            (fetch_recent_fills, fetch_historical_fills)
+            if include_historical
+            else (fetch_recent_fills,)
+        )
 
         target_inst_ids = _target_inst_ids(symbols=symbols, inst_ids=inst_ids)
         target_order_ids = _target_order_ids(order_ids)

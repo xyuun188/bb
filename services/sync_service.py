@@ -1783,7 +1783,7 @@ class OkxSyncService:
         provider: Callable[[Any, list[dict]], Awaitable[dict[tuple[str, str], dict[str, Any]]]],
         paper_okx: Any,
         exchange_positions: list[dict],
-    ) -> dict[tuple[str, str], dict[str, Any]]:
+    ) -> dict[tuple[str, str], dict[str, Any]] | None:
         timeout = self._reconcile_optional_timeout(EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS)
         if timeout is None:
             self._record_reconcile_degraded(
@@ -1797,7 +1797,7 @@ class OkxSyncService:
             logger.info(
                 "deferred exchange protection order map because reconciliation budget is low"
             )
-            return {}
+            return None
         try:
             return await asyncio.wait_for(
                 provider(paper_okx, exchange_positions),
@@ -1814,7 +1814,7 @@ class OkxSyncService:
                 note=reason,
             )
             logger.warning(reason)
-            return {}
+            return None
         except Exception as exc:
             reason = (
                 "exchange protection order map failed during reconciliation; "
@@ -1826,7 +1826,7 @@ class OkxSyncService:
                 note=reason,
             )
             logger.warning(reason, error=safe_error_text(exc))
-            return {}
+            return None
 
     async def _find_exchange_close_fill_with_timeout(
         self,
@@ -2177,14 +2177,16 @@ class OkxSyncService:
             )
             return []
 
-        protection_by_key = await self._fetch_exchange_protection_map_with_timeout(
+        protection_snapshot = await self._fetch_exchange_protection_map_with_timeout(
             fetch_exchange_protection_map,
             paper_okx,
             exchange_positions,
         )
-        self._pending_position_protection_rebalance_keys.update(
-            self._protection_coverage_mismatch_keys(exchange_positions, protection_by_key)
-        )
+        protection_by_key = protection_snapshot or {}
+        if protection_snapshot is not None:
+            self._pending_position_protection_rebalance_keys.update(
+                self._protection_coverage_mismatch_keys(exchange_positions, protection_by_key)
+            )
 
         exchange_position_keys = {
             key
@@ -2530,15 +2532,19 @@ class OkxSyncService:
                         order_id=order.exchange_order_id,
                     )
 
-                management_refreshed = await self._refresh_current_position_management_contracts(
-                    session=session,
-                    positions=positions,
-                    exchange_positions=exchange_positions,
-                    protection_by_key=protection_by_key,
-                    symbol_normalizer=normalize_symbol,
-                    float_parser=parse_float,
-                    entry_fee_for_position=entry_fee_for_position,
-                )
+                management_refreshed = 0
+                if protection_snapshot is not None:
+                    management_refreshed = (
+                        await self._refresh_current_position_management_contracts(
+                            session=session,
+                            positions=positions,
+                            exchange_positions=exchange_positions,
+                            protection_by_key=protection_by_key,
+                            symbol_normalizer=normalize_symbol,
+                            float_parser=parse_float,
+                            entry_fee_for_position=entry_fee_for_position,
+                        )
+                    )
                 if management_refreshed:
                     reconciled.append(
                         {

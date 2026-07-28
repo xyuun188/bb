@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from models.decision import _compact_decision_learning_snapshot
@@ -340,6 +341,44 @@ def test_entry_contract_accepts_complete_okx_order_detail_fact() -> None:
     )
 
 
+def test_recent_okx_fill_identity_gap_is_pending_until_sync_grace_expires() -> None:
+    order = _filled_order(108687)
+    order.created_at = datetime.now(UTC) - timedelta(minutes=2)
+    order.filled_at = order.created_at
+    order.okx_raw_fills = {}
+    order.okx_fill_contracts = 0.0
+
+    report = summarize_trade_execution_contract(
+        [_decision(108687, "long", _entry_raw())],
+        orders=[order],
+    )
+
+    entry = report["entry_contracts"][0]
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["summary"]["entry_authoritative_fill_sync_pending_count"] == 1
+    assert entry["contract_status"] == "pending_authoritative_fill_sync"
+    assert entry["contract_complete"] is False
+
+
+def test_stale_okx_fill_identity_gap_remains_a_contract_violation() -> None:
+    order = _filled_order(108688)
+    order.created_at = datetime.now(UTC) - timedelta(minutes=20)
+    order.filled_at = order.created_at
+    order.okx_raw_fills = {}
+    order.okx_fill_contracts = 0.0
+
+    report = summarize_trade_execution_contract(
+        [_decision(108688, "long", _entry_raw())],
+        orders=[order],
+    )
+
+    assert report["summary"]["contract_violation_count"] == 1
+    assert report["summary"]["entry_authoritative_fill_sync_pending_count"] == 0
+    assert report["violation_reason_counts"] == {
+        "filled_order_okx_fill_identity_incomplete": 1
+    }
+
+
 def test_live_rules_canary_contract_enforces_gate_notional_limit() -> None:
     report = summarize_trade_execution_contract(
         [
@@ -489,6 +528,26 @@ def test_report_projection_restores_only_execution_reconciliations() -> None:
 def test_compact_decision_projection_retains_large_execution_contract_fields() -> None:
     raw = _rules_canary_raw()
     raw["profit_risk_sizing"]["large_exchange_diagnostics"] = "x" * 20_000
+    raw["profit_risk_sizing"]["exchange_contract_specs"] = {
+        f"ASSET-{index}-USDT-SWAP": {
+            "ctVal": "10",
+            "ctMult": "1",
+            "source": "okx_public_instruments",
+        }
+        for index in range(500)
+    }
+    raw["profit_risk_sizing"]["portfolio_risk_snapshot"] = {
+        "scope": "paper_account_positions",
+        "current_stressed_loss_usdt": 4.2,
+        "positions": [{"symbol": "BTC/USDT", "payload": "x" * 1000}] * 100,
+    }
+    raw["profit_risk_sizing"]["dynamic_leverage_decision"] = {
+        "version": "dynamic_leverage_allocator_v5",
+        "adjustments": [{"payload": "x" * 1000}] * 100,
+    }
+    raw["profit_risk_sizing"]["leverage_tier_selection"]["tiers"] = [
+        {"payload": "x" * 1000}
+    ] * 100
     raw["opportunity_score"]["large_market_diagnostics"] = "x" * 20_000
 
     compact = _compact_decision_learning_snapshot(raw)
@@ -499,6 +558,18 @@ def test_compact_decision_projection_retains_large_execution_contract_fields() -
     assert compact_sizing["final_notional_usdt"] == 8.0
     assert compact_sizing["policy_provenance"]["source"] == "live_return_distribution"
     assert "large_exchange_diagnostics" not in compact_sizing
+    assert "exchange_contract_specs" not in compact_sizing
+    assert compact_sizing["portfolio_risk_snapshot"] == {
+        "scope": "paper_account_positions",
+        "current_stressed_loss_usdt": 4.2,
+    }
+    assert compact_sizing["dynamic_leverage_decision"] == {
+        "version": "dynamic_leverage_allocator_v5"
+    }
+    assert compact_sizing["leverage_tier_selection"] == {
+        "production_eligible": True,
+        "max_leverage": 20.0,
+    }
     assert compact_opportunity["execution_cost"]["order_size_complete"] is True
     assert "large_market_diagnostics" not in compact_opportunity
 

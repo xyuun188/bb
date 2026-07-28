@@ -1,4 +1,5 @@
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import Text, text
@@ -86,6 +87,29 @@ class _FakeMaker:
         return self.session
 
 
+class _FakeConnectionOnly:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    async def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+
+
+class _FakeConnectionEngine:
+    def __init__(self) -> None:
+        self.connection = _FakeConnectionOnly()
+        self.begin_called = False
+
+    @asynccontextmanager
+    async def connect(self):
+        yield self.connection
+
+    @asynccontextmanager
+    async def begin(self):
+        self.begin_called = True
+        yield self.connection
+
+
 @pytest.mark.asyncio
 async def test_read_session_ctx_does_not_rollback_success(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_session = _FakeSession()
@@ -147,6 +171,23 @@ async def test_sqlite_schema_init_does_not_use_advisory_lock(
     await session_module._lock_schema_migration_if_needed(fake_conn)
 
     assert fake_conn.statements == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_db_init_verifies_connection_without_schema_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _FakeConnectionEngine()
+
+    async def fake_get_engine():
+        return engine
+
+    monkeypatch.setattr(session_module, "get_engine", fake_get_engine)
+
+    await session_module.init_db(migrate_schema=False)
+
+    assert engine.connection.statements == ["SELECT 1"]
+    assert engine.begin_called is False
 
 
 @pytest.mark.asyncio
@@ -490,6 +531,16 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
         "CREATE OR REPLACE FUNCTION bb_compact_ai_decision_learning_value" in statement
         for statement in fake_conn.statements
     )
+    projection_function = next(
+        statement
+        for statement in fake_conn.statements
+        if "CREATE OR REPLACE FUNCTION bb_project_profit_risk_sizing_snapshot"
+        in statement
+    )
+    assert "'dynamic_leverage_decision'" in projection_function
+    assert "WHEN 'portfolio_risk_snapshot'" in projection_function
+    assert "'current_stressed_loss_usdt'" in projection_function
+    assert "'exchange_contract_specs'" not in projection_function
     assert any(
         "trg_ai_decisions_model_health_snapshot" in statement
         for statement in fake_conn.statements
@@ -506,7 +557,12 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     assert "preserve_ai_decision_projections" in retention_trigger
     assert "runtime_data_retention" in retention_trigger
     assert "bb_compact_ai_decision_learning_value" in retention_trigger
-    assert "profit_risk_sizing" in retention_trigger
+    assert "bb_project_profit_risk_sizing_snapshot" in retention_trigger
+    assert "decision_learning_snapshot_version := 3" in retention_trigger
+    assert any(
+        "decision_learning_snapshot_version < 3" in statement
+        for statement in fake_conn.statements
+    )
 
 
 @pytest.mark.asyncio

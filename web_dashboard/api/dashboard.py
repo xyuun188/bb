@@ -10,6 +10,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, overload
 
 import structlog
@@ -108,6 +109,10 @@ _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
+_DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 1
+_DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
     "okx_confirmed",
     "okx_only_backfilled",
@@ -125,8 +130,15 @@ _dashboard_okx_balance_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 _dashboard_okx_balance_error_cache: dict[str, tuple[datetime, dict[str, Any], Any | None]] = {}
 _dashboard_okx_balance_locks: dict[str, asyncio.Lock] = {}
 _dashboard_okx_balance_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_dashboard_read_only_okx_executors: dict[str, Any] = {}
+_dashboard_read_only_okx_executor_factories: dict[str, Any] = {}
+_dashboard_read_only_okx_executor_locks: dict[str, asyncio.Lock] = {}
+_dashboard_public_rest_client: Any | None = None
+_dashboard_public_rest_client_factory: Any | None = None
+_dashboard_public_rest_client_lock: asyncio.Lock | None = None
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
+_dashboard_closed_ledger_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 
 
@@ -212,6 +224,11 @@ def _clear_dashboard_heavy_cache(*names: str) -> None:
     for key in list(_dashboard_heavy_cache):
         if key and key[0] in wanted:
             _dashboard_heavy_cache.pop(key, None)
+    for key, task in list(_dashboard_closed_ledger_refresh_tasks.items()):
+        if key and key[0] in wanted:
+            if not task.done():
+                task.cancel()
+            _dashboard_closed_ledger_refresh_tasks.pop(key, None)
 
 
 def _log_dashboard_fallback(event: str, exc: Exception, **fields: Any) -> None:
@@ -299,30 +316,19 @@ def _start_dashboard_okx_position_refresh(selected_mode: str) -> None:
 
 async def _fetch_dashboard_okx_balance_uncached(selected_mode: str) -> dict[str, Any] | None:
     selected_mode = "live" if selected_mode == "live" else "paper"
-    fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
-    try:
-        await asyncio.wait_for(
-            fallback_executor.initialize(),
-            timeout=_DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS,
-        )
-        snapshot = await asyncio.wait_for(
-            fallback_executor.get_balance_snapshot("USDT"),
-            timeout=_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
-        )
-        if not snapshot:
-            raise RuntimeError("empty OKX balance snapshot")
-        if snapshot.get("error"):
-            raise RuntimeError(safe_error_text(snapshot.get("error")))
-        return dict(snapshot)
-    finally:
-        try:
-            await fallback_executor.shutdown()
-        except Exception as exc:
-            _log_dashboard_fallback(
-                "dashboard summary okx fallback shutdown failed",
-                exc,
-                mode=selected_mode,
-            )
+    fallback_executor = await _dashboard_read_only_okx_executor(
+        selected_mode,
+        prefer_shared=False,
+    )
+    snapshot = await asyncio.wait_for(
+        fallback_executor.get_balance_snapshot("USDT"),
+        timeout=_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
+    )
+    if not snapshot:
+        raise RuntimeError("empty OKX balance snapshot")
+    if snapshot.get("error"):
+        raise RuntimeError(safe_error_text(snapshot.get("error")))
+    return dict(snapshot)
 
 
 async def _fetch_dashboard_okx_balance_uncached_with_total_budget(
@@ -2719,6 +2725,8 @@ async def _fetch_dashboard_okx_positions_uncached(
     executor: Any | None = None,
 ) -> list[dict[str, Any]]:
     executor = executor if executor is not None else _dashboard_okx_executor_for_mode(selected_mode)
+    if executor is None:
+        executor = await _dashboard_read_only_okx_executor(selected_mode)
     if executor:
         fetch_strict = getattr(executor, "get_positions_strict", None)
         if callable(fetch_strict):
@@ -2727,25 +2735,7 @@ async def _fetch_dashboard_okx_positions_uncached(
                 timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
             )
 
-    fallback_executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
-    try:
-        async def fetch_with_fallback() -> list[dict[str, Any]]:
-            await fallback_executor.initialize()
-            return await fallback_executor.get_positions_strict()
-
-        return await asyncio.wait_for(
-            fetch_with_fallback(),
-            timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
-        )
-    finally:
-        try:
-            await fallback_executor.shutdown()
-        except Exception as exc:
-            _log_dashboard_fallback(
-                "dashboard okx position fallback shutdown failed",
-                exc,
-                mode=selected_mode,
-            )
+    raise RuntimeError("dashboard OKX executor does not support strict position reads")
 
 
 async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, Any]]:
@@ -2863,6 +2853,152 @@ def _make_lightweight_okx_executor(cls: Any, mode: str):
         return cls(mode=mode)
 
 
+async def _dashboard_read_only_okx_executor(
+    mode: str,
+    *,
+    prefer_shared: bool = True,
+) -> Any:
+    """Return one initialized read-only OKX executor per Dashboard process and mode."""
+
+    selected_mode = "live" if mode == "live" else "paper"
+    shared = _dashboard_okx_executor_for_mode(selected_mode) if prefer_shared else None
+    if shared is not None:
+        return shared
+    cached = _dashboard_read_only_okx_executors.get(selected_mode)
+    if (
+        cached is not None
+        and _dashboard_read_only_okx_executor_factories.get(selected_mode) is OKXExecutor
+    ):
+        return cached
+    lock = _dashboard_read_only_okx_executor_locks.setdefault(selected_mode, asyncio.Lock())
+    async with lock:
+        cached = _dashboard_read_only_okx_executors.get(selected_mode)
+        if (
+            cached is not None
+            and _dashboard_read_only_okx_executor_factories.get(selected_mode) is OKXExecutor
+        ):
+            return cached
+        if cached is not None:
+            try:
+                await cached.shutdown()
+            except Exception as exc:
+                _log_dashboard_fallback(
+                    "dashboard replaced read-only okx executor shutdown failed",
+                    exc,
+                    mode=selected_mode,
+                )
+            _dashboard_read_only_okx_executors.pop(selected_mode, None)
+            _dashboard_read_only_okx_executor_factories.pop(selected_mode, None)
+        executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
+        try:
+            await asyncio.wait_for(
+                executor.initialize(),
+                timeout=max(
+                    _DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
+                    _DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS,
+                ),
+            )
+        except Exception:
+            try:
+                await executor.shutdown()
+            except Exception as shutdown_exc:
+                _log_dashboard_fallback(
+                    "dashboard read-only okx executor shutdown failed",
+                    shutdown_exc,
+                    mode=selected_mode,
+                )
+            raise
+        _dashboard_read_only_okx_executors[selected_mode] = executor
+        _dashboard_read_only_okx_executor_factories[selected_mode] = OKXExecutor
+        return executor
+
+
+async def _dashboard_rest_client() -> Any:
+    global _dashboard_public_rest_client, _dashboard_public_rest_client_factory
+    global _dashboard_public_rest_client_lock
+
+    rest_client = getattr(_data_service, "rest_client", None) if _data_service else None
+    if rest_client is not None:
+        return rest_client
+    if (
+        _dashboard_public_rest_client is not None
+        and _dashboard_public_rest_client_factory is OKXRestClient
+    ):
+        return _dashboard_public_rest_client
+    if _dashboard_public_rest_client_lock is None:
+        _dashboard_public_rest_client_lock = asyncio.Lock()
+    async with _dashboard_public_rest_client_lock:
+        if (
+            _dashboard_public_rest_client is not None
+            and _dashboard_public_rest_client_factory is not OKXRestClient
+        ):
+            try:
+                await _dashboard_public_rest_client.close()
+            except Exception as exc:
+                _log_dashboard_fallback("dashboard replaced public ticker client close failed", exc)
+            _dashboard_public_rest_client = None
+        if _dashboard_public_rest_client is None:
+            _dashboard_public_rest_client = OKXRestClient()
+            _dashboard_public_rest_client_factory = OKXRestClient
+        return _dashboard_public_rest_client
+
+
+async def warm_dashboard_read_caches(mode: str | None = None) -> None:
+    """Prime only bounded exchange reads needed by the first dashboard paint."""
+
+    selected_mode = mode or mode_manager.mode.value
+    results = await asyncio.gather(
+        _refresh_dashboard_okx_position_cache(selected_mode),
+        _refresh_dashboard_okx_balance_cache(selected_mode),
+        return_exceptions=True,
+    )
+    for label, result in zip(("position", "balance"), results, strict=True):
+        if isinstance(result, BaseException):
+            _log_dashboard_fallback(
+                f"dashboard {label} cache warmup failed",
+                result,
+                mode=selected_mode,
+            )
+
+
+async def shutdown_dashboard_read_clients() -> None:
+    global _dashboard_public_rest_client, _dashboard_public_rest_client_factory
+    global _dashboard_public_rest_client_lock
+
+    tasks = [
+        task
+        for task in (
+            *_dashboard_okx_position_refresh_tasks.values(),
+            *_dashboard_okx_balance_refresh_tasks.values(),
+            *_dashboard_closed_ledger_refresh_tasks.values(),
+        )
+        if task is not None and not task.done()
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _dashboard_closed_ledger_refresh_tasks.clear()
+    executors = list(dict.fromkeys(_dashboard_read_only_okx_executors.values()))
+    _dashboard_read_only_okx_executors.clear()
+    _dashboard_read_only_okx_executor_factories.clear()
+    _dashboard_read_only_okx_executor_locks.clear()
+    for executor in executors:
+        try:
+            await executor.shutdown()
+        except Exception as exc:
+            _log_dashboard_fallback("dashboard read-only okx executor shutdown failed", exc)
+    rest_client = _dashboard_public_rest_client
+    _dashboard_public_rest_client = None
+    _dashboard_public_rest_client_factory = None
+    _dashboard_public_rest_client_lock = None
+    if rest_client is not None:
+        try:
+            await rest_client.close()
+        except Exception as exc:
+            _log_dashboard_fallback("dashboard public ticker client close failed", exc)
+
+
 def _dashboard_ml_signal_service() -> Any | None:
     if _trading_service and getattr(_trading_service, "ml_signal_service", None):
         return _trading_service.ml_signal_service
@@ -2945,62 +3081,6 @@ def _dashboard_split_exchange_order_ids(value: Any) -> set[str]:
     return {token for token in tokens if token}
 
 
-async def _dashboard_closed_ledger_watermark(
-    session: Any,
-    *,
-    mode: str | None,
-    model_names: tuple[str, ...] | None,
-) -> tuple[Any, ...]:
-    """Return a compact invalidation key for the persisted closed-position read model."""
-
-    from sqlalchemy import func, select
-
-    from models.account import OkxAccountBill
-    from models.trade import OkxPositionHistory, Order, Position
-
-    position_filters = [Position.is_open.is_(False)]
-    order_filters = [Order.status == "filled"]
-    history_filters = []
-    bill_filters = []
-    if mode:
-        position_filters.append(Position.execution_mode == mode)
-        order_filters.append(Order.execution_mode == mode)
-        history_filters.append(OkxPositionHistory.mode == mode)
-        bill_filters.append(OkxAccountBill.mode == mode)
-    if model_names:
-        position_filters.append(Position.model_name.in_(model_names))
-        order_filters.append(Order.model_name.in_(model_names))
-
-    row = (
-        await session.execute(
-            select(
-                select(func.count(Position.id)).where(*position_filters).scalar_subquery(),
-                select(func.max(Position.id)).where(*position_filters).scalar_subquery(),
-                select(func.max(Position.updated_at))
-                .where(*position_filters)
-                .scalar_subquery(),
-                select(func.count(Order.id)).where(*order_filters).scalar_subquery(),
-                select(func.max(Order.id)).where(*order_filters).scalar_subquery(),
-                select(func.max(Order.updated_at)).where(*order_filters).scalar_subquery(),
-                select(func.count(OkxPositionHistory.id))
-                .where(*history_filters)
-                .scalar_subquery(),
-                select(func.max(OkxPositionHistory.id))
-                .where(*history_filters)
-                .scalar_subquery(),
-                select(func.max(OkxPositionHistory.synced_at))
-                .where(*history_filters)
-                .scalar_subquery(),
-                select(func.count(OkxAccountBill.id))
-                .where(*bill_filters)
-                .scalar_subquery(),
-                select(func.max(OkxAccountBill.id)).where(*bill_filters).scalar_subquery(),
-            )
-        )
-    ).one()
-    return tuple(value.isoformat() if isinstance(value, datetime) else value for value in row)
-
-
 async def _dashboard_closed_position_ledger_rows(
     session: Any,
     repo: Any,
@@ -3011,33 +3091,262 @@ async def _dashboard_closed_position_ledger_rows(
     page_size: int = 20,
     paginate: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int, int, str]:
-    watermark = await _dashboard_closed_ledger_watermark(
-        session,
-        mode=mode,
-        model_names=model_names,
-    )
-    cache_key = (
-        "closed-position-ledger",
-        mode or "all",
-        tuple(model_names or ()),
-        int(page or 1),
-        int(page_size or 20),
-        bool(paginate),
-        watermark,
-    )
-
-    async def build() -> tuple[list[dict[str, Any]], int, int, int, str]:
-        return await _dashboard_closed_position_ledger_rows_uncached(
-            session,
-            repo,
+    cache_key = _dashboard_closed_ledger_cache_key(mode, model_names)
+    cached = _dashboard_heavy_cache.get(cache_key)
+    if cached is not None:
+        cached_at, payload = cached
+        age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
+        if age_seconds <= _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS:
+            ledger_payload = copy.deepcopy(payload)
+        elif age_seconds <= _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS:
+            _start_dashboard_closed_ledger_refresh(
+                cache_key,
+                mode=mode,
+                model_names=model_names,
+            )
+            ledger_payload = copy.deepcopy(payload)
+        else:
+            _dashboard_heavy_cache.pop(cache_key, None)
+            ledger_payload = await _rebuild_dashboard_closed_ledger_cache(
+                cache_key,
+                mode=mode,
+                model_names=model_names,
+                session=session,
+                repo=repo,
+            )
+    else:
+        persisted = _load_dashboard_closed_ledger_snapshot(
             mode=mode,
             model_names=model_names,
-            page=page,
-            page_size=page_size,
-            paginate=paginate,
         )
+        if persisted is not None:
+            persisted_at, persisted_payload = persisted
+            _dashboard_heavy_cache[cache_key] = (persisted_at, persisted_payload)
+            if (
+                datetime.now(UTC) - persisted_at
+            ).total_seconds() > _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS:
+                _start_dashboard_closed_ledger_refresh(
+                    cache_key,
+                    mode=mode,
+                    model_names=model_names,
+                )
+            ledger_payload = copy.deepcopy(persisted_payload)
+        else:
+            ledger_payload = await _rebuild_dashboard_closed_ledger_cache(
+                cache_key,
+                mode=mode,
+                model_names=model_names,
+                session=session,
+                repo=repo,
+            )
 
-    return await _dashboard_heavy_cached(cache_key, build, ttl_seconds=300.0)
+    full_rows, total, _cached_page, _cached_pages, source = ledger_payload
+    normalized_page_size = max(int(page_size or 20), 1)
+    total_pages = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+    normalized_page = min(max(int(page or 1), 1), total_pages)
+    if not paginate:
+        return full_rows, total, normalized_page, total_pages, source
+    start = (normalized_page - 1) * normalized_page_size
+    return (
+        full_rows[start : start + normalized_page_size],
+        total,
+        normalized_page,
+        total_pages,
+        source,
+    )
+
+
+async def _rebuild_dashboard_closed_ledger_cache(
+    cache_key: tuple[Any, ...],
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+    session: Any | None = None,
+    repo: Any | None = None,
+    force: bool = False,
+) -> tuple[list[dict[str, Any]], int, int, int, str]:
+    lock = _dashboard_heavy_cache_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        if not force:
+            cached = _dashboard_heavy_cache_get(
+                cache_key,
+                ttl_seconds=_DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS,
+            )
+            if cached is not None:
+                return cached
+
+        async def build(active_session: Any, active_repo: Any):
+            return await _dashboard_closed_position_ledger_rows_uncached(
+                active_session,
+                active_repo,
+                mode=mode,
+                model_names=model_names,
+                page=1,
+                page_size=5000,
+                paginate=False,
+            )
+
+        if session is not None and repo is not None:
+            payload = await build(session, repo)
+        else:
+            from db.repositories.trade_repo import TradeRepository
+            from db.session import get_session_ctx
+
+            async with get_session_ctx() as owned_session:
+                payload = await build(owned_session, TradeRepository(owned_session))
+        _persist_dashboard_closed_ledger_snapshot(
+            payload,
+            mode=mode,
+            model_names=model_names,
+        )
+        return _dashboard_heavy_cache_set(cache_key, payload)
+
+
+def _start_dashboard_closed_ledger_refresh(
+    cache_key: tuple[Any, ...],
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+) -> None:
+    existing = _dashboard_closed_ledger_refresh_tasks.get(cache_key)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _rebuild_dashboard_closed_ledger_cache(
+            cache_key,
+            mode=mode,
+            model_names=model_names,
+            force=True,
+        )
+    )
+    _dashboard_closed_ledger_refresh_tasks[cache_key] = task
+
+    def done(completed: asyncio.Task[Any]) -> None:
+        if _dashboard_closed_ledger_refresh_tasks.get(cache_key) is completed:
+            _dashboard_closed_ledger_refresh_tasks.pop(cache_key, None)
+        if completed.cancelled():
+            return
+        try:
+            completed.result()
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "dashboard closed ledger background refresh failed",
+                exc,
+                mode=mode or "all",
+            )
+
+    task.add_done_callback(done)
+
+
+async def _warm_dashboard_closed_position_ledger_cache(mode: str) -> None:
+    cache_key = _dashboard_closed_ledger_cache_key(mode, None)
+    await _rebuild_dashboard_closed_ledger_cache(
+        cache_key,
+        mode=mode,
+        model_names=None,
+    )
+
+
+def _dashboard_closed_ledger_snapshot_path(
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+) -> Path | None:
+    if not str(settings.database_url or "").startswith("postgresql"):
+        return None
+    if mode not in {"paper", "live"} or model_names:
+        return None
+    return settings.data_dir / "dashboard_read_models" / f"closed_position_ledger_{mode}.json"
+
+
+def _persist_dashboard_closed_ledger_snapshot(
+    payload: tuple[list[dict[str, Any]], int, int, int, str],
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+) -> None:
+    path = _dashboard_closed_ledger_snapshot_path(mode=mode, model_names=model_names)
+    if path is None:
+        return
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except Exception as exc:
+        _log_dashboard_fallback(
+            "dashboard closed ledger snapshot persist failed",
+            exc,
+            mode=mode or "all",
+        )
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_dashboard_closed_ledger_snapshot(
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+) -> tuple[datetime, tuple[list[dict[str, Any]], int, int, int, str]] | None:
+    path = _dashboard_closed_ledger_snapshot_path(mode=mode, model_names=model_names)
+    if path is None or not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if int(document.get("version") or 0) != _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION:
+            return None
+        generated_at = _as_utc_datetime(document.get("generated_at"))
+        raw_payload = document.get("payload")
+        if generated_at is None or not isinstance(raw_payload, list) or len(raw_payload) != 5:
+            return None
+        if (
+            datetime.now(UTC) - generated_at
+        ).total_seconds() > _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS:
+            return None
+        rows, total, cached_page, cached_pages, source = raw_payload
+        if not isinstance(rows, list) or not isinstance(source, str):
+            return None
+        payload = (
+            [dict(row) for row in rows if isinstance(row, dict)],
+            max(int(total or 0), 0),
+            max(int(cached_page or 1), 1),
+            max(int(cached_pages or 1), 1),
+            source,
+        )
+        return generated_at, payload
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        _log_dashboard_fallback(
+            "dashboard closed ledger snapshot load failed",
+            exc,
+            mode=mode or "all",
+        )
+        return None
+
+
+def _dashboard_closed_ledger_cache_key(
+    mode: str | None,
+    model_names: tuple[str, ...] | None,
+) -> tuple[Any, ...]:
+    return (
+        "closed-position-ledger",
+        str(settings.database_url),
+        mode or "all",
+        tuple(model_names or ()),
+    )
 
 
 async def _dashboard_closed_position_ledger_rows_uncached(
@@ -5460,11 +5769,7 @@ async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
         if (now - cached_at).total_seconds() <= _PUBLIC_TICKER_CACHE_TTL_SECONDS:
             return cached_value
 
-    rest_client = getattr(_data_service, "rest_client", None) if _data_service else None
-    owns_client = False
-    if rest_client is None:
-        rest_client = OKXRestClient()
-        owns_client = True
+    rest_client = await _dashboard_rest_client()
 
     try:
         raw_tickers = await asyncio.wait_for(rest_client.fetch_tickers(requested), timeout=8.0)
@@ -5478,13 +5783,6 @@ async def _get_public_ticker_map(symbols: set[str]) -> dict[str, dict]:
         raw_tickers = await _fetch_public_tickers_individually(rest_client, requested)
         if not raw_tickers:
             return cached[1] if cached else {}
-    finally:
-        if owns_client:
-            try:
-                await rest_client.close()
-            except Exception as exc:
-                _log_dashboard_fallback("public ticker client close fallback", exc)
-
     parsed = _parse_public_tickers(raw_tickers, set(requested))
 
     _public_ticker_cache[cache_key] = (now, parsed)

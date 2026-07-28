@@ -291,7 +291,9 @@ async def test_exchange_protection_map_fetches_account_wide_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exchange_protection_map_does_not_fan_out_after_account_wide_timeout() -> None:
+async def test_exchange_protection_map_propagates_account_wide_timeout_without_stale_cache() -> (
+    None
+):
     class SlowExecutor:
         def __init__(self) -> None:
             self.calls: list[str | None] = []
@@ -306,19 +308,20 @@ async def test_exchange_protection_map_does_not_fan_out_after_account_wide_timeo
         symbol_normalizer=normalize_trading_symbol,
         position_open_checker=lambda position: True,
         timeout_seconds=0.001,
+        account_wide_timeout_seconds=0.001,
         cache_ttl_seconds=0.0,
     )
 
-    result = await provider.fetch(
-        executor,
-        [
-            {"symbol": "BTC/USDT", "contracts": "1"},
-            {"symbol": "ETH/USDT", "contracts": "1"},
-            {"symbol": "SOL/USDT", "contracts": "1"},
-        ],
-    )
+    with pytest.raises(TimeoutError):
+        await provider.fetch(
+            executor,
+            [
+                {"symbol": "BTC/USDT", "contracts": "1"},
+                {"symbol": "ETH/USDT", "contracts": "1"},
+                {"symbol": "SOL/USDT", "contracts": "1"},
+            ],
+        )
 
-    assert result == {}
     assert executor.calls == [None]
 
 

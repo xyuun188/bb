@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from services.current_position_management import (
@@ -140,6 +140,56 @@ def test_capacity_audit_reports_hard_capacity_and_position_economics_only() -> N
     assert report["dynamic_exit_decision_count"] == 1
     assert report["dynamic_exit_decisions"][0]["dynamic_exit_contract_complete"] is False
     assert not any("release_decision" in key or "crowded" in key for key in report)
+
+
+def test_capacity_audit_observes_recent_fee_fact_sync_without_marking_hard_gap() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_management_contract={
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 2.0,
+            "entry_price": 100.0,
+            "current_price": 103.0,
+            "entry_fee_usdt": 0.0,
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_evidence_complete": True,
+            "blockers": ["authoritative_entry_fee_evidence_incomplete"],
+        },
+    )
+
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [])
+
+    assert report["position_economics_complete_count"] == 0
+    assert report["position_economics_pending_count"] == 1
+    assert report["position_economics_incomplete_count"] == 0
+    assert report["position_economics_pending"][0][
+        "authoritative_entry_fact_sync_pending"
+    ] is True
+
+
+def test_capacity_audit_marks_stale_fee_fact_gap_incomplete() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=20),
+        current_management_contract={
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 2.0,
+            "entry_price": 100.0,
+            "current_price": 103.0,
+            "entry_fee_usdt": 0.0,
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_evidence_complete": True,
+            "blockers": ["authoritative_entry_fee_evidence_incomplete"],
+        },
+    )
+
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [])
+
+    assert report["position_economics_pending_count"] == 0
+    assert report["position_economics_incomplete_count"] == 1
 
 
 def test_capacity_audit_checks_fragmented_positions_as_one_net_position_group() -> None:

@@ -25,6 +25,7 @@ from core.redis_runtime import create_redis_client
 from core.safe_output import safe_error_text
 from db.session import close_db, init_db
 from services.secure_runtime_config import load_secure_settings_into_runtime
+from web_dashboard.api import dashboard as dashboard_api
 from web_dashboard.app import app, ws_manager
 
 logger = structlog.get_logger("dashboard")
@@ -86,10 +87,16 @@ async def _close_redis(redis: Any | None) -> None:
 
 async def main() -> None:
     setup_logging()
-    await init_db()
+    # Schema migration belongs to the trading service.  The dashboard only
+    # needs a confirmed database connection before it begins serving reads.
+    await init_db(migrate_schema=False)
     await load_secure_settings_into_runtime()
     redis = await create_redis_client()
     listener_task = asyncio.create_task(_redis_dashboard_listener(redis))
+    warmup_task = asyncio.gather(
+        dashboard_api.warm_dashboard_read_caches(),
+        return_exceptions=True,
+    )
 
     logger.info(
         "starting dashboard process",
@@ -107,12 +114,18 @@ async def main() -> None:
     try:
         await server.serve()
     finally:
+        warmup_task.cancel()
+        try:
+            await warmup_task
+        except asyncio.CancelledError:
+            pass
         listener_task.cancel()
         try:
             await listener_task
         except asyncio.CancelledError:
             pass
         await _close_redis(redis)
+        await dashboard_api.shutdown_dashboard_read_clients()
         await close_db()
 
 

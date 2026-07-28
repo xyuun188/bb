@@ -816,6 +816,30 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_status_uses_override_timeout_for_parallel_health_reads(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    calls: list[tuple[str, float | None]] = []
+    both_started = asyncio.Event()
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        calls.append((path, request_timeout))
+        if len(calls) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.2)
+        return {"available": path == "/models/status", "ok": path == "/health"}
+
+    monkeypatch.setattr(client, "_get", get_status)
+
+    result = await client.status(request_timeout=1.25)
+
+    assert calls == [("/models/status", 1.25), ("/health", 1.25)]
+    assert result["service_available"] is True
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_status_probes_service_when_trading_influence_disabled(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,

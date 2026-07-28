@@ -639,6 +639,43 @@ async def test_dashboard_okx_balance_uncached_splits_initialize_and_read_timeout
     ]
 
 
+async def test_dashboard_standalone_okx_executor_is_reused_until_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances: list[Any] = []
+
+    class PersistentExecutor(SuccessfulStandaloneBalanceExecutor):
+        def __init__(self, mode: str) -> None:
+            super().__init__(mode)
+            self.initialize_count = 0
+            self.shutdown_count = 0
+            instances.append(self)
+
+        async def initialize(self) -> None:
+            self.initialize_count += 1
+
+        async def shutdown(self) -> None:
+            self.shutdown_count += 1
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "OKXExecutor", PersistentExecutor)
+    monkeypatch.setattr(dashboard, "_dashboard_read_only_okx_executors", {})
+    monkeypatch.setattr(dashboard, "_dashboard_read_only_okx_executor_factories", {})
+    monkeypatch.setattr(dashboard, "_dashboard_read_only_okx_executor_locks", {})
+
+    first = await dashboard._fetch_dashboard_okx_balance_uncached("paper")
+    second = await dashboard._fetch_dashboard_okx_balance_uncached("paper")
+
+    assert first["equity"] == second["equity"] == 7.0
+    assert len(instances) == 1
+    assert instances[0].initialize_count == 1
+    assert instances[0].shutdown_count == 0
+
+    await dashboard.shutdown_dashboard_read_clients()
+
+    assert instances[0].shutdown_count == 1
+
+
 async def test_dashboard_okx_position_cache_is_bound_to_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

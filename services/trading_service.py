@@ -1602,7 +1602,7 @@ class TradingService:
         pull_error = (
             safe_error_text(report.get("error"), limit=180) if report.get("error") else None
         )
-        if account_discovery and okx_pull_available and status == "ok":
+        if account_discovery and okx_pull_available and status in {"ok", "warning", "deferred"}:
             self._okx_order_fact_discovery_last_finished_at = datetime.now(UTC)
         degraded = not okx_pull_available
         requires_attention = unverified_count > 0 or (

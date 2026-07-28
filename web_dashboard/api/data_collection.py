@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable
@@ -56,8 +57,13 @@ logger = structlog.get_logger(__name__)
 TRAINING_SAMPLE_LIMIT = 240
 GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT = 500
 STATUS_SECTION_TIMEOUT_SECONDS = 6.0
+STATUS_REMOTE_MODEL_TIMEOUT_SECONDS = 2.0
+STATUS_CACHE_TTL_SECONDS = 60.0
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+_status_cache: dict[bool, tuple[datetime, dict[str, Any]]] = {}
+_status_refresh_tasks: dict[bool, asyncio.Task[Any]] = {}
+_status_refresh_locks: dict[bool, asyncio.Lock] = {}
 
 
 def _status_error_payload(section: str, exc: BaseException) -> dict[str, Any]:
@@ -596,7 +602,12 @@ async def _raw_local_ai_tools_status() -> dict[str, Any]:
     if local_ai_tools is None:
         return {"available": False, "status": "client_not_ready"}
     try:
-        status = await local_ai_tools.status()
+        status_method = local_ai_tools.status
+        parameters = inspect.signature(status_method).parameters
+        if "request_timeout" in parameters:
+            status = await status_method(request_timeout=STATUS_REMOTE_MODEL_TIMEOUT_SECONDS)
+        else:
+            status = await status_method()
     except TimeoutError:
         return {"available": False, "status": "timeout"}
     except Exception as exc:
@@ -618,11 +629,41 @@ async def _completed_training_trade_count() -> int:
     return int(await _completed_trade_sample_count())
 
 
-async def _training_governance_snapshot() -> dict[str, Any]:
+def _trade_sample_count_from_status(value: Any) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    candidates: list[int] = []
+    for payload in (
+        value,
+        value.get("metadata"),
+        value.get("training"),
+        value.get("scheduler_state"),
+    ):
+        if not isinstance(payload, dict):
+            continue
+        for key in (
+            "completed_trade_sample_count",
+            "training_trade_sample_count",
+            "trade_sample_count",
+            "last_trained_completed_trade_sample_count",
+        ):
+            if payload.get(key) is None:
+                continue
+            candidates.append(_safe_int_count(payload.get(key)))
+    return max(candidates) if candidates else None
+
+
+async def _training_governance_snapshot(
+    *,
+    trade_count: int | None = None,
+) -> dict[str, Any]:
     try:
         sample_limit = max(int(GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT), 1)
         epoch_started_at = load_training_epoch_start()
-        trade_count = await _completed_training_trade_count()
+        if trade_count is None:
+            trade_count = _trade_sample_count_from_status(MODEL_TRAINING_STATE_STORE.read())
+        if trade_count is None:
+            trade_count = await _completed_training_trade_count()
         async with get_session_ctx() as session:
             epoch_filter = (ShadowBacktest.created_at >= epoch_started_at,)
             completed_result = await session.execute(
@@ -780,6 +821,13 @@ async def _training_governance_snapshot() -> dict[str, Any]:
             "error": safe_error_text(exc, limit=180),
             "cleanup_effective": False,
         }
+
+
+async def _training_governance_snapshot_for_status(trade_count: int | None) -> dict[str, Any]:
+    provider = _training_governance_snapshot
+    if "trade_count" in inspect.signature(provider).parameters:
+        return await provider(trade_count=trade_count)
+    return await provider()
 
 
 async def _train_local_ai_tools_from_dashboard() -> dict[str, Any]:
@@ -1120,26 +1168,32 @@ async def get_data_collection_settings() -> dict[str, Any]:
     return sanitize_payload(_data_collection_settings_payload())
 
 
-@router.get("/data-collection/status")
-async def get_data_collection_status(
+async def _build_data_collection_status(
     include_feature_coverage: bool = True,
 ) -> dict[str, Any]:
-    # Keep CPU-heavy audit sections serial so one Dashboard worker stays responsive.
-    source_stats_result = await _run_status_section(_source_breakdown)
-    quality_result = await _run_status_section(_training_sample_quality)
-    local_ai_status_result = await _run_status_section(_local_ai_training_status)
+    source_stats_result, quality_result, local_ai_status_result, feature_coverage_result = (
+        await asyncio.gather(
+            _run_status_section(_source_breakdown),
+            _run_status_section(_training_sample_quality),
+            _run_status_section(
+                _local_ai_training_status,
+                timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+            ),
+            (
+                _run_status_section(
+                    lambda: CryptoFeatureCoverageService().report(hours=24, limit=1000),
+                    timeout=STATUS_SECTION_TIMEOUT_SECONDS,
+                )
+                if include_feature_coverage
+                else asyncio.sleep(0, result=_skipped_feature_coverage_status())
+            ),
+        )
+    )
+    local_trade_count = _trade_sample_count_from_status(local_ai_status_result)
     governance_result = await _run_status_section(
-        _training_governance_snapshot,
+        lambda: _training_governance_snapshot_for_status(local_trade_count),
         timeout=STATUS_SECTION_TIMEOUT_SECONDS,
     )
-    feature_coverage_result: dict[str, Any] | Exception
-    if include_feature_coverage:
-        feature_coverage_result = await _run_status_section(
-            lambda: CryptoFeatureCoverageService().report(hours=24, limit=1000),
-            timeout=STATUS_SECTION_TIMEOUT_SECONDS,
-        )
-    else:
-        feature_coverage_result = _skipped_feature_coverage_status()
     source_stats = _safe_status_section(
         source_stats_result,
         section="source_breakdown",
@@ -1175,6 +1229,65 @@ async def get_data_collection_status(
         },
     }
     return sanitize_payload(payload)
+
+
+def _consume_status_refresh_task(
+    include_feature_coverage: bool,
+) -> Callable[[asyncio.Task[Any]], None]:
+    def done(task: asyncio.Task[Any]) -> None:
+        if _status_refresh_tasks.get(include_feature_coverage) is task:
+            _status_refresh_tasks.pop(include_feature_coverage, None)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.warning(
+                "data collection status background refresh failed",
+                error=safe_error_text(exc, limit=180),
+            )
+
+    return done
+
+
+async def _refresh_data_collection_status(include_feature_coverage: bool) -> dict[str, Any]:
+    lock = _status_refresh_locks.setdefault(include_feature_coverage, asyncio.Lock())
+    async with lock:
+        payload = await _build_data_collection_status(include_feature_coverage)
+        _status_cache[include_feature_coverage] = (datetime.now(UTC), payload)
+        return payload
+
+
+def _start_data_collection_status_refresh(include_feature_coverage: bool) -> None:
+    task = _status_refresh_tasks.get(include_feature_coverage)
+    if task is not None and not task.done():
+        return
+    task = asyncio.create_task(_refresh_data_collection_status(include_feature_coverage))
+    _status_refresh_tasks[include_feature_coverage] = task
+    task.add_done_callback(_consume_status_refresh_task(include_feature_coverage))
+
+
+@router.get("/data-collection/status")
+async def get_data_collection_status(
+    include_feature_coverage: bool = True,
+) -> dict[str, Any]:
+    cache_enabled = str(settings.database_url or "").startswith("postgresql")
+    if not cache_enabled:
+        return await _build_data_collection_status(include_feature_coverage)
+    cached = _status_cache.get(include_feature_coverage)
+    if cached is not None:
+        cached_at, payload = cached
+        age_seconds = max((datetime.now(UTC) - cached_at).total_seconds(), 0.0)
+        if age_seconds > STATUS_CACHE_TTL_SECONDS:
+            _start_data_collection_status_refresh(include_feature_coverage)
+        result = dict(payload)
+        result["cache"] = {
+            "age_seconds": round(age_seconds, 3),
+            "ttl_seconds": STATUS_CACHE_TTL_SECONDS,
+            "refresh_in_progress": age_seconds > STATUS_CACHE_TTL_SECONDS,
+        }
+        return result
+    return await _refresh_data_collection_status(include_feature_coverage)
 
 
 @router.post("/data-collection/training-governance/refresh")

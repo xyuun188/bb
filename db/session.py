@@ -106,8 +106,14 @@ async def get_read_session_ctx() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
-async def init_db() -> None:
-    """Create all tables. Called at application startup."""
+async def init_db(*, migrate_schema: bool = True) -> None:
+    """Initialize database access and, by default, apply the owned schema migration.
+
+    Read-only services such as the Dashboard must verify that PostgreSQL is
+    reachable, but they do not own schema changes.  Keeping their startup out
+    of the migration lock prevents a Dashboard restart from waiting behind a
+    concurrent trading-service migration.
+    """
     import models.account  # noqa: F401 - register account tables in metadata
     import models.dashboard_auth  # noqa: F401 - register dashboard auth tables
     import models.decision  # noqa: F401 - register decision tables in metadata
@@ -119,6 +125,11 @@ async def init_db() -> None:
     import models.trade  # noqa: F401 - register trade tables in metadata
 
     engine = await get_engine()
+    if not migrate_schema:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return
+
     async with engine.begin() as conn:
         await _lock_schema_migration_if_needed(conn)
         await conn.run_sync(Base.metadata.create_all)
@@ -753,6 +764,88 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
         await conn.execute(
             text(
                 """
+                CREATE OR REPLACE FUNCTION bb_project_profit_risk_sizing_snapshot(
+                    input_value JSONB
+                )
+                RETURNS JSONB
+                LANGUAGE sql
+                IMMUTABLE
+                AS $$
+                    SELECT COALESCE(
+                        jsonb_object_agg(projected.key, projected.value),
+                        '{}'::JSONB
+                    )
+                    FROM (
+                        SELECT
+                            item.key,
+                            CASE item.key
+                                WHEN 'portfolio_risk_snapshot' THEN jsonb_build_object(
+                                    'scope', item.value -> 'scope',
+                                    'current_stressed_loss_usdt',
+                                        item.value -> 'current_stressed_loss_usdt'
+                                )
+                                WHEN 'leverage_tier_selection' THEN jsonb_build_object(
+                                    'production_eligible',
+                                        item.value -> 'production_eligible',
+                                    'max_leverage', item.value -> 'max_leverage'
+                                )
+                                WHEN 'dynamic_leverage_decision' THEN jsonb_build_object(
+                                    'version', item.value -> 'version'
+                                )
+                                WHEN 'entry_instrument_availability' THEN jsonb_build_object(
+                                    'available', item.value -> 'available'
+                                )
+                                ELSE bb_compact_ai_decision_learning_value(
+                                    item.value,
+                                    0
+                                )
+                            END AS value
+                        FROM jsonb_each(COALESCE(input_value, '{}'::JSONB)) AS item
+                        WHERE item.key = ANY(ARRAY[
+                            'account_equity_usdt',
+                            'available_margin_usdt',
+                            'contract_lifecycle',
+                            'contract_version',
+                            'decision_authority',
+                            'dynamic_leverage_decision',
+                            'entry_instrument_availability',
+                            'estimated_fill_drift_reserve_fraction',
+                            'exchange_min_notional_usdt',
+                            'exchange_minimum_order',
+                            'execution_scope',
+                            'fill_notional_ceiling_usdt',
+                            'final_leverage',
+                            'final_margin_usdt',
+                            'final_notional_usdt',
+                            'leverage_tier_selection',
+                            'minimum_order_notional_usdt',
+                            'model_can_influence',
+                            'model_leverage_is_explicit',
+                            'model_requested_leverage',
+                            'planned_stressed_loss_usdt',
+                            'policy_provenance',
+                            'portfolio_risk_budget_usdt',
+                            'portfolio_risk_snapshot',
+                            'position_size_pct',
+                            'production_eligible',
+                            'production_permission',
+                            'risk_budget_usdt',
+                            'selected_contract_spec',
+                            'stressed_loss_fraction',
+                            'target_inst_id',
+                            'target_notional_usdt',
+                            'target_price'
+                        ])
+                    ) AS projected
+                    WHERE projected.value IS NOT NULL
+                      AND pg_column_size(projected.value) <= 16384
+                $$
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
                 CREATE OR REPLACE FUNCTION bb_sync_ai_decision_model_health()
                 RETURNS trigger
                 LANGUAGE plpgsql
@@ -803,13 +896,14 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                                         WHEN jsonb_typeof(item.value) = 'string'
                                              AND length(item.value #>> '{}') <= 1024
                                         THEN item.value
+                                        WHEN item.key = 'profit_risk_sizing'
+                                        THEN bb_project_profit_risk_sizing_snapshot(
+                                            item.value
+                                        )
                                         WHEN jsonb_typeof(item.value) IN ('object', 'array')
                                              AND pg_column_size(item.value) <= 16384
                                         THEN item.value
-                                        WHEN item.key IN (
-                                            'profit_risk_sizing',
-                                            'opportunity_score'
-                                        )
+                                        WHEN item.key = 'opportunity_score'
                                         THEN bb_compact_ai_decision_learning_value(
                                             item.value,
                                             0
@@ -823,7 +917,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                         ),
                         '{}'::JSONB
                     );
-                    NEW.decision_learning_snapshot_version := 1;
+                    NEW.decision_learning_snapshot_version := 3;
                     RETURN NEW;
                 END;
                 $$
@@ -858,7 +952,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                     SELECT id
                     FROM ai_decisions
                     WHERE model_health_snapshot_version < 1
-                       OR decision_learning_snapshot_version < 1
+                       OR decision_learning_snapshot_version < 3
                     ORDER BY created_at DESC NULLS LAST, id DESC
                     LIMIT 1500
                 )

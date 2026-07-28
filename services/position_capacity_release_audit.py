@@ -18,7 +18,10 @@ from services.current_position_management import (
     current_position_management_contract_complete,
 )
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
-from services.trade_execution_contract import classify_exit_execution_contract
+from services.trade_execution_contract import (
+    AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS,
+    classify_exit_execution_contract,
+)
 
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
 
@@ -101,8 +104,17 @@ class PositionCapacityReleaseAuditService:
             for decision in decisions
             if _action(decision) in EXIT_ACTIONS
         ]
+        pending_positions = [
+            row
+            for row in position_rows
+            if not row["position_economics_complete"]
+            and row.get("authoritative_entry_fact_sync_pending") is True
+        ]
         incomplete_positions = [
-            row for row in position_rows if not row["position_economics_complete"]
+            row
+            for row in position_rows
+            if not row["position_economics_complete"]
+            and row.get("authoritative_entry_fact_sync_pending") is not True
         ]
         executed_exit_gaps = [
             row
@@ -124,7 +136,11 @@ class PositionCapacityReleaseAuditService:
             "open_group_count": capacity["open_group_count"],
             "side_counts": dict(Counter(row["side"] or "unknown" for row in fragment_rows)),
             "capacity": capacity,
-            "position_economics_complete_count": len(position_rows) - len(incomplete_positions),
+            "position_economics_complete_count": (
+                len(position_rows) - len(incomplete_positions) - len(pending_positions)
+            ),
+            "position_economics_pending_count": len(pending_positions),
+            "position_economics_pending": pending_positions[:50],
             "position_economics_incomplete_count": len(incomplete_positions),
             "position_economics_incomplete": incomplete_positions[:50],
             "dynamic_exit_decision_count": len(exit_rows),
@@ -144,6 +160,9 @@ class PositionCapacityReleaseAuditService:
                 "capacity_source": "configured_exchange_account_position_group_limit",
                 "strategy_learning_cannot_expand_capacity": True,
                 "position_economics_required_for_dynamic_exit": True,
+                "authoritative_fill_sync_grace_seconds": (
+                    AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS
+                ),
                 "dynamic_exit_provenance_required": True,
                 "filled_order_link_required_for_executed_exit": True,
             },
@@ -253,6 +272,25 @@ class PositionCapacityReleaseAuditService:
             and management_complete
             and stop_distance > 0
         )
+        blockers = {
+            str(reason or "").strip()
+            for reason in management_contract.get("blockers", [])
+            if str(reason or "").strip()
+        }
+        created_at = _as_utc(getattr(position, "created_at", None))
+        sync_deadline = (
+            created_at + timedelta(seconds=AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS)
+            if created_at is not None
+            else None
+        )
+        authoritative_entry_fact_sync_pending = bool(
+            not economics_complete
+            and blockers == {"authoritative_entry_fee_evidence_incomplete"}
+            and management_contract.get("protection_evidence_complete") is True
+            and stop_distance > 0
+            and sync_deadline is not None
+            and datetime.now(UTC) <= sync_deadline
+        )
         return {
             "id": int(getattr(position, "id", 0) or 0),
             "model_name": str(getattr(position, "model_name", "") or ""),
@@ -271,6 +309,14 @@ class PositionCapacityReleaseAuditService:
             "has_stop_distance": stop_distance > 0,
             "current_management_contract_complete": management_complete,
             "current_management_contract": management_contract,
+            "authoritative_entry_fact_sync_pending": (
+                authoritative_entry_fact_sync_pending
+            ),
+            "authoritative_entry_fact_sync_deadline_at": (
+                sync_deadline.isoformat()
+                if authoritative_entry_fact_sync_pending and sync_deadline is not None
+                else None
+            ),
             "original_entry_contract_status": management_contract.get(
                 "original_entry_contract_status"
             ),
@@ -336,3 +382,9 @@ def _iso(value: Any) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(UTC).isoformat()
+
+
+def _as_utc(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)

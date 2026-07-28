@@ -44,7 +44,7 @@ def test_continuous_no_production_source_raises_critical_alert() -> None:
     now = datetime(2026, 7, 17, 12, tzinfo=UTC)
     rows = [_decision(now - timedelta(hours=2, minutes=index)) for index in range(20)]
 
-    report = summarize_production_source_health(rows, now=now)
+    report = summarize_production_source_health(rows, now=now, production_permission=True)
 
     assert report["status"] == "critical"
     assert report["alert_active"] is True
@@ -58,7 +58,7 @@ def test_recent_production_source_clears_alert() -> None:
         _decision(now - timedelta(minutes=3)),
     ]
 
-    report = summarize_production_source_health(rows, now=now)
+    report = summarize_production_source_health(rows, now=now, production_permission=True)
 
     assert report["status"] == "ok"
     assert report["alert_active"] is False
@@ -72,7 +72,7 @@ def test_old_bootstrap_contract_does_not_count_as_normal_paper_activity() -> Non
 
     report = summarize_production_source_health(rows, now=now)
 
-    assert report["status"] == "critical"
+    assert report["status"] == "warning"
     assert report["recovery_state"] == "normal_paper_candidate_waiting"
     assert report["normal_paper_executed_count"] == 0
     assert report["paper_trade_alert_active"] is True
@@ -96,6 +96,7 @@ def test_normal_paper_trading_reports_continuous_training_without_sample_target(
     assert report["continuous_training_after_settlement"] is True
     assert report["paper_trade_alert_active"] is False
     assert report["paper_trade_status"] == "active"
+    assert report["status"] == "ok"
 
 
 def test_continuous_no_normal_paper_candidate_is_reported_separately() -> None:
@@ -107,8 +108,8 @@ def test_continuous_no_normal_paper_candidate_is_reported_separately() -> None:
 
     report = summarize_production_source_health(rows, now=now)
 
-    assert report["status"] == "critical"
-    assert report["reason"] == "continuous_no_production_return_source"
+    assert report["status"] == "warning"
+    assert report["reason"] == "continuous_no_normal_paper_candidate"
     assert report["paper_trade_alert_active"] is True
     assert report["paper_trade_alert_reason"] == "continuous_no_normal_paper_candidate"
     assert report["recovery_state"] == "normal_paper_candidate_waiting"

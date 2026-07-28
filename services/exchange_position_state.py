@@ -311,12 +311,17 @@ class ExchangeProtectionMapProvider:
         position_open_checker: Callable[[dict[str, Any]], bool],
         float_parser: Callable[[Any, float], float] | None = None,
         timeout_seconds: float = 2.5,
+        account_wide_timeout_seconds: float = 5.0,
         cache_ttl_seconds: float = 30.0,
     ) -> None:
         self.symbol_normalizer = symbol_normalizer
         self.position_open_checker = position_open_checker
         self.float_parser = float_parser or _default_float_parser
         self.timeout_seconds = timeout_seconds
+        self.account_wide_timeout_seconds = max(
+            float(account_wide_timeout_seconds),
+            float(timeout_seconds),
+        )
         self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
         self._cache: dict[str, _ProtectionCacheEntry] = {}
 
@@ -404,7 +409,7 @@ class ExchangeProtectionMapProvider:
         try:
             orders = await asyncio.wait_for(
                 executor.get_position_protection_orders(None),
-                timeout=self.timeout_seconds,
+                timeout=self.account_wide_timeout_seconds,
             )
             normalized_orders = list(orders or [])
             if self.cache_ttl_seconds > 0:
@@ -426,7 +431,7 @@ class ExchangeProtectionMapProvider:
                     list(cached.orders),
                     symbols,
                 )
-            return ALL_PROTECTION_ORDERS_CACHE_KEY, []
+            raise
         except Exception as exc:
             logger.warning(
                 "failed to fetch account-wide OKX TP/SL protection orders",

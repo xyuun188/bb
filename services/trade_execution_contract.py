@@ -51,6 +51,10 @@ from services.training_epoch import load_training_epoch_start
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
 FILLED_STATUSES = {"filled", "closed"}
+AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS = 10 * 60
+AUTHORITATIVE_FILL_SYNC_PENDING_REASONS = {
+    "filled_order_okx_fill_identity_incomplete",
+}
 OBSOLETE_POLICY_FIELDS = {
     "entry_evidence",
     "entry_evidence_probe",
@@ -186,6 +190,7 @@ def summarize_trade_execution_contract(
     orders: Sequence[Any] | None = None,
     positions: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
+    checked_at = datetime.now(UTC)
     orders_by_decision = _orders_by_decision(orders or [])
     violations: list[dict[str, Any]] = []
     entry_rows: list[dict[str, Any]] = []
@@ -208,10 +213,27 @@ def summarize_trade_execution_contract(
 
         if action in ENTRY_ACTIONS:
             row, reasons = _entry_contract_row(decision, raw, decision_orders, executed)
+            pending_deadline = _authoritative_fill_sync_pending_deadline(
+                decision_orders,
+                reasons,
+                now=checked_at,
+            )
+            row["authoritative_fill_sync_pending"] = pending_deadline is not None
+            row["authoritative_fill_sync_deadline_at"] = (
+                pending_deadline.isoformat() if pending_deadline is not None else None
+            )
+            row["contract_status"] = (
+                "pending_authoritative_fill_sync"
+                if pending_deadline is not None
+                else "complete"
+                if not reasons
+                else "violation"
+            )
             entry_rows.append(row)
             if executed:
                 executed_entry_count += 1
-                violations.extend(_violation(decision, reason, row) for reason in reasons)
+                if pending_deadline is None:
+                    violations.extend(_violation(decision, reason, row) for reason in reasons)
         else:
             row, reasons = _exit_contract_row(decision, raw, decision_orders, executed)
             exit_rows.append(row)
@@ -231,6 +253,11 @@ def summarize_trade_execution_contract(
         "executed_exit_count": executed_exit_count,
         "entry_contract_ready_count": sum(
             1 for row in entry_rows if row["executed"] and row["contract_complete"]
+        ),
+        "entry_authoritative_fill_sync_pending_count": sum(
+            1
+            for row in entry_rows
+            if row["executed"] and row.get("authoritative_fill_sync_pending") is True
         ),
         "exit_contract_ready_count": sum(
             1 for row in exit_rows if row["executed"] and row["contract_complete"]
@@ -267,9 +294,45 @@ def summarize_trade_execution_contract(
             "exit_requires_position_economics": True,
             "exit_requires_dynamic_close_fraction": True,
             "filled_order_link_required": True,
+            "authoritative_fill_sync_grace_seconds": AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS,
             "obsolete_policy_payload_forbidden": sorted(OBSOLETE_POLICY_FIELDS),
         },
     }
+
+
+def _authoritative_fill_sync_pending_deadline(
+    orders: Sequence[Any],
+    reasons: Sequence[str],
+    *,
+    now: datetime,
+) -> datetime | None:
+    reason_set = {str(reason or "").strip() for reason in reasons if str(reason or "").strip()}
+    if not reason_set or not reason_set.issubset(AUTHORITATIVE_FILL_SYNC_PENDING_REASONS):
+        return None
+    filled_orders = [order for order in orders if _order_status(order) in FILLED_STATUSES]
+    if not filled_orders or any(
+        not str(_row_get(order, "exchange_order_id") or "").strip()
+        for order in filled_orders
+    ):
+        return None
+    observed_at = max(
+        (
+            timestamp
+            for order in filled_orders
+            if (
+                timestamp := _as_utc(
+                    _row_get(order, "filled_at")
+                    or _row_get(order, "created_at")
+                )
+            )
+            is not None
+        ),
+        default=None,
+    )
+    if observed_at is None:
+        return None
+    deadline = observed_at + timedelta(seconds=AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS)
+    return deadline if now <= deadline else None
 
 
 def _entry_contract_row(

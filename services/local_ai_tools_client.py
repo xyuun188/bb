@@ -456,7 +456,7 @@ class LocalAIToolsClient:
         except (TypeError, ValueError):
             return default
 
-    async def status(self) -> dict[str, Any]:
+    async def status(self, *, request_timeout: float | None = None) -> dict[str, Any]:
         enabled_for_trading = self.enabled()
         if not self.service_configured():
             return {
@@ -475,11 +475,20 @@ class LocalAIToolsClient:
         cached = self._read_status_cache()
         if cached is not None:
             return cached
+        timeout = (
+            min(max(float(request_timeout), _MIN_REQUEST_TIMEOUT_SECONDS), _MAX_REQUEST_TIMEOUT_SECONDS)
+            if request_timeout is not None
+            else self._request_timeout()
+        )
+        status_result, health_result = await asyncio.gather(
+            self._get("/models/status", request_timeout=timeout),
+            self._get("/health", request_timeout=timeout),
+            return_exceptions=True,
+        )
         try:
-            status = await self._get(
-                "/models/status",
-                request_timeout=self._request_timeout(),
-            )
+            if isinstance(status_result, BaseException):
+                raise status_result
+            status = status_result
             status.setdefault("api_base", self._public_api_base())
             status_ok = True
             status_error = ""
@@ -489,10 +498,9 @@ class LocalAIToolsClient:
             status_error = safe_error_text(exc, limit=180)
 
         try:
-            health = await self._get(
-                "/health",
-                request_timeout=self._request_timeout(),
-            )
+            if isinstance(health_result, BaseException):
+                raise health_result
+            health = health_result
             health_ok = True
             health_error = ""
         except Exception as exc:

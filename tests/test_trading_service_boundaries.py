@@ -667,7 +667,7 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     class FakeOrderFactSyncService:
         async def sync(self) -> dict[str, Any]:
             return {
-                "status": "ok",
+                "status": "deferred",
                 "okx_pull_available": True,
                 "confirmed_count": 96,
                 "unverified_count": 0,
@@ -691,6 +691,7 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     assert factory_kwargs["priority_only"] is False
     assert factory_kwargs["timeout_seconds"] == 30.0
     assert row["sync_scope"] == "account_discovery"
+    assert service._okx_order_fact_discovery_last_finished_at is not None
     service._okx_order_fact_sync_last_row = row
     assert service._okx_order_fact_sync_status_payload()["sync_scope"] == "account_discovery"
 
@@ -6462,6 +6463,28 @@ async def test_sync_service_close_fill_lookup_timeout_is_phase_specific(
     assert degraded_rows[0]["degraded"] is True
     assert degraded_rows[0]["symbol"] == "LINK/USDT"
     assert degraded_rows[0]["side"] == "short"
+
+
+@pytest.mark.asyncio
+async def test_sync_service_protection_timeout_is_unavailable_not_empty_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = OkxSyncService()
+    monkeypatch.setattr(sync_module, "EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS", 0.001)
+
+    async def slow_provider(_executor, _positions):
+        await asyncio.sleep(0.05)
+        return {}
+
+    result = await service._fetch_exchange_protection_map_with_timeout(
+        slow_provider,
+        object(),
+        [{"symbol": "BTC/USDT", "contracts": "1"}],
+    )
+
+    assert result is None
+    degraded_rows = service._with_reconcile_degraded_rows([])
+    assert degraded_rows[0]["kind"] == "protection_order_map_unavailable"
 
 
 @pytest.mark.asyncio

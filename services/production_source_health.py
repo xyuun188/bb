@@ -67,6 +67,7 @@ def summarize_production_source_health(
     *,
     now: datetime | None = None,
     decision_interval_seconds: int = 60,
+    production_permission: bool = False,
 ) -> dict[str, Any]:
     checked_at = now or datetime.now(UTC)
     rows = sorted(
@@ -110,6 +111,13 @@ def summarize_production_source_health(
     if not market_rows:
         status = "warning"
         reason = "market_decision_evidence_unavailable"
+    elif not production_permission:
+        if paper_trade_alert_active:
+            status = "warning"
+            reason = paper_trade_alert_reason
+        else:
+            status = "ok"
+            reason = "live_production_permission_disabled"
     elif source_rows and no_source_seconds is not None and no_source_seconds < warning_after:
         if paper_trade_alert_active:
             status = "warning"
@@ -127,7 +135,7 @@ def summarize_production_source_health(
         "status": status,
         "reason": reason,
         "alert_active": status in {"warning", "critical"},
-        "production_permission": False,
+        "production_permission": bool(production_permission),
         "market_decision_count": len(market_rows),
         "production_source_decision_count": len(source_rows),
         "latest_production_source_at": last_source_at.isoformat() if last_source_at else None,

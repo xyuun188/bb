@@ -2512,6 +2512,56 @@ async def test_model_training_status_timeout_is_observing_when_runtime_tools_are
 
 
 @pytest.mark.asyncio
+async def test_model_training_status_section_error_is_observing_when_runtime_tools_are_healthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": False,
+                    "status": "error",
+                    "section": "local_ai_training_status",
+                    "error": "TimeoutError",
+                },
+                "governance": {"status": "error"},
+            },
+            "sources": [],
+        }
+
+    async def fake_runtime_status() -> dict[str, Any]:
+        return {
+            "ai_models": [{"model": "qwen3-14b-trade", "available": True}],
+            "local_ai_tools": {
+                "available": True,
+                "configured": True,
+                "api_base": "http://127.0.0.1:18001",
+            },
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+    _patch_historical_trade_fact_audit(monkeypatch)
+    _patch_artifact_retirement_audit(monkeypatch)
+
+    card = await system_audit._model_training_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "warning"
+    assert card["details"]["hard_failure"] is False
+    assert card["details"]["local_tools_status_probe_slow"] is True
+    assert card["details"]["local_ai_tools"]["section"] == "local_ai_training_status"
+    assert card["details"]["local_ai_tools"]["error"] == "TimeoutError"
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+
+
+@pytest.mark.asyncio
 async def test_okx_reconciliation_audit_reuses_short_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3579,6 +3629,7 @@ async def test_okx_trade_fact_integrity_audit_marks_nodes_and_ledger(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
+    assert system_audit.OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS >= 15.0
     _patch_okx_daily_report_path(
         monkeypatch,
         tmp_path,

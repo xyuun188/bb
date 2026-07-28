@@ -69,6 +69,41 @@ _LEARNING_SNAPSHOT_MAX_STRING_CHARS = 1_024
 _LEARNING_SNAPSHOT_MAX_CONTAINER_BYTES = 16_384
 _LEARNING_SNAPSHOT_MAX_DEPTH = 3
 _MISSING_LEARNING_VALUE = object()
+_PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
+    "account_equity_usdt",
+    "available_margin_usdt",
+    "contract_lifecycle",
+    "contract_version",
+    "decision_authority",
+    "dynamic_leverage_decision",
+    "entry_instrument_availability",
+    "estimated_fill_drift_reserve_fraction",
+    "exchange_min_notional_usdt",
+    "exchange_minimum_order",
+    "execution_scope",
+    "fill_notional_ceiling_usdt",
+    "final_leverage",
+    "final_margin_usdt",
+    "final_notional_usdt",
+    "leverage_tier_selection",
+    "minimum_order_notional_usdt",
+    "model_can_influence",
+    "model_leverage_is_explicit",
+    "model_requested_leverage",
+    "planned_stressed_loss_usdt",
+    "policy_provenance",
+    "portfolio_risk_budget_usdt",
+    "portfolio_risk_snapshot",
+    "position_size_pct",
+    "production_eligible",
+    "production_permission",
+    "risk_budget_usdt",
+    "selected_contract_spec",
+    "stressed_loss_fraction",
+    "target_inst_id",
+    "target_notional_usdt",
+    "target_price",
+}
 
 
 def _compact_learning_value(value: object, *, depth: int = 0) -> object:
@@ -98,6 +133,40 @@ def _compact_learning_value(value: object, *, depth: int = 0) -> object:
     return _MISSING_LEARNING_VALUE
 
 
+def _compact_profit_risk_sizing_snapshot(value: object) -> object:
+    if not isinstance(value, dict):
+        return _MISSING_LEARNING_VALUE
+    compact: dict[str, object] = {}
+    for key in _PROFIT_RISK_SIZING_SNAPSHOT_KEYS:
+        if key not in value:
+            continue
+        nested_value = value[key]
+        if key == "portfolio_risk_snapshot" and isinstance(nested_value, dict):
+            nested_value = {
+                field: nested_value[field]
+                for field in ("scope", "current_stressed_loss_usdt")
+                if field in nested_value
+            }
+        elif key == "leverage_tier_selection" and isinstance(nested_value, dict):
+            nested_value = {
+                field: nested_value[field]
+                for field in ("production_eligible", "max_leverage")
+                if field in nested_value
+            }
+        elif key == "dynamic_leverage_decision" and isinstance(nested_value, dict):
+            nested_value = {
+                "version": nested_value.get("version"),
+            }
+        elif key == "entry_instrument_availability" and isinstance(nested_value, dict):
+            nested_value = {
+                "available": nested_value.get("available"),
+            }
+        compact_value = _compact_learning_value(nested_value)
+        if compact_value is not _MISSING_LEARNING_VALUE:
+            compact[key] = compact_value
+    return compact if compact else _MISSING_LEARNING_VALUE
+
+
 def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
@@ -105,7 +174,11 @@ def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
     for key, value in raw.items():
         if not isinstance(key, str) or len(key) > 120:
             continue
-        compact_value = _compact_learning_value(value)
+        compact_value = (
+            _compact_profit_risk_sizing_snapshot(value)
+            if key == "profit_risk_sizing"
+            else _compact_learning_value(value)
+        )
         if compact_value is not _MISSING_LEARNING_VALUE:
             compact[key] = copy.deepcopy(compact_value)
     return compact
@@ -128,4 +201,4 @@ def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> Non
     target.model_health_has_local_ai_tools = _model_health_snapshot_present(raw, "local_ai_tools")
     target.model_health_snapshot_version = 1
     target.decision_learning_snapshot = _compact_decision_learning_snapshot(raw)
-    target.decision_learning_snapshot_version = 1
+    target.decision_learning_snapshot_version = 3

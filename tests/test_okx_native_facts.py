@@ -535,6 +535,45 @@ async def test_native_facts_merge_recent_and_historical_okx_fill_ledgers() -> No
 
 
 @pytest.mark.asyncio
+async def test_native_facts_client_can_limit_realtime_sync_to_recent_fills() -> None:
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    ccxt = _SplitFillCcxt(
+        recent_rows=[
+            {
+                "instId": "ACT-USDT-SWAP",
+                "ordId": "recent-order",
+                "tradeId": "recent-trade",
+                "side": "buy",
+                "fillSz": "4",
+                "fillPx": "0.00895",
+                "ts": str(now_ms),
+            }
+        ],
+        historical_rows=[
+            {
+                "instId": "ACT-USDT-SWAP",
+                "ordId": "historical-order",
+                "tradeId": "historical-trade",
+                "side": "sell",
+                "fillSz": "3",
+                "fillPx": "0.0091",
+                "ts": str(now_ms - 1000),
+            }
+        ],
+    )
+
+    groups = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_fill_groups(
+        inst_ids=["ACT-USDT-SWAP"],
+        include_historical=False,
+        strict=True,
+    )
+
+    assert [group.order_id for group in groups] == ["recent-order"]
+    assert ccxt.recent_calls == 1
+    assert ccxt.historical_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_native_facts_client_filters_by_inst_id_side_and_since() -> None:
     now = datetime.now(UTC)
     current_ts = int(now.timestamp() * 1000)

@@ -1205,7 +1205,7 @@ async def test_data_collection_status_keeps_config_when_governance_times_out(
 
 
 @pytest.mark.asyncio
-async def test_data_collection_status_runs_cpu_heavy_sections_serially(
+async def test_data_collection_status_runs_independent_sections_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     active_db_sections = 0
@@ -1262,19 +1262,48 @@ async def test_data_collection_status_runs_cpu_heavy_sections_serially(
     body = await data_collection_module.get_data_collection_status(include_feature_coverage=True)
 
     assert body["training"]["local_ai_tools"]["status"] == "ready"
-    assert max_active_db_sections == 1
+    assert max_active_db_sections == 3
     assert events == [
         "start:source_breakdown",
-        "end:source_breakdown",
         "start:training_sample_quality",
-        "end:training_sample_quality",
         "start:local_ai_training_status",
+        "start:crypto_feature_coverage",
+        "end:source_breakdown",
+        "end:training_sample_quality",
         "end:local_ai_training_status",
+        "end:crypto_feature_coverage",
         "start:training_governance",
         "end:training_governance",
-        "start:crypto_feature_coverage",
-        "end:crypto_feature_coverage",
     ]
+
+
+@pytest.mark.asyncio
+async def test_data_collection_status_reuses_runtime_snapshot_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def build(include_feature_coverage: bool) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {
+            "checked_at": datetime.now(UTC).isoformat(),
+            "feature": include_feature_coverage,
+        }
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://runtime")
+    monkeypatch.setattr(data_collection_module, "_build_data_collection_status", build)
+    monkeypatch.setattr(data_collection_module, "_status_cache", {})
+    monkeypatch.setattr(data_collection_module, "_status_refresh_tasks", {})
+    monkeypatch.setattr(data_collection_module, "_status_refresh_locks", {})
+
+    first = await data_collection_module.get_data_collection_status(True)
+    second = await data_collection_module.get_data_collection_status(True)
+
+    assert first["feature"] is True
+    assert second["feature"] is True
+    assert second["cache"]["refresh_in_progress"] is False
+    assert calls == 1
 
 
 async def _async_value(value: Any) -> Any:

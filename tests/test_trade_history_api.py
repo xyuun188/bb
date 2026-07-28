@@ -3374,6 +3374,7 @@ async def test_xrp_final_close_cannot_be_downgraded_by_stale_local_order_links(
                 filled_at=final_close_at,
             )
 
+        dashboard_api._clear_dashboard_heavy_cache("closed-position-ledger")
         after_final_link = await get_dashboard_positions(mode="paper", closed_only=True)
         repaired_row = after_final_link["positions"][0]
         assert repaired_row["close_status"] == "full"

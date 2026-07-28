@@ -113,6 +113,7 @@ TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
 OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS = 72
 OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT = 500
+OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS = 15.0
 OKX_AUTHORITATIVE_SYNC_AUDIT_HOURS = 24
 OKX_AUTHORITATIVE_SYNC_AUDIT_LIMIT = 500
 OKX_AUTHORITATIVE_SYNC_TIMEOUT_SECONDS = 5.0
@@ -2107,7 +2108,7 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
                 lookback_hours=OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS,
                 limit=OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT,
             ).audit(),
-            timeout=8.0,
+            timeout=OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         daily_report = _load_okx_daily_reconciliation_report_summary()
@@ -2968,12 +2969,13 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
         )
 
     economics_gaps = int(report.get("position_economics_incomplete_count") or 0)
+    economics_pending = int(report.get("position_economics_pending_count") or 0)
     exit_gaps = int(report.get("executed_dynamic_exit_contract_gap_count") or 0)
     violation_count = economics_gaps + exit_gaps
     return _audit_card(
         "position_capacity_release",
         "持仓经济性与动态退出",
-        "critical" if violation_count else "ok",
+        "critical" if violation_count else "warning" if economics_pending else "ok",
         (
             "持仓经济性或已执行动态退出契约不完整。"
             if violation_count
@@ -3151,8 +3153,11 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         )
     contract_summary = _safe_dict(contract_report.get("summary"))
     violations = int(contract_summary.get("contract_violation_count") or 0)
+    fill_sync_pending = int(
+        contract_summary.get("entry_authoritative_fill_sync_pending_count") or 0
+    )
     blocked = int(root_report.get("live_ml_blocked_count") or 0)
-    status = "critical" if violations else "warning" if blocked else "ok"
+    status = "critical" if violations else "warning" if blocked or fill_sync_pending else "ok"
     return _audit_card(
         "strategy_closed_loop",
         "动态费后收益闭环",
@@ -3285,10 +3290,11 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
 
     summary = _safe_dict(report.get("summary"))
     violation_count = int(summary.get("contract_violation_count") or 0)
+    fill_sync_pending = int(summary.get("entry_authoritative_fill_sync_pending_count") or 0)
     return _audit_card(
         "trade_execution_contract",
         "动态费后收益执行契约",
-        "critical" if violation_count else "ok",
+        "critical" if violation_count else "warning" if fill_sync_pending else "ok",
         (
             "已执行决策违反动态费后收益契约。"
             if violation_count
@@ -3672,9 +3678,11 @@ async def _model_training_audit() -> dict[str, Any]:
         == "current_training_epoch_only"
         and local_tools.get("pre_epoch_data_training_allowed") is False
     )
-    local_tools_status_probe_slow = local_tools_status in {"timeout", "status_error"} and (
-        bool(runtime_probe.get("local_ai_tools_available")) or clean_training_view_available
-    )
+    local_tools_status_probe_slow = local_tools_status in {
+        "timeout",
+        "status_error",
+        "error",
+    } and (bool(runtime_probe.get("local_ai_tools_available")) or clean_training_view_available)
     local_tools_unconfigured = (
         not bool(local_tools.get("available"))
         and local_tools_status in OPTIONAL_TRAINING_SOURCE_STATUSES
@@ -3805,6 +3813,8 @@ async def _model_training_audit() -> dict[str, Any]:
             "local_ai_tools": {
                 "available": bool(local_tools.get("available")),
                 "status": local_tools.get("status"),
+                "section": local_tools.get("section"),
+                "error": local_tools.get("error"),
                 "shadow_sample_count": local_tools.get("shadow_sample_count"),
                 "trade_sample_count": local_tools.get("trade_sample_count"),
                 "text_sentiment_sample_count": local_tools.get("text_sentiment_sample_count"),
