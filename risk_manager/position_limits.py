@@ -25,6 +25,7 @@ class LimitCheckResult:
 @dataclass
 class ContractExposureSnapshot:
     contract_algebra_valid: bool
+    portfolio_stress_limit_applied: bool
     account_equity_usdt: float
     available_margin_usdt: float
     current_margin_usdt: float
@@ -47,8 +48,13 @@ class ContractExposureSnapshot:
         return (
             self.contract_algebra_valid
             and _within_limit(self.margin_after_pct, self.margin_limit_pct)
-            and _within_limit(self.stop_risk_after_pct, self.stop_risk_limit_pct)
-            and _within_limit(self.notional_after_pct, self.notional_limit_pct)
+            and (
+                not self.portfolio_stress_limit_applied
+                or (
+                    _within_limit(self.stop_risk_after_pct, self.stop_risk_limit_pct)
+                    and _within_limit(self.notional_after_pct, self.notional_limit_pct)
+                )
+            )
         )
 
 
@@ -78,7 +84,7 @@ class PositionLimitChecker:
                 passed=False,
                 reason=f"{symbol} authoritative margin exceeds current OKX available margin.",
             )
-        if not _within_limit(
+        if snapshot.portfolio_stress_limit_applied and not _within_limit(
             snapshot.stop_risk_after_pct,
             snapshot.stop_risk_limit_pct,
         ):
@@ -86,7 +92,7 @@ class PositionLimitChecker:
                 passed=False,
                 reason=f"{symbol} would exceed the dynamic portfolio stressed-loss budget.",
             )
-        if not _within_limit(
+        if snapshot.portfolio_stress_limit_applied and not _within_limit(
             snapshot.notional_after_pct,
             snapshot.notional_limit_pct,
         ):
@@ -163,6 +169,9 @@ class PositionLimitChecker:
             self._safe_float(contract.get("portfolio_risk_budget_usdt"), 0.0),
             0.0,
         )
+        portfolio_stress_limit_applied = (
+            contract.get("contract_lifecycle") != "normal_paper_trade"
+        )
         remaining_stop_capacity = max(portfolio_budget - current_stop_risk, 0.0)
         proposed_notional_capacity = (
             remaining_stop_capacity / stress_fraction if stress_fraction > 0 else 0.0
@@ -179,6 +188,7 @@ class PositionLimitChecker:
 
         return ContractExposureSnapshot(
             contract_algebra_valid=contract_algebra_valid,
+            portfolio_stress_limit_applied=portfolio_stress_limit_applied,
             account_equity_usdt=base,
             available_margin_usdt=available_margin,
             current_margin_usdt=current_margin,

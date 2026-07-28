@@ -12,7 +12,6 @@ from typing import Any
 from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
-    NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     legacy_normal_paper_v2_trade_contract_reasons,
@@ -927,7 +926,6 @@ def validate_normal_paper_entry_contract(
     )
 
     risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
-    portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"), 0.0)
     planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
     stress = _safe_float(sizing.get("stressed_loss_fraction"), 0.0)
     final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
@@ -938,9 +936,6 @@ def validate_normal_paper_entry_contract(
     leverage = _safe_float(sizing.get("final_leverage"), 0.0)
     single_cap = _safe_float(
         normal_trade.get("single_trade_risk_fraction_cap"), 0.0
-    )
-    portfolio_cap = _safe_float(
-        normal_trade.get("portfolio_risk_fraction_cap"), 0.0
     )
     filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
 
@@ -980,18 +975,12 @@ def validate_normal_paper_entry_contract(
         or ""
     ):
         reasons.append("normal_paper_sizing_fingerprint_missing")
-    if equity <= 0.0 or risk_budget <= 0.0 or portfolio_budget <= 0.0:
+    if equity <= 0.0 or risk_budget <= 0.0:
         reasons.append("normal_paper_account_risk_budget_incomplete")
     if planned_loss <= 0.0 or planned_loss > risk_budget + 1e-8:
         reasons.append("normal_paper_planned_loss_invalid")
     if single_cap <= 0.0 or risk_budget > equity * single_cap + 1e-8:
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
-    if (
-        portfolio_cap <= 0.0
-        or portfolio_cap > NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION
-        or portfolio_budget > equity * portfolio_cap + 1e-8
-    ):
-        reasons.append("normal_paper_portfolio_risk_cap_exceeded")
     if stress <= 0.0 or not isclose(
         planned_loss,
         final_notional * stress,

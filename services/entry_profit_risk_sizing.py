@@ -21,7 +21,6 @@ from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
@@ -1473,23 +1472,8 @@ class EntryProfitRiskSizingPolicy:
                 else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
             ),
         )
-        portfolio_risk_fraction = min(
-            max(
-                _safe_float(normal_trade.get("portfolio_risk_fraction_cap"), 0.0),
-                0.0,
-            ),
-            NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
-        )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
-        portfolio_risk_budget = account_equity * portfolio_risk_fraction
-        remaining_portfolio_risk_budget = max(
-            portfolio_risk_budget - current_portfolio_risk,
-            0.0,
-        )
-        risk_budget = min(
-            single_trade_risk_budget,
-            remaining_portfolio_risk_budget,
-        )
+        risk_budget = single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
         fill_drift_reserve_fraction = max(
             max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0) / 100.0,
@@ -1606,9 +1590,6 @@ class EntryProfitRiskSizingPolicy:
                 if str(item).strip()
             }
         )
-        portfolio_capacity_fraction = _clamp(
-            remaining_portfolio_risk_budget / max(portfolio_risk_budget, 1e-12)
-        )
         allocator = self.dynamic_leverage_allocator or DynamicLeverageAllocator()
         leverage_decision = allocator.allocate(
             DynamicLeverageInput(
@@ -1627,7 +1608,7 @@ class EntryProfitRiskSizingPolicy:
                 aligned_source_count=aligned_source_count,
                 atr_pct=_atr_ratio(decision),
                 execution_cost=execution_cost,
-                portfolio_capacity_fraction=portfolio_capacity_fraction,
+                portfolio_capacity_fraction=1.0,
                 policy_scope="paper",
             )
         )
@@ -1714,10 +1695,8 @@ class EntryProfitRiskSizingPolicy:
             "return_lcb_pct": return_lcb,
             "dynamic_take_profit_fraction": dynamic_take_profit,
             "single_trade_risk_fraction_cap": single_trade_risk_fraction,
-            "portfolio_risk_fraction_cap": portfolio_risk_fraction,
             "single_trade_risk_budget_usdt": single_trade_risk_budget,
-            "portfolio_risk_budget_usdt": portfolio_risk_budget,
-            "remaining_portfolio_risk_budget_usdt": remaining_portfolio_risk_budget,
+            "portfolio_risk_limit_applied": False,
             "leverage_tier_input_fingerprint": _safe_dict(
                 leverage_tier_selection.get("policy_provenance")
             ).get("input_fingerprint"),
@@ -1750,11 +1729,7 @@ class EntryProfitRiskSizingPolicy:
             else 0.0,
             "risk_budget_usdt": round(risk_budget, 8),
             "single_trade_risk_budget_usdt": round(single_trade_risk_budget, 8),
-            "portfolio_risk_budget_usdt": round(portfolio_risk_budget, 8),
-            "remaining_portfolio_risk_budget_usdt": round(
-                remaining_portfolio_risk_budget,
-                8,
-            ),
+            "portfolio_risk_limit_applied": False,
             "current_portfolio_stressed_loss_usdt": round(current_portfolio_risk, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
             "target_notional_usdt": round(target_notional, 8),
@@ -1801,7 +1776,6 @@ class EntryProfitRiskSizingPolicy:
             "paper_profitability_gate_applied": False,
             "selection_reason": normal_trade.get("selection_reason"),
             "single_trade_risk_fraction_cap": round(single_trade_risk_fraction, 8),
-            "portfolio_risk_fraction_cap": round(portfolio_risk_fraction, 8),
             "return_lcb_pct": round(return_lcb, 8),
             "execution_cost": execution_cost,
             "portfolio_risk_snapshot": portfolio_snapshot,

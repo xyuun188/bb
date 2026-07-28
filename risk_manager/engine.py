@@ -15,7 +15,6 @@ from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     normal_paper_trade_contract_reasons,
@@ -177,7 +176,8 @@ class RiskEngine:
         )
         position_size = RiskEngine._safe_positive_float(sizing.get("position_size_pct"))
         leverage = RiskEngine._safe_positive_float(decision.suggested_leverage)
-        if sizing.get("contract_lifecycle") == "normal_paper_trade":
+        normal_paper_trade = sizing.get("contract_lifecycle") == "normal_paper_trade"
+        if normal_paper_trade:
             normal_trade = raw.get("normal_paper_trade")
             normal_trade = normal_trade if isinstance(normal_trade, dict) else {}
             equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
@@ -203,10 +203,6 @@ class RiskEngine:
                 equity * expected_single_cap + 1e-8
             ):
                 return "Normal paper trade exceeds its single-trade risk cap."
-            if portfolio_budget > (
-                equity * NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
-            ):
-                return "Normal paper trade exceeds its portfolio risk cap."
             leverage_tier = sizing.get("leverage_tier_selection")
             leverage_tier = leverage_tier if isinstance(leverage_tier, dict) else {}
             tier_max = RiskEngine._safe_positive_float(leverage_tier.get("max_leverage"))
@@ -233,7 +229,10 @@ class RiskEngine:
             return "Dynamic account risk budget provenance is incomplete."
         if planned_loss <= 0 or risk_budget <= 0 or planned_loss > risk_budget + 1e-8:
             return "Dynamic planned loss exceeds or is missing from the account risk budget."
-        if portfolio_budget <= 0 or current_portfolio_risk + planned_loss > portfolio_budget + 1e-8:
+        if not normal_paper_trade and (
+            portfolio_budget <= 0
+            or current_portfolio_risk + planned_loss > portfolio_budget + 1e-8
+        ):
             return "Dynamic entry exceeds the portfolio stressed-loss budget."
         if final_notional <= 0 or final_notional > target_notional + 1e-8:
             return "Dynamic final notional exceeds or is missing from its target."

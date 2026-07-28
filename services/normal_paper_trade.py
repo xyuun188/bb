@@ -27,7 +27,6 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
 }
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
 NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION = 0.0001
-NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION = 0.0015
 NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
 NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
 
@@ -218,7 +217,6 @@ def build_normal_paper_trade_contract(
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
         "single_trade_risk_fraction_cap": single_trade_cap,
-        "portfolio_risk_fraction_cap": (NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION),
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
@@ -343,13 +341,6 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     )
     if not isclose(single_cap, expected_single_cap, abs_tol=1e-12):
         reasons.append("normal_paper_trade_single_risk_cap_invalid")
-    portfolio_cap = _float(contract.get("portfolio_risk_fraction_cap"), 0.0) or 0.0
-    if not isclose(
-        portfolio_cap,
-        NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
-        abs_tol=1e-12,
-    ):
-        reasons.append("normal_paper_trade_portfolio_risk_cap_invalid")
     if contract.get("leverage_policy") != NORMAL_PAPER_TRADE_LEVERAGE_POLICY:
         reasons.append("normal_paper_trade_leverage_policy_invalid")
     if contract.get("model_leverage_role") != "upper_bound_when_explicit":

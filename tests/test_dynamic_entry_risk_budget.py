@@ -3,6 +3,7 @@ from copy import deepcopy
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from risk_manager.engine import RiskEngine
 from services.entry_profit_risk_sizing import (
     EntryProfitRiskSizingPolicy,
     build_portfolio_correlation_context,
@@ -584,15 +585,25 @@ async def test_lower_available_margin_cannot_increase_final_notional() -> None:
 
 
 @pytest.mark.asyncio
-async def test_existing_portfolio_stress_exhausts_normal_paper_risk_budget() -> None:
+async def test_existing_portfolio_stress_does_not_reduce_normal_paper_risk_budget() -> None:
     baseline = _decision()
     pressured = _decision()
     pressured.raw_response["strategy_mode"]["portfolio_correlation"] = {
         "BTC/USDT|long": {"weighted_adverse_correlation": 0.8}
     }
     pressured.raw_response["exchange_risk_facts"]["contract_specs"] = {
-        "BTC-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
-        "ETH-USDT-SWAP": {"ctVal": "1", "ctMult": "1"},
+        "BTC-USDT-SWAP": {
+            "ctVal": "1",
+            "ctMult": "1",
+            "minSz": "0.01",
+            "lotSz": "0.01",
+        },
+        "ETH-USDT-SWAP": {
+            "ctVal": "1",
+            "ctMult": "1",
+            "minSz": "0.01",
+            "lotSz": "0.01",
+        },
     }
     open_positions = [
         {
@@ -620,11 +631,14 @@ async def test_existing_portfolio_stress_exhausts_normal_paper_risk_budget() -> 
 
     baseline_budget = baseline.raw_response["profit_risk_sizing"]["risk_budget_usdt"]
     pressured_sizing = pressured.raw_response["profit_risk_sizing"]
-    assert pressured_sizing["production_eligible"] is False
-    assert pressured_sizing["risk_budget_usdt"] <= baseline_budget
-    assert pressured_sizing["remaining_portfolio_risk_budget_usdt"] == 0.0
-    assert "normal_paper_notional_zero" in pressured_sizing["reason"]
+    assert pressured_sizing["production_eligible"] is True
+    assert pressured_sizing["risk_budget_usdt"] == pytest.approx(baseline_budget)
+    assert pressured_sizing["portfolio_risk_limit_applied"] is False
+    assert "portfolio_risk_budget_usdt" not in pressured_sizing
+    assert "remaining_portfolio_risk_budget_usdt" not in pressured_sizing
     assert pressured_sizing["current_portfolio_stressed_loss_usdt"] == pytest.approx(5.0)
+    assessment = RiskEngine().assess(pressured, open_positions, 1000.0)
+    assert assessment.approved is True
 
 
 @pytest.mark.asyncio
