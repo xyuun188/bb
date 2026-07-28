@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-07-27.paper-model-direction.v3"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-07-28.paper-model-direction.v4"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
@@ -186,8 +186,21 @@ def summarize_paper_quantitative_evidence(
         for horizon, rows in sorted(by_horizon.items())
         if rows
     ]
-    selected_horizon = (
-        max(
+    cohort_selection = _dict(competition.get("horizon_cohort_selection"))
+    cohort_horizon = _float(
+        cohort_selection.get("selected_horizon_minutes")
+        or competition.get("selected_horizon_minutes")
+    )
+    selected_horizon = next(
+        (
+            item
+            for item in horizon_candidates
+            if _float(item.get("horizon_minutes")) == cohort_horizon
+        ),
+        None,
+    )
+    if selected_horizon is None and cohort_horizon is None:
+        selected_horizon = max(
             horizon_candidates,
             key=lambda item: (
                 float(item["expected_net_return_pct"]),
@@ -196,10 +209,7 @@ def summarize_paper_quantitative_evidence(
                 -float(item["loss_probability"] or 1.0),
                 -float(item["horizon_minutes"]),
             ),
-        )
-        if horizon_candidates
-        else None
-    )
+        ) if horizon_candidates else None
     family_summaries = list(
         _dict(selected_horizon).get("family_summaries") or []
     )
@@ -242,8 +252,15 @@ def summarize_paper_quantitative_evidence(
         "prediction_horizon_minutes": _dict(selected_horizon).get(
             "horizon_minutes"
         ),
-        "available_prediction_horizons": sorted(by_horizon),
-        "horizon_selection_policy": "best_fee_after_return_coherent_horizon",
+        "available_prediction_horizons": [
+            item.get("horizon_minutes")
+            for item in cohort_selection.get("available_horizon_groups") or []
+            if _float(_dict(item).get("horizon_minutes")) is not None
+        ] or sorted(by_horizon),
+        "horizon_selection_policy": (
+            cohort_selection.get("selection_reason")
+            or "best_fee_after_return_coherent_horizon"
+        ),
         "positive_quant_sources": sorted(
             {
                 source

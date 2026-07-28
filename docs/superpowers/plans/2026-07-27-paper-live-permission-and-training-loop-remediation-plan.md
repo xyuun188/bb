@@ -4,7 +4,7 @@
 
 项目：`E:\code\bb`
 
-状态：本地实施完成，待线上自然交易闭环验收
+状态：实施、线上自然交易闭环验收和回归验证均已完成
 
 适用范围：OKX 模拟盘交易、模型持续训练、模型晋升、OKX 实盘权限边界、Dashboard 治理展示
 
@@ -1537,10 +1537,12 @@ Artifact 注册表必须拒绝：
 - 小样本阶段使用全市场共享 Logistic/Ridge 基线；训练按新增独立 `decision_group`、时间和漂移触发。
 - Artifact 生命周期已区分 `paper_champion`、`paper_challenger` 和 `rollback_model`，并保存训练 manifest、分区和重放权重。
 - Dashboard 和生产源健康检查已切换到 normal paper 口径，分别展示模拟盘允许、实盘权限、训练可用性和中文阻断原因。
+- Paper 多预测期限在统一决策边界按来源连续权重选择单一 cohort；权重相同时选择较短期限，未选期限仅作为观察证据，live 仍对期限不一致失败关闭。
+- 策略重评分显式继承 `paper/live` 执行模式，有效 normal paper 合同可以恢复 paper 身份，显式 live 不会被历史 paper 合同反向覆盖。
 
 ### 36.2 本地验证证据
 
-- 全量测试：`2913 passed, 4 skipped`。
+- 全量测试：`2921 passed, 4 skipped`。
 - 定向删除回归：`19 passed`。
 - 全目录 Ruff lint：通过。
 - Python `compileall`：通过。
@@ -1550,7 +1552,7 @@ Artifact 注册表必须拒绝：
 - 模拟盘协调路径在 live 收益下界和晋升门禁之前独立返回；生产资格字段仅保留在 live 分支、当前 OKX 硬事实完整性和历史审计语义中。
 - 自动训练游标已按清洗后的市场标签 decision_group 与 OKX 持仓生命周期组计数；新增单笔结果不会绕过最小独立组增量直接触发训练。
 
-仓库存在既有 Ruff 格式基线差异，因此没有对整个仓库做无关的全量格式化；本次最后手工修改的文件已经单独格式化并通过检查。全量测试曾出现一次 aiosqlite 线程清理时序警告，对应测试随后以 `PytestUnhandledThreadExceptionWarning` 提升为错误单独复跑并通过。
+本次没有对整个仓库做无关的全量格式化；最终最小语义差异已通过全目录 Ruff、compileall、`git diff --check` 和全量 pytest。全量测试曾出现一次 aiosqlite 线程清理时序警告，对应测试随后以 `PytestUnhandledThreadExceptionWarning` 提升为错误单独复跑并通过。
 
 ### 36.3 已完成的线上运行态证据
 
@@ -1570,13 +1572,22 @@ Artifact 注册表必须拒绝：
 - PEPE 自然运行暴露出退出公式把 `adverse_move / total_move` 直接当作平仓压力：三个极小幅度收益只要方向一致不利就会得到 1.0 并立即全平。公式已从底层改为“方向一致度 × 已消耗止损风险预算”，策略版本升级为 `2026-07-27.dynamic-exit-risk-scaled-continuation.v8`；硬止损仍全平，盈利回撤、模型退出、组合压力和替代机会合同保持不变。
 - ENA 历史平仓发现并修复同一 OKX 生命周期因本地时间戳差异形成的重复 Position：生命周期身份现由交易所身份、symbol/side、开平订单和数量决定，重复行自动退役，官方净实现盈亏不再重复累计。
 - 市价买入的最大提交数量现按 OKX 当时 `buyLmt` 最坏成交价裁剪，并记录 `fill_risk_price`、来源和最大成交名义金额；历史 FIL 超限事实保留为违规证据，部署后 30/60 分钟合同窗口违规为 0。
-- 最近 60 分钟线上自然产生 30 条市场决策、覆盖 15 个币种，以及 290 条持仓复盘；候选覆盖无逾期。交易和 Dashboard 服务均为 active，最近部署重启后的连续运行窗口仍在积累。
+- Paper 多期限修复后的决策 `134807`、`134811` 和 `134817` 均选中一致的 5 分钟 cohort，方向竞争有 2 个有效来源且无聚合阻断；10 分钟来源保留为 observation-only。旧决策 `134802` 及更早的期限冲突历史事实不回写。
+- 策略执行模式修复后的决策 `134852`、`134855`、`134857` 和 `134869` 均记录 `opportunity_scope=paper`，机会期限与方向竞争期限一致，机会评分 ready 且无 blocker。决策 `134871` 当轮没有合法期限来源而 HOLD，属于可解释的正常拒绝。
+- 部署后已自然执行 ETH、FIL、JUP、CRO、H、LINK 和 IRYS 等多个 normal paper 订单，证明未晋升模型可以正常分析和交易，不依赖 live 晋升状态。
+- JUP long 决策 `134817` 使用 `normal_strategy_trade`、`production_permission=false` 和 5 分钟预测期限；订单 5434 已由 OKX 原生成交确认，`fill_risk_price_source=okx_buy_price_limit`，最大成交名义金额 `42.826 USDT` 不超过计划名义金额 `43.49301973 USDT`。
+- SOL short 决策 `134144` 的自然退出决策 `134153` 使用 `dynamic-exit-risk-scaled-continuation.v8`，在无硬风险且持续恶化为 0 时仅平仓 `0.08459844`，证明微小不利波动不再触发整仓退出。
+- 最新 OKX 审计中 9 个持仓均有数量匹配的保护单，pending、missing、orphan、split、mismatch、invalid 和 repair blocker 均为 0；交易、Dashboard 和模型隧道服务均为 active。
+- 最终精准同步重启后的新决策 `135009`、`135043`、`135050`、`135061` 和 `135109` 再次确认：2 个有效来源、5 分钟统一 cohort、10 分钟 observation-only、聚合 blocker 为空，机会评分为 paper 且可参与 normal paper 决策。
+- 上述部分决策没有下单的原因是当时 11 个存量持仓的组合压力已经超过硬风险预算：例如决策 `135109` 的当前组合压力为 `7.34078186 USDT`，组合预算为 `6.55858024 USDT`，剩余风险预算为 0。该拒绝来自必须保留的组合风险边界，不是晋升、亏损统计、LCB 或 Profit Factor 门禁；同期自然平仓链持续运行。
+- 最终同步后的 15 分钟交易合同审计记录 3 开、3 平，入场与退出合同全部 ready，违规和废弃 policy payload 均为 0；OKX 最新 11 个持仓对应 11 个保护单，保护完整性 blocker 仍为 0。
+- 最终权威结果审计为 563 条结果、73 条事实完整可训练、490 条按事实缺口隔离；73 条可训练结果中 15 条盈利、58 条亏损，全部为 `normal_strategy_trade`，旧探索/训练身份和合同违规均为 0。
+- 最终严格 30 分钟连续性审计 `ready=true`：交易和 Dashboard 均为 `active/running`、重启数 0，28 条市场决策覆盖 11 个币种，最大活动间隔 `100.255` 秒，208 次持仓复盘；候选逾期、未解决 due 和全部 assessment blocker 均为 0。
 
-### 36.4 尚未完成的线上验收
+### 36.4 线上验收结论
 
-以下项目必须在部署后由自然运行态证明，未完成前不得把总计划标记为完成：
-
-- 等待部署后新的自然买入开仓，验证 `fill_risk_price_source=okx_buy_price_limit` 且 `maximum_fill_notional_usdt <= planned_notional_usdt`，并在成交结算后复核合同完整性。
-- 等待 `dynamic-exit-risk-scaled-continuation.v8` 部署后的自然退出，确认单次微小同向不利收益不会再次形成 `continuation_deterioration=1.0` 和无硬风险全平；ETH 剩余 0.005 ETH 可继续由完整 OCO 保护自然管理，不为验收人工平仓。
-- 部署后的交易和 Dashboard 服务需要继续积累完整连续运行窗口；重新执行线上覆盖审计后，`trading_service_continuity_unproven`、`dashboard_service_continuity_unproven` 和市场活动间隔告警必须消失或具有可解释的真实运行原因。
-- 完整自然生命周期验收后重新执行 30/60 分钟交易合同审计，要求部署后新增订单合同违规为 0，并再次确认 live 仍由晋升状态、`live_ml_ready` 和逐笔 `production_trade_gate` 失败关闭。
+- 自然买入、自然退出、连续决策、OKX 原生成交和保护单一致性均已由部署后运行态证明，不依赖人工构造订单。
+- 部署后新增 normal paper 订单合同违规为 0；历史违规和旧期限冲突继续保留为不可变审计事实，不冒充新合同结果。
+- Paper 交易链只受普通决策质量、账户、合约和硬风险约束；模型亏损、未晋升、收益 LCB、Profit Factor 和 `live_ml_ready` 不会反向关闭模拟盘采样。
+- Live 仍由模型晋升、`live_ml_ready` 和逐笔 `production_trade_gate` 共同失败关闭，paper 合同无法覆盖显式 live 执行模式。
+- 总计划的代码实施、本地全量回归、线上自然运行态验收、提交推送和项目记忆同步完成后可以标记为完成。

@@ -295,6 +295,64 @@ def test_paper_continuous_weights_can_change_direction_without_affecting_live() 
     assert live == equal
 
 
+def test_paper_mixed_horizons_select_shorter_equal_weight_cohort() -> None:
+    server = _paper_payload(0.1, 0.7)
+    for side in ("long", "short"):
+        server["return_distribution_contract"][side]["horizon_minutes"] = 10
+
+    context = _context(
+        ml=_governed_ml(0.8, -0.2),
+        tools={"profit_prediction": server},
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["enabled"] is True
+    assert context["preferred_side"] == "short"
+    assert context["selected_horizon_minutes"] == 10
+    assert context["decision_source_count"] == 2
+    assert context["aggregate_blockers"] == []
+    assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]
+    local_rows = [
+        item
+        for side in ("long", "short")
+        for item in context[side]["evidence"]
+        if item["source"] == "local_ml"
+    ]
+    assert all(item["decision_eligible"] is False for item in local_rows)
+    assert all(
+        item["eligibility_reason"] == "paper_prediction_horizon_not_selected"
+        for item in local_rows
+    )
+
+
+def test_paper_mixed_horizons_select_highest_weight_cohort() -> None:
+    server = _paper_payload(0.0, 0.7)
+    for side in ("long", "short"):
+        server["return_distribution_contract"][side]["horizon_minutes"] = 60
+
+    context = _context(
+        ml=_governed_ml(0.8, -0.2),
+        tools={"profit_prediction": server},
+        strategy={
+            "execution_mode": "paper",
+            "continuous_model_weights": {
+                "applied": True,
+                "quant_source_weights": {
+                    "local_ml": {"effective_multiplier": 0.1},
+                    "server_profit": {"effective_multiplier": 1.4},
+                },
+            },
+        },
+    )
+
+    assert context["enabled"] is True
+    assert context["preferred_side"] == "short"
+    assert context["selected_horizon_minutes"] == 60
+    assert context["training_long"]["horizon_minutes"] == 60
+    assert context["training_short"]["horizon_minutes"] == 60
+    assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]
+
+
 def test_mismatched_horizons_cannot_enter_direction_aggregation() -> None:
     payload = _governed_payload(0.6, -0.1)
     for side in ("long", "short"):

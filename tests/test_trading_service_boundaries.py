@@ -3460,6 +3460,70 @@ def test_entry_policy_fails_fast_without_opportunity_score_dependency():
         policy.score_candidate(_decision(Action.LONG), {})
 
 
+def test_entry_policy_strategy_context_preserves_explicit_execution_mode() -> None:
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "strategy_mode": {"execution_mode": "live"},
+        "strategy_learning_context": {"execution_mode": "live"},
+    }
+
+    context = EntryPolicy.strategy_context_from_decision(decision, "paper")
+
+    assert context["execution_mode"] == "paper"
+
+
+def test_entry_policy_strategy_context_recovers_valid_normal_paper_contract() -> None:
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol=decision.symbol,
+            side="long",
+            selection_reason="coverage_sampling",
+            direction_support={
+                "eligible": True,
+                "selected_side": "long",
+                "prediction_horizon_minutes": 5,
+            },
+        )
+    }
+
+    context = EntryPolicy.strategy_context_from_decision(decision)
+
+    assert context["execution_mode"] == "paper"
+
+
+@pytest.mark.asyncio
+async def test_entry_policy_evaluate_does_not_rescore_paper_as_live() -> None:
+    observed_modes: list[str | None] = []
+
+    class FakeScorer:
+        def score_candidate(self, decision, strategy):
+            observed_modes.append((strategy or {}).get("execution_mode"))
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            raw["opportunity_score"] = {"score": 0.1}
+            decision.raw_response = raw
+            return 0.1
+
+    class StopAfterScoring:
+        @staticmethod
+        def stale_decision_reason(_decision):
+            return "stop-after-scoring"
+
+    result = await EntryPolicy(
+        decision_freshness=StopAfterScoring(),
+        entry_opportunity_score=FakeScorer(),
+    ).evaluate(
+        _decision(Action.LONG),
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "stale_decision"
+    assert observed_modes == ["paper"]
+
+
 @pytest.mark.asyncio
 async def test_entry_policy_uses_injected_profit_risk_sizing_boundary():
     calls: list[tuple[str, str, int]] = []

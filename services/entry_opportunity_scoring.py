@@ -29,6 +29,7 @@ from services.entry_signal_extraction import (
 )
 from services.execution_cost_model import execution_cost_estimate
 from services.model_strategy_blueprint import paper_strategy_authorization
+from services.paper_prediction_horizon import select_paper_horizon_cohort
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
@@ -392,19 +393,27 @@ class EntryOpportunityScoringPolicy:
         claimed_components = [
             component for component in components if component["decision_claimed"]
         ]
+        quant_multipliers = _paper_quant_multipliers(strategy)
+        horizon_selection: dict[str, Any] = {}
         selected_paper_horizon = None
         if execution_scope == "paper":
             normal_paper_trade = safe_dict(raw.get("normal_paper_trade"))
-            selected_paper_horizon = _finite(
-                normal_paper_trade.get("prediction_horizon_minutes")
+            horizon_selection = select_paper_horizon_cohort(
+                selected_components,
+                preferred_horizon_minutes=normal_paper_trade.get(
+                    "prediction_horizon_minutes"
+                ),
+                source_weights=quant_multipliers,
             )
-            if selected_paper_horizon is not None:
-                selected_components = [
-                    component
-                    for component in selected_components
-                    if _finite(component.get("horizon_minutes"))
-                    == selected_paper_horizon
-                ]
+            selected_paper_horizon = _finite(
+                horizon_selection.get("selected_horizon_minutes")
+            )
+            selected_components = [
+                component
+                for component in selected_components
+                if _finite(component.get("horizon_minutes"))
+                == selected_paper_horizon
+            ]
             if selected_components:
                 claimed_components = list(selected_components)
         claimed_contracts = [
@@ -412,7 +421,6 @@ class EntryOpportunityScoringPolicy:
             for component in claimed_components
             if safe_dict(component.get("return_distribution_contract"))
         ]
-        quant_multipliers = _paper_quant_multipliers(strategy)
         claimed_model_weights = (
             [
                 quant_multipliers.get(str(component.get("key") or ""), 1.0)
@@ -423,6 +431,7 @@ class EntryOpportunityScoringPolicy:
             else None
         )
         input_blockers = []
+        input_blockers.extend(horizon_selection.get("blockers") or [])
         if len(claimed_contracts) != len(claimed_components):
             input_blockers.append("claimed_profit_target_distribution_missing")
         cost_distributions = _unique_distribution_rows(
@@ -619,12 +628,14 @@ class EntryOpportunityScoringPolicy:
             if combination_ready
             else "unavailable"
         )
+        selected_component_ids = {id(component) for component in selected_components}
         selected_weight_total = sum(
             quant_multipliers.get(str(component.get("key") or ""), 1.0)
             for component in selected_components
         )
         for component in components:
-            included = bool(combination_ready and component in selected_components)
+            selected = id(component) in selected_component_ids
+            included = bool(combination_ready and selected)
             component["included_in_return_distribution"] = included
             component["aggregate_eligible"] = bool(included)
             component_weight = quant_multipliers.get(
@@ -645,18 +656,17 @@ class EntryOpportunityScoringPolicy:
             )
             if quant_multipliers:
                 component["continuous_weight_multiplier"] = component_weight
-            if component in selected_components and not combination_ready:
+            if selected and not combination_ready:
                 component["observation_only"] = True
                 component["eligibility_reason"] = (
                     "aggregate_return_distribution_contract_blocked"
                 )
             elif (
                 execution_scope == "paper"
-                and selected_paper_horizon is not None
-                and component.get("decision_eligible") is True
-                and _finite(component.get("horizon_minutes"))
-                != selected_paper_horizon
+                and component.get("paper_eligible") is True
+                and not selected
             ):
+                component["decision_eligible"] = False
                 component["observation_only"] = True
                 component["eligibility_reason"] = (
                     "paper_prediction_horizon_not_selected"
@@ -774,6 +784,8 @@ class EntryOpportunityScoringPolicy:
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
             "return_combination_version": combination_version,
             "execution_cost": execution_cost.to_dict(),
+            "selected_horizon_minutes": selected_paper_horizon,
+            "horizon_cohort_selection": horizon_selection,
             "expected_net_breakdown": {
                 "formula": transformations.get("formula"),
                 "unit": "pct",

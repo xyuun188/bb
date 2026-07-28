@@ -106,7 +106,10 @@ class EntryPolicy:
         self.score_candidate(decision, strategy)
 
     @staticmethod
-    def strategy_context_from_decision(decision: DecisionOutput) -> dict[str, Any]:
+    def strategy_context_from_decision(
+        decision: DecisionOutput,
+        model_mode: str | None = None,
+    ) -> dict[str, Any]:
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         context: dict[str, Any] = {}
         strategy_mode = raw.get("strategy_mode")
@@ -115,6 +118,13 @@ class EntryPolicy:
         learning_context = raw.get("strategy_learning_context")
         if isinstance(learning_context, dict):
             context.update(learning_context)
+        explicit_mode = str(model_mode or "").strip().lower()
+        if explicit_mode in {"paper", "live"}:
+            context["execution_mode"] = explicit_mode
+            return context
+        paper_contract = raw.get("normal_paper_trade")
+        if not normal_paper_trade_contract_reasons(paper_contract):
+            context["execution_mode"] = "paper"
         return context
 
     def immediate_execution_reason(self, decision: DecisionOutput) -> str | None:
@@ -213,7 +223,7 @@ class EntryPolicy:
         ensure_normal_paper_trade_contract(decision, model_mode)
         self.ensure_opportunity_score(
             decision,
-            self.strategy_context_from_decision(decision),
+            self.strategy_context_from_decision(decision, model_mode),
         )
         if self.entry_opportunity_score is None:
             await self.apply_profit_risk_sizing(
@@ -258,7 +268,7 @@ class EntryPolicy:
         decision.feature_snapshot = snapshot
         self.score_candidate(
             decision,
-            self.strategy_context_from_decision(decision),
+            self.strategy_context_from_decision(decision, model_mode),
         )
         await self.apply_profit_risk_sizing(
             decision,
@@ -352,7 +362,7 @@ class EntryPolicy:
         if self.entry_opportunity_score is not None:
             self.score_candidate(
                 decision,
-                self.strategy_context_from_decision(decision),
+                self.strategy_context_from_decision(decision, model_mode),
             )
 
         safety_reason = self.gate_reason(decision)

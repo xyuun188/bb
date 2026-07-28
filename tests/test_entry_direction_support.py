@@ -231,3 +231,36 @@ def test_paper_quantitative_summary_never_averages_different_horizons() -> None:
     assert support["prediction_horizon_minutes"] == 60.0
     assert support["available_prediction_horizons"] == [10.0, 60.0]
     assert directional_entry_support_reasons(support, "long") == []
+
+
+def test_paper_quantitative_summary_inherits_direction_cohort_selection() -> None:
+    server_profit = _row("server_profit", raw=0.2, objective=0.1)
+    server_profit["horizon_minutes"] = 10
+    timeseries = _row("timeseries", raw=0.8, objective=0.4)
+    timeseries["horizon_minutes"] = 60
+    competition = {
+        "selected_horizon_minutes": 10.0,
+        "horizon_cohort_selection": {
+            "selected_horizon_minutes": 10.0,
+            "selection_reason": "highest_continuous_weight_then_shortest_horizon",
+            "available_horizon_groups": [
+                {"horizon_minutes": 10.0},
+                {"horizon_minutes": 60.0},
+            ],
+        },
+        "long": {"evidence": [server_profit, timeseries]},
+    }
+
+    summary = summarize_paper_quantitative_evidence(
+        competition,
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert summary["prediction_horizon_minutes"] == 10.0
+    assert summary["available_prediction_horizons"] == [10.0, 60.0]
+    assert summary["expected_net_return_pct"] == pytest.approx(0.1)
+    assert summary["quant_family_summaries"][0]["sources"] == ["server_profit"]
+    assert summary["horizon_selection_policy"] == (
+        "highest_continuous_weight_then_shortest_horizon"
+    )

@@ -13,6 +13,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution,
     signal_return_distribution_eligibility,
 )
+from services.paper_prediction_horizon import select_paper_horizon_cohort
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -90,7 +91,10 @@ def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
+def _training_side_summary(
+    values: list[dict[str, Any]],
+    selected_horizon_minutes: float | None,
+) -> dict[str, Any]:
     """Summarize directional observations without requiring promotion permission."""
 
     objective_values = [
@@ -99,7 +103,8 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
-        if item.get("paper_eligible") is True
+        if item.get("training_aggregate_eligible") is True
+        and _safe_float(item.get("horizon_minutes")) == selected_horizon_minutes
         and _safe_float(item.get("objective_expected_return_pct")) is not None
     ]
     raw_values = [
@@ -108,13 +113,15 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
-        if item.get("paper_eligible") is True
+        if item.get("training_aggregate_eligible") is True
+        and _safe_float(item.get("horizon_minutes")) == selected_horizon_minutes
         and _safe_float(item.get("raw_expected_return_pct")) is not None
     ]
     horizon_values = [
         float(item["horizon_minutes"])
         for item in values
-        if item.get("paper_eligible") is True
+        if item.get("training_aggregate_eligible") is True
+        and _safe_float(item.get("horizon_minutes")) == selected_horizon_minutes
         and (_safe_float(item.get("horizon_minutes")) or 0.0) > 0
     ]
     selected = objective_values or raw_values
@@ -130,6 +137,8 @@ def _training_side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _enforce_aggregate_contract_consistency(
     evidence: dict[str, list[dict[str, Any]]],
+    *,
+    include_horizon: bool,
 ) -> list[str]:
     eligible = [
         item
@@ -137,25 +146,17 @@ def _enforce_aggregate_contract_consistency(
         for item in evidence[side]
         if item.get("decision_eligible") is True
     ]
-    signatures = {
-        (
-            item.get("objective_version"),
-            item.get("label_version"),
-            item.get("cost_model_version"),
-            item.get("profit_supervision_version"),
-            item.get("horizon_minutes"),
-        )
-        for item in eligible
-    }
-    if len(signatures) <= 1:
-        return []
-    fields = (
+    fields = [
         "objective_version",
         "label_version",
         "cost_model_version",
         "profit_supervision_version",
-        "horizon_minutes",
-    )
+    ]
+    if include_horizon:
+        fields.append("horizon_minutes")
+    signatures = {tuple(item.get(field) for field in fields) for item in eligible}
+    if len(signatures) <= 1:
+        return []
     blockers = [
         f"direction_competition_{field}_mismatch"
         for index, field in enumerate(fields)
@@ -216,11 +217,49 @@ class EntryDirectionCompetitionPolicy:
                 for item in evidence[side]:
                     source = str(item.get("source") or "")
                     item["continuous_weight_multiplier"] = quant_weights.get(source, 1.0)
-        aggregate_blockers = _enforce_aggregate_contract_consistency(evidence)
+        all_rows = [item for side in ("long", "short") for item in evidence[side]]
+        aggregate_blockers = _enforce_aggregate_contract_consistency(
+            evidence,
+            include_horizon=execution_scope == "live",
+        )
+        horizon_selection: dict[str, Any] = {}
+        if execution_scope == "paper" and not aggregate_blockers:
+            horizon_selection = select_paper_horizon_cohort(
+                (item for item in all_rows if item.get("decision_eligible") is True),
+                source_weights=quant_weights,
+            )
+            aggregate_blockers.extend(horizon_selection.get("blockers") or [])
+            selected_horizon = _safe_float(
+                horizon_selection.get("selected_horizon_minutes")
+            )
+            for item in all_rows:
+                if item.get("decision_eligible") is not True:
+                    continue
+                if _safe_float(item.get("horizon_minutes")) == selected_horizon:
+                    item["aggregate_eligible"] = True
+                    continue
+                item["decision_eligible"] = False
+                item["aggregate_eligible"] = False
+                item["observation_only"] = True
+                item["eligibility_reason"] = "paper_prediction_horizon_not_selected"
+
+        training_rows = [item for item in all_rows if item.get("paper_eligible") is True]
+        training_horizon_selection = select_paper_horizon_cohort(
+            training_rows,
+            source_weights=quant_weights,
+        )
+        training_horizon = _safe_float(
+            training_horizon_selection.get("selected_horizon_minutes")
+        )
+        for item in all_rows:
+            item["training_aggregate_eligible"] = bool(
+                item.get("paper_eligible") is True
+                and _safe_float(item.get("horizon_minutes")) == training_horizon
+            )
         long_side = _side_summary(evidence["long"])
         short_side = _side_summary(evidence["short"])
-        long_training = _training_side_summary(evidence["long"])
-        short_training = _training_side_summary(evidence["short"])
+        long_training = _training_side_summary(evidence["long"], training_horizon)
+        short_training = _training_side_summary(evidence["short"], training_horizon)
         long_score = _safe_float(long_side.get("score"))
         short_score = _safe_float(short_side.get("score"))
         source_count = int(long_side["decision_source_count"]) + int(
@@ -293,6 +332,13 @@ class EntryDirectionCompetitionPolicy:
             "production_permission": False,
             "policy": "execution_scoped_gross_market_observation_only_no_fixed_gap",
             "aggregate_blockers": aggregate_blockers,
+            "selected_horizon_minutes": (
+                horizon_selection.get("selected_horizon_minutes")
+                if execution_scope == "paper"
+                else None
+            ),
+            "horizon_cohort_selection": horizon_selection,
+            "training_horizon_cohort_selection": training_horizon_selection,
             "policy_provenance": {
                 "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
