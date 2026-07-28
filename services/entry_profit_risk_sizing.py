@@ -20,7 +20,6 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_LEVERAGE_CAP,
     NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
@@ -346,6 +345,7 @@ def _candidate_existing_exposure(
     candidate_side = _side(decision)
     notional = 0.0
     contracts = 0.0
+    leverages: list[float] = []
     for position in positions:
         item = _safe_dict(position)
         if item.get("is_open", True) is False:
@@ -360,9 +360,19 @@ def _candidate_existing_exposure(
         position_notional, valuation = _position_notional(item, contract_specs)
         notional += position_notional
         contracts += max(_safe_float(valuation.get("contracts"), 0.0), 0.0)
+        leverage = max(
+            _safe_float(
+                item.get("leverage") or info.get("lever") or info.get("leverage"),
+                0.0,
+            ),
+            0.0,
+        )
+        if leverage > 0.0:
+            leverages.append(leverage)
     return {
         "notional_usdt": notional,
         "contracts": contracts,
+        "leverage": min(leverages) if leverages else 0.0,
     }
 
 
@@ -509,6 +519,7 @@ def reconcile_profit_risk_sizing(
         _safe_float(sizing.get("model_requested_leverage"), 0.0),
         0.0,
     )
+    model_leverage_is_explicit = sizing.get("model_leverage_is_explicit") is not False
     model_position_fraction = _clamp(
         _safe_float(sizing.get("model_requested_position_fraction"), 0.0)
     )
@@ -521,7 +532,11 @@ def reconcile_profit_risk_sizing(
         reasons.append("execution_leverage_tier_contract_missing")
     elif leverage > tier_max_leverage + 1e-8:
         reasons.append("execution_leverage_exceeds_selected_okx_tier")
-    if model_requested_leverage >= 1.0 and leverage > model_requested_leverage + 1e-8:
+    if (
+        model_leverage_is_explicit
+        and model_requested_leverage >= 1.0
+        and leverage > model_requested_leverage + 1e-8
+    ):
         reasons.append("execution_leverage_exceeds_model_request")
     notional_ceiling = (
         fill_notional_ceiling
@@ -1379,8 +1394,24 @@ class EntryProfitRiskSizingPolicy:
             prior_sizing.get("contract_version") == NORMAL_PAPER_TRADE_SIZING_VERSION
             and prior_sizing.get("contract_lifecycle") == "normal_paper_trade"
         )
-        requested_leverage = min(
-            max(
+        recommendation = _safe_dict(raw.get("multidimensional_recommendation"))
+        recommendation_fallback_fields = {
+            str(item) for item in _safe_list(recommendation.get("fallback_fields"))
+        }
+        leverage_contributors = _safe_list(
+            _safe_dict(recommendation.get("contributors")).get("suggested_leverage")
+        )
+        model_leverage_is_explicit = (
+            bool(prior_sizing.get("model_leverage_is_explicit"))
+            if reuse_model_request
+            else (
+                bool(leverage_contributors)
+                and "suggested_leverage" not in recommendation_fallback_fields
+                if recommendation
+                else True
+            )
+        )
+        model_requested_leverage = max(
             _safe_float(
                 prior_sizing.get("model_requested_leverage")
                 if reuse_model_request
@@ -1388,8 +1419,6 @@ class EntryProfitRiskSizingPolicy:
                 1.0,
             ),
             1.0,
-            ),
-            NORMAL_PAPER_TRADE_LEVERAGE_CAP,
         )
         model_position_fraction = _clamp(
             _safe_float(
@@ -1462,21 +1491,11 @@ class EntryProfitRiskSizingPolicy:
             remaining_portfolio_risk_budget,
         )
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
-        model_requested_notional_cap = (
-            available_margin * model_position_fraction * requested_leverage
-            if model_position_cap_applied
-            else available_margin * requested_leverage
-        )
         fill_drift_reserve_fraction = max(
             max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0) / 100.0,
             NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
         )
-        fill_notional_ceiling = min(
-            available_margin * requested_leverage,
-            side_depth,
-            risk_limited_notional,
-            model_requested_notional_cap,
-        )
+        risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
             target_contract_spec,
             target_price,
@@ -1484,6 +1503,38 @@ class EntryProfitRiskSizingPolicy:
         minimum_order_notional = max(
             _safe_float(minimum_order.get("minimum_notional_usdt"), 0.0),
             0.0,
+        )
+        tier_target_notional = (
+            risk_and_liquidity_ceiling / (1.0 + fill_drift_reserve_fraction)
+            if risk_and_liquidity_ceiling > 0
+            else 0.0
+        )
+        leverage_tier_selection = select_okx_leverage_tier(
+            facts.get("leverage_tiers"),
+            target_notional_usdt=tier_target_notional,
+            mark_price=target_price,
+            contract_spec=target_contract_spec,
+            current_position_notional_usdt=existing_exposure["notional_usdt"],
+            current_position_contracts=existing_exposure["contracts"],
+        )
+        max_leverage = max(
+            _safe_float(leverage_tier_selection.get("max_leverage"), 0.0),
+            0.0,
+        )
+        requested_leverage = (
+            min(model_requested_leverage, max_leverage)
+            if model_leverage_is_explicit and max_leverage >= 1.0
+            else max(max_leverage, 1.0)
+        )
+        model_requested_notional_cap = (
+            available_margin * model_position_fraction * requested_leverage
+            if model_position_cap_applied
+            else risk_and_liquidity_ceiling
+        )
+        fill_notional_ceiling = min(
+            available_margin * requested_leverage,
+            risk_and_liquidity_ceiling,
+            model_requested_notional_cap,
         )
         unconstrained_target_notional = (
             fill_notional_ceiling / (1.0 + fill_drift_reserve_fraction)
@@ -1500,27 +1551,6 @@ class EntryProfitRiskSizingPolicy:
             if minimum_order_supported
             else unconstrained_target_notional
         )
-        leverage_tier_selection = select_okx_leverage_tier(
-            facts.get("leverage_tiers"),
-            target_notional_usdt=target_notional,
-            mark_price=target_price,
-            contract_spec=target_contract_spec,
-            current_position_notional_usdt=existing_exposure["notional_usdt"],
-            current_position_contracts=existing_exposure["contracts"],
-        )
-        max_leverage = max(
-            _safe_float(leverage_tier_selection.get("max_leverage"), 0.0),
-            0.0,
-        )
-        final_leverage = min(requested_leverage, max_leverage) if max_leverage >= 1 else 1.0
-        model_final_notional_cap = model_requested_notional_cap
-        final_notional = min(
-            target_notional,
-            available_margin * final_leverage,
-            side_depth,
-            model_final_notional_cap,
-        )
-        planned_loss = final_notional * stress_fraction
         expected_net = _safe_float(
             distribution.get("raw_expected_return_pct"),
             float("nan"),
@@ -1548,6 +1578,80 @@ class EntryProfitRiskSizingPolicy:
             return_lcb = _safe_float(
                 normal_trade.get("objective_net_return_pct"), 0.0
             )
+        expected_loss = max(
+            _safe_float(opportunity.get("expected_loss_pct"), 0.0),
+            _safe_float(distribution.get("tail_loss_penalty_pct"), 0.0),
+            0.0,
+        )
+        loss_probability = _clamp(
+            _safe_float(
+                opportunity.get(
+                    "server_profit_loss_probability",
+                    normal_trade.get("loss_probability"),
+                ),
+                1.0,
+            )
+        )
+        tail_risk = _clamp(
+            max(
+                _safe_float(opportunity.get("tail_risk_score"), 0.0),
+                _safe_float(distribution.get("tail_loss_probability"), 0.0),
+            )
+        )
+        profit_quality = max(_safe_float(opportunity.get("profit_quality_ratio"), 0.0), 0.0)
+        aligned_source_count = len(
+            {
+                str(item).strip()
+                for item in _safe_list(normal_trade.get("quant_evidence_families"))
+                if str(item).strip()
+            }
+        )
+        portfolio_capacity_fraction = _clamp(
+            remaining_portfolio_risk_budget / max(portfolio_risk_budget, 1e-12)
+        )
+        allocator = self.dynamic_leverage_allocator or DynamicLeverageAllocator()
+        leverage_decision = allocator.allocate(
+            DynamicLeverageInput(
+                symbol=decision.symbol,
+                requested_leverage=requested_leverage,
+                system_max_leverage=max_leverage,
+                target_notional_usdt=target_notional,
+                available_margin_usdt=available_margin,
+                stressed_loss_fraction=stress_fraction,
+                expected_net_return_pct=expected_net,
+                return_lcb_pct=return_lcb,
+                expected_loss_pct=expected_loss,
+                profit_quality_ratio=profit_quality,
+                loss_probability=loss_probability,
+                tail_risk_score=tail_risk,
+                aligned_source_count=aligned_source_count,
+                atr_pct=_atr_ratio(decision),
+                execution_cost=execution_cost,
+                portfolio_capacity_fraction=portfolio_capacity_fraction,
+                policy_scope="paper",
+            )
+        )
+        dynamic_leverage_limit = float(leverage_decision.final_integer_leverage)
+        existing_position_leverage = max(
+            _safe_float(existing_exposure.get("leverage"), 0.0),
+            0.0,
+        )
+        existing_leverage_exceeds_dynamic_limit = bool(
+            existing_position_leverage > dynamic_leverage_limit + 1e-8
+        )
+        final_leverage = (
+            existing_position_leverage
+            if existing_position_leverage > 0.0
+            else dynamic_leverage_limit
+        )
+        model_final_notional_cap = model_requested_notional_cap
+        final_notional = min(
+            target_notional,
+            available_margin * final_leverage,
+            side_depth,
+            model_final_notional_cap,
+        )
+        planned_loss = final_notional * stress_fraction
         dynamic_take_profit = max(
             declared_take_profit,
             abs(expected_net) / 100.0,
@@ -1567,6 +1671,10 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_orderbook_depth_missing")
         if leverage_tier_selection.get("production_eligible") is not True:
             reasons.append("normal_paper_leverage_tier_incomplete")
+        if leverage_decision.policy_provenance.get("production_eligible") is not True:
+            reasons.extend(leverage_decision.reasons)
+        if existing_leverage_exceeds_dynamic_limit:
+            reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
         if final_notional <= 0:
             reasons.append("normal_paper_notional_zero")
         if minimum_order_notional <= 0.0:
@@ -1587,6 +1695,10 @@ class EntryProfitRiskSizingPolicy:
             "target_price": target_price,
             "side_depth": side_depth,
             "requested_leverage": requested_leverage,
+            "model_requested_leverage": model_requested_leverage,
+            "model_leverage_is_explicit": model_leverage_is_explicit,
+            "dynamic_leverage_limit": dynamic_leverage_limit,
+            "existing_position_leverage": existing_position_leverage,
             "model_requested_position_fraction": model_position_fraction,
             "model_requested_notional_cap_usdt": model_requested_notional_cap,
             "model_position_cap_applied": model_position_cap_applied,
@@ -1655,7 +1767,9 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "model_requested_position_fraction": round(model_position_fraction, 8),
-            "model_requested_leverage": round(requested_leverage, 8),
+            "model_requested_leverage": round(model_requested_leverage, 8),
+            "model_leverage_is_explicit": model_leverage_is_explicit,
+            "leverage_candidate_cap": round(requested_leverage, 8),
             "model_requested_notional_cap_usdt": round(
                 model_requested_notional_cap,
                 8,
@@ -1669,6 +1783,12 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
+            "dynamic_leverage_decision": leverage_decision.to_dict(),
+            "existing_position_leverage": (
+                round(existing_position_leverage, 8)
+                if existing_position_leverage > 0.0
+                else None
+            ),
             "expected_net_return_pct": round(expected_net, 8),
             "expected_profit_usdt": round(final_notional * expected_net / 100.0, 8),
             "declared_stop_loss_fraction": round(declared_stop, 8),

@@ -277,6 +277,109 @@ async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_normal_paper_uses_dynamic_leverage_for_positive_edge() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert decision.suggested_leverage > 1.0
+    assert decision.suggested_leverage <= 8.0
+    assert sizing["dynamic_leverage_decision"]["version"] == "dynamic_leverage_allocator_v4"
+    assert sizing["dynamic_leverage_decision"]["policy_provenance"]["policy_scope"] == "paper"
+
+
+@pytest.mark.asyncio
+async def test_fallback_one_x_is_not_treated_as_model_leverage_cap() -> None:
+    decision = _decision()
+    decision.suggested_leverage = 1.0
+    decision.raw_response["multidimensional_recommendation"] = {
+        "fallback_fields": ["suggested_leverage"],
+        "contributors": {"suggested_leverage": []},
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["model_leverage_is_explicit"] is False
+    assert sizing["model_requested_leverage"] == 1.0
+    assert decision.suggested_leverage > 1.0
+
+
+@pytest.mark.asyncio
+async def test_explicit_one_x_model_recommendation_remains_an_upper_bound() -> None:
+    decision = _decision()
+    decision.suggested_leverage = 1.0
+    decision.raw_response["multidimensional_recommendation"] = {
+        "fallback_fields": [],
+        "contributors": {"suggested_leverage": ["risk_expert"]},
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["model_leverage_is_explicit"] is True
+    assert decision.suggested_leverage == 1.0
+
+
+@pytest.mark.asyncio
+async def test_coverage_sampling_with_negative_edge_stays_at_one_x() -> None:
+    decision = _decision()
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["expected_net_return_pct"] = -0.1
+    opportunity["return_distribution_contract"]["raw_expected_return_pct"] = -0.1
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="coverage_sampling",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": -0.1,
+            "objective_net_return_pct": -0.2,
+            "loss_probability": 0.7,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    assert decision.raw_response["profit_risk_sizing"]["production_eligible"] is True
+    assert decision.suggested_leverage == 1.0
+
+
+@pytest.mark.asyncio
+async def test_existing_position_above_dynamic_limit_fails_closed() -> None:
+    decision = _decision()
+    decision.raw_response["opportunity_score"]["tail_risk_score"] = 0.95
+    open_positions = [
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "notional": 10.0,
+            "contracts": 0.1,
+            "leverage": 20.0,
+            "is_open": True,
+            "info": {"instId": "BTC-USDT-SWAP"},
+        }
+    ]
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", open_positions)
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert "normal_paper_existing_leverage_exceeds_dynamic_limit" in sizing["reason"]
+
+
+@pytest.mark.asyncio
 async def test_live_rules_canary_sizes_without_profit_distribution_or_model_control() -> None:
     decision = _decision()
     opportunity = decision.raw_response["opportunity_score"]

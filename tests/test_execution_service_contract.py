@@ -174,6 +174,16 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
             "minimum_order_notional_usdt": 1.0,
             "final_margin_usdt": 40.0,
             "final_leverage": 1.0,
+            "model_requested_leverage": 1.0,
+            "model_leverage_is_explicit": True,
+            "dynamic_leverage_decision": {
+                "version": "dynamic_leverage_allocator_v4",
+                "final_integer_leverage": 1,
+            },
+            "leverage_tier_selection": {
+                "production_eligible": True,
+                "max_leverage": 20.0,
+            },
         }
     )
     raw["execution_cost_sizing_pass"].update(

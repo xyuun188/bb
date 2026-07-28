@@ -46,6 +46,7 @@ class DynamicLeverageInput:
     atr_pct: float = 0.0
     execution_cost: dict[str, Any] = field(default_factory=dict)
     portfolio_capacity_fraction: float = 1.0
+    policy_scope: str = "live"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +69,7 @@ class DynamicLeverageDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": "dynamic_leverage_allocator_v3",
+            "version": "dynamic_leverage_allocator_v4",
             "requested_leverage": round(self.requested_leverage, 6),
             "theoretical_leverage": round(self.theoretical_leverage, 6),
             "final_integer_leverage": self.final_integer_leverage,
@@ -91,6 +92,8 @@ class DynamicLeverageAllocator:
     """Allocate integer leverage from symbol/signal/risk context."""
 
     def allocate(self, data: DynamicLeverageInput) -> DynamicLeverageDecision:
+        policy_scope = str(data.policy_scope or "live").lower()
+        paper_scope = policy_scope == "paper"
         raw_system_max = _safe_float(data.system_max_leverage, 0.0)
         system_max = max(floor(raw_system_max), 1)
         requested = _clamp(_safe_float(data.requested_leverage, 1.0), 1.0, float(system_max))
@@ -98,9 +101,9 @@ class DynamicLeverageAllocator:
         adjustments: list[dict[str, Any]] = []
         cost = data.execution_cost if isinstance(data.execution_cost, dict) else {}
         missing_inputs: list[str] = []
-        if int(data.aligned_source_count) <= 0:
+        if not paper_scope and int(data.aligned_source_count) <= 0:
             missing_inputs.append("authoritative_return_samples_missing")
-        if _safe_float(data.expected_net_return_pct, 0.0) <= 0:
+        if not paper_scope and _safe_float(data.expected_net_return_pct, 0.0) <= 0:
             missing_inputs.append("positive_fee_after_return_missing")
         if cost.get("production_eligible") is not True:
             missing_inputs.append("live_execution_cost_incomplete")
@@ -132,7 +135,8 @@ class DynamicLeverageAllocator:
                     "observation_window": "current_decision_with_active_account_state",
                     "sample_count": max(int(data.aligned_source_count), 0),
                     "generated_at": datetime.now(UTC).isoformat(),
-                    "strategy_version": "2026-07-22.model-capped-risk-leverage.v4",
+                    "strategy_version": "2026-07-28.scope-aware-dynamic-leverage.v5",
+                    "policy_scope": policy_scope,
                     "fallback_reason": fallback_reason,
                     "production_eligible": False,
                 },
@@ -141,7 +145,16 @@ class DynamicLeverageAllocator:
         signal_quality = self._signal_quality_leverage(data, float(system_max), adjustments)
         volatility = self._volatility_leverage(data, float(system_max), adjustments)
         liquidity = self._liquidity_leverage(data, float(system_max), adjustments)
-        history = self._history_leverage(data, float(system_max), adjustments)
+        if paper_scope:
+            history = float(system_max)
+            adjustments.append(
+                {
+                    "factor": "paper_history_not_a_leverage_gate",
+                    "leverage": history,
+                }
+            )
+        else:
+            history = self._history_leverage(data, float(system_max), adjustments)
         portfolio = self._portfolio_leverage(data, float(system_max), adjustments)
 
         candidates = {
@@ -203,7 +216,8 @@ class DynamicLeverageAllocator:
                 "observation_window": "current_decision_with_active_account_state",
                 "sample_count": max(int(data.aligned_source_count), 0),
                 "generated_at": datetime.now(UTC).isoformat(),
-                "strategy_version": "2026-07-22.model-capped-risk-leverage.v4",
+                "strategy_version": "2026-07-28.scope-aware-dynamic-leverage.v5",
+                "policy_scope": policy_scope,
                 "fallback_reason": "",
                 "production_eligible": True,
             },

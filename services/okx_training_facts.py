@@ -9,8 +9,10 @@ from typing import Any
 
 from services.normal_paper_trade import (
     HISTORICAL_NORMAL_PAPER_TRADE_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_VERSION,
     historical_normal_paper_trade_contract_reasons,
+    legacy_normal_paper_v2_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_execution_slippage import (
@@ -863,12 +865,17 @@ def build_okx_history_training_sample(
     normal_paper = _dict(raw_llm_response.get("normal_paper_trade"))
     normal_paper_version = _text(normal_paper.get("version"))
     current_normal_paper = bool(normal_paper and normal_paper_version == NORMAL_PAPER_TRADE_VERSION)
+    legacy_v2_normal_paper = bool(
+        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_VERSION
+    )
     historical_normal_paper = bool(
         normal_paper and normal_paper_version == HISTORICAL_NORMAL_PAPER_TRADE_VERSION
     )
     normal_paper_gaps = []
     if current_normal_paper:
         normal_paper_gaps = normal_paper_trade_contract_reasons(normal_paper)
+    elif legacy_v2_normal_paper:
+        normal_paper_gaps = legacy_normal_paper_v2_trade_contract_reasons(normal_paper)
     elif historical_normal_paper:
         normal_paper_gaps = historical_normal_paper_trade_contract_reasons(normal_paper)
     elif normal_paper:
@@ -885,7 +892,9 @@ def build_okx_history_training_sample(
         paper_training_gaps.append("paper_training_non_paper_execution_mode")
     if paper_training and (paper_exploration or paper_canary):
         paper_training_gaps.append("paper_training_conflicting_entry_contract")
-    if current_normal_paper and (paper_exploration or paper_training or paper_canary):
+    if (current_normal_paper or legacy_v2_normal_paper) and (
+        paper_exploration or paper_training or paper_canary
+    ):
         normal_paper_gaps.append("normal_paper_trade_conflicting_legacy_contract")
     normal_paper_gaps = list(dict.fromkeys(normal_paper_gaps))
     paper_training_gaps = list(dict.fromkeys(paper_training_gaps))
@@ -1051,11 +1060,13 @@ def build_okx_history_training_sample(
             if valid_paper_exploration
             else "normal_paper_v1"
             if valid_normal_paper and historical_normal_paper
+            else "normal_paper_v2"
+            if valid_normal_paper and legacy_v2_normal_paper
             else None
         ),
         "strategy_selection_reason": (
             _text(normal_paper.get("selection_reason"))
-            if valid_normal_paper and current_normal_paper
+            if valid_normal_paper and (current_normal_paper or legacy_v2_normal_paper)
             else _text(normal_paper.get("route_kind"))
             if valid_normal_paper and historical_normal_paper
             else _text(paper_training.get("selection_reason"))
@@ -1068,7 +1079,11 @@ def build_okx_history_training_sample(
             {
                 "version": normal_paper.get("version"),
                 "contract_generation": (
-                    "current_normal_v2" if current_normal_paper else "historical_normal_v1"
+                    "current_dynamic_v3"
+                    if current_normal_paper
+                    else "historical_fixed_v2"
+                    if legacy_v2_normal_paper
+                    else "historical_normal_v1"
                 ),
                 "entry_type": normal_paper.get("entry_type"),
                 "route_kind": normal_paper.get("route_kind"),

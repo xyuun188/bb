@@ -60,6 +60,9 @@ def test_positive_net_direction_builds_normal_policy_trade() -> None:
         == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
     assert contract["production_permission"] is False
+    assert contract["leverage_policy"] == "dynamic_risk_and_okx_tier"
+    assert contract["model_leverage_role"] == "upper_bound_when_explicit"
+    assert "leverage_cap" not in contract
 
 
 def test_negative_net_direction_uses_bounded_coverage_in_same_order_pipeline() -> None:

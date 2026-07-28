@@ -10,8 +10,10 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-07-27.normal-paper-strategy-trade.v2"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-27.normal-paper-risk.v2"
+NORMAL_PAPER_TRADE_VERSION = "2026-07-28.normal-paper-strategy-trade.v3"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v3"
+LEGACY_NORMAL_PAPER_TRADE_VERSION = "2026-07-27.normal-paper-strategy-trade.v2"
+LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-27.normal-paper-risk.v2"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSION = "2026-07-22.normal-paper-trade.v1"
 HISTORICAL_NORMAL_PAPER_TRADE_ROUTES = {
     "evidence_best",
@@ -26,7 +28,7 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
 NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION = 0.0001
 NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION = 0.0015
-NORMAL_PAPER_TRADE_LEVERAGE_CAP = 1.0
+NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
 NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
 
 
@@ -77,7 +79,8 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "strong_expert_opposition",
             "single_trade_risk_fraction_cap",
             "portfolio_risk_fraction_cap",
-            "leverage_cap",
+            "leverage_policy",
+            "model_leverage_role",
             "uses_shared_order_pipeline",
             "uses_shared_position_ledger",
             "continuous_training_after_trusted_settlement",
@@ -216,7 +219,8 @@ def build_normal_paper_trade_contract(
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
         "single_trade_risk_fraction_cap": single_trade_cap,
         "portfolio_risk_fraction_cap": (NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION),
-        "leverage_cap": NORMAL_PAPER_TRADE_LEVERAGE_CAP,
+        "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+        "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
         "uses_shared_position_ledger": True,
         "continuous_training_after_trusted_settlement": True,
@@ -346,13 +350,77 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
         abs_tol=1e-12,
     ):
         reasons.append("normal_paper_trade_portfolio_risk_cap_invalid")
-    leverage_cap = _float(contract.get("leverage_cap"), 0.0) or 0.0
-    if not isclose(leverage_cap, NORMAL_PAPER_TRADE_LEVERAGE_CAP, abs_tol=1e-12):
-        reasons.append("normal_paper_trade_leverage_cap_invalid")
+    if contract.get("leverage_policy") != NORMAL_PAPER_TRADE_LEVERAGE_POLICY:
+        reasons.append("normal_paper_trade_leverage_policy_invalid")
+    if contract.get("model_leverage_role") != "upper_bound_when_explicit":
+        reasons.append("normal_paper_trade_model_leverage_role_invalid")
     if contract.get("contract_fingerprint") != _fingerprint(
         _contract_fingerprint_payload(contract)
     ):
         reasons.append("normal_paper_trade_fingerprint_mismatch")
+    return list(dict.fromkeys(reasons))
+
+
+def legacy_normal_paper_v2_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate the immutable fixed-1x v2 envelope for historical outcomes only."""
+
+    contract = _dict(value)
+    reasons: list[str] = []
+    if contract.get("version") != LEGACY_NORMAL_PAPER_TRADE_VERSION:
+        reasons.append("legacy_normal_paper_trade_version_invalid")
+    if contract.get("authorized") is not True:
+        reasons.append("legacy_normal_paper_trade_not_authorized")
+    if contract.get("trade_mode") != "paper" or contract.get("execution_scope") != "paper_only":
+        reasons.append("legacy_normal_paper_trade_scope_invalid")
+    if contract.get("entry_type") != "normal_strategy_trade" or contract.get(
+        "trade_kind"
+    ) != "normal_strategy_trade":
+        reasons.append("legacy_normal_paper_trade_kind_invalid")
+    if contract.get("production_permission") is not False:
+        reasons.append("legacy_normal_paper_trade_production_permission_invalid")
+    if contract.get("selection_reason") not in NORMAL_PAPER_TRADE_SELECTION_REASONS:
+        reasons.append("legacy_normal_paper_trade_selection_reason_invalid")
+    if str(contract.get("side") or "").lower() not in {"long", "short"}:
+        reasons.append("legacy_normal_paper_trade_side_missing")
+    if not str(contract.get("symbol") or "").strip():
+        reasons.append("legacy_normal_paper_trade_symbol_missing")
+    if not isclose(_float(contract.get("leverage_cap"), 0.0) or 0.0, 1.0, abs_tol=1e-12):
+        reasons.append("legacy_normal_paper_trade_leverage_cap_invalid")
+    legacy_fingerprint_payload = {
+        key: contract.get(key)
+        for key in (
+            "version",
+            "authorized",
+            "trade_mode",
+            "execution_scope",
+            "entry_type",
+            "trade_kind",
+            "production_permission",
+            "decision_authority",
+            "selection_reason",
+            "symbol",
+            "side",
+            "prediction_horizon_minutes",
+            "valid_for_seconds",
+            "expected_net_return_pct",
+            "objective_net_return_pct",
+            "loss_probability",
+            "quant_evidence_families",
+            "strong_expert_opposition",
+            "single_trade_risk_fraction_cap",
+            "portfolio_risk_fraction_cap",
+            "leverage_cap",
+            "uses_shared_order_pipeline",
+            "uses_shared_position_ledger",
+            "continuous_training_after_trusted_settlement",
+            "separate_sampling_order",
+            "risk_override_permission",
+            "sample_target",
+            "daily_sample_quota",
+        )
+    }
+    if contract.get("contract_fingerprint") != _fingerprint(legacy_fingerprint_payload):
+        reasons.append("legacy_normal_paper_trade_fingerprint_mismatch")
     return list(dict.fromkeys(reasons))
 
 

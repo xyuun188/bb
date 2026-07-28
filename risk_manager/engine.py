@@ -14,7 +14,6 @@ from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_LEVERAGE_CAP,
     NORMAL_PAPER_TRADE_MAX_COVERAGE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
@@ -208,8 +207,26 @@ class RiskEngine:
                 equity * NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION + 1e-8
             ):
                 return "Normal paper trade exceeds its portfolio risk cap."
-            if not isclose(leverage, NORMAL_PAPER_TRADE_LEVERAGE_CAP, abs_tol=1e-8):
-                return "Normal paper leverage must remain at one."
+            leverage_tier = sizing.get("leverage_tier_selection")
+            leverage_tier = leverage_tier if isinstance(leverage_tier, dict) else {}
+            tier_max = RiskEngine._safe_positive_float(leverage_tier.get("max_leverage"))
+            dynamic_leverage = sizing.get("dynamic_leverage_decision")
+            dynamic_leverage = (
+                dynamic_leverage if isinstance(dynamic_leverage, dict) else {}
+            )
+            if leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
+                return "Normal paper leverage must be a positive exchange integer."
+            if tier_max < 1.0 or leverage > tier_max + 1e-8:
+                return "Normal paper leverage exceeds the selected OKX tier."
+            if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v4":
+                return "Normal paper dynamic leverage evidence is missing."
+            if (
+                sizing.get("model_leverage_is_explicit") is True
+                and leverage
+                > RiskEngine._safe_positive_float(sizing.get("model_requested_leverage"))
+                + 1e-8
+            ):
+                return "Normal paper leverage exceeds the explicit model request."
         elif sizing.get("production_eligible") is not True:
             return "Dynamic account risk budget is not production eligible."
         if not provenance_complete:

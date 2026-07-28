@@ -10,10 +10,12 @@ from types import SimpleNamespace
 from typing import Any
 
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_LEVERAGE_CAP,
+    LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MAX_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
+    legacy_normal_paper_v2_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import (
@@ -915,7 +917,14 @@ def validate_normal_paper_entry_contract(
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
     pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
     sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
-    reasons = normal_paper_trade_contract_reasons(normal_trade)
+    legacy_fixed_leverage = (
+        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_VERSION
+    )
+    reasons = (
+        legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
+        if legacy_fixed_leverage
+        else normal_paper_trade_contract_reasons(normal_trade)
+    )
 
     risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
     portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"), 0.0)
@@ -949,7 +958,12 @@ def validate_normal_paper_entry_contract(
         executed and bounded_fill_drift.get("accepted") is True
     )
 
-    if sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION:
+    expected_sizing_version = (
+        LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION
+        if legacy_fixed_leverage
+        else NORMAL_PAPER_TRADE_SIZING_VERSION
+    )
+    if sizing.get("contract_version") != expected_sizing_version:
         reasons.append("normal_paper_sizing_version_invalid")
     if sizing.get("contract_lifecycle") != "normal_paper_trade":
         reasons.append("normal_paper_sizing_lifecycle_invalid")
@@ -998,8 +1012,31 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_fill_ceiling_invalid")
     if minimum_notional <= 0.0 or final_notional + 1e-8 < minimum_notional:
         reasons.append("normal_paper_minimum_order_invalid")
-    if not isclose(leverage, NORMAL_PAPER_TRADE_LEVERAGE_CAP, abs_tol=1e-8):
-        reasons.append("normal_paper_leverage_invalid")
+    tier_max_leverage = _safe_float(
+        _safe_dict(sizing.get("leverage_tier_selection")).get("max_leverage"),
+        0.0,
+    )
+    if legacy_fixed_leverage:
+        if not isclose(leverage, 1.0, abs_tol=1e-8):
+            reasons.append("normal_paper_leverage_invalid")
+    else:
+        dynamic_leverage = _safe_dict(sizing.get("dynamic_leverage_decision"))
+        model_requested_leverage = _safe_float(
+            sizing.get("model_requested_leverage"),
+            0.0,
+        )
+        if leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
+            reasons.append("normal_paper_leverage_invalid")
+        if tier_max_leverage < 1.0 or leverage > tier_max_leverage + 1e-8:
+            reasons.append("normal_paper_leverage_exceeds_okx_tier")
+        if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v4":
+            reasons.append("normal_paper_dynamic_leverage_contract_missing")
+        if (
+            sizing.get("model_leverage_is_explicit") is True
+            and model_requested_leverage >= 1.0
+            and leverage > model_requested_leverage + 1e-8
+        ):
+            reasons.append("normal_paper_leverage_exceeds_model_request")
     if execution_cost.get("production_eligible") is not True or (
         _safe_float(execution_cost.get("total_pct"), 0.0) <= 0.0
     ):
