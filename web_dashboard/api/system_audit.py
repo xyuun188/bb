@@ -50,6 +50,10 @@ from services.okx_integrity_gate import (
     partition_okx_integrity_issues,
 )
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
+from services.order_position_reconciliation import (
+    classify_missing_closed_position_plan,
+    plan_missing_closed_position,
+)
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
 from services.phase3_model_server_readiness import Phase3ModelServerReadinessAuditService
 from services.phase3_paper_resume_observation import Phase3PaperResumeObservationService
@@ -113,7 +117,7 @@ TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
 OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS = 72
 OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT = 500
-OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS = 15.0
+OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS = 40.0
 OKX_AUTHORITATIVE_SYNC_AUDIT_HOURS = 24
 OKX_AUTHORITATIVE_SYNC_AUDIT_LIMIT = 500
 OKX_AUTHORITATIVE_SYNC_TIMEOUT_SECONDS = 5.0
@@ -129,7 +133,7 @@ PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_REL_PATH = "phase3_paper_resume_preflight_r
 PHASE3_OPERATOR_APPROVAL_REPORT_MAX_AGE_SECONDS = 3 * 3600
 OKX_POSITION_FACT_LINK_AUDIT_DAYS = 14
 OKX_POSITION_FACT_LINK_AUDIT_MAX_POSITIONS = 300
-OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS = 300
+OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS = 1000
 HISTORICAL_TRADE_FACT_AUDIT_DAYS = 180
 HISTORICAL_TRADE_FACT_AUDIT_LIMIT = 2000
 PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS = 45
@@ -145,6 +149,7 @@ SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
     "strategy_signal_root_cause": 60.0,
     "model_training": 180.0,
     "position_capacity_release": 60.0,
+    "okx_trade_fact_integrity": OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS + 5.0,
 }
 PRIORITY_AUDIT_KEYS = ("okx_reconciliation", "trade_execution_contract")
 DB_AUDIT_KEYS = (
@@ -443,9 +448,7 @@ def _okx_runtime_entry_gate_summary(runtime_status: dict[str, Any]) -> dict[str,
             "sync_status": "unknown",
             "entry_blocked": True,
             "blocker": "runtime_heartbeat_unavailable",
-            "reason": (
-                "交易运行时心跳不可用；暂停新开仓，直到运行时发布新的 OKX 同步心跳。"
-            ),
+            "reason": ("交易运行时心跳不可用；暂停新开仓，直到运行时发布新的 OKX 同步心跳。"),
             "heartbeat_age_seconds": runtime_status.get("heartbeat_age_seconds"),
             "heartbeat_fresh_limit_seconds": None,
             "running": runtime_status.get("running"),
@@ -481,9 +484,7 @@ def _okx_runtime_entry_gate_summary(runtime_status: dict[str, Any]) -> dict[str,
         entry_blocked = True
         status = "runtime_heartbeat_stale"
         blocker = "trading_runtime_heartbeat_stale"
-        reason = (
-            "交易运行时心跳已过期；暂停新开仓，直到观察到新的 OKX 同步心跳。"
-        )
+        reason = "交易运行时心跳已过期；暂停新开仓，直到观察到新的 OKX 同步心跳。"
     elif sync_status in {"warning", "stale"}:
         entry_blocked = True
         blocker = "okx_authoritative_sync_unhealthy"
@@ -586,10 +587,7 @@ def _load_okx_daily_reconciliation_report_summary() -> dict[str, Any]:
             key=lambda item: item[0],
         )
         age = _age_seconds(generated_at) if generated_at is not None else None
-        stale = (
-            age is None
-            or age > OKX_DAILY_RECONCILIATION_REPORT_MAX_AGE_SECONDS
-        )
+        stale = age is None or age > OKX_DAILY_RECONCILIATION_REPORT_MAX_AGE_SECONDS
         gates = _safe_dict(payload.get("operational_gates"))
         ledger = _safe_dict(payload.get("issue_ledger"))
         return {
@@ -770,12 +768,6 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     return safe
 
 
-
-
-
-
-
-
 def _relative_gap(left: float, right: float) -> float:
     denominator = max(abs(left), abs(right), 1e-12)
     return abs(left - right) / denominator
@@ -814,8 +806,6 @@ def _decision_opportunity(row: AIDecision) -> dict[str, Any]:
 def _decision_evidence(row: AIDecision) -> dict[str, Any]:
     evidence = _decision_opportunity(row).get("evidence_score")
     return evidence if isinstance(evidence, dict) else {}
-
-
 
 
 def _decision_expected_net(row: AIDecision) -> float | None:
@@ -965,9 +955,7 @@ async def _audit_maybe_async(
     result = factory()
     if inspect.isawaitable(result):
         effective_timeout = (
-            SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS
-            if timeout_seconds is None
-            else timeout_seconds
+            SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         )
         result = await asyncio.wait_for(
             result,
@@ -1249,8 +1237,6 @@ def _load_trading_runtime_audit_window() -> dict[str, Any]:
     }
 
 
-
-
 async def _trade_loop_audit() -> dict[str, Any]:
     now = _now()
     since_10m = now - timedelta(minutes=AUDIT_WINDOWS["fast_minutes"])
@@ -1308,9 +1294,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
         runtime_running and bool(runtime_window.get("paused")) and runtime_heartbeat_fresh
     )
     dynamic_return_gate = (
-        _phase3_dynamic_return_gate_status()
-        if not runtime_running
-        else {"ready": False}
+        _phase3_dynamic_return_gate_status() if not runtime_running else {"ready": False}
     )
     stalled = (
         not bool(dynamic_return_gate.get("ready"))
@@ -1613,6 +1597,7 @@ async def _okx_reconciliation_light_scan(
     plans: list[Any] = []
     plan_classifications: list[dict[str, Any]] = []
     linked_count = 0
+    skipped_candidate_count = 0
     async with get_session_ctx() as session:
         candidate_order_count = int(
             (
@@ -1657,7 +1642,7 @@ async def _okx_reconciliation_light_scan(
         )
         official_history_covered_count = 0
         partial_exit_covered_count = 0
-        for order, action in rows:
+        for order, _action in rows:
             exchange_order_id = str(order.exchange_order_id or "").strip()
             if not exchange_order_id:
                 continue
@@ -1680,32 +1665,44 @@ async def _okx_reconciliation_light_scan(
                 partial_exit_covered_count += 1
                 plan_classifications.append(partial_exit_evidence)
                 continue
-            close_order_id = int(order.id)
-            classification = {
-                "status": "manual_review",
-                "reason": "close_order_has_no_position_close_exchange_link",
-                "close_order_id": close_order_id,
-                "close_exchange_order_id": exchange_order_id,
-            }
+            plan = await plan_missing_closed_position(session, order)
+            if plan is None:
+                skipped_candidate_count += 1
+                plan_classifications.append(
+                    {
+                        "status": "skipped_or_not_repairable",
+                        "reason": "no_deterministic_missing_position_plan",
+                        "close_order_id": int(order.id),
+                        "close_exchange_order_id": exchange_order_id,
+                    }
+                )
+                continue
+            classification = classify_missing_closed_position_plan(plan)
             plan_classifications.append(classification)
             plans.append(
                 SimpleNamespace(
-                    symbol=normalize_trading_symbol(order.symbol),
-                    side="long" if str(action or "").lower() == "close_long" else "short",
-                    quantity=round(_safe_float(order.quantity), 8),
-                    realized_pnl=0.0,
-                    close_order_id=close_order_id,
-                    closed_at=order.filled_at or order.created_at,
+                    symbol=plan.symbol,
+                    side=plan.side,
+                    quantity=round(float(plan.quantity), 8),
+                    realized_pnl=float(plan.realized_pnl),
+                    close_order_id=int(plan.close_order_id),
+                    closed_at=plan.closed_at,
                     exchange_order_id=exchange_order_id,
                 )
             )
 
     unscanned_count = max(candidate_order_count - len(rows), 0)
+    repairable_count = sum(item.get("status") == "repairable" for item in plan_classifications)
+    manual_review_count = sum(
+        item.get("status") == "manual_review" for item in plan_classifications
+    )
     classification_counts = {
         "linked": linked_count,
         "official_history_covered": official_history_covered_count,
         "partial_exit_covered": partial_exit_covered_count,
-        "manual_review": len(plans),
+        "repairable": repairable_count,
+        "manual_review": manual_review_count,
+        "skipped_or_not_repairable": skipped_candidate_count,
         "unscanned": unscanned_count,
     }
     return SimpleNamespace(
@@ -1721,9 +1718,9 @@ async def _okx_reconciliation_light_scan(
         duration_seconds=round(max((_now() - started_at).total_seconds(), 0.0), 6),
         plan_classifications=plan_classifications,
         classification_counts=classification_counts,
-        repairable_count=0,
-        manual_review_count=len(plans),
-        skipped_candidate_count=0,
+        repairable_count=repairable_count,
+        manual_review_count=manual_review_count,
+        skipped_candidate_count=skipped_candidate_count,
         unscanned_candidate_count=unscanned_count,
         official_history_covered_count=official_history_covered_count,
         partial_exit_covered_count=partial_exit_covered_count,
@@ -1758,7 +1755,9 @@ async def _load_partial_exit_coverage_index(
                     func.lower(Position.execution_mode).in_(sorted(modes)),
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     positions_with_entry_ids = [
         (
@@ -1778,9 +1777,7 @@ async def _load_partial_exit_coverage_index(
         return {}
 
     all_entry_ids = {
-        entry_id
-        for _position, entry_ids in positions_with_entry_ids
-        for entry_id in entry_ids
+        entry_id for _position, entry_ids in positions_with_entry_ids for entry_id in entry_ids
     }
     entry_rows = list(
         (
@@ -1914,11 +1911,7 @@ async def _load_partial_exit_coverage_index(
                 }
             )
 
-    return {
-        key: matches[0]
-        for key, matches in evidence_by_candidate.items()
-        if len(matches) == 1
-    }
+    return {key: matches[0] for key, matches in evidence_by_candidate.items() if len(matches) == 1}
 
 
 async def _load_position_close_link_index(
@@ -1958,11 +1951,7 @@ async def _load_official_history_close_link_index(
     execution_modes: set[str],
     exchange_order_ids: set[str],
 ) -> set[tuple[str, str]]:
-    modes = {
-        str(mode or "").strip().lower()
-        for mode in execution_modes
-        if str(mode or "").strip()
-    }
+    modes = {str(mode or "").strip().lower() for mode in execution_modes if str(mode or "").strip()}
     if not modes or not exchange_order_ids:
         return set()
     rows = list(
@@ -1970,7 +1959,9 @@ async def _load_official_history_close_link_index(
             await session.execute(
                 select(OkxPositionHistory).where(OkxPositionHistory.mode.in_(sorted(modes)))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     return {
         (str(row.mode or "").strip().lower(), str(order_id or "").strip())
@@ -2141,8 +2132,8 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
     authoritative_sync["live_repair_mutation"] = False
     authoritative_sync["can_write_database"] = False
     details["okx_authoritative_sync"] = authoritative_sync
-    blocking_integrity_issues, quarantined_integrity_issues = (
-        partition_okx_integrity_issues(details)
+    blocking_integrity_issues, quarantined_integrity_issues = partition_okx_integrity_issues(
+        details
     )
     details["current_blocking_issue_count"] = len(blocking_integrity_issues)
     details["quarantined_warning_count"] = len(quarantined_integrity_issues)
@@ -2265,13 +2256,10 @@ def _okx_unresolved_link_candidate_count(
         and issue.get("position_id") is not None
     }
     diagnostics = [
-        item
-        for item in _safe_list(link_repair.get("diagnostics"))
-        if isinstance(item, dict)
+        item for item in _safe_list(link_repair.get("diagnostics")) if isinstance(item, dict)
     ]
     if diagnostics and all(
-        int(item.get("position_id") or 0) in covered_residual_positions
-        for item in diagnostics
+        int(item.get("position_id") or 0) in covered_residual_positions for item in diagnostics
     ):
         return 0
     return candidate_count
@@ -2585,8 +2573,6 @@ async def _market_data_audit() -> dict[str, Any]:
     )
 
 
-
-
 async def _model_expert_health_audit() -> dict[str, Any]:
     try:
         report = await ModelExpertHealthService().report(
@@ -2820,9 +2806,7 @@ async def _shadow_missed_opportunity_audit() -> dict[str, Any]:
             "warning",
             "影子错失机会报告读取失败；错失机会反馈继续只作观察。",
             details={"error": safe_error_text(exc, limit=180), "audit_only": True},
-            next_actions=[
-                "检查 shadow_backtests 完成记录和错失机会报告输入。"
-            ],
+            next_actions=["检查 shadow_backtests 完成记录和错失机会报告输入。"],
         )
     summary = _safe_dict(report.get("summary"))
     blocked_counts = _safe_dict(report.get("blocked_reason_counts"))
@@ -2984,7 +2968,10 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
         details=report,
         evidence=[
             {"label": "当前持仓", "value": int(report.get("open_position_count") or 0)},
-            {"label": "经济性完整", "value": int(report.get("position_economics_complete_count") or 0)},
+            {
+                "label": "经济性完整",
+                "value": int(report.get("position_economics_complete_count") or 0),
+            },
             {"label": "经济性缺口", "value": economics_gaps},
             {"label": "动态退出", "value": int(report.get("dynamic_exit_decision_count") or 0)},
             {"label": "已执行退出契约缺口", "value": exit_gaps},
@@ -3162,11 +3149,7 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         "strategy_closed_loop",
         "动态费后收益闭环",
         status,
-        (
-            "已执行决策违反收益契约。"
-            if violations
-            else "收益输入、执行契约和已实现盈亏均可审计。"
-        ),
+        ("已执行决策违反收益契约。" if violations else "收益输入、执行契约和已实现盈亏均可审计。"),
         details={
             "audit_only": True,
             "strategy_signal": root_report,
@@ -3246,20 +3229,6 @@ async def _strategy_signal_root_cause_audit() -> dict[str, Any]:
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 async def _trade_execution_contract_audit() -> dict[str, Any]:
     try:
         report = _safe_trade_execution_contract_report(
@@ -3282,9 +3251,7 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
                 "can_bypass_risk_controls": False,
                 "summary": {},
             },
-            next_actions=[
-                "修改任何生产收益策略前，先恢复只读审计。"
-            ],
+            next_actions=["修改任何生产收益策略前，先恢复只读审计。"],
             owner_path="services/trade_execution_contract.py",
         )
 
@@ -3319,9 +3286,7 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
             },
         ],
         next_actions=(
-            [
-                "阻断任何缺少正向费后收益置信下界、实时成本、风险预算或来源证据的执行路径。"
-            ]
+            ["阻断任何缺少正向费后收益置信下界、实时成本、风险预算或来源证据的执行路径。"]
             if violation_count
             else ["继续审计已实现费后收益和左尾结果。"]
         ),
@@ -3423,7 +3388,9 @@ def _model_training_health_summary(
     specialist_shadow_evaluation: dict[str, Any],
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
-    local_stage = str(local_tools.get("model_stage") or local_tools.get("training_mode") or "shadow")
+    local_stage = str(
+        local_tools.get("model_stage") or local_tools.get("training_mode") or "shadow"
+    )
     trained_at = str(local_tools.get("trained_at") or "")
     trained_models_available = bool(
         local_tools.get("trained_models_available")
@@ -3671,18 +3638,28 @@ async def _model_training_audit() -> dict[str, Any]:
         }
     runtime_probe_timeout = bool(runtime_probe.get("timeout"))
     local_tools_status = str(local_tools.get("status") or "").lower()
+    local_tools_probe_timeout = (
+        local_tools_status in {"timeout", "status_error", "error"}
+        and (
+            str(local_tools.get("section") or "") == "local_ai_training_status"
+            or "timeout" in str(local_tools.get("error") or "").lower()
+        )
+    )
     clean_training_view_available = (
         _safe_int_value(local_tools.get("training_shadow_sample_count")) > 0
         and _safe_int_value(local_tools.get("training_trade_sample_count")) > 0
-        and str(local_tools.get("training_policy") or "")
-        == "current_training_epoch_only"
+        and str(local_tools.get("training_policy") or "") == "current_training_epoch_only"
         and local_tools.get("pre_epoch_data_training_allowed") is False
     )
     local_tools_status_probe_slow = local_tools_status in {
         "timeout",
         "status_error",
         "error",
-    } and (bool(runtime_probe.get("local_ai_tools_available")) or clean_training_view_available)
+    } and (
+        bool(runtime_probe.get("local_ai_tools_available"))
+        or clean_training_view_available
+        or local_tools_probe_timeout
+    )
     local_tools_unconfigured = (
         not bool(local_tools.get("available"))
         and local_tools_status in OPTIONAL_TRAINING_SOURCE_STATUSES
@@ -3726,18 +3703,14 @@ async def _model_training_audit() -> dict[str, Any]:
         or training_scheduler_unavailable
         or training_timeout_exceeded
     )
-    promotion_flow = (
-        local_tools.get("promotion_flow")
-        or "candidate_to_shadow_to_canary_to_active"
-    )
+    promotion_flow = local_tools.get("promotion_flow") or "candidate_to_shadow_to_canary_to_active"
     phase3_training_governance = {
         "training_mode": local_tools.get("training_mode") or "shadow",
         "model_stage": local_tools.get("model_stage") or "shadow",
         "promotion_flow": promotion_flow,
         "live_ml_ready": local_tools.get("live_ml_ready") is True,
         "policy": (
-            "三期模型变更必须按影子 -> 灰度 -> 生产的顺序推进；"
-            "审计可见性本身不得修改生产交易权重。"
+            "三期模型变更必须按影子 -> 灰度 -> 生产的顺序推进；审计可见性本身不得修改生产交易权重。"
         ),
     }
     phase3_rebuild_readiness = Phase3RebuildReadinessService().report(
@@ -3869,6 +3842,7 @@ async def _model_training_audit() -> dict[str, Any]:
             "observing": observing,
             "clean_training_view_available": clean_training_view_available,
             "local_tools_status_probe_slow": local_tools_status_probe_slow,
+            "local_tools_probe_timeout": local_tools_probe_timeout,
             "runtime_probe_timeout_is_observing": runtime_probe_timeout_is_observing,
             "source_warnings": hard_source_warnings[:8],
             "optional_source_warnings": optional_source_warnings[:8],
@@ -3916,11 +3890,7 @@ async def _phase3_server_migration_audit() -> dict[str, Any]:
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     phase3_blocked = bool(report.get("phase3_go_live_blocked"))
-    warning_codes = {
-        str(item.get("code") or "")
-        for item in warnings
-        if isinstance(item, dict)
-    }
+    warning_codes = {str(item.get("code") or "") for item in warnings if isinstance(item, dict)}
     report["observing"] = bool(
         warnings
         and not phase3_blocked
@@ -3963,7 +3933,9 @@ async def _phase3_model_server_readiness_audit() -> dict[str, Any]:
         timeout_seconds=PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS
     ).report()
     latest_report = _load_phase3_model_server_readiness_latest_report()
-    if _phase3_model_readiness_report_verified(latest_report) and _phase3_model_readiness_probe_failed_before_remote(report):
+    if _phase3_model_readiness_report_verified(
+        latest_report
+    ) and _phase3_model_readiness_probe_failed_before_remote(report):
         report = latest_report
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
@@ -3978,13 +3950,9 @@ async def _phase3_model_server_readiness_audit() -> dict[str, Any]:
         status = "warning"
     summary = "三期量化模型服务器的产物和服务均已就绪。"
     if blockers:
-        summary = (
-            "三期量化模型服务器因产物、CUDA、GPU 或策略就绪检查失败而阻断。"
-        )
+        summary = "三期量化模型服务器因产物、CUDA、GPU 或策略就绪检查失败而阻断。"
     elif not runtime_ready:
-        summary = (
-            "三期量化模型产物已就绪，但模型服务或接口尚未运行。"
-        )
+        summary = "三期量化模型产物已就绪，但模型服务或接口尚未运行。"
     elif warnings:
         summary = "三期量化模型服务器可用，但仍有非阻断提示。"
     return _audit_card(
@@ -4136,9 +4104,7 @@ async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
         status = "ok"
     summary = "三期模拟盘恢复后观察正常。"
     if status_value == "waiting_for_resume":
-        summary = (
-            "模拟盘仍处于停止状态，三期恢复后观察正在等待。"
-        )
+        summary = "模拟盘仍处于停止状态，三期恢复后观察正在等待。"
     elif status_value == "warming_up":
         summary = "三期模拟盘已恢复，但观察样本仍在预热积累。"
     elif blockers:
@@ -4181,6 +4147,27 @@ async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
 
 async def _phase3_stage_handoff_audit() -> dict[str, Any]:
     report = await asyncio.to_thread(Phase3StageHandoffService().report)
+    return _phase3_stage_handoff_card(report)
+
+
+async def _phase3_stage_handoff_audit_from_cards(
+    cards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    go_no_go_card = next(
+        (card for card in cards if card.get("key") == "phase3_go_no_go"),
+        {},
+    )
+    go_no_go_report = dict(_safe_dict(go_no_go_card.get("details")))
+    go_no_go_report.setdefault("checked_at", _now().isoformat())
+    go_no_go_report.setdefault("report_path", "current_system_audit")
+    report = await asyncio.to_thread(
+        Phase3StageHandoffService().report,
+        go_no_go_report=go_no_go_report,
+    )
+    return _phase3_stage_handoff_card(report)
+
+
+def _phase3_stage_handoff_card(report: dict[str, Any]) -> dict[str, Any]:
     blockers = _safe_list(report.get("blockers"))
     warnings = _safe_list(report.get("warnings"))
     ready = bool(report.get("ready")) and str(report.get("status") or "") == "dynamic_return_ready"
@@ -4395,9 +4382,18 @@ def _phase3_go_no_go_audit_from_cards(cards: list[dict[str, Any]]) -> dict[str, 
         details=report,
         evidence=[
             {"label": "已就绪", "value": ready},
-            {"label": "执行违规", "value": int(report_summary.get("current_contract_violation_count") or 0)},
-            {"label": "持仓经济性缺口", "value": int(report_summary.get("position_economics_incomplete_count") or 0)},
-            {"label": "动态退出缺口", "value": int(report_summary.get("executed_dynamic_exit_contract_gap_count") or 0)},
+            {
+                "label": "执行违规",
+                "value": int(report_summary.get("current_contract_violation_count") or 0),
+            },
+            {
+                "label": "持仓经济性缺口",
+                "value": int(report_summary.get("position_economics_incomplete_count") or 0),
+            },
+            {
+                "label": "动态退出缺口",
+                "value": int(report_summary.get("executed_dynamic_exit_contract_gap_count") or 0),
+            },
             {"label": "阻断项", "value": len(blockers)},
             {"label": "提示项", "value": len(warnings)},
         ],
@@ -4485,8 +4481,6 @@ def _strategy_gate_contract_audit() -> dict[str, Any]:
             "缺收益、成本、有效期或来源时必须 fail-closed。",
         ],
     )
-
-
 
 
 def _root_cause_findings(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4657,9 +4651,7 @@ def _issue_ledger_state(
         ):
             return "observing", "观察项 / OKX 运行同步健康或仅运行态待观察"
         if not has_data_integrity_issue and runtime_sync_healthy:
-            _blocking_issues, quarantined_issues = partition_okx_integrity_issues(
-                details
-            )
+            _blocking_issues, quarantined_issues = partition_okx_integrity_issues(details)
             if quarantined_issues:
                 return (
                     "observing",
@@ -5419,7 +5411,6 @@ async def _collect_system_audit_status_unlocked(
         ("phase3_model_server_readiness", _phase3_model_server_readiness_audit),
         ("phase3_paper_resume_preflight", _phase3_paper_resume_preflight_audit),
         ("phase3_paper_resume_observation", _phase3_paper_resume_observation_audit),
-        ("phase3_stage_handoff", _phase3_stage_handoff_audit),
         ("position_price_integrity", _position_price_integrity_audit),
         ("market_data", _market_data_audit),
         ("strategy_quality", _strategy_quality_audit),
@@ -5510,6 +5501,7 @@ async def _collect_system_audit_status_unlocked(
         else:
             cards.append(result)
     cards.append(_phase3_go_no_go_audit_from_cards(cards))
+    cards.append(await _phase3_stage_handoff_audit_from_cards(cards))
     cards = sorted(cards, key=lambda item: STATUS_RANK.get(str(item.get("status")), 9))
     nodes = _build_audit_nodes(cards)
     findings = _root_cause_findings(cards)
@@ -5576,7 +5568,11 @@ async def _collect_system_audit_status_unlocked(
 async def system_audit_status() -> dict[str, Any]:
     cached = _cached_system_audit_status()
     if cached is None:
-        return await collect_system_audit_status(record_history=True, source="api_cold_start")
+        payload = await collect_system_audit_status(
+            record_history=True,
+            source="api_cold_start",
+        )
+        return _dashboard_system_audit_payload(payload)
     checked_at, payload = cached
     age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
     refresh_after = max(float(settings.system_audit_history_interval_seconds or 300), 60.0)
@@ -5588,6 +5584,39 @@ async def system_audit_status() -> dict[str, Any]:
         "refresh_after_seconds": round(refresh_after, 3),
         "refresh_in_background": age_seconds >= refresh_after,
     }
+    return _dashboard_system_audit_payload(payload)
+
+
+def _dashboard_system_audit_payload(value: Any) -> dict[str, Any]:
+    payload = copy.deepcopy(value) if isinstance(value, dict) else {}
+    cards = payload.get("cards") if isinstance(payload.get("cards"), list) else []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        details = card.get("details") if isinstance(card.get("details"), dict) else {}
+        key = str(card.get("key") or "")
+        if key == "model_training":
+            scalar_details = {
+                name: nested
+                for name, nested in details.items()
+                if nested is None or isinstance(nested, (str, int, float, bool))
+            }
+            card["details"] = {
+                **scalar_details,
+                "local_ai_tools": details.get("local_ai_tools") or {},
+                "source_warnings": list(details.get("source_warnings") or [])[:8],
+                "optional_source_warnings": list(details.get("optional_source_warnings") or [])[:8],
+                "model_critical_items": list(details.get("model_critical_items") or [])[:8],
+            }
+        elif key in {
+            "phase3_paper_resume_preflight",
+            "phase3_paper_resume_observation",
+        }:
+            card["details"] = {
+                name: nested
+                for name, nested in details.items()
+                if nested is None or isinstance(nested, (str, int, float, bool))
+            }
     return sanitize_payload(payload)
 
 

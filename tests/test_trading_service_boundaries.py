@@ -403,12 +403,19 @@ async def test_okx_authoritative_sync_loop_reconciles_current_positions(
     calls: list[dict[str, Any]] = []
 
     class FakeOkxSyncService:
-        async def reconcile_positions(self, reason, timeout_seconds, lock_wait_seconds):
+        async def reconcile_positions(
+            self,
+            reason,
+            timeout_seconds,
+            lock_wait_seconds,
+            record_timeout_error,
+        ):
             calls.append(
                 {
                     "reason": reason,
                     "timeout_seconds": timeout_seconds,
                     "lock_wait_seconds": lock_wait_seconds,
+                    "record_timeout_error": record_timeout_error,
                 }
             )
             return [
@@ -435,7 +442,7 @@ async def test_okx_authoritative_sync_loop_reconciles_current_positions(
     monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
     service.okx_sync_service = FakeOkxSyncService()
     service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
-    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+    service.okx_authoritative_sync_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
     service._okx_authoritative_sync_task = None
     service._okx_authoritative_sync_started_at = None
     service._okx_authoritative_sync_last_success_at = None
@@ -456,6 +463,7 @@ async def test_okx_authoritative_sync_loop_reconciles_current_positions(
             "reason": "auto okx authoritative sync",
             "timeout_seconds": 8.0,
             "lock_wait_seconds": 0.1,
+            "record_timeout_error": False,
         }
     ]
     status = service._okx_authoritative_sync_status_payload()
@@ -485,12 +493,19 @@ async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
     never_finish = asyncio.Event()
 
     class FakeOkxSyncService:
-        async def reconcile_positions(self, reason, timeout_seconds, lock_wait_seconds):
+        async def reconcile_positions(
+            self,
+            reason,
+            timeout_seconds,
+            lock_wait_seconds,
+            record_timeout_error,
+        ):
             calls.append(
                 {
                     "reason": reason,
                     "timeout_seconds": timeout_seconds,
                     "lock_wait_seconds": lock_wait_seconds,
+                    "record_timeout_error": record_timeout_error,
                 }
             )
             return [
@@ -518,7 +533,7 @@ async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
     service.okx_sync_service = FakeOkxSyncService()
     service.okx_order_fact_sync_factory = factory
     service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
-    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+    service.okx_authoritative_sync_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
     service._okx_authoritative_sync_task = None
     service._okx_authoritative_sync_started_at = None
     service._okx_authoritative_sync_last_success_at = None
@@ -548,6 +563,7 @@ async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
             "reason": "auto okx authoritative sync",
             "timeout_seconds": 8.0,
             "lock_wait_seconds": 0.1,
+            "record_timeout_error": False,
         }
     ]
     assert status["status"] == "ok"
@@ -802,7 +818,14 @@ async def test_okx_authoritative_sync_loop_records_failures(
     service._running = True
 
     class FakeOkxSyncService:
-        async def reconcile_positions(self, reason, timeout_seconds, lock_wait_seconds):
+        async def reconcile_positions(
+            self,
+            reason,
+            timeout_seconds,
+            lock_wait_seconds,
+            record_timeout_error,
+        ):
+            assert record_timeout_error is False
             raise RuntimeError("OKX timeout")
 
     async def fake_sleep(_seconds: float) -> None:
@@ -811,7 +834,7 @@ async def test_okx_authoritative_sync_loop_records_failures(
     monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
     service.okx_sync_service = FakeOkxSyncService()
     service.okx_authoritative_sync_interval_seconds = lambda: 20.0  # type: ignore[method-assign]
-    service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
+    service.okx_authoritative_sync_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
     service._okx_authoritative_sync_task = None
     service._okx_authoritative_sync_started_at = None
     service._okx_authoritative_sync_last_success_at = None
@@ -5236,6 +5259,8 @@ def test_parallel_loop_intervals_are_not_market_throttles(
 
     assert service.market_loop_interval_seconds() == pytest.approx(10.5)
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
+    assert service.round_start_reconcile_timeout_seconds() == pytest.approx(15.0)
+    assert service.okx_authoritative_sync_timeout_seconds() == pytest.approx(45.0)
     assert service.market_loop_interval_seconds() < service.position_loop_interval_seconds()
     assert service.market_loop_interval_seconds() < service.market_round_time_budget_seconds()
 
@@ -6822,10 +6847,149 @@ async def test_current_position_management_refresh_allows_missing_protection() -
         protection_by_key={},
         symbol_normalizer=normalize_trading_symbol,
         float_parser=lambda value, default=0.0: default if value is None else float(value),
-        entry_fee_for_position=lambda *_args: None,
     )
 
     assert refreshed == 0
+
+
+@pytest.mark.asyncio
+async def test_current_position_management_refresh_bulk_loads_entry_orders_once() -> None:
+    async def account_equity(_mode: str) -> dict[str, float]:
+        return {"equity": 1000.0}
+
+    positions = [
+        SimpleNamespace(
+            id=1,
+            is_open=True,
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            side="long",
+            quantity=2.0,
+            entry_fee=0.0,
+            entry_exchange_order_id="btc-entry",
+            current_management_contract={},
+            updated_at=None,
+        ),
+        SimpleNamespace(
+            id=2,
+            is_open=True,
+            execution_mode="paper",
+            symbol="ETH/USDT",
+            side="short",
+            quantity=3.0,
+            entry_fee=0.0,
+            entry_exchange_order_id="eth-entry",
+            current_management_contract={},
+            updated_at=None,
+        ),
+    ]
+    orders = [
+        SimpleNamespace(
+            exchange_order_id="btc-entry",
+            decision_id=11,
+            status=OrderStatus.FILLED.value,
+            price=100.0,
+            quantity=2.0,
+            okx_raw_fills={
+                "fills_history_confirmed": True,
+                "order_id": "btc-entry",
+                "fee_abs": 0.2,
+            },
+        ),
+        SimpleNamespace(
+            exchange_order_id="eth-entry",
+            decision_id=12,
+            status=OrderStatus.FILLED.value,
+            price=50.0,
+            quantity=3.0,
+            okx_raw_fills={
+                "fills_history_confirmed": True,
+                "order_id": "eth-entry",
+                "fee_abs": 0.3,
+            },
+        ),
+    ]
+
+    class FakeScalarResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return orders
+
+    class FakeSession:
+        execute_count = 0
+
+        async def execute(self, _statement):
+            self.execute_count += 1
+            return FakeScalarResult()
+
+    session = FakeSession()
+    protection_by_key = {
+        ("BTC/USDT", "long"): {
+            "stop_loss_price": 98.0,
+            "take_profit_price": 110.0,
+            "protection_orders": [
+                {
+                    "algo_id": "btc-oco",
+                    "state": "live",
+                    "contracts": 2.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 98.0,
+                    "take_profit_price": 110.0,
+                }
+            ],
+        },
+        ("ETH/USDT", "short"): {
+            "stop_loss_price": 52.0,
+            "take_profit_price": 45.0,
+            "protection_orders": [
+                {
+                    "algo_id": "eth-oco",
+                    "state": "live",
+                    "contracts": 3.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 52.0,
+                    "take_profit_price": 45.0,
+                }
+            ],
+        },
+    }
+
+    refreshed = await OkxSyncService(
+        account_equity_provider=account_equity
+    )._refresh_current_position_management_contracts(
+        session=session,
+        positions=positions,
+        exchange_positions=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "contracts": 2.0,
+                "contractSize": 1.0,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+                "info": {"instId": "BTC-USDT-SWAP", "pos": "2", "ctVal": "1"},
+            },
+            {
+                "symbol": "ETH/USDT:USDT",
+                "side": "short",
+                "contracts": 3.0,
+                "contractSize": 1.0,
+                "entryPrice": 50.0,
+                "markPrice": 49.0,
+                "info": {"instId": "ETH-USDT-SWAP", "pos": "-3", "ctVal": "1"},
+            },
+        ],
+        protection_by_key=protection_by_key,
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+    )
+
+    assert refreshed == 2
+    assert session.execute_count == 1
+    assert positions[0].current_management_contract["entry_fee_usdt"] == 0.2
+    assert positions[1].current_management_contract["entry_fee_usdt"] == 0.3
 
 
 @pytest.mark.asyncio
@@ -7284,12 +7448,53 @@ async def test_sync_service_retries_failed_position_protection_rebalance(
 
     first = await service._rebalance_pending_position_protection(object())
     second = await service._rebalance_pending_position_protection(object())
+    service._position_protection_rebalance_retry_at[key] = 0.0
+    third = await service._rebalance_pending_position_protection(object())
 
     assert first[0]["kind"] == "current_position_protection_rebalance_failed"
     assert first[0]["requires_attention"] is True
-    assert second[0]["kind"] == "current_position_protection_rebalanced"
-    assert second[0]["status"] == "already_exact"
+    assert first[0]["retry_after_seconds"] == 60.0
+    assert second[0]["kind"] == "current_position_protection_rebalance_deferred"
+    assert second[0]["status"] == "retry_backoff"
+    assert third[0]["kind"] == "current_position_protection_rebalanced"
+    assert third[0]["status"] == "already_exact"
     assert key not in service._pending_position_protection_rebalance_keys
+
+
+@pytest.mark.asyncio
+async def test_sync_service_runs_position_protection_rebalance_outside_sync_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def rebalance_protection(_executor, **_kwargs):
+        started.set()
+        await release.wait()
+        return {"status": "already_exact", "verified": True, "applied_actions": []}
+
+    monkeypatch.setattr(
+        sync_module,
+        "rebalance_current_position_protection",
+        rebalance_protection,
+    )
+    service = OkxSyncService()
+    key = ("BTC/USDT", "short")
+    service._pending_position_protection_rebalance_keys.add(key)
+
+    assert service._start_pending_position_protection_rebalance(object()) is True
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    task = service._position_protection_rebalance_task
+    assert task is not None
+    assert task.done() is False
+    assert service._start_pending_position_protection_rebalance(object()) is False
+
+    release.set()
+    await asyncio.wait_for(task, timeout=0.2)
+    await asyncio.sleep(0)
+
+    assert key not in service._pending_position_protection_rebalance_keys
+    assert service._position_protection_rebalance_task is None
 
 
 @pytest.mark.asyncio

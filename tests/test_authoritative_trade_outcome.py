@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
+import services.authoritative_trade_outcome as authoritative_trade_outcome
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.trade import OkxPositionHistory
@@ -16,6 +18,49 @@ from services.authoritative_trade_outcome import (
 )
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.training_data_quality import annotate_training_payload
+
+
+@pytest.mark.asyncio
+async def test_stale_compact_outcomes_return_immediately_and_refresh_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+
+    class PendingTask:
+        def done(self) -> bool:
+            return False
+
+        def add_done_callback(self, _callback: object) -> None:
+            return None
+
+    def create_task(coroutine: object) -> PendingTask:
+        coroutine.close()  # type: ignore[attr-defined]
+        created.append(coroutine)
+        return PendingTask()
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
+    monkeypatch.setattr(authoritative_trade_outcome.asyncio, "create_task", create_task)
+    monkeypatch.setattr(
+        authoritative_trade_outcome,
+        "_compact_outcome_cache",
+        (
+            time.monotonic()
+            - authoritative_trade_outcome._COMPACT_OUTCOME_CACHE_TTL_SECONDS
+            - 1,
+            [{"outcome_id": "cached", "execution_mode": "paper"}],
+        ),
+    )
+    monkeypatch.setattr(
+        authoritative_trade_outcome,
+        "_compact_outcome_refresh_task",
+        None,
+    )
+
+    first = await load_authoritative_trade_outcomes(mode="paper", compact=True)
+    second = await load_authoritative_trade_outcomes(mode="paper", compact=True)
+
+    assert first == second == [{"outcome_id": "cached", "execution_mode": "paper"}]
+    assert len(created) == 1
 
 
 def _sample(**overrides):

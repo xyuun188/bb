@@ -331,7 +331,11 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         SimpleNamespace(
             exchange_order_id="entry-a",
             status="filled",
-            okx_raw_fills={"fee_abs": 0.2, "fills_history_confirmed": True},
+            okx_raw_fills={
+                "fee_abs": 0.2,
+                "fills_history_confirmed": True,
+                "order_id": "entry-a",
+            },
             price=100.0,
             quantity=2.0,
             decision_id=11,
@@ -339,7 +343,11 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         SimpleNamespace(
             exchange_order_id="entry-b",
             status="filled",
-            okx_raw_fills={"fee_abs": 0.1, "fills_history_confirmed": True},
+            okx_raw_fills={
+                "fee_abs": 0.1,
+                "fills_history_confirmed": True,
+                "order_id": "entry-b",
+            },
             price=100.0,
             quantity=1.0,
             decision_id=12,
@@ -363,9 +371,6 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
 
     async def balance(_mode):
         return {"equity": 1_000.0}
-
-    async def entry_fee(_session, position, _quantity):
-        return position.entry_fee
 
     service = OkxSyncService(account_equity_provider=balance)
     refreshed = await service._refresh_current_position_management_contracts(
@@ -400,7 +405,6 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         },
         symbol_normalizer=normalize_trading_symbol,
         float_parser=_float,
-        entry_fee_for_position=entry_fee,
     )
 
     contract = first.current_management_contract

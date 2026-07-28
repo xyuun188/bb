@@ -62,9 +62,7 @@ def _order_row(order: dict[str, Any]) -> dict[str, Any] | None:
         "symbol": key[0],
         "side": key[1],
         "inst_id": str(
-            order.get("inst_id")
-            or info.get("instId")
-            or okx_inst_id_from_symbol(key[0])
+            order.get("inst_id") or info.get("instId") or okx_inst_id_from_symbol(key[0])
         ).upper(),
         "algo_id": algo_id,
         "contracts": str(contracts),
@@ -189,8 +187,12 @@ def _resize_actions(
                     "reason": "match_current_position_contract_coverage",
                     "inst_id": order["inst_id"],
                     "algo_id": order["algo_id"],
+                    "position_side": position["side"],
+                    "okx_position_side": order.get("okx_position_side") or "net",
                     "old_contracts": order["contracts"],
                     "new_contracts": str(target),
+                    "stop_loss_price": order.get("stop_loss_price"),
+                    "take_profit_price": order.get("take_profit_price"),
                     "rollback": {
                         "action": "amend_size",
                         "inst_id": order["inst_id"],
@@ -245,10 +247,7 @@ def audit_protection_order_integrity(
 
     position_rows = [row for item in positions if (row := _position_row(item)) is not None]
     order_rows = [row for item in protection_orders if (row := _order_row(item)) is not None]
-    positions_by_key = {
-        (row["symbol"], row["side"]): row
-        for row in position_rows
-    }
+    positions_by_key = {(row["symbol"], row["side"]): row for row in position_rows}
     orders_by_key: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in order_rows:
         orders_by_key[(row["symbol"], row["side"])].append(row)
@@ -339,9 +338,7 @@ def audit_protection_order_integrity(
         "repair_blockers": list(dict.fromkeys(repair_blockers)),
     }
     payload["position_inventory_fingerprint"] = hashlib.sha256(
-        json.dumps(position_rows, ensure_ascii=True, sort_keys=True, default=str).encode(
-            "utf-8"
-        )
+        json.dumps(position_rows, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     payload["input_fingerprint"] = _repair_input_fingerprint(payload)
     payload["repair_ready"] = not payload["repair_blockers"] and not missing and not invalid_orders

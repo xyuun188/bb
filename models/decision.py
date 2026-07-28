@@ -72,8 +72,10 @@ _MISSING_LEARNING_VALUE = object()
 _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "account_equity_usdt",
     "available_margin_usdt",
+    "blockers",
     "contract_lifecycle",
     "contract_version",
+    "current_portfolio_stressed_loss_usdt",
     "decision_authority",
     "dynamic_leverage_decision",
     "entry_instrument_availability",
@@ -81,6 +83,9 @@ _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "exchange_min_notional_usdt",
     "exchange_minimum_order",
     "execution_scope",
+    "execution_reconciliations",
+    "expected_net_return_pct",
+    "expected_profit_usdt",
     "fill_notional_ceiling_usdt",
     "final_leverage",
     "final_margin_usdt",
@@ -97,9 +102,12 @@ _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "position_size_pct",
     "production_eligible",
     "production_permission",
+    "reason",
+    "remaining_portfolio_risk_budget_usdt",
     "risk_budget_usdt",
     "selected_contract_spec",
     "stressed_loss_fraction",
+    "single_trade_risk_budget_usdt",
     "target_inst_id",
     "target_notional_usdt",
     "target_price",
@@ -144,7 +152,14 @@ def _compact_profit_risk_sizing_snapshot(value: object) -> object:
         if key == "portfolio_risk_snapshot" and isinstance(nested_value, dict):
             nested_value = {
                 field: nested_value[field]
-                for field in ("scope", "current_stressed_loss_usdt")
+                for field in (
+                    "scope",
+                    "current_stressed_loss_usdt",
+                    "current_margin_usdt",
+                    "gross_notional_usdt",
+                    "same_side_notional_usdt",
+                    "direction_concentration",
+                )
                 if field in nested_value
             }
         elif key == "leverage_tier_selection" and isinstance(nested_value, dict):
@@ -201,4 +216,4 @@ def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> Non
     target.model_health_has_local_ai_tools = _model_health_snapshot_present(raw, "local_ai_tools")
     target.model_health_snapshot_version = 1
     target.decision_learning_snapshot = _compact_decision_learning_snapshot(raw)
-    target.decision_learning_snapshot_version = 3
+    target.decision_learning_snapshot_version = 4

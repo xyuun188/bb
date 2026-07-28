@@ -1267,14 +1267,20 @@ class StrategyLearningService:
         limit: int = 500,
         detail: str = "summary",
         include_runtime_prior_records: bool = False,
+        include_historical_replay: bool = True,
     ) -> dict[str, Any]:
-        blueprint, predictor = self._default_model_replay_context(mode)
+        blueprint, predictor = (
+            self._default_model_replay_context(mode)
+            if include_historical_replay
+            else ({}, None)
+        )
         feedback = await self._feedback(
             mode=mode,
             hours=hours,
             limit=limit,
             include_historical_replay=bool(
-                paper_strategy_replay_available(blueprint)
+                include_historical_replay
+                and paper_strategy_replay_available(blueprint)
                 and predictor is not None
             ),
         )
@@ -1379,6 +1385,7 @@ class StrategyLearningService:
             mode=selected_mode,
             since=since,
             limit=effective_limit,
+            compact=True,
         )
         async with get_read_session_ctx() as session:
             open_rows = list(
@@ -1419,33 +1426,31 @@ class StrategyLearningService:
                 if position_ids
                 else []
             )
-            shadows = list(
+            shadow_rows = list(
                 (
                     await session.execute(
-                        select(ShadowBacktest)
+                        select(
+                            ShadowBacktest.id,
+                            ShadowBacktest.symbol,
+                            ShadowBacktest.training_feature_snapshot.label(
+                                "feature_snapshot"
+                            ),
+                            ShadowBacktest.horizon_minutes,
+                            ShadowBacktest.long_return_pct,
+                            ShadowBacktest.short_return_pct,
+                            ShadowBacktest.created_at,
+                        )
                         .where(
                             ShadowBacktest.execution_mode == selected_mode,
                             ShadowBacktest.status == "completed",
                             ShadowBacktest.created_at >= since_naive,
                         )
-                        .options(
-                            load_only(
-                                ShadowBacktest.id,
-                                ShadowBacktest.symbol,
-                                ShadowBacktest.feature_snapshot,
-                                ShadowBacktest.horizon_minutes,
-                                ShadowBacktest.long_return_pct,
-                                ShadowBacktest.short_return_pct,
-                                ShadowBacktest.created_at,
-                            )
-                        )
                         .order_by(ShadowBacktest.created_at.desc())
                         .limit(effective_limit)
                     )
-                )
-                .scalars()
-                .all()
+                ).all()
             )
+            shadows = [SimpleNamespace(**dict(row._mapping)) for row in shadow_rows]
             replay_shadows = (
                 list(
                     (
@@ -1507,7 +1512,7 @@ class StrategyLearningService:
                             AIDecision.created_at,
                             AIDecision.was_executed,
                             AIDecision.execution_reason,
-                            AIDecision.raw_llm_response[
+                            AIDecision.decision_learning_snapshot[
                                 "entry_candidate_evidence"
                             ].label("entry_candidate_evidence"),
                         )

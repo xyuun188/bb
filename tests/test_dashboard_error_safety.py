@@ -316,8 +316,43 @@ def test_dashboard_execution_account_keeps_stale_cached_balance_usable(
 
     assert payload["account_equity"] == 260.0
     assert payload["available_balance"] == 200.0
-    assert payload["balance_error"] == "OKX balance snapshot request timed out"
+    assert payload["balance_error"] is None
+    assert payload["balance_warning"] == "OKX balance snapshot request timed out"
     assert payload["risk_paused"] is False
+
+
+def test_analysis_ml_signal_summary_excludes_heavy_diagnostics() -> None:
+    summary = dashboard._analysis_ml_signal_summary(
+        {
+            "available": True,
+            "primary_horizon_minutes": 15,
+            "readiness": {"large_diagnostic": "x" * 10_000},
+            "strategy_blueprint": {"large_policy": "x" * 10_000},
+            "predictions": [
+                {
+                    "horizon_minutes": 15,
+                    "best_side": "long",
+                    "multitask_prediction": {"large_payload": "x" * 10_000},
+                    "return_distribution_contract": {
+                        "long": {
+                            "raw_expected_return_pct": 0.01,
+                            "objective_expected_return_pct": 0.008,
+                            "unused_diagnostic": "x" * 10_000,
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+    assert summary is not None
+    assert "readiness" not in summary
+    assert "strategy_blueprint" not in summary
+    assert "multitask_prediction" not in summary["predictions"][0]
+    assert summary["predictions"][0]["return_distribution_contract"]["long"] == {
+        "raw_expected_return_pct": 0.01,
+        "objective_expected_return_pct": 0.008,
+    }
 
 
 @pytest.mark.asyncio

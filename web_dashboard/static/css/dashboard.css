@@ -5343,6 +5343,10 @@ select.form-input { cursor: pointer; }
     padding: 0 10px;
     white-space: nowrap;
 }
+.pagination[data-loading="true"] .page-info::after {
+    content: " · 加载中";
+    color: var(--accent-light);
+}
 
 /* ── Responsive ── */
 @media (max-width: 800px) { 

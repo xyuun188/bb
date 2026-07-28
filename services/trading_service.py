@@ -622,6 +622,7 @@ class TradingService:
             local_position_snapshot_syncer=self.position_snapshot_syncer.sync,
             datetime_from_ms_parser=self.position_time.datetime_from_ms,
             exchange_close_fill_finder=self.exchange_close_fill_finder.find,
+            exchange_close_fill_batch_finder=self.exchange_close_fill_finder.find_many,
             fresh_feature_vector_provider=self.fresh_feature_vector_for_price_recheck,
             market_value_reader=self.market_value_reader.read,
             entry_fee_provider=self.entry_fee_provider.entry_fee_for_position,
@@ -1115,7 +1116,7 @@ class TradingService:
 
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        return max(8.0, min(14.0, interval * 0.35))
+        return max(14.0, min(20.0, interval * 0.5))
 
     def okx_authoritative_sync_interval_seconds(self) -> float:
         """Return the background cadence for current OKX position sync."""
@@ -1123,6 +1124,13 @@ class TradingService:
         settings.refresh_runtime_env(force=True)
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(20.0, min(60.0, interval * 0.5))
+
+    def okx_authoritative_sync_timeout_seconds(self) -> float:
+        """Allow the independent OKX sync loop to finish its full account pass."""
+
+        settings.refresh_runtime_env(force=True)
+        interval = max(10.0, float(settings.decision_interval_seconds or 60))
+        return max(30.0, min(45.0, interval * 1.5))
 
     def okx_order_fact_sync_interval_seconds(self) -> float:
         """Return the normal cadence for optional OKX order-fact repair."""
@@ -2791,13 +2799,15 @@ class TradingService:
             started_at = datetime.now(UTC)
             self._okx_authoritative_sync_started_at = started_at
             try:
+                sync_timeout_seconds = self.okx_authoritative_sync_timeout_seconds()
                 position_result = await asyncio.wait_for(
                     self.okx_sync_service.reconcile_positions(
                         "auto okx authoritative sync",
-                        timeout_seconds=self.round_start_reconcile_timeout_seconds(),
+                        timeout_seconds=sync_timeout_seconds,
                         lock_wait_seconds=0.1,
+                        record_timeout_error=False,
                     ),
-                    timeout=self.round_start_reconcile_timeout_seconds() + 2.0,
+                    timeout=sync_timeout_seconds + 2.0,
                 )
                 result = list(position_result) if isinstance(position_result, list) else []
                 order_fact_result = getattr(self, "_okx_order_fact_sync_last_row", None)

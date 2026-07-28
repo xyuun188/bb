@@ -49,6 +49,7 @@ async def _system_audit_history_loop() -> None:
 
     interval = max(60, int(settings.system_audit_history_interval_seconds or 300))
     while True:
+        await asyncio.sleep(interval)
         try:
             await collect_system_audit_status(record_history=True, source="background")
         except asyncio.CancelledError:
@@ -58,7 +59,6 @@ async def _system_audit_history_loop() -> None:
                 "system audit history loop failed",
                 error=safe_error_text(exc, limit=240),
             )
-        await asyncio.sleep(interval)
 
 
 @asynccontextmanager

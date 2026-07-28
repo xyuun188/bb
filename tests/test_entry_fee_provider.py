@@ -15,6 +15,16 @@ class _FakeResult:
     def scalar_one_or_none(self) -> Any:
         return self.value
 
+    def scalars(self) -> "_FakeResult":
+        return self
+
+    def all(self) -> list[Any]:
+        if self.value is None:
+            return []
+        if isinstance(self.value, list):
+            return self.value
+        return [self.value]
+
 
 class _FakeSession:
     def __init__(self, *values: Any) -> None:
@@ -89,6 +99,41 @@ async def test_entry_fee_provider_uses_exact_linked_okx_fill():
     fee = await EntryFeeProvider().entry_fee_for_position(session, _position(), close_qty=2.0)
 
     assert fee == 1.0
+    assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_entry_fee_provider_loads_multiple_linked_fills_in_one_query():
+    session = _FakeSession(
+        [
+            _order(
+                exchange_order_id="entry-1",
+                quantity=2.0,
+                okx_raw_fills={
+                    "fills_history_confirmed": True,
+                    "order_id": "entry-1",
+                    "fee_abs": 1.0,
+                },
+            ),
+            _order(
+                exchange_order_id="entry-2",
+                quantity=4.0,
+                okx_raw_fills={
+                    "fills_history_confirmed": True,
+                    "order_id": "entry-2",
+                    "fee_abs": 2.0,
+                },
+            ),
+        ]
+    )
+
+    fee = await EntryFeeProvider().entry_fee_for_position(
+        session,
+        _position(entry_exchange_order_id="entry-1,entry-2", quantity=6.0),
+        close_qty=3.0,
+    )
+
+    assert fee == 1.5
     assert len(session.statements) == 1
 
 

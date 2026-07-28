@@ -59,6 +59,63 @@ class ExchangeCloseFillFinder:
             return {}
         return self._best_candidate(candidates, target_quantity)
 
+    async def find_many(self, positions: list[Any]) -> list[dict[str, Any]]:
+        """Resolve several newly missing positions from one OKX fill snapshot."""
+
+        if not positions:
+            return []
+        paper_okx = self.paper_okx_provider()
+        if not paper_okx:
+            return [{} for _position in positions]
+
+        client = OkxNativeFactsClient(paper_okx)
+        inst_ids = {
+            inst_id
+            for position in positions
+            if (inst_id := self._okx_inst_id_for_position(position))
+        }
+        if not inst_ids:
+            return [{} for _position in positions]
+        contract_sizes = await client.fetch_contract_sizes(inst_ids=inst_ids)
+        since_values = [
+            since
+            for position in positions
+            if (since := self._opened_since_ms(position)) is not None
+        ]
+        groups = await client.fetch_fill_groups(
+            inst_ids=inst_ids,
+            since=(min(since_values) if since_values else 0) - 1000,
+            limit=100,
+            account_wide_only=True,
+            strict=True,
+        )
+
+        results: list[dict[str, Any]] = []
+        for position in positions:
+            inst_id = self._okx_inst_id_for_position(position)
+            contract_size = self.float_parser(contract_sizes.get(inst_id), 0.0)
+            since = self._opened_since_ms(position)
+            close_side = "buy" if position.side == "short" else "sell"
+            target_quantity = abs(self.float_parser(getattr(position, "quantity", 0.0), 0.0))
+            candidates = [
+                candidate
+                for group in groups
+                if (
+                    group.inst_id == inst_id
+                    and group.side == close_side
+                    and (since is None or float(group.timestamp_ms or 0.0) >= since - 1000)
+                )
+                if (
+                    candidate := self._candidate_from_group(
+                        group,
+                        contract_size=contract_size,
+                        target_quantity=target_quantity,
+                    )
+                )
+            ]
+            results.append(self._best_candidate(candidates, target_quantity) if candidates else {})
+        return results
+
     @staticmethod
     def _best_candidate(
         candidates: list[dict[str, Any]],
@@ -125,7 +182,10 @@ class ExchangeCloseFillFinder:
             return []
 
         client = OkxNativeFactsClient(paper_okx)
-        okx_contract_size, okx_contract_size_source = await self._contract_size_from_okx_instruments(
+        (
+            okx_contract_size,
+            okx_contract_size_source,
+        ) = await self._contract_size_from_okx_instruments(
             client,
             okx_inst_id=okx_inst_id,
         )
@@ -142,32 +202,48 @@ class ExchangeCloseFillFinder:
         except Exception:
             raise
 
-        candidates: list[dict[str, Any]] = []
-        for group in groups:
-            contracts = float(group.contracts or 0.0)
-            if contracts <= 0:
-                continue
-            quantity = contracts * okx_contract_size
-            if target_quantity > 0 and quantity > 0 and quantity < target_quantity * 0.2:
-                continue
-            timestamp = group.timestamp_ms or 0
-            candidates.append(
-                {
-                    "price": group.avg_price,
-                    "fee": group.fee_abs,
-                    "order_id": group.order_id,
-                    "timestamp_ms": timestamp,
-                    "timestamp": self._datetime_from_ms(timestamp),
-                    "quantity": quantity,
-                    "contracts": contracts,
-                    "contract_size": okx_contract_size,
-                    "contract_size_source": okx_contract_size_source,
-                    "pnl": group.fill_pnl,
-                    "source": "okx_fills_history",
-                    "order_info": group.latest_row,
-                }
+        return [
+            candidate
+            for group in groups
+            if (
+                candidate := self._candidate_from_group(
+                    group,
+                    contract_size=okx_contract_size,
+                    target_quantity=target_quantity,
+                    contract_size_source=okx_contract_size_source,
+                )
             )
-        return candidates
+        ]
+
+    def _candidate_from_group(
+        self,
+        group: Any,
+        *,
+        contract_size: float,
+        target_quantity: float,
+        contract_size_source: str = "okx_public_instruments",
+    ) -> dict[str, Any]:
+        contracts = float(group.contracts or 0.0)
+        if contracts <= 0 or contract_size <= 0:
+            return {}
+        quantity = contracts * contract_size
+        if target_quantity > 0 and quantity < target_quantity * 0.2:
+            return {}
+        timestamp = group.timestamp_ms or 0
+        return {
+            "price": group.avg_price,
+            "fee": group.fee_abs,
+            "order_id": group.order_id,
+            "timestamp_ms": timestamp,
+            "timestamp": self._datetime_from_ms(timestamp),
+            "quantity": quantity,
+            "contracts": contracts,
+            "contract_size": contract_size,
+            "contract_size_source": contract_size_source,
+            "pnl": group.fill_pnl,
+            "source": "okx_fills_history",
+            "order_info": group.latest_row,
+        }
 
     def _datetime_from_ms(self, timestamp_ms: Any) -> Any | None:
         if not timestamp_ms or self.datetime_from_ms_parser is None:

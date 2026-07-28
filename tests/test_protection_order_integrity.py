@@ -52,9 +52,7 @@ def test_split_protection_is_not_duplicate_when_quantity_coverage_is_exact() -> 
 
 def test_repair_fingerprint_ignores_observation_timestamp_only() -> None:
     position = _position("SAND/USDT", "long", "10")
-    first_order = _protection(
-        "SAND/USDT", "long", "algo-sand", "1", created_at_ms=1
-    )
+    first_order = _protection("SAND/USDT", "long", "algo-sand", "1", created_at_ms=1)
     second_order = dict(first_order)
     first_order["updated_at_ms"] = 100
     second_order["updated_at_ms"] = 200
@@ -72,9 +70,7 @@ def test_repair_fingerprint_ignores_observation_timestamp_only() -> None:
 
 def test_repair_fingerprint_changes_with_action_relevant_order_facts() -> None:
     position = _position("SAND/USDT", "long", "10")
-    baseline = _protection(
-        "SAND/USDT", "long", "algo-sand", "1", created_at_ms=1
-    )
+    baseline = _protection("SAND/USDT", "long", "algo-sand", "1", created_at_ms=1)
     changed_quantity = {**baseline, "contracts": "2"}
     changed_stop = {**baseline, "stop_loss_price": 109.0}
     specs = {"SAND-USDT-SWAP": {"lotSz": "1", "minSz": "1"}}
@@ -110,9 +106,7 @@ def test_oversized_split_protection_is_resized_to_exact_current_contracts() -> N
             "order_count": 2,
         }
     ]
-    amendments = [
-        action for action in report["repair_actions"] if action["action"] == "amend_size"
-    ]
+    amendments = [action for action in report["repair_actions"] if action["action"] == "amend_size"]
     assert sum(float(action["new_contracts"]) for action in amendments) == 13.0
     assert {action["algo_id"] for action in amendments} == {"algo-old", "algo-new"}
     assert all(action["rollback"]["action"] == "amend_size" for action in amendments)
@@ -214,8 +208,12 @@ def test_existing_algo_precision_can_match_residual_position_below_order_lot_ste
             "reason": "match_current_position_contract_coverage",
             "inst_id": "ETC-USDT-SWAP",
             "algo_id": "algo-etc",
+            "position_side": "short",
+            "okx_position_side": "net",
             "old_contracts": "0.435",
             "new_contracts": "0.37",
+            "stop_loss_price": 90.0,
+            "take_profit_price": 70.0,
             "rollback": {
                 "action": "amend_size",
                 "inst_id": "ETC-USDT-SWAP",

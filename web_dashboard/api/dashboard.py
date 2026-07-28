@@ -11,6 +11,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, overload
 
 import structlog
@@ -108,6 +109,7 @@ _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
 _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
+_DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
@@ -123,6 +125,8 @@ _dashboard_okx_position_cache: dict[str, tuple[datetime, list[dict[str, Any]], A
 _dashboard_okx_position_error_cache: dict[str, tuple[datetime, str, Any | None]] = {}
 _dashboard_okx_position_locks: dict[str, asyncio.Lock] = {}
 _dashboard_okx_position_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_dashboard_okx_protection_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+_dashboard_okx_protection_locks: dict[str, asyncio.Lock] = {}
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, Any]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
@@ -872,6 +876,90 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
         },
         "blockers": blockers,
     }
+
+
+def _analysis_ml_signal_summary(raw_signal: Any) -> dict[str, Any] | None:
+    """Return only the ML fields rendered by analysis list views."""
+
+    signal = _safe_dict(raw_signal)
+    if not signal:
+        return None
+
+    distribution_fields = (
+        "raw_expected_return_pct",
+        "objective_expected_return_pct",
+        "lower_quantile_return_pct",
+        "uncertainty_penalty_pct",
+        "dispersion_pct",
+        "tail_loss_probability",
+        "tail_loss_scale_pct",
+    )
+
+    def slim_distribution(value: Any) -> dict[str, Any]:
+        container = _safe_dict(value)
+        return {
+            side: {
+                field: side_payload.get(field)
+                for field in distribution_fields
+                if side_payload.get(field) is not None
+            }
+            for side in ("long", "short")
+            if (side_payload := _safe_dict(container.get(side)))
+        }
+
+    predictions = []
+    for prediction_value in _safe_list(signal.get("predictions"))[:8]:
+        prediction = _safe_dict(prediction_value)
+        if not prediction:
+            continue
+        predictions.append(
+            {
+                key: prediction.get(key)
+                for key in (
+                    "horizon_minutes",
+                    "best_side",
+                    "profit_edge_pct",
+                    "risk_score",
+                    "long_win_rate",
+                    "short_win_rate",
+                    "best_win_rate",
+                    "profit_quality_score",
+                )
+                if prediction.get(key) is not None
+            }
+            | {
+                "return_distribution_contract": slim_distribution(
+                    prediction.get("return_distribution_contract")
+                )
+            }
+        )
+
+    summary = {
+        key: signal.get(key)
+        for key in (
+            "available",
+            "status",
+            "mode",
+            "prediction_eligible",
+            "primary_horizon_minutes",
+            "note",
+            "suggestion",
+            "profit_quality_score",
+            "long_win_rate",
+            "short_win_rate",
+            "profit_edge_pct",
+        )
+        if signal.get(key) is not None
+    }
+    summary["predictions"] = predictions
+    influence = _safe_dict(signal.get("influence_policy"))
+    if influence:
+        summary["influence_policy"] = {
+            key: influence.get(key)
+            for key in ("enabled", "disabled_reason", "reason")
+            if influence.get(key) is not None
+        }
+    return summary
 
 
 def _side_from_action(action: str | None) -> str:
@@ -1911,6 +1999,8 @@ def _build_execution_account_status(
     if okx_error and not pause_reason and not okx_balance_available:
         source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
         pause_reason = f"{source} 余额同步失败，系统不会分析新的交易对。原因：{okx_error}"
+    blocking_balance_error = okx_error if not okx_balance_available else None
+    balance_warning = okx_error if okx_balance_available else None
     payload = {
         **cfg,
         "model_name": ENSEMBLE_TRADER_NAME,
@@ -1919,7 +2009,8 @@ def _build_execution_account_status(
         "account_equity": account_equity,
         "risk_paused": bool(pause_reason),
         "risk_pause_reason": pause_reason,
-        "balance_error": okx_error,
+        "balance_error": blocking_balance_error,
+        "balance_warning": balance_warning,
         "okx_available_balance": okx_available,
         "okx_used_balance": okx_used,
         "okx_total_balance": okx_total,
@@ -2500,16 +2591,39 @@ async def _dashboard_open_position_risk_evidence(
         }
         decisions_by_id: dict[int, Any] = {}
         if decision_ids:
+            decision_result = await session.execute(
+                select(
+                    AIDecision.id,
+                    AIDecision.decision_learning_snapshot,
+                ).where(AIDecision.id.in_(decision_ids))
+            )
             decisions_by_id = {
-                int(decision.id): decision
-                for decision in (
-                    await session.execute(
-                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
-                    )
+                int(row.id): SimpleNamespace(
+                    id=row.id,
+                    raw_llm_response=dict(row.decision_learning_snapshot or {}),
                 )
-                .scalars()
-                .all()
+                for row in decision_result.all()
+                if row.id is not None
             }
+            missing_snapshot_ids = {
+                decision_id
+                for decision_id, decision in decisions_by_id.items()
+                if not _safe_dict(decision.raw_llm_response).get("profit_risk_sizing")
+            }
+            if missing_snapshot_ids:
+                legacy_result = await session.execute(
+                    select(
+                        AIDecision.id,
+                        AIDecision.raw_llm_response,
+                    ).where(AIDecision.id.in_(missing_snapshot_ids))
+                )
+                for row in legacy_result.all():
+                    if row.id is None:
+                        continue
+                    decisions_by_id[int(row.id)] = SimpleNamespace(
+                        id=row.id,
+                        raw_llm_response=dict(row.raw_llm_response or {}),
+                    )
 
     for item in positions:
         item_position_ids = [
@@ -2590,48 +2704,84 @@ def _dashboard_position_risk_envelope(
     }
 
 
+async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
+    from services.protection_order_integrity import audit_protection_order_integrity
+
+    cached = _dashboard_okx_protection_cache.get(selected_mode)
+    if cached is not None:
+        cached_at, audit = cached
+        if (
+            datetime.now(UTC) - cached_at
+        ).total_seconds() <= _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS:
+            return audit
+
+    lock = _dashboard_okx_protection_locks.setdefault(selected_mode, asyncio.Lock())
+    async with lock:
+        cached = _dashboard_okx_protection_cache.get(selected_mode)
+        if cached is not None:
+            cached_at, audit = cached
+            if (
+                datetime.now(UTC) - cached_at
+            ).total_seconds() <= _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS:
+                return audit
+
+        executor = _dashboard_okx_executor_for_mode(selected_mode)
+        owns_executor = executor is None
+        if owns_executor:
+            executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
+
+        try:
+            if owns_executor:
+                await asyncio.wait_for(
+                    executor.initialize(),
+                    timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
+                )
+            positions_coro = (
+                _fetch_dashboard_okx_positions_uncached(selected_mode, executor=executor)
+                if owns_executor
+                else _fetch_dashboard_okx_positions(selected_mode)
+            )
+            raw_positions, protection_orders, pending_orders = await asyncio.gather(
+                positions_coro,
+                asyncio.wait_for(
+                    executor.get_position_protection_orders(),
+                    timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+                ),
+                asyncio.wait_for(
+                    executor.get_open_orders_strict(),
+                    timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+                ),
+            )
+            audit = audit_protection_order_integrity(
+                raw_positions,
+                protection_orders,
+                pending_orders,
+                {},
+                pending_snapshot_complete=True,
+            )
+            _dashboard_okx_protection_cache[selected_mode] = (datetime.now(UTC), audit)
+            return audit
+        finally:
+            if owns_executor:
+                try:
+                    await executor.shutdown()
+                except Exception as exc:
+                    _log_dashboard_fallback(
+                        "dashboard okx protection fallback shutdown failed",
+                        exc,
+                        mode=selected_mode,
+                    )
+
+
 async def _dashboard_open_position_protection_evidence(
     positions: list[dict[str, Any]],
     *,
     mode: str | None,
 ) -> dict[str, Any]:
-    from services.protection_order_integrity import audit_protection_order_integrity
-
     selected_mode = "live" if mode == "live" else "paper"
-    executor = _dashboard_okx_executor_for_mode(selected_mode)
-    owns_executor = executor is None
-    if owns_executor:
-        executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
 
     try:
-        if owns_executor:
-            await asyncio.wait_for(
-                executor.initialize(),
-                timeout=_DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS,
-            )
-        positions_coro = (
-            _fetch_dashboard_okx_positions_uncached(selected_mode, executor=executor)
-            if owns_executor
-            else _fetch_dashboard_okx_positions(selected_mode)
-        )
-        raw_positions, protection_orders, pending_orders = await asyncio.gather(
-            positions_coro,
-            asyncio.wait_for(
-                executor.get_position_protection_orders(),
-                timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
-            ),
-            asyncio.wait_for(
-                executor.get_open_orders_strict(),
-                timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
-            ),
-        )
-        audit = audit_protection_order_integrity(
-            raw_positions,
-            protection_orders,
-            pending_orders,
-            {},
-            pending_snapshot_complete=True,
-        )
+        audit = await _dashboard_okx_protection_audit(selected_mode)
     except Exception as exc:
         blocker = f"okx_protection_inventory_unavailable:{safe_error_text(exc, limit=120)}"
         for item in positions:
@@ -2646,17 +2796,6 @@ async def _dashboard_open_position_protection_evidence(
             "orphan_keys": [],
             "split_coverage_keys": [],
         }
-    finally:
-        if owns_executor:
-            try:
-                await executor.shutdown()
-            except Exception as exc:
-                _log_dashboard_fallback(
-                    "dashboard okx protection fallback shutdown failed",
-                    exc,
-                    mode=selected_mode,
-                )
-
     orders_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for order in _safe_list(audit.get("protection_orders")):
         if not isinstance(order, dict):
@@ -2947,18 +3086,52 @@ async def warm_dashboard_read_caches(mode: str | None = None) -> None:
     """Prime only bounded exchange reads needed by the first dashboard paint."""
 
     selected_mode = mode or mode_manager.mode.value
-    results = await asyncio.gather(
+    from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
+
+    first_stage_results = await asyncio.gather(
         _refresh_dashboard_okx_position_cache(selected_mode),
         _refresh_dashboard_okx_balance_cache(selected_mode),
+        load_authoritative_trade_outcomes(compact=True),
         return_exceptions=True,
     )
-    for label, result in zip(("position", "balance"), results, strict=True):
+    for label, result in zip(
+        ("position", "balance", "authoritative_outcomes"),
+        first_stage_results,
+        strict=True,
+    ):
         if isinstance(result, BaseException):
             _log_dashboard_fallback(
                 f"dashboard {label} cache warmup failed",
                 result,
                 mode=selected_mode,
             )
+    second_stage_results = await asyncio.gather(
+        _warm_dashboard_strategy_learning_cache(selected_mode),
+        get_model_training_registry_status(),
+        _warm_dashboard_data_collection_cache(),
+        return_exceptions=True,
+    )
+    for label, result in zip(
+        ("strategy_learning", "model_registry", "data_collection"),
+        second_stage_results,
+        strict=True,
+    ):
+        if isinstance(result, BaseException):
+            _log_dashboard_fallback(
+                f"dashboard {label} cache warmup failed",
+                result,
+                mode=selected_mode,
+            )
+
+
+async def _warm_dashboard_strategy_learning_cache(mode: str) -> None:
+    await get_strategy_learning(mode=mode)
+
+
+async def _warm_dashboard_data_collection_cache() -> None:
+    from web_dashboard.api.data_collection import get_data_collection_status
+
+    await get_data_collection_status()
 
 
 async def shutdown_dashboard_read_clients() -> None:
@@ -2979,6 +3152,8 @@ async def shutdown_dashboard_read_clients() -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     _dashboard_closed_ledger_refresh_tasks.clear()
+    _dashboard_okx_protection_cache.clear()
+    _dashboard_okx_protection_locks.clear()
     executors = list(dict.fromkeys(_dashboard_read_only_okx_executors.values()))
     _dashboard_read_only_okx_executors.clear()
     _dashboard_read_only_okx_executor_factories.clear()
@@ -3361,7 +3536,6 @@ async def _dashboard_closed_position_ledger_rows_uncached(
 ) -> tuple[list[dict[str, Any]], int, int, int, str]:
     from sqlalchemy import select
 
-    from models.account import OkxAccountBill
     from models.trade import Order, Position
     from services.okx_order_fact_sync import (
         OKX_SYNC_CONFIRMED,
@@ -3372,7 +3546,6 @@ async def _dashboard_closed_position_ledger_rows_uncached(
         load_okx_position_history_records,
         okx_position_history_records_to_rows,
     )
-    from services.okx_position_ledger_view import build_okx_position_ledger_groups
     from services.position_settlement import is_final_settlement_status
 
     if model_names:
@@ -3490,27 +3663,9 @@ async def _dashboard_closed_position_ledger_rows_uncached(
             }
         ]
     if position_history_rows:
-        account_bill_rows = await _dashboard_okx_account_bill_rows(
-            session,
-            closed_rows=closed_rows,
-            mode=mode,
-            account_bill_model=OkxAccountBill,
-        )
-        refreshed_groups = build_okx_position_ledger_groups(
-            closed_rows,
-            order_rows,
-            account_bills=account_bill_rows,
-            position_history_rows=position_history_rows,
-            require_order_lifecycle_source_positions=True,
-        )
-        refreshed_groups = [
-            group
-            for group in refreshed_groups
-            if is_final_settlement_status(getattr(group, "settlement_status", None))
-        ]
         official_rows = _dashboard_position_history_official_rows_as_groups(
             position_history_rows,
-            refreshed_groups,
+            [],
             mode=mode,
             order_rows=order_rows,
             closed_rows=closed_rows,
@@ -4767,6 +4922,27 @@ def _dashboard_position_history_official_rows_as_groups(
     official_groups: list[dict[str, Any]] = []
     order_rows = list(order_rows or [])
     closed_rows = list(closed_rows or [])
+    orders_by_inst_id: dict[str, list[Any]] = {}
+    orders_by_exchange_id: dict[str, list[Any]] = {}
+    for order in order_rows:
+        inst_id = _dashboard_order_inst_id(order)
+        if inst_id:
+            orders_by_inst_id.setdefault(inst_id, []).append(order)
+        for order_id in _dashboard_split_exchange_order_ids(
+            getattr(order, "exchange_order_id", None)
+        ):
+            orders_by_exchange_id.setdefault(order_id, []).append(order)
+
+    positions_by_inst_id: dict[str, list[Any]] = {}
+    for position in closed_rows:
+        inst_id = (
+            str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            or okx_inst_id_from_symbol(getattr(position, "symbol", None))
+            or ""
+        )
+        if inst_id:
+            positions_by_inst_id.setdefault(inst_id, []).append(position)
+
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -4774,11 +4950,29 @@ def _dashboard_position_history_official_rows_as_groups(
         symbol = symbol_from_okx_inst_id(inst_id) or normalize_trading_symbol(inst_id)
         if not symbol:
             continue
-        side = _dashboard_position_history_local_side(row, local_groups, closed_rows)
+        relevant_closed_rows = positions_by_inst_id.get(inst_id, []) if inst_id else closed_rows
+        relevant_order_rows = list(orders_by_inst_id.get(inst_id, [])) if inst_id else order_rows
+        hinted_order_ids = set().union(
+            _dashboard_split_exchange_order_ids(row.get("_dashboard_entry_order_ids")),
+            _dashboard_split_exchange_order_ids(row.get("_dashboard_close_order_ids")),
+            _dashboard_split_exchange_order_ids(row.get("_dashboard_linked_order_ids")),
+        )
+        seen_orders = {id(order) for order in relevant_order_rows}
+        for order_id in hinted_order_ids:
+            for order in orders_by_exchange_id.get(order_id, []):
+                if id(order) not in seen_orders:
+                    relevant_order_rows.append(order)
+                    seen_orders.add(id(order))
+
+        side = _dashboard_position_history_local_side(
+            row,
+            local_groups,
+            relevant_closed_rows,
+        )
         order_payload = _dashboard_position_history_order_payload(
             row,
             side=side,
-            order_rows=order_rows,
+            order_rows=relevant_order_rows,
         )
         status, status_label = _dashboard_position_history_close_status(row)
         authoritative_full = _dashboard_position_history_is_authoritative_full(row)
@@ -4854,7 +5048,7 @@ def _dashboard_position_history_official_rows_as_groups(
                 "official_updated_at": updated_at.isoformat() if updated_at else None,
                 "position_ids": _dashboard_position_history_matching_position_ids(
                     row,
-                    closed_rows,
+                    relevant_closed_rows,
                     side=side,
                 ),
                 "entry_order_ids": order_payload["entry_order_ids"],
@@ -6079,6 +6273,11 @@ def _load_model_training_report(relative_path: str) -> dict[str, Any]:
 async def get_model_training_registry_status() -> dict[str, Any]:
     """Return one truthful lifecycle view for trained and pretrained models."""
 
+    cache_key = ("model-training-registry",)
+    cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
+    if cached is not None:
+        return sanitize_payload(cached)
+
     local_ml_status = await get_ml_signal_status()
     local_tools_status = await get_local_ai_tools_status()
     specialist_report = _load_model_training_report(
@@ -6100,7 +6299,7 @@ async def get_model_training_registry_status() -> dict[str, Any]:
         contribution_performance=contribution_performance,
     )
     registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
-    return sanitize_payload(registry)
+    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, registry))
 
 
 @router.get("/model-training/scheduler")
@@ -6701,25 +6900,37 @@ async def get_positions(
             exchange_mark_map,
             mode=mode,
         )
-        try:
-            await _dashboard_open_position_risk_evidence(positions, mode=mode)
-        except Exception as exc:
-            _log_dashboard_fallback("open position risk evidence unavailable", exc, mode=mode)
-            blocker = f"position_risk_evidence_unavailable:{safe_error_text(exc, limit=120)}"
+        risk_result, protection_result = await asyncio.gather(
+            _dashboard_open_position_risk_evidence(positions, mode=mode),
+            _dashboard_open_position_protection_evidence(positions, mode=mode),
+            return_exceptions=True,
+        )
+        if isinstance(risk_result, BaseException):
+            _log_dashboard_fallback(
+                "open position risk evidence unavailable",
+                risk_result,
+                mode=mode,
+            )
+            blocker = (
+                "position_risk_evidence_unavailable:"
+                f"{safe_error_text(risk_result, limit=120)}"
+            )
             for item in positions:
                 item["risk_contract"] = {
                     "available": False,
                     "contracts": [],
                     "blockers": [blocker],
                 }
-        try:
-            protection_inventory = await _dashboard_open_position_protection_evidence(
-                positions,
+        if isinstance(protection_result, BaseException):
+            _log_dashboard_fallback(
+                "open position OCO evidence unavailable",
+                protection_result,
                 mode=mode,
             )
-        except Exception as exc:
-            _log_dashboard_fallback("open position OCO evidence unavailable", exc, mode=mode)
-            blocker = f"okx_protection_evidence_unavailable:{safe_error_text(exc, limit=120)}"
+            blocker = (
+                "okx_protection_evidence_unavailable:"
+                f"{safe_error_text(protection_result, limit=120)}"
+            )
             for item in positions:
                 item["protection_contract"] = {
                     "available": False,
@@ -6732,6 +6943,8 @@ async def get_positions(
                 "orphan_keys": [],
                 "split_coverage_keys": [],
             }
+        else:
+            protection_inventory = protection_result
 
     display_total = len(positions) if open_only or closed_only else total
     display_open_count = len(positions) if open_only else open_count
@@ -7293,6 +7506,7 @@ async def get_analysis_records(
     decision_id: int | None = None,
     analysis_type: str | None = None,
     include_detail: bool = False,
+    include_ml_summary: bool = False,
     symbol: str | None = None,
     expert_name: str | None = None,
     is_paper: bool | None = None,
@@ -7585,6 +7799,7 @@ async def get_analysis_records(
                     raw,
                     display_execution_reason,
                 ),
+                "prediction_economics": _display_prediction_economics(raw),
                 "position_review_policy": (
                     raw.get("position_review_policy")
                     if isinstance(raw.get("position_review_policy"), dict)
@@ -7611,6 +7826,20 @@ async def get_analysis_records(
                 "vector_memory": vector_memory_context,
             }
             if include_detail
+            else {}
+        )
+
+        list_projection_payload = (
+            {
+                "ml_signal": _analysis_ml_signal_summary(raw.get("ml_signal")),
+                "prediction_economics": _bounded_dashboard_payload(
+                    _display_prediction_economics(raw),
+                    max_depth=5,
+                    max_items=48,
+                    max_text=600,
+                ),
+            }
+            if include_ml_summary and not include_detail
             else {}
         )
 
@@ -7662,18 +7891,6 @@ async def get_analysis_records(
             "disagreement": raw.get("disagreement"),
             "was_executed": d.was_executed,
             "execution_reason": display_execution_reason,
-            "ml_signal": _bounded_dashboard_payload(
-                raw.get("ml_signal") if isinstance(raw.get("ml_signal"), dict) else None,
-                max_depth=4,
-                max_items=40,
-                max_text=600,
-            ),
-            "prediction_economics": _bounded_dashboard_payload(
-                _display_prediction_economics(raw),
-                max_depth=5,
-                max_items=48,
-                max_text=600,
-            ),
             "is_paper": d.is_paper,
             "flow_summary": (
                 f"{pre_expert_skip.get('label')}：{pre_expert_skip.get('reason')}"
@@ -7687,6 +7904,7 @@ async def get_analysis_records(
                 )
             ),
         }
+        record.update(list_projection_payload)
         record.update(detail_payload)
         records.append(_bounded_dashboard_payload(sanitize_payload(record)))
 
@@ -7707,6 +7925,95 @@ async def get_analysis_records(
     }
 
 
+def _strategy_learning_candidate_summary(value: Any) -> dict[str, Any]:
+    candidate = _safe_dict(value)
+    params = _safe_dict(candidate.get("params"))
+    promotion = _safe_dict(candidate.get("promotion"))
+    backtest = _safe_dict(candidate.get("backtest"))
+    shadow = _safe_dict(candidate.get("shadow_validation"))
+    return {
+        key: candidate.get(key)
+        for key in ("id", "version", "rank", "label", "status")
+        if candidate.get(key) is not None
+    } | {
+        "params": {
+            "selector": _safe_dict(params.get("selector")),
+            "historical_return_distribution": _safe_dict(
+                params.get("historical_return_distribution")
+            ),
+        },
+        "promotion": {
+            key: promotion.get(key)
+            for key in (
+                "evaluation_state",
+                "historical_prior_context_eligible",
+                "rejection_reasons",
+                "can_authorize_entry",
+                "can_change_size_or_leverage",
+                "production_permission",
+            )
+            if promotion.get(key) is not None
+        },
+        "backtest": {
+            "status": backtest.get("status"),
+            "metrics": _safe_dict(backtest.get("metrics")),
+        },
+        "shadow_validation": {
+            "status": shadow.get("status"),
+            "metrics": _safe_dict(shadow.get("metrics")),
+        },
+    }
+
+
+def _strategy_learning_dashboard_summary(payload: Any) -> dict[str, Any]:
+    result = _safe_dict(payload)
+    schedule = _safe_dict(result.get("schedule"))
+    runtime = _safe_dict(schedule.get("runtime"))
+    candidates = [
+        _strategy_learning_candidate_summary(candidate)
+        for candidate in _safe_list(schedule.get("candidates"))
+        if isinstance(candidate, dict)
+    ]
+    leading = _safe_dict(schedule.get("leading_candidate"))
+    leading_summary = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("id") == leading.get("id")
+            and candidate.get("version") == leading.get("version")
+        ),
+        _strategy_learning_candidate_summary(leading) if leading else None,
+    )
+    result["schedule"] = {
+        "leading_candidate": leading_summary,
+        "reason": schedule.get("reason"),
+        "runtime": {
+            key: runtime.get(key)
+            for key in (
+                "optimization_target",
+                "historical_prior_context_enabled",
+                "can_authorize_entry",
+                "can_change_size_or_leverage",
+                "current_return_contract_required",
+                "execution_owners",
+                "current_market_regime",
+                "account_state",
+                "policy_provenance",
+            )
+            if runtime.get(key) is not None
+        },
+        "candidates": candidates,
+        "candidate_count": schedule.get("candidate_count"),
+        "governed_candidate_count": schedule.get("governed_candidate_count"),
+        "rejected_candidate_count": schedule.get("rejected_candidate_count"),
+        "scheduler_mode": schedule.get("scheduler_mode"),
+        "current_production_strategy": _safe_dict(
+            schedule.get("current_production_strategy")
+        ),
+    }
+    return result
+
+
 @router.get("/strategy-learning")
 async def get_strategy_learning(
     mode: str | None = None,
@@ -7715,8 +8022,6 @@ async def get_strategy_learning(
     detail: str = "summary",
 ):
     """Return the active strategy-learning feedback and scheduler state."""
-    from services.strategy_learning import StrategyLearningService
-
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
     selected_detail = "full" if str(detail or "").lower() == "full" else "summary"
     strategy_params = STRATEGY_LEARNING_PARAMS
@@ -7735,12 +8040,19 @@ async def get_strategy_learning(
         strategy_params.min_dashboard_limit,
         min(int(limit or strategy_params.dashboard_default_limit), max_limit),
     )
-    cache_key = (
+    request_cache_key = (
         "strategy-learning",
         selected_mode,
         capped_hours,
         capped_limit,
         selected_detail,
+    )
+    cached = _dashboard_heavy_cache_get(request_cache_key, ttl_seconds=300.0)
+    if cached is not None:
+        return sanitize_payload(cached)
+
+    cache_key = (
+        *request_cache_key,
         await _strategy_learning_watermark_for_request(
             selected_mode=selected_mode,
             since=datetime.now(UTC) - timedelta(hours=capped_hours),
@@ -7748,17 +8060,34 @@ async def get_strategy_learning(
     )
     cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
     if cached is not None:
-        return sanitize_payload(cached)
-    service = getattr(_trading_service, "strategy_learning_service", None)
-    if service is None:
-        service = StrategyLearningService()
-    payload = await service.dashboard_payload(
-        mode=selected_mode,
-        hours=capped_hours,
-        limit=capped_limit,
-        detail=selected_detail,
+        return sanitize_payload(_dashboard_heavy_cache_set(request_cache_key, cached))
+
+    async def build_payload() -> dict[str, Any]:
+        from services.strategy_learning import StrategyLearningService
+
+        service = getattr(_trading_service, "strategy_learning_service", None)
+        if service is None:
+            service = StrategyLearningService()
+        payload = await service.dashboard_payload(
+            mode=selected_mode,
+            hours=capped_hours,
+            limit=capped_limit,
+            detail=selected_detail,
+            include_historical_replay=False,
+        )
+        return (
+            payload
+            if selected_detail == "full"
+            else _strategy_learning_dashboard_summary(payload)
+        )
+
+    payload = await _dashboard_heavy_cached(
+        cache_key,
+        build_payload,
+        ttl_seconds=300.0,
     )
-    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, payload))
+    _dashboard_heavy_cache_set(request_cache_key, payload)
+    return sanitize_payload(payload)
 
 
 async def _strategy_learning_watermark_for_request(
@@ -7890,6 +8219,111 @@ async def _profit_attribution_watermark(
     return tuple(value.isoformat() if isinstance(value, datetime) else value for value in row)
 
 
+def _profit_attribution_dashboard_record(value: Any) -> dict[str, Any]:
+    record = _safe_dict(value)
+    result = {
+        key: record.get(key)
+        for key in (
+            "position_id",
+            "symbol",
+            "side",
+            "side_label",
+            "entry_at",
+            "closed_at",
+            "hold_minutes",
+            "entry_price",
+            "exit_price",
+            "quantity",
+            "realized_pnl",
+            "bucket",
+            "main_reason",
+            "attribution_confidence",
+        )
+        if record.get(key) is not None
+    }
+    result["notes"] = [sanitize_text(item) for item in _safe_list(record.get("notes"))[:2]]
+
+    entry = _safe_dict(record.get("entry_decision"))
+    result["entry_decision"] = {
+        key: entry.get(key)
+        for key in ("id", "action", "action_label", "confidence")
+        if entry.get(key) is not None
+    }
+
+    signals = _safe_dict(record.get("signals"))
+    result["signals"] = {}
+    for signal_name in ("ml", "server_profit", "timeseries", "sentiment"):
+        signal = _safe_dict(signals.get(signal_name))
+        result["signals"][signal_name] = {
+            key: signal.get(key)
+            for key in (
+                "available",
+                "side",
+                "score",
+                "expected_return_pct",
+                "return_distribution_contract",
+            )
+            if signal.get(key) is not None
+        }
+
+    shadow = _safe_dict(record.get("shadow"))
+    result["shadow"] = {
+        key: shadow.get(key)
+        for key in (
+            "id",
+            "status",
+            "best_action",
+            "best_action_label",
+            "long_return_pct",
+            "short_return_pct",
+        )
+        if shadow.get(key) is not None
+    }
+
+    evidence = _safe_dict(record.get("evidence_status"))
+    result["evidence_status"] = {
+        source_name: {
+            key: source.get(key)
+            for key in (
+                "available",
+                "status",
+                "side",
+                "action",
+                "action_label",
+                "confidence",
+                "best_action",
+                "best_action_label",
+                "missing_reason",
+                "return_distribution_contract",
+            )
+            if source.get(key) is not None
+        }
+        for source_name, source_value in evidence.items()
+        if (source := _safe_dict(source_value))
+    }
+
+    decision_state = _safe_dict(record.get("decision_state"))
+    state_summary = _safe_dict(decision_state.get("summary"))
+    result["decision_state"] = {
+        "summary": {
+            key: state_summary.get(key)
+            for key in ("final_stage", "final_status", "final_reason")
+            if state_summary.get(key) is not None
+        }
+    }
+    return result
+
+
+def _profit_attribution_dashboard_payload(value: Any) -> dict[str, Any]:
+    payload = _safe_dict(value)
+    payload["records"] = [
+        _profit_attribution_dashboard_record(record)
+        for record in _safe_list(payload.get("records"))
+        if isinstance(record, dict)
+    ]
+    return payload
+
+
 @router.get("/profit-attribution")
 async def get_profit_attribution(
     mode: str | None = None,
@@ -7898,6 +8332,7 @@ async def get_profit_attribution(
 ):
     """Explain why recent closed trades made or lost money."""
     from sqlalchemy import select
+    from sqlalchemy.orm import load_only
 
     from db.session import get_session_ctx
     from models.decision import AIDecision
@@ -7912,6 +8347,15 @@ async def get_profit_attribution(
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
     capped_hours = max(1, min(int(hours or 24), 720))
     max_rows = max(20, min(int(limit or 200), 1000))
+    request_cache_key = (
+        "profit-attribution",
+        selected_mode,
+        capped_hours,
+        max_rows,
+    )
+    cached = _dashboard_heavy_cache_get(request_cache_key, ttl_seconds=30.0)
+    if cached is not None:
+        return sanitize_payload(cached)
     since = datetime.now(UTC) - timedelta(hours=capped_hours)
     async with get_session_ctx() as session:
         watermark = await _profit_attribution_watermark(
@@ -7919,16 +8363,12 @@ async def get_profit_attribution(
             selected_mode=selected_mode,
             since=since,
         )
-        cache_key = (
-            "profit-attribution",
-            selected_mode,
-            capped_hours,
-            max_rows,
-            watermark,
-        )
+        cache_key = (*request_cache_key, watermark)
         cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
         if cached is not None:
-            return sanitize_payload(cached)
+            return sanitize_payload(
+                _dashboard_heavy_cache_set(request_cache_key, cached)
+            )
         position_result = await session.execute(
             select(Position)
             .where(
@@ -7961,7 +8401,10 @@ async def get_profit_attribution(
                 "records": [],
                 "message": "最近窗口内暂无已平仓记录。",
             }
-            return sanitize_payload(_dashboard_heavy_cache_set(cache_key, empty_payload))
+            _dashboard_heavy_cache_set(cache_key, empty_payload)
+            return sanitize_payload(
+                _dashboard_heavy_cache_set(request_cache_key, empty_payload)
+            )
 
         symbols = {p.symbol for p in positions if p.symbol}
         symbol_variants = _dashboard_symbol_query_variants(symbols)
@@ -7978,6 +8421,7 @@ async def get_profit_attribution(
             .where(
                 Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                 Order.execution_mode == selected_mode,
+                Order.status == "filled",
                 Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1,
                 Order.created_at >= order_since,
             )
@@ -7990,13 +8434,36 @@ async def get_profit_attribution(
         decisions_by_id = {}
         if decision_ids:
             decision_result = await session.execute(
-                select(AIDecision)
+                select(
+                    AIDecision.id,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.confidence,
+                    AIDecision.reasoning,
+                    AIDecision.execution_reason,
+                    AIDecision.was_executed,
+                    AIDecision.executed_at,
+                    AIDecision.created_at,
+                    AIDecision.decision_learning_snapshot,
+                )
                 .where(AIDecision.id.in_(decision_ids))
                 .order_by(AIDecision.created_at.desc())
             )
-            decisions_by_id.update(
-                {int(row.id): row for row in decision_result.scalars().all() if row.id is not None}
-            )
+            for row in decision_result.all():
+                if row.id is None:
+                    continue
+                decisions_by_id[int(row.id)] = SimpleNamespace(
+                    id=row.id,
+                    symbol=row.symbol,
+                    action=row.action,
+                    confidence=row.confidence,
+                    reasoning=row.reasoning,
+                    execution_reason=row.execution_reason,
+                    was_executed=row.was_executed,
+                    executed_at=row.executed_at,
+                    created_at=row.created_at,
+                    raw_llm_response=dict(row.decision_learning_snapshot or {}),
+                )
         decisions = list(decisions_by_id.values())
 
         entry_decisions = match_entry_decisions_for_positions(positions, orders, decisions)
@@ -8006,6 +8473,23 @@ async def get_profit_attribution(
             shadow_result = await session.execute(
                 select(ShadowBacktest)
                 .where(ShadowBacktest.decision_id.in_(shadow_decision_ids))
+                .options(
+                    load_only(
+                        ShadowBacktest.id,
+                        ShadowBacktest.decision_id,
+                        ShadowBacktest.execution_mode,
+                        ShadowBacktest.symbol,
+                        ShadowBacktest.decision_action,
+                        ShadowBacktest.status,
+                        ShadowBacktest.horizon_minutes,
+                        ShadowBacktest.long_return_pct,
+                        ShadowBacktest.short_return_pct,
+                        ShadowBacktest.best_action,
+                        ShadowBacktest.missed_opportunity,
+                        ShadowBacktest.note,
+                        ShadowBacktest.created_at,
+                    )
+                )
                 .order_by(ShadowBacktest.created_at.desc())
                 .limit(max(len(shadow_decision_ids) * 4, max_rows * 10))
             )
@@ -8024,7 +8508,11 @@ async def get_profit_attribution(
         **payload,
         "message": "按已平仓真实盈亏，结合 AI 决策、订单、影子复盘和本地模型证据做交易级归因。",
     }
-    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, result_payload))
+    dashboard_payload = _profit_attribution_dashboard_payload(result_payload)
+    _dashboard_heavy_cache_set(cache_key, dashboard_payload)
+    return sanitize_payload(
+        _dashboard_heavy_cache_set(request_cache_key, dashboard_payload)
+    )
 
 
 @router.get("/model-contribution/stats")
@@ -8350,6 +8838,7 @@ async def get_expert_memories(
     selected_mode = str(mode or "").lower()
     outcomes = await load_authoritative_trade_outcomes(
         mode=selected_mode if selected_mode in {"paper", "live"} else None,
+        compact=True,
     )
     outcome_by_position_id = {
         int(position_id): outcome

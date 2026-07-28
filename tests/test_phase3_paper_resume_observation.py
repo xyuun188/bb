@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -269,19 +270,31 @@ def test_paper_resume_observation_treats_active_paper_preflight_as_consumed() ->
 
 @pytest.mark.asyncio
 async def test_paper_resume_observation_service_uses_injected_providers() -> None:
+    main_thread_id = threading.get_ident()
+    provider_thread_ids: set[int] = set()
+
+    def off_loop(factory):
+        def provider():
+            provider_thread_ids.add(threading.get_ident())
+            return factory()
+
+        return provider
+
     service = Phase3PaperResumeObservationService(
-        sample_summary_provider=_samples,
-        platform_server_provider=_platform_server,
-        platform_runtime_provider=_platform_runtime,
-        okx_sync_provider=_okx_clean,
-        specialist_shadow_provider=_specialist,
-        latest_preflight_provider=_preflight,
+        sample_summary_provider=off_loop(_samples),
+        platform_server_provider=off_loop(_platform_server),
+        platform_runtime_provider=off_loop(_platform_runtime),
+        okx_sync_provider=off_loop(_okx_clean),
+        specialist_shadow_provider=off_loop(_specialist),
+        latest_preflight_provider=off_loop(_preflight),
     )
 
     report = await service.report()
 
     assert report["status"] == "healthy"
     assert report["summary"]["completed_shadow_count"] == 2
+    assert provider_thread_ids
+    assert main_thread_id not in provider_thread_ids
 
 
 def test_paper_resume_observation_cli_writes_latest_report(tmp_path) -> None:

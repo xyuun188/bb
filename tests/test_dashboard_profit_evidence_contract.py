@@ -393,6 +393,7 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    dashboard._dashboard_okx_protection_cache.clear()
     await close_db()
     monkeypatch.setattr(
         settings,
@@ -555,6 +556,7 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
             "_dashboard_okx_executor_for_mode",
             lambda _mode: SplitFakeExecutor(),
         )
+        dashboard._dashboard_okx_protection_cache.clear()
         split_rows = [{"symbol": "EDGE/USDT", "side": "long"}]
         split_inventory = await dashboard._dashboard_open_position_protection_evidence(
             split_rows,

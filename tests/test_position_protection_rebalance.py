@@ -18,12 +18,15 @@ class _Executor:
         position_contracts: str = "5",
         protection_contracts: tuple[str, ...] = ("13",),
         fail_algo_id: str = "",
+        stuck_algo_id: str = "",
     ) -> None:
         self.position_contracts = position_contracts
         self.protection_contracts = list(protection_contracts)
         self.fail_algo_id = fail_algo_id
+        self.stuck_algo_id = stuck_algo_id
         self.amend_calls: list[dict[str, Any]] = []
         self.create_calls: list[dict[str, Any]] = []
+        self.cancel_calls: list[dict[str, Any]] = []
 
     async def get_positions_strict(self, _symbol: str | None) -> list[dict[str, Any]]:
         if not self.position_contracts:
@@ -74,9 +77,11 @@ class _Executor:
         algo_id: str,
         contracts: float,
     ) -> dict[str, Any]:
-        self.amend_calls.append(
-            {"inst_id": inst_id, "algo_id": algo_id, "contracts": contracts}
-        )
+        self.amend_calls.append({"inst_id": inst_id, "algo_id": algo_id, "contracts": contracts})
+        if algo_id == self.stuck_algo_id:
+            raise RuntimeError(
+                "OKX API error [51513]: Number of modification requests in progress exceeded"
+            )
         if algo_id == self.fail_algo_id:
             return {"code": "1", "data": [{"algoId": algo_id, "sCode": "51000"}]}
         index = int(algo_id.rsplit("-", 1)[-1]) - 1
@@ -89,6 +94,7 @@ class _Executor:
         inst_id: str,
         algo_id: str,
     ) -> dict[str, Any]:
+        self.cancel_calls.append({"inst_id": inst_id, "algo_id": algo_id})
         index = int(algo_id.rsplit("-", 1)[-1]) - 1
         self.protection_contracts.pop(index)
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
@@ -177,6 +183,33 @@ async def test_resize_failure_rolls_back_prior_amendment() -> None:
     assert caught.value.report["status"] == "apply_failed"
     assert executor.protection_contracts == ["6", "7"]
     assert caught.value.report["rollback_results"][0]["applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_stuck_okx_amend_is_replaced_without_unprotected_gap() -> None:
+    executor = _Executor(
+        position_contracts="5",
+        protection_contracts=("13",),
+        stuck_algo_id="algo-1",
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert result["status"] == "repaired"
+    assert executor.protection_contracts == ["5"]
+    assert executor.create_calls == [
+        {
+            "inst_id": "IRYS-USDT-SWAP",
+            "position_side": "short",
+            "okx_position_side": "net",
+            "contracts": 5.0,
+            "stop_loss_price": 0.16,
+            "take_profit_price": 0.14,
+        }
+    ]
+    assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-1"}]
+    assert result["applied_actions"][0]["action"]["action"] == "replace_stuck_amend"
 
 
 @pytest.mark.asyncio

@@ -558,9 +558,9 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     assert "runtime_data_retention" in retention_trigger
     assert "bb_compact_ai_decision_learning_value" in retention_trigger
     assert "bb_project_profit_risk_sizing_snapshot" in retention_trigger
-    assert "decision_learning_snapshot_version := 3" in retention_trigger
+    assert "decision_learning_snapshot_version := 4" in retention_trigger
     assert any(
-        "decision_learning_snapshot_version < 3" in statement
+        "decision_learning_snapshot_version < 4" in statement
         for statement in fake_conn.statements
     )
 

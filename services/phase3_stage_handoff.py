@@ -119,7 +119,9 @@ def evaluate_phase3_stage_handoff_inputs(
     passed: list[str] = []
 
     if not go_report.get("available"):
-        blockers.append(_blocker("go_no_go_report_missing", "Dynamic return gate report is missing."))
+        blockers.append(
+            _blocker("go_no_go_report_missing", "Dynamic return gate report is missing.")
+        )
     elif not _is_fresh(go_report, max_age):
         blockers.append(
             _blocker(
@@ -168,10 +170,14 @@ def evaluate_phase3_stage_handoff_inputs(
     elif specialist.get("available"):
         passed.append("specialist_shadow_observation_only")
     else:
-        warnings.append(_warning("specialist_report_missing", "Specialist observation report is missing."))
+        warnings.append(
+            _warning("specialist_report_missing", "Specialist observation report is missing.")
+        )
 
     if not observation.get("available"):
-        warnings.append(_warning("observation_report_missing", "Paper observation report is missing."))
+        warnings.append(
+            _warning("observation_report_missing", "Paper observation report is missing.")
+        )
     if not rebuild.get("available"):
         warnings.append(_warning("rebuild_report_missing", "Rebuild report is missing."))
 
@@ -201,7 +207,10 @@ def evaluate_phase3_stage_handoff_inputs(
             "okx_unresolved_count": unresolved,
         },
         "inputs": {
-            "go_no_go": {"available": bool(go_report.get("available")), "status": gate.get("status")},
+            "go_no_go": {
+                "available": bool(go_report.get("available")),
+                "status": gate.get("status"),
+            },
             "observation": {"available": bool(observation.get("available"))},
             "specialist": {"available": bool(specialist.get("available"))},
             "rebuild": {"available": bool(rebuild.get("available"))},
@@ -225,13 +234,19 @@ class Phase3StageHandoffService:
         self.data_dir = data_dir or settings.data_dir
         self.report_max_age_seconds = max(int(report_max_age_seconds or 60), 60)
 
-    def report(self) -> dict[str, Any]:
+    def report(
+        self,
+        *,
+        go_no_go_report: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         root = Path(self.data_dir)
-        go_report = _first_report([root / GO_NO_GO_REL])
-        observation = _first_report([root / OBSERVATION_REL])
-        specialist = _first_report(
-            [root / SPECIALIST_DATA_REL, Path.cwd() / SPECIALIST_REPORT_REL]
+        go_report = (
+            {**go_no_go_report, "available": True}
+            if isinstance(go_no_go_report, dict) and go_no_go_report
+            else _first_report([root / GO_NO_GO_REL])
         )
+        observation = _first_report([root / OBSERVATION_REL])
+        specialist = _first_report([root / SPECIALIST_DATA_REL, Path.cwd() / SPECIALIST_REPORT_REL])
         rebuild = _first_report([root / REBUILD_REL])
         okx_daily = _first_report([root / OKX_DAILY_REL])
         report = evaluate_phase3_stage_handoff_inputs(
@@ -243,7 +258,7 @@ class Phase3StageHandoffService:
             report_max_age_seconds=self.report_max_age_seconds,
         )
         report["report_paths"] = {
-            "go_no_go": go_report.get("report_path"),
+            "go_no_go": go_report.get("report_path") or "current_system_audit",
             "observation": observation.get("report_path"),
             "specialist": specialist.get("report_path"),
             "rebuild": rebuild.get("report_path"),

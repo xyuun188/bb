@@ -97,7 +97,7 @@ async def test_exchange_close_fill_finder_uses_latest_native_okx_fill_candidate(
                 "ts": str(timestamp + 1),
                 "algoId": "algo-1",
             },
-        ]
+        ],
     )
     parser_calls = []
     finder = ExchangeCloseFillFinder(
@@ -115,6 +115,53 @@ async def test_exchange_close_fill_finder_uses_latest_native_okx_fill_candidate(
     assert result["source"] == "okx_fills_history"
     assert result["order_info"]["algoId"] == "algo-1"
     assert parser_calls == [timestamp + 1]
+
+
+@pytest.mark.asyncio
+async def test_exchange_close_fill_finder_batches_multiple_missing_positions() -> None:
+    timestamp = int(datetime(2026, 6, 8, 12, 10, tzinfo=UTC).timestamp() * 1000)
+    ccxt = _FakeCcxt(
+        instruments=[
+            {"instId": "BTC-USDT-SWAP", "ctVal": "0.5", "ctMult": "1"},
+            {"instId": "ETH-USDT-SWAP", "ctVal": "0.1", "ctMult": "1"},
+        ],
+        fills_history=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "ordId": "close-btc",
+                "side": "sell",
+                "fillSz": "4",
+                "fillPx": "112",
+                "ts": str(timestamp),
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "ordId": "close-eth",
+                "side": "buy",
+                "fillSz": "30",
+                "fillPx": "1900",
+                "ts": str(timestamp + 1),
+            },
+        ],
+    )
+    finder = ExchangeCloseFillFinder(paper_okx_provider=lambda: _FakePaperOkx(ccxt))
+
+    results = await finder.find_many(
+        [
+            _position(symbol="BTC/USDT", side="long", quantity=2.0),
+            _position(
+                symbol="ETH/USDT",
+                side="short",
+                quantity=3.0,
+                okx_inst_id="ETH-USDT-SWAP",
+            ),
+        ]
+    )
+
+    assert [result["order_id"] for result in results] == ["close-btc", "close-eth"]
+    assert [result["quantity"] for result in results] == pytest.approx([2.0, 3.0])
+    assert ccxt.instrument_params == [{"instType": "SWAP"}]
+    assert _without_begin(ccxt.fill_history_params) == [{"instType": "SWAP", "limit": "100"}]
 
 
 @pytest.mark.asyncio
@@ -141,7 +188,7 @@ async def test_exchange_close_fill_finder_prefers_native_quantity_match_over_lat
                 "fillPnl": "11.7",
                 "ts": str(timestamp + 60000),
             },
-        ]
+        ],
     )
     finder = ExchangeCloseFillFinder(paper_okx_provider=lambda: _FakePaperOkx(ccxt))
 
@@ -202,9 +249,7 @@ async def test_exchange_close_fill_finder_uses_okx_ctval_for_contract_quantity_m
 
 @pytest.mark.asyncio
 async def test_exchange_close_fill_finder_ignores_ccxt_abstract_history_without_native_fills():
-    ccxt = _FakeCcxt(
-        instruments=[{"instId": "BTC-USDT-SWAP", "ctVal": "1", "ctMult": "1"}]
-    )
+    ccxt = _FakeCcxt(instruments=[{"instId": "BTC-USDT-SWAP", "ctVal": "1", "ctMult": "1"}])
     finder = ExchangeCloseFillFinder(paper_okx_provider=lambda: _FakePaperOkx(ccxt))
 
     result = await finder.find(_position(side="short", quantity=2.0))

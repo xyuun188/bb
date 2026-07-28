@@ -9,7 +9,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
 from services.protection_order_integrity import audit_protection_order_integrity
 
-POSITION_PROTECTION_REBALANCE_VERSION = "2026-07-25.current-position-exact-coverage.v2"
+POSITION_PROTECTION_REBALANCE_VERSION = "2026-07-28.current-position-exact-coverage.v3"
 
 
 class PositionProtectionRebalanceError(RuntimeError):
@@ -47,10 +47,7 @@ def _response_success(response: Any) -> bool:
     rows = response.get("data")
     if not isinstance(rows, list) or not rows:
         return False
-    return all(
-        isinstance(row, dict) and str(row.get("sCode") or "") == "0"
-        for row in rows
-    )
+    return all(isinstance(row, dict) and str(row.get("sCode") or "") == "0" for row in rows)
 
 
 def _response_algo_id(response: Any) -> str:
@@ -202,6 +199,80 @@ async def apply_protection_repair_actions(
     return applied
 
 
+async def replace_stuck_protection_amendments(
+    executor: Any,
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace OCOs whose OKX amend queue is stuck without an unprotected gap."""
+
+    if not actions or any(str(action.get("action") or "") != "amend_size" for action in actions):
+        raise RuntimeError("Stuck-amend replacement only accepts amend_size actions")
+
+    applied: list[dict[str, Any]] = []
+    for action in actions:
+        stop_loss_price = float(action.get("stop_loss_price") or 0.0)
+        take_profit_price = float(action.get("take_profit_price") or 0.0)
+        if stop_loss_price <= 0 or take_profit_price <= 0:
+            raise RuntimeError("Stuck-amend replacement requires the original OCO prices")
+
+        create_response = await executor.create_position_protection_order(
+            inst_id=str(action.get("inst_id") or ""),
+            position_side=str(action.get("position_side") or ""),
+            okx_position_side=str(action.get("okx_position_side") or "net"),
+            contracts=float(action.get("new_contracts") or 0.0),
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+        )
+        created_algo_id = _response_algo_id(create_response)
+        if not created_algo_id or not _response_success(create_response):
+            raise RuntimeError(
+                f"OKX rejected replacement protection for algo {action.get('algo_id')}"
+            )
+
+        try:
+            cancel_response = await executor.cancel_position_protection_order(
+                inst_id=str(action.get("inst_id") or ""),
+                algo_id=str(action.get("algo_id") or ""),
+            )
+            if not _response_success(cancel_response):
+                raise RuntimeError(
+                    f"OKX rejected stale protection cancel for algo {action.get('algo_id')}"
+                )
+        except Exception as exc:
+            rollback_response: Any = None
+            rollback_error = ""
+            try:
+                rollback_response = await executor.cancel_position_protection_order(
+                    inst_id=str(action.get("inst_id") or ""),
+                    algo_id=created_algo_id,
+                )
+            except Exception as rollback_exc:  # pragma: no cover - defensive exchange boundary
+                rollback_error = str(rollback_exc)
+            error = RuntimeError(
+                "Stale protection cancel failed after replacement creation; "
+                "the replacement cancel rollback was attempted"
+            )
+            error.replacement_action = {  # type: ignore[attr-defined]
+                "action": action,
+                "created_algo_id": created_algo_id,
+                "create_response": create_response,
+                "rollback_response": rollback_response,
+                "rollback_error": rollback_error,
+            }
+            raise error from exc
+
+        applied.append(
+            {
+                "action": {**action, "action": "replace_stuck_amend"},
+                "created_algo_id": created_algo_id,
+                "create_response": create_response,
+                "cancel_response": cancel_response,
+                "applied": True,
+            }
+        )
+    return applied
+
+
 async def rebalance_current_position_protection(
     executor: Any,
     *,
@@ -266,18 +337,39 @@ async def rebalance_current_position_protection(
     try:
         applied_actions = await apply_protection_repair_actions(executor, actions)
     except Exception as exc:
-        base_report.update(
-            {
-                "status": "apply_failed",
-                "applied_actions": getattr(exc, "applied_actions", []),
-                "rollback_results": getattr(exc, "rollback_results", []),
-                "error": str(exc),
-            }
-        )
-        raise PositionProtectionRebalanceError(
-            "Post-exit protection resize failed and rollback evidence was recorded",
-            base_report,
-        ) from exc
+        if "51513" in str(exc) and all(
+            str(action.get("action") or "") == "amend_size" for action in actions
+        ):
+            try:
+                applied_actions = await replace_stuck_protection_amendments(executor, actions)
+            except Exception as replacement_exc:
+                base_report.update(
+                    {
+                        "status": "replacement_failed",
+                        "applied_actions": getattr(exc, "applied_actions", []),
+                        "rollback_results": getattr(exc, "rollback_results", []),
+                        "amend_error": str(exc),
+                        "error": str(replacement_exc),
+                        "replacement_action": getattr(replacement_exc, "replacement_action", {}),
+                    }
+                )
+                raise PositionProtectionRebalanceError(
+                    "Stuck protection amend replacement failed with rollback evidence",
+                    base_report,
+                ) from replacement_exc
+        else:
+            base_report.update(
+                {
+                    "status": "apply_failed",
+                    "applied_actions": getattr(exc, "applied_actions", []),
+                    "rollback_results": getattr(exc, "rollback_results", []),
+                    "error": str(exc),
+                }
+            )
+            raise PositionProtectionRebalanceError(
+                "Post-exit protection resize failed and rollback evidence was recorded",
+                base_report,
+            ) from exc
 
     after = await protection_integrity_snapshot(
         executor,

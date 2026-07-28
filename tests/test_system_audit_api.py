@@ -19,6 +19,49 @@ from web_dashboard.api import system_audit
 AuditFactory = Callable[[], Awaitable[dict[str, Any]]]
 
 
+def test_okx_reconciliation_dashboard_scan_capacity_covers_current_history() -> None:
+    assert system_audit.OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS >= 1000
+
+
+def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> None:
+    payload = {
+        "status": "warning",
+        "cards": [
+            {
+                "key": "phase3_paper_resume_observation",
+                "details": {
+                    "status": "observing",
+                    "paper_active": True,
+                    "inputs": {"rows": [1] * 10_000},
+                },
+            },
+            {
+                "key": "model_training",
+                "details": {
+                    "hard_failure": False,
+                    "governance_status": "ok",
+                    "local_ai_tools": {"available": True},
+                    "source_warnings": [{"name": "required"}],
+                    "optional_source_warnings": [{"name": str(index)} for index in range(20)],
+                    "model_critical_items": [],
+                    "model_registry": {"models": [1] * 10_000},
+                    "specialist_shadow_evaluation": {"rows": [1] * 10_000},
+                },
+            },
+        ],
+    }
+
+    compact = system_audit._dashboard_system_audit_payload(payload)
+    observation = compact["cards"][0]["details"]
+    training = compact["cards"][1]["details"]
+
+    assert observation == {"status": "observing", "paper_active": True}
+    assert training["local_ai_tools"] == {"available": True}
+    assert len(training["optional_source_warnings"]) == 8
+    assert "model_registry" not in training
+    assert "specialist_shadow_evaluation" not in training
+
+
 @pytest.fixture(autouse=True)
 def _stable_model_training_scheduler_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
@@ -69,16 +112,6 @@ def _trade_contract_details_ok() -> dict[str, Any]:
         },
         "violation_reason_counts": {},
     }
-
-
-
-
-
-
-
-
-
-
 
 
 def _patch_okx_daily_report_path(
@@ -368,6 +401,50 @@ def _patch_phase3_stage_handoff_audit(
     monkeypatch.setattr(system_audit, "_phase3_stage_handoff_audit", factory)
 
 
+@pytest.mark.asyncio
+async def test_phase3_stage_handoff_uses_current_go_no_go_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakePhase3StageHandoffService:
+        def report(self, *, go_no_go_report: dict[str, Any] | None = None) -> dict[str, Any]:
+            captured.update(go_no_go_report or {})
+            return {
+                "status": "dynamic_return_ready",
+                "stage": "observation_only",
+                "ready": True,
+                "blockers": [],
+                "warnings": [],
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3StageHandoffService",
+        FakePhase3StageHandoffService,
+    )
+    card = await system_audit._phase3_stage_handoff_audit_from_cards(
+        [
+            system_audit._audit_card(
+                "phase3_go_no_go",
+                "gate",
+                "ok",
+                "ready",
+                details={
+                    "status": "go",
+                    "ready": True,
+                    "blockers": [],
+                },
+            )
+        ]
+    )
+
+    assert captured["status"] == "go"
+    assert captured["ready"] is True
+    assert datetime.fromisoformat(captured["checked_at"]) <= datetime.now(UTC)
+    assert captured["report_path"] == "current_system_audit"
+    assert card["status"] == "ok"
+    assert card["details"]["observing"] is True
 
 
 @pytest.mark.asyncio
@@ -384,8 +461,6 @@ async def test_audit_maybe_async_times_out_slow_sections(
 
     with pytest.raises(TimeoutError):
         await system_audit._audit_maybe_async(slow_audit)
-
-
 
 
 @pytest.mark.asyncio
@@ -598,8 +673,6 @@ async def test_system_audit_collect_uses_process_lock(
         "start:second",
         "finish:second",
     ]
-
-
 
 
 @pytest.mark.asyncio
@@ -1106,12 +1179,6 @@ async def test_phase3_paper_resume_observation_audit_reports_healthy(
     assert card["details"]["paper_active"] is True
     assert card["details"]["observing"] is False
     assert card["evidence"][3]["value"] == 12
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -1729,8 +1796,6 @@ async def test_high_risk_review_audit_and_endpoint_force_read_only(
     assert endpoint_report["samples"][0]["can_force_open"] is False
 
 
-
-
 @pytest.mark.asyncio
 async def test_strong_opportunity_audit_and_endpoint_force_read_only(
     monkeypatch: pytest.MonkeyPatch,
@@ -1801,8 +1866,6 @@ async def test_strong_opportunity_audit_and_endpoint_force_read_only(
     assert endpoint_report["near_misses"][0]["can_force_open"] is False
 
 
-
-
 @pytest.mark.asyncio
 async def test_strategy_signal_root_cause_audit_forces_read_only(
     monkeypatch: pytest.MonkeyPatch,
@@ -1869,14 +1932,6 @@ async def test_strategy_signal_root_cause_audit_forces_read_only(
     assert card["evidence"][-1] == {"label": "根因数", "value": 1}
 
 
-
-
-
-
-
-
-
-
 def test_okx_integrity_authoritative_timeout_is_observing_when_runtime_sync_is_healthy() -> None:
     card = {
         "key": "okx_trade_fact_integrity",
@@ -1907,16 +1962,6 @@ def test_okx_integrity_authoritative_timeout_is_observing_when_runtime_sync_is_h
 
     assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
     assert ledger["observing"][0]["key"] == "okx_trade_fact_integrity"
-
-
-
-
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -2090,16 +2135,16 @@ async def test_production_source_health_card_exposes_continuous_alert(
 ) -> None:
     class FakeProductionSourceHealthService:
         async def report(self, **_kwargs: object) -> dict[str, object]:
-                return {
-                    "status": "critical",
-                    "reason": "continuous_no_production_return_source",
-                    "continuous_no_source_seconds": 7200.0,
-                    "production_source_decision_count": 0,
-                    "normal_paper_executed_count": 1,
-                    "continuous_no_normal_paper_candidate_seconds": 120.0,
-                    "paper_trade_alert_active": False,
-                    "recovery_state": "normal_paper_trading",
-                }
+            return {
+                "status": "critical",
+                "reason": "continuous_no_production_return_source",
+                "continuous_no_source_seconds": 7200.0,
+                "production_source_decision_count": 0,
+                "normal_paper_executed_count": 1,
+                "continuous_no_normal_paper_candidate_seconds": 120.0,
+                "paper_trade_alert_active": False,
+                "recovery_state": "normal_paper_trading",
+            }
 
     monkeypatch.setattr(
         system_audit,
@@ -2145,10 +2190,6 @@ async def test_production_source_health_card_exposes_normal_paper_trade_alert(
     assert card["status"] == "critical"
     assert "模拟盘持续没有生成正常策略候选" in card["summary"]
     assert card["details"]["paper_trade_alert_active"] is True
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -2276,8 +2317,6 @@ async def test_model_training_ready_tools_optional_sources_summary_is_specific(
     assert card["summary"] == "模型服务可用；可选增强数据源未配置。"
     assert card["details"]["local_ai_tools"]["status"] == "ready"
     assert card["details"]["hard_failure"] is False
-
-
 
 
 @pytest.mark.asyncio
@@ -2562,6 +2601,50 @@ async def test_model_training_status_section_error_is_observing_when_runtime_too
 
 
 @pytest.mark.asyncio
+async def test_model_training_dual_probe_timeouts_are_observing_not_hard_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "training": {
+                "local_ai_tools": {
+                    "available": False,
+                    "status": "error",
+                    "section": "local_ai_training_status",
+                    "error": "TimeoutError",
+                },
+                "governance": {"status": "error"},
+            },
+            "sources": [],
+        }
+
+    async def timeout_runtime_status() -> dict[str, Any]:
+        raise TimeoutError()
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", timeout_runtime_status)
+    _patch_historical_trade_fact_audit(monkeypatch)
+    _patch_artifact_retirement_audit(monkeypatch)
+
+    card = await system_audit._model_training_audit()
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert card["status"] == "warning"
+    assert card["details"]["hard_failure"] is False
+    assert card["details"]["observing"] is True
+    assert card["details"]["local_tools_probe_timeout"] is True
+    assert card["details"]["runtime_probe"]["timeout"] is True
+    assert card["details"]["runtime_probe_timeout_is_observing"] is True
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+
+
+@pytest.mark.asyncio
 async def test_okx_reconciliation_audit_reuses_short_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2656,7 +2739,7 @@ async def test_okx_reconciliation_timeout_is_observing_not_unresolved(
 
 
 @pytest.mark.asyncio
-async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
+async def test_okx_reconciliation_light_scan_plans_only_deterministic_unlinked_orders(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
@@ -2683,6 +2766,15 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
     await init_db()
     try:
         async with get_session_ctx() as session:
+            entry_decision = AIDecision(
+                model_name="test_model",
+                symbol="PROS/USDT",
+                action="long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(minutes=15)).replace(tzinfo=None),
+            )
             decision = AIDecision(
                 model_name="test_model",
                 symbol="PROS/USDT",
@@ -2710,10 +2802,41 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
                 was_executed=True,
                 created_at=(now - timedelta(hours=1)).replace(tzinfo=None),
             )
-            session.add_all([decision, linked_decision, pre_epoch_decision])
+            skipped_decision = AIDecision(
+                model_name="test_model",
+                symbol="ENA/USDT",
+                action="close_long",
+                confidence=0.8,
+                raw_llm_response={},
+                was_executed=True,
+                created_at=(now - timedelta(minutes=3)).replace(tzinfo=None),
+            )
+            session.add_all(
+                [
+                    entry_decision,
+                    decision,
+                    linked_decision,
+                    pre_epoch_decision,
+                    skipped_decision,
+                ]
+            )
             await session.flush()
             session.add_all(
                 [
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=entry_decision.id,
+                        symbol="PROS/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=9,
+                        price=0.4,
+                        status="filled",
+                        exchange_order_id="entry-pros",
+                        filled_at=(now - timedelta(minutes=15)).replace(tzinfo=None),
+                        created_at=(now - timedelta(minutes=15)).replace(tzinfo=None),
+                    ),
                     Order(
                         model_name="test_model",
                         execution_mode="paper",
@@ -2756,6 +2879,20 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
                         filled_at=(now - timedelta(hours=1)).replace(tzinfo=None),
                         created_at=(now - timedelta(hours=1)).replace(tzinfo=None),
                     ),
+                    Order(
+                        model_name="test_model",
+                        execution_mode="paper",
+                        decision_id=skipped_decision.id,
+                        symbol="ENA/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=2,
+                        price=0.5,
+                        status="filled",
+                        exchange_order_id="close-without-deterministic-plan",
+                        filled_at=(now - timedelta(minutes=3)).replace(tzinfo=None),
+                        created_at=(now - timedelta(minutes=3)).replace(tzinfo=None),
+                    ),
                     Position(
                         model_name="test_model",
                         execution_mode="paper",
@@ -2777,16 +2914,17 @@ async def test_okx_reconciliation_light_scan_reports_unlinked_close_orders(
 
         assert card["status"] == "warning"
         assert card["details"]["scan_mode"] == "light_close_order_link_summary"
-        assert card["details"]["candidate_close_order_count"] == 2
-        assert card["details"]["scanned_close_order_count"] == 2
+        assert card["details"]["candidate_close_order_count"] == 3
+        assert card["details"]["scanned_close_order_count"] == 3
         assert card["details"]["missing_closed_positions"] == 1
-        assert card["details"]["manual_review_count"] == 1
-        assert card["details"]["repairable_count"] == 0
+        assert card["details"]["manual_review_count"] == 0
+        assert card["details"]["repairable_count"] == 1
+        assert card["details"]["skipped_candidate_count"] == 1
         assert card["details"]["classification_counts"]["linked"] == 1
         assert card["details"]["root_cause_summary"]["status"] == "dirty"
-        assert card["details"]["root_cause_summary"]["manual_review_count"] == 1
+        assert card["details"]["root_cause_summary"]["repairable_count"] == 1
         assert card["details"]["root_cause_summary"]["root_causes"][0]["code"] == (
-            "manual_review_required"
+            "deterministic_repair_available"
         )
         assert card["details"]["training_data_policy"]["cleanup_mode"] == ("quarantine_not_delete")
         assert card["details"]["training_data_policy"]["requires_training_rebuild"] is True
@@ -2959,11 +3097,14 @@ async def test_okx_reconciliation_light_scan_covers_only_conserved_partial_exits
             "linked": 0,
             "official_history_covered": 0,
             "partial_exit_covered": 1,
-            "manual_review": 1,
+            "repairable": 1,
+            "manual_review": 0,
+            "skipped_or_not_repairable": 0,
             "unscanned": 0,
         }
         assert report.partial_exit_covered_count == 1
-        assert report.manual_review_count == 1
+        assert report.repairable_count == 1
+        assert report.manual_review_count == 0
         assert [plan.exchange_order_id for plan in report.plans] == ["bad-partial-close"]
         partial_exit = next(
             item
@@ -3077,8 +3218,6 @@ async def test_trade_loop_paused_market_analysis_is_observing(
         await close_db()
 
 
-
-
 @pytest.mark.asyncio
 async def test_trade_loop_orderless_but_healthy_runtime_is_observing(
     monkeypatch: pytest.MonkeyPatch,
@@ -3145,8 +3284,6 @@ async def test_trade_loop_orderless_but_healthy_runtime_is_observing(
         assert ledger["observing"][0]["state_label"] == "观察项 / 有分析但当前未触发订单"
     finally:
         await close_db()
-
-
 
 
 @pytest.mark.asyncio
@@ -4445,6 +4582,8 @@ def test_audit_nodes_use_issue_state_for_display_status() -> None:
     assert nodes["runtime_loop"]["display_status"] == "critical"
     assert nodes["strategy_gate_contract"]["state"] == "fixed"
     assert nodes["strategy_gate_contract"]["display_status"] == "ok"
+
+
 def test_latest_audit_snapshot_serializes_nested_datetimes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -4463,6 +4602,4 @@ def test_latest_audit_snapshot_serializes_nested_datetimes(
     assert loaded is not None
     loaded_at, loaded_payload = loaded
     assert loaded_at == checked_at
-    assert loaded_payload["cards"][0]["details"]["settlement_synced_at"] == (
-        checked_at.isoformat()
-    )
+    assert loaded_payload["cards"][0]["details"]["settlement_synced_at"] == (checked_at.isoformat())

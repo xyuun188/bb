@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -295,20 +296,32 @@ def test_phase3_paper_resume_preflight_blocks_stale_specialist_report() -> None:
 
 @pytest.mark.asyncio
 async def test_phase3_paper_resume_preflight_service_uses_injected_providers() -> None:
+    main_thread_id = threading.get_ident()
+    provider_thread_ids: set[int] = set()
+
+    def off_loop(factory):
+        def provider():
+            provider_thread_ids.add(threading.get_ident())
+            return factory()
+
+        return provider
+
     service = Phase3PaperResumePreflightService(
-        okx_sync_provider=_okx_sync_clean,
-        okx_integrity_provider=_okx_integrity_clean,
-        model_server_provider=_model_server_ready,
-        platform_runtime_provider=_platform_runtime_ready,
-        platform_server_provider=_platform_server_ready,
-        specialist_shadow_provider=_specialist_ready,
-        account_equity_provider=_account_equity_ready,
+        okx_sync_provider=off_loop(_okx_sync_clean),
+        okx_integrity_provider=off_loop(_okx_integrity_clean),
+        model_server_provider=off_loop(_model_server_ready),
+        platform_runtime_provider=off_loop(_platform_runtime_ready),
+        platform_server_provider=off_loop(_platform_server_ready),
+        specialist_shadow_provider=off_loop(_specialist_ready),
+        account_equity_provider=off_loop(_account_equity_ready),
     )
 
     report = await service.report()
 
     assert report["status"] == "ready"
     assert report["can_resume_paper"] is True
+    assert provider_thread_ids
+    assert main_thread_id not in provider_thread_ids
 
 
 def test_phase3_paper_resume_preflight_cli_writes_latest_report(tmp_path) -> None:

@@ -167,7 +167,10 @@ class CryptoFeatureCoverageService:
                             func.count(func.distinct(Kline.symbol)),
                             func.max(Kline.open_time),
                         )
-                        .where(Kline.timeframe.in_(EXPECTED_KLINE_TIMEFRAMES))
+                        .where(
+                            Kline.timeframe.in_(EXPECTED_KLINE_TIMEFRAMES),
+                            Kline.open_time >= since,
+                        )
                         .group_by(Kline.timeframe)
                     )
                 ).all()

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
+import time
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
+import structlog
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
+from config.settings import settings
 from core.runtime_data_retention_contract import is_ai_decision_retention_payload
 from core.training_contracts import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
@@ -58,7 +64,28 @@ _DERIVED_OUTCOME_KEYS = {
     "consumer_provenance",
     "learning_summary",
 }
+_COMPACT_OUTCOME_CACHE_TTL_SECONDS = 60.0
+_compact_outcome_cache: tuple[float, list[dict[str, Any]]] | None = None
+_compact_outcome_refresh_task: asyncio.Task[list[dict[str, Any]]] | None = None
+logger = structlog.get_logger(__name__)
 
+
+def _compact_outcome_refresh_done(
+    completed: asyncio.Task[list[dict[str, Any]]],
+) -> None:
+    global _compact_outcome_refresh_task
+
+    if _compact_outcome_refresh_task is completed:
+        _compact_outcome_refresh_task = None
+    if completed.cancelled():
+        return
+    try:
+        completed.result()
+    except Exception as exc:
+        logger.warning(
+            "compact authoritative outcome background refresh failed",
+            error=f"{type(exc).__name__}: {exc}"[:240],
+        )
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -95,6 +122,37 @@ def _canonical_execution_mode(value: Any) -> str:
     if mode in {"live", "real", "production"}:
         return "live"
     return ""
+
+
+def _filter_compact_outcomes(
+    outcomes: list[dict[str, Any]],
+    *,
+    mode: str | None,
+    since: datetime | None,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    selected_mode = _canonical_execution_mode(mode)
+    since_utc = _as_utc(since)
+    rows = [
+        outcome
+        for outcome in outcomes
+        if not selected_mode or outcome.get("execution_mode") == selected_mode
+    ]
+    if since_utc is not None:
+        filtered: list[dict[str, Any]] = []
+        for outcome in rows:
+            try:
+                label_time = _as_utc(
+                    datetime.fromisoformat(str(outcome.get("label_timestamp") or ""))
+                )
+            except ValueError:
+                label_time = None
+            if label_time is not None and label_time >= since_utc:
+                filtered.append(outcome)
+        rows = filtered
+    if limit is not None:
+        rows = rows[-max(int(limit), 1) :]
+    return list(rows)
 
 
 def _profit_label_contract(
@@ -392,18 +450,69 @@ async def load_authoritative_trade_outcomes(
     mode: str | None = None,
     since: datetime | None = None,
     limit: int | None = None,
+    compact: bool = False,
     session_factory: Callable[[], AbstractAsyncContextManager[Any]] = get_read_session_ctx,
+    _force_compact_refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """Load deterministic outcome events; no local-position PnL fallback is allowed."""
+    """Load deterministic outcome events; no local-position PnL fallback is allowed.
+
+    Compact reads preserve the outcome contract while avoiding multi-megabyte
+    decision and shadow payloads that dashboard summaries never consume.
+    """
+
+    global _compact_outcome_cache, _compact_outcome_refresh_task
+    cache_enabled = bool(
+        compact
+        and session_factory is get_read_session_ctx
+        and str(settings.database_url or "").startswith("postgresql")
+    )
+    if cache_enabled and _compact_outcome_cache is not None:
+        cached_at, cached_outcomes = _compact_outcome_cache
+        cache_age = time.monotonic() - cached_at
+        if cache_age <= _COMPACT_OUTCOME_CACHE_TTL_SECONDS:
+            return _filter_compact_outcomes(
+                cached_outcomes,
+                mode=mode,
+                since=since,
+                limit=limit,
+            )
+        if not _force_compact_refresh:
+            if (
+                _compact_outcome_refresh_task is None
+                or _compact_outcome_refresh_task.done()
+            ):
+                _compact_outcome_refresh_task = asyncio.create_task(
+                    load_authoritative_trade_outcomes(
+                        compact=True,
+                        _force_compact_refresh=True,
+                    )
+                )
+                _compact_outcome_refresh_task.add_done_callback(
+                    _compact_outcome_refresh_done
+                )
+            return _filter_compact_outcomes(
+                cached_outcomes,
+                mode=mode,
+                since=since,
+                limit=limit,
+            )
+
+    requested_mode = None if cache_enabled else mode
+    requested_since = None if cache_enabled else since
+    requested_result_limit = None if cache_enabled else limit
 
     async with session_factory() as session:
-        requested_limit = max(int(limit), 1) if limit is not None else 5000
+        requested_limit = (
+            max(int(requested_result_limit), 1)
+            if requested_result_limit is not None
+            else 5000
+        )
         histories = await load_okx_position_history_records(
             session,
-            mode=mode,
+            mode=requested_mode,
             limit=requested_limit,
         )
-        since_utc = _as_utc(since)
+        since_utc = _as_utc(requested_since)
         if since_utc is not None:
             histories = [
                 history
@@ -411,7 +520,7 @@ async def load_authoritative_trade_outcomes(
                 if (_as_utc(history.updated_at_okx) or datetime.min.replace(tzinfo=UTC))
                 >= since_utc
             ]
-        if limit is not None:
+        if requested_result_limit is not None:
             histories = histories[:requested_limit]
 
         position_ids = {
@@ -453,17 +562,44 @@ async def load_authoritative_trade_outcomes(
         decision_ids = {
             int(order.decision_id or 0) for order in orders if int(order.decision_id or 0) > 0
         }
-        decisions = (
-            list(
+        if decision_ids and compact:
+            decision_rows = list(
                 (
                     await session.execute(
-                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                        select(
+                            AIDecision.id,
+                            AIDecision.model_name,
+                            AIDecision.stop_loss_pct,
+                            AIDecision.take_profit_pct,
+                            AIDecision.decision_learning_snapshot,
+                        ).where(AIDecision.id.in_(decision_ids))
                     )
-                ).scalars().all()
+                ).all()
             )
-            if decision_ids
-            else []
-        )
+            decisions = [
+                SimpleNamespace(
+                    id=row.id,
+                    model_name=row.model_name,
+                    stop_loss_pct=row.stop_loss_pct,
+                    take_profit_pct=row.take_profit_pct,
+                    feature_snapshot={},
+                    decision_learning_snapshot=row.decision_learning_snapshot,
+                    raw_llm_response=dict(row.decision_learning_snapshot or {}),
+                )
+                for row in decision_rows
+            ]
+        else:
+            decisions = (
+                list(
+                    (
+                        await session.execute(
+                            select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                        )
+                    ).scalars().all()
+                )
+                if decision_ids
+                else []
+            )
         reflections = (
             list(
                 (
@@ -475,14 +611,23 @@ async def load_authoritative_trade_outcomes(
             if position_ids
             else []
         )
-        shadows = (
-            list(
-                (
-                    await session.execute(
-                        select(ShadowBacktest).where(ShadowBacktest.decision_id.in_(decision_ids))
-                    )
-                ).scalars().all()
+        shadow_stmt = select(ShadowBacktest).where(
+            ShadowBacktest.decision_id.in_(decision_ids)
+        )
+        if compact:
+            shadow_stmt = shadow_stmt.options(
+                load_only(
+                    ShadowBacktest.id,
+                    ShadowBacktest.decision_id,
+                    ShadowBacktest.status,
+                    ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.long_return_pct,
+                    ShadowBacktest.short_return_pct,
+                    ShadowBacktest.best_action,
+                )
             )
+        shadows = (
+            list((await session.execute(shadow_stmt)).scalars().all())
             if decision_ids
             else []
         )
@@ -524,6 +669,9 @@ async def load_authoritative_trade_outcomes(
         for row in sorted(reflections, key=lambda item: int(item.id or 0), reverse=True)
         if int(row.position_id or 0) > 0
     }
+    shadows_by_decision_id: dict[int, list[Any]] = {}
+    for row in shadows:
+        shadows_by_decision_id.setdefault(int(row.decision_id or 0), []).append(row)
     results: list[dict[str, Any]] = []
     for history in histories:
         sample = build_okx_history_training_sample(
@@ -542,14 +690,23 @@ async def load_authoritative_trade_outcomes(
             ),
             None,
         )
-        results.append(
-            build_authoritative_trade_outcome(
-                sample,
-                reflection=reflection,
-                shadow_rows=shadows,
-            )
+        outcome = build_authoritative_trade_outcome(
+            sample,
+            reflection=reflection,
+            shadow_rows=shadows_by_decision_id.get(int(sample.get("decision_id") or 0), []),
         )
+        if compact:
+            outcome.pop("raw_llm_response", None)
+        results.append(outcome)
     results.reverse()
+    if cache_enabled:
+        _compact_outcome_cache = (time.monotonic(), results)
+        return _filter_compact_outcomes(
+            results,
+            mode=mode,
+            since=since,
+            limit=limit,
+        )
     return results
 
 

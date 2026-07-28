@@ -782,7 +782,15 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                                 WHEN 'portfolio_risk_snapshot' THEN jsonb_build_object(
                                     'scope', item.value -> 'scope',
                                     'current_stressed_loss_usdt',
-                                        item.value -> 'current_stressed_loss_usdt'
+                                        item.value -> 'current_stressed_loss_usdt',
+                                    'current_margin_usdt',
+                                        item.value -> 'current_margin_usdt',
+                                    'gross_notional_usdt',
+                                        item.value -> 'gross_notional_usdt',
+                                    'same_side_notional_usdt',
+                                        item.value -> 'same_side_notional_usdt',
+                                    'direction_concentration',
+                                        item.value -> 'direction_concentration'
                                 )
                                 WHEN 'leverage_tier_selection' THEN jsonb_build_object(
                                     'production_eligible',
@@ -804,8 +812,10 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                         WHERE item.key = ANY(ARRAY[
                             'account_equity_usdt',
                             'available_margin_usdt',
+                            'blockers',
                             'contract_lifecycle',
                             'contract_version',
+                            'current_portfolio_stressed_loss_usdt',
                             'decision_authority',
                             'dynamic_leverage_decision',
                             'entry_instrument_availability',
@@ -813,6 +823,9 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                             'exchange_min_notional_usdt',
                             'exchange_minimum_order',
                             'execution_scope',
+                            'execution_reconciliations',
+                            'expected_net_return_pct',
+                            'expected_profit_usdt',
                             'fill_notional_ceiling_usdt',
                             'final_leverage',
                             'final_margin_usdt',
@@ -829,9 +842,12 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                             'position_size_pct',
                             'production_eligible',
                             'production_permission',
+                            'reason',
+                            'remaining_portfolio_risk_budget_usdt',
                             'risk_budget_usdt',
                             'selected_contract_spec',
                             'stressed_loss_fraction',
+                            'single_trade_risk_budget_usdt',
                             'target_inst_id',
                             'target_notional_usdt',
                             'target_price'
@@ -917,7 +933,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                         ),
                         '{}'::JSONB
                     );
-                    NEW.decision_learning_snapshot_version := 3;
+                    NEW.decision_learning_snapshot_version := 4;
                     RETURN NEW;
                 END;
                 $$
@@ -952,7 +968,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                     SELECT id
                     FROM ai_decisions
                     WHERE model_health_snapshot_version < 1
-                       OR decision_learning_snapshot_version < 3
+                       OR decision_learning_snapshot_version < 4
                     ORDER BY created_at DESC NULLS LAST, id DESC
                     LIMIT 1500
                 )

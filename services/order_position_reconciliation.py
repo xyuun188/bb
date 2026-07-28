@@ -67,6 +67,39 @@ class ReconciledClosedPosition:
     plan: MissingClosedPositionPlan
 
 
+def classify_missing_closed_position_plan(
+    plan: MissingClosedPositionPlan,
+) -> dict[str, Any]:
+    """Classify whether a deterministic missing-position plan is safe to apply."""
+
+    reasons: list[str] = []
+    if not str(plan.entry_exchange_order_id or "").strip():
+        reasons.append("missing_entry_exchange_order_id")
+    if not str(plan.close_exchange_order_id or "").strip():
+        reasons.append("missing_close_exchange_order_id")
+    if float(plan.quantity or 0.0) <= 0:
+        reasons.append("non_positive_quantity")
+    if float(plan.entry_price or 0.0) <= 0:
+        reasons.append("non_positive_entry_price")
+    if float(plan.exit_price or 0.0) <= 0:
+        reasons.append("non_positive_exit_price")
+    if plan.created_at > plan.closed_at:
+        reasons.append("entry_after_close")
+    status = "manual_review" if reasons else "repairable"
+    return {
+        "status": status,
+        "reason": ";".join(reasons) if reasons else "deterministic_order_pair",
+        "symbol": plan.symbol,
+        "side": plan.side,
+        "quantity": float(plan.quantity or 0.0),
+        "realized_pnl": round(float(plan.realized_pnl or 0.0), 8),
+        "entry_order_id": int(plan.entry_order_id or 0),
+        "close_order_id": int(plan.close_order_id or 0),
+        "entry_exchange_order_id": plan.entry_exchange_order_id,
+        "close_exchange_order_id": plan.close_exchange_order_id,
+    }
+
+
 async def plan_missing_closed_position(
     session: Any,
     close_order: Order,
@@ -111,9 +144,8 @@ async def plan_missing_closed_position(
     if entry_okx_inst_id and close_okx_inst_id and entry_okx_inst_id != close_okx_inst_id:
         return None
 
-    symbol = (
-        symbol_from_okx_inst_id(okx_inst_id)
-        or normalize_trading_symbol(close_order.symbol or entry_order.symbol)
+    symbol = symbol_from_okx_inst_id(okx_inst_id) or normalize_trading_symbol(
+        close_order.symbol or entry_order.symbol
     )
     quantity = min(close_quantity, _safe_float(entry_order.quantity))
     if quantity <= 0:

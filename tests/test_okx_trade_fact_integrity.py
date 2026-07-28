@@ -7,7 +7,7 @@ import pytest
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
-from models.trade import Order, Position
+from models.trade import OkxPositionHistory, Order, Position
 from services.manual_close_marker import ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX
 from services.okx_trade_fact_integrity import (
     OkxTradeFactIntegrityService,
@@ -99,9 +99,7 @@ def _execution_raw(
                     "okx_public_instruments" if contract_size_verified else "missing"
                 ),
                 "filled_contracts": contracts,
-                "base_quantity": (
-                    contracts * contract_size if contract_size_verified else None
-                ),
+                "base_quantity": (contracts * contract_size if contract_size_verified else None),
             }
         }
     }
@@ -236,6 +234,122 @@ async def test_trade_fact_audit_does_not_assume_contract_size_one(
 
 def _recent_filled_at(*, minutes_ago: int) -> datetime:
     return datetime.now(UTC) - timedelta(minutes=minutes_ago)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_position_history_satisfies_order_lifecycle_evidence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        entry_filled_at = _recent_filled_at(minutes_ago=30)
+        close_filled_at = entry_filled_at + timedelta(minutes=20)
+        async with get_session_ctx() as session:
+            entry_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SLX/USDT",
+                action="long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="SLX-USDT-SWAP",
+                    contracts=16,
+                    contract_size=10,
+                    avg_price=0.12,
+                ),
+                was_executed=True,
+                created_at=entry_filled_at - timedelta(seconds=5),
+            )
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="ARB/USDT",
+                action="close_long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="ARB-USDT-SWAP",
+                    contracts=3.5,
+                    contract_size=10,
+                    avg_price=0.08,
+                ),
+                was_executed=True,
+                created_at=close_filled_at - timedelta(seconds=5),
+            )
+            session.add_all([entry_decision, close_decision])
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SLX/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=160,
+                        price=0.12,
+                        status="filled",
+                        decision_id=entry_decision.id,
+                        exchange_order_id="slx-entry-order",
+                        filled_at=entry_filled_at,
+                        created_at=entry_filled_at,
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="ARB/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=35,
+                        price=0.08,
+                        status="filled",
+                        decision_id=close_decision.id,
+                        exchange_order_id="arb-close-order",
+                        filled_at=close_filled_at,
+                        created_at=close_filled_at,
+                    ),
+                    OkxPositionHistory(
+                        mode="paper",
+                        row_identity="paper|SLX-USDT-SWAP|slx-pos|net|entry",
+                        inst_id="SLX-USDT-SWAP",
+                        symbol="SLX/USDT",
+                        pos_id="slx-pos",
+                        pos_side="net",
+                        opened_at=entry_filled_at,
+                        updated_at_okx=entry_filled_at + timedelta(minutes=5),
+                        entry_order_ids=[],
+                        close_order_ids=[],
+                        linked_order_ids=[],
+                        position_ids=[],
+                        match_status="okx_account_position_history",
+                        evidence_gaps=[],
+                    ),
+                    OkxPositionHistory(
+                        mode="paper",
+                        row_identity="paper|ARB-USDT-SWAP|arb-pos|net|close",
+                        inst_id="ARB-USDT-SWAP",
+                        symbol="ARB/USDT",
+                        pos_id="arb-pos",
+                        pos_side="net",
+                        opened_at=entry_filled_at,
+                        updated_at_okx=close_filled_at,
+                        entry_order_ids=["arb-entry-order"],
+                        close_order_ids=["arb-close-order"],
+                        linked_order_ids=["arb-entry-order", "arb-close-order"],
+                        position_ids=["42"],
+                        match_status="okx_account_position_history",
+                        evidence_gaps=[],
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["checked_authoritative_histories"] == 2
+        assert "order_position_missing" not in {
+            issue["kind"] for issue in report["issues"]
+        }
+        assert report["status"] == "ok"
+    finally:
+        await close_db()
 
 
 def test_legacy_position_history_projection_gap_is_not_a_runtime_blocker() -> None:
@@ -474,11 +588,11 @@ async def test_order_okx_raw_fills_win_over_stale_decision_execution_price(
                             "order_id": "3694561249469370368",
                             "trade_ids": ["aave-fill-1"],
                             "inst_id": "AAVE-USDT-SWAP",
-                                "contracts": 2.0,
-                                "contract_size": 1.0,
-                                "contract_size_verified": True,
-                                "contract_size_source": "okx_public_instruments",
-                                "base_quantity": 2.0,
+                            "contracts": 2.0,
+                            "contract_size": 1.0,
+                            "contract_size_verified": True,
+                            "contract_size_source": "okx_public_instruments",
+                            "base_quantity": 2.0,
                             "avg_price": 97.54,
                             "rows": [
                                 {
@@ -1100,6 +1214,136 @@ async def test_old_linked_position_missing_local_order_is_info_observation(
 
 
 @pytest.mark.asyncio
+async def test_limited_scan_loads_position_directly_linked_to_selected_order(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=5)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="LINK/USDT",
+                action="close_long",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="LINK-USDT-SWAP",
+                    contracts=4,
+                    contract_size=1,
+                    avg_price=8.2,
+                ),
+                was_executed=True,
+                created_at=filled_at,
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="LINK/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=4.0,
+                        price=8.2,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="close-selected-outside-position-limit",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="LINK/USDT",
+                        side="long",
+                        quantity=4.0,
+                        entry_price=8.0,
+                        current_price=8.2,
+                        realized_pnl=0.8,
+                        is_open=False,
+                        entry_exchange_order_id="entry-link",
+                        close_exchange_order_id="close-selected-outside-position-limit",
+                        created_at=filled_at - timedelta(hours=2),
+                        closed_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="NEWER/USDT",
+                        side="long",
+                        quantity=1.0,
+                        entry_price=1.0,
+                        current_price=1.0,
+                        is_open=True,
+                        entry_exchange_order_id="newer-entry",
+                        created_at=filled_at + timedelta(seconds=1),
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24, limit=1).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert "order_position_missing" not in kinds
+        assert report["checked_orders"] == 1
+        assert report["checked_positions"] == 2
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_order_is_valid_position_link_evidence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=5)
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="CELO/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=31.0,
+                        price=0.064,
+                        status="partial",
+                        exchange_order_id="partial-close-link",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="CELO/USDT",
+                        side="short",
+                        quantity=31.0,
+                        entry_price=0.065,
+                        current_price=0.064,
+                        realized_pnl=0.031,
+                        is_open=False,
+                        entry_exchange_order_id=None,
+                        close_exchange_order_id="partial-close-link",
+                        created_at=filled_at - timedelta(minutes=20),
+                        closed_at=filled_at,
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert "position_order_link_missing_local_order" not in kinds
+        assert "closed_position_missing_close_order_link" not in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_entry_order_matches_existing_position_lifecycle_without_false_warning(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1450,9 +1694,7 @@ async def test_complete_lifecycle_supersedes_nonzero_stale_projection(
 
         assert report["critical_count"] == 0
         assert report["status"] == "ok"
-        assert [issue["kind"] for issue in issues].count(
-            "superseded_position_residual"
-        ) == 2
+        assert [issue["kind"] for issue in issues].count("superseded_position_residual") == 2
     finally:
         await close_db()
 
@@ -1539,10 +1781,10 @@ async def test_split_exit_order_uses_weighted_child_fill_price(
                     "price": 3.95,
                     "filled": 4.0,
                     "amount": 4.0,
-                        "contract_size": 1.0,
-                        "contract_size_verified": True,
-                        "contract_size_source": "okx_public_instruments",
-                        "filled_contracts": 24.0,
+                    "contract_size": 1.0,
+                    "contract_size_verified": True,
+                    "contract_size_source": "okx_public_instruments",
+                    "filled_contracts": 24.0,
                     "base_quantity": 24.0,
                     "split_exit_order": True,
                     "split_chunks": [

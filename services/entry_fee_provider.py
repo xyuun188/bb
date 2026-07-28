@@ -36,42 +36,62 @@ class EntryFeeProvider:
         entry_order_ids = _split_exchange_order_ids(
             getattr(position, "entry_exchange_order_id", None)
         )
-        orders: list[Any] = []
-        for order_id in entry_order_ids:
-            order = await self._first_order(
-                session,
-                select(Order)
-                .where(
+        orders_by_id: dict[str, Any] = {}
+        if entry_order_ids:
+            result = await session.execute(
+                select(Order).where(
                     Order.execution_mode == position.execution_mode,
-                    Order.exchange_order_id == order_id,
+                    Order.exchange_order_id.in_(entry_order_ids),
                     Order.status == OrderStatus.FILLED.value,
                 )
-                .limit(1),
             )
-            if order is None or not _has_authoritative_fee_fact(order, order_id=order_id):
-                orders = []
-                break
-            orders.append(order)
-        if orders and len(orders) == len(entry_order_ids):
-            total_fee = sum(
-                abs(float(getattr(order, "okx_raw_fills", {}).get("fee_abs") or 0.0))
-                for order in orders
-            )
-            total_quantity = sum(abs(float(getattr(order, "quantity", 0.0) or 0.0)) for order in orders)
-            return proportional_fee(total_fee, close_qty, total_quantity)
+            orders_by_id = {
+                str(order.exchange_order_id): order
+                for order in result.scalars().all()
+                if str(order.exchange_order_id or "").strip()
+            }
+        return entry_fee_from_orders(
+            position,
+            close_qty,
+            orders_by_exchange_id=orders_by_id,
+        )
 
-        if current_position_management_contract_complete(position):
-            return proportional_fee(
-                getattr(position, "entry_fee", None),
-                close_qty,
-                getattr(position, "quantity", None),
-            )
-        return 0.0
 
-    @staticmethod
-    async def _first_order(session: Any, statement: Any) -> Any | None:
-        result = await session.execute(statement)
-        return result.scalar_one_or_none()
+def entry_fee_from_orders(
+    position: Any,
+    close_qty: float,
+    *,
+    orders_by_exchange_id: dict[str, Any],
+) -> float:
+    """Calculate a position's entry fee from an already-loaded order map."""
+
+    entry_order_ids = _split_exchange_order_ids(
+        getattr(position, "entry_exchange_order_id", None)
+    )
+    orders = [orders_by_exchange_id.get(order_id) for order_id in entry_order_ids]
+    if entry_order_ids and all(
+        order is not None and _has_authoritative_fee_fact(order, order_id=order_id)
+        for order_id, order in zip(entry_order_ids, orders, strict=True)
+    ):
+        total_fee = sum(
+            abs(float(getattr(order, "okx_raw_fills", {}).get("fee_abs") or 0.0))
+            for order in orders
+            if order is not None
+        )
+        total_quantity = sum(
+            abs(float(getattr(order, "quantity", 0.0) or 0.0))
+            for order in orders
+            if order is not None
+        )
+        return proportional_fee(total_fee, close_qty, total_quantity)
+
+    if current_position_management_contract_complete(position):
+        return proportional_fee(
+            getattr(position, "entry_fee", None),
+            close_qty,
+            getattr(position, "quantity", None),
+        )
+    return 0.0
 
 
 def _split_exchange_order_ids(value: Any) -> list[str]:

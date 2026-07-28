@@ -117,6 +117,12 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+async def _invoke_report_provider(provider: ReportProvider) -> Any:
+    """Call unknown sync/async providers without blocking the dashboard loop."""
+
+    return await _maybe_await(await asyncio.to_thread(provider))
+
+
 def _service_by_name(platform_server: dict[str, Any], name: str) -> dict[str, Any]:
     for item in _safe_list(platform_server.get("services")):
         if isinstance(item, dict) and str(item.get("name") or "") == name:
@@ -550,7 +556,7 @@ class Phase3PaperResumeObservationService:
         default_provider: ReportProvider,
     ) -> dict[str, Any]:
         try:
-            result = await _maybe_await((provider or default_provider)())
+            result = await _invoke_report_provider(provider or default_provider)
             if isinstance(result, dict):
                 return result
             return {

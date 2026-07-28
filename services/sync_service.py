@@ -34,6 +34,7 @@ from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_VERSION,
     build_current_position_management_contract,
 )
+from services.entry_fee_provider import entry_fee_from_orders
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.paper_training import build_paper_training_position_lifecycle
@@ -57,6 +58,8 @@ EXCHANGE_PROTECTION_MAP_TIMEOUT_SECONDS = 6.0
 EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS = 8.0
 RECONCILE_OPTIONAL_DEADLINE_RESERVE_SECONDS = 0.75
 RECONCILE_OPTIONAL_MIN_TIMEOUT_SECONDS = 0.5
+POSITION_PROTECTION_REBALANCE_RETRY_SECONDS = 60.0
+POSITION_PROTECTION_REBALANCE_RATE_LIMIT_RETRY_SECONDS = 300.0
 RECONCILE_ORIGIN_SYSTEM_PROTECTION = "system_protection"
 RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
@@ -105,7 +108,9 @@ def _entry_order_persistence_pending(
     observed_at = now or datetime.now(UTC)
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=UTC)
-    age_seconds = max((observed_at.astimezone(UTC) - timestamp.astimezone(UTC)).total_seconds(), 0.0)
+    age_seconds = max(
+        (observed_at.astimezone(UTC) - timestamp.astimezone(UTC)).total_seconds(), 0.0
+    )
     return age_seconds < LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS
 
 
@@ -131,14 +136,12 @@ def _authoritative_entry_fee_available(order: Order) -> bool:
             or (
                 raw.get("order_detail_confirmed") is True
                 and raw.get("contract_size_verified") is True
-                and str(raw.get("contract_size_source") or "")
-                == "okx_public_instruments"
+                and str(raw.get("contract_size_source") or "") == "okx_public_instruments"
             )
             or (
                 raw.get("execution_result_confirmed") is True
                 and raw.get("contract_size_verified") is True
-                and str(raw.get("contract_size_source") or "")
-                == "okx_public_instruments"
+                and str(raw.get("contract_size_source") or "") == "okx_public_instruments"
             )
         )
     )
@@ -842,8 +845,7 @@ def normalized_open_position_context(
         )
     )
     contract_size = float_parser(
-        position_payload.get("contract_size")
-        or position_payload.get("contractSize"),
+        position_payload.get("contract_size") or position_payload.get("contractSize"),
         0.0,
     )
     contracts = abs(
@@ -925,9 +927,7 @@ def normalized_open_position_context(
         "exit_fee_rate": exit_fee_rate,
         "current_management_contract": current_management_contract,
         "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
-        "paper_training_lifecycle": _dict_value(
-            position_payload.get("paper_training_lifecycle")
-        ),
+        "paper_training_lifecycle": _dict_value(position_payload.get("paper_training_lifecycle")),
         "execution_mode": position_payload.get("execution_mode"),
         "info": info,
     }
@@ -961,6 +961,9 @@ class OkxSyncService:
         local_position_snapshot_syncer: Callable[..., bool] | None = None,
         datetime_from_ms_parser: Callable[[Any], datetime] | None = None,
         exchange_close_fill_finder: Callable[[Any], Awaitable[dict[str, Any]]] | None = None,
+        exchange_close_fill_batch_finder: (
+            Callable[[list[Any]], Awaitable[list[dict[str, Any]]]] | None
+        ) = None,
         fresh_feature_vector_provider: Callable[[str], Awaitable[Any | None]] | None = None,
         market_value_reader: Callable[[Any, str], Any] | None = None,
         entry_fee_provider: Callable[[Any, Any, float], Awaitable[float]] | None = None,
@@ -988,6 +991,7 @@ class OkxSyncService:
         self.local_position_snapshot_syncer = local_position_snapshot_syncer
         self.datetime_from_ms_parser = datetime_from_ms_parser
         self.exchange_close_fill_finder = exchange_close_fill_finder
+        self.exchange_close_fill_batch_finder = exchange_close_fill_batch_finder
         self.fresh_feature_vector_provider = fresh_feature_vector_provider
         self.market_value_reader = market_value_reader
         self.entry_fee_provider = entry_fee_provider
@@ -999,6 +1003,8 @@ class OkxSyncService:
         self._reconcile_deadline_monotonic: float | None = None
         self._reconcile_degraded_rows: list[dict[str, Any]] | None = None
         self._pending_position_protection_rebalance_keys: set[tuple[str, str]] = set()
+        self._position_protection_rebalance_retry_at: dict[tuple[str, str], float] = {}
+        self._position_protection_rebalance_task: asyncio.Task[list[dict[str, Any]]] | None = None
 
     def _protection_coverage_mismatch_keys(
         self,
@@ -1044,6 +1050,25 @@ class OkxSyncService:
 
         rows: list[dict[str, Any]] = []
         for symbol, side in sorted(self._pending_position_protection_rebalance_keys):
+            key = (symbol, side)
+            retry_after_seconds = max(
+                self._position_protection_rebalance_retry_at.get(key, 0.0) - time.monotonic(),
+                0.0,
+            )
+            if retry_after_seconds > 0:
+                rows.append(
+                    {
+                        "kind": "current_position_protection_rebalance_deferred",
+                        "source": "okx_authoritative_current_position",
+                        "symbol": symbol,
+                        "side": side,
+                        "status": "retry_backoff",
+                        "verified": False,
+                        "requires_attention": True,
+                        "retry_after_seconds": round(retry_after_seconds, 3),
+                    }
+                )
+                continue
             try:
                 report = await rebalance_current_position_protection(
                     executor,
@@ -1054,6 +1079,14 @@ class OkxSyncService:
             except Exception as exc:
                 report = getattr(exc, "report", None)
                 report = report if isinstance(report, dict) else {}
+                report_error = str(report.get("error") or "").strip()
+                error_text = safe_error_text(report_error or exc, limit=180)
+                retry_seconds = (
+                    POSITION_PROTECTION_REBALANCE_RATE_LIMIT_RETRY_SECONDS
+                    if "51513" in f"{report_error} {safe_error_text(exc)}"
+                    else POSITION_PROTECTION_REBALANCE_RETRY_SECONDS
+                )
+                self._position_protection_rebalance_retry_at[key] = time.monotonic() + retry_seconds
                 row = {
                     "kind": "current_position_protection_rebalance_failed",
                     "source": "okx_authoritative_current_position",
@@ -1065,7 +1098,8 @@ class OkxSyncService:
                         (_dict_value(report.get("before"))).get("repair_blockers") or []
                     ),
                     "requires_attention": True,
-                    "error": safe_error_text(exc, limit=180),
+                    "error": error_text,
+                    "retry_after_seconds": retry_seconds,
                 }
                 rows.append(row)
                 logger.warning(
@@ -1080,7 +1114,12 @@ class OkxSyncService:
 
             verified = report.get("verified") is True
             if verified:
-                self._pending_position_protection_rebalance_keys.discard((symbol, side))
+                self._pending_position_protection_rebalance_keys.discard(key)
+                self._position_protection_rebalance_retry_at.pop(key, None)
+            else:
+                self._position_protection_rebalance_retry_at[key] = (
+                    time.monotonic() + POSITION_PROTECTION_REBALANCE_RETRY_SECONDS
+                )
             rows.append(
                 {
                     "kind": "current_position_protection_rebalanced",
@@ -1094,6 +1133,53 @@ class OkxSyncService:
                 }
             )
         return rows
+
+    def _start_pending_position_protection_rebalance(self, executor: Any) -> bool:
+        """Run protection mutations outside the authoritative position-sync deadline."""
+
+        task = self._position_protection_rebalance_task
+        if task is not None and not task.done():
+            return False
+        now = time.monotonic()
+        ready_keys = {
+            key
+            for key in self._pending_position_protection_rebalance_keys
+            if self._position_protection_rebalance_retry_at.get(key, 0.0) <= now
+        }
+        if not ready_keys:
+            return False
+
+        async def run() -> list[dict[str, Any]]:
+            return await self._rebalance_pending_position_protection(executor)
+
+        task = asyncio.create_task(run())
+        self._position_protection_rebalance_task = task
+        logger.info(
+            "scheduled current OKX position protection rebalance",
+            position_count=len(ready_keys),
+        )
+
+        def finish(completed: asyncio.Task[list[dict[str, Any]]]) -> None:
+            if self._position_protection_rebalance_task is completed:
+                self._position_protection_rebalance_task = None
+            try:
+                result = completed.result()
+            except asyncio.CancelledError:
+                logger.info("background current OKX position protection rebalance cancelled")
+            except Exception as exc:
+                logger.warning(
+                    "background current OKX position protection rebalance failed",
+                    error=safe_error_text(exc),
+                )
+            else:
+                logger.info(
+                    "background current OKX position protection rebalance completed",
+                    result_count=len(result),
+                    positions=result,
+                )
+
+        task.add_done_callback(finish)
+        return True
 
     def _required_exchange_reconcile_lock(self) -> AbstractAsyncContextManager[Any]:
         if self.exchange_reconcile_lock is None:
@@ -1249,6 +1335,59 @@ class OkxSyncService:
             raise RuntimeError("OkxSyncService requires exchange_close_fill_finder dependency")
         return self.exchange_close_fill_finder
 
+    async def _find_exchange_close_fills_batch_with_timeout(
+        self,
+        positions: list[Any],
+    ) -> dict[int, dict[str, Any]]:
+        finder = self.exchange_close_fill_batch_finder
+        if not positions or finder is None:
+            return {}
+        timeout = self._reconcile_optional_timeout(EXCHANGE_CLOSE_FILL_LOOKUP_TIMEOUT_SECONDS)
+        unavailable = {"lookup_unavailable": True, "error": "deadline_budget_exhausted"}
+        if timeout is None:
+            return {id(position): dict(unavailable) for position in positions}
+        try:
+            rows = await asyncio.wait_for(finder(positions), timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                "batched exchange close-fill lookup timed out during reconciliation",
+                position_count=len(positions),
+            )
+            return {
+                id(position): {"lookup_unavailable": True, "error": "timeout"}
+                for position in positions
+            }
+        except Exception as exc:
+            logger.warning(
+                "batched exchange close-fill lookup failed during reconciliation",
+                position_count=len(positions),
+                error=safe_error_text(exc),
+            )
+            return {
+                id(position): {
+                    "lookup_unavailable": True,
+                    "error": safe_error_text(exc, limit=180),
+                }
+                for position in positions
+            }
+        if len(rows) != len(positions):
+            logger.warning(
+                "batched exchange close-fill lookup returned an invalid result count",
+                position_count=len(positions),
+                result_count=len(rows),
+            )
+            return {
+                id(position): {
+                    "lookup_unavailable": True,
+                    "error": "invalid_batch_result_count",
+                }
+                for position in positions
+            }
+        return {
+            id(position): (row if isinstance(row, dict) else {})
+            for position, row in zip(positions, rows, strict=True)
+        }
+
     def _required_fresh_feature_vector_provider(self) -> Callable[[str], Awaitable[Any | None]]:
         if self.fresh_feature_vector_provider is None:
             raise RuntimeError("OkxSyncService requires fresh_feature_vector_provider dependency")
@@ -1328,7 +1467,9 @@ class OkxSyncService:
             )
             if record_timeout_error:
                 self._record_round_error(timeout_reason)
-            logger.warning(timeout_reason)
+                logger.warning(timeout_reason)
+            else:
+                logger.info(timeout_reason)
 
             def finish_background_reconciliation(completed: asyncio.Task[Any]) -> None:
                 self._reconcile_deadline_monotonic = previous_deadline
@@ -1922,7 +2063,6 @@ class OkxSyncService:
         protection_by_key: dict[tuple[str, str], dict[str, Any]],
         symbol_normalizer: Callable[[Any], str],
         float_parser: Callable[[Any, float], float],
-        entry_fee_for_position: Callable[[Any, Any, float], Awaitable[float]],
     ) -> int:
         """Persist one reduce-only contract per authoritative OKX net-position group."""
 
@@ -1955,10 +2095,7 @@ class OkxSyncService:
 
         local_by_key: dict[tuple[str, str], list[Position]] = {}
         for position in positions:
-            if (
-                not position.is_open
-                or position.execution_mode != "paper"
-            ):
+            if not position.is_open or position.execution_mode != "paper":
                 continue
             key = (
                 symbol_normalizer(position.symbol),
@@ -1966,6 +2103,26 @@ class OkxSyncService:
             )
             if key in exchange_by_key:
                 local_by_key.setdefault(key, []).append(position)
+
+        entry_order_ids = {
+            order_id
+            for fragments in local_by_key.values()
+            for position in fragments
+            for order_id in _split_exchange_order_ids(position.entry_exchange_order_id)
+        }
+        orders_by_id: dict[str, Order] = {}
+        if entry_order_ids:
+            result = await session.execute(
+                select(Order).where(
+                    Order.execution_mode == "paper",
+                    Order.exchange_order_id.in_(entry_order_ids),
+                )
+            )
+            orders_by_id = {
+                str(order.exchange_order_id): order
+                for order in result.scalars().all()
+                if str(order.exchange_order_id or "").strip()
+            }
 
         group_rows: list[dict[str, Any]] = []
         for key, snapshot in exchange_by_key.items():
@@ -1982,10 +2139,7 @@ class OkxSyncService:
             )
             if stop_loss <= 0:
                 stop_loss = max(
-                    [
-                        float_parser(item.get("stop_loss_price"), 0.0)
-                        for item in protection_orders
-                    ],
+                    [float_parser(item.get("stop_loss_price"), 0.0) for item in protection_orders],
                     default=0.0,
                 )
             group_rows.append(
@@ -2030,19 +2184,6 @@ class OkxSyncService:
                     for order_id in _split_exchange_order_ids(position.entry_exchange_order_id)
                 }
             )
-            orders_by_id: dict[str, Order] = {}
-            if entry_order_ids:
-                result = await session.execute(
-                    select(Order).where(
-                        Order.execution_mode == "paper",
-                        Order.exchange_order_id.in_(entry_order_ids),
-                    )
-                )
-                orders_by_id = {
-                    str(order.exchange_order_id): order
-                    for order in result.scalars().all()
-                    if str(order.exchange_order_id or "").strip()
-                }
             entry_orders = [orders_by_id.get(order_id) for order_id in entry_order_ids]
             entry_fee_evidence_complete = bool(
                 entry_orders
@@ -2055,10 +2196,10 @@ class OkxSyncService:
             )
             current_entry_fee = 0.0
             for position in fragments:
-                current_entry_fee += await entry_fee_for_position(
-                    session,
+                current_entry_fee += entry_fee_from_orders(
                     position,
                     position.quantity,
+                    orders_by_exchange_id=orders_by_id,
                 )
             full_entry_fee = sum(
                 abs(float_parser(_dict_value(order.okx_raw_fills).get("fee_abs"), 0.0))
@@ -2072,8 +2213,7 @@ class OkxSyncService:
             )
             protection_orders = row["protection_orders"]
             protection_contracts = sum(
-                abs(float_parser(item.get("contracts"), 0.0))
-                for item in protection_orders
+                abs(float_parser(item.get("contracts"), 0.0)) for item in protection_orders
             )
             protection_evidence_complete = bool(
                 protection_orders
@@ -2105,9 +2245,7 @@ class OkxSyncService:
                 "take_profit_price": row["protection"].get("take_profit_price"),
                 "protection_evidence_complete": protection_evidence_complete,
                 "protection_orders": protection_orders,
-                "position_stressed_loss_usdt": abs(
-                    row["entry_price"] - row["stop_loss"]
-                )
+                "position_stressed_loss_usdt": abs(row["entry_price"] - row["stop_loss"])
                 * row["quantity"],
                 "portfolio_stressed_loss_usdt": portfolio_stressed_loss,
                 "portfolio_gross_notional_usdt": portfolio_gross_notional,
@@ -2120,9 +2258,7 @@ class OkxSyncService:
                     if order is not None and order.decision_id
                 ],
                 "original_entry_contract_complete": False,
-                "original_entry_contract_gaps": [
-                    "historical_entry_contract_not_reconstructed"
-                ],
+                "original_entry_contract_gaps": ["historical_entry_contract_not_reconstructed"],
                 "position_fragment_ids": [position.id for position in fragments if position.id],
                 "position_fragment_count": len(fragments),
             }
@@ -2542,7 +2678,6 @@ class OkxSyncService:
                             protection_by_key=protection_by_key,
                             symbol_normalizer=normalize_symbol,
                             float_parser=parse_float,
-                            entry_fee_for_position=entry_fee_for_position,
                         )
                     )
                 if management_refreshed:
@@ -2554,6 +2689,36 @@ class OkxSyncService:
                             "note": "已按 OKX 当前净仓位刷新只减仓管理合同。",
                         }
                     )
+
+                missing_exchange_positions = [
+                    pos
+                    for pos in positions
+                    if (
+                        pos.execution_mode == "paper"
+                        and pos.is_open
+                        and (
+                            normalize_symbol(pos.symbol),
+                            str(pos.side or "").lower(),
+                        )
+                        not in exchange_position_keys
+                    )
+                ]
+                close_fills_by_position: dict[int, dict[str, Any]] = {}
+                external_close_fill_positions: list[Any] = []
+                for pos in missing_exchange_positions:
+                    local_close_fill = await _confirmed_local_close_fill_for_position(
+                        session,
+                        pos,
+                    )
+                    if local_close_fill:
+                        close_fills_by_position[id(pos)] = local_close_fill
+                    else:
+                        external_close_fill_positions.append(pos)
+                close_fills_by_position.update(
+                    await self._find_exchange_close_fills_batch_with_timeout(
+                        external_close_fill_positions
+                    )
+                )
 
                 for pos in positions:
                     if pos.execution_mode != "paper":
@@ -2630,11 +2795,13 @@ class OkxSyncService:
                             )
                             continue
 
-                    close_fill = await _confirmed_local_close_fill_for_position(
-                        session,
-                        pos,
-                    )
-                    if not close_fill:
+                    close_fill = close_fills_by_position.get(id(pos))
+                    if close_fill is None:
+                        close_fill = await _confirmed_local_close_fill_for_position(
+                            session,
+                            pos,
+                        )
+                    if not close_fill and id(pos) not in close_fills_by_position:
                         close_fill = await self._find_exchange_close_fill_with_timeout(
                             find_exchange_close_fill,
                             pos,
@@ -2949,7 +3116,10 @@ class OkxSyncService:
             )
             return self._with_reconcile_degraded_rows(reconciled)
 
-        reconciled.extend(await self._rebalance_pending_position_protection(paper_okx))
+        if self._reconcile_deadline_monotonic is None:
+            reconciled.extend(await self._rebalance_pending_position_protection(paper_okx))
+        else:
+            self._start_pending_position_protection_rebalance(paper_okx)
 
         if reconciled:
             logger.info(
@@ -3390,8 +3560,7 @@ class OkxSyncService:
                     decision_ids_by_entry_order = {
                         str(exchange_order_id): int(decision_id)
                         for exchange_order_id, decision_id in entry_order_rows
-                        if str(exchange_order_id or "").strip()
-                        and int(decision_id or 0) > 0
+                        if str(exchange_order_id or "").strip() and int(decision_id or 0) > 0
                     }
                 decision_ids = {
                     int(decision_id)
@@ -3435,9 +3604,7 @@ class OkxSyncService:
                     if not canary_lifecycle:
                         for decision_id in lineage_decision_ids:
                             decision = decisions_by_id.get(
-                                int(decision_id)
-                                if str(decision_id or "").isdigit()
-                                else -1
+                                int(decision_id) if str(decision_id or "").isdigit() else -1
                             )
                             lifecycle = build_paper_canary_position_lifecycle(decision)
                             if lifecycle:
@@ -3446,9 +3613,7 @@ class OkxSyncService:
                     if not training_lifecycle:
                         for decision_id in lineage_decision_ids:
                             decision = decisions_by_id.get(
-                                int(decision_id)
-                                if str(decision_id or "").isdigit()
-                                else -1
+                                int(decision_id) if str(decision_id or "").isdigit() else -1
                             )
                             lifecycle = build_paper_training_position_lifecycle(decision)
                             if lifecycle:

@@ -126,7 +126,6 @@ const FIXED_AI_EXPERT_FALLBACKS = [
     },
 ];
 let recentDecisionsRefreshTimer = null;
-let positionsRequestToken = 0;
 const closingPositionIds = new Set();
 let closingAllPositions = false;
 const positionLinkedOrdersByGroup = new Map();
@@ -152,6 +151,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initDashboardUserActions();
     initModalActionButtons();
     initServerMonitorTabs();
+    initPaginationControls();
     fetchDashboardSummary();
     fetchPnlHistory();
     fetchRecentDecisions();
@@ -164,10 +164,18 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }, 10000);
     setInterval(updateRuntimeClock, 1000);
-    setInterval(fetchPnlHistory, 60000);
-    setInterval(fetchRecentDecisions, 30000);
-    setInterval(fetchRecentExecutions, 30000);
-    setInterval(fetchTrades, 60000);
+    setInterval(() => {
+        if (!document.hidden && isPageActive('dashboard')) fetchPnlHistory();
+    }, 60000);
+    setInterval(() => {
+        if (!document.hidden && isPageActive('dashboard')) fetchRecentDecisions();
+    }, 30000);
+    setInterval(() => {
+        if (!document.hidden && isPageActive('dashboard')) fetchRecentExecutions();
+    }, 30000);
+    setInterval(() => {
+        if (!document.hidden && isPageActive('trades')) fetchTrades();
+    }, 60000);
     setInterval(fetchDashboardAuthStatus, 60000);
     setInterval(() => {
         if (isPageActive('positions')) {
@@ -340,6 +348,7 @@ function apiErrorText(data, fallback = '未知错误') {
 }
 
 const inflightJSONRequests = new Map();
+const paginatedRequestVersions = new Map();
 
 async function fetchJSON(url) {
     const requestKey = String(url);
@@ -373,6 +382,14 @@ async function fetchJSON(url) {
             inflightJSONRequests.delete(requestKey);
         }
     }
+}
+
+async function fetchLatestPageJSON(requestKey, url) {
+    const key = String(requestKey);
+    const version = Number(paginatedRequestVersions.get(key) || 0) + 1;
+    paginatedRequestVersions.set(key, version);
+    const data = await fetchJSON(url);
+    return paginatedRequestVersions.get(key) === version ? data : null;
 }
 
 function redirectToLogin(message = '') {
@@ -591,7 +608,10 @@ function updateSymbolCount() {
 }
 
 async function fetchTrades() {
-    const data = await fetchJSON(`/api/trades?limit=${PAGE_SIZE}&mode=${state.mode}&page=${state.tradesPage}`);
+    const data = await fetchLatestPageJSON(
+        'trades',
+        `/api/trades?limit=${PAGE_SIZE}&mode=${state.mode}&page=${state.tradesPage}`,
+    );
     if (!data) return;
     updateTradeTable(data.trades || [], state.mode, data.total ?? data.count);
 }
@@ -854,7 +874,11 @@ function updateExecutionAccountPanel(account) {
                 <div class="exec-status-cell"><span>今日OKX权益变化</span><strong style="color:${signedMoneyColor(todayTotalPnl)};">${signedMoneyWithUnit(todayTotalPnl)}</strong></div>
                 <div class="exec-status-cell"><span>${phase3EquityLabel}</span><strong style="color:${signedMoneyColor(phase3TotalPnl)};">${signedMoneyWithUnit(phase3TotalPnl)}</strong></div>
             </div>
-            ${account.balance_error ? `<div class="exec-risk-note paused">${escHtml(account.balance_error)}</div>` : pauseNote}
+            ${account.balance_error
+                ? `<div class="exec-risk-note paused">${escHtml(account.balance_error)}</div>`
+                : account.balance_warning
+                    ? `<div class="exec-risk-note">${escHtml(account.balance_warning)}</div>`
+                    : pauseNote}
         </div>
     `;
 }
@@ -890,7 +914,11 @@ function updateAccounts(accounts, executionAccount = null) {
                 <div class="acct-name">${escHtml(account.account_name || account.model_name || '多专家执行账户')}</div>
                 <div style="font-size:12px;color:var(--text);font-weight:700;">${accountBalanceLabel}可交易余额 ${accountMoneyText(remainingAllocation, account)} USDT</div>
                 <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${accountBalanceLabel}当前账户权益 ${accountMoneyText(accountEquity, account)} | 今日OKX权益变化（北京时间）${signedMoney(todayTotalPnl)}</div>
-                ${account.balance_error ? `<div style="font-size:10px;color:var(--red);margin-top:4px;">${escHtml(account.balance_error)}</div>` : ''}
+                ${account.balance_error
+                    ? `<div style="font-size:10px;color:var(--red);margin-top:4px;">${escHtml(account.balance_error)}</div>`
+                    : account.balance_warning
+                        ? `<div style="font-size:10px;color:var(--yellow);margin-top:4px;">${escHtml(account.balance_warning)}</div>`
+                        : ''}
             </div>
             <div class="acct-side">
                 <div class="acct-side-label">三期OKX权益变化</div>
@@ -1137,7 +1165,7 @@ function renderRecentExecutions(executions, total) {
 
 function changeTradePage(page) {
     state.tradesPage = page;
-    fetchTrades();
+    return fetchTrades();
 }
 
 function parsedRuntimeSeconds(stats) {
@@ -1475,7 +1503,7 @@ function renderRiskAlerts(events = state.riskEvents || []) {
 
 function changeRiskAlertPage(page) {
     state.riskEventsPage = Math.max(1, Number(page) || 1);
-    renderRiskAlerts(state.riskEvents || []);
+    return renderRiskAlerts(state.riskEvents || []);
 }
 
 function addRiskAlert(data) {
@@ -1687,6 +1715,12 @@ function activateSettingsTab(name = 'okx') {
 }
 
 function loadPageData(page) {
+    if (page === 'dashboard') {
+        fetchDashboardSummary();
+        fetchPnlHistory();
+        fetchRecentDecisions();
+        fetchRecentExecutions();
+    }
     if (page === 'trades') {
         const label = document.getElementById('trade-mode-label');
         if (label) label.textContent = state.mode === 'paper' ? '模拟盘' : '实盘';
@@ -1888,7 +1922,7 @@ function resetDecisionFilters() {
 
 async function fetchAllDecisions() {
     const qs = getDecisionFilters();
-    const data = await fetchJSON('/api/decisions?' + qs);
+    const data = await fetchLatestPageJSON('decisions', '/api/decisions?' + qs);
     if (!data || !data.decisions) return;
     renderAllDecisions(data.decisions, data);
     updateDecisionBadge(data.total ?? data.count);
@@ -2167,7 +2201,7 @@ function setDecisionModalWide(enabled) {
 
 function changeDecisionsPage(page) {
     state.decisionsPage = page;
-    fetchAllDecisions();
+    return fetchAllDecisions();
 }
 
 // ========== Expert Analysis Records ==========
@@ -2183,7 +2217,10 @@ async function fetchAnalysisRecords() {
     params.set('analysis_type', state.analysisView === 'position' ? 'position' : 'market');
     params.set('include_detail', 'false');
     params.set('is_paper', state.mode === 'paper' ? 'true' : 'false');
-    const data = await fetchJSON('/api/analysis-records?' + params.toString());
+    const data = await fetchLatestPageJSON(
+        'analysis',
+        '/api/analysis-records?' + params.toString(),
+    );
     if (!data || !data.records) return;
     renderAnalysisRecords(data.records, data);
     const badge = document.getElementById('analysis-badge');
@@ -3918,7 +3955,7 @@ function renderAnalysisReasonModal(record) {
 
 function changeAnalysisPage(page) {
     state.analysisPage = page;
-    fetchAnalysisRecords();
+    return fetchAnalysisRecords();
 }
 
 // ========== Expert Long-term Memory ==========
@@ -3929,7 +3966,10 @@ async function fetchExpertMemories() {
         memory_page: state.expertMemoryPage,
         reflection_page: state.tradeReflectionPage,
     });
-    const data = await fetchJSON(`/api/expert-memories?${params.toString()}`);
+    const data = await fetchLatestPageJSON(
+        'expert-memories',
+        `/api/expert-memories?${params.toString()}`,
+    );
     if (!data) return;
     state.expertMemories = data.memories || [];
     state.tradeReflections = data.reflections || [];
@@ -4043,12 +4083,12 @@ function renderExpertMemories(data = {}) {
 
 function changeExpertMemoryPage(page) {
     state.expertMemoryPage = Math.max(1, Number(page) || 1);
-    fetchExpertMemories();
+    return fetchExpertMemories();
 }
 
 function changeTradeReflectionPage(page) {
     state.tradeReflectionPage = Math.max(1, Number(page) || 1);
-    fetchExpertMemories();
+    return fetchExpertMemories();
 }
 
 function setExpertMemoryView(view) {
@@ -4070,7 +4110,10 @@ async function fetchShadowBacktests() {
     });
     const status = state.shadowBacktestStatus || document.getElementById('shadow-backtest-status')?.value || '';
     if (status) params.set('status', status);
-    const data = await fetchJSON(`/api/shadow-backtests?${params.toString()}`);
+    const data = await fetchLatestPageJSON(
+        'shadow-backtests',
+        `/api/shadow-backtests?${params.toString()}`,
+    );
     if (!data) return;
     state.shadowBacktests = data.records || [];
     state.shadowBacktestTotal = Number(data.count || 0);
@@ -4136,7 +4179,7 @@ function shadowDecisionNote(row) {
 
 function changeShadowBacktestPage(page) {
     state.shadowBacktestPage = Math.max(1, Number(page) || 1);
-    fetchShadowBacktests();
+    return fetchShadowBacktests();
 }
 
 function changeShadowBacktestStatus() {
@@ -4221,7 +4264,7 @@ async function fetchMLSignalDashboard() {
             summary: {},
             error: err?.message || '模型训练注册表请求失败',
         })),
-        fetchJSON(`/api/analysis-records?limit=120&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`).catch(() => ({ records: [] })),
+        fetchJSON(`/api/analysis-records?limit=120&include_ml_summary=true&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`).catch(() => ({ records: [] })),
         fetchJSON(`/api/model-contribution/stats?mode=${state.mode === 'live' ? 'live' : 'paper'}&days=7`).catch(() => null),
     ]);
     state.mlSignalStatus = status || null;
@@ -4901,7 +4944,7 @@ function renderMLSignalRecent() {
 
 function changeMLSignalPage(page) {
     state.mlSignalPage = Math.max(1, Number(page) || 1);
-    renderMLSignalRecent();
+    return renderMLSignalRecent();
 }
 
 // ========== Data Collection Dashboard ==========
@@ -8297,10 +8340,11 @@ async function deleteModel(name) {
 // ========== Record Page Overrides ==========
 
 async function fetchPositions() {
-    const requestToken = ++positionsRequestToken;
-    const data = await fetchJSON(`/api/dashboard/positions?mode=${state.mode}&page=${state.positionsPage}&page_size=${PAGE_SIZE}&open_only=true`);
+    const data = await fetchLatestPageJSON(
+        'positions',
+        `/api/dashboard/positions?mode=${state.mode}&page=${state.positionsPage}&page_size=${PAGE_SIZE}&open_only=true`,
+    );
     if (!data) return;
-    if (requestToken !== positionsRequestToken) return;
     state.positionsPage = data.page || state.positionsPage;
     state.positionsTotal = data.total || 0;
     state.openPositions = data.positions || [];
@@ -8330,7 +8374,10 @@ function positionProtectionInventoryWarnings(inventory) {
 }
 
 async function fetchPositionHistory() {
-    const data = await fetchJSON(`/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true`);
+    const data = await fetchLatestPageJSON(
+        'position-history',
+        `/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true`,
+    );
     if (!data) return;
     state.positionHistoryPage = data.page || state.positionHistoryPage;
     state.positionHistoryTotal = data.total || 0;
@@ -9087,12 +9134,12 @@ function renderDecisionsPage(totalPagesOverride = null) {
 
 function changePositionsPage(page) {
     state.positionsPage = page;
-    fetchPositions();
+    return fetchPositions();
 }
 
 function changePositionHistoryPage(page) {
     state.positionHistoryPage = page;
-    fetchPositionHistory();
+    return fetchPositionHistory();
 }
 
 // Override the older pagination renderer so record pages always show clear,
@@ -9124,14 +9171,19 @@ function renderPagination(containerId, page, totalPages, totalItems, callbackNam
         else startP = Math.max(1, endP - 6);
     }
 
+    const button = (targetPage, label, options = {}) => {
+        const disabled = options.disabled ? 'disabled' : '';
+        const active = options.active ? 'class="active" aria-current="page"' : '';
+        return `<button type="button" data-pagination-callback="${callback}" data-page="${targetPage}" ${active} ${disabled}>${label}</button>`;
+    };
     let html = '';
-    html += `<button onclick="${callback}(1)" ${currentPage <= 1 ? 'disabled' : ''}>首页</button>`;
-    html += `<button onclick="${callback}(${currentPage - 1})" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>`;
+    html += button(1, '首页', { disabled: currentPage <= 1 });
+    html += button(currentPage - 1, '上一页', { disabled: currentPage <= 1 });
     for (let p = startP; p <= endP; p++) {
-        html += `<button onclick="${callback}(${p})" ${p === currentPage ? 'class="active"' : ''}>${p}</button>`;
+        html += button(p, String(p), { active: p === currentPage, disabled: p === currentPage });
     }
-    html += `<button onclick="${callback}(${currentPage + 1})" ${currentPage >= pages ? 'disabled' : ''}>下一页</button>`;
-    html += `<button onclick="${callback}(${pages})" ${currentPage >= pages ? 'disabled' : ''}>末页</button>`;
+    html += button(currentPage + 1, '下一页', { disabled: currentPage >= pages });
+    html += button(pages, '末页', { disabled: currentPage >= pages });
     html += `<span class="page-info">共 ${total} 条 / ${pages} 页</span>`;
     container.innerHTML = html;
 }
@@ -9493,6 +9545,50 @@ const PAGINATION_CALLBACKS = new Set([
     'changeMLSignalPage',
     'changeProfitAttributionRecordPage',
 ]);
+
+const PAGINATION_HANDLERS = {
+    changePositionsPage,
+    changePositionHistoryPage,
+    changeTradePage,
+    changeDecisionsPage,
+    changeAnalysisPage,
+    changeRiskAlertPage,
+    changeExpertMemoryPage,
+    changeTradeReflectionPage,
+    changeShadowBacktestPage,
+    changeMLSignalPage,
+    changeProfitAttributionRecordPage,
+};
+
+function initPaginationControls() {
+    document.addEventListener('click', async event => {
+        const button = event.target?.closest?.('.pagination button[data-pagination-callback]');
+        if (!button || button.disabled) return;
+        const callbackName = safePaginationCallbackName(button.dataset.paginationCallback);
+        const handler = PAGINATION_HANDLERS[callbackName];
+        const page = Number(button.dataset.page);
+        if (!handler || !Number.isInteger(page) || page < 1) return;
+
+        event.preventDefault();
+        const container = button.closest('.pagination');
+        if (container?.dataset.loading === 'true') return;
+        if (container) {
+            container.dataset.loading = 'true';
+            container.setAttribute('aria-busy', 'true');
+            container.querySelectorAll('button').forEach(item => { item.disabled = true; });
+        }
+        try {
+            await Promise.resolve(handler(page));
+        } catch (error) {
+            console.error(`Failed to load page ${page} for ${callbackName}`, error);
+        } finally {
+            if (container?.isConnected) {
+                delete container.dataset.loading;
+                container.removeAttribute('aria-busy');
+            }
+        }
+    });
+}
 
 function safePaginationCallbackName(callbackName) {
     const value = String(callbackName || '');
@@ -10198,7 +10294,7 @@ function setProfitAttributionView(view) {
 
 function changeProfitAttributionRecordPage(page) {
     state.profitAttributionRecordPage = Math.max(1, Number(page) || 1);
-    renderProfitAttributionRecords(state.profitAttribution || {});
+    return renderProfitAttributionRecords(state.profitAttribution || {});
 }
 
 // ========== Opening Funnel ==========

@@ -15,14 +15,41 @@ def _u(escaped: str) -> str:
 
 
 def test_dashboard_deduplicates_identical_inflight_reads() -> None:
-    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "const inflightJSONRequests = new Map();" in script
     assert "const existingRequest = inflightJSONRequests.get(requestKey);" in script
     assert "if (existingRequest) return existingRequest;" in script
     assert "inflightJSONRequests.delete(requestKey);" in script
+
+
+def test_dashboard_pagination_uses_delegated_latest_request_controls() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "function initPaginationControls()" in script
+    assert "data-pagination-callback" in script
+    assert "const PAGINATION_HANDLERS" in script
+    assert "async function fetchLatestPageJSON(requestKey, url)" in script
+    assert "paginatedRequestVersions.get(key) === version ? data : null" in script
+    assert 'onclick="${callback}' not in script
+
+
+def test_dashboard_background_polling_only_refreshes_visible_active_pages() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "if (!document.hidden && isPageActive('dashboard')) fetchPnlHistory();" in script
+    assert "if (!document.hidden && isPageActive('dashboard')) fetchRecentDecisions();" in script
+    assert "if (!document.hidden && isPageActive('trades')) fetchTrades();" in script
+
+
+def test_analysis_list_omits_heavy_ml_payload_unless_requested() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    source = (PROJECT_ROOT / "web_dashboard/api/dashboard.py").read_text(encoding="utf-8")
+
+    assert "include_ml_summary: bool = False" in source
+    assert "if include_ml_summary and not include_detail" in source
+    assert "include_ml_summary=true" in script
+    assert "include_detail', 'false'" in script or "params.set('include_detail', 'false')" in script
 
 
 def test_main_dashboard_removes_manual_symbol_selector() -> None:
@@ -86,7 +113,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
+    assert "dashboard.js?v=20260728-menu-latency-v2" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -110,9 +137,7 @@ def test_dashboard_refreshes_active_local_ml_status() -> None:
 
 
 def test_trade_reflections_distinguish_pending_settlement_from_missing_evidence() -> None:
-    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "const authorityStatus = r.authority_status || {};" in script
     assert "复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实" in script
@@ -529,7 +554,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
+    assert "dashboard.js?v=20260728-menu-latency-v2" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -669,7 +694,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
+    assert "dashboard.js?v=20260728-menu-latency-v2" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -784,7 +809,10 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "initDataCollectionSettingsForm()" in script
     assert "dataCollectionSettingsDirty" in script
     assert "dataCollectionSettingsLoaded: false" in script
-    assert "if (!state.dataCollectionSettingsLoaded || state.dataCollectionSettingsSaving) return;" in script
+    assert (
+        "if (!state.dataCollectionSettingsLoaded || state.dataCollectionSettingsSaving) return;"
+        in script
+    )
     assert "const firstHydration = !state.dataCollectionSettingsLoaded;" in script
     assert "state.dataCollectionSettingsLoaded = true;" in script
     assert "已阻止保存空表单" in script
@@ -834,7 +862,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
+    assert "dashboard.js?v=20260728-menu-latency-v2" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1034,8 +1062,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "learning_only: '仅学习观察'" in reason_block
     assert (
         "artifact_activation_not_production_authorized: "
-        "'当前 Artifact 可参与模拟盘，尚未获得实盘权限'"
-        in reason_block
+        "'当前 Artifact 可参与模拟盘，尚未获得实盘权限'" in reason_block
     )
     assert "okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据'" in reason_block
     assert "risk_contract_version_missing: '历史入场记录未保存风险合同版本'" in reason_block
@@ -1062,7 +1089,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260728-data-collection-settings-hydration" in html
+    assert "/static/js/dashboard.js?v=20260728-menu-latency-v2" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:

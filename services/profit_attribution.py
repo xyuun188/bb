@@ -298,9 +298,37 @@ def _decision_payload(decision: AIDecision | None, confidence: str) -> dict[str,
         "was_executed": bool(decision.was_executed),
         "matched_confidence": confidence,
         "created_at": created_at.isoformat() if created_at else None,
-        "opportunity_score": opportunity,
-        "evidence_score": evidence_score,
+        "opportunity_score": _compact_opportunity_score(opportunity),
+        "evidence_score": _compact_evidence_score(evidence_score),
     }
+
+
+def _compact_opportunity_score(value: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "score",
+        "side",
+        "expected_net_return_pct",
+        "objective_net_return_pct",
+        "return_lcb_pct",
+        "loss_probability",
+        "tail_loss_probability",
+        "paper_eligible",
+        "production_eligible",
+        "selected_for_execution",
+        "execution_final_state",
+    )
+    return {key: value[key] for key in keys if key in value}
+
+
+def _compact_evidence_score(value: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "score",
+        "required_score",
+        "eligible",
+        "approved",
+        "reason",
+    )
+    return {key: value[key] for key in keys if key in value}
 
 
 def _shadow_payload(row: ShadowBacktest | None) -> dict[str, Any] | None:
@@ -509,6 +537,21 @@ def _decision_state_or_closed_fallback(
     }
 
 
+def _compact_decision_state(value: dict[str, Any]) -> dict[str, Any]:
+    summary = _safe_dict(value.get("summary"))
+    return {
+        "summary": {
+            "completed_stage_count": summary.get("completed_stage_count"),
+            "blocked": summary.get("blocked"),
+            "failed": summary.get("failed"),
+            "final_stage": summary.get("final_stage"),
+            "final_status": summary.get("final_status"),
+            "final_reason": summary.get("final_reason") or "",
+        },
+        "inferred": value.get("inferred") is True,
+    }
+
+
 def build_profit_attribution(
     positions: list[Position],
     orders: list[Order],
@@ -599,15 +642,19 @@ def build_profit_attribution(
                 "signals": signals,
                 "shadow": _shadow_payload(shadow),
                 "evidence_status": _evidence_status(entry_match.decision, signals, shadow),
-                "decision_state": _decision_state_or_closed_fallback(
-                    raw_entry,
-                    position,
-                    entry_match.decision,
+                "decision_state": _compact_decision_state(
+                    _decision_state_or_closed_fallback(
+                        raw_entry,
+                        position,
+                        entry_match.decision,
+                    )
                 ),
-                "close_state": _decision_state_or_closed_fallback(
-                    raw_close,
-                    position,
-                    close_match.decision,
+                "close_state": _compact_decision_state(
+                    _decision_state_or_closed_fallback(
+                        raw_close,
+                        position,
+                        close_match.decision,
+                    )
                 ),
             }
         )

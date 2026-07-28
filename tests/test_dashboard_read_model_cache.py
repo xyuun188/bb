@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,7 +21,9 @@ async def test_closed_ledger_read_model_builds_once_across_pages(
     dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
     builds = {"count": 0}
 
-    async def fake_build(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, Any]], int, int, int, str]:
+    async def fake_build(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[list[dict[str, Any]], int, int, int, str]:
         builds["count"] += 1
         assert _kwargs["page"] == 1
         assert _kwargs["page_size"] == 5000
@@ -131,7 +134,7 @@ async def test_closed_ledger_cold_memory_uses_persisted_snapshot_before_refresh(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_startup_warmup_only_primes_bounded_okx_reads(
+async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -142,11 +145,36 @@ async def test_dashboard_startup_warmup_only_primes_bounded_okx_reads(
     async def prime_balance(_mode: str) -> None:
         calls.append("balance")
 
+    async def prime_strategy_learning(_mode: str) -> None:
+        calls.append("strategy_learning")
+
+    async def prime_model_registry() -> dict[str, Any]:
+        calls.append("model_registry")
+        return {}
+
+    async def prime_data_collection() -> None:
+        calls.append("data_collection")
+
     async def forbidden_ledger(_mode: str) -> None:
         raise AssertionError("closed ledger must not run during dashboard startup")
 
     monkeypatch.setattr(dashboard, "_refresh_dashboard_okx_position_cache", prime_positions)
     monkeypatch.setattr(dashboard, "_refresh_dashboard_okx_balance_cache", prime_balance)
+    monkeypatch.setattr(
+        dashboard,
+        "_warm_dashboard_strategy_learning_cache",
+        prime_strategy_learning,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "get_model_training_registry_status",
+        prime_model_registry,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_warm_dashboard_data_collection_cache",
+        prime_data_collection,
+    )
     monkeypatch.setattr(
         dashboard,
         "_warm_dashboard_closed_position_ledger_cache",
@@ -155,7 +183,178 @@ async def test_dashboard_startup_warmup_only_primes_bounded_okx_reads(
 
     await dashboard.warm_dashboard_read_caches("paper")
 
-    assert sorted(calls) == ["balance", "positions"]
+    assert sorted(calls) == [
+        "balance",
+        "data_collection",
+        "model_registry",
+        "positions",
+        "strategy_learning",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strategy_learning_request_snapshot_skips_repeated_watermark_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("strategy-learning")
+    watermark_calls = 0
+    payload_calls = 0
+
+    async def watermark(**_kwargs: Any) -> tuple[str]:
+        nonlocal watermark_calls
+        watermark_calls += 1
+        return ("v1",)
+
+    class StrategyLearningStub:
+        async def dashboard_payload(self, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal payload_calls
+            payload_calls += 1
+            return {"mode": "paper", "schedule": {"status": "ready"}}
+
+    monkeypatch.setattr(dashboard, "_strategy_learning_watermark_for_request", watermark)
+    monkeypatch.setattr(
+        dashboard,
+        "_trading_service",
+        SimpleNamespace(strategy_learning_service=StrategyLearningStub()),
+    )
+
+    first = await dashboard.get_strategy_learning(mode="paper")
+    second = await dashboard.get_strategy_learning(mode="paper")
+
+    assert first == second
+    assert watermark_calls == 1
+    assert payload_calls == 1
+    dashboard._clear_dashboard_heavy_cache("strategy-learning")
+
+
+def test_strategy_learning_summary_keeps_rendered_fields_without_duplicate_rows() -> None:
+    payload = {
+        "feedback": {"generated_at": "2026-07-28T00:00:00+00:00"},
+        "schedule": {
+            "leading_candidate": {"id": "side-long", "version": 2},
+            "runtime": {
+                "historical_prior_context_enabled": True,
+                "execution_owners": ["live_ml_profit_contract"],
+                "continuous_strategy_routing": {"oversized": [1] * 1000},
+                "governed_profiles": [{"oversized": [1] * 1000}],
+            },
+            "candidates": [
+                {
+                    "id": "side-long",
+                    "version": 2,
+                    "rank": 1,
+                    "params": {
+                        "selector": {"scope": "side", "side": "long"},
+                        "historical_return_distribution": {"return_lcb_pct": 0.2},
+                        "unused": [1] * 1000,
+                    },
+                    "promotion": {
+                        "historical_prior_context_eligible": True,
+                        "rejection_reasons": [],
+                    },
+                    "backtest": {
+                        "status": "ready",
+                        "metrics": {"return_lcb_pct": 0.1},
+                        "rows": [{"oversized": [1] * 1000}],
+                    },
+                    "shadow_validation": {
+                        "status": "ready",
+                        "metrics": {"return_lcb_pct": 0.05},
+                        "rows": [{"oversized": [1] * 1000}],
+                    },
+                }
+            ],
+            "backtest": {"rows": [{"oversized": [1] * 1000}]},
+            "shadow_validation": {"rows": [{"oversized": [1] * 1000}]},
+            "continuous_strategy_routing": {"oversized": [1] * 1000},
+            "scheduler_mode": "governed_dynamic_return",
+            "governed_candidate_count": 1,
+            "rejected_candidate_count": 0,
+        },
+    }
+
+    summary = dashboard._strategy_learning_dashboard_summary(payload)
+    schedule = summary["schedule"]
+    candidate = schedule["candidates"][0]
+
+    assert schedule["leading_candidate"] is candidate
+    assert candidate["params"]["selector"]["side"] == "long"
+    assert candidate["backtest"]["metrics"]["return_lcb_pct"] == 0.1
+    assert "rows" not in candidate["backtest"]
+    assert "continuous_strategy_routing" not in schedule
+    assert "continuous_strategy_routing" not in schedule["runtime"]
+
+
+def test_profit_attribution_summary_drops_unrendered_reasoning_and_empty_distributions() -> None:
+    record = {
+        "position_id": 7,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "realized_pnl": 1.2,
+        "notes": ["first", "second", "third"],
+        "entry_decision": {
+            "id": 9,
+            "action": "long",
+            "confidence": 0.8,
+            "reasoning": "unused" * 1000,
+        },
+        "signals": {
+            "ml": {
+                "available": True,
+                "side": "long",
+                "return_distribution_contract": {"q10": -0.1, "q50": 0.2},
+                "unused": [1] * 1000,
+            }
+        },
+        "evidence_status": {
+            "ai": {
+                "available": True,
+                "action": "long",
+                "missing_reason": "",
+                "unused": [1] * 1000,
+            }
+        },
+        "decision_state": {
+            "summary": {
+                "final_stage": "local_sync",
+                "final_status": "completed",
+                "final_reason": "done",
+                "unused": [1] * 1000,
+            }
+        },
+        "close_decision": {"reasoning": "unused" * 1000},
+    }
+
+    compact = dashboard._profit_attribution_dashboard_record(record)
+
+    assert compact["notes"] == ["first", "second"]
+    assert "reasoning" not in compact["entry_decision"]
+    assert "unused" not in compact["signals"]["ml"]
+    assert compact["decision_state"]["summary"]["final_stage"] == "local_sync"
+    assert "close_decision" not in compact
+
+
+@pytest.mark.asyncio
+async def test_profit_attribution_parameter_snapshot_short_circuits_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("profit-attribution")
+    cache_key = ("profit-attribution", "paper", 24, 200)
+    cached_payload = {"mode": "paper", "records": [{"position_id": 7}]}
+    dashboard._dashboard_heavy_cache_set(cache_key, cached_payload)
+
+    async def fail_watermark(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        raise AssertionError("fresh parameter snapshot must skip the database watermark")
+
+    monkeypatch.setattr(dashboard, "_profit_attribution_watermark", fail_watermark)
+
+    assert await dashboard.get_profit_attribution() == cached_payload
+
+    dashboard._dashboard_heavy_cache[cache_key] = (
+        datetime.now(UTC) - timedelta(seconds=31),
+        cached_payload,
+    )
+    assert dashboard._dashboard_heavy_cache_get(cache_key, ttl_seconds=30.0) is None
 
 
 @pytest.mark.asyncio
@@ -234,6 +433,113 @@ def test_closed_ledger_snapshot_round_trip(
     assert loaded is not None
     _generated_at, loaded_payload = loaded
     assert loaded_payload == payload
+
+
+def test_official_history_matches_only_instrument_scoped_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_at = datetime(2026, 7, 28, 8, 0, tzinfo=UTC)
+    closed_at = opened_at + timedelta(minutes=30)
+
+    def order(inst_id: str, order_id: str, side: str, filled_at: datetime) -> Any:
+        return SimpleNamespace(
+            okx_inst_id=inst_id,
+            symbol=inst_id.replace("-SWAP", "").replace("-", "/"),
+            exchange_order_id=order_id,
+            side=side,
+            quantity=1.0,
+            price=100.0,
+            fee=0.01,
+            filled_at=filled_at,
+            created_at=filled_at,
+            okx_sync_status="okx_confirmed",
+            okx_fill_contracts=1.0,
+            okx_fill_pnl=0.5 if side == "sell" else 0.0,
+            okx_trade_ids=f"trade-{order_id}",
+            okx_raw_fills={
+                "base_quantity": 1.0,
+                "contracts": 1.0,
+                "contract_size": 1.0,
+                "avg_price": 100.0,
+                "fill_pnl": 0.5 if side == "sell" else 0.0,
+                "fee_abs": 0.01,
+            },
+        )
+
+    relevant_orders = [
+        order("BTC-USDT-SWAP", "btc-entry", "buy", opened_at),
+        order("BTC-USDT-SWAP", "btc-close", "sell", closed_at),
+    ]
+    unrelated_orders = [
+        order("ETH-USDT-SWAP", f"eth-{index}", "buy", opened_at) for index in range(200)
+    ]
+    relevant_position = SimpleNamespace(
+        id=1,
+        okx_inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT",
+        okx_pos_id="btc-pos",
+        side="long",
+        created_at=opened_at,
+        closed_at=closed_at,
+    )
+    unrelated_positions = [
+        SimpleNamespace(
+            id=index + 2,
+            okx_inst_id="ETH-USDT-SWAP",
+            symbol="ETH/USDT",
+            okx_pos_id=f"eth-pos-{index}",
+            side="long",
+            created_at=opened_at,
+            closed_at=closed_at,
+        )
+        for index in range(200)
+    ]
+    row = {
+        "instId": "BTC-USDT-SWAP",
+        "posId": "btc-pos",
+        "posSide": "long",
+        "openAvgPx": "100",
+        "closeAvgPx": "101",
+        "openMaxPos": "1",
+        "closeTotalPos": "1",
+        "realizedPnl": "0.48",
+        "pnl": "0.5",
+        "fundingFee": "0",
+        "type": "2",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "_dashboard_entry_order_ids": ["btc-entry"],
+        "_dashboard_close_order_ids": ["btc-close"],
+    }
+    match_calls = 0
+    original_match = dashboard._dashboard_order_matches_position_history_window
+
+    def counted_match(*args: Any, **kwargs: Any) -> bool:
+        nonlocal match_calls
+        match_calls += 1
+        return original_match(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_order_matches_position_history_window",
+        counted_match,
+    )
+
+    result = dashboard._dashboard_position_history_official_rows_as_groups(
+        [row],
+        [],
+        mode="paper",
+        order_rows=[*relevant_orders, *unrelated_orders],
+        closed_rows=[relevant_position, *unrelated_positions],
+    )
+
+    assert len(result) == 1
+    assert result[0]["position_ids"] == [1]
+    assert {fill["order_id"] for fill in result[0]["linked_fills"]} == {
+        "btc-entry",
+        "btc-close",
+    }
+    assert match_calls == len(relevant_orders)
 
 
 @pytest.mark.asyncio

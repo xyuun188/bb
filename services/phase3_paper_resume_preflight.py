@@ -130,6 +130,12 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+async def _invoke_report_provider(provider: ReportProvider) -> Any:
+    """Call unknown sync/async providers without blocking the dashboard loop."""
+
+    return await _maybe_await(await asyncio.to_thread(provider))
+
+
 def evaluate_phase3_paper_resume_preflight_inputs(
     *,
     okx_authoritative_sync: dict[str, Any],
@@ -590,7 +596,7 @@ class Phase3PaperResumePreflightService:
         default_provider: ReportProvider,
     ) -> dict[str, Any]:
         try:
-            result = await _maybe_await((provider or default_provider)())
+            result = await _invoke_report_provider(provider or default_provider)
             if isinstance(result, dict):
                 return result
             return {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -518,10 +519,13 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
     return samples
 
 
-async def _load_trade_samples() -> list[dict[str, Any]]:
+async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
     """Load the only trainable realized-trade source."""
 
-    samples = await load_authoritative_trade_outcomes(since=load_training_epoch_start())
+    samples = await load_authoritative_trade_outcomes(
+        since=load_training_epoch_start(),
+        compact=compact,
+    )
     for sample in samples:
         features = _compact_local_ai_tools_features(_snapshot(sample.get("features")))
         if features:
@@ -552,7 +556,12 @@ async def _completed_trade_sample_count() -> int:
     computed from the same clean view that is sent to the model server.
     """
 
-    trade_samples = await _load_trade_samples()
+    loader = _load_trade_samples
+    trade_samples = (
+        await loader(compact=True)
+        if "compact" in inspect.signature(loader).parameters
+        else await loader()
+    )
     payload = annotate_training_payload(
         shadow_samples=[],
         trade_samples=trade_samples,

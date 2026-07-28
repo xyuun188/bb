@@ -469,6 +469,10 @@ async def _execution_account_status(mode: str) -> dict:
         pause_reason = (
             f"未同步到 {okx_snapshot.get('balance_source')} 的实际余额，暂停分析新的交易对。"
         )
+    blocking_balance_error = (
+        okx_snapshot.get("balance_error") if not okx_balance_available else None
+    )
+    balance_warning = okx_snapshot.get("balance_error") if okx_balance_available else None
     status = dict(cfg)
     status.update(
         {
@@ -505,7 +509,8 @@ async def _execution_account_status(mode: str) -> dict:
             "local_trade_today_pnl": pnl_summary.get("today_total_pnl", 0.0),
             "account_pnl_source": "okx_authoritative" if okx_balance_available else "okx_unavailable",
             "remaining_allocation": okx_available,
-            "balance_error": okx_snapshot.get("balance_error"),
+            "balance_error": blocking_balance_error,
+            "balance_warning": balance_warning,
             "balance_status": okx_snapshot.get("balance_status"),
             "refresh_in_progress": bool(okx_snapshot.get("refresh_in_progress")),
             "balance_source": okx_snapshot.get("balance_source"),

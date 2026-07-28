@@ -25,6 +25,7 @@ from models.learning import TradeReflection  # noqa: E402
 from models.trade import OkxPositionHistory, Order  # noqa: E402
 from services.order_position_reconciliation import (  # noqa: E402
     apply_missing_closed_position_plan,
+    classify_missing_closed_position_plan,
     plan_missing_closed_position,
 )
 
@@ -117,7 +118,7 @@ async def collect_missing_closed_position_scan(
             plan = await plan_missing_closed_position(session, order)
             if plan is not None and _matches_filters(plan, active_filters):
                 plans.append(plan)
-    classifications = [_classify_plan(plan) for plan in plans]
+    classifications = [classify_missing_closed_position_plan(plan) for plan in plans]
     classification_counts = _classification_counts(
         classifications,
         skipped_candidate_count=max(
@@ -157,7 +158,9 @@ async def _official_history_close_order_index(
             await session.execute(
                 select(OkxPositionHistory).where(OkxPositionHistory.mode.in_(sorted(modes)))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     return {
         (str(row.mode or "").strip().lower(), str(order_id or "").strip())
@@ -226,7 +229,7 @@ async def apply_plans(
             plan = await plan_missing_closed_position(session, close_order)
             if plan is None or not _matches_filters(plan, active_filters):
                 continue
-            if _classify_plan(plan)["status"] != "repairable":
+            if classify_missing_closed_position_plan(plan)["status"] != "repairable":
                 continue
             position = await apply_missing_closed_position_plan(session, plan)
             session.add(
@@ -249,7 +252,9 @@ async def apply_plans(
                     outcome=(
                         "profit"
                         if plan.realized_pnl > 0
-                        else "loss" if plan.realized_pnl < 0 else "flat"
+                        else "loss"
+                        if plan.realized_pnl < 0
+                        else "flat"
                     ),
                     mistake_summary=(
                         "OKX 成交订单已存在，本地持仓历史曾缺失；已自动补齐用于对账与审计，"
@@ -296,37 +301,6 @@ def _matches_filters(plan: Any, filters: ReconciliationFilters) -> bool:
     if filters.max_realized_pnl is not None and plan.realized_pnl > filters.max_realized_pnl:
         return False
     return True
-
-
-def _classify_plan(plan: Any) -> dict[str, Any]:
-    reasons: list[str] = []
-    if not str(getattr(plan, "entry_exchange_order_id", "") or "").strip():
-        reasons.append("missing_entry_exchange_order_id")
-    if not str(getattr(plan, "close_exchange_order_id", "") or "").strip():
-        reasons.append("missing_close_exchange_order_id")
-    if float(getattr(plan, "quantity", 0.0) or 0.0) <= 0:
-        reasons.append("non_positive_quantity")
-    if float(getattr(plan, "entry_price", 0.0) or 0.0) <= 0:
-        reasons.append("non_positive_entry_price")
-    if float(getattr(plan, "exit_price", 0.0) or 0.0) <= 0:
-        reasons.append("non_positive_exit_price")
-    created_at = getattr(plan, "created_at", None)
-    closed_at = getattr(plan, "closed_at", None)
-    if created_at is not None and closed_at is not None and created_at > closed_at:
-        reasons.append("entry_after_close")
-    status = "manual_review" if reasons else "repairable"
-    return {
-        "status": status,
-        "reason": ";".join(reasons) if reasons else "deterministic_order_pair",
-        "symbol": getattr(plan, "symbol", ""),
-        "side": getattr(plan, "side", ""),
-        "quantity": float(getattr(plan, "quantity", 0.0) or 0.0),
-        "realized_pnl": round(float(getattr(plan, "realized_pnl", 0.0) or 0.0), 8),
-        "entry_order_id": int(getattr(plan, "entry_order_id", 0) or 0),
-        "close_order_id": int(getattr(plan, "close_order_id", 0) or 0),
-        "entry_exchange_order_id": getattr(plan, "entry_exchange_order_id", None),
-        "close_exchange_order_id": getattr(plan, "close_exchange_order_id", None),
-    }
 
 
 def _classification_counts(

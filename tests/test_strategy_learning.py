@@ -445,17 +445,20 @@ def test_strategy_feedback_shadow_query_omits_unused_large_payload_columns() -> 
         node
         for node in ast.walk(feedback_method)
         if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "shadows" for target in node.targets)
+        and any(
+            isinstance(target, ast.Name) and target.id == "shadow_rows"
+            for target in node.targets
+        )
     )
     query_source = ast.unparse(shadow_assignment.value)
 
-    assert ".options(load_only(" in query_source
-    assert "ShadowBacktest.feature_snapshot" in query_source
+    assert "select(" in query_source
+    assert "ShadowBacktest.training_feature_snapshot" in query_source
     assert "ShadowBacktest.long_return_pct" in query_source
     assert "ShadowBacktest.short_return_pct" in query_source
     for unused_column in (
         "ShadowBacktest.raw_llm_response",
-        "ShadowBacktest.training_feature_snapshot",
+        "ShadowBacktest.feature_snapshot",
         "ShadowBacktest.note",
     ):
         assert unused_column not in query_source
