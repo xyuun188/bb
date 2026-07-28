@@ -520,6 +520,48 @@ def test_data_collection_marks_scrapling_invalid_without_valid_sources(
 
 
 @pytest.mark.asyncio
+async def test_data_collection_settings_get_is_lightweight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", True)
+    monkeypatch.setattr(settings, "external_event_scraper_interval_seconds", 600)
+    monkeypatch.setattr(settings, "external_event_scraper_timeout_seconds", 5.0)
+    monkeypatch.setattr(settings, "external_event_scraper_max_sources", 8)
+    monkeypatch.setattr(settings, "external_event_scraper_max_items_per_source", 4)
+    monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+    monkeypatch.setattr(
+        settings.__class__,
+        "refresh_runtime_env",
+        lambda self, force=False: None,
+    )
+    monkeypatch.setattr(data_collection_module, "_scrapling_installed", lambda: True)
+
+    async def fail_heavy_status_section() -> dict[str, Any]:
+        raise AssertionError("lightweight settings endpoint called a heavy status section")
+
+    monkeypatch.setattr(data_collection_module, "_source_breakdown", fail_heavy_status_section)
+    monkeypatch.setattr(
+        data_collection_module,
+        "_training_sample_quality",
+        fail_heavy_status_section,
+    )
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/data-collection/settings")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["config"]["external_event_scraper_interval_seconds"] == 600
+    assert body["config"]["external_event_scraper_timeout_seconds"] == 5.0
+    assert body["config"]["external_event_scraper_max_sources"] == 8
+    assert body["config"]["external_event_scraper_max_items_per_source"] == 4
+
+
+@pytest.mark.asyncio
 async def test_data_collection_settings_rejects_private_scrapling_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

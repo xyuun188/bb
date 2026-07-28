@@ -64,6 +64,7 @@ const state = {
     localAIToolsStatus: null,
     modelTrainingRegistry: null,
     dataCollectionStatus: null,
+    dataCollectionSettingsLoaded: false,
     dataCollectionSettingsDirty: false,
     dataCollectionSettingsSaving: false,
     serverMonitorStatus: null,
@@ -1681,7 +1682,7 @@ function activateSettingsTab(name = 'okx') {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
     if (selected === 'trading') fetchTradingParams();
-    if (selected === 'external-events') fetchDataCollectionStatus({ silent: true });
+    if (selected === 'external-events') fetchDataCollectionSettings({ silent: true });
     if (selected === 'vector-memory') refreshVectorMemoryStatus({ silent: true });
 }
 
@@ -1723,7 +1724,7 @@ function loadPageData(page) {
         fetchExecutionAccountSettings();
         fetchAIModels();
         fetchTradingParams();
-        fetchDataCollectionStatus({ silent: true });
+        fetchDataCollectionSettings({ silent: true });
     }
 }
 
@@ -4905,6 +4906,42 @@ function changeMLSignalPage(page) {
 
 // ========== Data Collection Dashboard ==========
 
+async function fetchDataCollectionSettings(options = {}) {
+    const runtimeNote = document.getElementById('data-external-runtime-note');
+    const saveStatus = document.getElementById('data-collection-save-status');
+    if (!state.dataCollectionSettingsLoaded && runtimeNote && !options.silent) {
+        runtimeNote.textContent = '正在读取线上配置...';
+    }
+    let data = null;
+    try {
+        data = await fetchJSON('/api/data-collection/settings');
+    } catch (err) {
+        if (saveStatus) {
+            saveStatus.style.color = 'var(--red)';
+            saveStatus.textContent = err?.message || '外部事件采集配置读取失败。';
+        }
+        return;
+    }
+    if (!data?.config) {
+        if (saveStatus) {
+            saveStatus.style.color = 'var(--red)';
+            saveStatus.textContent = '外部事件采集配置未返回，已保持当前表单。';
+        }
+        return;
+    }
+    state.dataCollectionStatus = {
+        ...(state.dataCollectionStatus || {}),
+        checked_at: data.checked_at,
+        config: data.config,
+    };
+    const wasLoaded = state.dataCollectionSettingsLoaded;
+    fillDataCollectionSettings(data.config);
+    if (!wasLoaded && state.dataCollectionSettingsLoaded && saveStatus) {
+        saveStatus.style.color = 'var(--text-muted)';
+        saveStatus.textContent = '线上配置已加载。';
+    }
+}
+
 async function fetchDataCollectionStatus(options = {}) {
     const updated = document.getElementById('data-collection-updated');
     if (updated && !options.silent) updated.textContent = '读取中...';
@@ -5018,7 +5055,7 @@ function renderPhase3PromotionGate(promotion, localTools = {}) {
 }
 
 function markDataCollectionSettingsDirty(message = '外部事件采集设置有未保存修改，请点击“保存设置”。') {
-    if (state.dataCollectionSettingsSaving) return;
+    if (!state.dataCollectionSettingsLoaded || state.dataCollectionSettingsSaving) return;
     state.dataCollectionSettingsDirty = true;
     const status = document.getElementById('data-collection-save-status');
     if (status && message) {
@@ -5032,7 +5069,9 @@ function clearDataCollectionSettingsDirty() {
 }
 
 function fillDataCollectionSettings(config, options = {}) {
-    if (state.dataCollectionSettingsDirty && !options.force) {
+    if (!config || typeof config !== 'object' || !Object.keys(config).length) return;
+    const firstHydration = !state.dataCollectionSettingsLoaded;
+    if (!firstHydration && state.dataCollectionSettingsDirty && !options.force) {
         const note = document.getElementById('data-external-runtime-note');
         if (note) {
             const dependency = config.external_event_scraper_dependency_installed ? '依赖已安装' : '依赖未安装';
@@ -5064,6 +5103,8 @@ function fillDataCollectionSettings(config, options = {}) {
         const sourceMode = config.external_event_scraper_uses_default_sources ? '使用默认源' : '使用自定义源';
         note.textContent = `${dependency} · ${runtime} · ${sourceMode}`;
     }
+    state.dataCollectionSettingsLoaded = true;
+    if (firstHydration || options.force) clearDataCollectionSettingsDirty();
 }
 
 function renderDataCollectionDashboard(options = {}) {
@@ -5520,6 +5561,13 @@ async function applyRecommendedDataCollectionSources() {
 
 async function saveDataCollectionSettings(options = {}) {
     const status = document.getElementById('data-collection-save-status');
+    if (!state.dataCollectionSettingsLoaded) {
+        if (status) {
+            status.style.color = 'var(--red)';
+            status.textContent = '线上配置尚未加载完成，已阻止保存空表单，请稍后重试。';
+        }
+        return;
+    }
     state.dataCollectionSettingsSaving = true;
     if (status) {
         status.style.color = 'var(--text-muted)';
@@ -5538,9 +5586,13 @@ async function saveDataCollectionSettings(options = {}) {
             newsapi_api_key: document.getElementById('data-newsapi-api-key')?.value?.trim() || null,
         };
         const data = await postJSON('/api/data-collection/settings', body);
-        state.dataCollectionStatus = data || null;
+        state.dataCollectionStatus = {
+            ...(state.dataCollectionStatus || {}),
+            checked_at: data?.checked_at,
+            config: data?.config || {},
+        };
         clearDataCollectionSettingsDirty();
-        renderDataCollectionDashboard({ forceSettings: true });
+        fillDataCollectionSettings(data?.config || {}, { force: true });
         if (isPageActive('data-collection')) fetchDataCollectionStatus({ silent: true });
         if (status) {
             status.style.color = 'var(--green)';

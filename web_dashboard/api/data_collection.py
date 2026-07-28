@@ -966,6 +966,68 @@ def _recommended_source_cards() -> list[dict[str, Any]]:
     return cards
 
 
+def _data_collection_settings_payload() -> dict[str, Any]:
+    scrapling_installed = _scrapling_installed()
+    configured_source_cards = _configured_source_cards()
+    valid_scrapling_sources = [
+        source
+        for source in configured_source_cards
+        if source.get("valid") and source.get("enabled")
+    ]
+    invalid_scrapling_sources = [
+        source for source in configured_source_cards if not source.get("valid")
+    ]
+    return {
+        "status": "ok",
+        "checked_at": datetime.now(UTC).isoformat(),
+        "config": {
+            "external_event_scraper_enabled": bool(settings.external_event_scraper_enabled),
+            "external_event_scraper_dependency_installed": scrapling_installed,
+            "external_event_scraper_runtime_active": bool(
+                settings.external_event_scraper_enabled
+                and scrapling_installed
+                and valid_scrapling_sources
+            ),
+            "external_event_scraper_valid_source_count": len(valid_scrapling_sources),
+            "external_event_scraper_invalid_source_count": len(invalid_scrapling_sources),
+            "external_event_scraper_interval_seconds": int(
+                settings.external_event_scraper_interval_seconds
+            ),
+            "external_event_scraper_timeout_seconds": float(
+                settings.external_event_scraper_timeout_seconds
+            ),
+            "external_event_scraper_max_sources": int(
+                settings.external_event_scraper_max_sources
+            ),
+            "external_event_scraper_max_items_per_source": int(
+                settings.external_event_scraper_max_items_per_source
+            ),
+            "external_event_scraper_sources": configured_source_cards,
+            "recommended_external_event_sources": _recommended_source_cards(),
+            "external_event_scraper_uses_default_sources": not bool(
+                settings.external_event_scraper_sources
+            ),
+            "api_channels": {
+                "cryptopanic": {
+                    "label": "CryptoPanic",
+                    "configured": bool(settings.cryptopanic_api_key),
+                    "api_key": mask_secret(settings.cryptopanic_api_key),
+                },
+                "coinmarketcal": {
+                    "label": "CoinMarketCal",
+                    "configured": bool(settings.coinmarketcal_api_key),
+                    "api_key": mask_secret(settings.coinmarketcal_api_key),
+                },
+                "newsapi": {
+                    "label": "NewsAPI",
+                    "configured": bool(settings.newsapi_api_key),
+                    "api_key": mask_secret(settings.newsapi_api_key),
+                },
+            },
+        },
+    }
+
+
 def _collection_sources_summary() -> list[dict[str, Any]]:
     scrapling_installed = _scrapling_installed()
     scrapling_sources = _configured_source_cards()
@@ -1051,6 +1113,13 @@ def _collection_sources_summary() -> list[dict[str, Any]]:
     ]
 
 
+@router.get("/data-collection/settings")
+async def get_data_collection_settings() -> dict[str, Any]:
+    """Return editable collection settings without running status/training audits."""
+    settings.refresh_runtime_env(force=True)
+    return sanitize_payload(_data_collection_settings_payload())
+
+
 @router.get("/data-collection/status")
 async def get_data_collection_status(
     include_feature_coverage: bool = True,
@@ -1092,61 +1161,10 @@ async def get_data_collection_status(
         fallback={"cleanup_effective": False},
     )
     feature_coverage = _safe_feature_coverage_status(feature_coverage_result)
-    scrapling_installed = _scrapling_installed()
-    configured_source_cards = _configured_source_cards()
-    valid_scrapling_sources = [
-        source
-        for source in configured_source_cards
-        if source.get("valid") and source.get("enabled")
-    ]
-    invalid_scrapling_sources = [
-        source for source in configured_source_cards if not source.get("valid")
-    ]
+    settings_payload = _data_collection_settings_payload()
     payload = {
         "checked_at": datetime.now(UTC).isoformat(),
-        "config": {
-            "external_event_scraper_enabled": bool(settings.external_event_scraper_enabled),
-            "external_event_scraper_dependency_installed": scrapling_installed,
-            "external_event_scraper_runtime_active": bool(
-                settings.external_event_scraper_enabled
-                and scrapling_installed
-                and valid_scrapling_sources
-            ),
-            "external_event_scraper_valid_source_count": len(valid_scrapling_sources),
-            "external_event_scraper_invalid_source_count": len(invalid_scrapling_sources),
-            "external_event_scraper_interval_seconds": int(
-                settings.external_event_scraper_interval_seconds
-            ),
-            "external_event_scraper_timeout_seconds": float(
-                settings.external_event_scraper_timeout_seconds
-            ),
-            "external_event_scraper_max_sources": int(settings.external_event_scraper_max_sources),
-            "external_event_scraper_max_items_per_source": int(
-                settings.external_event_scraper_max_items_per_source
-            ),
-            "external_event_scraper_sources": configured_source_cards,
-            "recommended_external_event_sources": _recommended_source_cards(),
-            "external_event_scraper_uses_default_sources": not bool(
-                settings.external_event_scraper_sources
-            ),
-            "api_channels": {
-                "cryptopanic": {
-                    "label": "CryptoPanic",
-                    "configured": bool(settings.cryptopanic_api_key),
-                    "api_key": mask_secret(settings.cryptopanic_api_key),
-                },
-                "coinmarketcal": {
-                    "label": "CoinMarketCal",
-                    "configured": bool(settings.coinmarketcal_api_key),
-                    "api_key": mask_secret(settings.coinmarketcal_api_key),
-                },
-                "newsapi": {
-                    "label": "NewsAPI",
-                    "configured": bool(settings.newsapi_api_key),
-                    "api_key": mask_secret(settings.newsapi_api_key),
-                },
-            },
-        },
+        "config": settings_payload["config"],
         "sources": _collection_sources_summary(),
         "stats": source_stats,
         "feature_coverage": feature_coverage,
@@ -1339,8 +1357,7 @@ async def update_data_collection_settings(req: DataCollectionSettingsRequest) ->
         settings.update_env_file(strip_secret_env_updates(updates))
 
     runtime = await _sync_runtime_external_event_service(settings.external_event_scraper_enabled)
-    payload = await get_data_collection_status()
-    payload["status"] = "ok"
+    payload = _data_collection_settings_payload()
     payload["message"] = "数据采集配置已保存。"
     payload["runtime_sync"] = runtime
     return sanitize_payload(payload)

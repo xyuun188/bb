@@ -86,7 +86,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
+    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -529,7 +529,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
+    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -669,7 +669,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
+    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -766,6 +766,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert 'id="data-cryptopanic-api-key"' in external_settings_html
     assert 'id="data-coinmarketcal-api-key"' in external_settings_html
     assert 'id="data-newsapi-api-key"' in external_settings_html
+    assert external_settings_html.count('autocomplete="new-password"') == 3
     assert "\u5411\u91cf\u8bb0\u5fc6\u8bbe\u7f6e" in vector_settings_html
     assert 'id="vector-memory-enabled"' in vector_settings_html
     assert 'id="vector-memory-status-panel"' in vector_settings_html
@@ -774,6 +775,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
     assert "if (isPageActive('data-collection'))" in script
     assert "fetchDataCollectionStatus({ silent: true });" in script
+    assert "fetchDataCollectionSettings({ silent: true });" in script
     assert "selected === 'external-events'" in script
     assert "selected === 'vector-memory'" in script
     assert "selected === 'models') fetchDataCollectionStatus" not in script
@@ -781,12 +783,16 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "recommended_external_event_sources" in script
     assert "initDataCollectionSettingsForm()" in script
     assert "dataCollectionSettingsDirty" in script
+    assert "dataCollectionSettingsLoaded: false" in script
+    assert "if (!state.dataCollectionSettingsLoaded || state.dataCollectionSettingsSaving) return;" in script
+    assert "const firstHydration = !state.dataCollectionSettingsLoaded;" in script
+    assert "state.dataCollectionSettingsLoaded = true;" in script
+    assert "已阻止保存空表单" in script
     assert "markDataCollectionSettingsDirty" in script
     assert "options.forceSettings === true" in script
     assert "正在保存到后端配置" in script
     assert "await saveDataCollectionSettings({" in script
     assert "options.successMessage" in script
-    assert "renderDataCollectionDashboard({ forceSettings: true })" in script
     assert "renderDataCollectionSourceManager" in script
     assert "addDataCollectionSource" in script
     assert "removeDataCollectionSource" in script
@@ -795,6 +801,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "cryptopanic_api_key" in script
     assert "groupDataCollectionSources" in script
     assert "fetchJSON('/api/data-collection/status')" in script
+    assert "fetchJSON('/api/data-collection/settings')" in script
     assert 'id="data-collection-feature-coverage"' in html
     assert "renderDataCollectionFeatureCoverage" in script
     assert "feature_coverage" in script
@@ -803,6 +810,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-feature-coverage-grid" in style
     assert ".data-feature-row" in style
     assert "postJSON('/api/data-collection/settings', body)" in script
+    assert "renderDataCollectionDashboard({ forceSettings: true })" not in script
     assert "fetchJSON('/api/vector-memory/status')" in script
     assert "postJSON('/api/vector-memory/clear', {})" in script
     assert "postJSON('/api/vector-memory/reindex', {})" in script
@@ -826,7 +834,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260727-paper-live-training-contract" in html
+    assert "dashboard.js?v=20260728-data-collection-settings-hydration" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1054,7 +1062,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260727-paper-live-training-contract" in html
+    assert "/static/js/dashboard.js?v=20260728-data-collection-settings-hydration" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:
