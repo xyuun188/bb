@@ -173,6 +173,7 @@ def test_paper_resume_observation_warns_for_quarantined_historical_okx_differenc
     )
 
     assert report["status"] == "warming_up"
+    assert report["can_use_for_promotion"] is True
     assert report["blockers"] == []
     assert report["summary"]["okx_blocking_issue_count"] == 0
     assert report["summary"]["okx_quarantined_issue_count"] == 1
@@ -203,9 +204,30 @@ def test_paper_resume_observation_warns_on_read_only_okx_pull_timeout_when_runti
     )
 
     assert report["status"] == "warming_up"
+    assert report["can_use_for_promotion"] is True
     assert report["blockers"] == []
     assert report["summary"]["runtime_okx_sync_clean"] is True
     assert "okx_runtime_authoritative_sync_clean_after_resume" in report["passed_checks"]
+    assert "okx_authoritative_audit_pull_degraded_runtime_clean" in {
+        item["code"] for item in report["warnings"]
+    }
+
+
+def test_paper_resume_observation_uses_clean_runtime_when_read_only_audit_is_unavailable() -> None:
+    report = evaluate_phase3_paper_resume_observation_inputs(
+        **_ready_inputs(
+            okx_authoritative_sync={
+                "status": "unavailable",
+                "error": "temporary read-only audit failure",
+            },
+            trading_runtime_status=_trading_runtime_clean(),
+        )
+    )
+
+    assert report["status"] == "warming_up"
+    assert report["can_use_for_promotion"] is True
+    assert report["blockers"] == []
+    assert report["summary"]["okx_blocking_issue_count"] == 0
     assert "okx_authoritative_audit_pull_degraded_runtime_clean" in {
         item["code"] for item in report["warnings"]
     }

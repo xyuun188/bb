@@ -26,12 +26,20 @@ from db.session import get_read_session_ctx, get_session_ctx
 from models.learning import ShadowBacktest
 from models.market_data import Kline
 from models.news import NewsArticle, SocialPost
+from scripts.run_phase3_paper_resume_observation import (
+    DEFAULT_REPORT_DIR as PAPER_OBSERVATION_REPORT_DIR,
+)
+from scripts.run_phase3_paper_resume_observation import (
+    collect_phase3_paper_resume_observation,
+)
+from scripts.run_phase3_paper_resume_observation import (
+    write_report as write_paper_observation_report,
+)
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
 from services.execution_cost_model import round_trip_fee_pct
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
-    load_latest_paper_observation_report,
 )
 from services.okx_training_gate import okx_training_refresh_gate
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
@@ -151,6 +159,45 @@ _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "activation_blocker",
     "promotion_flow",
 }
+
+
+async def _refresh_paper_observation_report_for_training() -> dict[str, Any]:
+    """Collect promotion evidence at training time and persist the exact snapshot used."""
+
+    try:
+        report = await collect_phase3_paper_resume_observation()
+        report["training_refresh"] = {
+            "refreshed_inline": True,
+            "reason": "training_promotion_evaluation",
+            "refreshed_at": datetime.now(UTC).isoformat(),
+        }
+        write_paper_observation_report(
+            report,
+            settings.data_dir / PAPER_OBSERVATION_REPORT_DIR,
+            indent=None,
+        )
+        report.setdefault("available", True)
+        return report
+    except Exception as exc:
+        return {
+            "available": False,
+            "status": "refresh_failed",
+            "can_use_for_promotion": False,
+            "read_only": True,
+            "audit_only": True,
+            "mutates_database": False,
+            "starts_trading_service": False,
+            "submits_orders": False,
+            "changes_model_routing": False,
+            "error": safe_error_text(exc, limit=180),
+            "training_refresh": {
+                "refreshed_inline": False,
+                "reason": "training_promotion_evaluation",
+                "failed_at": datetime.now(UTC).isoformat(),
+            },
+        }
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -796,7 +843,7 @@ async def _main() -> None:
         )
     completed_shadow_count = await _completed_shadow_sample_count()
     completed_trade_count = await _completed_trade_sample_count()
-    paper_observation_report = load_latest_paper_observation_report()
+    paper_observation_report = await _refresh_paper_observation_report_for_training()
     return_objective_report = build_return_objective_report(
         trade_samples=training_payload["trade_samples"],
         shadow_samples=training_payload["shadow_samples"],

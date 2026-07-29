@@ -451,6 +451,63 @@ async def test_local_ai_tools_training_post_preserves_governance_report() -> Non
 
 
 @pytest.mark.asyncio
+async def test_training_refreshes_and_persists_paper_observation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    checked_at = "2026-07-29T10:30:00+00:00"
+
+    async def collect_report() -> dict[str, object]:
+        return {
+            "status": "healthy",
+            "checked_at": checked_at,
+            "can_use_for_promotion": True,
+            "read_only": True,
+        }
+
+    report_dir = tmp_path / "phase3_paper_resume_observation_reports"
+    monkeypatch.setattr(train_script, "PAPER_OBSERVATION_REPORT_DIR", report_dir)
+    monkeypatch.setattr(
+        train_script,
+        "collect_phase3_paper_resume_observation",
+        collect_report,
+    )
+
+    report = await train_script._refresh_paper_observation_report_for_training()
+
+    latest_path = report_dir / "latest.json"
+    persisted = json.loads(latest_path.read_text(encoding="utf-8"))
+    assert report["status"] == "healthy"
+    assert report["available"] is True
+    assert report["training_refresh"]["refreshed_inline"] is True
+    assert persisted["checked_at"] == checked_at
+    assert persisted["training_refresh"]["reason"] == "training_promotion_evaluation"
+    assert list(latest_path.parent.glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_training_paper_observation_refresh_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_collection() -> dict[str, object]:
+        raise RuntimeError("fresh observation unavailable")
+
+    monkeypatch.setattr(
+        train_script,
+        "collect_phase3_paper_resume_observation",
+        fail_collection,
+    )
+
+    report = await train_script._refresh_paper_observation_report_for_training()
+
+    assert report["status"] == "refresh_failed"
+    assert report["can_use_for_promotion"] is False
+    assert report["training_refresh"]["refreshed_inline"] is False
+    assert report["starts_trading_service"] is False
+    assert report["submits_orders"] is False
+
+
+@pytest.mark.asyncio
 async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -481,6 +538,13 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
 
     async def completed_trade_count() -> int:
         return 0
+
+    async def fresh_paper_observation() -> dict[str, object]:
+        return {
+            "status": "healthy",
+            "can_use_for_promotion": True,
+            "training_refresh": {"refreshed_inline": True},
+        }
 
     async def post_training_payload(
         base_url: str,
@@ -513,6 +577,11 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     monkeypatch.setattr(train_script, "_completed_trade_sample_count", completed_trade_count)
     monkeypatch.setattr(
         train_script,
+        "_refresh_paper_observation_report_for_training",
+        fresh_paper_observation,
+    )
+    monkeypatch.setattr(
+        train_script,
         "okx_training_refresh_gate",
         lambda: {
             "allowed": True,
@@ -533,6 +602,9 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     assert payload["persist_artifact"] is False
     assert payload["confirm_phase3_rebuild"] is False
     assert payload["okx_daily_reconciliation_gate"]["allowed"] is True
+    assert payload["paper_observation_report"]["training_refresh"] == {
+        "refreshed_inline": True
+    }
     assert payload["training_quarantine"] == {
         "skipped": True,
         "reason": "phase3_preflight_no_quarantine_writes",

@@ -317,6 +317,11 @@ class OkxAuthoritativeSyncService:
                 for item in observations
                 if item.kind == "okx_fill_pending_local_order_sync"
             ),
+            "pending_position_close_sync_count": sum(
+                1
+                for item in observations
+                if item.kind == "local_position_pending_okx_close_sync"
+            ),
             "classification_counts": dict(classification_counts),
             "severity_counts": dict(severity_counts),
             "repairable_count": int(classification_counts.get("repairable", 0)),
@@ -877,6 +882,22 @@ class OkxAuthoritativeSyncService:
         }
         linked_position_order_ids = _linked_position_order_ids(local_positions)
         observed_at = observed_at or datetime.now(UTC)
+        pending_close_fills_by_position_key: dict[
+            tuple[str, str], OkxFillGroup
+        ] = {}
+        for fill in exchange_fills:
+            if not _is_pending_local_order_sync(fill, observed_at=observed_at):
+                continue
+            if fill.side == "buy":
+                closed_side = "short"
+            elif fill.side == "sell":
+                closed_side = "long"
+            else:
+                continue
+            pending_close_fills_by_position_key.setdefault(
+                (fill.symbol, closed_side),
+                fill,
+            )
 
         open_position_keys: set[tuple[str, str]] = set()
         for position in local_positions:
@@ -918,6 +939,35 @@ class OkxAuthoritativeSyncService:
                 continue
             key = _local_position_key(position)
             if key not in exchange_position_keys:
+                pending_close_fill = pending_close_fills_by_position_key.get(key)
+                if pending_close_fill is not None:
+                    issues.append(
+                        OkxAuthoritativeIssue(
+                            kind="local_position_pending_okx_close_sync",
+                            classification="observation",
+                            severity="info",
+                            reason=(
+                                "OKX no longer reports the local position, but a matching "
+                                "close fill is still inside the local synchronization window."
+                            ),
+                            symbol=key[0],
+                            side=key[1],
+                            local_position_id=(
+                                int(getattr(position, "id", 0) or 0) or None
+                            ),
+                            local_quantity=_safe_float(
+                                getattr(position, "quantity", None)
+                            ),
+                            local_price=_safe_float(
+                                getattr(position, "current_price", None)
+                            ),
+                            exchange_order_id=pending_close_fill.order_id,
+                            okx_contracts=pending_close_fill.contracts,
+                            okx_price=pending_close_fill.avg_price,
+                            okx_timestamp=pending_close_fill.timestamp,
+                        )
+                    )
+                    continue
                 issues.append(
                     OkxAuthoritativeIssue(
                         kind="local_open_position_missing_on_okx",
@@ -1035,6 +1085,26 @@ class OkxAuthoritativeSyncService:
         for fill in exchange_fills:
             if fill.order_id in local_exchange_order_ids:
                 continue
+            if _is_pending_local_order_sync(fill, observed_at=observed_at):
+                issues.append(
+                    OkxAuthoritativeIssue(
+                        kind="okx_fill_pending_local_order_sync",
+                        classification="observation",
+                        severity="info",
+                        reason=(
+                            "OKX fill is within the local order-fact synchronization window. "
+                            "It is observed while the background sync persists the local order; "
+                            "it becomes an integrity issue only after that window expires."
+                        ),
+                        symbol=fill.symbol,
+                        side=fill.side,
+                        exchange_order_id=fill.order_id,
+                        okx_contracts=fill.contracts,
+                        okx_price=fill.avg_price,
+                        okx_timestamp=fill.timestamp,
+                    )
+                )
+                continue
             linked_protection = _linked_protection_fill_context(
                 fill,
                 order_contexts=exchange_order_contexts,
@@ -1075,26 +1145,6 @@ class OkxAuthoritativeSyncService:
                         protection_execution=linked_protection.get(
                             "protection_execution"
                         ),
-                    )
-                )
-                continue
-            if _is_pending_local_order_sync(fill, observed_at=observed_at):
-                issues.append(
-                    OkxAuthoritativeIssue(
-                        kind="okx_fill_pending_local_order_sync",
-                        classification="observation",
-                        severity="info",
-                        reason=(
-                            "OKX fill is within the local order-fact synchronization window. "
-                            "It is observed while the background sync persists the local order; "
-                            "it becomes an integrity issue only after that window expires."
-                        ),
-                        symbol=fill.symbol,
-                        side=fill.side,
-                        exchange_order_id=fill.order_id,
-                        okx_contracts=fill.contracts,
-                        okx_price=fill.avg_price,
-                        okx_timestamp=fill.timestamp,
                     )
                 )
                 continue

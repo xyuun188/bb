@@ -273,14 +273,19 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "unavailable",
     }
     runtime_okx_clean = _runtime_okx_sync_clean_for_entry(trading_runtime)
-    if okx_blocking_issues:
+    current_okx_blocking_issues = [
+        issue
+        for issue in okx_blocking_issues
+        if str(issue.get("kind") or "") != "integrity_evidence_missing"
+    ]
+    if current_okx_blocking_issues:
         blockers.append(
             _blocker(
                 "okx_authoritative_sync_has_post_resume_differences",
                 "OKX/local differences appeared during the post-resume observation window.",
                 evidence={
                     "issue_count": okx_sync.get("issue_count"),
-                    "blocking_issues": okx_blocking_issues[:8],
+                    "blocking_issues": current_okx_blocking_issues[:8],
                 },
             )
         )
@@ -315,6 +320,14 @@ def evaluate_phase3_paper_resume_observation_inputs(
                     "error": okx_sync.get("error"),
                     "runtime_okx_sync_clean": runtime_okx_clean,
                 },
+            )
+        )
+    elif okx_blocking_issues:
+        blockers.append(
+            _blocker(
+                "okx_authoritative_integrity_evidence_missing_after_resume",
+                "OKX audit evidence is incomplete and no degraded-runtime fallback applies.",
+                evidence={"blocking_issues": okx_blocking_issues[:8]},
             )
         )
     elif okx_quarantined_issues:
@@ -420,7 +433,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "submits_orders": False,
         "changes_model_routing": False,
         "paper_active": paper_active,
-        "can_use_for_promotion": status == "healthy",
+        "can_use_for_promotion": bool(paper_active and not blockers),
         "blockers": blockers,
         "warnings": warnings,
         "passed_checks": list(dict.fromkeys(passed)),
@@ -434,7 +447,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
             "specialist_eligible_shadow_count": specialist_eligible_count,
             "phase3_quant_child_endpoint_count": len(child_endpoints),
             "okx_issue_count": _safe_int(okx_sync.get("issue_count")),
-            "okx_blocking_issue_count": len(okx_blocking_issues),
+            "okx_blocking_issue_count": len(current_okx_blocking_issues),
             "okx_quarantined_issue_count": len(okx_quarantined_issues),
             "runtime_okx_sync_clean": runtime_okx_clean,
             "specialist_report_age_seconds": (

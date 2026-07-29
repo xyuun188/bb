@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,15 @@ def _report_output_dir(value: Path | None) -> Path:
     return settings.data_dir / DEFAULT_REPORT_DIR
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = str(report.get("checked_at") or _now_iso())
@@ -51,8 +62,8 @@ def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None
     artifacts = {"report_path": str(report_path), "latest_path": str(latest_path)}
     report["report_artifacts"] = artifacts
     text = json.dumps(report, ensure_ascii=False, indent=indent, sort_keys=True)
-    report_path.write_text(text + "\n", encoding="utf-8")
-    latest_path.write_text(text + "\n", encoding="utf-8")
+    _write_text_atomic(report_path, text + "\n")
+    _write_text_atomic(latest_path, text + "\n")
     return artifacts
 
 

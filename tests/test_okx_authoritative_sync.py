@@ -552,6 +552,21 @@ async def test_okx_authoritative_sync_observes_fresh_fill_until_local_order_sync
     )
     await init_db()
     try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="long",
+                    quantity=1.0,
+                    entry_price=100.0,
+                    current_price=99.0,
+                    is_open=True,
+                    created_at=datetime.now(UTC) - timedelta(minutes=5),
+                )
+            )
+
         report = await OkxAuthoritativeSyncService(
             mode="paper",
             lookback_hours=24,
@@ -561,9 +576,14 @@ async def test_okx_authoritative_sync_observes_fresh_fill_until_local_order_sync
         assert report["status"] == "ok"
         assert report["issue_count"] == 0
         assert report["pending_local_order_sync_count"] == 1
+        assert report["pending_position_close_sync_count"] == 1
         assert report["issues"] == []
-        assert report["observations"][0]["kind"] == "okx_fill_pending_local_order_sync"
-        assert report["observations"][0]["severity"] == "info"
+        observation_kinds = {item["kind"] for item in report["observations"]}
+        assert observation_kinds == {
+            "local_position_pending_okx_close_sync",
+            "okx_fill_pending_local_order_sync",
+        }
+        assert {item["severity"] for item in report["observations"]} == {"info"}
     finally:
         await close_db()
 
@@ -1005,6 +1025,12 @@ class _LinkedProtectionFillExecutor(_FakeExecutor):
         return self.ccxt
 
 
+class _AgedLinkedProtectionFillExecutor(_LinkedProtectionFillExecutor):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        super().__init__(*_args, **_kwargs)
+        self.ccxt.timestamp_ms -= 10 * 60 * 1000
+
+
 @pytest.mark.asyncio
 async def test_okx_authoritative_sync_ignores_okx_fills_outside_window(
     tmp_path,
@@ -1175,7 +1201,7 @@ async def test_okx_authoritative_sync_classifies_linked_protection_fill_missing_
         report = await OkxAuthoritativeSyncService(
             mode="paper",
             lookback_hours=24,
-            executor_factory=_LinkedProtectionFillExecutor,
+            executor_factory=_AgedLinkedProtectionFillExecutor,
         ).collect()
 
         kinds = {issue["kind"] for issue in report["issues"]}
