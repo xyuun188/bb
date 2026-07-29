@@ -2354,6 +2354,65 @@ async def test_local_ml_auto_train_requires_framed_machine_result(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_training_uses_framed_result_after_stdout_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b'{"event":"paper observation refreshed"}\n'
+                b"BB_LOCAL_AI_TOOLS_TRAIN_RESULT_JSON="
+                b'{"trained":true,"model_count":6}\n',
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_local_ai_tools_training_subprocess()
+
+    assert result == {"trained": True, "model_count": 6}
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_training_requires_framed_machine_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"trained":true,"model_count":6}', b""
+
+    async def fake_create_subprocess_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_local_ai_tools_training_subprocess()
+
+    assert result["trained"] is False
+    assert result["reason"] == "invalid_training_response"
+    assert result["error"] == "local AI tools training result frame missing"
+
+
+@pytest.mark.asyncio
 async def test_local_ai_cursor_probe_isolated_from_trading_database_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2464,8 +2523,10 @@ async def test_local_ml_immature_partition_is_info_and_uses_normal_interval(
 
 
 @pytest.mark.asyncio
-async def test_local_ai_cursor_failure_uses_retry_interval(
+@pytest.mark.parametrize("reason", ["error", "invalid_training_response"])
+async def test_local_ai_training_failure_uses_retry_interval(
     monkeypatch: pytest.MonkeyPatch,
+    reason: str,
 ) -> None:
     service = TradingService.__new__(TradingService)
     service._running = True
@@ -2476,7 +2537,7 @@ async def test_local_ai_cursor_failure_uses_retry_interval(
     service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
         {
             "trained": False,
-            "reason": "error",
+            "reason": reason,
             "error": "QueuePool connection timed out in isolated cursor probe",
             "training_process_isolated": True,
         }

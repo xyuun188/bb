@@ -591,7 +591,11 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     )
     monkeypatch.setattr(train_script, "quarantine_dirty_shadow_samples", fail_quarantine)
     monkeypatch.setattr(train_script, "_post_training_payload", post_training_payload)
-    monkeypatch.setattr(train_script, "safe_print", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        train_script,
+        "safe_print",
+        lambda value, **_kwargs: captured.update(stdout=str(value)),
+    )
 
     await train_script._main()
 
@@ -599,6 +603,11 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     assert isinstance(payload, dict)
     assert captured["base_url"] == "http://127.0.0.1:8001"
     assert captured["request_timeout"] == 180.0
+    stdout = str(captured["stdout"])
+    assert stdout.startswith(train_script.LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
+    assert json.loads(
+        stdout.removeprefix(train_script.LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
+    ) == {"trained": False, "reason": "phase3_preflight_no_artifact_write"}
     assert payload["persist_artifact"] is False
     assert payload["confirm_phase3_rebuild"] is False
     assert payload["okx_daily_reconciliation_gate"]["allowed"] is True

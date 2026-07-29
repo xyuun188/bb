@@ -37,6 +37,7 @@ from scripts.run_phase3_paper_resume_observation import (
 )
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
 from services.execution_cost_model import round_trip_fee_pct
+from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
@@ -886,14 +887,18 @@ async def _main() -> None:
         payload,
         request_timeout=args.timeout,
     )
-    safe_print(json.dumps(result, ensure_ascii=False, indent=2))
+    safe_print(
+        LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
+        + json.dumps(result, ensure_ascii=False, sort_keys=True)
+    )
 
 
 if __name__ == "__main__":
     training_lock = _try_acquire_training_lock()
     if training_lock is None:
         safe_print(
-            json.dumps(
+            LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
+            + json.dumps(
                 {
                     "trained": False,
                     "reason": "local_ai_tools_training_already_running",

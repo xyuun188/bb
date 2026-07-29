@@ -121,6 +121,7 @@ from services.high_risk_review_service import HighRiskReviewService
 from services.live_rules_canary_signal import apply_live_rules_canary_signal
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.local_ai_training_contract import (
+    LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
     decision_group_training_trigger,
     training_distribution_drift,
 )
@@ -8798,7 +8799,12 @@ class TradingService:
                 raise
             except Exception as e:
                 logger.warning("local AI tools auto-train loop error", error=safe_error_text(e))
-            failed_reasons = {"error", "load_samples_error", "timeout"}
+            failed_reasons = {
+                "error",
+                "invalid_training_response",
+                "load_samples_error",
+                "timeout",
+            }
             retry_due = any(
                 str(result.get("reason") or "") in failed_reasons
                 for result in (ml_result, local_tools_result)
@@ -9244,8 +9250,19 @@ class TradingService:
                 "error": safe_error_text(stderr.decode("utf-8", errors="replace"), limit=180),
             }
         try:
-            payload = json.loads(stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            stdout_text = stdout.decode("utf-8")
+            result_frame = next(
+                (
+                    line.removeprefix(LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
+                    for line in reversed(stdout_text.splitlines())
+                    if line.startswith(LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
+                ),
+                None,
+            )
+            if result_frame is None:
+                raise ValueError("local AI tools training result frame missing")
+            payload = json.loads(result_frame)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             return {
                 "trained": False,
                 "reason": "invalid_training_response",
