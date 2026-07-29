@@ -242,6 +242,7 @@ def audit_protection_order_integrity(
     contract_specs: dict[str, dict[str, Any]],
     *,
     pending_snapshot_complete: bool,
+    missing_protection_plans: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a non-mutating, quantity-exact repair plan from OKX-native facts."""
 
@@ -259,12 +260,62 @@ def audit_protection_order_integrity(
     invalid_orders: list[dict[str, Any]] = []
     repair_actions: list[dict[str, Any]] = []
     repair_blockers: list[str] = []
+    planned_missing_keys: list[list[str]] = []
+    missing_protection_plans = missing_protection_plans or {}
 
     for key, position in sorted(positions_by_key.items()):
         orders = orders_by_key.get(key, [])
         if not orders:
             missing.append(list(key))
-            repair_blockers.append(f"missing_protection:{key[0]}:{key[1]}")
+            plan = _safe_dict(missing_protection_plans.get(key))
+            stop_loss_price = _decimal(plan.get("stop_loss_price"))
+            take_profit_price = _decimal(plan.get("take_profit_price"))
+            desired = _decimal(position.get("contracts"))
+            spec = _safe_dict(contract_specs.get(position["inst_id"]))
+            exchange_step = _decimal(spec.get("lotSz"))
+            exchange_minimum = _decimal(spec.get("minSz"))
+            if not pending_snapshot_complete:
+                repair_blockers.append(
+                    f"missing_protection_pending_snapshot_incomplete:{key[0]}:{key[1]}"
+                )
+            elif key in pending_entry_keys:
+                repair_blockers.append(f"missing_protection_has_pending_entry:{key[0]}:{key[1]}")
+            elif not plan:
+                repair_blockers.append(f"missing_protection:{key[0]}:{key[1]}")
+            elif stop_loss_price <= 0 or take_profit_price <= 0:
+                repair_blockers.append(
+                    f"missing_protection_dynamic_prices_incomplete:{key[0]}:{key[1]}"
+                )
+            elif exchange_step <= 0:
+                repair_blockers.append(
+                    f"missing_protection_lot_size_missing:{key[0]}:{key[1]}"
+                )
+            elif exchange_minimum > 0 and desired < exchange_minimum:
+                repair_blockers.append(
+                    f"missing_protection_below_exchange_minimum:{key[0]}:{key[1]}"
+                )
+            else:
+                repair_actions.append(
+                    {
+                        "action": "create_delta",
+                        "reason": "restore_missing_dynamic_position_protection",
+                        "inst_id": position["inst_id"],
+                        "position_side": position["side"],
+                        "okx_position_side": str(
+                            plan.get("okx_position_side") or "net"
+                        ).lower(),
+                        "old_contracts": "0",
+                        "new_contracts": str(desired),
+                        "stop_loss_price": str(stop_loss_price),
+                        "take_profit_price": str(take_profit_price),
+                        "rollback": {
+                            "action": "cancel_created",
+                            "inst_id": position["inst_id"],
+                            "algo_id": None,
+                        },
+                    }
+                )
+                planned_missing_keys.append(list(key))
             continue
         if len(orders) > 1:
             split.append(list(key))
@@ -325,6 +376,7 @@ def audit_protection_order_integrity(
         "positions": position_rows,
         "protection_orders": order_rows,
         "missing_keys": missing,
+        "planned_missing_keys": planned_missing_keys,
         "orphan_keys": orphan,
         "split_coverage_keys": split,
         "coverage_mismatches": coverage_mismatch,
@@ -341,5 +393,9 @@ def audit_protection_order_integrity(
         json.dumps(position_rows, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     payload["input_fingerprint"] = _repair_input_fingerprint(payload)
-    payload["repair_ready"] = not payload["repair_blockers"] and not missing and not invalid_orders
+    payload["repair_ready"] = bool(
+        not payload["repair_blockers"]
+        and not invalid_orders
+        and len(planned_missing_keys) == len(missing)
+    )
     return payload

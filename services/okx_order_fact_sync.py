@@ -30,6 +30,10 @@ from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
 from models.trade import Order
+from services.normal_paper_trade import (
+    normal_paper_decision_id_from_client_order_id,
+    normal_paper_order_identity_reasons,
+)
 from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_VERSION,
     build_okx_fill_mark_slippage,
@@ -766,7 +770,7 @@ class OkxOrderFactSyncService:
                 decision_id
                 for row in order_rows
                 if (
-                    decision_id := paper_training_decision_id_from_client_order_id(
+                    decision_id := _decision_id_from_client_order_id(
                         _order_row_client_order_id(row)
                     )
                 )
@@ -775,7 +779,7 @@ class OkxOrderFactSyncService:
                 decision_id
                 for fill in fills
                 if (
-                    decision_id := paper_training_decision_id_from_client_order_id(
+                    decision_id := _decision_id_from_client_order_id(
                         _fill_client_order_id(
                             fill,
                             order_rows_by_id.get(str(fill.order_id or "").strip()),
@@ -1572,7 +1576,7 @@ class OkxOrderFactSyncService:
                 samples.append(_fill_sample(fill, kind="okx_only_fill_waiting_public_contract_size"))
                 continue
             order_row = order_rows_by_id.get(fill.order_id)
-            decision = _paper_training_decision_for_order_fact(
+            decision = _decision_for_order_fact(
                 fill=fill,
                 order_row=order_row,
                 decisions_by_id=decisions_by_id,
@@ -1607,7 +1611,7 @@ class OkxOrderFactSyncService:
                 protection_execution=protection_execution_by_order_id.get(fill.order_id),
             )
             if decision is not None:
-                _apply_paper_training_exchange_recovery_to_decision(
+                _apply_exchange_recovery_to_decision(
                     decision,
                     fill=fill,
                     client_order_id=_fill_client_order_id(fill, order_row),
@@ -1620,7 +1624,7 @@ class OkxOrderFactSyncService:
                 _sample(
                     order,
                     kind=(
-                        "okx_only_backfilled_with_paper_training_decision"
+                        "okx_only_backfilled_with_decision_identity"
                         if decision is not None
                         else "okx_only_backfilled"
                     ),
@@ -2869,19 +2873,60 @@ def _fill_client_order_id(
     return ""
 
 
-def _paper_training_decision_for_order_fact(
+def _decision_id_from_client_order_id(value: Any) -> int | None:
+    return normal_paper_decision_id_from_client_order_id(
+        value
+    ) or paper_training_decision_id_from_client_order_id(value)
+
+
+def _decision_for_order_fact(
     *,
     fill: OkxNativeFillGroup,
     order_row: dict[str, Any] | None,
     decisions_by_id: dict[int, AIDecision],
 ) -> AIDecision | None:
     client_order_id = _fill_client_order_id(fill, order_row)
-    decision_id = paper_training_decision_id_from_client_order_id(client_order_id)
+    decision_id = _decision_id_from_client_order_id(client_order_id)
     decision = decisions_by_id.get(int(decision_id or 0))
     if decision is None or getattr(decision, "is_paper", None) is not True:
         return None
     raw = getattr(decision, "raw_llm_response", None)
     raw = raw if isinstance(raw, dict) else {}
+    expected_side = {
+        "long": "buy",
+        "short": "sell",
+    }.get(str(getattr(decision, "action", "") or "").strip().lower())
+    shared_reasons = [
+        reason
+        for reason, invalid in (
+            (
+                "normal_paper_order_identity_symbol_mismatch",
+                normalize_trading_symbol(getattr(decision, "symbol", None))
+                != normalize_trading_symbol(fill.symbol),
+            ),
+            (
+                "normal_paper_order_identity_side_mismatch",
+                expected_side != str(fill.side or "").strip().lower(),
+            ),
+        )
+        if invalid
+    ]
+    if normal_paper_decision_id_from_client_order_id(client_order_id):
+        identity = raw.get("normal_paper_order_identity")
+        identity = identity if isinstance(identity, dict) else {}
+        identity_reasons = normal_paper_order_identity_reasons(
+            identity,
+            decision_id=getattr(decision, "id", None),
+            contract=raw.get("normal_paper_trade"),
+        )
+        if (
+            identity_reasons
+            or shared_reasons
+            or str(identity.get("client_order_id") or "").strip() != client_order_id
+        ):
+            return None
+        return decision
+
     contract = raw.get("paper_training")
     contract = contract if isinstance(contract, dict) else {}
     identity = raw.get("paper_training_order_identity")
@@ -2890,44 +2935,47 @@ def _paper_training_decision_for_order_fact(
         identity_decision_id = int(identity.get("decision_id") or 0)
     except (TypeError, ValueError):
         return None
-    expected_side = {
-        "long": "buy",
-        "short": "sell",
-    }.get(str(getattr(decision, "action", "") or "").strip().lower())
     if (
         paper_training_contract_reasons(contract)
         or identity.get("execution_scope") != "paper_only"
         or identity.get("production_permission") is not False
         or identity_decision_id != int(decision.id or 0)
         or str(identity.get("client_order_id") or "").strip() != client_order_id
-        or normalize_trading_symbol(getattr(decision, "symbol", None))
-        != normalize_trading_symbol(fill.symbol)
-        or expected_side != str(fill.side or "").strip().lower()
+        or shared_reasons
     ):
         return None
     return decision
 
 
-def _apply_paper_training_exchange_recovery_to_decision(
+def _apply_exchange_recovery_to_decision(
     decision: AIDecision,
     *,
     fill: OkxNativeFillGroup,
     client_order_id: str,
     now: datetime,
 ) -> None:
+    normal_decision = bool(normal_paper_decision_id_from_client_order_id(client_order_id))
     decision.was_executed = True
     decision.executed_at = fill.timestamp or now
     decision.execution_price = fill.avg_price
-    decision.execution_reason = (
-        "OKX 已确认该模拟训练订单成交；系统已按客户端订单身份恢复精确决策关联。"
-    )
+    decision.execution_reason = "OKX 已确认模拟盘订单成交；系统已按客户端订单身份恢复精确决策关联。"
     raw = getattr(decision, "raw_llm_response", None)
     raw = dict(raw) if isinstance(raw, dict) else {}
-    raw["paper_training_exchange_recovery"] = {
-        "version": "2026-07-22.paper-training-exchange-recovery.v1",
+    recovery_key = (
+        "normal_paper_exchange_recovery"
+        if normal_decision
+        else "paper_training_exchange_recovery"
+    )
+    raw[recovery_key] = {
+        "version": (
+            "2026-07-29.normal-paper-exchange-recovery.v1"
+            if normal_decision
+            else "2026-07-22.paper-training-exchange-recovery.v1"
+        ),
         "source_authority": "okx_native_fills_and_client_order_identity",
         "execution_scope": "paper_only",
         "production_permission": False,
+        "entry_type": "normal_strategy_trade" if normal_decision else "historical_paper_training",
         "client_order_id": client_order_id,
         "exchange_order_id": fill.order_id,
         "decision_id": int(decision.id or 0),

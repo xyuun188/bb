@@ -801,6 +801,7 @@ class OkxPerpetualSdkExchange:
         return await self._call_sdk(
             lambda: self.trade_api,
             "cancel_order",
+            check_data_code=True,
             instId=str(params["instId"]),
             ordId=str(params.get("ordId") or ""),
             clOrdId=str(params.get("clOrdId") or ""),
@@ -878,7 +879,7 @@ class OkxPerpetualSdkExchange:
             mgnMode=str((params or {}).get("mgnMode") or OKX_CROSS_MARGIN_MODE),
             posSide=str((params or {}).get("posSide") or ""),
             ccy=str((params or {}).get("ccy") or ""),
-            autoCxl=str((params or {}).get("autoCxl") or ""),
+            autoCxl=_normalize_bool_text((params or {}).get("autoCxl")),
             clOrdId=str((params or {}).get("clOrdId") or ""),
             tag=str((params or {}).get("tag") or ""),
         )

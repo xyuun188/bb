@@ -115,6 +115,18 @@ class ExecutionResultClassifier:
             return "交易接口未返回执行结果。"
 
         raw = result.raw_response or {}
+        if isinstance(raw, dict) and raw.get("entry_residual_terminal"):
+            protection = (
+                raw.get("entry_partial_fill_protection")
+                if isinstance(raw.get("entry_partial_fill_protection"), dict)
+                else {}
+            )
+            protection_text = (
+                "实际仓位保护已核验。"
+                if protection.get("verified") is True
+                else "实际仓位保护仍需后台复核。"
+            )
+            return f"OKX 开仓已部分成交，未成交余量已撤销；{protection_text}"
         if isinstance(raw, dict) and raw.get("entry_tracking"):
             reason = self._entry_tracking_reason(result, raw)
             if reason:
@@ -272,7 +284,15 @@ class ExecutionResultClassifier:
     def is_exchange_confirmed_execution(result: ExecutionResult | None) -> bool:
         """Only treat an execution as real after OKX returns a concrete order id."""
 
-        if result is None or result.status != OrderStatus.FILLED:
+        if result is None:
+            return False
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        terminal_partial_entry = bool(
+            result.status == OrderStatus.PARTIAL
+            and raw.get("entry_residual_terminal") is True
+            and raw.get("entry_recovery_only") is not True
+        )
+        if result.status != OrderStatus.FILLED and not terminal_partial_entry:
             return False
         if is_confirmed_native_full_close_result(result):
             return True

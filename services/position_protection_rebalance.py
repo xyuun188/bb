@@ -61,6 +61,7 @@ async def protection_integrity_snapshot(
     *,
     symbol: str,
     side: str,
+    missing_protection_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read one symbol/side from strict OKX-native position and order APIs."""
 
@@ -83,6 +84,11 @@ async def protection_integrity_snapshot(
         pending_orders,
         contract_specs,
         pending_snapshot_complete=True,
+        missing_protection_plans=(
+            {(normalized_symbol, side): dict(missing_protection_plan)}
+            if isinstance(missing_protection_plan, dict) and missing_protection_plan
+            else None
+        ),
     )
     return {
         "report": report,
@@ -279,6 +285,7 @@ async def rebalance_current_position_protection(
     symbol: str,
     side: str,
     observation_window: str,
+    missing_protection_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Make active OCO coverage equal one current OKX position quantity."""
 
@@ -304,6 +311,7 @@ async def rebalance_current_position_protection(
         executor,
         symbol=normalized_symbol,
         side=normalized_side,
+        missing_protection_plan=missing_protection_plan,
     )
     before_report = before["report"]
     provenance["sample_count"] = int(before_report.get("position_count") or 0) + int(

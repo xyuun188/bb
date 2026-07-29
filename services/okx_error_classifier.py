@@ -8,13 +8,21 @@ failures separately from strategy mistakes and order-rule validation errors.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 OKX_TEMPORARY_SERVICE_CODE = "50001"
+OKX_TEMPORARY_SERVICE_CODES = frozenset({"50001", "50013", "50026"})
 OKX_TEMPORARY_SERVICE_MARKERS = (
     "service temporarily unavailable",
     "temporarily unavailable",
+    "systems are busy",
+    "system error. try again later",
     "max retries exceeded",
+)
+OKX_BRACKET_ERROR_PATTERN = re.compile(
+    r"okx\s+api\s+error\s*\[([^\]]+)\]\s*:\s*(.+)",
+    re.IGNORECASE,
 )
 
 
@@ -48,7 +56,12 @@ def extract_okx_error(value: Any) -> tuple[str | None, str | None]:
     if isinstance(value, dict):
         payload = value
     else:
-        payload = _extract_json_payload(_stringify(value))
+        text = _stringify(value)
+        payload = _extract_json_payload(text)
+        if not payload:
+            match = OKX_BRACKET_ERROR_PATTERN.search(text)
+            if match:
+                return match.group(1).strip() or None, match.group(2).strip() or None
     if not payload:
         return None, None
 
@@ -80,25 +93,31 @@ def is_okx_temporary_service_error(value: Any) -> bool:
     code, message = extract_okx_error(value)
     message_text = str(message or "").lower()
     combined = f"{text} {message_text}"
-    if code == OKX_TEMPORARY_SERVICE_CODE:
+    if code in OKX_TEMPORARY_SERVICE_CODES:
         return True
-    if OKX_TEMPORARY_SERVICE_CODE in combined and "okx" in combined:
+    if any(item in combined for item in OKX_TEMPORARY_SERVICE_CODES) and "okx" in combined:
         return True
     has_marker = any(marker in combined for marker in OKX_TEMPORARY_SERVICE_MARKERS)
-    return bool(has_marker and ("okx" in combined or OKX_TEMPORARY_SERVICE_CODE in combined))
+    return bool(
+        has_marker
+        and (
+            "okx" in combined
+            or any(item in combined for item in OKX_TEMPORARY_SERVICE_CODES)
+        )
+    )
 
 
 def okx_temporary_service_error_message(value: Any | None = None) -> str:
     """User-facing text for OKX temporary service failures."""
 
-    _, message = extract_okx_error(value) if value is not None else (None, None)
+    code, message = extract_okx_error(value) if value is not None else (None, None)
     suffix = (
         f"OKX 原文：{message}"
         if message
         else "OKX 原文：Service temporarily unavailable. Please try again later."
     )
     return (
-        "OKX 返回错误码 50001：交易所服务临时不可用，系统没有拿到订单成交确认。"
+        f"OKX 返回错误码 {code or OKX_TEMPORARY_SERVICE_CODE}：交易所服务临时不可用，系统没有拿到订单成交确认。"
         "这不是下单前交易规则读取、最小张数、精度或仓位计算错误，也不计为策略质量失败；"
         "系统会临时跳过该币种，稍后自动重试。"
         f"{suffix}"

@@ -21,6 +21,7 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult
 from services.decision_state import DecisionStage, DecisionStageStatus
+from services.normal_paper_trade import attach_normal_paper_order_identity
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.production_trade_gate import validate_production_trade_gate
 from services.strategy_arbitration import arbitrate_decision
@@ -1278,6 +1279,12 @@ class ExecutionService:
                 ]
                 decision.raw_response = raw
             if decision_db_id is not None:
+                attach_normal_paper_order_identity(
+                    decision,
+                    model_mode=model_mode,
+                    decision_id=decision_db_id,
+                )
+            if decision_db_id is not None:
                 attach_execution_parameters("entry_policy_passed")
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
 
@@ -1606,6 +1613,17 @@ class ExecutionService:
             )
             exchange_confirmed = is_exchange_confirmed_execution(execution_result)
             exit_progress = is_exit_progress_execution(execution_result)
+            execution_raw = (
+                execution_result.raw_response
+                if isinstance(execution_result.raw_response, dict)
+                else {}
+            )
+            entry_recovery_only = bool(
+                decision.is_entry
+                and execution_raw.get("entry_recovery_only") is True
+                and str(execution_result.exchange_order_id or "").strip()
+                and execution_result.quantity > 0
+            )
             confirm_reason = execution_reason_from_result(execution_result)
             local_order_persisted = True
             local_order_persistence_error: str | None = None
@@ -1638,7 +1656,9 @@ class ExecutionService:
                     {"model": model_name, "symbol": symbol, "warning": warning}
                 )
                 await log_risk_event("warning", symbol, warning, model_name)
-            if local_order_persisted and (exchange_confirmed or exit_progress):
+            if local_order_persisted and (
+                exchange_confirmed or exit_progress or entry_recovery_only
+            ):
                 recovery_requested = self._trigger_order_fact_recovery(model_mode)
             if exchange_confirmed:
                 await mark_stage(
@@ -1662,6 +1682,18 @@ class ExecutionService:
                         "order_id": execution_result.order_id,
                         "exchange_order_id": execution_result.exchange_order_id,
                         "status": execution_result.status.value,
+                    },
+                )
+            elif entry_recovery_only:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.PENDING,
+                    confirm_reason,
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                        "recovery_requested": recovery_requested,
                     },
                 )
             else:

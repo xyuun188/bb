@@ -498,8 +498,8 @@ async def test_collect_existing_order_decision_link_plans_requires_unique_entry_
     )
     await init_db()
     try:
-        opened_at = datetime(2026, 6, 28, 23, 2, 54, tzinfo=UTC)
-        closed_at = datetime(2026, 6, 29, 0, 30, tzinfo=UTC)
+        opened_at = datetime.now(UTC) - timedelta(days=1)
+        closed_at = opened_at + timedelta(hours=1, minutes=27)
         async with get_session_ctx() as session:
             position = Position(
                 model_name="okx_authoritative_sync",
@@ -583,8 +583,8 @@ async def test_collect_existing_order_decision_link_plans_uses_decision_only_onc
     )
     await init_db()
     try:
-        opened_at = datetime(2026, 6, 28, 23, 2, 54, tzinfo=UTC)
-        closed_at = datetime(2026, 6, 29, 0, 30, tzinfo=UTC)
+        opened_at = datetime.now(UTC) - timedelta(days=1)
+        closed_at = opened_at + timedelta(hours=1, minutes=27)
         async with get_session_ctx() as session:
             position = Position(
                 model_name="okx_authoritative_sync",
@@ -666,8 +666,8 @@ async def test_collect_existing_order_decision_link_plans_respects_exchange_orde
     )
     await init_db()
     try:
-        opened_at = datetime(2026, 6, 28, 23, 2, 54, tzinfo=UTC)
-        closed_at = datetime(2026, 6, 29, 0, 30, tzinfo=UTC)
+        opened_at = datetime.now(UTC) - timedelta(days=1)
+        closed_at = opened_at + timedelta(hours=1, minutes=27)
         async with get_session_ctx() as session:
             position = Position(
                 model_name="okx_authoritative_sync",
@@ -749,8 +749,8 @@ async def test_collect_existing_order_decision_link_plans_skips_ambiguous_decisi
     )
     await init_db()
     try:
-        opened_at = datetime(2026, 6, 28, 23, 2, 54, tzinfo=UTC)
-        closed_at = datetime(2026, 6, 29, 0, 30, tzinfo=UTC)
+        opened_at = datetime.now(UTC) - timedelta(days=1)
+        closed_at = opened_at + timedelta(hours=1, minutes=27)
         async with get_session_ctx() as session:
             position = Position(
                 model_name="okx_authoritative_sync",

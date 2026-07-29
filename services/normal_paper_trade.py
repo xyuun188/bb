@@ -12,6 +12,8 @@ from ai_brain.base_model import DecisionOutput
 
 NORMAL_PAPER_TRADE_VERSION = "2026-07-28.normal-paper-strategy-trade.v4"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v4"
+NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1"
+NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 LEGACY_NORMAL_PAPER_TRADE_V3_VERSION = "2026-07-28.normal-paper-strategy-trade.v3"
 LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v3"
 LEGACY_NORMAL_PAPER_TRADE_VERSION = "2026-07-27.normal-paper-strategy-trade.v2"
@@ -52,6 +54,101 @@ def _fingerprint(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def normal_paper_client_order_id(decision_id: Any) -> str:
+    """Return the stable OKX client id for one persisted normal-paper decision."""
+
+    try:
+        normalized_id = int(decision_id or 0)
+    except (TypeError, ValueError):
+        return ""
+    if normalized_id <= 0:
+        return ""
+    return f"{NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX}{normalized_id}"
+
+
+def normal_paper_decision_id_from_client_order_id(value: Any) -> int | None:
+    """Recover a normal-paper decision id from an OKX client order id."""
+
+    client_order_id = str(value or "").strip().upper()
+    if not client_order_id.startswith(NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX):
+        return None
+    raw_decision_id = client_order_id[len(NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX) :]
+    if not raw_decision_id.isdigit():
+        return None
+    decision_id = int(raw_decision_id)
+    return decision_id if decision_id > 0 else None
+
+
+def attach_normal_paper_order_identity(
+    decision: DecisionOutput,
+    *,
+    model_mode: str,
+    decision_id: Any,
+) -> dict[str, Any]:
+    """Attach an exchange-recoverable identity after the decision row exists."""
+
+    if str(model_mode or "").lower() != "paper" or not decision.is_entry:
+        return {}
+    raw = dict(_dict(decision.raw_response))
+    contract = _dict(raw.get("normal_paper_trade"))
+    if normal_paper_trade_contract_reasons(contract):
+        return {}
+    client_order_id = normal_paper_client_order_id(decision_id)
+    if not client_order_id:
+        return {}
+    identity = {
+        "version": NORMAL_PAPER_ORDER_IDENTITY_VERSION,
+        "decision_id": int(decision_id),
+        "client_order_id": client_order_id,
+        "execution_scope": "paper_only",
+        "entry_type": "normal_strategy_trade",
+        "production_permission": False,
+        "normal_trade_contract_fingerprint": contract.get("contract_fingerprint"),
+    }
+    raw["normal_paper_order_identity"] = identity
+    decision.raw_response = raw
+    return identity
+
+
+def normal_paper_order_identity_reasons(
+    value: Any,
+    *,
+    decision_id: Any,
+    contract: Any,
+) -> list[str]:
+    """Validate the identity against its exact decision and strategy contract."""
+
+    identity = _dict(value)
+    normal_contract = _dict(contract)
+    expected_client_id = normal_paper_client_order_id(decision_id)
+    reasons: list[str] = []
+    if identity.get("version") != NORMAL_PAPER_ORDER_IDENTITY_VERSION:
+        reasons.append("normal_paper_order_identity_version_invalid")
+    try:
+        identity_decision_id = int(identity.get("decision_id") or 0)
+        expected_decision_id = int(decision_id or 0)
+    except (TypeError, ValueError):
+        identity_decision_id = 0
+        expected_decision_id = 0
+    if expected_decision_id <= 0 or identity_decision_id != expected_decision_id:
+        reasons.append("normal_paper_order_identity_decision_mismatch")
+    if not expected_client_id or identity.get("client_order_id") != expected_client_id:
+        reasons.append("normal_paper_order_identity_client_id_invalid")
+    if identity.get("execution_scope") != "paper_only":
+        reasons.append("normal_paper_order_identity_scope_invalid")
+    if identity.get("entry_type") != "normal_strategy_trade":
+        reasons.append("normal_paper_order_identity_entry_type_invalid")
+    if identity.get("production_permission") is not False:
+        reasons.append("normal_paper_order_identity_production_permission_invalid")
+    if normal_paper_trade_contract_reasons(normal_contract):
+        reasons.append("normal_paper_order_identity_trade_contract_invalid")
+    if identity.get("normal_trade_contract_fingerprint") != normal_contract.get(
+        "contract_fingerprint"
+    ):
+        reasons.append("normal_paper_order_identity_contract_mismatch")
+    return list(dict.fromkeys(reasons))
 
 
 def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:

@@ -37,6 +37,8 @@ from services.entry_profit_risk_sizing import (
     select_okx_leverage_tier,
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
+from services.normal_paper_trade import normal_paper_order_identity_reasons
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
@@ -55,6 +57,7 @@ OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
 OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
+OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
 
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
@@ -547,7 +550,11 @@ class OKXExecutor(AbstractExecutor):
     @staticmethod
     def _is_transient_system_error(message: Any) -> bool:
         text = str(message or "").lower()
-        return "50026" in text or "system error. try again later" in text
+        return bool(
+            is_okx_temporary_service_error(message)
+            or "50026" in text
+            or "system error. try again later" in text
+        )
 
     async def place_order(
         self,
@@ -738,6 +745,11 @@ class OKXExecutor(AbstractExecutor):
             if decision.is_entry:
                 existing_entry = await self._find_active_entry_order(ccxt, okx_symbol, side)
                 if existing_entry:
+                    existing_entry = await self._finalize_partial_entry_order(
+                        ccxt,
+                        existing_entry,
+                        okx_symbol,
+                    )
                     info = existing_entry.get("info") or {}
                     order_id = str(existing_entry.get("id") or info.get("ordId") or "")
                     filled_contracts = self._safe_float(
@@ -772,6 +784,8 @@ class OKXExecutor(AbstractExecutor):
                             **existing_entry,
                             "entry_tracking": True,
                             "existing_entry_order": True,
+                            "entry_recovery_only": filled_contracts > 0,
+                            "do_not_persist_order": True,
                             "message": (
                                 "OKX 已有同方向开仓委托正在挂单或追单，系统不会重复提交新的开仓单；"
                                 "成交后会由 OKX 仓位同步写入本地持仓。"
@@ -1047,6 +1061,20 @@ class OKXExecutor(AbstractExecutor):
                         )
             params: dict[str, Any] = {"tdMode": "cross"}
             if decision.is_entry:
+                raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                identity = (
+                    raw.get("normal_paper_order_identity")
+                    if isinstance(raw.get("normal_paper_order_identity"), dict)
+                    else {}
+                )
+                identity_reasons = normal_paper_order_identity_reasons(
+                    identity,
+                    decision_id=identity.get("decision_id"),
+                    contract=raw.get("normal_paper_trade"),
+                )
+                client_order_id = str(identity.get("client_order_id") or "").strip()
+                if not identity_reasons and client_order_id:
+                    params["clOrdId"] = client_order_id
                 quantity_leverage = self._safe_float(decision.suggested_leverage, 1.0)
                 leverage_check = await self._set_leverage_if_needed(decision)
                 if not leverage_check.get("ok"):
@@ -1550,6 +1578,25 @@ class OKXExecutor(AbstractExecutor):
                 acknowledged_at=datetime.now(UTC),
             )
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
+            if decision.is_entry:
+                order = await self._finalize_partial_entry_order(ccxt, order, okx_symbol)
+                finalization = order.get("entry_partial_fill_finalization")
+                if (
+                    isinstance(finalization, dict)
+                    and self._safe_float(finalization.get("filled_contracts"), 0.0) > 0
+                ):
+                    partial_protection = await self._ensure_partial_entry_protection(
+                        decision=decision,
+                        params=params,
+                        filled_contracts=self._safe_float(
+                            finalization.get("filled_contracts"),
+                            0.0,
+                        ),
+                    )
+                    order = {
+                        **order,
+                        "entry_partial_fill_protection": partial_protection,
+                    }
             result_symbol = self._execution_result_symbol(order, decision.symbol)
             filled_contracts = self._safe_float(order.get("filled"), 0.0)
             execution_price = float(order.get("average") or order.get("price") or price or 0)
@@ -1860,6 +1907,7 @@ class OKXExecutor(AbstractExecutor):
                             ),
                         }
                         if decision.is_entry
+                        and not order.get("entry_residual_terminal")
                         and status
                         in {
                             OrderStatus.OPEN,
@@ -2760,6 +2808,236 @@ class OKXExecutor(AbstractExecutor):
                 }
         return order
 
+    async def _finalize_partial_entry_order(
+        self,
+        ccxt: Any,
+        order: dict[str, Any],
+        symbol: str,
+    ) -> dict[str, Any]:
+        """Cancel an active entry residual and prove the partial fill is terminal."""
+
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        order_id = str(order.get("id") or info.get("ordId") or "").strip()
+        status = self._order_status_from_ccxt(order.get("status") or info.get("state"))
+        filled_contracts = self._safe_float(
+            order.get("filled") or info.get("accFillSz"),
+            0.0,
+        )
+        if (
+            not order_id
+            or filled_contracts <= 0
+            or status not in {OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.PARTIAL}
+        ):
+            return order
+
+        cancel_error = ""
+        cancel_pending_settlement = False
+        cancel_response: dict[str, Any] | None = None
+        try:
+            cancel_response = await self._cancel_order_native(ccxt, order_id, symbol)
+        except Exception as exc:
+            cancel_error = safe_error_text(exc, limit=180)
+            cancel_pending_settlement = self._is_order_pending_settlement_error(cancel_error)
+            log_method = logger.info if cancel_pending_settlement else logger.warning
+            log_method(
+                (
+                    "partial entry residual cancellation is pending settlement"
+                    if cancel_pending_settlement
+                    else "partial entry residual cancellation failed"
+                ),
+                order_id=order_id,
+                symbol=symbol,
+                filled_contracts=filled_contracts,
+                error=cancel_error,
+            )
+
+        refreshed = dict(order)
+        terminal_status = status
+        if cancel_response is not None:
+            for attempt in range(4):
+                if attempt:
+                    await asyncio.sleep(0.35 * attempt)
+                try:
+                    detail = await self._fetch_native_order_detail(ccxt, order_id, symbol)
+                except Exception as exc:
+                    cancel_error = cancel_error or safe_error_text(exc, limit=180)
+                    continue
+                if not detail:
+                    continue
+                refreshed = {**refreshed, **detail}
+                detail_info = (
+                    refreshed.get("info")
+                    if isinstance(refreshed.get("info"), dict)
+                    else {}
+                )
+                terminal_status = self._order_status_from_ccxt(
+                    refreshed.get("status") or detail_info.get("state")
+                )
+                filled_contracts = max(
+                    filled_contracts,
+                    self._safe_float(
+                        refreshed.get("filled") or detail_info.get("accFillSz"),
+                        0.0,
+                    ),
+                )
+                if terminal_status in {
+                    OrderStatus.CANCELLED,
+                    OrderStatus.FILLED,
+                    OrderStatus.REJECTED,
+                }:
+                    break
+
+        terminal = bool(
+            cancel_response is not None
+            and terminal_status
+            in {OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.REJECTED}
+        )
+        amount_contracts = self._safe_float(
+            refreshed.get("amount")
+            or (refreshed.get("info") or {}).get("sz")
+            or order.get("amount")
+            or info.get("sz"),
+            filled_contracts,
+        )
+        finalization = {
+            "version": "2026-07-29.partial-entry-terminalization.v1",
+            "order_id": order_id,
+            "cancel_attempted": True,
+            "cancel_acknowledged": cancel_response is not None,
+            "cancel_error": cancel_error or None,
+            "cancel_pending_settlement": cancel_pending_settlement,
+            "exchange_terminal_status": terminal_status.value,
+            "terminal": terminal,
+            "filled_contracts": filled_contracts,
+            "cancelled_residual_contracts": (
+                max(amount_contracts - filled_contracts, 0.0) if terminal else None
+            ),
+        }
+        if terminal and filled_contracts > 0:
+            refreshed = {
+                **refreshed,
+                "status": "partially_filled",
+                "filled": filled_contracts,
+                "entry_residual_terminal": True,
+                "remaining_contracts": 0.0,
+            }
+        return {
+            **refreshed,
+            "entry_partial_fill_finalization": finalization,
+        }
+
+    async def _ensure_partial_entry_protection(
+        self,
+        *,
+        decision: DecisionOutput,
+        params: dict[str, Any],
+        filled_contracts: float,
+    ) -> dict[str, Any]:
+        """Cover a terminal partial entry with the exact submitted dynamic OCO prices."""
+
+        requested = params.get("attachAlgoOrds")
+        requested_row = requested[0] if isinstance(requested, list) and requested else {}
+        requested_row = requested_row if isinstance(requested_row, dict) else {}
+        stop_loss_price = self._safe_float(requested_row.get("slTriggerPx"), 0.0)
+        take_profit_price = self._safe_float(requested_row.get("tpTriggerPx"), 0.0)
+        report: dict[str, Any] = {
+            "version": "2026-07-29.partial-entry-protection.v1",
+            "verified": False,
+            "created": False,
+            "stop_loss_price": stop_loss_price or None,
+            "take_profit_price": take_profit_price or None,
+        }
+        if filled_contracts <= 0 or stop_loss_price <= 0 or take_profit_price <= 0:
+            report["error"] = "submitted_dynamic_protection_prices_incomplete"
+            return report
+
+        target_side = "long" if decision.action == Action.LONG else "short"
+        try:
+            positions: list[dict[str, Any]] = []
+            for attempt in range(4):
+                if attempt:
+                    await asyncio.sleep(0.4 * attempt)
+                positions = [
+                    position
+                    for position in await self.get_positions_strict(decision.symbol)
+                    if str(
+                        position.get("side") or (position.get("info") or {}).get("posSide") or ""
+                    ).lower()
+                    == target_side
+                ]
+                if positions:
+                    break
+            if not positions:
+                report["error"] = "exchange_position_not_visible_after_partial_fill"
+                return report
+
+            desired_contracts = sum(self._position_contracts(position) for position in positions)
+            report["position_contracts"] = desired_contracts
+            if desired_contracts <= 0:
+                report["error"] = "exchange_position_contracts_missing"
+                return report
+
+            protection_orders: list[dict[str, Any]] = []
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(0.5 * attempt)
+                protection_orders = [
+                    order
+                    for order in await self.get_position_protection_orders(decision.symbol)
+                    if str(order.get("position_side") or "").lower() == target_side
+                ]
+                covered_contracts = sum(
+                    self._safe_float(order.get("contracts"), 0.0)
+                    for order in protection_orders
+                )
+                if covered_contracts > 0:
+                    break
+            covered_contracts = sum(
+                self._safe_float(order.get("contracts"), 0.0) for order in protection_orders
+            )
+            tolerance = max(desired_contracts * 1e-9, 1e-8)
+            uncovered_contracts = max(desired_contracts - covered_contracts, 0.0)
+            report["covered_contracts_before"] = covered_contracts
+            if uncovered_contracts <= tolerance:
+                report["verified"] = abs(covered_contracts - desired_contracts) <= tolerance
+                report["status"] = "already_covered"
+                return report
+
+            position_info = (
+                positions[0].get("info") if isinstance(positions[0].get("info"), dict) else {}
+            )
+            response = await self.create_position_protection_order(
+                inst_id=okx_inst_id_from_symbol(decision.symbol),
+                position_side=target_side,
+                okx_position_side=str(position_info.get("posSide") or "net").lower(),
+                contracts=uncovered_contracts,
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
+            )
+            report["created"] = True
+            rows = response.get("data") if isinstance(response, dict) else None
+            first = rows[0] if isinstance(rows, list) and rows else {}
+            report["created_algo_id"] = (
+                str(first.get("algoId") or "") if isinstance(first, dict) else ""
+            )
+
+            await asyncio.sleep(0.5)
+            after_orders = [
+                order
+                for order in await self.get_position_protection_orders(decision.symbol)
+                if str(order.get("position_side") or "").lower() == target_side
+            ]
+            covered_after = sum(
+                self._safe_float(order.get("contracts"), 0.0) for order in after_orders
+            )
+            report["covered_contracts_after"] = covered_after
+            report["verified"] = abs(covered_after - desired_contracts) <= tolerance
+            report["status"] = "created_and_verified" if report["verified"] else "verification_failed"
+            return report
+        except Exception as exc:
+            report["error"] = safe_error_text(exc, limit=180)
+            return report
+
     async def _fetch_native_order_detail(
         self,
         ccxt: Any,
@@ -3354,14 +3632,24 @@ class OKXExecutor(AbstractExecutor):
             return {"cancel_success": True}
         except Exception as e:
             error_text = safe_error_text(e, limit=300)
-            logger.warning(
-                "failed to cancel stale OKX exit order for replace",
+            pending_settlement = self._is_order_pending_settlement_error(error_text)
+            log_method = logger.info if pending_settlement else logger.warning
+            log_method(
+                (
+                    "stale OKX exit order cancellation is pending settlement"
+                    if pending_settlement
+                    else "failed to cancel stale OKX exit order for replace"
+                ),
                 symbol=okx_symbol,
                 order_id=order_id,
                 age_seconds=order_age,
                 error=error_text,
             )
-            return {"cancel_success": False, "cancel_error": error_text}
+            return {
+                "cancel_success": False,
+                "cancel_error": error_text,
+                "cancel_pending_settlement": pending_settlement,
+            }
 
     def _order_fee_cost(self, order: dict) -> float:
         fee = order.get("fee")
@@ -3376,6 +3664,15 @@ class OKXExecutor(AbstractExecutor):
             "51169" in lowered
             or "don't have any positions in this direction" in lowered
             or "no matching position to close" in lowered
+        )
+
+    @staticmethod
+    def _is_order_pending_settlement_error(message: str) -> bool:
+        text = str(message or "").lower()
+        return (
+            "51410" in text
+            or "already in canceling status" in text
+            or "pending settlement" in text
         )
 
     def _entry_order_amount(
@@ -3848,6 +4145,201 @@ class OKXExecutor(AbstractExecutor):
         except Exception as e:
             logger.error("cancel order failed", order_id=order_id, error=safe_error_text(e))
             return False
+
+    async def finalize_active_partial_entries(self) -> list[dict[str, Any]]:
+        """Cancel residual quantities for every authoritative active partial entry."""
+
+        ccxt = await self._get_ccxt()
+        recovered: list[dict[str, Any]] = []
+        for order in await self.get_open_orders_strict(None):
+            info = order.get("info") if isinstance(order.get("info"), dict) else {}
+            reduce_only = order.get("reduceOnly")
+            if reduce_only in (None, ""):
+                reduce_only = info.get("reduceOnly")
+            if str(reduce_only or "").lower() in {"true", "1"}:
+                continue
+            filled_contracts = self._safe_float(
+                order.get("filled") or info.get("accFillSz"),
+                0.0,
+            )
+            amount_contracts = self._safe_float(
+                order.get("amount") or info.get("sz"),
+                0.0,
+            )
+            if filled_contracts <= 0 or amount_contracts <= filled_contracts:
+                continue
+            symbol = str(info.get("instId") or order.get("symbol") or "").strip()
+            finalized = await self._finalize_partial_entry_order(
+                ccxt,
+                order,
+                symbol,
+            )
+            finalization = finalized.get("entry_partial_fill_finalization")
+            if not isinstance(finalization, dict):
+                continue
+            forced_close: dict[str, Any] = {}
+            if finalization.get("terminal") is not True:
+                forced_close = await self._force_close_stale_partial_entry(
+                    ccxt,
+                    finalized,
+                    symbol,
+                )
+            recovered_terminal = bool(
+                finalization.get("terminal") is True
+                or forced_close.get("recovered") is True
+            )
+            recovered.append(
+                {
+                    "order_id": finalization.get("order_id"),
+                    "symbol": normalize_trading_symbol(symbol),
+                    "side": str(order.get("side") or info.get("side") or "").lower(),
+                    "terminal": recovered_terminal,
+                    "filled_contracts": finalization.get("filled_contracts"),
+                    "cancelled_residual_contracts": finalization.get(
+                        "cancelled_residual_contracts"
+                    ),
+                    "cancel_error": finalization.get("cancel_error"),
+                    "forced_close": forced_close or None,
+                }
+            )
+        return recovered
+
+    async def _force_close_stale_partial_entry(
+        self,
+        ccxt: Any,
+        order: dict[str, Any],
+        symbol: str,
+    ) -> dict[str, Any]:
+        """Flatten a stale partial market entry when OKX will not terminalize its residual."""
+
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        order_id = str(order.get("id") or info.get("ordId") or "").strip()
+        order_age_seconds = self._order_age_seconds(order)
+        report: dict[str, Any] = {
+            "version": "2026-07-29.stale-partial-entry-force-close.v1",
+            "order_id": order_id,
+            "order_age_seconds": order_age_seconds,
+            "force_close_after_seconds": OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS,
+            "attempted": False,
+            "acknowledged": False,
+            "recovered": False,
+        }
+        if order_age_seconds < OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS:
+            report["status"] = "waiting_for_cancel_terminalization"
+            return report
+
+        order_side = str(order.get("side") or info.get("side") or "").strip().lower()
+        target_side = {"buy": "long", "sell": "short"}.get(order_side)
+        inst_id = okx_inst_id_from_symbol(info.get("instId") or symbol)
+        if not order_id or target_side is None or not inst_id:
+            report["status"] = "entry_identity_incomplete"
+            return report
+
+        positions = [
+            position
+            for position in await self.get_positions_strict(symbol)
+            if self._position_matches_exit_side(
+                position,
+                target_side,
+                decision_symbol=symbol,
+            )
+        ]
+        before_contracts = sum(self._position_contracts(position) for position in positions)
+        report["position_side"] = target_side
+        report["position_contracts_before"] = before_contracts
+        if before_contracts <= 0:
+            report["status"] = "position_already_flat"
+            return report
+
+        close_position = getattr(ccxt, "privatePostTradeClosePosition", None)
+        if not callable(close_position):
+            report["status"] = "native_close_position_unavailable"
+            return report
+
+        exit_side = "sell" if target_side == "long" else "buy"
+        existing_exit = await self._find_active_exit_order(ccxt, inst_id, exit_side)
+        if existing_exit:
+            existing_info = (
+                existing_exit.get("info")
+                if isinstance(existing_exit.get("info"), dict)
+                else {}
+            )
+            existing_exit_id = str(
+                existing_exit.get("id") or existing_info.get("ordId") or ""
+            ).strip()
+            existing_exit_age = self._order_age_seconds(existing_exit)
+            report["existing_exit_order_id"] = existing_exit_id
+            report["existing_exit_order_age_seconds"] = existing_exit_age
+            if existing_exit_age < EXIT_ORDER_REPLACE_AFTER_SECONDS:
+                report["status"] = "existing_exit_order_tracking"
+                return report
+            cancel_result = await self._cancel_stale_exit_order(
+                ccxt,
+                existing_exit,
+                inst_id,
+                existing_exit_id,
+                existing_exit_age,
+            )
+            report["existing_exit_cancel"] = cancel_result
+            if cancel_result.get("cancel_success") is not True:
+                report["status"] = (
+                    "existing_exit_pending_settlement"
+                    if cancel_result.get("cancel_pending_settlement") is True
+                    else "existing_exit_cancel_failed"
+                )
+                return report
+            await asyncio.sleep(0.5)
+            before_contracts = await self._position_contracts_for_side(symbol, target_side)
+            report["position_contracts_before_replacement"] = before_contracts
+            if before_contracts <= 0:
+                report["status"] = "position_flat_after_existing_exit_cancel"
+                return report
+
+        position_side = self._okx_position_side(positions[0], target_side)
+        request_params: dict[str, Any] = {
+            "instId": inst_id,
+            "mgnMode": str(info.get("tdMode") or "cross"),
+            "autoCxl": True,
+        }
+        if position_side and position_side != "net":
+            request_params["posSide"] = target_side
+        report["attempted"] = True
+        report["request_params"] = request_params
+        try:
+            response = await self._with_retry(close_position, request_params)
+        except Exception as exc:
+            report["status"] = "native_close_position_failed"
+            report["error"] = safe_error_text(exc, limit=180)
+            return report
+        report["acknowledged"] = True
+        report["response"] = response
+
+        after_contracts = before_contracts
+        residual_active = True
+        for attempt in range(8):
+            if attempt:
+                await asyncio.sleep(0.75)
+            after_contracts = await self._position_contracts_for_side(symbol, target_side)
+            open_orders = await self.get_open_orders_strict(symbol)
+            residual_active = any(
+                str(
+                    row.get("id")
+                    or (row.get("info") or {}).get("ordId")
+                    or ""
+                ).strip()
+                == order_id
+                for row in open_orders
+            )
+            if after_contracts <= max(before_contracts * 0.001, 1e-8) and not residual_active:
+                break
+        report["position_contracts_after"] = after_contracts
+        report["residual_order_active_after"] = residual_active
+        report["recovered"] = bool(
+            after_contracts <= max(before_contracts * 0.001, 1e-8)
+            and not residual_active
+        )
+        report["status"] = "flattened_and_cancelled" if report["recovered"] else "verification_failed"
+        return report
 
     async def _cancel_order_native(
         self,

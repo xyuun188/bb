@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -25,6 +26,36 @@ def _float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+@pytest.mark.asyncio
+async def test_partial_entry_recovery_runs_single_flight_and_requests_fact_sync() -> None:
+    recovery_requests: list[str] = []
+    release = asyncio.Event()
+    calls = 0
+
+    class Executor:
+        async def finalize_active_partial_entries(self) -> list[dict[str, object]]:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return [{"order_id": "partial-entry", "terminal": True}]
+
+    service = OkxSyncService(
+        order_fact_recovery_trigger=lambda mode: recovery_requests.append(mode)
+    )
+
+    assert service._start_partial_entry_recovery(Executor()) is True
+    assert service._start_partial_entry_recovery(Executor()) is False
+    release.set()
+    task = service._partial_entry_recovery_task
+    assert task is not None
+    await task
+    await asyncio.sleep(0)
+
+    assert calls == 1
+    assert recovery_requests == ["paper"]
+    assert service._partial_entry_recovery_task is None
 
 
 def test_normalized_open_position_context_uses_contract_value_and_stable_open_time() -> None:

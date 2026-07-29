@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -12,11 +13,16 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
+from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Order
 from services import okx_order_fact_sync as order_fact_sync_module
+from services.normal_paper_trade import (
+    attach_normal_paper_order_identity,
+    build_normal_paper_trade_contract,
+)
 from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_VERSION,
     build_okx_fill_mark_slippage,
@@ -30,12 +36,83 @@ from services.okx_order_fact_sync import (
     _build_contract_size_catalog,
     _configure_order_fact_write_transaction,
     _database_timeout_stage,
+    _decision_for_order_fact,
     _dedupe_fills_by_order_id,
     _prioritized_exchange_order_ids,
     _rebuild_stored_slippage_fact,
     _repair_stored_fill_contract_size_from_instruments,
     _stored_slippage_fact_needs_refresh,
 )
+
+
+def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.2,
+            "objective_net_return_pct": 0.1,
+            "loss_probability": 0.4,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    output = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.7,
+        reasoning="test",
+        position_size_pct=0.1,
+        raw_response={"normal_paper_trade": contract},
+    )
+    identity = attach_normal_paper_order_identity(
+        output,
+        model_mode="paper",
+        decision_id=88,
+    )
+    decision = AIDecision(
+        id=88,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action="long",
+        confidence=0.7,
+        is_paper=True,
+        raw_llm_response=output.raw_response,
+    )
+    fill = OkxNativeFillGroup(
+        order_id="okx-entry-88",
+        trade_ids=("trade-88",),
+        inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT",
+        side="buy",
+        pos_side="long",
+        contracts=2.0,
+        avg_price=100.0,
+        fee_abs=0.01,
+        fill_pnl=0.0,
+        timestamp_ms=0.0,
+        timestamp=datetime.now(UTC),
+        raw_count=1,
+        rows=({"clOrdId": identity["client_order_id"]},),
+    )
+
+    assert _decision_for_order_fact(
+        fill=fill,
+        order_row={"clOrdId": identity["client_order_id"]},
+        decisions_by_id={88: decision},
+    ) is decision
+
+    wrong_side_fill = replace(fill, side="sell")
+    assert _decision_for_order_fact(
+        fill=wrong_side_fill,
+        order_row={"clOrdId": identity["client_order_id"]},
+        decisions_by_id={88: decision},
+    ) is None
 
 
 class _ScalarResult:

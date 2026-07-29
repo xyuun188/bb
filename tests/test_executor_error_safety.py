@@ -186,6 +186,25 @@ class _SystemErrorOnceCcxt:
         return {"data": []}
 
 
+class _TemporaryServiceOnceCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.position_calls = 0
+
+    async def privateGetAccountPositions(
+        self, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.position_calls += 1
+        if self.position_calls == 1:
+            raise ExchangeAPIError(
+                "OKX API error [50001]: Service temporarily unavailable. Please try again later.",
+                code="50001",
+            )
+        return {"data": []}
+
+
 def _native_position_row(
     inst_id: str,
     *,
@@ -1218,6 +1237,29 @@ async def test_okx_with_retry_recovers_from_temporary_50026(
 
     assert result == {"data": []}
     assert exchange.position_history_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_okx_with_retry_recovers_from_temporary_50001(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _TemporaryServiceOnceCcxt()
+    executor = _executor(exchange)
+    monkeypatch.setattr(okx_module, "RETRY_DELAY", 0.0)
+
+    result = await executor._with_retry(
+        exchange.privateGetAccountPositions,
+        {"instType": "SWAP"},
+    )
+
+    assert result == {"data": []}
+    assert exchange.position_calls == 2
+
+
+def test_okx_retry_classifier_recognizes_busy_50013() -> None:
+    assert OKXExecutor._is_transient_system_error(
+        "OKX API error [50013]: Systems are busy. Please try again later."
+    ) is True
 
 
 def _exit_decision() -> DecisionOutput:

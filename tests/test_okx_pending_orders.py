@@ -304,6 +304,15 @@ class MissingNativeTickerCcxt(FakeCcxt):
         raise ExchangeAPIError("OKX native ticker unavailable")
 
 
+class PendingSettlementCancelCcxt(FakeCcxt):
+    async def privatePostTradeCancelOrder(self, params):
+        self.native_cancel_order_requests.append(dict(params))
+        raise ExchangeAPIError(
+            "OKX API error [51410]: Cancellation failed as the order is pending settlement.",
+            code="51410",
+        )
+
+
 def _executor(fake_ccxt: FakeCcxt) -> OKXExecutor:
     executor = OKXExecutor(mode="paper")
     executor._connected = True
@@ -434,7 +443,48 @@ async def test_existing_active_entry_order_blocks_duplicate_submit():
     assert result.exchange_order_id == "existing-entry"
     assert result.raw_response is not None
     assert result.raw_response["existing_entry_order"] is True
+    assert result.raw_response["do_not_persist_order"] is True
     assert "不会重复提交新的开仓单" in result.raw_response["message"]
+
+
+@pytest.mark.asyncio
+async def test_existing_partial_entry_is_recovery_only_while_cancel_is_pending():
+    existing = {
+        "id": "existing-partial-entry",
+        "symbol": "HOME/USDT:USDT",
+        "side": "buy",
+        "type": "market",
+        "status": "partially_filled",
+        "amount": 30.0,
+        "filled": 12.0,
+        "price": 1.0,
+        "average": 1.0,
+        "info": {
+            "state": "partially_filled",
+            "ordId": "existing-partial-entry",
+            "side": "buy",
+            "ordType": "market",
+        },
+    }
+    fake_ccxt = PendingSettlementCancelCcxt(open_orders=[existing])
+    executor = _executor(fake_ccxt)
+
+    result = await executor.place_order(
+        _entry_decision(),
+        account_id="ensemble_trader",
+        override_balance=10.0,
+    )
+
+    assert fake_ccxt.create_calls == []
+    assert result.status == OrderStatus.PARTIAL
+    assert result.quantity == pytest.approx(12.0)
+    assert result.exchange_order_id == "existing-partial-entry"
+    assert result.raw_response["entry_recovery_only"] is True
+    assert result.raw_response.get("entry_residual_terminal") is not True
+    assert result.raw_response["do_not_persist_order"] is True
+    assert result.raw_response["entry_partial_fill_finalization"][
+        "cancel_pending_settlement"
+    ] is True
 
 
 @pytest.mark.asyncio

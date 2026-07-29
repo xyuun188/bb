@@ -100,6 +100,24 @@ class _TradeApi:
         self.calls.append(("place_order", dict(kwargs)))
         return {"code": "0", "data": [{"ordId": "okx-1", "sCode": "0"}]}
 
+    def close_positions(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("close_positions", dict(kwargs)))
+        return {"code": "0", "data": [{"ordId": "okx-close", "sCode": "0"}]}
+
+    def cancel_order(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("cancel_order", dict(kwargs)))
+        return {
+            "code": "1",
+            "msg": "All operations failed",
+            "data": [
+                {
+                    "ordId": kwargs.get("ordId"),
+                    "sCode": "51410",
+                    "sMsg": "Cancellation failed as the order is pending settlement.",
+                }
+            ],
+        }
+
     def amend_algo_order(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("amend_algo_order", dict(kwargs)))
         return {"code": "0", "data": [{"algoId": "algo-1", "sCode": "0"}]}
@@ -341,6 +359,50 @@ async def test_sdk_adapter_rejects_spot_order_shape() -> None:
         await exchange.privatePostTradeOrder(
             {"instId": "BTC-USDT", "tdMode": "cross", "side": "buy", "ordType": "market", "sz": "1"}
         )
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_normalizes_close_position_auto_cancel_boolean() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    trade_api = _TradeApi()
+    exchange._trade_api = trade_api
+
+    await exchange.privatePostTradeClosePosition(
+        {
+            "instId": "YB-USDT-SWAP",
+            "mgnMode": "cross",
+            "autoCxl": True,
+        }
+    )
+
+    assert trade_api.calls == [
+        (
+            "close_positions",
+            {
+                "instId": "YB-USDT-SWAP",
+                "mgnMode": "cross",
+                "posSide": "",
+                "ccy": "",
+                "autoCxl": "true",
+                "clOrdId": "",
+                "tag": "",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_preserves_cancel_order_pending_settlement_code() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    exchange._trade_api = _TradeApi()
+
+    with pytest.raises(ExchangeAPIError) as captured:
+        await exchange.privatePostTradeCancelOrder(
+            {"instId": "YB-USDT-SWAP", "ordId": "stale-entry"}
+        )
+
+    assert captured.value.code == "51410"
+    assert "pending settlement" in str(captured.value)
 
 
 @pytest.mark.asyncio

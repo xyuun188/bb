@@ -111,6 +111,34 @@ async def test_trade_order_log_service_surfaces_persistence_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trade_order_log_service_skips_existing_entry_recovery_result() -> None:
+    repo = FakeTradeRepo()
+    result = ExecutionResult(
+        order_id="existing-partial-entry",
+        exchange_order_id="existing-partial-entry",
+        symbol="BTC/USDT",
+        side="buy",
+        order_type="market",
+        quantity=2.5,
+        price=101.2,
+        status=OrderStatus.PARTIAL,
+        raw_response={
+            "entry_recovery_only": True,
+            "do_not_persist_order": True,
+        },
+    )
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda _model_name: "paper",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", _decision(), decision_id=78)
+
+    assert repo.orders == []
+
+
+@pytest.mark.asyncio
 async def test_trade_order_log_service_persists_structured_okx_rejection_fact() -> None:
     repo = FakeTradeRepo()
     rejected_at = datetime(2026, 7, 11, 1, 2, tzinfo=UTC)

@@ -972,6 +972,7 @@ class OkxSyncService:
         position_margin_calculator: Callable[[float, float | None], float] | None = None,
         memory_position_remover: Callable[[str, str, str], None] | None = None,
         account_equity_provider: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        order_fact_recovery_trigger: Callable[[str], None] | None = None,
     ) -> None:
         self.exchange_reconcile_lock = exchange_reconcile_lock
         self.round_error_recorder = round_error_recorder
@@ -1000,11 +1001,16 @@ class OkxSyncService:
         self.position_margin_calculator = position_margin_calculator
         self.memory_position_remover = memory_position_remover
         self.account_equity_provider = account_equity_provider
+        self.order_fact_recovery_trigger = order_fact_recovery_trigger
         self._reconcile_deadline_monotonic: float | None = None
         self._reconcile_degraded_rows: list[dict[str, Any]] | None = None
         self._pending_position_protection_rebalance_keys: set[tuple[str, str]] = set()
+        self._pending_position_protection_plans: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
         self._position_protection_rebalance_retry_at: dict[tuple[str, str], float] = {}
         self._position_protection_rebalance_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        self._partial_entry_recovery_task: asyncio.Task[list[dict[str, Any]]] | None = None
 
     def _protection_coverage_mismatch_keys(
         self,
@@ -1070,11 +1076,17 @@ class OkxSyncService:
                 )
                 continue
             try:
+                rebalance_kwargs: dict[str, Any] = {
+                    "symbol": symbol,
+                    "side": side,
+                    "observation_window": "post_okx_authoritative_position_reconcile",
+                }
+                missing_plan = self._pending_position_protection_plans.get(key)
+                if missing_plan:
+                    rebalance_kwargs["missing_protection_plan"] = missing_plan
                 report = await rebalance_current_position_protection(
                     executor,
-                    symbol=symbol,
-                    side=side,
-                    observation_window="post_okx_authoritative_position_reconcile",
+                    **rebalance_kwargs,
                 )
             except Exception as exc:
                 report = getattr(exc, "report", None)
@@ -1115,6 +1127,7 @@ class OkxSyncService:
             verified = report.get("verified") is True
             if verified:
                 self._pending_position_protection_rebalance_keys.discard(key)
+                self._pending_position_protection_plans.pop(key, None)
                 self._position_protection_rebalance_retry_at.pop(key, None)
             else:
                 self._position_protection_rebalance_retry_at[key] = (
@@ -1177,6 +1190,47 @@ class OkxSyncService:
                     result_count=len(result),
                     positions=result,
                 )
+
+        task.add_done_callback(finish)
+        return True
+
+    def _start_partial_entry_recovery(self, executor: Any) -> bool:
+        """Finalize interrupted partial entries outside the reconciliation deadline."""
+
+        finalize = getattr(executor, "finalize_active_partial_entries", None)
+        if not callable(finalize):
+            return False
+        task = self._partial_entry_recovery_task
+        if task is not None and not task.done():
+            return False
+
+        async def run() -> list[dict[str, Any]]:
+            rows = await finalize()
+            if rows and self.order_fact_recovery_trigger is not None:
+                self.order_fact_recovery_trigger("paper")
+            return rows
+
+        task = asyncio.create_task(run())
+        self._partial_entry_recovery_task = task
+
+        def finish(completed: asyncio.Task[list[dict[str, Any]]]) -> None:
+            if self._partial_entry_recovery_task is completed:
+                self._partial_entry_recovery_task = None
+            try:
+                rows = completed.result()
+            except asyncio.CancelledError:
+                logger.info("background partial entry recovery cancelled")
+            except Exception as exc:
+                logger.warning(
+                    "background partial entry recovery failed",
+                    error=safe_error_text(exc),
+                )
+            else:
+                if rows:
+                    logger.warning(
+                        "finalized interrupted partial entry orders",
+                        orders=rows,
+                    )
 
         task.add_done_callback(finish)
         return True
@@ -2380,20 +2434,6 @@ class OkxSyncService:
                     )
                     exchange_unrealized = parse_float(snapshot.get("upl"), 0.0)
                     exchange_realized = parse_float(exchange_pos.get("realizedPnl"), 0.0)
-                    protection = protection_by_key.get(key, {})
-                    fallback_protection = await fallback_position_protection(
-                        session,
-                        symbol=symbol,
-                        side=side,
-                        entry_price=entry_price,
-                    )
-                    stop_loss_price = protection.get("stop_loss_price") or fallback_protection.get(
-                        "stop_loss_price"
-                    )
-                    take_profit_price = protection.get(
-                        "take_profit_price"
-                    ) or fallback_protection.get("take_profit_price")
-
                     matching_local_positions = [
                         pos
                         for pos in positions
@@ -2404,6 +2444,67 @@ class OkxSyncService:
                             and str(pos.side or "").lower() == side
                         )
                     ]
+                    protection = protection_by_key.get(key, {})
+                    fallback_protection: dict[str, Any] = {}
+                    if matching_local_positions:
+                        linked_entry_ids = {
+                            order_id
+                            for pos in matching_local_positions
+                            for order_id in _split_exchange_order_ids(
+                                getattr(pos, "entry_exchange_order_id", None)
+                            )
+                        }
+                        linked_order = None
+                        if linked_entry_ids:
+                            linked_order_result = await session.execute(
+                                select(Order)
+                                .where(
+                                    Order.execution_mode == "paper",
+                                    Order.exchange_order_id.in_(sorted(linked_entry_ids)),
+                                )
+                                .order_by(Order.created_at.desc())
+                                .limit(1)
+                            )
+                            linked_order = linked_order_result.scalar_one_or_none()
+                        fallback_protection = await fallback_position_protection(
+                            session,
+                            symbol=symbol,
+                            side=side,
+                            entry_price=entry_price,
+                            order=linked_order,
+                        )
+                    stop_loss_price = protection.get("stop_loss_price") or next(
+                        (
+                            getattr(pos, "stop_loss_price", None)
+                            for pos in matching_local_positions
+                            if parse_float(getattr(pos, "stop_loss_price", None), 0.0) > 0
+                        ),
+                        None,
+                    ) or fallback_protection.get("stop_loss_price")
+                    take_profit_price = protection.get("take_profit_price") or next(
+                        (
+                            getattr(pos, "take_profit_price", None)
+                            for pos in matching_local_positions
+                            if parse_float(getattr(pos, "take_profit_price", None), 0.0) > 0
+                        ),
+                        None,
+                    ) or fallback_protection.get("take_profit_price")
+                    if (
+                        protection_snapshot is not None
+                        and not protection
+                        and parse_float(stop_loss_price, 0.0) > 0
+                        and parse_float(take_profit_price, 0.0) > 0
+                    ):
+                        self._pending_position_protection_rebalance_keys.add(key)
+                        self._pending_position_protection_plans[key] = {
+                            "stop_loss_price": stop_loss_price,
+                            "take_profit_price": take_profit_price,
+                            "okx_position_side": str(info.get("posSide") or "net").lower(),
+                            "source": str(
+                                fallback_protection.get("source")
+                                or "persisted_local_dynamic_protection"
+                            ),
+                        }
                     if matching_local_positions:
                         local_quantity_before_by_id = {
                             getattr(pos, "id", id(pos)): parse_float(
@@ -2619,6 +2720,25 @@ class OkxSyncService:
                         take_profit_price = take_profit_price or order_fallback_protection.get(
                             "take_profit_price"
                         )
+                        if order_fallback_protection:
+                            fallback_protection = order_fallback_protection
+
+                    if (
+                        protection_snapshot is not None
+                        and not protection
+                        and parse_float(stop_loss_price, 0.0) > 0
+                        and parse_float(take_profit_price, 0.0) > 0
+                    ):
+                        self._pending_position_protection_rebalance_keys.add(key)
+                        self._pending_position_protection_plans[key] = {
+                            "stop_loss_price": stop_loss_price,
+                            "take_profit_price": take_profit_price,
+                            "okx_position_side": str(info.get("posSide") or "net").lower(),
+                            "source": str(
+                                fallback_protection.get("source")
+                                or "exact_order_dynamic_protection"
+                            ),
+                        }
 
                     opened_at = datetime_from_ms(exchange_pos.get("timestamp") or info.get("cTime"))
                     order.status = OrderStatus.FILLED.value
@@ -3116,7 +3236,11 @@ class OkxSyncService:
             )
             return self._with_reconcile_degraded_rows(reconciled)
 
-        if self._reconcile_deadline_monotonic is None:
+        self._start_partial_entry_recovery(paper_okx)
+        if (
+            self._reconcile_deadline_monotonic is None
+            and not self._pending_position_protection_plans
+        ):
             reconciled.extend(await self._rebalance_pending_position_protection(paper_okx))
         else:
             self._start_pending_position_protection_rebalance(paper_okx)

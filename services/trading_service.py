@@ -633,6 +633,7 @@ class TradingService:
             position_margin_calculator=self.position_margin_calculator.margin,
             memory_position_remover=self.memory_position_store.remove_open_position,
             account_equity_provider=self._get_okx_balance_snapshot_for_mode,
+            order_fact_recovery_trigger=self.request_okx_order_fact_recovery,
         )
         self.okx_order_fact_sync_factory = OkxOrderFactSyncService
         self.okx_settlement_fact_sync_factory = OkxSettlementFactSyncService

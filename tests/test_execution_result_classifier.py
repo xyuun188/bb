@@ -96,6 +96,21 @@ def test_execution_reason_translates_okx_50001_as_transient_exchange_error() -> 
     assert "仓位计算错误" in reason
 
 
+def test_execution_reason_translates_okx_50013_as_transient_exchange_error() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.REJECTED,
+        raw_response={"error": "OKX API error [50013]: Systems are busy. Please try again later."},
+        exchange_order_id=None,
+    )
+
+    reason = policy.reason_from_result(result)
+
+    assert "50013" in reason
+    assert "交易所服务临时不可用" in reason
+    assert "不计为策略质量失败" in reason
+
+
 def test_execution_reason_translates_okx_json_parameter_errors() -> None:
     policy = ExecutionResultClassifier()
     result = _result(
@@ -196,6 +211,33 @@ def test_execution_confirmation_requires_real_exchange_order_id() -> None:
         is False
     )
     assert policy.is_exchange_confirmed_execution(_result(OrderStatus.PARTIAL)) is False
+
+
+def test_terminal_partial_entry_counts_as_real_execution() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.PARTIAL,
+        raw_response={
+            "entry_residual_terminal": True,
+            "entry_partial_fill_protection": {"verified": True},
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is True
+    assert "未成交余量已撤销" in policy.reason_from_result(result)
+
+
+def test_recovered_existing_partial_entry_does_not_claim_new_decision_execution() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.PARTIAL,
+        raw_response={
+            "entry_residual_terminal": True,
+            "entry_recovery_only": True,
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is False
 
 
 def test_execution_confirmation_rejects_native_full_close_without_real_order_id() -> None:

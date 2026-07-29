@@ -222,3 +222,60 @@ def test_existing_algo_precision_can_match_residual_position_below_order_lot_ste
             },
         }
     ]
+
+
+def test_missing_protection_can_be_rebuilt_only_from_complete_dynamic_plan() -> None:
+    report = audit_protection_order_integrity(
+        [_position("YB/USDT", "short", "760")],
+        [],
+        [],
+        {"YB-USDT-SWAP": {"lotSz": "1", "minSz": "1"}},
+        pending_snapshot_complete=True,
+        missing_protection_plans={
+            ("YB/USDT", "short"): {
+                "stop_loss_price": 0.047,
+                "take_profit_price": 0.043,
+                "okx_position_side": "short",
+            }
+        },
+    )
+
+    assert report["repair_ready"] is True
+    assert report["planned_missing_keys"] == [["YB/USDT", "short"]]
+    assert report["repair_actions"] == [
+        {
+            "action": "create_delta",
+            "reason": "restore_missing_dynamic_position_protection",
+            "inst_id": "YB-USDT-SWAP",
+            "position_side": "short",
+            "okx_position_side": "short",
+            "old_contracts": "0",
+            "new_contracts": "760",
+            "stop_loss_price": "0.047",
+            "take_profit_price": "0.043",
+            "rollback": {
+                "action": "cancel_created",
+                "inst_id": "YB-USDT-SWAP",
+                "algo_id": None,
+            },
+        }
+    ]
+
+
+def test_missing_protection_stays_blocked_while_entry_residual_is_active() -> None:
+    report = audit_protection_order_integrity(
+        [_position("YB/USDT", "short", "760")],
+        [],
+        [{"symbol": "YB/USDT", "side": "sell", "reduceOnly": False}],
+        {"YB-USDT-SWAP": {"lotSz": "1", "minSz": "1"}},
+        pending_snapshot_complete=True,
+        missing_protection_plans={
+            ("YB/USDT", "short"): {
+                "stop_loss_price": 0.047,
+                "take_profit_price": 0.043,
+            }
+        },
+    )
+
+    assert report["repair_ready"] is False
+    assert "missing_protection_has_pending_entry:YB/USDT:short" in report["repair_blockers"]

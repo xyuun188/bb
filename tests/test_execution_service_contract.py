@@ -1004,6 +1004,64 @@ async def test_execution_service_marks_entry_policy_cancellation_terminal_before
 
 
 @pytest.mark.asyncio
+async def test_paper_entry_attaches_recoverable_identity_before_okx_submit() -> None:
+    raw_updates: list[dict[str, Any] | None] = []
+    observed_identity: dict[str, Any] = {}
+
+    class FilledExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            del account_id, override_balance
+            identity = decision.raw_response.get("normal_paper_order_identity", {})
+            observed_identity.update(identity)
+            return ExecutionResult(
+                order_id="local-normal-paper-entry",
+                exchange_order_id="okx-normal-paper-entry",
+                symbol=decision.symbol,
+                side="sell",
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={},
+            )
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return FilledExecutor()
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        raw_updates=raw_updates,
+    )
+    decision = _profit_first_ready_position_review_decision()
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        991,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert observed_identity["decision_id"] == 991
+    assert observed_identity["client_order_id"] == "BBNP991"
+    assert observed_identity["entry_type"] == "normal_strategy_trade"
+    assert observed_identity["production_permission"] is False
+    assert decision.raw_response["normal_paper_order_identity"] == observed_identity
+    assert any(
+        update and update.get("normal_paper_order_identity") == observed_identity
+        for update in raw_updates
+    )
+
+
+@pytest.mark.asyncio
 async def test_execution_service_recovers_when_confirmed_order_fact_write_fails() -> None:
     persisted_positions: list[str] = []
     recovery_requests: list[str] = []
@@ -1115,6 +1173,70 @@ async def test_execution_service_requests_authoritative_facts_after_confirmed_wr
     assert result is not None
     assert result.status == OrderStatus.FILLED
     assert recovery_requests == ["paper"]
+
+
+@pytest.mark.asyncio
+async def test_existing_partial_entry_requests_recovery_without_claiming_new_execution() -> None:
+    recovery_requests: list[str] = []
+    persisted_positions: list[str] = []
+    stages: list[tuple[str, str, str]] = []
+
+    class ExistingPartialExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            del account_id, override_balance
+            return ExecutionResult(
+                order_id="existing-partial-entry",
+                exchange_order_id="existing-partial-entry",
+                symbol=decision.symbol,
+                side="sell",
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.PARTIAL,
+                raw_response={
+                    "entry_tracking": True,
+                    "entry_recovery_only": True,
+                    "do_not_persist_order": True,
+                },
+            )
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return ExistingPartialExecutor()
+
+    async def persist_position(*_args: Any, **_kwargs: Any) -> None:
+        persisted_positions.append("called")
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        position_execution_persister=persist_position,
+        order_fact_recovery_trigger=lambda mode: recovery_requests.append(mode),
+        stages=stages,
+    )
+    results: dict[str, Any] = {"warnings": [], "decisions": [], "executions": []}
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        _profit_first_ready_position_review_decision(),
+        SimpleNamespace(warnings=[]),
+        994,
+        results,
+        open_positions=[],
+    )
+
+    assert result is not None and result.status == OrderStatus.PARTIAL
+    assert recovery_requests == ["paper"]
+    assert persisted_positions == []
+    assert results["decisions"][0]["executed"] is False
+    assert any(
+        stage == DecisionStage.EXCHANGE_CONFIRM and status == DecisionStageStatus.PENDING
+        for stage, status, _reason in stages
+    )
 
 
 @pytest.mark.asyncio

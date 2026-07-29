@@ -3,8 +3,11 @@ from __future__ import annotations
 from ai_brain.base_model import Action, DecisionOutput
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    attach_normal_paper_order_identity,
     build_normal_paper_trade_contract,
     ensure_normal_paper_trade_contract,
+    normal_paper_decision_id_from_client_order_id,
+    normal_paper_order_identity_reasons,
     normal_paper_trade_contract_reasons,
     select_normal_paper_trade_side,
 )
@@ -124,3 +127,48 @@ def test_normal_paper_contract_never_attaches_to_live() -> None:
 
     assert ensure_normal_paper_trade_contract(decision, "live") == {}
     assert "normal_paper_trade" not in decision.raw_response
+
+
+def test_normal_paper_order_identity_round_trips_exact_decision() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2),
+    )
+    decision = _decision({"normal_paper_trade": contract})
+
+    identity = attach_normal_paper_order_identity(
+        decision,
+        model_mode="paper",
+        decision_id=137947,
+    )
+
+    assert identity["client_order_id"] == "BBNP137947"
+    assert normal_paper_decision_id_from_client_order_id("BBNP137947") == 137947
+    assert normal_paper_order_identity_reasons(
+        identity,
+        decision_id=137947,
+        contract=contract,
+    ) == []
+
+
+def test_normal_paper_order_identity_rejects_cross_decision_reuse() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2),
+    )
+    decision = _decision({"normal_paper_trade": contract})
+    identity = attach_normal_paper_order_identity(
+        decision,
+        model_mode="paper",
+        decision_id=11,
+    )
+
+    assert "normal_paper_order_identity_decision_mismatch" in normal_paper_order_identity_reasons(
+        identity,
+        decision_id=12,
+        contract=contract,
+    )
