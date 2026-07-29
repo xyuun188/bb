@@ -24,6 +24,9 @@ from services.trade_execution_contract import validate_entry_execution_contract
 from services.trading_policies import PolicyGateResult
 from services.training_data_quality import annotate_training_payload
 from tests.legacy_paper_contract_fixtures import (
+    build_legacy_normal_paper_v4_trade_contract,
+)
+from tests.legacy_paper_contract_fixtures import (
     build_legacy_paper_training_contract as build_paper_training_contract,
 )
 
@@ -631,6 +634,26 @@ async def test_execution_service_persists_live_rules_canary_contract_before_subm
     assert contract["decision_authority"] == "rules"
     assert contract["model_can_influence"] is False
     assert raw_updates[-1]["live_rules_canary_contract"] == contract
+
+
+def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_valid() -> None:
+    decision = _profit_first_ready_position_review_decision()
+    decision.raw_response["normal_paper_trade"] = (
+        build_legacy_normal_paper_v4_trade_contract(
+            symbol=decision.symbol,
+            side="short",
+            objective_net_return_pct=-0.1,
+        )
+    )
+
+    contract, reasons = validate_entry_execution_contract(decision.raw_response)
+    assert reasons == []
+    assert contract["contract_lifecycle"] == "normal_paper_trade"
+
+    entry_gate = _return_entry_contract_result(decision, "paper")
+    assert entry_gate.passed is False
+    assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
+    assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
 
 
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:

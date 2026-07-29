@@ -16,7 +16,7 @@ def _cards() -> list[dict]:
                 "report_available": True,
                 "policy": {
                     "paper_entry_requires_model_promotion": False,
-                    "paper_entry_requires_positive_return_lcb": False,
+                    "paper_entry_requires_positive_return_lcb": True,
                     "paper_entry_requires_profit_factor": False,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,

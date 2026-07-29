@@ -8,6 +8,15 @@ from datetime import UTC, datetime
 from math import sqrt
 from typing import Any
 
+from services.normal_paper_trade import (
+    LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
+    NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+)
+from services.normal_paper_trade import (
+    _contract_fingerprint_payload as _normal_v4_fingerprint_payload,
+)
+from services.normal_paper_trade import _fingerprint as _normal_v4_fingerprint
 from services.paper_exploration import (
     PAPER_EXPLORATION_MAX_PORTFOLIO_RISK_FRACTION,
     PAPER_EXPLORATION_MAX_SINGLE_TRADE_RISK_FRACTION,
@@ -32,6 +41,53 @@ from services.paper_training import (
 )
 
 HISTORICAL_NORMAL_PAPER_TRADE_VERSION = "2026-07-22.normal-paper-trade.v1"
+
+
+def build_legacy_normal_paper_v4_trade_contract(
+    *,
+    symbol: str,
+    side: str,
+    expected_net_return_pct: float = 0.2,
+    objective_net_return_pct: float = -0.1,
+    horizon_minutes: float = 30.0,
+) -> dict[str, Any]:
+    contract = {
+        "version": LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
+        "authorized": True,
+        "trade_mode": "paper",
+        "execution_scope": "paper_only",
+        "entry_type": "normal_strategy_trade",
+        "trade_kind": "normal_strategy_trade",
+        "production_permission": False,
+        "decision_authority": "ensemble",
+        "selection_reason": "strategy_edge_selected",
+        "symbol": symbol,
+        "side": side,
+        "prediction_horizon_minutes": horizon_minutes,
+        "valid_for_seconds": horizon_minutes * 60.0,
+        "expected_net_return_pct": expected_net_return_pct,
+        "objective_net_return_pct": objective_net_return_pct,
+        "loss_probability": 0.4,
+        "quant_evidence_families": ["local_ml"],
+        "strong_expert_opposition": False,
+        "single_trade_risk_fraction_cap": (
+            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        ),
+        "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+        "model_leverage_role": "upper_bound_when_explicit",
+        "uses_shared_order_pipeline": True,
+        "uses_shared_position_ledger": True,
+        "continuous_training_after_trusted_settlement": True,
+        "training_eligibility_source": (
+            "trusted_settlement_and_task_specific_training_contract"
+        ),
+        "risk_override_permission": False,
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
+    contract["contract_fingerprint"] = _normal_v4_fingerprint(
+        _normal_v4_fingerprint_payload(contract)
+    )
+    return contract
 
 
 def build_legacy_paper_training_contract(

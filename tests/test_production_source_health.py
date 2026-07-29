@@ -35,6 +35,7 @@ def _decision(
                 "selected_side": "long",
                 "prediction_horizon_minutes": 15,
                 "expected_net_return_pct": 0.1,
+                "objective_net_return_pct": 0.05,
             },
         )
     return decision

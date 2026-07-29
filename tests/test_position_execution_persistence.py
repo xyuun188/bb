@@ -240,7 +240,7 @@ def _attach_normal_paper(
                 "selected_side": side,
                 "prediction_horizon_minutes": 10.0,
                 "expected_net_return_pct": 0.2,
-                "objective_net_return_pct": -0.2,
+                "objective_net_return_pct": 0.1,
                 "loss_probability": 0.4,
                 "quant_evidence_families": ["local_ml"],
                 "strong_expert_opposition": False,

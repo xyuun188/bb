@@ -87,7 +87,7 @@ def _trade_contract_details_ok() -> dict[str, Any]:
         "can_bypass_risk_controls": False,
         "policy": {
             "paper_entry_requires_model_promotion": False,
-            "paper_entry_requires_positive_return_lcb": False,
+            "paper_entry_requires_positive_return_lcb": True,
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,

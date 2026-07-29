@@ -19,7 +19,7 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     policy = summarize_trade_execution_contract([])["policy"]
 
     assert policy["paper_entry_requires_model_promotion"] is False
-    assert policy["paper_entry_requires_positive_return_lcb"] is False
+    assert policy["paper_entry_requires_positive_return_lcb"] is True
     assert policy["paper_entry_requires_profit_factor"] is False
     assert policy["paper_entry_requires_positive_expected_net_return"] is True
     assert policy["live_entry_requires_production_trade_gate"] is True

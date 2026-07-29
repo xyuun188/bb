@@ -2,24 +2,37 @@ from __future__ import annotations
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.normal_paper_trade import (
+    NORMAL_PAPER_ORDER_IDENTITY_VERSION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     attach_normal_paper_order_identity,
     build_normal_paper_trade_contract,
     ensure_normal_paper_trade_contract,
+    legacy_normal_paper_v4_trade_contract_reasons,
     normal_paper_decision_id_from_client_order_id,
     normal_paper_order_identity_reasons,
+    normal_paper_settlement_contract_reasons,
     normal_paper_trade_contract_reasons,
     select_normal_paper_trade_side,
 )
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_normal_paper_v4_trade_contract,
+)
 
 
-def _support(side: str, *, expected_net: float) -> dict:
+def _support(
+    side: str,
+    *,
+    expected_net: float,
+    objective_net: float | None = None,
+) -> dict:
     return {
         "eligible": True,
         "selected_side": side,
         "prediction_horizon_minutes": 30.0,
         "expected_net_return_pct": expected_net,
-        "objective_net_return_pct": expected_net - 0.1,
+        "objective_net_return_pct": (
+            expected_net - 0.1 if objective_net is None else objective_net
+        ),
         "loss_probability": 0.4,
         "quant_evidence_families": ["local_ml"],
         "strong_expert_opposition": False,
@@ -84,6 +97,23 @@ def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:
     assert contract == {}
 
 
+def test_positive_expected_net_with_non_positive_objective_cannot_authorize_order() -> None:
+    support = _support("long", expected_net=0.2, objective_net=-0.01)
+    selection = select_normal_paper_trade_side({"long": support})
+
+    assert selection["selected"] is False
+    assert selection["selected_side"] == "neutral"
+    assert (
+        build_normal_paper_trade_contract(
+            symbol="BTC/USDT",
+            side="long",
+            selection_reason="strategy_edge_selected",
+            direction_support=support,
+        )
+        == {}
+    )
+
+
 def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:
     support = _support("long", expected_net=0.2)
     contract = build_normal_paper_trade_contract(
@@ -104,6 +134,27 @@ def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:
     )
 
     assert ensure_normal_paper_trade_contract(decision, "paper") == contract
+
+
+def test_legacy_v4_contract_is_removed_before_new_entry_authorization() -> None:
+    support = _support("long", expected_net=0.2, objective_net=-0.01)
+    decision = _decision(
+        {
+            "paper_trade_selection": {
+                "selection_reason": "strategy_edge_selected",
+                "decision_authority": "ensemble",
+            },
+            "independent_direction_support": support,
+            "normal_paper_trade": build_legacy_normal_paper_v4_trade_contract(
+                symbol="BTC/USDT",
+                side="long",
+                objective_net_return_pct=-0.01,
+            ),
+        }
+    )
+
+    assert ensure_normal_paper_trade_contract(decision, "paper") == {}
+    assert "normal_paper_trade" not in decision.raw_response
 
 
 def test_legacy_paper_identities_cannot_authorize_a_new_trade() -> None:
@@ -172,3 +223,29 @@ def test_normal_paper_order_identity_rejects_cross_decision_reuse() -> None:
         decision_id=12,
         contract=contract,
     )
+
+
+def test_v4_contract_is_recovery_eligible_but_cannot_authorize_new_entry() -> None:
+    contract = build_legacy_normal_paper_v4_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        objective_net_return_pct=-0.2,
+    )
+    identity = {
+        "version": NORMAL_PAPER_ORDER_IDENTITY_VERSION,
+        "decision_id": 23,
+        "client_order_id": "BBNP23",
+        "execution_scope": "paper_only",
+        "entry_type": "normal_strategy_trade",
+        "production_permission": False,
+        "normal_trade_contract_fingerprint": contract["contract_fingerprint"],
+    }
+
+    assert legacy_normal_paper_v4_trade_contract_reasons(contract) == []
+    assert normal_paper_settlement_contract_reasons(contract) == []
+    assert "normal_paper_trade_version_invalid" in normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_order_identity_reasons(
+        identity,
+        decision_id=23,
+        contract=contract,
+    ) == []

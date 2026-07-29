@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from models.decision import AIDecision
 from models.trade import Order
-from services.normal_paper_trade import normal_paper_trade_contract_reasons
+from services.normal_paper_trade import normal_paper_settlement_contract_reasons
 from services.trade_execution_contract import validate_entry_execution_contract
 
 
@@ -47,7 +47,7 @@ class PositionProtectionFallbackPolicy:
         raw = raw if isinstance(raw, dict) else {}
         normal_trade = raw.get("normal_paper_trade")
         normal_trade = normal_trade if isinstance(normal_trade, dict) else {}
-        normal_trade_valid = not normal_paper_trade_contract_reasons(normal_trade)
+        normal_trade_valid = not normal_paper_settlement_contract_reasons(normal_trade)
 
         submitted = self._submitted_protection_prices(raw)
         if normal_trade_valid and submitted:

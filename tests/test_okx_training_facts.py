@@ -21,6 +21,7 @@ from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
 from tests.legacy_paper_contract_fixtures import (
     build_legacy_normal_paper_trade_contract,
+    build_legacy_normal_paper_v4_trade_contract,
 )
 from tests.legacy_paper_contract_fixtures import (
     build_legacy_paper_exploration_contract as build_paper_exploration_contract,
@@ -584,6 +585,27 @@ def test_historical_normal_paper_v1_is_recovered_without_runtime_authority() -> 
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True
     assert sample["normal_paper_trade_evidence"]["contract_generation"] == "historical_normal_v1"
+
+
+def test_v4_negative_objective_contract_remains_historical_training_eligible() -> None:
+    lineage = _complete_lineage()
+    contract = build_legacy_normal_paper_v4_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        objective_net_return_pct=-0.2,
+    )
+    lineage["decision_raw_by_order_id"]["entry-1"] = {"normal_paper_trade": contract}
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert normal_paper_trade_contract_reasons(contract)
+    assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
+    assert sample["historical_entry_contract_kind"] == "normal_paper_v4"
+    assert sample["strategy_selection_reason"] == "strategy_edge_selected"
+    assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
+        "historical_expected_net_v4"
+    )
+    assert sample["profit_training_contract"]["eligible"] is True
 
 
 def test_historical_normal_wrapper_preserves_legacy_training_identity() -> None:

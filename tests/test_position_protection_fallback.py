@@ -4,6 +4,9 @@ from typing import Any
 import pytest
 
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
+from tests.legacy_paper_contract_fixtures import (
+    build_legacy_normal_paper_v4_trade_contract,
+)
 from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
@@ -143,3 +146,38 @@ async def test_exact_order_canary_risk_plan_recovers_stop() -> None:
 
     assert result["stop_loss_price"] == 99.0
     assert result["decision_id"] == 404
+
+
+@pytest.mark.asyncio
+async def test_v4_normal_trade_recovers_exact_submitted_protection() -> None:
+    contract = build_legacy_normal_paper_v4_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+    )
+    decision = _decision(
+        id=405,
+        raw_llm_response={
+            "normal_paper_trade": contract,
+            "execution_result": {
+                "raw_response": {
+                    "request_params": {
+                        "attachAlgoOrds": [
+                            {"slTriggerPx": "98", "tpTriggerPx": "104"}
+                        ]
+                    }
+                }
+            },
+        },
+    )
+
+    result = await PositionProtectionFallbackPolicy().protection_from_decision(
+        _FakeSession(decision),
+        symbol="BTC/USDT",
+        side="long",
+        entry_price=100.0,
+        order=SimpleNamespace(decision_id=405),
+    )
+
+    assert result["stop_loss_price"] == 98.0
+    assert result["take_profit_price"] == 104.0
+    assert result["source"] == "exact_order_submitted_dynamic_protection"

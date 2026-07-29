@@ -751,7 +751,7 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
         policy.pop(retired_key, None)
     policy["optimization_target"] = PROFIT_TRAINING_TARGET
     policy["paper_entry_requires_model_promotion"] = False
-    policy["paper_entry_requires_positive_return_lcb"] = False
+    policy["paper_entry_requires_positive_return_lcb"] = True
     policy["paper_entry_requires_profit_factor"] = False
     policy["paper_entry_requires_positive_expected_net_return"] = True
     policy["paper_entry_requires_current_execution_cost"] = True

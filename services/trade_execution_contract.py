@@ -13,11 +13,13 @@ from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     legacy_normal_paper_v2_trade_contract_reasons,
     legacy_normal_paper_v3_trade_contract_reasons,
+    legacy_normal_paper_v4_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import (
@@ -281,7 +283,7 @@ def summarize_trade_execution_contract(
         "policy": {
             "optimization_target": PROFIT_TRAINING_TARGET,
             "paper_entry_requires_model_promotion": False,
-            "paper_entry_requires_positive_return_lcb": False,
+            "paper_entry_requires_positive_return_lcb": True,
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
@@ -587,6 +589,7 @@ def validate_entry_execution_contract(
             filled_notional_usdt=filled_notional_usdt,
             executed=executed,
             filled_order_present=filled_order_present,
+            allow_legacy_settlement=True,
         )
     if lifecycle == "paper_bootstrap_canary":
         return validate_paper_canary_entry_contract(
@@ -973,8 +976,9 @@ def validate_normal_paper_entry_contract(
     filled_notional_usdt: float = 0.0,
     executed: bool = False,
     filled_order_present: bool | None = None,
+    allow_legacy_settlement: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Validate a normal paper trade without production-performance gates."""
+    """Validate a normal paper trade; legacy envelopes are settlement-only."""
 
     normal_trade = _safe_dict(raw.get("normal_paper_trade"))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
@@ -988,11 +992,16 @@ def validate_normal_paper_entry_contract(
     legacy_dynamic_v3 = (
         normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V3_VERSION
     )
+    legacy_objective_v4 = (
+        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION
+    )
     reasons = (
         legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
-        if legacy_fixed_leverage
+        if allow_legacy_settlement and legacy_fixed_leverage
         else legacy_normal_paper_v3_trade_contract_reasons(normal_trade)
-        if legacy_dynamic_v3
+        if allow_legacy_settlement and legacy_dynamic_v3
+        else legacy_normal_paper_v4_trade_contract_reasons(normal_trade)
+        if allow_legacy_settlement and legacy_objective_v4
         else normal_paper_trade_contract_reasons(normal_trade)
     )
 

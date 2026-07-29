@@ -298,25 +298,17 @@ def test_live_entry_keeps_legacy_execution_values() -> None:
     assert "multidimensional_recommendation" not in decision.raw_response
 
 
-def test_positive_mean_uncertain_candidate_can_only_create_bounded_paper_entry() -> None:
+def test_positive_mean_uncertain_candidate_remains_shadow_only() -> None:
     decision = _coordinator().combine(
         _features(),
         _paper_exploration_context("paper"),
         _strong_long_opinions(),
     )
 
-    assert decision.action == Action.LONG
-    assert decision.suggested_leverage == 3.0
-    assert (
-        decision.raw_response["multidimensional_recommendation"]["execution_scope"] == "paper_only"
-    )
-    contract = decision.raw_response["normal_paper_trade"]
-    assert contract["execution_scope"] == "paper_only"
-    assert contract["production_permission"] is False
-    assert contract["entry_type"] == "normal_strategy_trade"
-    assert contract["selection_reason"] == "strategy_edge_selected"
-    assert "sample_target" not in contract
-    assert "daily_sample_quota" not in contract
+    assert decision.action == Action.HOLD
+    assert "normal_paper_trade" not in decision.raw_response
+    assert decision.raw_response["paper_trade_selection"]["selected"] is False
+    assert decision.raw_response["entry_permission"]["granted"] is False
 
 
 def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
@@ -436,7 +428,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "side": "long",
                         "decision_eligible": True,
                         "raw_expected_return_pct": 0.5,
-                        "objective_expected_return_pct": -0.05,
+                        "objective_expected_return_pct": 0.25,
                         "horizon_minutes": 30,
                         "return_distribution_contract": {
                             "tail_loss_probability": 0.3
@@ -484,7 +476,7 @@ def test_unpromoted_positive_net_model_creates_normal_paper_trade() -> None:
     assert contract["entry_type"] == "normal_strategy_trade"
     assert contract["selection_reason"] == "strategy_edge_selected"
     assert contract["expected_net_return_pct"] == 0.4
-    assert contract["objective_net_return_pct"] == pytest.approx(-0.15)
+    assert contract["objective_net_return_pct"] == pytest.approx(0.15)
     assert contract["loss_probability"] == 0.3
     assert decision.raw_response["entry_permission"]["granted"] is True
     assert "paper_training" not in decision.raw_response
@@ -515,7 +507,7 @@ def test_unpromoted_positive_net_model_trades_when_all_experts_hold() -> None:
     assert decision.raw_response["normal_paper_trade"]["authorized"] is True
 
 
-def test_positive_expected_net_with_negative_objective_can_trade_in_paper() -> None:
+def test_positive_expected_net_with_negative_objective_remains_shadow_only() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -558,12 +550,11 @@ def test_positive_expected_net_with_negative_objective_can_trade_in_paper() -> N
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.LONG
+    assert decision.action == Action.HOLD
     assert "paper_training" not in decision.raw_response
-    assert (
-        decision.raw_response["normal_paper_trade"]["selection_reason"]
-        == "strategy_edge_selected"
-    )
+    assert "normal_paper_trade" not in decision.raw_response
+    assert decision.raw_response["paper_trade_selection"]["selected"] is False
+    assert decision.raw_response["entry_permission"]["granted"] is False
 
 
 def test_unresolved_expert_opposition_blocks_normal_paper_entry() -> None:

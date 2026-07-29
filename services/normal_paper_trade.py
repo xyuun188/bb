@@ -10,10 +10,11 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-07-28.normal-paper-strategy-trade.v4"
+NORMAL_PAPER_TRADE_VERSION = "2026-07-29.normal-paper-strategy-trade.v5"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v4"
 NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1"
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
+LEGACY_NORMAL_PAPER_TRADE_V4_VERSION = "2026-07-28.normal-paper-strategy-trade.v4"
 LEGACY_NORMAL_PAPER_TRADE_V3_VERSION = "2026-07-28.normal-paper-strategy-trade.v3"
 LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v3"
 LEGACY_NORMAL_PAPER_TRADE_VERSION = "2026-07-27.normal-paper-strategy-trade.v2"
@@ -142,7 +143,7 @@ def normal_paper_order_identity_reasons(
         reasons.append("normal_paper_order_identity_entry_type_invalid")
     if identity.get("production_permission") is not False:
         reasons.append("normal_paper_order_identity_production_permission_invalid")
-    if normal_paper_trade_contract_reasons(normal_contract):
+    if normal_paper_settlement_contract_reasons(normal_contract):
         reasons.append("normal_paper_order_identity_trade_contract_invalid")
     if identity.get("normal_trade_contract_fingerprint") != normal_contract.get(
         "contract_fingerprint"
@@ -272,6 +273,8 @@ def select_normal_paper_trade_side(
         for item in candidates
         if item["expected_net_return_pct"] is not None
         and float(item["expected_net_return_pct"]) > 0.0
+        and item["objective_net_return_pct"] is not None
+        and float(item["objective_net_return_pct"]) > 0.0
     ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
@@ -317,6 +320,7 @@ def build_normal_paper_trade_contract(
     support = _dict(direction_support)
     horizon = _float(support.get("prediction_horizon_minutes"), 0.0) or 0.0
     expected_net = _float(support.get("expected_net_return_pct"), None)
+    objective_net = _float(support.get("objective_net_return_pct"), None)
     if (
         normalized_side not in {"long", "short"}
         or selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS
@@ -325,6 +329,8 @@ def build_normal_paper_trade_contract(
         or horizon <= 0.0
         or expected_net is None
         or expected_net <= 0.0
+        or objective_net is None
+        or objective_net <= 0.0
     ):
         return {}
 
@@ -343,7 +349,7 @@ def build_normal_paper_trade_contract(
         "prediction_horizon_minutes": horizon,
         "valid_for_seconds": horizon * 60.0,
         "expected_net_return_pct": expected_net,
-        "objective_net_return_pct": _float(support.get("objective_net_return_pct"), None),
+        "objective_net_return_pct": objective_net,
         "loss_probability": _float(support.get("loss_probability"), None),
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
@@ -374,6 +380,11 @@ def ensure_normal_paper_trade_contract(
     if not normal_paper_trade_contract_reasons(existing):
         return existing
 
+    # A recognized historical envelope may settle an old fill, but it must not
+    # survive into the authorization path for a new submission.
+    raw.pop("normal_paper_trade", None)
+    decision.raw_response = raw
+
     selection = _dict(raw.get("paper_trade_selection"))
     support = _dict(raw.get("independent_direction_support"))
     contract = build_normal_paper_trade_contract(
@@ -385,7 +396,7 @@ def ensure_normal_paper_trade_contract(
     )
     if contract:
         raw["normal_paper_trade"] = contract
-        decision.raw_response = raw
+    decision.raw_response = raw
     return contract
 
 
@@ -418,10 +429,15 @@ def build_normal_paper_position_lifecycle(decision: Any) -> dict[str, Any]:
     }
 
 
-def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
+def _normal_strategy_trade_contract_reasons(
+    value: Any,
+    *,
+    expected_version: str,
+    require_positive_objective: bool,
+) -> list[str]:
     contract = _dict(value)
     reasons: list[str] = []
-    if contract.get("version") != NORMAL_PAPER_TRADE_VERSION:
+    if contract.get("version") != expected_version:
         reasons.append("normal_paper_trade_version_invalid")
     if contract.get("authorized") is not True:
         reasons.append("normal_paper_trade_not_authorized")
@@ -448,6 +464,11 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     expected_net = _float(contract.get("expected_net_return_pct"), None)
     if expected_net is None or expected_net <= 0.0:
         reasons.append("normal_paper_trade_expected_net_not_positive")
+    objective_net = _float(contract.get("objective_net_return_pct"), None)
+    if objective_net is None:
+        reasons.append("normal_paper_trade_objective_net_missing")
+    elif require_positive_objective and objective_net <= 0.0:
+        reasons.append("normal_paper_trade_objective_net_not_positive")
     if contract.get("uses_shared_order_pipeline") is not True:
         reasons.append("normal_paper_trade_order_pipeline_split")
     if contract.get("uses_shared_position_ledger") is not True:
@@ -476,6 +497,26 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     ):
         reasons.append("normal_paper_trade_fingerprint_mismatch")
     return list(dict.fromkeys(reasons))
+
+
+def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate the only contract allowed to authorize a new paper entry."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=True,
+    )
+
+
+def legacy_normal_paper_v4_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate a v4 envelope for settlement and recovery, never new entry."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
+        require_positive_objective=False,
+    )
 
 
 def legacy_normal_paper_v3_trade_contract_reasons(value: Any) -> list[str]:
@@ -637,3 +678,21 @@ def historical_normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     if contract.get("contract_fingerprint") != expected_fingerprint:
         reasons.append("historical_normal_paper_trade_fingerprint_mismatch")
     return list(dict.fromkeys(reasons))
+
+
+def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
+    """Validate any recognized normal-paper contract for recovery or settlement."""
+
+    contract = _dict(value)
+    version = contract.get("version")
+    if version == NORMAL_PAPER_TRADE_VERSION:
+        return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION:
+        return legacy_normal_paper_v4_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V3_VERSION:
+        return legacy_normal_paper_v3_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_VERSION:
+        return legacy_normal_paper_v2_trade_contract_reasons(contract)
+    if version == HISTORICAL_NORMAL_PAPER_TRADE_VERSION:
+        return historical_normal_paper_trade_contract_reasons(contract)
+    return normal_paper_trade_contract_reasons(contract)
