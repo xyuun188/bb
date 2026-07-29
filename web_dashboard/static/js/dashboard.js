@@ -3073,6 +3073,8 @@ function analysisLocalToolsRunStatus(status) {
         partial: '部分返回',
         unavailable: '全部不可用',
         error: '调用失败',
+        timeout: '调用超时',
+        analysis_budget_deferred: '预算未执行',
         disabled: '未启用',
         circuit_open: '暂时熔断',
     };
@@ -3092,6 +3094,10 @@ function analysisLocalToolsErrorsText(errors) {
         const text = String(raw || '').trim();
         const readable = /ReadTimeout|读取响应超时/i.test(text)
             ? '读取服务器响应超时，该轮未取得结果'
+            : /batch budget exhausted before request|inference queue exhausted the batch budget/i.test(text)
+                ? '服务器量化工具本轮预算已耗尽，后续子工具未执行'
+                : /exceeded the remaining batch budget/i.test(text)
+                    ? '服务器量化工具调用超过本轮剩余时间'
             : /ConnectTimeout|连接.*超时/i.test(text)
                 ? '连接服务器超时，该轮未取得结果'
                 : /could not reach the service|无法连接服务器量化工具/i.test(text)

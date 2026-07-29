@@ -242,8 +242,10 @@ class _AnalysisRuntimeState:
 PENDING_FEATURE_CANCEL_DRAIN_SECONDS = 0.25
 MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS = 3.0
 MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS = 1.0
+MARKET_LOCAL_ML_CONTEXT_ESTIMATE_SECONDS = 6.0
 MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
-MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 12.0
+MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
+MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 1.0
 VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
 VECTOR_MEMORY_CONTEXT_CACHE_LIMIT = 128
@@ -1027,9 +1029,10 @@ class TradingService:
         requested = (
             max(
                 MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
-                MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS,
+                MARKET_LOCAL_ML_CONTEXT_ESTIMATE_SECONDS,
             )
             + local_tools_timeout
+            + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS
             + MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS
         )
         return round(
@@ -2209,6 +2212,7 @@ class TradingService:
         deadline_monotonic: float,
         timeout_seconds: float,
         timings: list[dict[str, Any]] | None = None,
+        timeout_fallback: Any | None = None,
     ) -> Any:
         """Bound optional per-symbol context to the shared market-AI deadline."""
 
@@ -2238,7 +2242,7 @@ class TradingService:
                     timeout_seconds=round(allowed_timeout, 3),
                     remaining_seconds=round(remaining_seconds, 3),
                 )
-                return fallback
+                return timeout_fallback if timeout_fallback is not None else fallback
             return next(iter(done)).result()
         except Exception as exc:
             status = "error"
@@ -7961,6 +7965,17 @@ class TradingService:
                         timings=market_context_timings,
                     ),
                 )
+                local_tools_timeout_seconds = max(
+                    float(settings.local_ai_tools_timeout_seconds or 0.0),
+                    0.0,
+                )
+                local_tools_stage_timeout_seconds = (
+                    local_tools_timeout_seconds + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS
+                )
+                local_tools_deadline_monotonic = asyncio.get_running_loop().time() + max(
+                    local_tools_stage_timeout_seconds + MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS,
+                    0.05,
+                )
                 local_ai_tools_context = await self._bounded_market_context_value(
                     "local_ai_tools_context",
                     self._local_ai_tools_context(
@@ -7974,9 +7989,15 @@ class TradingService:
                         "status": "analysis_budget_deferred",
                         "production_permission": False,
                     },
-                    deadline_monotonic=context_deadline_monotonic,
-                    timeout_seconds=float(settings.local_ai_tools_timeout_seconds or 0.0),
+                    deadline_monotonic=local_tools_deadline_monotonic,
+                    timeout_seconds=local_tools_stage_timeout_seconds,
                     timings=market_context_timings,
+                    timeout_fallback={
+                        "enabled": bool(settings.local_ai_tools_enabled),
+                        "status": "timeout",
+                        "reason": "local_ai_tools_context_timeout",
+                        "production_permission": False,
+                    },
                 )
                 direction_competition_context = self._direction_competition_context(
                     fv,

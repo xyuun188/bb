@@ -48,6 +48,8 @@ _STATUS_CACHE_TTL_SECONDS = 8.0
 _MAX_TIMESERIES_SEQUENCE_LENGTH = 80
 _HTTP_MAX_KEEPALIVE_CONNECTIONS = 4
 _HTTP_MAX_CONNECTIONS = 8
+_BATCH_COMPLETION_RESERVE_MAX_SECONDS = 0.4
+_MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
 
 
 class LocalAIToolsClient:
@@ -146,20 +148,55 @@ class LocalAIToolsClient:
             payload["open_positions"] = self._position_payload(features, open_positions)
         payload = self._json_safe(payload)
         request_timeout = self._request_timeout()
+        completion_reserve = min(
+            _BATCH_COMPLETION_RESERVE_MAX_SECONDS,
+            max(request_timeout * 0.05, 0.01),
+        )
+        batch_deadline = monotonic() + max(
+            request_timeout - completion_reserve,
+            _MIN_INFERENCE_ATTEMPT_SECONDS,
+        )
 
         started = datetime.now(UTC)
         tool_specs = [
             ("profit_prediction", "/profit/predict"),
-            ("time_series_prediction", "/timeseries/predict"),
             ("sentiment_analysis", "/sentiment/deep/analyze"),
+            ("time_series_prediction", "/timeseries/predict"),
         ]
         if include_exit_advice and open_positions:
             tool_specs.append(("exit_advice", "/exit/advise"))
 
         async def call_tool(name: str, path: str) -> dict[str, Any]:
             tool_started = datetime.now(UTC)
+            remaining_seconds = max(batch_deadline - monotonic(), 0.0)
+            if remaining_seconds < _MIN_INFERENCE_ATTEMPT_SECONDS:
+                return {
+                    "available": False,
+                    "status": "timeout",
+                    "error": "local AI tools batch budget exhausted before request",
+                    "path": path,
+                    "duration_sec": round(
+                        max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
+                        4,
+                    ),
+                }
+            tool_timeout = min(request_timeout, remaining_seconds)
             try:
-                result = await self._post(path, payload, request_timeout=request_timeout)
+                result = await asyncio.wait_for(
+                    self._post(path, payload, request_timeout=tool_timeout),
+                    timeout=tool_timeout,
+                )
+            except TimeoutError:
+                return {
+                    "available": False,
+                    "status": "timeout",
+                    "error": "server quant tool exceeded the remaining batch budget",
+                    "path": path,
+                    "duration_sec": round(
+                        max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
+                        4,
+                    ),
+                }
             except Exception as exc:
                 return {
                     "available": False,
@@ -181,25 +218,50 @@ class LocalAIToolsClient:
             )
             return item
 
-        # Market and position analysis run independently. Without one shared
-        # client-side queue, their batches can overlap and overload the quant
-        # service. The three market inference routes are independent and run
-        # concurrently inside the one admitted batch; optional exit advice stays
-        # sequential because it is only needed for position review.
+        # The model server runs these CPU-heavy routes in one process. Running
+        # them concurrently increases total latency enough to exhaust the market
+        # analysis deadline. Serialize both batches and routes, and let every
+        # later route use only the remaining batch budget so completed evidence
+        # survives a slow child model.
         results: list[dict[str, Any]] = []
-        async with self._inference_lock:
-            core_specs = tool_specs[:3]
-            results.extend(
-                await asyncio.gather(*(call_tool(name, path) for name, path in core_specs))
-            )
-            for name, path in tool_specs[len(core_specs) :]:
-                results.append(await call_tool(name, path))
+        lock_acquired = False
+        queue_started = monotonic()
+        queue_wait_seconds = 0.0
+        try:
+            lock_timeout = max(batch_deadline - monotonic(), 0.0)
+            if lock_timeout >= _MIN_INFERENCE_ATTEMPT_SECONDS:
+                try:
+                    await asyncio.wait_for(self._inference_lock.acquire(), timeout=lock_timeout)
+                    lock_acquired = True
+                except TimeoutError:
+                    pass
+            queue_wait_seconds = max(monotonic() - queue_started, 0.0)
+            if lock_acquired:
+                for name, path in tool_specs:
+                    results.append(await call_tool(name, path))
+            else:
+                results.extend(
+                    {
+                        "available": False,
+                        "status": "timeout",
+                        "error": "local AI tools inference queue exhausted the batch budget",
+                        "path": path,
+                        "duration_sec": 0.0001,
+                    }
+                    for _name, path in tool_specs
+                )
+        finally:
+            if lock_acquired:
+                self._inference_lock.release()
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",
             "api_base": self._public_api_base(),
             "started_at": started.isoformat(),
             "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
+            "execution_mode": "sequential_cpu_bound",
+            "batch_budget_seconds": round(request_timeout, 3),
+            "queue_wait_seconds": round(queue_wait_seconds, 4),
         }
         errors: dict[str, str] = {}
         for (name, _path), item in zip(tool_specs, results, strict=False):

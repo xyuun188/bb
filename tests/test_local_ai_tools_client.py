@@ -113,7 +113,7 @@ async def test_local_ai_tools_circuit_breaker_recovers_after_cooldown(
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_second_cap(
+async def test_local_ai_tools_enrich_shares_configured_timeout_across_serial_routes(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,14 +134,18 @@ async def test_local_ai_tools_enrich_uses_configured_timeout_without_three_secon
     result = await client.enrich_with_context({"symbol": "BTC/USDT"})
 
     assert result["status"] == "completed"
-    assert timeouts == [8.0, 8.0, 8.0]
+    assert len(timeouts) == 3
+    assert all(timeout is not None and 0 < timeout <= 8.0 for timeout in timeouts)
+    assert timeouts == sorted(timeouts, reverse=True)
+    assert result["execution_mode"] == "sequential_cpu_bound"
+    assert result["batch_budget_seconds"] == 8.0
     assert result["profit_prediction"]["duration_sec"] > 0
     assert result["time_series_prediction"]["duration_sec"] > 0
     assert result["sentiment_analysis"]["duration_sec"] > 0
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_serializes_batches_but_parallelizes_market_inference(
+async def test_local_ai_tools_serializes_batches_and_cpu_bound_routes(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,10 +176,45 @@ async def test_local_ai_tools_serializes_batches_but_parallelizes_market_inferen
 
     assert first["status"] == "completed"
     assert second["status"] == "completed"
-    assert max_active_calls == 3
+    assert max_active_calls == 1
     assert len(calls) == 6
     symbols = [symbol for symbol, _path in calls]
     assert sum(left != right for left, right in zip(symbols, symbols[1:], strict=False)) == 1
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_keeps_completed_results_when_later_route_exhausts_budget(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 0.2)
+    client = LocalAIToolsClient()
+    calls: list[str] = []
+
+    async def slow_timeseries(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del payload
+        calls.append(path)
+        if path == "/timeseries/predict":
+            await asyncio.sleep(1.0)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post", slow_timeseries)
+
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+
+    assert result["status"] == "partial"
+    assert result["profit_prediction"]["available"] is True
+    assert result["sentiment_analysis"]["available"] is True
+    assert result["time_series_prediction"]["status"] == "timeout"
+    assert calls == [
+        "/profit/predict",
+        "/sentiment/deep/analyze",
+        "/timeseries/predict",
+    ]
 
 
 def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> None:

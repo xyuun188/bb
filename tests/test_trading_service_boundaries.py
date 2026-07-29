@@ -5113,9 +5113,9 @@ def test_market_symbol_context_and_model_budgets_are_independent(
     monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
     monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
 
-    assert service.market_symbol_context_timeout_seconds() == pytest.approx(11.25)
+    assert service.market_symbol_context_timeout_seconds() == pytest.approx(16.25)
     assert service.market_model_inference_timeout_seconds() == pytest.approx(48.0)
-    assert service.market_symbol_total_budget_seconds() == pytest.approx(59.25)
+    assert service.market_symbol_total_budget_seconds() == pytest.approx(64.25)
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
@@ -5664,6 +5664,31 @@ async def test_market_context_stage_uses_shared_deadline_and_fallback() -> None:
     assert cancelled is True
     assert timings[0]["status"] == "timeout"
     assert timings[0]["allowed_timeout_seconds"] == 0.02
+
+
+@pytest.mark.asyncio
+async def test_market_context_stage_distinguishes_timeout_from_budget_defer() -> None:
+    service = TradingService.__new__(TradingService)
+    timings: list[dict[str, Any]] = []
+
+    async def slow_context() -> dict[str, Any]:
+        await asyncio.sleep(60)
+        return {"status": "late"}
+
+    deferred = {"status": "analysis_budget_deferred"}
+    timed_out = {"status": "timeout", "reason": "local_ai_tools_context_timeout"}
+    result = await service._bounded_market_context_value(
+        "local_ai_tools_context",
+        slow_context(),
+        deferred,
+        deadline_monotonic=asyncio.get_running_loop().time() + 0.5,
+        timeout_seconds=0.02,
+        timings=timings,
+        timeout_fallback=timed_out,
+    )
+
+    assert result == timed_out
+    assert timings[0]["status"] == "timeout"
 
 
 @pytest.mark.asyncio

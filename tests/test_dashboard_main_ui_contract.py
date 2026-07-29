@@ -1639,9 +1639,13 @@ def test_analysis_local_ai_tool_partial_errors_are_readable_chinese() -> None:
     block = script[start:end]
 
     assert "partial: '部分返回'" in block
+    assert "timeout: '调用超时'" in block
+    assert "analysis_budget_deferred: '预算未执行'" in block
     assert "time_series_prediction: '时序预测'" in block
     assert "sentiment_analysis: '情绪模型'" in block
     assert "读取服务器响应超时，该轮未取得结果" in block
+    assert "服务器量化工具本轮预算已耗尽，后续子工具未执行" in block
+    assert "服务器量化工具调用超过本轮剩余时间" in block
     assert "JSON.stringify(tools.errors)" not in block
     assert "analysisLocalToolsErrorsText(tools.errors)" in block
 
