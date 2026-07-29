@@ -8,16 +8,64 @@ do not mix local Position fragments with exchange history semantics.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 
+from config.settings import settings
 from core.symbols import normalize_trading_symbol, symbol_from_okx_inst_id
 from models.trade import OkxPositionHistory
 
 _EXISTING_RECORD_NOT_LOADED = object()
+
+
+def okx_position_history_watermark_path(mode: str) -> Path:
+    selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    return (
+        settings.data_dir
+        / "dashboard_read_models"
+        / f"okx_position_history_{selected_mode}.watermark"
+    )
+
+
+def publish_okx_position_history_watermark(
+    mode: str,
+    *,
+    changed_at: datetime | None = None,
+) -> datetime:
+    value = changed_at or datetime.now(UTC)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    value = value.astimezone(UTC)
+    current = load_okx_position_history_watermark(mode)
+    if current is not None and current >= value:
+        return current
+    path = okx_position_history_watermark_path(mode)
+    temporary = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        temporary.write_text(value.isoformat(), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return value
+
+
+def load_okx_position_history_watermark(mode: str | None) -> datetime | None:
+    if mode not in {"paper", "live"}:
+        return None
+    path = okx_position_history_watermark_path(mode)
+    try:
+        value = datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def okx_position_history_row_identity(row: dict[str, Any], *, mode: str | None = None) -> str:

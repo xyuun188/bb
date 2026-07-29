@@ -1312,6 +1312,7 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     pos_id = "band-pos-3714144287308087298"
     entry_fee = 0.0366182
     official_realized_pnl = 1.245640902389385
+    official_updated_at = datetime(2026, 7, 5, 23, 22, 36, tzinfo=UTC)
     partial_closes = (
         ("band-close-203", 203.0, 0.1650, 0.6034309734513242, 0.0167475, 16, 59, 55),
         ("band-close-112", 112.0, 0.1645, 0.2769274336283168, 0.0092120, 17, 16, 10),
@@ -1334,9 +1335,7 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
                 "pnl": "1.333852212389385",
                 "lever": "2.0",
                 "cTime": "1783192525444",
-                "uTime": str(
-                    int(datetime(2026, 7, 5, 23, 22, 36, tzinfo=UTC).timestamp() * 1000)
-                ),
+                "uTime": str(int(official_updated_at.timestamp() * 1000)),
             }
         ]
 
@@ -1461,6 +1460,8 @@ async def test_dashboard_position_history_groups_okx_partial_closes_by_position_
     row = payload["positions"][0]
     assert row["symbol"] == "BAND/USDT"
     assert row["close_status"] == "partial"
+    assert row["closed_at"] == official_updated_at.isoformat()
+    assert row["history_event_at"] == official_updated_at.isoformat()
     assert row["close_status_label"] == "部分平仓"
     assert row["quantity"] == pytest.approx(410.0)
     assert row["max_position_quantity"] == pytest.approx(452.0)
@@ -1911,6 +1912,9 @@ async def test_dashboard_position_history_keeps_reused_posid_lifecycles_and_part
     assert [row["symbol"] for row in rows] == ["JUP/USDT", "ICP/USDT"]
 
     jup_row = rows[0]
+    assert jup_row["close_status"] == "partial"
+    assert jup_row["closed_at"] == jup_close_d.isoformat()
+    assert jup_row["history_event_at"] == jup_close_d.isoformat()
     assert jup_row["quantity"] == pytest.approx(90.0)
     assert jup_row["max_position_quantity"] == pytest.approx(110.0)
     assert jup_row["realized_pnl"] == pytest.approx(0.423237822727263)
@@ -1922,6 +1926,9 @@ async def test_dashboard_position_history_keeps_reused_posid_lifecycles_and_part
     }
 
     icp_row = rows[1]
+    assert icp_row["close_status"] == "partial"
+    assert icp_row["closed_at"] == icp_close_c.isoformat()
+    assert icp_row["history_event_at"] == icp_close_c.isoformat()
     assert icp_row["quantity"] == pytest.approx(29.984)
     assert icp_row["max_position_quantity"] == pytest.approx(35.97)
     assert icp_row["realized_pnl"] == pytest.approx(0.7160030259843799)

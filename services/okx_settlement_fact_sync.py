@@ -27,7 +27,9 @@ from services.okx_native_facts import (
     OkxNativeFactsClient,
 )
 from services.okx_position_history_store import (
+    load_okx_position_history_watermark,
     okx_position_history_row_identity,
+    publish_okx_position_history_watermark,
     upsert_okx_position_history_row,
 )
 
@@ -240,6 +242,19 @@ class OkxSettlementFactSyncService:
             history_rows,
             checked_at=started_at,
         )
+        if (
+            history_stats["inserted"]
+            or history_stats["updated"]
+            or load_okx_position_history_watermark(self.mode) is None
+        ):
+            try:
+                publish_okx_position_history_watermark(self.mode, changed_at=started_at)
+            except OSError as exc:
+                logger.warning(
+                    "OKX position history dashboard watermark publish failed",
+                    mode=self.mode,
+                    error=safe_error_text(exc, limit=160),
+                )
         bill_stats, bill_samples = await self._persist_account_bills(
             account_bills,
             checked_at=started_at,

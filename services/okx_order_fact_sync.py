@@ -53,6 +53,8 @@ DEFAULT_LIMIT = 500
 DEFAULT_TIMEOUT_SECONDS = 8.0
 ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS = 1.0
 ORDER_FACT_SYNC_MAX_PERSISTENCE_RESERVE_SECONDS = 1.5
+ORDER_FACT_SYNC_DB_LOCK_TIMEOUT_MILLISECONDS = 1500
+ORDER_FACT_SYNC_DB_STATEMENT_TIMEOUT_MILLISECONDS = 10000
 DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 4
 DEFAULT_MAX_ORDER_GAP_QUERIES = 4
 ACCOUNT_HISTORY_MAX_PAGES = 5
@@ -198,9 +200,12 @@ class OkxOrderFactSyncService:
         )
 
     async def sync(self) -> dict[str, Any]:
-        if not str(settings.database_url or "").startswith("postgresql"):
-            return await self._sync_with_hard_deadline()
+        operation = self._sync_single_writer
+        if str(settings.database_url or "").startswith("postgresql"):
+            operation = self._sync_with_postgres_writer_lock
+        return await self._sync_with_hard_deadline(operation)
 
+    async def _sync_with_postgres_writer_lock(self) -> dict[str, Any]:
         lock_key = ORDER_FACT_SYNC_ADVISORY_LOCK_BASE + (1 if self.mode == "live" else 0)
         async with get_session_ctx() as lock_session:
             acquired = bool(
@@ -227,21 +232,27 @@ class OkxOrderFactSyncService:
                         },
                     ),
                 ).as_dict()
+            # The advisory lock is session-scoped. End the implicit SQLAlchemy
+            # transaction so a long sync is never idle in transaction.
+            await lock_session.commit()
             try:
-                return await self._sync_with_hard_deadline()
+                return await self._sync_single_writer()
             finally:
                 await lock_session.execute(
                     text("SELECT pg_advisory_unlock(:lock_key)"),
                     {"lock_key": lock_key},
                 )
 
-    async def _sync_with_hard_deadline(self) -> dict[str, Any]:
+    async def _sync_with_hard_deadline(
+        self,
+        operation: Any | None = None,
+    ) -> dict[str, Any]:
         hard_deadline_seconds = (
             self.timeout_seconds + ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS
         )
         try:
             return await asyncio.wait_for(
-                self._sync_single_writer(),
+                (operation or self._sync_single_writer)(),
                 timeout=hard_deadline_seconds,
             )
         except TimeoutError:
@@ -264,6 +275,34 @@ class OkxOrderFactSyncService:
                         "kind": "order_fact_sync_hard_deadline",
                         "mode": self.mode,
                         "hard_deadline_seconds": round(hard_deadline_seconds, 3),
+                    },
+                ),
+            ).as_dict()
+        except Exception as exc:
+            timeout_stage = _database_timeout_stage(exc)
+            if timeout_stage is None:
+                raise
+            error = safe_error_text(exc, limit=180)
+            logger.warning(
+                "OKX order fact sync database operation deferred",
+                mode=self.mode,
+                stage=timeout_stage,
+                error=error,
+            )
+            return OkxOrderFactSyncSummary(
+                status="deferred",
+                mode=self.mode,
+                source="okx_native_orders_and_fills",
+                phase3_order_sync_start=self.phase3_order_sync_start,
+                checked_at=datetime.now(UTC),
+                okx_pull_available=True,
+                deferred_stages=(timeout_stage,),
+                error=f"order_fact_sync_{timeout_stage}",
+                samples=(
+                    {
+                        "kind": "order_fact_sync_database_timeout",
+                        "mode": self.mode,
+                        "stage": timeout_stage,
                     },
                 ),
             ).as_dict()
@@ -703,6 +742,7 @@ class OkxOrderFactSyncService:
             algo_rows=protection_algo_rows,
         )
         async with get_session_ctx() as session:
+            await _configure_order_fact_write_transaction(session)
             writable_orders = await self._load_writable_refresh_orders(
                 session,
                 since_naive,
@@ -874,6 +914,7 @@ class OkxOrderFactSyncService:
         initial_samples: list[dict[str, Any]],
     ) -> dict[str, Any]:
         async with get_session_ctx() as session:
+            await _configure_order_fact_write_transaction(session)
             writable_orders = await self._load_writable_refresh_orders(
                 session,
                 since_naive,
@@ -929,6 +970,7 @@ class OkxOrderFactSyncService:
         self,
     ) -> tuple[int, list[dict[str, Any]]]:
         async with get_session_ctx() as session:
+            await _configure_order_fact_write_transaction(session)
             orders = await self._load_stored_slippage_refresh_orders(session)
             samples: list[dict[str, Any]] = []
             refreshed_count = 0
@@ -1100,6 +1142,7 @@ class OkxOrderFactSyncService:
 
         fills_by_order_id = {fill.order_id: fill for fill in fills if fill.order_id}
         async with get_session_ctx() as session:
+            await _configure_order_fact_write_transaction(session)
             writable_orders = await self._load_writable_refresh_orders(
                 session,
                 since_naive,
@@ -3402,6 +3445,44 @@ def _datetime_from_ms(value: Any) -> datetime | None:
         return datetime.fromtimestamp(timestamp_ms / 1000.0, UTC)
     except (OSError, OverflowError, ValueError):
         return None
+
+
+async def _configure_order_fact_write_transaction(session: Any) -> None:
+    if not str(settings.database_url or "").startswith("postgresql"):
+        return
+    await session.execute(
+        text("SELECT set_config('lock_timeout', :value, true)"),
+        {"value": f"{ORDER_FACT_SYNC_DB_LOCK_TIMEOUT_MILLISECONDS}ms"},
+    )
+    await session.execute(
+        text("SELECT set_config('statement_timeout', :value, true)"),
+        {"value": f"{ORDER_FACT_SYNC_DB_STATEMENT_TIMEOUT_MILLISECONDS}ms"},
+    )
+
+
+def _database_timeout_stage(exc: BaseException) -> str | None:
+    current: BaseException | None = exc
+    messages: list[str] = []
+    sqlstates: set[str] = set()
+    while current is not None:
+        messages.append(str(current).lower())
+        for attribute in ("sqlstate", "pgcode"):
+            value = getattr(current, attribute, None)
+            if value:
+                sqlstates.add(str(value))
+        next_exc = getattr(current, "orig", None) or current.__cause__ or current.__context__
+        current = next_exc if isinstance(next_exc, BaseException) and next_exc is not current else None
+    message = " | ".join(messages)
+    if "55p03" in sqlstates or "lock timeout" in message or "lock_not_available" in message:
+        return "database_lock_timeout"
+    if (
+        "57014" in sqlstates
+        or "statement timeout" in message
+        or "query_canceled" in message
+        or "canceling statement due to statement timeout" in message
+    ):
+        return "database_statement_timeout"
+    return None
 
 
 async def _bounded(awaitable: Any, timeout_seconds: float) -> Any:

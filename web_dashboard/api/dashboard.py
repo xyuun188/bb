@@ -113,7 +113,7 @@ _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
-_DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 1
+_DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 2
 _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
     "okx_confirmed",
@@ -3266,8 +3266,18 @@ async def _dashboard_closed_position_ledger_rows(
     page_size: int = 20,
     paginate: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int, int, str]:
+    from services.okx_position_history_store import load_okx_position_history_watermark
+
     cache_key = _dashboard_closed_ledger_cache_key(mode, model_names)
     cached = _dashboard_heavy_cache.get(cache_key)
+    history_watermark = load_okx_position_history_watermark(mode)
+    if (
+        cached is not None
+        and history_watermark is not None
+        and cached[0] < history_watermark
+    ):
+        _dashboard_heavy_cache.pop(cache_key, None)
+        cached = None
     if cached is not None:
         cached_at, payload = cached
         age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
@@ -3477,6 +3487,8 @@ def _load_dashboard_closed_ledger_snapshot(
     mode: str | None,
     model_names: tuple[str, ...] | None,
 ) -> tuple[datetime, tuple[list[dict[str, Any]], int, int, int, str]] | None:
+    from services.okx_position_history_store import load_okx_position_history_watermark
+
     path = _dashboard_closed_ledger_snapshot_path(mode=mode, model_names=model_names)
     if path is None or not path.exists():
         return None
@@ -3485,8 +3497,11 @@ def _load_dashboard_closed_ledger_snapshot(
         if int(document.get("version") or 0) != _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION:
             return None
         generated_at = _as_utc_datetime(document.get("generated_at"))
+        history_watermark = load_okx_position_history_watermark(mode)
         raw_payload = document.get("payload")
         if generated_at is None or not isinstance(raw_payload, list) or len(raw_payload) != 5:
+            return None
+        if history_watermark is not None and generated_at < history_watermark:
             return None
         if (
             datetime.now(UTC) - generated_at
@@ -3934,8 +3949,7 @@ async def _dashboard_position_history_rows(
     ]
     combined_rows = sorted(
         [*settled_rows, *pending_rows],
-        key=lambda row: _as_utc_datetime(row.get("closed_at"))
-        or datetime.min.replace(tzinfo=UTC),
+        key=_dashboard_position_history_event_at,
         reverse=True,
     )
     total = len(combined_rows)
@@ -3953,6 +3967,15 @@ async def _dashboard_position_history_rows(
         ledger_source,
         len(settled_rows),
         len(pending_rows),
+    )
+
+
+def _dashboard_position_history_event_at(row: dict[str, Any]) -> datetime:
+    return (
+        _as_utc_datetime(row.get("history_event_at"))
+        or _as_utc_datetime(row.get("closed_at"))
+        or _as_utc_datetime(row.get("official_updated_at"))
+        or datetime.min.replace(tzinfo=UTC)
     )
 
 
@@ -4828,7 +4851,7 @@ def _dashboard_position_history_official_rows_as_groups_legacy(
             status, status_label = "partial", "部分平仓"
         opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
         updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
-        closed_at = None if status == "partial" else updated_at
+        closed_at = updated_at
         close_quantity = _dashboard_position_history_quantity_in_base_units(
             row.get("closeTotalPos"),
             payload,
@@ -4885,6 +4908,7 @@ def _dashboard_position_history_official_rows_as_groups_legacy(
                 "settlement_status": "okx_position_history",
                 "opened_at": opened_at.isoformat() if opened_at else payload.get("opened_at"),
                 "closed_at": closed_at.isoformat() if closed_at else None,
+                "history_event_at": closed_at.isoformat() if closed_at else None,
                 "official_updated_at": updated_at.isoformat() if updated_at else None,
                 "ledger_source": "okx_positions_history_official",
                 "okx_position_history_row": dict(row),
@@ -4991,7 +5015,9 @@ def _dashboard_position_history_official_rows_as_groups(
         elif authoritative_full:
             status = "full"
             status_label = _dashboard_position_history_status_label(status)
-        closed_at = None if status == "partial" else updated_at
+        # A partial history row is still a realized close event. Its status
+        # describes the remaining lifecycle; it must not erase OKX's event time.
+        closed_at = updated_at
         realized_pnl = _safe_float(row.get("realizedPnl"), 0.0) or 0.0
         pnl_ratio = _safe_float(row.get("pnlRatio"), None)
         if pnl_ratio is not None:
@@ -5045,6 +5071,7 @@ def _dashboard_position_history_official_rows_as_groups(
                 "realized_pnl_formula": "okx_position_history_realized_pnl_authoritative",
                 "opened_at": opened_at.isoformat() if opened_at else None,
                 "closed_at": closed_at.isoformat() if closed_at else None,
+                "history_event_at": closed_at.isoformat() if closed_at else None,
                 "official_updated_at": updated_at.isoformat() if updated_at else None,
                 "position_ids": _dashboard_position_history_matching_position_ids(
                     row,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,7 @@ from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import Position
+from services import okx_position_history_store as position_history_store
 from web_dashboard.api import dashboard
 
 
@@ -58,6 +60,43 @@ async def test_closed_ledger_read_model_builds_once_across_pages(
     assert second[:4] == ([{"row": 3}], 3, 2, 2)
     assert full[0] == [{"row": 1}, {"row": 2}, {"row": 3}]
     assert builds["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_closed_ledger_rebuilds_when_okx_history_watermark_is_newer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
+    cache_key = dashboard._dashboard_closed_ledger_cache_key("paper", None)
+    cached_at = datetime.now(UTC) - timedelta(minutes=2)
+    dashboard._dashboard_heavy_cache[cache_key] = (
+        cached_at,
+        ([{"build": "stale"}], 1, 1, 1, "okx_authoritative"),
+    )
+    monkeypatch.setattr(
+        position_history_store,
+        "load_okx_position_history_watermark",
+        lambda _mode: cached_at + timedelta(minutes=1),
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_load_dashboard_closed_ledger_snapshot",
+        lambda **_kwargs: None,
+    )
+
+    async def fake_build(*_args: Any, **_kwargs: Any):
+        return ([{"build": "fresh"}], 1, 1, 1, "okx_authoritative")
+
+    monkeypatch.setattr(dashboard, "_dashboard_closed_position_ledger_rows_uncached", fake_build)
+
+    result = await dashboard._dashboard_closed_position_ledger_rows(
+        object(),
+        object(),
+        mode="paper",
+    )
+
+    assert result[0] == [{"build": "fresh"}]
+    dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
 
 
 @pytest.mark.asyncio
@@ -433,6 +472,36 @@ def test_closed_ledger_snapshot_round_trip(
     assert loaded is not None
     _generated_at, loaded_payload = loaded
     assert loaded_payload == payload
+
+
+def test_closed_ledger_snapshot_rejects_older_okx_history_watermark(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_path = tmp_path / "closed_position_ledger_paper.json"
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_closed_ledger_snapshot_path",
+        lambda **_kwargs: snapshot_path,
+    )
+    dashboard._persist_dashboard_closed_ledger_snapshot(
+        ([{"row": "stale"}], 1, 1, 1, "okx_authoritative"),
+        mode="paper",
+        model_names=None,
+    )
+    generated_at = datetime.fromisoformat(
+        json.loads(snapshot_path.read_text(encoding="utf-8"))["generated_at"]
+    )
+    monkeypatch.setattr(
+        position_history_store,
+        "load_okx_position_history_watermark",
+        lambda _mode: generated_at + timedelta(seconds=1),
+    )
+
+    assert dashboard._load_dashboard_closed_ledger_snapshot(
+        mode="paper",
+        model_names=None,
+    ) is None
 
 
 def test_official_history_matches_only_instrument_scoped_rows(

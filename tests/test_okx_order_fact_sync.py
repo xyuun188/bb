@@ -28,6 +28,8 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_ORDER_DETAIL_CONFIRMED,
     OkxOrderFactSyncService,
     _build_contract_size_catalog,
+    _configure_order_fact_write_transaction,
+    _database_timeout_stage,
     _dedupe_fills_by_order_id,
     _prioritized_exchange_order_ids,
     _rebuild_stored_slippage_fact,
@@ -56,7 +58,11 @@ class _StatementCaptureSession:
     def __init__(self) -> None:
         self.statements: list[Any] = []
 
-    async def execute(self, statement: Any) -> _EmptyRowsResult:
+    async def execute(
+        self,
+        statement: Any,
+        params: dict[str, Any] | None = None,
+    ) -> _EmptyRowsResult:
         self.statements.append(statement)
         return _EmptyRowsResult()
 
@@ -65,10 +71,14 @@ class _AdvisoryLockSession:
     def __init__(self, values: list[Any]) -> None:
         self.values = list(values)
         self.calls: list[tuple[Any, dict[str, Any]]] = []
+        self.commit_count = 0
 
     async def execute(self, statement: Any, params: dict[str, Any]) -> _ScalarResult:
         self.calls.append((statement, params))
         return _ScalarResult(self.values.pop(0) if self.values else None)
+
+    async def commit(self) -> None:
+        self.commit_count += 1
 
 
 class _FakeCcxt:
@@ -305,6 +315,7 @@ async def test_postgres_single_writer_lock_defers_overlapping_sync(
     assert report["status"] == "deferred"
     assert report["deferred_stages"] == ["single_writer_lock"]
     assert len(lock_session.calls) == 1
+    assert lock_session.commit_count == 0
 
 
 @pytest.mark.asyncio
@@ -331,6 +342,7 @@ async def test_postgres_single_writer_lock_is_released_after_sync_failure(
 
     assert len(lock_session.calls) == 2
     assert "pg_advisory_unlock" in str(lock_session.calls[1][0])
+    assert lock_session.commit_count == 1
 
 
 @pytest.mark.asyncio
@@ -389,6 +401,66 @@ async def test_postgres_hard_deadline_cancels_sync_and_releases_writer_lock(
     assert len(lock_session.calls) == 2
     assert "pg_advisory_unlock" in str(lock_session.calls[1][0])
     assert events == ["cancelled", "unlock"]
+    assert lock_session.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_hard_deadline_includes_writer_lock_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_wait_cancelled = asyncio.Event()
+
+    class SlowLockSession:
+        async def execute(self, _statement: Any, _params: dict[str, Any]) -> _ScalarResult:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                lock_wait_cancelled.set()
+            return _ScalarResult(False)
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield SlowLockSession()
+
+    service = OkxOrderFactSyncService(mode="paper")
+    service.timeout_seconds = 0.01
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
+    monkeypatch.setattr(
+        order_fact_sync_module,
+        "ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(order_fact_sync_module, "get_session_ctx", fake_session_ctx)
+
+    report = await service.sync()
+
+    assert lock_wait_cancelled.is_set() is True
+    assert report["status"] == "deferred"
+    assert report["deferred_stages"] == ["hard_deadline"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_order_fact_writes_configure_bounded_database_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _StatementCaptureSession()
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
+
+    await _configure_order_fact_write_transaction(session)
+
+    statements = [str(statement) for statement in session.statements]
+    assert any("lock_timeout" in statement for statement in statements)
+    assert any("statement_timeout" in statement for statement in statements)
+
+
+def test_database_timeout_stage_classifies_postgres_lock_and_statement_timeouts() -> None:
+    assert _database_timeout_stage(RuntimeError("canceling statement due to lock timeout")) == (
+        "database_lock_timeout"
+    )
+    assert _database_timeout_stage(
+        RuntimeError("canceling statement due to statement timeout")
+    ) == "database_statement_timeout"
+    assert _database_timeout_stage(RuntimeError("unrelated failure")) is None
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,12 @@ from config.settings import settings
 from db.session import close_db, get_engine, get_session_ctx, init_db
 from models.account import OkxAccountBill
 from models.trade import OkxPositionHistory
+from services import okx_position_history_store as position_history_store
+from services import okx_settlement_fact_sync as settlement_fact_sync_module
+from services.okx_position_history_store import (
+    load_okx_position_history_watermark,
+    publish_okx_position_history_watermark,
+)
 from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 
 
@@ -104,7 +110,31 @@ async def _init_test_db(tmp_path, monkeypatch: pytest.MonkeyPatch, name: str) ->
         "database_url",
         f"sqlite+aiosqlite:///{(tmp_path / name).as_posix()}",
     )
+    monkeypatch.setattr(
+        settlement_fact_sync_module,
+        "load_okx_position_history_watermark",
+        lambda _mode: datetime.now(UTC),
+    )
     await init_db()
+
+
+def test_position_history_watermark_is_atomic_and_monotonic(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history.watermark"
+    monkeypatch.setattr(
+        position_history_store,
+        "okx_position_history_watermark_path",
+        lambda _mode: path,
+    )
+    first = datetime(2026, 7, 29, 5, 0, tzinfo=UTC)
+    second = first + timedelta(minutes=1)
+
+    assert publish_okx_position_history_watermark("paper", changed_at=second) == second
+    assert publish_okx_position_history_watermark("paper", changed_at=first) == second
+    assert load_okx_position_history_watermark("paper") == second
+    assert list(tmp_path.glob("*.tmp.*")) == []
 
 
 @pytest.mark.asyncio

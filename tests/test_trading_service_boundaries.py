@@ -603,31 +603,9 @@ async def test_okx_order_fact_sync_background_backs_off_after_degraded_result() 
 
 
 @pytest.mark.asyncio
-async def test_okx_background_fact_syncs_are_serialized_before_operation_start() -> None:
-    service = TradingService.__new__(TradingService)
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-    second_started = asyncio.Event()
-
-    async def first_operation() -> str:
-        first_started.set()
-        await release_first.wait()
-        return "first"
-
-    async def second_operation() -> str:
-        second_started.set()
-        return "second"
-
-    first_task = asyncio.create_task(service._run_serialized_okx_fact_sync(first_operation))
-    await asyncio.wait_for(first_started.wait(), timeout=1.0)
-    second_task = asyncio.create_task(service._run_serialized_okx_fact_sync(second_operation))
-    await asyncio.sleep(0)
-
-    assert second_started.is_set() is False
-
-    release_first.set()
-    assert await asyncio.wait_for(first_task, timeout=1.0) == "first"
-    assert await asyncio.wait_for(second_task, timeout=1.0) == "second"
+async def test_okx_background_fact_syncs_do_not_share_a_process_lock() -> None:
+    assert not hasattr(TradingService, "_run_serialized_okx_fact_sync")
+    assert not hasattr(TradingService, "_okx_fact_sync_serialization_lock")
 
 
 @pytest.mark.asyncio

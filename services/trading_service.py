@@ -1186,17 +1186,6 @@ class TradingService:
 
         return 10.0
 
-    def _okx_fact_sync_serialization_lock(self) -> asyncio.Lock:
-        lock = getattr(self, "_okx_fact_sync_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._okx_fact_sync_lock = lock
-        return lock
-
-    async def _run_serialized_okx_fact_sync(self, operation: Any) -> Any:
-        async with self._okx_fact_sync_serialization_lock():
-            return await operation()
-
     def _okx_authoritative_sync_status_payload(
         self,
         now: datetime | None = None,
@@ -1595,15 +1584,13 @@ class TradingService:
             }
         mode = "live" if mode_manager.mode.value == "live" else "paper"
         account_discovery = self._okx_order_fact_account_discovery_due()
-        report = await self._run_serialized_okx_fact_sync(
-            lambda: factory(
-                mode=mode,
-                lookback_hours=24,
-                limit=100,
-                priority_only=not account_discovery,
-                timeout_seconds=self.okx_order_fact_sync_timeout_seconds(),
-            ).sync()
-        )
+        report = await factory(
+            mode=mode,
+            lookback_hours=24,
+            limit=100,
+            priority_only=not account_discovery,
+            timeout_seconds=self.okx_order_fact_sync_timeout_seconds(),
+        ).sync()
         report = dict(report if isinstance(report, dict) else {})
         report["sync_scope"] = "account_discovery" if account_discovery else "priority"
         status = str(report.get("status") or "unknown").lower()
@@ -1767,15 +1754,13 @@ class TradingService:
             self._okx_settlement_fact_sync_last_started_at = started_at
             try:
                 mode = "live" if mode_manager.mode.value == "live" else "paper"
-                row = await self._run_serialized_okx_fact_sync(
-                    lambda factory=factory, mode=mode: factory(
-                        mode=mode,
-                        lookback_hours=72,
-                        limit=100,
-                        max_pages=5,
-                        timeout_seconds=8.0,
-                    ).sync_once()
-                )
+                row = await factory(
+                    mode=mode,
+                    lookback_hours=72,
+                    limit=100,
+                    max_pages=5,
+                    timeout_seconds=8.0,
+                ).sync_once()
                 if not isinstance(row, dict):
                     row = {
                         "status": "degraded",
@@ -1878,13 +1863,11 @@ class TradingService:
             self._okx_position_settlement_sync_last_started_at = started_at
             try:
                 mode = "live" if mode_manager.mode.value == "live" else "paper"
-                row = await self._run_serialized_okx_fact_sync(
-                    lambda factory=factory, mode=mode: factory(
-                        mode=mode,
-                        retry_seconds=self.okx_position_settlement_sync_interval_seconds(),
-                        limit=10,
-                    ).sync_once()
-                )
+                row = await factory(
+                    mode=mode,
+                    retry_seconds=self.okx_position_settlement_sync_interval_seconds(),
+                    limit=10,
+                ).sync_once()
                 self._okx_position_settlement_sync_last_row = row
                 self._okx_position_settlement_sync_last_error = None
                 self._okx_position_settlement_sync_success_count = (
