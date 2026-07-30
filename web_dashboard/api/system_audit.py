@@ -4596,6 +4596,19 @@ def _issue_ledger_state(
         return "observing", "历史交易事实只读隔离 / 当前交易与训练不受阻断"
     if status == "warning" and bool(details.get("observing")):
         return "observing", "观察项 / 受控阶段或预热中"
+    if key == "production_source_health" and status == "warning":
+        controlled_paper_observation = bool(
+            details.get("recovery_state") == "normal_paper_trading"
+            and str(details.get("reason") or "")
+            in {
+                "continuous_no_normal_paper_candidate",
+                "live_production_permission_disabled",
+            }
+            and not details.get("error")
+            and not bool(details.get("hard_failure"))
+        )
+        if controlled_paper_observation:
+            return "observing", "观察项 / 模拟盘持续训练中，等待新的合格候选"
     if (
         key == "model_training"
         and status == "warning"

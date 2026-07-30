@@ -169,6 +169,74 @@ async def test_phase3_okx_fact_sync_apply_runs_order_fact_sync(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery_order_id = "3785286327831597056"
+    protection_order_id = "3786076389078962176"
+    reports = [
+        {
+            **_report("warning"),
+            "cards": [
+                {
+                    "key": "okx_trade_fact_integrity",
+                    "details": {
+                        "okx_authoritative_sync": {
+                            "issues": [
+                                {
+                                    "kind": "okx_fill_missing_local_order",
+                                    "exchange_order_id": recovery_order_id,
+                                },
+                                {
+                                    "kind": "okx_linked_protection_fill_missing_local_order",
+                                    "exchange_order_id": protection_order_id,
+                                },
+                                {
+                                    "kind": "unrelated_issue",
+                                    "exchange_order_id": "3780000000000000000",
+                                },
+                                {
+                                    "kind": "okx_fill_missing_local_order",
+                                    "exchange_order_id": "not-an-okx-order-id",
+                                },
+                            ]
+                        }
+                    },
+                }
+            ],
+        },
+        _report(),
+    ]
+    captured: dict[str, object] = {}
+
+    async def fake_collect_report(*, allow_cache: bool = False) -> dict:
+        return reports.pop(0)
+
+    async def fake_equity_snapshot(*, mode: str) -> dict:
+        return {"status": "created", "mode": mode}
+
+    class FakeOrderSync:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def sync(self) -> dict:
+            return {"status": "ok", "backfilled_count": 1}
+
+    monkeypatch.setattr(script, "collect_report", fake_collect_report)
+    monkeypatch.setattr(script, "_sync_okx_equity_snapshot", fake_equity_snapshot)
+    monkeypatch.setattr(script, "OkxOrderFactSyncService", FakeOrderSync)
+
+    result = await script.run(mode="paper", apply_order_sync=True, allow_cache=False)
+
+    assert captured == {
+        "mode": "paper",
+        "recovery_order_ids": (recovery_order_id, protection_order_id),
+    }
+    assert result["recovery_order_ids"] == [recovery_order_id, protection_order_id]
+    assert result["order_sync_result"]["backfilled_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_phase3_okx_fact_sync_reset_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 

@@ -50,6 +50,12 @@ from services.okx_order_fact_sync import (  # noqa: E402
 PHASE3_CLEAN_SNAPSHOT_DATE = "2026-06-28"
 BEIJING_TZ = timezone(timedelta(hours=8))
 logger = logging.getLogger(__name__)
+OKX_ORDER_RECOVERY_ISSUE_KINDS = frozenset(
+    {
+        "okx_fill_missing_local_order",
+        "okx_linked_protection_fill_missing_local_order",
+    }
+)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -94,6 +100,42 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _recovery_order_ids_from_report(report: dict[str, Any]) -> tuple[str, ...]:
+    cards = report.get("cards") if isinstance(report.get("cards"), list) else []
+    integrity_card = next(
+        (
+            card
+            for card in cards
+            if isinstance(card, dict) and card.get("key") == "okx_trade_fact_integrity"
+        ),
+        {},
+    )
+    details = (
+        integrity_card.get("details")
+        if isinstance(integrity_card.get("details"), dict)
+        else {}
+    )
+    authoritative = (
+        details.get("okx_authoritative_sync")
+        if isinstance(details.get("okx_authoritative_sync"), dict)
+        else {}
+    )
+    issues = (
+        authoritative.get("issues")
+        if isinstance(authoritative.get("issues"), list)
+        else []
+    )
+    return tuple(
+        dict.fromkeys(
+            order_id
+            for issue in issues
+            if isinstance(issue, dict)
+            and str(issue.get("kind") or "") in OKX_ORDER_RECOVERY_ISSUE_KINDS
+            if (order_id := str(issue.get("exchange_order_id") or "").strip()).isdigit()
+        )
+    )
+
+
 def _authoritative_report_output_dir() -> Path:
     return settings.data_dir / DEFAULT_REPORT_DIR
 
@@ -106,6 +148,7 @@ async def run(
     reset_local_cache: bool = False,
 ) -> dict[str, Any]:
     before_report = await collect_report(allow_cache=allow_cache)
+    recovery_order_ids = _recovery_order_ids_from_report(before_report)
     sync_result: dict[str, Any] | None = None
     sync_error: str | None = None
     cleanup_result: dict[str, Any] | None = None
@@ -115,7 +158,10 @@ async def run(
             if reset_local_cache:
                 cleanup_result = await _cleanup_phase3_local_okx_cache(mode=mode)
             equity_snapshot_result = await _sync_okx_equity_snapshot(mode=mode)
-            sync_result = await OkxOrderFactSyncService(mode=mode).sync()
+            sync_kwargs: dict[str, Any] = {"mode": mode}
+            if recovery_order_ids:
+                sync_kwargs["recovery_order_ids"] = recovery_order_ids
+            sync_result = await OkxOrderFactSyncService(**sync_kwargs).sync()
         except Exception as exc:  # pragma: no cover - defensive operator output
             sync_error = f"{type(exc).__name__}: {safe_error_text(exc, limit=240)}"
     after_report = await collect_report(allow_cache=False)
@@ -129,6 +175,7 @@ async def run(
             "local_cache_reset_requested": bool(reset_local_cache),
             "cleanup_result": cleanup_result,
             "equity_snapshot_result": equity_snapshot_result,
+            "recovery_order_ids": recovery_order_ids,
             "order_sync_result": sync_result,
             "order_sync_error": sync_error,
             "before_reconciliation": {

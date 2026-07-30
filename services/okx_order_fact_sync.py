@@ -192,6 +192,7 @@ class OkxOrderFactSyncService:
         executor_factory: Any | None = None,
         phase3_order_sync_start: datetime | None = PHASE3_DEFAULT_ORDER_SYNC_START,
         priority_only: bool = False,
+        recovery_order_ids: Iterable[Any] | None = None,
     ) -> None:
         self.mode = "live" if str(mode or "").lower() == "live" else "paper"
         self.lookback_hours = max(int(lookback_hours or DEFAULT_LOOKBACK_HOURS), 1)
@@ -199,6 +200,18 @@ class OkxOrderFactSyncService:
         self.timeout_seconds = max(float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS), 0.5)
         self.executor_factory = executor_factory or OKXExecutor
         self.priority_only = bool(priority_only)
+        recovery_values = (
+            (recovery_order_ids,)
+            if isinstance(recovery_order_ids, (str, bytes))
+            else tuple(recovery_order_ids or ())
+        )
+        self.recovery_order_ids = tuple(
+            dict.fromkeys(
+                token
+                for value in recovery_values
+                for token in _split_exchange_order_ids(value)
+            )
+        )[:DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC]
         self.phase3_order_sync_start = _aware_utc(
             phase3_order_sync_start or PHASE3_DEFAULT_ORDER_SYNC_START
         )
@@ -342,10 +355,11 @@ class OkxOrderFactSyncService:
             token
             for order in external_refresh_orders
             for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-        } | set(submit_recovery_target_order_ids)
+        } | set(submit_recovery_target_order_ids) | set(self.recovery_order_ids)
         priority_target_order_ids = tuple(
             dict.fromkeys(
                 [
+                    *self.recovery_order_ids,
                     *submit_recovery_target_order_ids,
                     *_prioritized_exchange_order_ids(
                         external_refresh_orders,
@@ -359,7 +373,7 @@ class OkxOrderFactSyncService:
             for order in external_refresh_orders
             if not _order_has_authoritative_stored_okx_fill_fact(order)
             for token in _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-        } | set(submit_recovery_target_order_ids)
+        } | set(submit_recovery_target_order_ids) | set(self.recovery_order_ids)
         if self.priority_only:
             priority_target_order_ids = tuple(
                 order_id
@@ -411,6 +425,7 @@ class OkxOrderFactSyncService:
         priority_unverified_count = 0
         priority_skipped_old_count = 0
         priority_contract_size_deferred_count = 0
+        priority_backfilled_count = 0
         priority_local_checked = 0
         priority_samples: list[dict[str, Any]] = []
         account_fills_complete = False
@@ -517,14 +532,33 @@ class OkxOrderFactSyncService:
                 )
                 contract_sizes.update(dict(priority_contract_sizes or {}))
                 targeted_fill_ids = {fill.order_id for fill in fills if fill.order_id}
+                recovery_targeted_fill_ids = (
+                    set(self.recovery_order_ids) & targeted_fill_ids
+                )
+                if recovery_targeted_fill_ids:
+                    (
+                        priority_backfilled_count,
+                        recovery_contract_size_deferred_count,
+                        recovery_samples,
+                    ) = await self._persist_recovery_fill_facts(
+                        since=since,
+                        target_order_ids=recovery_targeted_fill_ids,
+                        fills=fills,
+                        contract_sizes=contract_sizes,
+                    )
+                    priority_contract_size_deferred_count += (
+                        recovery_contract_size_deferred_count
+                    )
+                    priority_samples.extend(recovery_samples)
+                    completed_stages.append("recovery_order_facts_persisted")
                 if urgent_target_order_ids & targeted_fill_ids:
                     (
                         priority_local_checked,
                         priority_confirmed_count,
                         priority_unverified_count,
                         priority_skipped_old_count,
-                        priority_contract_size_deferred_count,
-                        priority_samples,
+                        local_priority_contract_size_deferred_count,
+                        local_priority_samples,
                     ) = await self._persist_priority_fill_facts(
                         since=since,
                         since_naive=since_naive,
@@ -532,6 +566,10 @@ class OkxOrderFactSyncService:
                         fills=fills,
                         contract_sizes=contract_sizes,
                     )
+                    priority_contract_size_deferred_count += (
+                        local_priority_contract_size_deferred_count
+                    )
+                    priority_samples.extend(local_priority_samples)
                     completed_stages.append("priority_order_facts_persisted")
                     if urgent_target_order_ids.issubset(targeted_fill_ids):
                         status = (
@@ -553,6 +591,7 @@ class OkxOrderFactSyncService:
                                 stored_slippage_refresh_count + priority_confirmed_count
                             ),
                             unverified_count=priority_unverified_count,
+                            backfilled_count=priority_backfilled_count,
                             contract_size_deferred_count=(
                                 priority_contract_size_deferred_count
                             ),
@@ -586,6 +625,7 @@ class OkxOrderFactSyncService:
                     local_checked=priority_local_checked,
                     confirmed_count=priority_confirmed_count,
                     unverified_count=priority_unverified_count,
+                    backfilled_count=priority_backfilled_count,
                     contract_size_deferred_count=priority_contract_size_deferred_count,
                     completed_stages=tuple(completed_stages),
                     deferred_stages=("priority_fill_not_yet_observed",),
@@ -805,7 +845,7 @@ class OkxOrderFactSyncService:
             contract_sizes = _build_contract_size_catalog(
                 public_sizes=contract_sizes,
             )
-            backfilled_count = 0
+            backfilled_count = priority_backfilled_count
             order_history_backfilled_count = 0
             contract_size_deferred_count = priority_contract_size_deferred_count
             if okx_pull_available:
@@ -843,7 +883,7 @@ class OkxOrderFactSyncService:
                 confirmed_count += local_confirmed_count
                 samples.extend(local_samples)
                 (
-                    backfilled_count,
+                    newly_backfilled_count,
                     order_history_backfilled_count,
                     backfill_contract_size_deferred_count,
                 ) = await self._backfill_okx_only_orders(
@@ -857,8 +897,10 @@ class OkxOrderFactSyncService:
                     now=datetime.now(UTC),
                     samples=samples,
                 )
+                backfilled_count += newly_backfilled_count
                 contract_size_deferred_count = (
-                    local_contract_size_deferred_count
+                    priority_contract_size_deferred_count
+                    + local_contract_size_deferred_count
                     + backfill_contract_size_deferred_count
                 )
                 if contract_size_deferred_count:
@@ -1200,6 +1242,58 @@ class OkxOrderFactSyncService:
                 contract_size_deferred_count,
                 samples,
             )
+
+    async def _persist_recovery_fill_facts(
+        self,
+        *,
+        since: datetime,
+        target_order_ids: set[str],
+        fills: list[OkxNativeFillGroup],
+        contract_sizes: dict[str, float],
+    ) -> tuple[int, int, list[dict[str, Any]]]:
+        """Backfill explicitly audited OKX-only fills before slow history pulls."""
+
+        recovery_fills = [
+            fill for fill in fills if fill.order_id and fill.order_id in target_order_ids
+        ]
+        decision_ids = {
+            decision_id
+            for fill in recovery_fills
+            if (
+                decision_id := _decision_id_from_client_order_id(
+                    _fill_client_order_id(fill, None)
+                )
+            )
+        }
+        async with get_session_ctx() as session:
+            await _configure_order_fact_write_transaction(session)
+            decisions_by_id: dict[int, AIDecision] = {}
+            if decision_ids:
+                decision_rows = await session.execute(
+                    select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
+                )
+                decisions_by_id = {
+                    int(decision.id): decision for decision in decision_rows.scalars().all()
+                }
+            samples: list[dict[str, Any]] = []
+            (
+                backfilled_count,
+                _order_history_backfilled_count,
+                contract_size_deferred_count,
+            ) = await self._backfill_okx_only_orders(
+                session,
+                fills=recovery_fills,
+                order_rows=[],
+                decisions_by_id=decisions_by_id,
+                protection_execution_by_order_id={},
+                contract_sizes=_build_contract_size_catalog(public_sizes=contract_sizes),
+                since=since,
+                now=datetime.now(UTC),
+                samples=samples,
+            )
+            if backfilled_count:
+                await session.flush()
+            return backfilled_count, contract_size_deferred_count, samples
 
     def _apply_local_order_facts(
         self,

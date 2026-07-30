@@ -2192,6 +2192,29 @@ async def test_production_source_health_card_exposes_normal_paper_trade_alert(
     assert card["details"]["paper_trade_alert_active"] is True
 
 
+def test_production_source_normal_paper_wait_is_observing_but_failure_is_unresolved() -> None:
+    card = {
+        "key": "production_source_health",
+        "status": "warning",
+        "summary": "Waiting for another qualified normal-paper candidate.",
+        "details": {
+            "reason": "continuous_no_normal_paper_candidate",
+            "recovery_state": "normal_paper_trading",
+            "paper_trade_alert_active": True,
+            "normal_paper_executed_count": 2,
+        },
+    }
+
+    ledger = system_audit._issue_ledger_from_cards([card])
+    assert ledger["summary"]["observing"] == 1
+    assert ledger["summary"]["unresolved"] == 0
+
+    card["details"]["hard_failure"] = True
+    failed_ledger = system_audit._issue_ledger_from_cards([card])
+    assert failed_ledger["summary"]["observing"] == 0
+    assert failed_ledger["summary"]["unresolved"] == 1
+
+
 @pytest.mark.asyncio
 async def test_model_training_optional_sources_are_observing_not_unresolved(
     monkeypatch: pytest.MonkeyPatch,

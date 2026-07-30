@@ -786,6 +786,73 @@ async def test_priority_only_sync_is_idle_without_pending_local_order(
 
 
 @pytest.mark.asyncio
+async def test_recovery_order_id_backfills_okx_only_fill_before_account_history(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "targeted-recovery-fast-lane.db")
+    now = datetime.now(UTC)
+    recovery_order_id = "3785286327831597056"
+    ccxt = _SlowAccountFastTargetCcxt(
+        fills=[_act_fill_row(now, order_id=recovery_order_id)],
+        orders=[_act_order_row(now, order_id=recovery_order_id)],
+        instruments=[_act_instrument_row()],
+    )
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=2.0,
+            priority_only=True,
+            recovery_order_ids=[recovery_order_id],
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert ccxt.calls[0] == "fills_targeted"
+        assert "fills_account" not in ccxt.calls
+        assert "recovery_order_facts_persisted" in report["completed_stages"]
+        assert report["backfilled_count"] == 1
+        assert order.exchange_order_id == recovery_order_id
+        assert order.model_name == "okx_authoritative_sync"
+        assert order.decision_id is None
+        assert order.okx_raw_fills["contract_size_verified"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_recovery_order_id_defers_without_public_contract_size(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "targeted-recovery-no-contract.db")
+    now = datetime.now(UTC)
+    recovery_order_id = "3785286327831597057"
+    ccxt = _SlowAccountFastTargetCcxt(
+        fills=[_act_fill_row(now, order_id=recovery_order_id)],
+        instruments=[],
+    )
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=2.0,
+            priority_only=True,
+            recovery_order_ids=[recovery_order_id],
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        async with get_session_ctx() as session:
+            orders = list((await session.execute(select(Order))).scalars().all())
+        assert orders == []
+        assert report["backfilled_count"] == 0
+        assert report["contract_size_deferred_count"] == 1
+        assert report["status"] == "deferred"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
