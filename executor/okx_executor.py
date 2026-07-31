@@ -58,6 +58,7 @@ OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
 OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
+OKX_MAX_LEVERAGE_RECOVERY_ATTEMPTS = 7
 
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
@@ -4420,6 +4421,121 @@ class OKXExecutor(AbstractExecutor):
             or "cancel to reduce your orders to 5" in text
         )
 
+    def _is_leverage_maximum_limit_error(self, error: Any) -> bool:
+        text = str(error or "").lower()
+        return "59102" in text or "leverage exceeds the maximum limit" in text
+
+    async def _recover_account_accepted_leverage(
+        self,
+        ccxt: Any,
+        okx_symbol: str,
+        params: dict[str, Any],
+        *,
+        rejected_leverage: int,
+        current_leverage: float,
+    ) -> dict[str, Any]:
+        """Find the highest account-accepted leverage below a rejected target."""
+
+        target = max(int(rejected_leverage), 1)
+        current = int(round(current_leverage or 0.0))
+        best = current if 1 <= current < target else 0
+        lower = max(best + 1, 1)
+        upper = target - 1
+        attempts: list[dict[str, Any]] = []
+        last_response: dict[str, Any] | None = None
+
+        while lower <= upper and len(attempts) < OKX_MAX_LEVERAGE_RECOVERY_ATTEMPTS:
+            candidate = (lower + upper + 1) // 2
+            try:
+                response = await self._with_retry(
+                    ccxt.set_leverage,
+                    candidate,
+                    okx_symbol,
+                    params,
+                    _expected_error_codes={"59102"},
+                    _max_attempts=1,
+                )
+            except Exception as exc:
+                error_text = safe_error_text(exc, limit=220)
+                attempts.append(
+                    {
+                        "leverage": candidate,
+                        "accepted": False,
+                        "error": error_text,
+                    }
+                )
+                if not self._is_leverage_maximum_limit_error(error_text):
+                    return {
+                        "ok": False,
+                        "reason": "unexpected_error_during_account_leverage_recovery",
+                        "rejected_leverage": target,
+                        "actual_leverage": None,
+                        "attempts": attempts,
+                        "error": error_text,
+                    }
+                upper = candidate - 1
+                continue
+
+            best = candidate
+            last_response = response if isinstance(response, dict) else {"response": response}
+            attempts.append({"leverage": candidate, "accepted": True})
+            lower = candidate + 1
+
+        if best < 1:
+            return {
+                "ok": False,
+                "reason": "no_account_accepted_leverage_found",
+                "rejected_leverage": target,
+                "actual_leverage": None,
+                "attempts": attempts,
+                "error": "OKX did not accept a lower leverage within the bounded recovery.",
+            }
+
+        try:
+            actual, verify_response = await self._fetch_current_leverage(
+                ccxt,
+                okx_symbol,
+                params,
+                force=True,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "account_leverage_recovery_verification_failed",
+                "rejected_leverage": target,
+                "accepted_leverage": best,
+                "actual_leverage": None,
+                "attempts": attempts,
+                "error": safe_error_text(exc, limit=220),
+            }
+
+        if int(round(actual or 0.0)) != best:
+            return {
+                "ok": False,
+                "reason": "account_leverage_recovery_verification_mismatch",
+                "rejected_leverage": target,
+                "accepted_leverage": best,
+                "actual_leverage": actual or None,
+                "attempts": attempts,
+                "verify_response": verify_response,
+                "error": (
+                    f"OKX accepted {best}x during recovery but reported "
+                    f"{actual or 0:g}x afterwards."
+                ),
+            }
+
+        return {
+            "ok": True,
+            "reason": "account_maximum_leverage_discovered_after_59102",
+            "rejected_leverage": target,
+            "accepted_leverage": best,
+            "actual_leverage": actual,
+            "attempts": attempts,
+            "set_response": last_response
+            or {"reused_verified_current_leverage": True, "lever": str(best)},
+            "verify_response": verify_response,
+        }
+
     def _is_safe_to_cancel_for_leverage_retry(self, order: dict[str, Any]) -> bool:
         info = order.get("info") or {}
         reduce_only = order.get("reduceOnly")
@@ -4737,13 +4853,47 @@ class OKXExecutor(AbstractExecutor):
 
         set_response: dict[str, Any] | None = None
         cleanup_result: dict[str, Any] | None = None
+        leverage_limit_recovery: dict[str, Any] | None = None
         set_error: Exception | None = None
         try:
             set_response = await self._with_retry(ccxt.set_leverage, leverage, okx_symbol, params)
         except Exception as e:
             set_error = e
             set_error_text = safe_error_text(set_error, limit=220)
-            if self._is_leverage_open_order_limit_error(set_error_text):
+            if self._is_leverage_maximum_limit_error(set_error_text):
+                leverage_limit_recovery = await self._recover_account_accepted_leverage(
+                    ccxt,
+                    okx_symbol,
+                    params,
+                    rejected_leverage=leverage,
+                    current_leverage=actual,
+                )
+                if leverage_limit_recovery.get("ok") is True:
+                    leverage = int(leverage_limit_recovery["accepted_leverage"])
+                    actual = self._safe_float(
+                        leverage_limit_recovery.get("actual_leverage"),
+                        float(leverage),
+                    )
+                    verify_response = leverage_limit_recovery.get("verify_response")
+                    set_response = leverage_limit_recovery.get("set_response")
+                    set_error = None
+                    set_error_text = ""
+                    decision.suggested_leverage = float(leverage)
+                    max_leverage = min(max_leverage, float(leverage))
+                    logger.warning(
+                        "OKX account leverage limit recovered after 59102",
+                        symbol=decision.symbol,
+                        okx_symbol=okx_symbol,
+                        requested_leverage=requested_leverage,
+                        rejected_leverage=leverage_limit_recovery.get("rejected_leverage"),
+                        accepted_leverage=leverage,
+                        attempts=len(leverage_limit_recovery.get("attempts") or []),
+                    )
+                else:
+                    recovery_error = str(leverage_limit_recovery.get("error") or "").strip()
+                    if recovery_error:
+                        set_error_text = recovery_error
+            elif self._is_leverage_open_order_limit_error(set_error_text):
                 cleanup_result = await self._reduce_open_orders_for_leverage_retry(ccxt, okx_symbol)
                 if int(cleanup_result.get("cancelled") or 0) > 0:
                     try:
@@ -4901,7 +5051,11 @@ class OKXExecutor(AbstractExecutor):
                     }
 
         if set_response is None:
-            set_error_text = safe_error_text(set_error, limit=220)
+            set_error_text = (
+                str(leverage_limit_recovery.get("error") or "").strip()
+                if leverage_limit_recovery
+                else safe_error_text(set_error, limit=220)
+            )
             message = (
                 f"OKX 杠杆设置失败，本次未开仓。目标杠杆 {leverage}x。"
                 f"OKX 返回：{set_error_text}"
@@ -4930,6 +5084,7 @@ class OKXExecutor(AbstractExecutor):
                 "set_response": set_response,
                 "verify_response": verify_response,
                 "cleanup_result": cleanup_result,
+                "leverage_limit_recovery": leverage_limit_recovery,
                 "params": params,
             }
 
@@ -4962,6 +5117,7 @@ class OKXExecutor(AbstractExecutor):
                 "set_response": set_response,
                 "verify_response": verify_response,
                 "cleanup_result": cleanup_result,
+                "leverage_limit_recovery": leverage_limit_recovery,
                 "params": params,
             }
 
@@ -4990,6 +5146,7 @@ class OKXExecutor(AbstractExecutor):
                 "set_response": set_response,
                 "verify_response": verify_response,
                 "cleanup_result": cleanup_result,
+                "leverage_limit_recovery": leverage_limit_recovery,
                 "params": params,
             }
 
@@ -5003,6 +5160,7 @@ class OKXExecutor(AbstractExecutor):
             "set_response": set_response,
             "verify_response": verify_response,
             "cleanup_result": cleanup_result,
+            "leverage_limit_recovery": leverage_limit_recovery,
             "params": params,
         }
 

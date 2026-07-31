@@ -3860,8 +3860,16 @@ async def _dashboard_pending_closed_position_rows(
             }
         )
         payload = group.as_dict(include_fills=True)
+        close_order_ids = set(group.close_order_ids)
+        close_orders = [
+            order
+            for order in order_rows
+            if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+            & close_order_ids
+        ]
         payload.update(
             {
+                **_dashboard_position_close_origin({}, close_orders),
                 "realized_pnl": None,
                 "realized_pnl_pct": None,
                 "pnl_source": "pending_official_settlement",
@@ -4050,6 +4058,70 @@ def _dashboard_position_history_is_authoritative_full(row: dict[str, Any]) -> bo
     closed_qty = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
     max_qty = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
     return bool(max_qty > 0 and closed_qty >= max_qty * 0.999)
+
+
+def _dashboard_position_close_origin(
+    row: dict[str, Any],
+    close_orders: list[Any],
+) -> dict[str, Any]:
+    """Classify a historical close from persisted OKX and order facts."""
+
+    liquidation_penalty = (
+        _safe_float(
+            row.get("liqPenalty") or row.get("liquidationPenalty"),
+            0.0,
+        )
+        or 0.0
+    )
+    if abs(liquidation_penalty) > 1e-12:
+        return {
+            "close_origin": "liquidation",
+            "close_origin_label": "强制平仓",
+            "close_origin_source": "okx_position_history_liquidation_penalty",
+            "close_origin_confirmed": True,
+        }
+
+    for order in close_orders:
+        raw = _dashboard_order_raw_fills(order)
+        protection = raw.get("protection_execution")
+        protection = protection if isinstance(protection, dict) else {}
+        actual_side = str(protection.get("actual_side") or "").lower().strip()
+        if (
+            protection.get("lifecycle_complete") is True
+            and str(protection.get("source_authority") or "").strip()
+            == "okx_algo_history_plus_fills_history"
+            and actual_side in {"tp", "sl"}
+        ):
+            return {
+                "close_origin": "take_profit" if actual_side == "tp" else "stop_loss",
+                "close_origin_label": "止盈" if actual_side == "tp" else "止损",
+                "close_origin_source": "okx_protection_execution_lifecycle",
+                "close_origin_confirmed": True,
+            }
+
+    for order in close_orders:
+        if is_manual_close_order(order):
+            return {
+                "close_origin": "manual",
+                "close_origin_label": MANUAL_CLOSE_LABEL,
+                "close_origin_source": "manual_close_order_marker",
+                "close_origin_confirmed": True,
+            }
+
+    if any(getattr(order, "decision_id", None) for order in close_orders):
+        return {
+            "close_origin": "system",
+            "close_origin_label": "系统平仓",
+            "close_origin_source": "linked_system_close_order",
+            "close_origin_confirmed": True,
+        }
+
+    return {
+        "close_origin": "unknown",
+        "close_origin_label": "来源待确认",
+        "close_origin_source": "close_origin_evidence_incomplete",
+        "close_origin_confirmed": False,
+    }
 
 
 def _dashboard_position_history_group_id(row: dict[str, Any], mode: str | None) -> str:
@@ -4798,6 +4870,7 @@ def _dashboard_position_history_order_payload_from_selected(
         "entry_order_ids": _dashboard_order_ids(selected_entries),
         "close_order_ids": _dashboard_order_ids(selected_closes),
         "linked_fills": [_dashboard_linked_fill_from_order(order) for order in linked_orders],
+        **_dashboard_position_close_origin(row, selected_closes),
         "close_quantity": close_quantity,
         "max_quantity": max_quantity,
         "entry_fee": sum(_dashboard_order_fee_abs(order) for order in selected_entries),
@@ -5080,6 +5153,10 @@ def _dashboard_position_history_official_rows_as_groups(
                 ),
                 "entry_order_ids": order_payload["entry_order_ids"],
                 "close_order_ids": order_payload["close_order_ids"],
+                "close_origin": order_payload["close_origin"],
+                "close_origin_label": order_payload["close_origin_label"],
+                "close_origin_source": order_payload["close_origin_source"],
+                "close_origin_confirmed": order_payload["close_origin_confirmed"],
                 "linked_fills": order_payload["linked_fills"],
                 "linked_order_count": len(order_payload["linked_fills"]),
                 "evidence_complete": not evidence_gaps,

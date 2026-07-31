@@ -225,8 +225,20 @@ class OKXWebSocketClient:
 
         # Auto-reconnect
         if self._running:
+            stale_ws = self._ws
+            self._ws = None
+            if stale_ws is not None:
+                try:
+                    await stale_ws.close()
+                except Exception as exc:
+                    logger.debug(
+                        "stale OKX WebSocket close failed",
+                        error=safe_error_text(exc),
+                    )
             logger.info("reconnecting in 5 seconds...")
             await asyncio.sleep(5)
+            if not self._running:
+                return
             await self.connect()
             asyncio.create_task(self.listen())
 

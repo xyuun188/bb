@@ -28,6 +28,7 @@ from services.manual_close_marker import (
     is_local_non_exchange_close_marker,
     is_manual_close_order,
 )
+from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
 from services.training_epoch import load_training_epoch_start
 
 DEFAULT_LOOKBACK_HOURS = 72
@@ -393,7 +394,7 @@ class OkxTradeFactIntegrityService:
     ) -> list[TradeFactIssue]:
         if decision is None or not order.decision_id:
             return []
-        action = str(decision.action or "").lower()
+        action = _order_position_alignment_action(order, decision, raw)
         side = _position_side_for_action(action)
         if side is None:
             return []
@@ -693,6 +694,31 @@ def _order_execution_raw(
     if isinstance(okx_raw_fills, dict) and okx_raw_fills:
         return _raw_from_order_fills(order, okx_raw_fills)
     return _execution_raw_response(execution_result or {})
+
+
+def _order_position_alignment_action(
+    order: Order,
+    decision: AIDecision,
+    raw: dict[str, Any],
+) -> str:
+    action = str(getattr(decision, "action", "") or "").lower().strip()
+    if action not in {"long", "short"}:
+        return action
+    execution = raw.get("protection_execution")
+    if not isinstance(execution, dict):
+        return action
+    generated_order_id = str(execution.get("generated_order_id") or "").strip()
+    order_ids = _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+    if not (
+        execution.get("version") == OKX_PROTECTION_EXECUTION_VERSION
+        and execution.get("source_authority") == "okx_algo_history_plus_fills_history"
+        and execution.get("lifecycle_complete") is True
+        and str(execution.get("actual_side") or "").lower() in {"sl", "tp"}
+        and generated_order_id
+        and generated_order_id in order_ids
+    ):
+        return action
+    return f"close_{action}"
 
 
 def _raw_from_order_fills(order: Order, okx_raw_fills: dict[str, Any]) -> dict[str, Any]:

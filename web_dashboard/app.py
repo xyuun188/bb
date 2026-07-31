@@ -45,13 +45,13 @@ ws_manager = WebSocketManager()
 
 
 async def _system_audit_history_loop() -> None:
-    from web_dashboard.api.system_audit import collect_system_audit_status
+    from web_dashboard.api.system_audit import refresh_system_audit_snapshot
 
     interval = max(60, int(settings.system_audit_history_interval_seconds or 300))
     while True:
         await asyncio.sleep(interval)
         try:
-            await collect_system_audit_status(record_history=True, source="background")
+            await refresh_system_audit_snapshot(record_history=True, source="background")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

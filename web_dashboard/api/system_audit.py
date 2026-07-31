@@ -7,6 +7,8 @@ import asyncio
 import copy
 import inspect
 import json
+import os
+import sys
 import time
 from collections import Counter
 from contextvars import ContextVar
@@ -99,6 +101,10 @@ OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
 SYSTEM_AUDIT_MAX_CONCURRENCY = 4
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 600.0
+SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
 MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
     settings.data_dir / "model_training_scheduler_state.json"
 )
@@ -235,6 +241,7 @@ NODE_OWNER_PATHS = {
 _okx_reconciliation_cache: tuple[datetime, dict[str, Any]] | None = None
 _system_audit_status_cache: tuple[datetime, dict[str, Any]] | None = None
 _system_audit_refresh_task: asyncio.Task[Any] | None = None
+_system_audit_subprocess_task: asyncio.Task[dict[str, Any]] | None = None
 _okx_authoritative_sync_cache: tuple[datetime, dict[str, Any]] | None = None
 _system_audit_collect_lock: asyncio.Lock | None = None
 
@@ -5343,10 +5350,148 @@ def _cached_system_audit_status() -> tuple[datetime, dict[str, Any]] | None:
     return checked_at, copy.deepcopy(payload)
 
 
+def _reload_system_audit_status_cache() -> tuple[datetime, dict[str, Any]] | None:
+    global _system_audit_status_cache
+    _system_audit_status_cache = _load_latest_audit_snapshot()
+    if _system_audit_status_cache is None:
+        return None
+    checked_at, payload = _system_audit_status_cache
+    return checked_at, copy.deepcopy(payload)
+
+
+async def _stop_system_audit_subprocess(process: Any) -> None:
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await process.wait()
+    except ProcessLookupError:
+        pass
+
+
+def _parse_system_audit_runner_result(stdout: bytes) -> dict[str, Any]:
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    result_frame = next(
+        (
+            line.removeprefix(SYSTEM_AUDIT_RUNNER_RESULT_PREFIX)
+            for line in reversed(stdout_text.splitlines())
+            if line.startswith(SYSTEM_AUDIT_RUNNER_RESULT_PREFIX)
+        ),
+        None,
+    )
+    if result_frame is None:
+        raise RuntimeError("isolated system audit returned no result frame")
+    try:
+        result = json.loads(result_frame)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("isolated system audit returned an invalid result frame") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("isolated system audit returned a non-object result frame")
+    return result
+
+
+async def _run_system_audit_subprocess_once(
+    *,
+    record_history: bool,
+    source: str,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(SYSTEM_AUDIT_RUNNER_PATH),
+        "--source",
+        str(source or "subprocess")[:80],
+    ]
+    if not record_history:
+        command.append("--no-record-history")
+    process_env = os.environ.copy()
+    process_env["PYTHONIOENCODING"] = "utf-8"
+    process = await asyncio.create_subprocess_exec(  # noqa: S603
+        *command,
+        cwd=str(PROJECT_ROOT),
+        env=process_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        await _stop_system_audit_subprocess(process)
+        raise
+    except TimeoutError as exc:
+        await _stop_system_audit_subprocess(process)
+        raise TimeoutError(
+            "isolated system audit exceeded "
+            f"{SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS:.0f} seconds"
+        ) from exc
+
+    try:
+        result = _parse_system_audit_runner_result(stdout)
+    except RuntimeError as exc:
+        stderr_text = stderr.decode("utf-8", errors="replace")[-1000:]
+        if process.returncode != 0 and stderr_text:
+            raise RuntimeError(
+                "isolated system audit failed: " + safe_error_text(stderr_text, limit=500)
+            ) from exc
+        raise
+    if process.returncode != 0 or not result.get("ok"):
+        error = result.get("error") or stderr.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(
+            "isolated system audit failed: "
+            + (safe_error_text(error, limit=500) if error else "unknown error")
+        )
+    snapshot = _reload_system_audit_status_cache()
+    if snapshot is None:
+        raise RuntimeError("isolated system audit completed without a readable snapshot")
+    checked_at, payload = snapshot
+    runner_checked_at = _parse_utc_datetime(result.get("checked_at"))
+    if runner_checked_at is None or checked_at != runner_checked_at:
+        raise RuntimeError("isolated system audit snapshot does not match its result frame")
+    return payload
+
+
+async def refresh_system_audit_snapshot(
+    *,
+    record_history: bool = True,
+    source: str = "background",
+) -> dict[str, Any]:
+    """Run one shared audit subprocess and reload its durable snapshot."""
+
+    global _system_audit_subprocess_task
+    task = _system_audit_subprocess_task
+    if task is None or task.done():
+        task = asyncio.create_task(
+            _run_system_audit_subprocess_once(
+                record_history=record_history,
+                source=source,
+            )
+        )
+        _system_audit_subprocess_task = task
+    try:
+        return await task
+    finally:
+        if task.done() and _system_audit_subprocess_task is task:
+            _system_audit_subprocess_task = None
+
+
 async def _refresh_system_audit_status() -> None:
     global _system_audit_refresh_task
     try:
-        await collect_system_audit_status(record_history=True, source="background_api_refresh")
+        await refresh_system_audit_snapshot(
+            record_history=True,
+            source="background_api_refresh",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "isolated system audit refresh failed",
+            error=safe_error_text(exc, limit=240),
+        )
     finally:
         _system_audit_refresh_task = None
 
@@ -5581,7 +5726,7 @@ async def _collect_system_audit_status_unlocked(
 async def system_audit_status() -> dict[str, Any]:
     cached = _cached_system_audit_status()
     if cached is None:
-        payload = await collect_system_audit_status(
+        payload = await refresh_system_audit_snapshot(
             record_history=True,
             source="api_cold_start",
         )

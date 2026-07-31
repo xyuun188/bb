@@ -9,6 +9,7 @@ from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
 from services.manual_close_marker import ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX
+from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
 from services.okx_trade_fact_integrity import (
     OkxTradeFactIntegrityService,
     _start_consistent_read_snapshot,
@@ -348,6 +349,107 @@ async def test_authoritative_position_history_satisfies_order_lifecycle_evidence
             issue["kind"] for issue in report["issues"]
         }
         assert report["status"] == "ok"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_exchange_protection_fill_uses_exit_alignment_with_entry_decision(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        filled_at = _recent_filled_at(minutes_ago=30)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="SAND/USDT",
+                action="short",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="SAND-USDT-SWAP",
+                    contracts=426,
+                    contract_size=10,
+                    avg_price=0.0425,
+                ),
+                was_executed=True,
+                created_at=filled_at - timedelta(days=2),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="SAND/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=4260.0,
+                        price=0.0425,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="sand-protection-close",
+                        filled_at=filled_at,
+                        created_at=filled_at,
+                        okx_inst_id="SAND-USDT-SWAP",
+                        okx_raw_fills={
+                            "fills_history_confirmed": True,
+                            "inst_id": "SAND-USDT-SWAP",
+                            "contracts": 426.0,
+                            "avg_price": 0.0425,
+                            "contract_size": 10.0,
+                            "contract_size_verified": True,
+                            "contract_size_source": "okx_public_instruments",
+                            "base_quantity": 4260.0,
+                            "protection_execution": {
+                                "version": OKX_PROTECTION_EXECUTION_VERSION,
+                                "source_authority": "okx_algo_history_plus_fills_history",
+                                "lifecycle_complete": True,
+                                "actual_side": "sl",
+                                "generated_order_id": "sand-protection-close",
+                            },
+                        },
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="MAGIC/USDT",
+                        side="short",
+                        quantity=4260.0,
+                        entry_price=0.0425,
+                        current_price=0.0425,
+                        leverage=3.0,
+                        is_open=True,
+                        okx_inst_id="MAGIC-USDT-SWAP",
+                        created_at=filled_at - timedelta(minutes=2),
+                    ),
+                    OkxPositionHistory(
+                        mode="paper",
+                        row_identity="paper|SAND-USDT-SWAP|sand-pos|net|protection",
+                        inst_id="SAND-USDT-SWAP",
+                        symbol="SAND/USDT",
+                        pos_id="sand-pos",
+                        pos_side="net",
+                        opened_at=filled_at - timedelta(days=2),
+                        updated_at_okx=filled_at,
+                        entry_order_ids=["sand-entry"],
+                        close_order_ids=["sand-partial-close"],
+                        linked_order_ids=["sand-entry", "sand-partial-close"],
+                        position_ids=[],
+                        match_status="okx_account_position_history",
+                        evidence_gaps=[],
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        kinds = {issue["kind"] for issue in report["issues"]}
+
+        assert "order_position_symbol_mismatch" not in kinds
+        assert "order_position_missing" not in kinds
+        assert report["critical_count"] == 0
     finally:
         await close_db()
 

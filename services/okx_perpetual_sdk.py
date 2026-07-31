@@ -196,15 +196,41 @@ class OkxPublicWebSocketSdkStream:
             await self._client.send(op, args, callback=self._on_message, id=request_id)
 
     async def recv(self) -> str:
-        return await self._queue.get()
+        consume_task = self._consume_task
+        if consume_task is None:
+            raise ExchangeAPIError("OKX WebSocket SDK consumer is not running")
+        if consume_task.done():
+            consume_task.result()
+            raise ExchangeAPIError("OKX WebSocket SDK consumer stopped unexpectedly")
+
+        queue_waiter = asyncio.create_task(self._queue.get())
+        try:
+            done, _ = await asyncio.wait(
+                (queue_waiter, consume_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if consume_task in done:
+                consume_task.result()
+                raise ExchangeAPIError("OKX WebSocket SDK consumer stopped unexpectedly")
+            return queue_waiter.result()
+        finally:
+            if not queue_waiter.done():
+                queue_waiter.cancel()
+                await asyncio.gather(queue_waiter, return_exceptions=True)
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.stop()
-        if self._consume_task is not None and not self._consume_task.done():
-            self._consume_task.cancel()
+        client = self._client
+        consume_task = self._consume_task
         self._client = None
         self._consume_task = None
+        try:
+            if client is not None:
+                await client.stop()
+        finally:
+            if consume_task is not None:
+                if not consume_task.done():
+                    consume_task.cancel()
+                await asyncio.gather(consume_task, return_exceptions=True)
 
 
 def normalize_swap_inst_id(value: Any, *, field: str = "instId", required: bool = True) -> str:

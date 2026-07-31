@@ -632,6 +632,54 @@ class _FractionalLeverageCcxt(_ExistingPositionLeverageCcxt):
         return {"code": "0", "data": [{"lever": str(leverage)}]}
 
 
+class _AccountCappedLeverageCcxt(_ExistingPositionLeverageCcxt):
+    def __init__(
+        self,
+        *,
+        accepted_max: int = 50,
+        recovery_error: str = "",
+        verification_stale: bool = False,
+    ) -> None:
+        super().__init__()
+        self.accepted_max = accepted_max
+        self.recovery_error = recovery_error
+        self.verification_stale = verification_stale
+        self.actual_leverage = 1
+        self.requested_leverages: list[int] = []
+
+    async def fetch_market_leverage_tiers(self, _symbol: str) -> list[dict[str, Any]]:
+        return [{"maxLeverage": 100}]
+
+    async def fetch_leverage(
+        self,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        actual = 1 if self.verification_stale else self.actual_leverage
+        return {"longLeverage": actual, "shortLeverage": actual, "info": []}
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def set_leverage(
+        self,
+        leverage: int,
+        _symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.requested_leverages.append(leverage)
+        if leverage > self.accepted_max:
+            raise ExchangeAPIError(
+                "OKX API error [59102]: Leverage exceeds the maximum limit. "
+                "Please lower the leverage.",
+                code="59102",
+            )
+        if self.recovery_error:
+            raise RuntimeError(self.recovery_error)
+        self.actual_leverage = leverage
+        return {"code": "0", "data": [{"lever": str(leverage)}]}
+
+
 class _PrecisionEntryCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -1799,6 +1847,72 @@ async def test_okx_fractional_model_leverage_is_normalized_downward() -> None:
     )
     assert reconciled["eligible"] is True
     assert "execution_leverage_exceeds_model_request" not in reconciled["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_okx_59102_discovers_and_verifies_account_accepted_leverage() -> None:
+    exchange = _AccountCappedLeverageCcxt(accepted_max=50)
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.suggested_leverage = 60
+    decision.raw_response["profit_risk_sizing"]["leverage_tier_selection"]["max_leverage"] = 100
+
+    result = await executor._set_leverage_if_needed(decision)
+
+    assert result["ok"] is True
+    assert result["target_leverage"] == 50
+    assert result["actual_leverage"] == 50
+    assert result["okx_max_leverage"] == 50
+    assert result["okx_leverage_tier_selection"]["max_leverage"] == 100
+    assert result["leverage_limit_recovery"]["rejected_leverage"] == 60
+    assert result["leverage_limit_recovery"]["accepted_leverage"] == 50
+    assert len(result["leverage_limit_recovery"]["attempts"]) <= 7
+    assert exchange.requested_leverages[0] == 60
+    assert max(exchange.requested_leverages[1:]) < 60
+    assert decision.suggested_leverage == 50
+
+
+@pytest.mark.asyncio
+async def test_okx_59102_recovery_fails_closed_on_unexpected_error() -> None:
+    exchange = _AccountCappedLeverageCcxt(
+        accepted_max=50,
+        recovery_error="unexpected account endpoint failure",
+    )
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.suggested_leverage = 60
+    decision.raw_response["profit_risk_sizing"]["leverage_tier_selection"]["max_leverage"] = 100
+
+    result = await executor._set_leverage_if_needed(decision)
+
+    assert result["ok"] is False
+    assert result["leverage_limit_recovery"]["ok"] is False
+    assert result["leverage_limit_recovery"]["reason"] == (
+        "unexpected_error_during_account_leverage_recovery"
+    )
+    assert exchange.requested_leverages == [60, 31]
+    assert decision.suggested_leverage == 60
+
+
+@pytest.mark.asyncio
+async def test_okx_59102_recovery_rejects_unverified_leverage() -> None:
+    exchange = _AccountCappedLeverageCcxt(
+        accepted_max=50,
+        verification_stale=True,
+    )
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.suggested_leverage = 60
+    decision.raw_response["profit_risk_sizing"]["leverage_tier_selection"]["max_leverage"] = 100
+
+    result = await executor._set_leverage_if_needed(decision)
+
+    assert result["ok"] is False
+    assert result["leverage_limit_recovery"]["reason"] == (
+        "account_leverage_recovery_verification_mismatch"
+    )
+    assert result["actual_leverage"] == 1
+    assert decision.suggested_leverage == 60
 
 
 @pytest.mark.asyncio

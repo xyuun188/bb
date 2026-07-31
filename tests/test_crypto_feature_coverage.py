@@ -296,6 +296,8 @@ def test_feature_coverage_uses_recent_available_snapshot_per_feature() -> None:
                     "timestamp": (now - timedelta(minutes=20)).isoformat(),
                     "current_price": 140.0,
                     "close": 140.0,
+                    "bid": 139.99,
+                    "ask": 140.01,
                     "volatility_20": 0.032,
                     "abnormal_wick_count_72h": 0,
                     "abnormal_wick_max_pct": 0.0,
@@ -320,9 +322,11 @@ def test_feature_coverage_uses_recent_available_snapshot_per_feature() -> None:
     feature_states = {item["key"]: item for item in report["features"]}
     assert feature_states["altcoin_volatility_risk"]["status"] == "available"
     assert feature_states["abnormal_wick"]["status"] == "available"
+    assert feature_states["slippage"]["status"] == "available"
     assert feature_states["abnormal_wick"]["details"]["count_72h"] == 0
     assert "altcoin_volatility_risk" not in report["missing_features"]
     assert "abnormal_wick" not in report["missing_features"]
+    assert "slippage" not in report["missing_features"]
 
 
 def test_feature_coverage_uses_recent_derivatives_and_market_anchor_evidence() -> None:

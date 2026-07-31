@@ -8498,7 +8498,7 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
     if (!tbody) return;
     positionLinkedOrdersByGroup.clear();
     if (!positions.length) {
-        tbody.innerHTML = '<tr><td colspan="11" style="color:var(--text-muted);text-align:center;padding:24px;">\u6682\u65e0\u5386\u53f2\u6301\u4ed3\u6570\u636e</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);text-align:center;padding:24px;">\u6682\u65e0\u5386\u53f2\u6301\u4ed3\u6570\u636e</td></tr>';
         if (pagination) pagination.style.display = 'none';
         return;
     }
@@ -8511,6 +8511,8 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
             : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}`;
         const statusLabel = p.close_status_label || p.position_status || (p.close_status === 'partial' ? '\u90e8\u5206\u5e73\u4ed3' : '\u5168\u90e8\u5e73\u4ed3');
         const statusColor = p.close_status === 'partial' ? 'var(--accent-light)' : 'var(--text-muted)';
+        const closeOrigin = String(p.close_origin || 'unknown');
+        const closeOriginLabel = p.close_origin_label || '\u6765\u6e90\u5f85\u786e\u8ba4';
         const groupId = String(p.group_id || p.id || `row-${page}-${index}`);
         const linkedFills = Array.isArray(p.linked_fills) ? p.linked_fills : [];
         positionLinkedOrdersByGroup.set(groupId, { position: p, fills: linkedFills });
@@ -8526,6 +8528,7 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
             <td>${escHtml(p.symbol || '-')}</td>
             <td><span style="color:${p.side === 'long' ? 'var(--green)' : 'var(--red)'}">${sideLabel(p.side)}</span></td>
             <td><span style="color:${statusColor};font-weight:600;">${escHtml(statusLabel)}</span></td>
+            <td><span class="position-close-origin origin-${escHtml(closeOrigin)}">${escHtml(closeOriginLabel)}</span></td>
             <td>${Number(p.leverage || 1).toFixed(1)}x</td>
             <td>${fmtNum(p.quantity)}</td>
             <td>${fmtPrice(p.entry_price)}</td>

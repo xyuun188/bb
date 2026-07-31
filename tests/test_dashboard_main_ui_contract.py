@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -247,11 +248,14 @@ def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:
     assert "关联订单" in html
     assert 'id="position-linked-orders-modal-overlay"' in html
     assert 'id="position-linked-orders-modal-body"' in html
-    assert 'colspan="11"' in html
+    assert "平仓来源" in html
+    assert 'colspan="12"' in html
     assert "positionLinkedOrdersByGroup" in script
     assert "linked_fills" in script
     assert "linked_order_count" in script
     assert "evidence_complete" in script
+    assert "close_origin_label" in script
+    assert "position-close-origin" in script
     assert "function openPositionLinkedOrdersModal" in script
     assert "function closePositionLinkedOrdersModal" in script
     assert ".js-position-linked-orders" in script
@@ -273,6 +277,55 @@ def test_position_history_separates_confirmed_close_from_official_settlement() -
     assert "\\u5f85\\u5bf9\\u8d26" not in script
     assert "\\u8ba2\\u5355\\u8865\\u5168\\u4e2d" in script
     assert "\\u5df2\\u5b98\\u65b9\\u7ed3\\u7b97" in script
+
+
+def test_position_history_close_origin_prefers_authoritative_protection_and_liquidation() -> None:
+    stop_order = SimpleNamespace(
+        decision_id=101,
+        exchange_order_id="okx-stop-order",
+        okx_raw_fills={
+            "protection_execution": {
+                "lifecycle_complete": True,
+                "source_authority": "okx_algo_history_plus_fills_history",
+                "actual_side": "sl",
+            }
+        },
+    )
+
+    stop = dashboard._dashboard_position_close_origin({}, [stop_order])
+    liquidation = dashboard._dashboard_position_close_origin(
+        {"liqPenalty": "-2.5"},
+        [stop_order],
+    )
+
+    assert stop == {
+        "close_origin": "stop_loss",
+        "close_origin_label": "止损",
+        "close_origin_source": "okx_protection_execution_lifecycle",
+        "close_origin_confirmed": True,
+    }
+    assert liquidation["close_origin"] == "liquidation"
+    assert liquidation["close_origin_label"] == "强制平仓"
+
+
+def test_position_history_close_origin_fails_closed_when_evidence_is_missing() -> None:
+    unknown = dashboard._dashboard_position_close_origin({}, [])
+    system = dashboard._dashboard_position_close_origin(
+        {},
+        [
+            SimpleNamespace(
+                decision_id=102,
+                exchange_order_id="okx-system-close",
+                okx_raw_fills={},
+            )
+        ],
+    )
+
+    assert unknown["close_origin"] == "unknown"
+    assert unknown["close_origin_label"] == "来源待确认"
+    assert unknown["close_origin_confirmed"] is False
+    assert system["close_origin"] == "system"
+    assert system["close_origin_label"] == "系统平仓"
 
 
 def test_opportunity_score_ui_prefers_expected_net_return() -> None:

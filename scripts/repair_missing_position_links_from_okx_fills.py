@@ -235,6 +235,13 @@ class LinkedProtectionFillOrderPlan:
     okx_algo_id: str = ""
     okx_source: str = ""
     decision_id: int | None = None
+    contracts: float = 0.0
+    contract_size: float = 0.0
+    contract_size_source: str = ""
+    fill_pnl: float = 0.0
+    trade_ids: tuple[str, ...] = ()
+    fill_rows: tuple[dict[str, Any], ...] = ()
+    protection_execution: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1323,9 +1330,13 @@ async def collect_linked_protection_fill_order_plans(
     limit: int = DEFAULT_LIMIT,
     exchange_order_ids: tuple[str, ...] = (),
 ) -> list[LinkedProtectionFillOrderPlan]:
+    requested_exchange_ids = {
+        str(item or "").strip() for item in exchange_order_ids if str(item or "").strip()
+    }
+    candidate_limit = max(int(limit or DEFAULT_LIMIT), 1000) if requested_exchange_ids else limit
     local_orders, local_decisions, local_positions = await _candidate_linked_protection_orders(
         days=days,
-        limit=limit,
+        limit=candidate_limit,
     )
     if not local_orders:
         return []
@@ -1338,14 +1349,18 @@ async def collect_linked_protection_fill_order_plans(
     fills = [fill for group in fills_by_symbol.values() for fill in group]
     if not fills:
         return []
-    existing_exchange_ids = await _existing_local_order_ids()
-    requested_exchange_ids = {str(item or "").strip() for item in exchange_order_ids if item}
+    existing_protection_execution_ids = await _existing_protection_execution_order_ids()
     if requested_exchange_ids:
         fills = [fill for fill in fills if str(fill.order_id) in requested_exchange_ids]
-    fills = [fill for fill in fills if str(fill.order_id) not in existing_exchange_ids]
+    fills = [fill for fill in fills if str(fill.order_id) not in existing_protection_execution_ids]
     if not fills:
         return []
     order_contexts = await _fetch_okx_order_history_contexts(fills)
+    protection_algo_rows = await _fetch_okx_protection_algo_history_rows(
+        fills,
+        order_contexts=order_contexts,
+        days=days,
+    )
     contract_sizes = await _fetch_okx_contract_sizes_for_inst_ids(
         {str(fill.inst_id or "").strip().upper() for fill in fills if fill.inst_id}
     )
@@ -1362,6 +1377,7 @@ async def collect_linked_protection_fill_order_plans(
             local_orders=local_orders,
             local_decisions=local_decisions,
             local_positions=local_positions,
+            protection_algo_rows=protection_algo_rows,
         )
         if linked is None:
             continue
@@ -1371,8 +1387,12 @@ async def collect_linked_protection_fill_order_plans(
         if source_order is None:
             continue
         contract_size = _safe_float(contract_sizes.get(str(fill.inst_id or "").strip().upper()))
+        contract_size_source = "okx_public_instruments" if contract_size > 0 else ""
         if contract_size <= 0:
-            contract_size = _safe_float(source_order.quantity) / max(_safe_float(fill.contracts), 1e-12)
+            contract_size = _safe_float(source_order.quantity) / max(
+                _safe_float(fill.contracts), 1e-12
+            )
+            contract_size_source = "linked_entry_quantity_ratio_fallback"
         quantity = (
             _fill_quantity_with_contract_size(fill, contract_size)
             if contract_size > 0
@@ -1398,6 +1418,23 @@ async def collect_linked_protection_fill_order_plans(
                 decision_id=(
                     int(source_order.decision_id)
                     if getattr(source_order, "decision_id", None) is not None
+                    else None
+                ),
+                contracts=_safe_float(fill.contracts),
+                contract_size=contract_size,
+                contract_size_source=contract_size_source,
+                fill_pnl=_safe_float(getattr(fill, "fill_pnl", None)),
+                trade_ids=tuple(
+                    str(item or "").strip()
+                    for item in getattr(fill, "trade_ids", ())
+                    if str(item or "").strip()
+                ),
+                fill_rows=tuple(
+                    dict(row) for row in getattr(fill, "rows", ()) if isinstance(row, dict)
+                ),
+                protection_execution=(
+                    dict(linked["protection_execution"])
+                    if isinstance(linked.get("protection_execution"), dict)
                     else None
                 ),
             )
@@ -1654,6 +1691,24 @@ async def _existing_local_order_ids() -> set[str]:
     return order_ids
 
 
+async def _existing_protection_execution_order_ids() -> set[str]:
+    async with get_session_ctx() as session:
+        rows = await session.execute(
+            select(Order.exchange_order_id, Order.okx_raw_fills).where(
+                Order.exchange_order_id.is_not(None),
+                Order.exchange_order_id != "",
+            )
+        )
+        result: set[str] = set()
+        for exchange_order_id, raw_fills in rows.all():
+            raw = raw_fills if isinstance(raw_fills, dict) else {}
+            execution = raw.get("protection_execution")
+            if not isinstance(execution, dict) or execution.get("lifecycle_complete") is not True:
+                continue
+            result.update(_split_exchange_order_ids(exchange_order_id))
+        return result
+
+
 async def _fetch_okx_contract_sizes(positions: list[Position]) -> dict[str, float]:
     inst_ids = {
         _position_okx_inst_id(position)
@@ -1699,6 +1754,39 @@ async def _fetch_okx_order_history_contexts(
             fills=fills,
             limit=5,
             strict=False,
+        )
+    finally:
+        shutdown = getattr(executor, "shutdown", None)
+        if callable(shutdown):
+            result = shutdown()
+            if hasattr(result, "__await__"):
+                await result
+
+
+async def _fetch_okx_protection_algo_history_rows(
+    fills: list[FillGroup],
+    *,
+    order_contexts: dict[str, tuple[dict[str, Any], ...]],
+    days: int,
+) -> list[dict[str, Any]]:
+    if not fills:
+        return []
+    algo_ids = {
+        str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+        for rows in order_contexts.values()
+        for row in rows
+        if str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
+    }
+    executor = OKXExecutor("paper")
+    try:
+        return await OkxNativeFactsClient(executor).fetch_protection_algo_history_rows(
+            algo_ids=algo_ids,
+            order_ids={str(fill.order_id or "").strip() for fill in fills if fill.order_id},
+            inst_ids={str(fill.inst_id or "").strip().upper() for fill in fills if fill.inst_id},
+            since=datetime.now(UTC) - timedelta(days=max(int(days or DEFAULT_DAYS), 1)),
+            limit=100,
+            max_pages=2,
+            strict=True,
         )
     finally:
         shutdown = getattr(executor, "shutdown", None)
@@ -2488,37 +2576,46 @@ async def apply_linked_protection_fill_order_plans(
         return {"applied": 0}
     backup_path = await _backup_linked_protection_fill_orders(plans)
     applied = 0
+    enriched = 0
     async with get_session_ctx() as session:
         for plan in plans:
             okx_inst_id = str(getattr(plan, "okx_inst_id", "") or "").strip().upper()
             exchange_order_id = str(getattr(plan, "exchange_order_id", "") or "").strip()
             if not okx_inst_id or not exchange_order_id:
                 continue
-            exists = (
+            existing_order = (
                 await session.execute(
-                    select(Order.id).where(Order.exchange_order_id == exchange_order_id).limit(1)
+                    select(Order).where(Order.exchange_order_id == exchange_order_id).limit(1)
                 )
             ).scalar_one_or_none()
-            if exists is not None:
-                continue
             filled_at = plan.filled_at or datetime.now(UTC)
-            session.add(
-                Order(
-                    model_name=plan.model_name,
-                    execution_mode=plan.execution_mode,
-                    symbol=normalize_trading_symbol(okx_inst_id),
-                    side=plan.side,
-                    order_type="market",
-                    quantity=plan.quantity,
-                    price=plan.price,
-                    status="filled",
-                    fee=plan.fee,
-                    decision_id=plan.decision_id,
-                    exchange_order_id=exchange_order_id,
+            if existing_order is not None:
+                if not _existing_linked_protection_order_matches_plan(existing_order, plan):
+                    continue
+                _apply_linked_protection_order_facts(
+                    existing_order,
+                    plan,
                     filled_at=filled_at,
-                    created_at=filled_at,
                 )
+                enriched += 1
+                continue
+            order = Order(
+                model_name=plan.model_name,
+                execution_mode=plan.execution_mode,
+                symbol=normalize_trading_symbol(okx_inst_id),
+                side=plan.side,
+                order_type="market",
+                quantity=plan.quantity,
+                price=plan.price,
+                status="filled",
+                fee=plan.fee,
+                decision_id=plan.decision_id,
+                exchange_order_id=exchange_order_id,
+                filled_at=filled_at,
+                created_at=filled_at,
             )
+            _apply_linked_protection_order_facts(order, plan, filled_at=filled_at)
+            session.add(order)
             positions = (
                 (
                     await session.execute(
@@ -2541,7 +2638,78 @@ async def apply_linked_protection_fill_order_plans(
                 )
             applied += 1
         await session.flush()
-    return {"applied": applied, "backup_path": str(backup_path)}
+    return {
+        "applied": applied,
+        "enriched": enriched,
+        "backup_path": str(backup_path),
+    }
+
+
+def _existing_linked_protection_order_matches_plan(
+    order: Order,
+    plan: LinkedProtectionFillOrderPlan,
+) -> bool:
+    protection_execution = (
+        plan.protection_execution if isinstance(plan.protection_execution, dict) else {}
+    )
+    return bool(
+        protection_execution.get("lifecycle_complete") is True
+        and str(getattr(order, "status", "") or "").lower() == "filled"
+        and str(getattr(order, "execution_mode", "") or "").lower()
+        == str(plan.execution_mode or "").lower()
+        and normalize_trading_symbol(getattr(order, "symbol", None))
+        == normalize_trading_symbol(plan.okx_inst_id)
+        and str(getattr(order, "side", "") or "").lower() == str(plan.side or "").lower()
+    )
+
+
+def _apply_linked_protection_order_facts(
+    order: Order,
+    plan: LinkedProtectionFillOrderPlan,
+    *,
+    filled_at: datetime,
+) -> None:
+    now = datetime.now(UTC)
+    rows = [dict(row) for row in plan.fill_rows if isinstance(row, dict)]
+    trade_ids = tuple(
+        dict.fromkeys(
+            [
+                *[str(item or "").strip() for item in plan.trade_ids],
+                *[str(row.get("tradeId") or row.get("trade_id") or "").strip() for row in rows],
+            ]
+        )
+    )
+    trade_ids = tuple(item for item in trade_ids if item)
+    existing_raw = order.okx_raw_fills if isinstance(order.okx_raw_fills, dict) else {}
+    raw_fills = {
+        **existing_raw,
+        "source": plan.source,
+        "fills_history_confirmed": True,
+        "order_id": plan.exchange_order_id,
+        "trade_ids": list(trade_ids),
+        "inst_id": plan.okx_inst_id,
+        "contracts": plan.contracts,
+        "avg_price": plan.price,
+        "fee_abs": plan.fee,
+        "fill_pnl": plan.fill_pnl,
+        "contract_size": plan.contract_size,
+        "contract_size_verified": plan.contract_size_source == "okx_public_instruments",
+        "contract_size_source": plan.contract_size_source,
+        "base_quantity": plan.quantity,
+        "timestamp": filled_at.isoformat(),
+        "rows": rows,
+    }
+    if isinstance(plan.protection_execution, dict) and plan.protection_execution:
+        raw_fills["protection_execution"] = dict(plan.protection_execution)
+    order.okx_inst_id = plan.okx_inst_id
+    order.okx_trade_ids = ",".join(trade_ids) or None
+    order.okx_fill_contracts = plan.contracts or None
+    order.okx_fill_pnl = plan.fill_pnl
+    order.okx_state = "filled"
+    order.okx_sync_status = OKX_SYNC_CONFIRMED
+    order.okx_synced_at = now
+    order.okx_last_error = None
+    order.okx_raw_fills = raw_fills
 
 
 async def apply_open_position_close_plans(plans: list[OpenPositionClosePlan]) -> dict[str, Any]:

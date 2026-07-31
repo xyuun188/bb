@@ -1529,7 +1529,13 @@ class OkxOrderFactSyncService:
                 contract_size=contract_size,
                 contract_size_source=contract_size_source,
             ):
-                if _stored_slippage_fact_needs_refresh(order):
+                protection_execution = protection_execution_by_order_id.get(fill.order_id)
+                needs_slippage_refresh = _stored_slippage_fact_needs_refresh(order)
+                needs_protection_refresh = _stored_protection_execution_needs_refresh(
+                    order,
+                    protection_execution,
+                )
+                if needs_slippage_refresh or needs_protection_refresh:
                     self._apply_fill_to_order(
                         order,
                         fill,
@@ -1538,13 +1544,18 @@ class OkxOrderFactSyncService:
                         contract_size=contract_size,
                         contract_size_source=contract_size_source,
                         order_row=order_row,
-                        protection_execution=protection_execution_by_order_id.get(
-                            fill.order_id
-                        ),
+                        protection_execution=protection_execution,
                     )
                     confirmed_count += 1
                     samples.append(
-                        _sample(order, kind="local_order_slippage_fact_refreshed")
+                        _sample(
+                            order,
+                            kind=(
+                                "local_order_slippage_fact_refreshed"
+                                if needs_slippage_refresh
+                                else "local_order_protection_execution_refreshed"
+                            ),
+                        )
                     )
                 continue
             self._apply_fill_to_order(
@@ -2762,6 +2773,21 @@ def _stored_slippage_fact_needs_refresh(order: Order) -> bool:
             )
         )
     )
+
+
+def _stored_protection_execution_needs_refresh(
+    order: Order,
+    protection_execution: dict[str, Any] | None,
+) -> bool:
+    if (
+        not isinstance(protection_execution, dict)
+        or protection_execution.get("lifecycle_complete") is not True
+    ):
+        return False
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    stored = raw.get("protection_execution")
+    return not isinstance(stored, dict) or stored != protection_execution
 
 
 def _rebuild_stored_slippage_fact(order: Order, *, now: datetime) -> bool:

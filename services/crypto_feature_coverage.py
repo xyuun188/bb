@@ -76,7 +76,7 @@ def summarize_crypto_feature_coverage(
     feature_rows.extend(
         [
             _orderbook_feature(evidence["orderbook_depth"], symbols, current),
-            _slippage_feature(latest_snapshot, latest_snapshot_at, symbols, current),
+            _slippage_feature(evidence["slippage"], symbols, current),
             _funding_feature(evidence["funding_rate"], symbols, current),
             _open_interest_feature(evidence["open_interest"], symbols, current),
             _liquidation_feature(evidence["liquidation_risk"], symbols, current),
@@ -342,6 +342,7 @@ def _snapshot_rows(decisions: Sequence[Any]) -> list[dict[str, Any]]:
 def _feature_evidence_from_snapshots(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     keys = (
         "orderbook_depth",
+        "slippage",
         "funding_rate",
         "open_interest",
         "liquidation_risk",
@@ -357,6 +358,8 @@ def _feature_evidence_from_snapshots(rows: Sequence[dict[str, Any]]) -> dict[str
         timestamp = _as_utc(row.get("timestamp"))
         if not evidence["orderbook_depth"]["snapshot"] and _has_orderbook_depth(snapshot):
             evidence["orderbook_depth"] = {"snapshot": snapshot, "timestamp": timestamp}
+        if not evidence["slippage"]["snapshot"] and _has_slippage_presence(snapshot):
+            evidence["slippage"] = {"snapshot": snapshot, "timestamp": timestamp}
         if not evidence["funding_rate"]["snapshot"] and _has_funding_presence(snapshot):
             evidence["funding_rate"] = {"snapshot": snapshot, "timestamp": timestamp}
         if not evidence["open_interest"]["snapshot"] and _has_open_interest(snapshot):
@@ -565,8 +568,10 @@ def _orderbook_feature(
 
 
 def _slippage_feature(
-    snapshot: dict[str, Any], timestamp: datetime | None, symbols: Sequence[str], now: datetime
+    evidence: dict[str, Any], symbols: Sequence[str], now: datetime
 ) -> dict[str, Any]:
+    snapshot = _safe_dict(evidence.get("snapshot"))
+    timestamp = _as_utc(evidence.get("timestamp"))
     spread = _safe_float(snapshot.get("spread_pct"), 0.0)
     bid = _safe_float(snapshot.get("bid"), 0.0)
     ask = _safe_float(snapshot.get("ask"), 0.0)
@@ -1006,6 +1011,13 @@ def _has_orderbook_depth(snapshot: dict[str, Any]) -> bool:
         _safe_float(snapshot.get("orderbook_bid_depth"), 0.0) > 0
         and _safe_float(snapshot.get("orderbook_ask_depth"), 0.0) > 0
     )
+
+
+def _has_slippage_presence(snapshot: dict[str, Any]) -> bool:
+    spread = _safe_float(snapshot.get("spread_pct"), 0.0)
+    bid = _safe_float(snapshot.get("bid"), 0.0)
+    ask = _safe_float(snapshot.get("ask"), 0.0)
+    return spread > 0 or (bid > 0 and ask >= bid) or _has_orderbook_depth(snapshot)
 
 
 def _has_funding_presence(snapshot: dict[str, Any]) -> bool:

@@ -1318,6 +1318,73 @@ def test_matching_native_fill_still_refreshes_missing_slippage_fact() -> None:
     assert order.okx_raw_fills["execution_slippage"]["complete"] is True
 
 
+def test_matching_native_fill_refreshes_missing_protection_execution() -> None:
+    now = datetime.now(UTC)
+    order_id = "act-protection-fill"
+    row = _act_fill_row(now, order_id=order_id)
+    fill = OkxNativeFillGroup(
+        order_id=order_id,
+        trade_ids=(f"trade-{order_id}",),
+        inst_id="ACT-USDT-SWAP",
+        symbol="ACT/USDT",
+        side="buy",
+        pos_side="net",
+        contracts=4.0,
+        avg_price=0.00895,
+        fee_abs=0.001,
+        fill_pnl=0.0,
+        timestamp_ms=now.timestamp() * 1000.0,
+        timestamp=now,
+        raw_count=1,
+        rows=(row,),
+    )
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ACT/USDT",
+        side="buy",
+        order_type="market",
+        quantity=4.0,
+        price=0.00895,
+        status="filled",
+        fee=0.001,
+        exchange_order_id=order_id,
+        created_at=now,
+        filled_at=now,
+    )
+    service = OkxOrderFactSyncService(mode="paper")
+    service._apply_fill_to_order(
+        order,
+        fill,
+        now=now,
+        sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=1.0,
+        contract_size_source="okx_public_instruments",
+    )
+    lifecycle = {
+        "lifecycle_complete": True,
+        "source_authority": "okx_algo_history_plus_fills_history",
+        "actual_side": "tp",
+    }
+
+    confirmed, unverified, skipped, deferred, samples = service._apply_local_order_facts(
+        [order],
+        fills=[fill],
+        fills_by_order_id={order_id: fill},
+        order_rows_by_id={},
+        protection_execution_by_order_id={order_id: lifecycle},
+        contract_sizes={"ACT-USDT-SWAP": 1.0},
+        decisions_by_id={},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids=set(),
+    )
+
+    assert (confirmed, unverified, skipped, deferred) == (1, 0, 0, 0)
+    assert samples[0]["kind"] == "local_order_protection_execution_refreshed"
+    assert order.okx_raw_fills["protection_execution"] == lifecycle
+
+
 def test_fill_storage_keeps_every_compact_row_without_twenty_row_truncation() -> None:
     now = datetime.now(UTC)
     order_id = "act-many-fills"

@@ -445,6 +445,23 @@ async def test_linked_protection_fill_order_apply_creates_order_without_closing_
             okx_algo_id="aave-oco-triggered",
             okx_source="7",
             decision_id=1717,
+            contracts=61.0,
+            contract_size=0.01,
+            contract_size_source="okx_public_instruments",
+            fill_pnl=0.17,
+            trade_ids=("aave-protection-trade",),
+            fill_rows=(
+                {
+                    "ordId": "aave-protection-close",
+                    "tradeId": "aave-protection-trade",
+                    "fillSz": "61",
+                },
+            ),
+            protection_execution={
+                "lifecycle_complete": True,
+                "source_authority": "okx_algo_history_plus_fills_history",
+                "actual_side": "sl",
+            },
         )
 
         monkeypatch.setattr(
@@ -481,8 +498,191 @@ async def test_linked_protection_fill_order_apply_creates_order_without_closing_
     assert order["side"] == "buy"
     assert order["quantity"] == pytest.approx(0.61)
     assert order["decision_id"] == 1717
+    assert order["okx_inst_id"] == "AAVE-USDT-SWAP"
+    assert order["okx_fill_contracts"] == pytest.approx(61.0)
+    assert order["okx_sync_status"] == "okx_confirmed"
+    assert order["okx_raw_fills"]["protection_execution"]["actual_side"] == "sl"
+    assert order["okx_raw_fills"]["contract_size_verified"] is True
     assert len(reflection_rows) == 1
     assert reflection_rows[0]["expert_lessons"]["repair_plan"]["okx_algo_id"] == "aave-oco-triggered"
+
+
+@pytest.mark.asyncio
+async def test_targeted_linked_protection_repair_scans_full_candidate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, int] = {}
+
+    async def candidate_orders(*, days: int, limit: int):
+        captured.update(days=days, limit=limit)
+        return [], {}, []
+
+    monkeypatch.setattr(
+        repair_script,
+        "_candidate_linked_protection_orders",
+        candidate_orders,
+    )
+
+    plans = await repair_script.collect_linked_protection_fill_order_plans(
+        days=30,
+        limit=100,
+        exchange_order_ids=("older-generated-protection-order",),
+    )
+
+    assert plans == []
+    assert captured == {"days": 30, "limit": 1000}
+
+
+@pytest.mark.asyncio
+async def test_linked_protection_repair_uses_completed_algo_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filled_at = datetime(2026, 7, 31, 6, 57, tzinfo=UTC)
+    source_order = SimpleNamespace(
+        id=6150,
+        exchange_order_id="bch-entry",
+        symbol="BCH/USDT",
+        side="buy",
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision_id=172900,
+        quantity=0.08,
+    )
+    fill = SimpleNamespace(
+        order_id="bch-protection-close",
+        inst_id="BCH-USDT-SWAP",
+        side="sell",
+        contracts=8.0,
+        avg_price=548.0,
+        fee_abs=0.03,
+        fill_pnl=0.9,
+        timestamp=filled_at,
+        trade_ids=("bch-protection-trade",),
+        rows=({"tradeId": "bch-protection-trade"},),
+    )
+    order_contexts = {
+        "bch-protection-close": (
+            {"ordId": "bch-protection-close", "algoId": "bch-oco", "source": "7"},
+        )
+    }
+    algo_rows = [
+        {
+            "algoId": "bch-oco",
+            "ordId": "bch-protection-close",
+            "actualSide": "tp",
+            "state": "effective",
+        }
+    ]
+    captured: dict[str, object] = {}
+
+    async def candidate_orders(*, days: int, limit: int):
+        return [source_order], {}, []
+
+    async def fetch_algo_history(fills, *, order_contexts, days):
+        captured["algo_fetch"] = (fills, order_contexts, days)
+        return algo_rows
+
+    def linked_context(fill, **kwargs):
+        captured["linked_algo_rows"] = kwargs["protection_algo_rows"]
+        return {
+            "linked_exchange_order_id": "bch-entry",
+            "okx_algo_id": "bch-oco",
+            "okx_source": "7",
+            "protection_execution": {
+                "lifecycle_complete": True,
+                "source_authority": "okx_algo_history_plus_fills_history",
+                "actual_side": kwargs["protection_algo_rows"][0]["actualSide"],
+            },
+        }
+
+    monkeypatch.setattr(repair_script, "_candidate_linked_protection_orders", candidate_orders)
+    monkeypatch.setattr(
+        repair_script,
+        "_fetch_okx_fill_groups",
+        lambda _symbols: _async_value({"BCH/USDT": [fill]}),
+    )
+    monkeypatch.setattr(
+        repair_script,
+        "_existing_protection_execution_order_ids",
+        lambda: _async_value(set()),
+    )
+    monkeypatch.setattr(
+        repair_script,
+        "_fetch_okx_order_history_contexts",
+        lambda _fills: _async_value(order_contexts),
+    )
+    monkeypatch.setattr(
+        repair_script,
+        "_fetch_okx_protection_algo_history_rows",
+        fetch_algo_history,
+    )
+    monkeypatch.setattr(
+        repair_script,
+        "_fetch_okx_contract_sizes_for_inst_ids",
+        lambda _inst_ids: _async_value({"BCH-USDT-SWAP": 0.01}),
+    )
+    monkeypatch.setattr(repair_script, "_linked_protection_fill_context", linked_context)
+
+    plans = await repair_script.collect_linked_protection_fill_order_plans(days=30)
+
+    assert captured["algo_fetch"] == ([fill], order_contexts, 30)
+    assert captured["linked_algo_rows"] == algo_rows
+    assert len(plans) == 1
+    assert plans[0].protection_execution["lifecycle_complete"] is True
+    assert plans[0].protection_execution["actual_side"] == "tp"
+
+
+def test_linked_protection_fill_fact_enriches_existing_order() -> None:
+    filled_at = datetime(2026, 7, 31, 6, 57, tzinfo=UTC)
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="SAND/USDT",
+        side="buy",
+        order_type="market",
+        quantity=4260.0,
+        price=0.0425,
+        status="filled",
+        fee=0.09,
+        exchange_order_id="sand-protection-close",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_raw_fills={},
+    )
+    plan = repair_script.LinkedProtectionFillOrderPlan(
+        local_entry_order_id=5962,
+        linked_exchange_order_id="sand-entry",
+        symbol="SAND/USDT",
+        side="buy",
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        exchange_order_id="sand-protection-close",
+        quantity=4260.0,
+        price=0.0425,
+        fee=0.09,
+        filled_at=filled_at,
+        source="okx_linked_protection_fill_missing_local_order",
+        okx_inst_id="SAND-USDT-SWAP",
+        contracts=426.0,
+        contract_size=10.0,
+        contract_size_source="okx_public_instruments",
+        protection_execution={
+            "lifecycle_complete": True,
+            "source_authority": "okx_algo_history_plus_fills_history",
+            "actual_side": "sl",
+        },
+    )
+
+    repair_script._apply_linked_protection_order_facts(
+        order,
+        plan,
+        filled_at=filled_at,
+    )
+
+    assert order.okx_inst_id == "SAND-USDT-SWAP"
+    assert order.okx_fill_contracts == pytest.approx(426.0)
+    assert order.okx_sync_status == "okx_confirmed"
+    assert order.okx_raw_fills["protection_execution"]["actual_side"] == "sl"
 
 
 @pytest.mark.asyncio

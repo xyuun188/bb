@@ -4232,6 +4232,20 @@ select.form-input { cursor: pointer; }
     color: var(--accent-light);
     background: var(--accent-dim);
 }
+.position-close-origin {
+    display: inline-flex;
+    align-items: center;
+    min-height: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+.position-close-origin.origin-take_profit { color: var(--green); }
+.position-close-origin.origin-stop_loss,
+.position-close-origin.origin-liquidation { color: var(--red); }
+.position-close-origin.origin-system { color: var(--accent-light); }
+.position-close-origin.origin-manual,
+.position-close-origin.origin-unknown { color: var(--text-muted); }
 .position-ledger-summary {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
