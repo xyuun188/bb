@@ -2471,9 +2471,17 @@ class OkxSyncService:
                             symbol=symbol,
                             side=side,
                             entry_price=entry_price,
+                            reference_price=current_price,
                             order=linked_order,
                         )
-                    stop_loss_price = protection.get("stop_loss_price") or next(
+                    reanchored_protection = bool(
+                        fallback_protection.get("reanchored_from_stale_submission") is True
+                    )
+                    stop_loss_price = protection.get("stop_loss_price") or (
+                        fallback_protection.get("stop_loss_price")
+                        if reanchored_protection
+                        else None
+                    ) or next(
                         (
                             getattr(pos, "stop_loss_price", None)
                             for pos in matching_local_positions
@@ -2481,7 +2489,11 @@ class OkxSyncService:
                         ),
                         None,
                     ) or fallback_protection.get("stop_loss_price")
-                    take_profit_price = protection.get("take_profit_price") or next(
+                    take_profit_price = protection.get("take_profit_price") or (
+                        fallback_protection.get("take_profit_price")
+                        if reanchored_protection
+                        else None
+                    ) or next(
                         (
                             getattr(pos, "take_profit_price", None)
                             for pos in matching_local_positions
@@ -2712,6 +2724,7 @@ class OkxSyncService:
                             symbol=symbol,
                             side=side,
                             entry_price=entry_price,
+                            reference_price=current_price,
                             order=order,
                         )
                         stop_loss_price = stop_loss_price or order_fallback_protection.get(

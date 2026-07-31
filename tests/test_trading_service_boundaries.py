@@ -7067,8 +7067,11 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
         symbol="BTC/USDT",
         side="long",
         is_open=True,
+        stop_loss_price=90.0,
+        take_profit_price=130.0,
     )
     sync_calls: list[dict[str, Any]] = []
+    fallback_calls: list[dict[str, Any]] = []
 
     class FakePaperOKX:
         async def get_positions_strict(self):
@@ -7108,8 +7111,13 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
             }
         }
 
-    async def fallback_protection(_session, **_kwargs):
-        return {}
+    async def fallback_protection(_session, **kwargs):
+        fallback_calls.append(kwargs)
+        return {
+            "stop_loss_price": 91.0,
+            "take_profit_price": 131.0,
+            "reanchored_from_stale_submission": True,
+        }
 
     def sync_snapshot(positions, **kwargs):
         sync_calls.append({"positions": positions, "kwargs": kwargs})
@@ -7156,6 +7164,107 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_snapshot_
             },
         }
     ]
+    assert fallback_calls[0]["reference_price"] == 111.0
+
+
+@pytest.mark.asyncio
+async def test_sync_service_missing_protection_uses_reanchored_prices_over_stale_local(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    local_position = SimpleNamespace(
+        id=5474,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="YB/USDT",
+        side="short",
+        is_open=True,
+        quantity=1797.0,
+        entry_price=0.0666,
+        current_price=0.0456,
+        unrealized_pnl=0.0,
+        stop_loss_price=0.06882,
+        take_profit_price=0.06479,
+        entry_exchange_order_id=None,
+    )
+    sync_calls: list[dict[str, Any]] = []
+    fallback_calls: list[dict[str, Any]] = []
+
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            return [
+                {
+                    "symbol": "YB/USDT",
+                    "side": "short",
+                    "contracts": "-1797",
+                    "contractSize": "1",
+                    "entryPrice": "0.0666",
+                    "markPrice": "0.0456",
+                    "unrealizedPnl": "37.737",
+                    "info": {
+                        "instId": "YB-USDT-SWAP",
+                        "posSide": "net",
+                        "pos": "-1797",
+                    },
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return [local_position]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    async def protection_map(_paper_okx, _exchange_positions):
+        return {}
+
+    async def fallback_protection(_session, **kwargs):
+        fallback_calls.append(kwargs)
+        return {
+            "stop_loss_price": 0.04712,
+            "take_profit_price": 0.04436072072072072,
+            "source": "exact_order_reanchored_dynamic_protection",
+            "reanchored_from_stale_submission": True,
+        }
+
+    def sync_snapshot(positions, **kwargs):
+        sync_calls.append({"positions": positions, "kwargs": kwargs})
+        return True
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    service = OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=sync_snapshot,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime.now(UTC),
+        **_noop_reconcile_close_boundaries(),
+    )
+    service._start_pending_position_protection_rebalance = lambda _executor: False
+
+    result = await service.reconcile_exchange_positions()
+
+    assert fallback_calls[0]["reference_price"] == 0.0456
+    assert sync_calls[0]["kwargs"]["stop_loss_price"] == pytest.approx(0.04712)
+    assert sync_calls[0]["kwargs"]["take_profit_price"] == pytest.approx(
+        0.04436072072072072
+    )
+    assert service._pending_position_protection_plans[("YB/USDT", "short")] == {
+        "stop_loss_price": pytest.approx(0.04712),
+        "take_profit_price": pytest.approx(0.04436072072072072),
+        "okx_position_side": "net",
+        "source": "exact_order_reanchored_dynamic_protection",
+    }
+    assert result[0]["kind"] == "snapshot_update"
 
 
 @pytest.mark.asyncio

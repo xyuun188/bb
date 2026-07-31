@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the accelerated OKX Demo canary sampling campaign online."""
+"""Audit current normal paper sampling and trading activity online."""
 
 # ruff: noqa: S608 - the remote template uses SQLAlchemy expressions, not raw SQL.
 
@@ -21,125 +21,130 @@ def _remote_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--remote-app-dir", default="/data/bb/app")
-    parser.add_argument("--limit", type=int, default=500)
-    parser.add_argument("--timeout", type=int, default=120)
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    remote_script = f"""
+def _remote_script(*, remote_app_dir: str, hours: int, limit: int) -> str:
+    return f"""
 import asyncio
 import json
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from scripts.runtime_env_bootstrap import load_runtime_env_files, drop_privileges_to_runtime_user_if_needed
+from scripts.runtime_env_bootstrap import (
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
 
-root = Path({args.remote_app_dir!r})
+root = Path({remote_app_dir!r})
 load_runtime_env_files(project_root=root)
 drop_privileges_to_runtime_user_if_needed(project_root=root)
 
 from sqlalchemy import select
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
-from services.paper_bootstrap_canary import (
-    PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES,
-    PAPER_BOOTSTRAP_CAMPAIGN_START,
-    PAPER_BOOTSTRAP_CAMPAIGN_VERSION,
-    PAPER_BOOTSTRAP_CANARY_VERSION,
-    PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
-    PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE,
-    PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
-    PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
-    PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK,
-    PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK,
-    PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
+from services.ml_signal_service import load_authoritative_trade_training_samples
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_VERSION,
+    normal_paper_trade_contract_reasons,
 )
+
+WINDOW_HOURS = {max(int(hours), 1)!r}
+LIMIT = {max(int(limit), 1)!r}
+
 
 def obj(value):
     return value if isinstance(value, dict) else {{}}
 
+
 async def run():
+    now = datetime.now(UTC)
+    window_start = now - timedelta(hours=WINDOW_HOURS)
     async with get_read_session_ctx() as session:
         result = await session.execute(
             select(AIDecision)
             .where(
                 AIDecision.is_paper.is_(True),
-                AIDecision.created_at >= PAPER_BOOTSTRAP_CAMPAIGN_START.replace(tzinfo=None),
+                AIDecision.created_at >= window_start.replace(tzinfo=None),
+                AIDecision.raw_llm_response.is_not(None),
             )
             .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
-            .limit({max(int(args.limit or 1), 1)!r})
         )
         decisions = list(result.scalars().all())
+
     rows = []
     for decision in decisions:
         raw = obj(decision.raw_llm_response)
-        canary = obj(raw.get("paper_bootstrap_canary"))
-        if canary.get("version") != PAPER_BOOTSTRAP_CANARY_VERSION:
+        contract = obj(raw.get("normal_paper_trade"))
+        if not contract:
             continue
-        guard = obj(canary.get("runtime_guard"))
-        sizing = obj(raw.get("profit_risk_sizing"))
-        selected_observation = obj(canary.get("selected_observation"))
+        reasons = normal_paper_trade_contract_reasons(contract)
         rows.append({{
             "decision_id": int(decision.id),
             "created_at": decision.created_at,
             "symbol": decision.symbol,
             "persisted_action": decision.action,
-            "candidate_action": canary.get("candidate_action") or canary.get("selected_side"),
-            "authorized": canary.get("authorized") is True,
-            "runtime_authorized": canary.get("runtime_preflight_authorized") is True,
+            "contract_version": contract.get("version"),
+            "contract_valid": not reasons,
+            "contract_reasons": reasons,
+            "authorized": contract.get("authorized") is True,
+            "selected_side": contract.get("side"),
+            "selection_reason": contract.get("selection_reason"),
+            "expected_net_return_pct": contract.get("expected_net_return_pct"),
+            "objective_net_return_pct": contract.get("objective_net_return_pct"),
+            "loss_probability": contract.get("loss_probability"),
             "was_executed": bool(decision.was_executed),
             "executed_at": decision.executed_at,
             "execution_price": decision.execution_price,
             "execution_reason": decision.execution_reason,
             "outcome": decision.outcome,
-            "horizon_minutes": selected_observation.get("horizon_minutes"),
-            "blocking_reasons": guard.get("blocking_reasons") or canary.get("runtime_preflight_blocking_reasons") or [],
-            "daily_entry_count": guard.get("daily_entry_count"),
-            "max_daily_entries": guard.get("max_daily_entries"),
-            "open_position_count": guard.get("open_position_count"),
-            "max_open_positions": guard.get("max_open_positions"),
-            "completed_authoritative_sample_count": guard.get("completed_authoritative_sample_count"),
-            "remaining_authoritative_sample_count": guard.get("remaining_authoritative_sample_count"),
-            "campaign_completed_sample_count": guard.get("campaign_completed_sample_count"),
-            "sizing_version": sizing.get("contract_version"),
-            "sizing_eligible": sizing.get("production_eligible") is True,
-            "sizing_reasons": sizing.get("reasons") or [],
+            "outcome_pnl_pct": decision.outcome_pnl_pct,
         }})
-    completed = sum(bool(row.get("outcome")) for row in rows)
-    current_count = PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES + completed
+
+    authoritative_samples = await load_authoritative_trade_training_samples()
     payload = {{
         "status": "ok",
         "read_only": True,
-        "campaign_version": PAPER_BOOTSTRAP_CAMPAIGN_VERSION,
-        "canary_version": PAPER_BOOTSTRAP_CANARY_VERSION,
-        "campaign_start": PAPER_BOOTSTRAP_CAMPAIGN_START.astimezone(UTC).isoformat(),
-        "baseline_authoritative_sample_count": PAPER_BOOTSTRAP_AUTHORITATIVE_BASELINE_SAMPLES,
-        "target_authoritative_sample_count": PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES,
-        "campaign_candidate_count": len(rows),
-        "campaign_runtime_authorized_count": sum(row["runtime_authorized"] for row in rows),
-        "campaign_executed_count": sum(row["was_executed"] for row in rows),
-        "campaign_completed_count": completed,
-        "current_authoritative_sample_count": current_count,
-        "remaining_authoritative_sample_count": max(PAPER_BOOTSTRAP_TARGET_AUTHORITATIVE_SAMPLES - current_count, 0),
+        "generated_at": now.isoformat(),
+        "window_hours": WINDOW_HOURS,
+        "window_start": window_start.isoformat(),
+        "contract_version": NORMAL_PAPER_TRADE_VERSION,
+        "loaded_decision_count": len(decisions),
+        "candidate_count": len(rows),
+        "contract_valid_count": sum(row["contract_valid"] for row in rows),
+        "authorized_count": sum(row["authorized"] for row in rows),
+        "executed_count": sum(row["was_executed"] for row in rows),
+        "completed_outcome_count": sum(bool(row.get("outcome")) for row in rows),
+        "current_authoritative_sample_count": len(authoritative_samples),
         "sampling_policy": {{
-            "expected_completion_rate": PAPER_BOOTSTRAP_EXPECTED_COMPLETION_RATE,
-            "max_daily_entries": PAPER_BOOTSTRAP_MAX_DAILY_ENTRIES,
-            "max_open_positions": PAPER_BOOTSTRAP_MAX_OPEN_POSITIONS,
-            "single_trade_equity_risk": PAPER_BOOTSTRAP_SINGLE_TRADE_EQUITY_RISK,
-            "portfolio_equity_risk": PAPER_BOOTSTRAP_PORTFOLIO_EQUITY_RISK,
-            "daily_loss_equity_risk": PAPER_BOOTSTRAP_DAILY_LOSS_EQUITY_RISK,
+            "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+            "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+            "production_permission": False,
         }},
-        "latest_candidates": rows[:20],
+        "latest_candidates": rows[:LIMIT],
     }}
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
+
 asyncio.run(run())
 """
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--remote-app-dir", default="/data/bb/app")
+    parser.add_argument("--hours", type=int, default=24)
+    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--timeout", type=int, default=120)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    remote_script = _remote_script(
+        remote_app_dir=args.remote_app_dir,
+        hours=args.hours,
+        limit=args.limit,
+    )
     command = (
         f"cd {_remote_quote(args.remote_app_dir)} && "
         "PYBIN=python3; "

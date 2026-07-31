@@ -2282,3 +2282,286 @@ async def test_okx_authoritative_sync_fill_page_cap_does_not_follow_row_limit(
     assert captured["limit"] == 100
     assert captured["max_pages"] == MAX_AUTHORITATIVE_FILL_PAGES == 10
     assert captured["account_wide_only"] is True
+
+
+class _BoundaryFillCcxt(_RecentFillLedgerEmpty):
+    fill_timestamp_ms: int = 0
+    begins: list[int] = []
+
+    async def privateGetTradeFills(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._fills(params)
+
+    async def privateGetTradeFillsHistory(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self._fills(params)
+
+    async def _fills(self, params: dict[str, Any]) -> dict[str, Any]:
+        begin = int(params.get("begin") or 0)
+        self.begins.append(begin)
+        if begin > self.fill_timestamp_ms:
+            return {"data": []}
+        return {
+            "data": [
+                {
+                    "ordId": "boundary-order",
+                    "tradeId": "boundary-trade",
+                    "instId": "LQTY-USDT-SWAP",
+                    "side": "buy",
+                    "fillSz": "919",
+                    "fillPx": "0.19709989",
+                    "fee": "-0.0905674",
+                    "fillPnl": "0",
+                    "ts": str(self.fill_timestamp_ms),
+                }
+            ]
+        }
+
+    async def publicGetPublicInstruments(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        assert params["instType"] == "SWAP"
+        return {"data": [{"instId": "LQTY-USDT-SWAP", "ctVal": "1"}]}
+
+
+class _BoundaryFillExecutor(_FakeExecutor):
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return []
+
+    async def _get_ccxt(self) -> _BoundaryFillCcxt:
+        return _BoundaryFillCcxt()
+
+
+class _EmptyConfirmedFillCcxt(_RecentFillLedgerEmpty):
+    async def privateGetTradeFillsHistory(
+        self, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {"data": []}
+
+    async def publicGetPublicInstruments(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        assert params["instType"] == "SWAP"
+        return {"data": [{"instId": "LQTY-USDT-SWAP", "ctVal": "1"}]}
+
+
+class _EmptyConfirmedFillExecutor(_FakeExecutor):
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return []
+
+    async def _get_ccxt(self) -> _EmptyConfirmedFillCcxt:
+        return _EmptyConfirmedFillCcxt()
+
+
+def _confirmed_lqty_order(
+    *,
+    now: datetime,
+    quantity: float = 919.0,
+    raw_order_id: str = "persisted-order",
+) -> Order:
+    fill_timestamp_ms = int((now - timedelta(minutes=5)).timestamp() * 1000)
+    return Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="LQTY/USDT",
+        side="buy",
+        order_type="market",
+        quantity=quantity,
+        price=0.19709989,
+        status="filled",
+        exchange_order_id="persisted-order",
+        okx_inst_id="LQTY-USDT-SWAP",
+        okx_trade_ids="64790397,64790398",
+        okx_fill_contracts=919.0,
+        okx_sync_status="okx_confirmed",
+        okx_raw_fills={
+            "fills_history_confirmed": True,
+            "order_id": "persisted-order",
+            "trade_ids": ["64790397", "64790398"],
+            "inst_id": "LQTY-USDT-SWAP",
+            "contracts": 919.0,
+            "contract_size": 1.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": 919.0,
+            "avg_price": 0.19709989,
+            "rows": [
+                {
+                    "ordId": raw_order_id,
+                    "tradeId": "64790397",
+                    "instId": "LQTY-USDT-SWAP",
+                    "side": "buy",
+                    "fillSz": "400",
+                    "fillPx": "0.19709989",
+                    "fee": "-0.04",
+                    "fillPnl": "0",
+                    "ts": str(fill_timestamp_ms),
+                },
+                {
+                    "ordId": raw_order_id,
+                    "tradeId": "64790398",
+                    "instId": "LQTY-USDT-SWAP",
+                    "side": "buy",
+                    "fillSz": "519",
+                    "fillPx": "0.19709989",
+                    "fee": "-0.0505674",
+                    "fillPnl": "0",
+                    "ts": str(fill_timestamp_ms + 1),
+                },
+            ],
+        },
+        filled_at=now - timedelta(minutes=5),
+        created_at=now - timedelta(minutes=5),
+    )
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_expands_exchange_window_for_selected_local_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-boundary.db').as_posix()}",
+    )
+    epoch_started_at = datetime.now(UTC) - timedelta(days=2)
+    monkeypatch.setattr(
+        "services.okx_authoritative_sync.load_training_epoch_start",
+        lambda: epoch_started_at,
+    )
+    await init_db()
+    now = datetime.now(UTC)
+    fill_at = now - timedelta(hours=24, minutes=16)
+    _BoundaryFillCcxt.fill_timestamp_ms = int(fill_at.timestamp() * 1000)
+    _BoundaryFillCcxt.begins = []
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="LQTY/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=919.0,
+                    price=0.19709989,
+                    status="filled",
+                    exchange_order_id="boundary-order",
+                    okx_inst_id="LQTY-USDT-SWAP",
+                    okx_fill_contracts=919.0,
+                    filled_at=fill_at,
+                    created_at=now - timedelta(hours=23, minutes=59),
+                )
+            )
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            executor_factory=_BoundaryFillExecutor,
+        ).collect()
+
+        kinds = {issue["kind"] for issue in report["issues"]}
+        query_start = datetime.fromisoformat(report["exchange_query_window_start"])
+        assert query_start <= fill_at
+        assert query_start >= epoch_started_at
+        assert min(_BoundaryFillCcxt.begins) <= _BoundaryFillCcxt.fill_timestamp_ms
+        assert report["okx_fill_order_count"] == 1
+        assert "local_order_not_found_in_recent_okx_fills" not in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_accepts_identity_complete_persisted_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-persisted-fill.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(_confirmed_lqty_order(now=datetime.now(UTC)))
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            executor_factory=_EmptyConfirmedFillExecutor,
+        ).collect()
+
+        issue_kinds = {issue["kind"] for issue in report["issues"]}
+        observation_kinds = {item["kind"] for item in report["observations"]}
+        assert "local_order_not_found_in_recent_okx_fills" not in issue_kinds
+        assert "local_order_quantity_differs_from_okx_fill" not in issue_kinds
+        assert "local_order_verified_from_persisted_okx_fills" in observation_kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_rejects_wrong_persisted_fill_identity(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-wrong-fill.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                _confirmed_lqty_order(
+                    now=datetime.now(UTC),
+                    raw_order_id="different-order",
+                )
+            )
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            executor_factory=_EmptyConfirmedFillExecutor,
+        ).collect()
+
+        issue_kinds = {issue["kind"] for issue in report["issues"]}
+        observation_kinds = {item["kind"] for item in report["observations"]}
+        assert "local_order_not_found_in_recent_okx_fills" in issue_kinds
+        assert "local_order_verified_from_persisted_okx_fills" not in observation_kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_keeps_quantity_mismatch_for_persisted_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-fill-quantity.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(_confirmed_lqty_order(now=datetime.now(UTC), quantity=800.0))
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            executor_factory=_EmptyConfirmedFillExecutor,
+        ).collect()
+
+        issue_kinds = {issue["kind"] for issue in report["issues"]}
+        observation_kinds = {item["kind"] for item in report["observations"]}
+        assert "local_order_not_found_in_recent_okx_fills" not in issue_kinds
+        assert "local_order_quantity_differs_from_okx_fill" in issue_kinds
+        assert "local_order_verified_from_persisted_okx_fills" in observation_kinds
+    finally:
+        await close_db()

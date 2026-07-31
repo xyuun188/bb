@@ -181,3 +181,79 @@ async def test_v4_normal_trade_recovers_exact_submitted_protection() -> None:
     assert result["stop_loss_price"] == 98.0
     assert result["take_profit_price"] == 104.0
     assert result["source"] == "exact_order_submitted_dynamic_protection"
+
+
+@pytest.mark.asyncio
+async def test_stale_submitted_short_protection_reanchors_to_current_price() -> None:
+    contract = build_legacy_normal_paper_v4_trade_contract(
+        symbol="YB/USDT",
+        side="short",
+    )
+    decision = _decision(
+        id=406,
+        executed_at="2026-07-28T07:33:31+00:00",
+        raw_llm_response={
+            "normal_paper_trade": contract,
+            "execution_result": {
+                "price": 0.0666,
+                "raw_response": {
+                    "average": 0.0666,
+                    "request_params": {
+                        "attachAlgoOrds": [
+                            {"slTriggerPx": "0.06882", "tpTriggerPx": "0.06479"}
+                        ]
+                    },
+                },
+            },
+        },
+    )
+
+    result = await PositionProtectionFallbackPolicy().protection_from_decision(
+        _FakeSession(decision),
+        symbol="YB/USDT",
+        side="short",
+        entry_price=0.0456,
+        reference_price=0.0456,
+        order=SimpleNamespace(decision_id=406),
+    )
+
+    assert result["stop_loss_price"] == pytest.approx(0.04712)
+    assert result["take_profit_price"] == pytest.approx(0.04436072072072072)
+    assert result["source"] == "exact_order_reanchored_dynamic_protection"
+    assert result["reanchored_from_stale_submission"] is True
+    assert result["original_stop_loss_price"] == 0.06882
+    assert result["original_take_profit_price"] == 0.06479
+
+
+@pytest.mark.asyncio
+async def test_stale_submitted_protection_without_original_fill_price_is_blocked() -> None:
+    contract = build_legacy_normal_paper_v4_trade_contract(
+        symbol="YB/USDT",
+        side="short",
+    )
+    decision = _decision(
+        id=407,
+        raw_llm_response={
+            "normal_paper_trade": contract,
+            "execution_result": {
+                "raw_response": {
+                    "request_params": {
+                        "attachAlgoOrds": [
+                            {"slTriggerPx": "0.06882", "tpTriggerPx": "0.06479"}
+                        ]
+                    }
+                }
+            },
+        },
+    )
+
+    result = await PositionProtectionFallbackPolicy().protection_from_decision(
+        _FakeSession(decision),
+        symbol="YB/USDT",
+        side="short",
+        entry_price=0.0456,
+        reference_price=0.0456,
+        order=SimpleNamespace(decision_id=407),
+    )
+
+    assert result == {}

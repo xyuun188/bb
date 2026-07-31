@@ -31,6 +31,7 @@ from services.exchange_position_state import parse_exchange_position_snapshot
 from services.okx_native_facts import (
     OkxNativeFactsClient,
     build_okx_protection_execution_lifecycle,
+    group_okx_native_fill_rows,
 )
 from services.okx_position_confirmation import (
     find_current_position_entry_confirmation,
@@ -165,6 +166,20 @@ class OkxAuthoritativeSyncService:
         since = max(nominal_since, epoch_started_at)
         since_naive = since.replace(tzinfo=None)
         local_orders, local_positions, local_decisions = await self._load_local_facts(since_naive)
+        local_fill_times = [
+            parsed
+            for order in local_orders
+            if (parsed := _parse_datetime(getattr(order, "filled_at", None))) is not None
+        ]
+        earliest_local_fill = min(local_fill_times, default=None)
+        exchange_since = (
+            max(
+                epoch_started_at,
+                min(since, earliest_local_fill - timedelta(minutes=1)),
+            )
+            if earliest_local_fill is not None
+            else since
+        )
         symbols = {
             normalize_trading_symbol(item)
             for item in [
@@ -207,7 +222,7 @@ class OkxAuthoritativeSyncService:
         fetch_errors: list[dict[str, Any]] = []
         pull_report = await self._pull_exchange_facts(
             symbols=symbols,
-            since=since,
+            since=exchange_since,
             target_inst_ids=target_inst_ids,
             target_order_ids=target_order_ids,
             priority_order_ids=priority_context_order_ids,
@@ -293,6 +308,7 @@ class OkxAuthoritativeSyncService:
             "nominal_okx_fill_window_start": nominal_since.isoformat(),
             "okx_fill_window_start": since.isoformat(),
             "effective_fill_window_start": since.isoformat(),
+            "exchange_query_window_start": exchange_since.isoformat(),
             "training_epoch_started_at": epoch_started_at.isoformat(),
             "duration_seconds": round((datetime.now(UTC) - started_at).total_seconds(), 6),
             "local_order_count": len(local_orders),
@@ -1022,25 +1038,54 @@ class OkxAuthoritativeSyncService:
                     )
                     if current_position_confirmation is not None:
                         continue
+                    fill = _local_order_persisted_confirmed_okx_fill(
+                        order,
+                        exchange_order_id=exchange_order_id,
+                    )
+                    if fill is None:
+                        issues.append(
+                            OkxAuthoritativeIssue(
+                                kind="local_order_not_found_in_recent_okx_fills",
+                                classification="skipped",
+                                severity="warning",
+                                reason=(
+                                    "Local order id is not present in the bounded OKX fill pull; "
+                                    "run a wider/order-id targeted pull before repair."
+                                ),
+                                symbol=order_symbol,
+                                side=str(order.side or "").lower(),
+                                local_order_id=int(order.id),
+                                exchange_order_id=exchange_order_id,
+                                local_quantity=_safe_float(order.quantity),
+                                local_price=_safe_float(order.price),
+                            )
+                        )
+                        continue
                     issues.append(
                         OkxAuthoritativeIssue(
-                            kind="local_order_not_found_in_recent_okx_fills",
-                            classification="skipped",
-                            severity="warning",
+                            kind="local_order_verified_from_persisted_okx_fills",
+                            classification="observation",
+                            severity="info",
                             reason=(
-                                "Local order id is not present in the bounded OKX fill pull; "
-                                "run a wider/order-id targeted pull before repair."
+                                "The bounded OKX pull omitted this order, but its persisted "
+                                "OKX-confirmed raw fill rows passed exact identity validation."
                             ),
                             symbol=order_symbol,
                             side=str(order.side or "").lower(),
                             local_order_id=int(order.id),
                             exchange_order_id=exchange_order_id,
                             local_quantity=_safe_float(order.quantity),
+                            okx_contracts=fill.contracts,
                             local_price=_safe_float(order.price),
+                            okx_price=fill.avg_price,
+                            okx_timestamp=fill.timestamp,
                         )
                     )
-                    continue
                 contract_size = _local_order_verified_okx_raw_contract_size(order)
+                if contract_size <= 0 and fill.rows == tuple(
+                    _safe_dict(getattr(order, "okx_raw_fills", None)).get("rows") or []
+                ):
+                    contract_size = _local_order_persisted_public_contract_size(order)
                 if contract_size <= 0:
                     contract_size = instrument_contract_sizes.get(fill.inst_id, 0.0)
                 if contract_size <= 0:
@@ -1783,6 +1828,103 @@ def _local_order_verified_okx_raw_contract_size(order: Order) -> float:
         )
     )
     return contract_size if identity_complete and contracts_match and quantities_match else 0.0
+
+
+def _local_order_persisted_confirmed_okx_fill(
+    order: Order,
+    *,
+    exchange_order_id: str,
+) -> OkxFillGroup | None:
+    """Rebuild a previously confirmed OKX fill only from identity-complete raw rows."""
+
+    if str(getattr(order, "okx_sync_status", "") or "").strip() != "okx_confirmed":
+        return None
+    raw = _safe_dict(getattr(order, "okx_raw_fills", None))
+    if raw.get("fills_history_confirmed") is not True:
+        return None
+    requested_order_id = str(exchange_order_id or "").strip()
+    raw_order_id = str(raw.get("order_id") or "").strip()
+    raw_inst_id = str(raw.get("inst_id") or "").strip().upper()
+    local_inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+    local_side = str(getattr(order, "side", "") or "").strip().lower()
+    rows = raw.get("rows")
+    if (
+        not requested_order_id
+        or raw_order_id != requested_order_id
+        or not raw_inst_id
+        or local_inst_id != raw_inst_id
+        or not isinstance(rows, list)
+        or not rows
+        or any(not isinstance(row, dict) for row in rows)
+        or any(str(row.get("ordId") or row.get("order") or "").strip() != requested_order_id for row in rows)
+        or any(str(row.get("instId") or "").strip().upper() != raw_inst_id for row in rows)
+        or any(not str(row.get("tradeId") or "").strip() for row in rows)
+        or any(str(row.get("side") or "").strip().lower() != local_side for row in rows)
+    ):
+        return None
+
+    groups = group_okx_native_fill_rows(rows)
+    if len(groups) != 1:
+        return None
+    group = groups[0]
+    raw_trade_id_values = raw.get("trade_ids")
+    if not isinstance(raw_trade_id_values, (list, tuple, set)):
+        return None
+    raw_trade_ids = {
+        str(item).strip() for item in raw_trade_id_values if str(item).strip()
+    }
+    stored_trade_ids = {
+        item.strip()
+        for item in str(getattr(order, "okx_trade_ids", "") or "").split(",")
+        if item.strip()
+    }
+    raw_contracts = _safe_float(raw.get("contracts"), 0.0)
+    stored_contracts = _safe_float(getattr(order, "okx_fill_contracts", None), 0.0)
+    raw_avg_price = _safe_float(raw.get("avg_price"), 0.0)
+    identity_matches = bool(
+        group.order_id == requested_order_id
+        and group.inst_id == raw_inst_id
+        and group.side == local_side
+        and group.raw_count == len(rows)
+        and raw_trade_ids
+        and set(group.trade_ids) == raw_trade_ids
+        and (not stored_trade_ids or stored_trade_ids == raw_trade_ids)
+        and raw_contracts > 0
+        and stored_contracts > 0
+        and _relative_close_enough(group.contracts, raw_contracts, 0.000001)
+        and _relative_close_enough(group.contracts, stored_contracts, 0.000001)
+        and raw_avg_price > 0
+        and _relative_close_enough(group.avg_price, raw_avg_price, 0.000001)
+    )
+    if not identity_matches:
+        return None
+    return OkxFillGroup(
+        order_id=group.order_id,
+        trade_ids=group.trade_ids,
+        inst_id=group.inst_id,
+        symbol=group.symbol,
+        side=group.side,
+        pos_side=group.pos_side,
+        contracts=group.contracts,
+        avg_price=group.avg_price,
+        fee_abs=group.fee_abs,
+        fill_pnl=group.fill_pnl,
+        timestamp_ms=group.timestamp_ms,
+        timestamp=group.timestamp,
+        raw_count=group.raw_count,
+        rows=group.rows,
+    )
+
+
+def _local_order_persisted_public_contract_size(order: Order) -> float:
+    raw = _safe_dict(getattr(order, "okx_raw_fills", None))
+    if (
+        raw.get("contract_size_verified") is not True
+        or str(raw.get("contract_size_source") or "").strip()
+        != "okx_public_instruments"
+    ):
+        return 0.0
+    return max(_safe_float(raw.get("contract_size"), 0.0), 0.0)
 
 
 def _split_exchange_order_ids(value: Any) -> set[str]:
