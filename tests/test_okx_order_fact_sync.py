@@ -17,7 +17,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
 from models.decision import AIDecision
-from models.trade import Order
+from models.trade import Order, Position
 from services import okx_order_fact_sync as order_fact_sync_module
 from services.normal_paper_trade import (
     attach_normal_paper_order_identity,
@@ -144,11 +144,12 @@ class _StatementCaptureSession:
         return _EmptyRowsResult()
 
 
-class _AdvisoryLockSession:
+class _AdvisoryLockConnection:
     def __init__(self, values: list[Any]) -> None:
         self.values = list(values)
         self.calls: list[tuple[Any, dict[str, Any]]] = []
         self.commit_count = 0
+        self.invalidate_count = 0
 
     async def execute(self, statement: Any, params: dict[str, Any]) -> _ScalarResult:
         self.calls.append((statement, params))
@@ -156,6 +157,23 @@ class _AdvisoryLockSession:
 
     async def commit(self) -> None:
         self.commit_count += 1
+
+    async def invalidate(self) -> None:
+        self.invalidate_count += 1
+
+
+class _AdvisoryLockEngine:
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+        self.connect_count = 0
+
+    @asynccontextmanager
+    async def _connect(self):
+        self.connect_count += 1
+        yield self.connection
+
+    def connect(self):
+        return self._connect()
 
 
 class _FakeCcxt:
@@ -368,11 +386,11 @@ async def _init_test_db(tmp_path, monkeypatch: pytest.MonkeyPatch, name: str) ->
 async def test_postgres_single_writer_lock_defers_overlapping_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_session = _AdvisoryLockSession([False])
+    lock_connection = _AdvisoryLockConnection([False])
+    lock_engine = _AdvisoryLockEngine(lock_connection)
 
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield lock_session
+    async def fake_get_engine():
+        return lock_engine
 
     service = OkxOrderFactSyncService(mode="paper")
     sync_called = False
@@ -383,7 +401,7 @@ async def test_postgres_single_writer_lock_defers_overlapping_sync(
         return {"status": "ok"}
 
     monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
-    monkeypatch.setattr(order_fact_sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(order_fact_sync_module, "get_engine", fake_get_engine)
     monkeypatch.setattr(service, "_sync_single_writer", fake_sync_single_writer)
 
     report = await service.sync()
@@ -391,19 +409,20 @@ async def test_postgres_single_writer_lock_defers_overlapping_sync(
     assert sync_called is False
     assert report["status"] == "deferred"
     assert report["deferred_stages"] == ["single_writer_lock"]
-    assert len(lock_session.calls) == 1
-    assert lock_session.commit_count == 0
+    assert len(lock_connection.calls) == 1
+    assert lock_connection.commit_count == 0
+    assert lock_engine.connect_count == 1
 
 
 @pytest.mark.asyncio
 async def test_postgres_single_writer_lock_is_released_after_sync_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_session = _AdvisoryLockSession([True, True])
+    lock_connection = _AdvisoryLockConnection([True, True])
+    lock_engine = _AdvisoryLockEngine(lock_connection)
 
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield lock_session
+    async def fake_get_engine():
+        return lock_engine
 
     service = OkxOrderFactSyncService(mode="live")
 
@@ -411,25 +430,27 @@ async def test_postgres_single_writer_lock_is_released_after_sync_failure(
         raise RuntimeError("sync failed")
 
     monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
-    monkeypatch.setattr(order_fact_sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(order_fact_sync_module, "get_engine", fake_get_engine)
     monkeypatch.setattr(service, "_sync_single_writer", failing_sync_single_writer)
 
     with pytest.raises(RuntimeError, match="sync failed"):
         await service.sync()
 
-    assert len(lock_session.calls) == 2
-    assert "pg_advisory_unlock" in str(lock_session.calls[1][0])
-    assert lock_session.commit_count == 1
+    assert len(lock_connection.calls) == 2
+    assert "pg_advisory_unlock" in str(lock_connection.calls[1][0])
+    assert lock_connection.commit_count == 1
+    assert lock_connection.invalidate_count == 0
 
 
 @pytest.mark.asyncio
 async def test_postgres_hard_deadline_cancels_sync_and_releases_writer_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_session = _AdvisoryLockSession([True, True])
+    lock_connection = _AdvisoryLockConnection([True, True])
+    lock_engine = _AdvisoryLockEngine(lock_connection)
     cancelled = asyncio.Event()
     events: list[str] = []
-    execute = lock_session.execute
+    execute = lock_connection.execute
 
     async def tracking_execute(
         statement: Any,
@@ -439,11 +460,10 @@ async def test_postgres_hard_deadline_cancels_sync_and_releases_writer_lock(
             events.append("unlock")
         return await execute(statement, params)
 
-    lock_session.execute = tracking_execute  # type: ignore[method-assign]
+    lock_connection.execute = tracking_execute  # type: ignore[method-assign]
 
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield lock_session
+    async def fake_get_engine():
+        return lock_engine
 
     service = OkxOrderFactSyncService(mode="paper")
     service.timeout_seconds = 0.01
@@ -462,7 +482,7 @@ async def test_postgres_hard_deadline_cancels_sync_and_releases_writer_lock(
         "ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS",
         0.01,
     )
-    monkeypatch.setattr(order_fact_sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(order_fact_sync_module, "get_engine", fake_get_engine)
     monkeypatch.setattr(service, "_sync_single_writer", never_finish)
 
     started = time.monotonic()
@@ -475,10 +495,11 @@ async def test_postgres_hard_deadline_cancels_sync_and_releases_writer_lock(
     assert report["okx_pull_available"] is False
     assert report["deferred_stages"] == ["hard_deadline"]
     assert report["error"] == "order_fact_sync_hard_deadline_exceeded"
-    assert len(lock_session.calls) == 2
-    assert "pg_advisory_unlock" in str(lock_session.calls[1][0])
+    assert len(lock_connection.calls) == 2
+    assert "pg_advisory_unlock" in str(lock_connection.calls[1][0])
     assert events == ["cancelled", "unlock"]
-    assert lock_session.commit_count == 1
+    assert lock_connection.commit_count == 1
+    assert lock_connection.invalidate_count == 0
 
 
 @pytest.mark.asyncio
@@ -495,9 +516,10 @@ async def test_postgres_hard_deadline_includes_writer_lock_acquisition(
                 lock_wait_cancelled.set()
             return _ScalarResult(False)
 
-    @asynccontextmanager
-    async def fake_session_ctx():
-        yield SlowLockSession()
+    lock_engine = _AdvisoryLockEngine(SlowLockSession())
+
+    async def fake_get_engine():
+        return lock_engine
 
     service = OkxOrderFactSyncService(mode="paper")
     service.timeout_seconds = 0.01
@@ -507,7 +529,7 @@ async def test_postgres_hard_deadline_includes_writer_lock_acquisition(
         "ORDER_FACT_SYNC_HARD_DEADLINE_GRACE_SECONDS",
         0.01,
     )
-    monkeypatch.setattr(order_fact_sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(order_fact_sync_module, "get_engine", fake_get_engine)
 
     report = await service.sync()
 
@@ -644,6 +666,126 @@ async def test_order_fact_sync_only_calls_order_fact_endpoints_and_confirms_fill
         assert order.okx_sync_status == OKX_SYNC_CONFIRMED
         assert order.okx_trade_ids == "trade-okx-order-1"
         assert order.fee == pytest.approx(0.12)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_recovery_order_continues_through_protection_history(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "order-fact-recovery-stages.db")
+    now = datetime.now(UTC)
+    order_id = "okx-recovery-order"
+    ccxt = _FakeCcxt(
+        fills=[_fill_row(now, order_id=order_id)],
+        orders=[_order_row(now, order_id=order_id)],
+    )
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=5.0,
+            recovery_order_ids=(order_id,),
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        assert "protection" in ccxt.calls
+        assert report["source"] == "okx_native_orders_and_fills"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_stored_fact_fallback_recovers_confirmed_protection_position(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "stored-protection-recovery.db")
+    now = datetime.now(UTC)
+    entry_order_id = "stored-entry"
+    close_order_id = "stored-protection-close"
+    try:
+        async with get_session_ctx() as session:
+            position = Position(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="ETH/USDT",
+                side="long",
+                quantity=0.5,
+                entry_price=1900.0,
+                current_price=1920.0,
+                is_open=False,
+                closed_at=now - timedelta(minutes=10),
+                okx_inst_id="ETH-USDT-SWAP",
+                entry_exchange_order_id=entry_order_id,
+                close_exchange_order_id="okx_orphan_quarantine:5721",
+                settlement_status="settlement_quarantined",
+                current_management_contract={
+                    "original_entry_order_ids": [entry_order_id],
+                    "protection_orders": [
+                        {"algo_id": "stored-protection-algo", "reduce_only": True}
+                    ],
+                },
+            )
+            close_order = Order(
+                model_name="okx_authoritative_sync",
+                execution_mode="paper",
+                symbol="ETH/USDT",
+                side="sell",
+                order_type="market",
+                quantity=0.5,
+                price=1930.0,
+                status="filled",
+                fee=0.2,
+                exchange_order_id=close_order_id,
+                filled_at=now,
+                okx_inst_id="ETH-USDT-SWAP",
+                okx_fill_pnl=15.0,
+                okx_sync_status=OKX_SYNC_CONFIRMED,
+                okx_raw_fills={
+                    "fills_history_confirmed": True,
+                    "order_id": close_order_id,
+                    "base_quantity": 0.5,
+                    "protection_execution": {
+                        "lifecycle_complete": True,
+                        "source_authority": "okx_algo_history_plus_fills_history",
+                        "generated_order_id": close_order_id,
+                        "algo_id": "stored-protection-algo",
+                        "inst_id": "ETH-USDT-SWAP",
+                        "position_side": "long",
+                        "close_side": "sell",
+                        "reduce_only": True,
+                    },
+                },
+                created_at=now,
+            )
+            session.add_all([position, close_order])
+
+        since = now - timedelta(days=1)
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            executor_factory=_executor_factory(_FakeCcxt()),
+        )._sync_from_stored_facts(
+            since=since,
+            since_naive=since.replace(tzinfo=None),
+            started_at=now,
+            completed_stages=[],
+            deferred_stages=["initialize"],
+            stage_errors=[],
+            pull_error="test OKX initialization failure",
+            initial_confirmed_count=0,
+            initial_samples=[],
+        )
+
+        async with get_session_ctx() as session:
+            recovered = (
+                await session.execute(select(Position).where(Position.symbol == "ETH/USDT"))
+            ).scalar_one()
+        assert report["status"] == "degraded"
+        assert report["position_lifecycle_recovered_count"] == 1
+        assert recovered.close_exchange_order_id == close_order_id
+        assert recovered.settlement_status == "settlement_quarantined"
     finally:
         await close_db()
 

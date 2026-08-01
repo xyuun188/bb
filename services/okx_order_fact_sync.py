@@ -26,7 +26,7 @@ from core.symbols import (
     okx_inst_id_from_symbol,
     symbol_from_okx_inst_id,
 )
-from db.session import get_session_ctx
+from db.session import get_engine, get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
 from models.trade import Order
@@ -42,6 +42,10 @@ from services.okx_native_facts import (
     OkxNativeFactsClient,
     OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
+)
+from services.okx_protection_position_recovery import (
+    confirmed_protection_lifecycle,
+    recover_protection_position_lifecycles,
 )
 from services.paper_training import (
     paper_training_contract_reasons,
@@ -107,6 +111,7 @@ class OkxOrderFactSyncSummary:
     order_history_backfilled_count: int = 0
     contract_size_deferred_count: int = 0
     protection_execution_count: int = 0
+    position_lifecycle_recovered_count: int = 0
     protection_execution_error: str | None = None
     completed_stages: tuple[str, ...] = ()
     deferred_stages: tuple[str, ...] = ()
@@ -133,6 +138,7 @@ class OkxOrderFactSyncSummary:
             "order_history_backfilled_count": self.order_history_backfilled_count,
             "contract_size_deferred_count": self.contract_size_deferred_count,
             "protection_execution_count": self.protection_execution_count,
+            "position_lifecycle_recovered_count": self.position_lifecycle_recovered_count,
             "protection_execution_error": self.protection_execution_error,
             "completed_stages": list(self.completed_stages),
             "deferred_stages": list(self.deferred_stages),
@@ -224,10 +230,11 @@ class OkxOrderFactSyncService:
 
     async def _sync_with_postgres_writer_lock(self) -> dict[str, Any]:
         lock_key = ORDER_FACT_SYNC_ADVISORY_LOCK_BASE + (1 if self.mode == "live" else 0)
-        async with get_session_ctx() as lock_session:
+        engine = await get_engine()
+        async with engine.connect() as lock_connection:
             acquired = bool(
                 (
-                    await lock_session.execute(
+                    await lock_connection.execute(
                         text("SELECT pg_try_advisory_lock(:lock_key)"),
                         {"lock_key": lock_key},
                     )
@@ -249,16 +256,23 @@ class OkxOrderFactSyncService:
                         },
                     ),
                 ).as_dict()
-            # The advisory lock is session-scoped. End the implicit SQLAlchemy
-            # transaction so a long sync is never idle in transaction.
-            await lock_session.commit()
+            # Keep this AsyncConnection checked out for the full lock lifetime.
+            # Committing an AsyncSession can return its physical connection to
+            # the pool, making a later pg_advisory_unlock run on another backend.
+            await lock_connection.commit()
             try:
                 return await self._sync_single_writer()
             finally:
-                await lock_session.execute(
-                    text("SELECT pg_advisory_unlock(:lock_key)"),
-                    {"lock_key": lock_key},
-                )
+                try:
+                    await lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
+                except BaseException:
+                    # Closing the physical backend is the only reliable fallback
+                    # when cancellation or a broken connection prevents unlock.
+                    await lock_connection.invalidate()
+                    raise
 
     async def _sync_with_hard_deadline(
         self,
@@ -571,7 +585,10 @@ class OkxOrderFactSyncService:
                     )
                     priority_samples.extend(local_priority_samples)
                     completed_stages.append("priority_order_facts_persisted")
-                    if urgent_target_order_ids.issubset(targeted_fill_ids):
+                    if (
+                        not self.recovery_order_ids
+                        and urgent_target_order_ids.issubset(targeted_fill_ids)
+                    ):
                         status = (
                             "warning"
                             if priority_unverified_count
@@ -912,7 +929,15 @@ class OkxOrderFactSyncService:
                     now=datetime.now(UTC),
                     samples=samples,
                 )
-            if confirmed_count:
+            position_recovery_samples = await _recover_protection_position_links(
+                session,
+                mode=self.mode,
+                orders=writable_orders,
+                target_order_ids=set(protection_execution_by_order_id),
+            )
+            position_lifecycle_recovered_count = len(position_recovery_samples)
+            samples.extend(position_recovery_samples)
+            if confirmed_count or position_lifecycle_recovered_count:
                 await session.flush()
 
         if not okx_pull_available:
@@ -937,6 +962,7 @@ class OkxOrderFactSyncService:
             order_history_backfilled_count=order_history_backfilled_count,
             contract_size_deferred_count=contract_size_deferred_count,
             protection_execution_count=len(protection_execution_by_order_id),
+            position_lifecycle_recovered_count=position_lifecycle_recovered_count,
             protection_execution_error=protection_execution_error,
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
@@ -994,7 +1020,14 @@ class OkxOrderFactSyncService:
                     samples=samples,
                 )
             )
-            if confirmed_count:
+            position_recovery_samples = await _recover_protection_position_links(
+                session,
+                mode=self.mode,
+                orders=writable_orders,
+            )
+            position_lifecycle_recovered_count = len(position_recovery_samples)
+            samples.extend(position_recovery_samples)
+            if confirmed_count or position_lifecycle_recovered_count:
                 await session.flush()
         return OkxOrderFactSyncSummary(
             status="degraded",
@@ -1005,6 +1038,7 @@ class OkxOrderFactSyncService:
             okx_pull_available=False,
             local_checked=len(stored_repair_orders),
             confirmed_count=confirmed_count,
+            position_lifecycle_recovered_count=position_lifecycle_recovered_count,
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
             stage_errors=tuple(stage_errors),
@@ -1169,6 +1203,7 @@ class OkxOrderFactSyncService:
             )
             if _order_needs_okx_fact_refresh(order)
             or _stored_slippage_fact_needs_refresh(order)
+            or confirmed_protection_lifecycle(order) is not None
             or bool(
                 _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
                 & fill_order_ids
@@ -3613,6 +3648,50 @@ def _datetime_from_ms(value: Any) -> datetime | None:
         return datetime.fromtimestamp(timestamp_ms / 1000.0, UTC)
     except (OSError, OverflowError, ValueError):
         return None
+
+
+async def _recover_protection_position_links(
+    session: Any,
+    *,
+    mode: str,
+    orders: Iterable[Order],
+    target_order_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    order_ids = {
+        str(item or "").strip()
+        for item in (target_order_ids or set())
+        if str(item or "").strip()
+    }
+    by_exchange_id: dict[str, Order] = {}
+    for order in orders:
+        exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        raw = getattr(order, "okx_raw_fills", None)
+        raw = raw if isinstance(raw, dict) else {}
+        lifecycle = raw.get("protection_execution")
+        if (
+            exchange_order_id
+            and isinstance(lifecycle, dict)
+            and lifecycle.get("lifecycle_complete") is True
+        ):
+            order_ids.add(exchange_order_id)
+            by_exchange_id[exchange_order_id] = order
+    if not order_ids:
+        return []
+    result = await session.execute(
+        select(Order).where(
+            Order.execution_mode == ("live" if str(mode).lower() == "live" else "paper"),
+            Order.exchange_order_id.in_(order_ids),
+        )
+    )
+    for order in result.scalars().all():
+        exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        if exchange_order_id:
+            by_exchange_id[exchange_order_id] = order
+    return await recover_protection_position_lifecycles(
+        session,
+        orders=by_exchange_id.values(),
+        mode=mode,
+    )
 
 
 async def _configure_order_fact_write_transaction(session: Any) -> None:

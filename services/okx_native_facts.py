@@ -1301,6 +1301,11 @@ def build_okx_protection_execution_lifecycle(
     ).strip().lower()
     if position_side not in {"long", "short"}:
         position_side = "short" if close_side == "buy" else "long" if close_side == "sell" else ""
+    reduce_only = _native_bool(
+        algo_row.get("reduceOnly")
+        if algo_row.get("reduceOnly") not in (None, "")
+        else order_row.get("reduceOnly")
+    )
 
     def adverse_slippage(reference: float | None) -> float | None:
         reference_value = _safe_float(reference, 0.0)
@@ -1322,6 +1327,7 @@ def build_okx_protection_execution_lifecycle(
         and fill_start_ms > 0
         and fill_price > 0
         and configured_trigger_price > 0
+        and reduce_only is True
     )
     stop_slippage = (
         adverse_slippage(configured_trigger_price)
@@ -1339,6 +1345,7 @@ def build_okx_protection_execution_lifecycle(
         "actual_side": actual_side,
         "position_side": position_side,
         "close_side": close_side,
+        "reduce_only": reduce_only,
         "contracts": _safe_float(algo_row.get("actualSz") or getattr(fill, "contracts", 0.0), 0.0),
         "client_submit_requested_at": None,
         "client_submit_recorded": False,

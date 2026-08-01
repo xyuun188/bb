@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import ENSEMBLE_TRADER_NAME
@@ -112,6 +112,41 @@ def _entry_order_persistence_pending(
         (observed_at.astimezone(UTC) - timestamp.astimezone(UTC)).total_seconds(), 0.0
     )
     return age_seconds < LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS
+
+
+async def _find_reopenable_closed_position(
+    session: Any,
+    *,
+    symbol_variants: set[str],
+    side: str,
+    entry_exchange_order_id: str,
+    quantity: float,
+) -> Position | None:
+    result = await session.execute(
+        select(Position)
+        .where(
+            Position.execution_mode == "paper",
+            Position.symbol.in_(symbol_variants),
+            Position.side == side,
+            Position.is_open.is_(False),
+            Position.entry_exchange_order_id == entry_exchange_order_id,
+            or_(
+                Position.close_exchange_order_id.is_(None),
+                Position.close_exchange_order_id == "",
+                Position.close_exchange_order_id.like(
+                    f"{ORPHAN_QUARANTINE_CLOSE_PREFIX}%"
+                ),
+            ),
+            func.abs(Position.quantity - quantity)
+            <= max(abs(quantity) * 0.001, 1e-8),
+        )
+        .order_by(
+            Position.closed_at.desc().nullslast(),
+            Position.id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
@@ -2661,19 +2696,13 @@ class OkxSyncService:
                         )
                         continue
 
-                    closed_position_result = await session.execute(
-                        select(Position)
-                        .where(
-                            Position.execution_mode == "paper",
-                            Position.symbol.in_(symbol_variants),
-                            Position.side == side,
-                            Position.is_open.is_(False),
-                            Position.entry_exchange_order_id == order.exchange_order_id,
-                        )
-                        .order_by(Position.created_at.desc())
-                        .limit(1)
+                    closed_position = await _find_reopenable_closed_position(
+                        session,
+                        symbol_variants=symbol_variants,
+                        side=side,
+                        entry_exchange_order_id=str(order.exchange_order_id or ""),
+                        quantity=quantity,
                     )
-                    closed_position = closed_position_result.scalar_one_or_none()
                     if closed_position:
                         closed_position.is_open = True
                         closed_position.quantity = quantity

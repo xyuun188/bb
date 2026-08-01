@@ -624,6 +624,30 @@ async def _completed_training_shadow_count() -> int:
 
 
 async def _completed_training_trade_count() -> int:
+    state = MODEL_TRAINING_STATE_STORE.read()
+    if isinstance(state, dict) and str(state.get("status") or "").lower() == "ok":
+        if state.get("heartbeat_stale") is not True and state.get("training_timeout_exceeded") is not True:
+            models = state.get("models")
+            if isinstance(models, dict):
+                persisted_counts: list[int] = []
+                for model_state in models.values():
+                    if not isinstance(model_state, dict):
+                        continue
+                    for cursor_key in ("active_sample_cursor", "sample_cursor"):
+                        cursor = model_state.get(cursor_key)
+                        if not isinstance(cursor, dict) or cursor.get("trade") is None:
+                            continue
+                        persisted_counts.append(_safe_int_count(cursor.get("trade")))
+                    last_result = model_state.get("last_result")
+                    if isinstance(last_result, dict) and last_result.get(
+                        "completed_trade_sample_count"
+                    ) is not None:
+                        persisted_counts.append(
+                            _safe_int_count(last_result.get("completed_trade_sample_count"))
+                        )
+                if persisted_counts:
+                    return max(persisted_counts)
+
     from scripts.train_local_ai_tools_models import _completed_trade_sample_count
 
     return int(await _completed_trade_sample_count())

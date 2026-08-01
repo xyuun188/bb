@@ -13,6 +13,7 @@ from services.vector_memory.service import _decision_document, _hit_payload, _in
 from services.vector_memory.store import (
     JsonVectorMemoryStore,
     ZvecVectorMemoryStore,
+    build_vector_memory_store,
     document_to_fields,
     fields_to_hit,
 )
@@ -124,10 +125,30 @@ def test_json_vector_memory_store_filters_by_symbol(tmp_path) -> None:
 
 def test_vector_memory_settings_defaults_are_safe() -> None:
     assert settings.vector_memory_enabled is False
-    assert settings.vector_memory_backend == "auto"
+    assert settings.vector_memory_backend == "jsonl"
     assert settings.vector_memory_dimension >= 16
     assert settings.vector_memory_auto_reindex_enabled is True
     assert settings.vector_memory_auto_reindex_interval_seconds >= 300
+
+
+def test_vector_memory_auto_backend_avoids_native_zvec(tmp_path, monkeypatch) -> None:
+    def fail_native_load() -> object:
+        raise AssertionError("auto backend must not load native zvec")
+
+    monkeypatch.setattr(
+        ZvecVectorMemoryStore,
+        "_load_zvec",
+        staticmethod(fail_native_load),
+    )
+
+    store = build_vector_memory_store(
+        tmp_path,
+        backend="auto",
+        dimension=32,
+        max_documents=20,
+    )
+
+    assert isinstance(store, JsonVectorMemoryStore)
 
 
 def test_vector_memory_document_fields_strip_invalid_control_text() -> None:

@@ -397,7 +397,7 @@ class Settings(BaseSettings):
     external_event_scraper_max_sources: int = 6
     external_event_scraper_max_items_per_source: int = 8
     vector_memory_enabled: bool = False
-    vector_memory_backend: str = "auto"
+    vector_memory_backend: str = "jsonl"
     vector_memory_dimension: int = 96
     vector_memory_max_documents: int = 20000
     vector_memory_decision_index_limit: int = 1200

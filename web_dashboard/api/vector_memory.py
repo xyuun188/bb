@@ -68,9 +68,9 @@ async def vector_memory_settings(
         settings.vector_memory_enabled = bool(req.enabled)
         updates["VECTOR_MEMORY_ENABLED"] = "true" if settings.vector_memory_enabled else "false"
     if req.backend is not None:
-        backend = str(req.backend or "auto").strip().lower()
-        if backend not in {"auto", "zvec", "jsonl"}:
-            backend = "auto"
+        backend = str(req.backend or "jsonl").strip().lower()
+        if backend not in {"auto", "jsonl"}:
+            backend = "jsonl"
         settings.vector_memory_backend = backend
         updates["VECTOR_MEMORY_BACKEND"] = backend
     if updates:

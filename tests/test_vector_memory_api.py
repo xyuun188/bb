@@ -93,6 +93,48 @@ async def test_vector_memory_settings_persists_and_reloads_runtime(
 
 
 @pytest.mark.asyncio
+async def test_vector_memory_settings_unsafe_zvec_backend_falls_back_to_jsonl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_updates: list[dict[str, str]] = []
+
+    class FakeVectorMemoryService:
+        async def reset_store(self) -> None:
+            return None
+
+        async def status(self) -> dict[str, object]:
+            return {
+                "enabled": settings.vector_memory_enabled,
+                "status": "ready",
+                "configured_backend": settings.vector_memory_backend,
+            }
+
+    def capture_update_env_file(self: object, updates: dict[str, str]) -> None:
+        captured_updates.append(updates)
+
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "vector_memory_backend", "auto")
+    monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
+    monkeypatch.setattr(
+        vector_memory_module,
+        "get_vector_memory_service",
+        lambda: FakeVectorMemoryService(),
+    )
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/vector-memory/settings",
+            json={"backend": "zvec"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["configured_backend"] == "jsonl"
+    assert captured_updates[-1] == {"VECTOR_MEMORY_BACKEND": "jsonl"}
+
+
+@pytest.mark.asyncio
 async def test_vector_memory_clear_endpoint_clears_training_epoch_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

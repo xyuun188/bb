@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,11 +171,31 @@ class JsonVectorMemoryStore:
         return rows
 
     def _write_rows(self, rows: list[dict[str, Any]]) -> None:
-        self.path.write_text(
-            "\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows)
-            + ("\n" if rows else ""),
-            encoding="utf-8",
+        payload = (
+            "\n".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                for row in rows
+            )
+            + ("\n" if rows else "")
         )
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
 
     @staticmethod
     def _matches_filters(fields: dict[str, Any], filters: dict[str, str] | None) -> bool:
@@ -390,7 +412,10 @@ def build_vector_memory_store(
     """Build the configured vector memory store with safe fallback."""
 
     normalized = str(backend or "auto").lower()
-    if normalized in {"auto", "zvec"}:
+    # Keep native zvec opt-in for offline callers. The trading and audit processes share this path,
+    # and zvec can terminate the interpreter when another process rebuilds it;
+    # a native SIGSEGV cannot be handled by the Python fallback below.
+    if normalized == "zvec":
         try:
             return ZvecVectorMemoryStore(
                 path / "zvec",
@@ -399,11 +424,9 @@ def build_vector_memory_store(
                 read_only=read_only,
             )
         except Exception as exc:
-            if normalized == "zvec":
-                raise
-            logger.warning(
-                "zvec unavailable; falling back to json vector memory", error=safe_error_text(exc)
-            )
+            raise RuntimeError(
+                f"zvec vector memory unavailable: {safe_error_text(exc)}"
+            ) from exc
     return JsonVectorMemoryStore(
         path / "vector_memory.jsonl",
         dimension=dimension,

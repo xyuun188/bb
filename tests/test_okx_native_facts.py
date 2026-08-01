@@ -161,6 +161,7 @@ class _NativeAlgoHistoryCcxt:
                     "ordId": "close-stop-1",
                     "ordType": "oco",
                     "side": "buy",
+                    "reduceOnly": "true",
                     "posSide": "net",
                     "actualSide": "sl",
                     "state": "effective",
@@ -1345,13 +1346,19 @@ async def test_native_algo_history_and_fill_build_authoritative_stop_lifecycle()
 
     lifecycle = build_okx_protection_execution_lifecycle(
         fills[0],
-        order_row={"ordId": "close-stop-1", "algoId": "algo-stop-1", "side": "buy"},
+        order_row={
+            "ordId": "close-stop-1",
+            "algoId": "algo-stop-1",
+            "side": "buy",
+            "reduceOnly": "true",
+        },
         algo_row=algo_rows[0],
     )
 
     assert ccxt.detail_params == [{"algoId": "algo-stop-1"}]
     assert lifecycle is not None
     assert lifecycle["lifecycle_complete"] is True
+    assert lifecycle["reduce_only"] is True
     assert lifecycle["actual_side"] == "sl"
     assert lifecycle["position_side"] == "short"
     assert lifecycle["configured_trigger_price"] == pytest.approx(0.01655)

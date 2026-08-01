@@ -274,6 +274,41 @@ def test_data_collection_local_ai_status_has_no_duplicate_normalizer_or_outer_ti
 
 
 @pytest.mark.asyncio
+async def test_completed_training_trade_count_uses_fresh_scheduler_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FreshTrainingState:
+        @staticmethod
+        def read() -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "heartbeat_stale": False,
+                "training_timeout_exceeded": False,
+                "models": {
+                    "local_ai_profit_prediction": {
+                        "active_sample_cursor": {"trade": 74}
+                    }
+                },
+            }
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "MODEL_TRAINING_STATE_STORE",
+        FreshTrainingState(),
+    )
+
+    async def fail_full_rebuild() -> int:
+        raise AssertionError("fresh scheduler cursor should avoid full trade scan")
+
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._completed_trade_sample_count",
+        fail_full_rebuild,
+    )
+
+    assert await data_collection_module._completed_training_trade_count() == 74
+
+
+@pytest.mark.asyncio
 async def test_data_collection_does_not_promote_artifact_counts_to_current_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

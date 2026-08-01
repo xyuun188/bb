@@ -54,6 +54,7 @@ OKX_ORDER_RECOVERY_ISSUE_KINDS = frozenset(
     {
         "okx_fill_missing_local_order",
         "okx_linked_protection_fill_missing_local_order",
+        "okx_fill_not_linked_to_position",
     }
 )
 
