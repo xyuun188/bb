@@ -2098,6 +2098,52 @@ def test_market_data_zero_coverage_warning_remains_unresolved() -> None:
     assert state == "unresolved"
 
 
+def test_market_data_stale_websocket_warning_remains_unresolved() -> None:
+    card = system_audit._audit_card(
+        "market_data",
+        "行情与 K线",
+        "warning",
+        "OKX 实时 ticker 流已失活",
+        details={
+            "warmup_observing": False,
+            "websocket_status_available": True,
+            "websocket_connected": True,
+            "websocket_stale": True,
+            "websocket_ticker_age_seconds": 3600.0,
+            "missing_timeframes": [],
+            "stale_timeframes": [],
+            "covered_timeframes": ["1m", "5m", "15m", "1h"],
+        },
+    )
+
+    state, _label = system_audit._issue_ledger_state(card, cards_by_key={})
+
+    assert state == "unresolved"
+
+
+def test_runtime_market_websocket_status_detects_false_online_stream() -> None:
+    status = system_audit._runtime_market_websocket_status(
+        {
+            "available": True,
+            "ws_stats": {
+                "connected": True,
+                "last_ticker_seconds_ago": 3600.0,
+                "ticker_stream_stale": True,
+                "reconnect_count": 3,
+            },
+        }
+    )
+
+    assert status == {
+        "available": True,
+        "connected": True,
+        "ticker_age_seconds": 3600.0,
+        "stale": True,
+        "stale_after_seconds": system_audit.MARKET_WEBSOCKET_STALE_SECONDS,
+        "reconnect_count": 3,
+    }
+
+
 def test_system_audit_primary_user_facing_reasons_are_chinese() -> None:
     source = (Path(__file__).resolve().parents[1] / "web_dashboard/api/system_audit.py").read_text(
         encoding="utf-8"

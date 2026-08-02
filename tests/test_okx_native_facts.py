@@ -277,6 +277,33 @@ class _OrderHistoryCcxt(_FakeCcxt):
         }
 
 
+class _OrderHistoryDetailFallbackCcxt(_FakeCcxt):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.order_history_params: list[dict[str, Any]] = []
+        self.order_detail_params: list[dict[str, Any]] = []
+
+    async def privateGetTradeOrdersHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.order_history_params.append(dict(params))
+        return {"data": []}
+
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.order_detail_params.append(dict(params))
+        return {
+            "data": [
+                {
+                    "instId": params["instId"],
+                    "ordId": params["ordId"],
+                    "clOrdId": "O3796532835402251264",
+                    "side": "buy",
+                    "reduceOnly": "true",
+                    "algoId": "3782209309421965312",
+                    "source": "7",
+                }
+            ]
+        }
+
+
 class _PagedOrderHistoryCcxt:
     def __init__(self) -> None:
         self.params: list[dict[str, Any]] = []
@@ -895,6 +922,43 @@ async def test_native_facts_client_fetches_order_history_context_by_order_id() -
             "instId": "AAVE-USDT-SWAP",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_order_history_context_falls_back_to_native_order_detail() -> None:
+    timestamp = int(datetime.now(UTC).timestamp() * 1000)
+    fill = group_okx_native_fill_rows(
+        [
+            {
+                "instId": "XLM-USDT-SWAP",
+                "ordId": "3796532835558064128",
+                "tradeId": "83437749",
+                "side": "buy",
+                "fillSz": "11.5",
+                "fillPx": "0.17691986",
+                "ts": str(timestamp),
+            }
+        ]
+    )[0]
+    ccxt = _OrderHistoryDetailFallbackCcxt()
+
+    contexts = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_order_history_contexts(
+        fills=[fill],
+        limit=5,
+    )
+
+    assert contexts[fill.order_id][0]["algoId"] == "3782209309421965312"
+    assert contexts[fill.order_id][0]["reduceOnly"] == "true"
+    assert contexts[fill.order_id][0]["source"] == "7"
+    assert ccxt.order_history_params == [
+        {
+            "instType": "SWAP",
+            "ordId": fill.order_id,
+            "limit": "5",
+            "instId": "XLM-USDT-SWAP",
+        }
+    ]
+    assert ccxt.order_detail_params == [{"instId": "XLM-USDT-SWAP", "ordId": fill.order_id}]
 
 
 @pytest.mark.asyncio

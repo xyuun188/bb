@@ -91,6 +91,7 @@ _skip_okx_daily_reconciliation_latest: ContextVar[bool] = ContextVar(
 AUDIT_WINDOWS = {"fast_minutes": 10, "trade_hours": 2, "strategy_hours": 24}
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 KLINE_STALE_LIMIT_SECONDS = {"1m": 180, "5m": 600, "15m": 1800, "1h": 7200}
+MARKET_WEBSOCKET_STALE_SECONDS = 120.0
 STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
 SYSTEM_AUDIT_LATEST_FILE = "system_audit_latest.json"
@@ -443,6 +444,30 @@ def _load_trading_runtime_status_for_audit() -> dict[str, Any]:
             "reason": "runtime_heartbeat_read_failed",
             "error": safe_error_text(exc, limit=180),
         }
+
+
+def _runtime_market_websocket_status(runtime_status: dict[str, Any]) -> dict[str, Any]:
+    ws_stats = _safe_dict(runtime_status.get("ws_stats"))
+    available = bool(ws_stats)
+    connected = bool(ws_stats.get("connected")) if available else None
+    ticker_age = _safe_float(ws_stats.get("last_ticker_seconds_ago"), -1.0) if available else -1.0
+    stale = bool(
+        available
+        and (
+            not connected
+            or ticker_age < 0.0
+            or ticker_age > MARKET_WEBSOCKET_STALE_SECONDS
+            or ws_stats.get("ticker_stream_stale") is True
+        )
+    )
+    return {
+        "available": available,
+        "connected": connected,
+        "ticker_age_seconds": ticker_age if ticker_age >= 0.0 else None,
+        "stale": stale,
+        "stale_after_seconds": MARKET_WEBSOCKET_STALE_SECONDS,
+        "reconnect_count": int(ws_stats.get("reconnect_count") or 0),
+    }
 
 
 def _okx_runtime_entry_gate_summary(runtime_status: dict[str, Any]) -> dict[str, Any]:
@@ -2546,6 +2571,9 @@ async def _market_data_audit() -> dict[str, Any]:
         )
     ticker_age = _age_seconds(ticker_row[1])
     ticker_stale = ticker_age is None or ticker_age > 600
+    runtime_status = _load_trading_runtime_status_for_audit()
+    websocket = _runtime_market_websocket_status(runtime_status)
+    websocket_stale = bool(websocket["stale"])
     covered_timeframes = [
         row["timeframe"] for row in rows if not row["missing"] and not row["stale"]
     ]
@@ -2554,18 +2582,28 @@ async def _market_data_audit() -> dict[str, Any]:
     )
     status = _status_from_counts(
         critical=bool(missing_timeframes),
-        warning=bool(stale_timeframes) or ticker_stale,
+        warning=bool(stale_timeframes) or ticker_stale or websocket_stale,
     )
+    if websocket_stale:
+        summary = "OKX 实时 ticker 流已失活，系统正在依赖 REST 降级行情。"
+    else:
+        summary = "行情/K线覆盖正常。" if status == "ok" else "行情或 K线覆盖存在缺失/过期。"
     return _audit_card(
         "market_data",
         "行情与 K线",
         status,
-        "行情/K线覆盖正常。" if status == "ok" else "行情或 K线覆盖存在缺失/过期。",
+        summary,
         details={
             "ticker_count": int(ticker_row[0] or 0),
             "ticker_latest_at": _iso(ticker_row[1]),
             "ticker_age_seconds": round(ticker_age, 3) if ticker_age is not None else None,
             "ticker_stale": ticker_stale,
+            "websocket_status_available": websocket["available"],
+            "websocket_connected": websocket["connected"],
+            "websocket_ticker_age_seconds": websocket["ticker_age_seconds"],
+            "websocket_stale": websocket_stale,
+            "websocket_stale_after_seconds": websocket["stale_after_seconds"],
+            "websocket_reconnect_count": websocket["reconnect_count"],
             "klines": rows,
             "missing_timeframes": missing_timeframes,
             "stale_timeframes": stale_timeframes,
@@ -2574,6 +2612,7 @@ async def _market_data_audit() -> dict[str, Any]:
         },
         evidence=[{"label": f"{row['timeframe']} 币种", "value": row["symbols"]} for row in rows],
         next_actions=[
+            "WebSocket 失活时先确认自动重连已恢复 ticker，再判断 REST 或策略参数问题。",
             "先查 DataService K线覆盖刷新任务和 OKX REST 错误。",
             "K线异常时不要先调整策略参数。",
         ],
@@ -3645,12 +3684,9 @@ async def _model_training_audit() -> dict[str, Any]:
         }
     runtime_probe_timeout = bool(runtime_probe.get("timeout"))
     local_tools_status = str(local_tools.get("status") or "").lower()
-    local_tools_probe_timeout = (
-        local_tools_status in {"timeout", "status_error", "error"}
-        and (
-            str(local_tools.get("section") or "") == "local_ai_training_status"
-            or "timeout" in str(local_tools.get("error") or "").lower()
-        )
+    local_tools_probe_timeout = local_tools_status in {"timeout", "status_error", "error"} and (
+        str(local_tools.get("section") or "") == "local_ai_training_status"
+        or "timeout" in str(local_tools.get("error") or "").lower()
     )
     clean_training_view_available = (
         _safe_int_value(local_tools.get("training_shadow_sample_count")) > 0
@@ -5425,8 +5461,7 @@ async def _run_system_audit_subprocess_once(
     except TimeoutError as exc:
         await _stop_system_audit_subprocess(process)
         raise TimeoutError(
-            "isolated system audit exceeded "
-            f"{SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS:.0f} seconds"
+            f"isolated system audit exceeded {SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS:.0f} seconds"
         ) from exc
 
     try:

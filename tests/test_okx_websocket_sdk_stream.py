@@ -81,3 +81,71 @@ async def test_ws_listener_closes_failed_stream_before_reconnect_backoff(
     assert stream.closed is True
     assert client._ws is None
     assert reconnect_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_ws_listener_reconnects_when_ping_succeeds_but_tickers_are_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PongOnlyStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def recv(self) -> str:
+            return "pong"
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stream = PongOnlyStream()
+    client = OKXWebSocketClient()
+    client._running = True
+    client._ws = stream
+    client._connected_at = (
+        okx_ws_client.time.time() - okx_ws_client.WS_TICKER_STALE_RECONNECT_SECONDS - 1
+    )
+
+    async def stop_during_backoff(_seconds: float) -> None:
+        client._running = False
+
+    monkeypatch.setattr(okx_ws_client.asyncio, "sleep", stop_during_backoff)
+
+    await client.listen()
+
+    assert stream.closed is True
+    assert client._ws is None
+
+
+@pytest.mark.asyncio
+async def test_ws_listener_reconnects_after_repeated_receive_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimeoutStream:
+        def __init__(self) -> None:
+            self.closed = False
+            self.sent: list[str] = []
+
+        async def recv(self) -> str:
+            raise TimeoutError
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stream = TimeoutStream()
+    client = OKXWebSocketClient()
+    client._running = True
+    client._ws = stream
+
+    async def stop_during_backoff(_seconds: float) -> None:
+        client._running = False
+
+    monkeypatch.setattr(okx_ws_client.asyncio, "sleep", stop_during_backoff)
+
+    await client.listen()
+
+    assert stream.sent == ["ping"]
+    assert stream.closed is True
+    assert client._ws is None

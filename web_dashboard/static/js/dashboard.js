@@ -6008,6 +6008,8 @@ function systemAuditMarketDataDetails(details) {
         <div class="system-audit-detail-grid">
             ${systemAuditMetric('Ticker 数量', details.ticker_count, details.ticker_stale ? '实时行情过期' : '实时行情正常')}
             ${systemAuditMetric('Ticker 最新', details.ticker_latest_at ? toBeijingTime(details.ticker_latest_at) : '-', '行情新鲜度')}
+            ${systemAuditMetric('WebSocket ticker', details.websocket_ticker_age_seconds == null ? '-' : `${monitorNumber(details.websocket_ticker_age_seconds, 1)} 秒前`, details.websocket_stale ? '实时流失活' : '实时流正常')}
+            ${systemAuditMetric('WebSocket 重连', details.websocket_reconnect_count ?? 0, details.websocket_connected === false ? '当前断开' : '当前连接')}
             ${systemAuditMetric('缺失周期', Array.isArray(details.missing_timeframes) ? details.missing_timeframes.join('、') || '无' : '无')}
             ${systemAuditMetric('过期周期', Array.isArray(details.stale_timeframes) ? details.stale_timeframes.join('、') || '无' : '无')}
         </div>

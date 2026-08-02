@@ -4,16 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import String, cast, select
 
 from models.decision import AIDecision
-from models.trade import Order
+from models.trade import Order, Position
 
 RECONCILE_ORIGIN_SYSTEM_EXECUTION = "system_execution"
 EXIT_LINEAGE_VERSION = "2026-07-15.okx-exit-decision-lineage.v1"
+EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
+SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
+SUPERSEDED_POSITION_REASONS = {
+    "duplicate_local_open_position_for_same_okx_pos_id",
+    "duplicate_local_closed_position_for_same_okx_lifecycle",
+}
 
 
 class ExitDecisionLineageAmbiguous(RuntimeError):
@@ -176,6 +182,142 @@ async def load_exit_decision_lineage(
         close_order_id=order_id,
         linked_decision=linked_decision,
         linked_order=linked_order,
+    )
+
+
+async def recover_exit_decision_lineage_from_order_fact(
+    session: Any,
+    *,
+    order: Order,
+    close_fill: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Repair a close order whose local decision link lost a concurrency race.
+
+    The exchange order id is the only join key. This helper deliberately skips
+    entry actions and refuses to infer a position from a time window.
+    """
+
+    close_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    if not close_order_id:
+        return None
+    linked_decision_id = int(getattr(order, "decision_id", 0) or 0)
+    if not linked_decision_id:
+        return None
+    linked_decision = await session.get(AIDecision, linked_decision_id)
+    action = str(getattr(linked_decision, "action", "") or "").strip().lower()
+    if action not in EXIT_ACTIONS:
+        return None
+    expected_action = (
+        "close_short"
+        if str(getattr(order, "side", "") or "").strip().lower() == "buy"
+        else "close_long"
+    )
+    if action != expected_action:
+        return None
+    resolution = await load_exit_decision_lineage(
+        session,
+        model_name=str(getattr(order, "model_name", "") or ""),
+        symbol=str(getattr(order, "symbol", "") or ""),
+        action=action,
+        is_paper=str(getattr(order, "execution_mode", "") or "").lower() != "live",
+        execution_mode=str(getattr(order, "execution_mode", "") or "paper"),
+        close_order_id=close_order_id,
+    )
+    authoritative = resolution.authoritative
+    if authoritative is None:
+        return None
+    if int(getattr(order, "decision_id", 0) or 0) == int(authoritative.id) and not resolution.superseded:
+        return None
+
+    raw_fill = dict(close_fill or {})
+    if not raw_fill:
+        stored = getattr(order, "okx_raw_fills", None)
+        if isinstance(stored, dict):
+            raw_fill = dict(stored)
+    raw_fill["order_id"] = close_order_id
+    position_result = await session.execute(
+        select(Position).where(
+            Position.execution_mode == getattr(order, "execution_mode", "paper"),
+            Position.symbol == getattr(order, "symbol", ""),
+            Position.is_open.is_(False),
+            Position.close_exchange_order_id.is_not(None),
+            cast(Position.close_exchange_order_id, String).contains(close_order_id),
+        )
+    )
+    positions = [
+        position
+        for position in position_result.scalars().all()
+        if close_order_id
+        in {
+            item.strip()
+            for item in str(getattr(position, "close_exchange_order_id", "") or "").split(",")
+            if item.strip()
+        }
+        and str(getattr(position, "settlement_status", "") or "").strip()
+        != SUPERSEDED_POSITION_STATUS
+        and str(_safe_dict(getattr(position, "settlement_raw", None)).get("reason") or "").strip()
+        not in SUPERSEDED_POSITION_REASONS
+    ]
+    exact_positions = [
+        position
+        for position in positions
+        if str(getattr(position, "close_exchange_order_id", "") or "").strip()
+        == close_order_id
+    ]
+    if len(exact_positions) > 1:
+        raise ExitDecisionLineageAmbiguous(
+            f"Multiple closed positions claim OKX close order {close_order_id}"
+        )
+    if not exact_positions and len(positions) > 1:
+        raise ExitDecisionLineageAmbiguous(
+            "Multiple closed positions contain OKX close order "
+            f"{close_order_id} without one exact lifecycle slice"
+        )
+    settlement_positions = exact_positions or positions
+    realized_pnl = (
+        sum(float(getattr(position, "realized_pnl", 0.0) or 0.0) for position in settlement_positions)
+        if settlement_positions
+        else float(
+            raw_fill.get("realized_pnl")
+            or raw_fill.get("pnl")
+            or raw_fill.get("fill_pnl")
+            or 0.0
+        )
+    )
+    entry_notional = (
+        sum(
+            abs(float(getattr(position, "entry_price", 0.0) or 0.0))
+            * abs(float(getattr(position, "quantity", 0.0) or 0.0))
+            for position in settlement_positions
+        )
+        or float(raw_fill.get("entry_notional") or 0.0)
+    )
+    closed_at = next(
+        (
+            position.closed_at
+            for position in settlement_positions
+            if isinstance(getattr(position, "closed_at", None), datetime)
+        ),
+        getattr(order, "filled_at", None) or now or datetime.now(UTC),
+    )
+    exit_price = float(
+        raw_fill.get("avg_price")
+        or raw_fill.get("price")
+        or getattr(order, "price", 0.0)
+        or 0.0
+    )
+    if exit_price <= 0:
+        return None
+    return apply_exit_decision_lineage(
+        resolution,
+        close_order_id=close_order_id,
+        close_fill=raw_fill,
+        reconcile_origin="external_okx_sync",
+        exit_price=exit_price,
+        realized_pnl=realized_pnl,
+        closed_at=closed_at,
+        entry_notional=entry_notional,
     )
 
 

@@ -8,7 +8,7 @@ from math import isfinite
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from core.symbols import normalize_trading_symbol
 from db.session import get_read_session_ctx
@@ -18,6 +18,7 @@ from services.current_position_management import (
     current_position_management_contract_complete,
 )
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
+from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.trade_execution_contract import (
     AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS,
     classify_exit_execution_contract,
@@ -66,12 +67,27 @@ class PositionCapacityReleaseAuditService:
                 for decision in decisions
                 if decision.id and _action(decision) in EXIT_ACTIONS
             ]
+            exit_order_ids = {
+                exchange_order_id
+                for decision in decisions
+                if _action(decision) in EXIT_ACTIONS
+                for exchange_order_id in decision_exit_exchange_order_ids(decision)
+            }
             orders = (
                 list(
                     (
                         await session.execute(
                             select(Order)
-                            .where(Order.decision_id.in_(decision_ids))
+                            .where(
+                                or_(
+                                    Order.decision_id.in_(decision_ids)
+                                    if decision_ids
+                                    else False,
+                                    Order.exchange_order_id.in_(sorted(exit_order_ids))
+                                    if exit_order_ids
+                                    else False,
+                                )
+                            )
                             .order_by(Order.created_at.desc())
                             .limit(self.limit)
                         )
@@ -79,7 +95,7 @@ class PositionCapacityReleaseAuditService:
                     .scalars()
                     .all()
                 )
-                if decision_ids
+                if decision_ids or exit_order_ids
                 else []
             )
         return self._summarize(positions, decisions, orders)
@@ -94,16 +110,23 @@ class PositionCapacityReleaseAuditService:
         position_rows = self._position_group_rows(positions)
         capacity = self.capacity_policy.evaluate(open_positions=fragment_rows).as_dict()
         orders_by_decision: dict[int, list[Order]] = {}
+        orders_by_exchange_id: dict[str, list[Order]] = {}
         for order in orders:
             decision_id = int(getattr(order, "decision_id", 0) or 0)
             if decision_id:
                 orders_by_decision.setdefault(decision_id, []).append(order)
+            for exchange_order_id in _order_exchange_ids(order):
+                orders_by_exchange_id.setdefault(exchange_order_id, []).append(order)
 
-        exit_rows = [
-            self._exit_row(decision, orders_by_decision.get(int(decision.id or 0), []))
-            for decision in decisions
-            if _action(decision) in EXIT_ACTIONS
-        ]
+        exit_rows = []
+        for decision in decisions:
+            if _action(decision) not in EXIT_ACTIONS:
+                continue
+            related_orders = list(orders_by_decision.get(int(decision.id or 0), []))
+            for exchange_order_id in decision_exit_exchange_order_ids(decision):
+                related_orders.extend(orders_by_exchange_id.get(exchange_order_id, []))
+            deduplicated_orders = list({id(order): order for order in related_orders}.values())
+            exit_rows.append(self._exit_row(decision, deduplicated_orders))
         pending_positions = [
             row
             for row in position_rows
@@ -359,6 +382,17 @@ def _action(row: Any) -> str:
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _order_exchange_ids(order: Any) -> set[str]:
+    value = str(getattr(order, "exchange_order_id", "") or "").strip()
+    if not value:
+        return set()
+    return {
+        token.strip()
+        for separator_normalized in value.replace(";", ",").replace("|", ",").split(",")
+        if (token := separator_normalized.strip())
+    }
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

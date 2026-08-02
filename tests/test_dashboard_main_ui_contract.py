@@ -308,6 +308,29 @@ def test_position_history_close_origin_prefers_authoritative_protection_and_liqu
     assert liquidation["close_origin_label"] == "强制平仓"
 
 
+def test_position_history_marks_tp_trigger_that_realized_a_slippage_loss() -> None:
+    tp_order = SimpleNamespace(
+        decision_id=101,
+        exchange_order_id="okx-tp-order",
+        okx_raw_fills={
+            "protection_execution": {
+                "lifecycle_complete": True,
+                "source_authority": "okx_algo_history_plus_fills_history",
+                "actual_side": "tp",
+            }
+        },
+    )
+
+    result = dashboard._dashboard_position_close_origin(
+        {"pnl": "-9.327", "realizedPnl": "-9.803076"},
+        [tp_order],
+    )
+
+    assert result["close_origin"] == "take_profit"
+    assert result["close_origin_label"] == "止盈（滑点亏损）"
+    assert result["close_origin_confirmed"] is True
+
+
 def test_position_history_close_origin_fails_closed_when_evidence_is_missing() -> None:
     unknown = dashboard._dashboard_position_close_origin({}, [])
     system = dashboard._dashboard_position_close_origin(

@@ -2670,6 +2670,8 @@ def _apply_linked_protection_order_facts(
     filled_at: datetime,
 ) -> None:
     now = datetime.now(UTC)
+    if getattr(order, "decision_id", None) is None and plan.decision_id is not None:
+        order.decision_id = int(plan.decision_id)
     rows = [dict(row) for row in plan.fill_rows if isinstance(row, dict)]
     trade_ids = tuple(
         dict.fromkeys(

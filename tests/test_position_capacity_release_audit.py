@@ -319,3 +319,26 @@ def test_capacity_audit_classifies_okx_protection_exit_without_dynamic_gap() -> 
     row = report["dynamic_exit_decisions"][0]
     assert row["exit_contract_kind"] == "okx_exchange_protection"
     assert row["exit_contract_complete"] is True
+
+
+def test_capacity_audit_joins_filled_order_by_exact_exit_exchange_id() -> None:
+    service = PositionCapacityReleaseAuditService()
+    decision = _decision(
+        decision_id=50,
+        raw={
+            "dynamic_exit_policy": _dynamic_exit_policy(),
+            "execution_result": {"exchange_order_id": "raced-close-50"},
+        },
+        executed=True,
+    )
+    raced_order = SimpleNamespace(
+        decision_id=51,
+        status="filled",
+        exchange_order_id="raced-close-50",
+    )
+
+    report = service._summarize([_position()], [decision], [raced_order])
+
+    row = report["dynamic_exit_decisions"][0]
+    assert row["filled_order_count"] == 1
+    assert row["dynamic_exit_contract_complete"] is True

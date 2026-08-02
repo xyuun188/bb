@@ -717,6 +717,7 @@ class OkxNativeFactsClient:
             if strict:
                 raise RuntimeError("OKX native orders-history API is unavailable")
             return {}
+        fetch_order_detail = getattr(ccxt, "privateGetTradeOrder", None)
 
         inst_lookup = dict(inst_ids_by_order_id or {})
         targets: dict[str, str] = {}
@@ -741,13 +742,27 @@ class OkxNativeFactsClient:
             params = {"instType": "SWAP", "ordId": order_id, "limit": str(_limit(limit))}
             if inst_id:
                 params["instId"] = inst_id
+            history_error: Exception | None = None
             try:
                 response = await self.executor._with_retry(fetch_orders, params)
-            except Exception:
-                if strict:
-                    raise
-                continue
-            contexts[order_id] = tuple(_response_rows(response))
+                rows = _response_rows(response)
+            except Exception as exc:
+                history_error = exc
+                rows = []
+            if not rows and callable(fetch_order_detail) and inst_id:
+                try:
+                    detail_response = await self.executor._with_retry(
+                        fetch_order_detail,
+                        {"instId": inst_id, "ordId": order_id},
+                    )
+                    rows = _response_rows(detail_response)
+                except Exception:
+                    if strict:
+                        raise
+            elif history_error is not None and strict:
+                raise history_error
+            if rows:
+                contexts[order_id] = tuple(rows)
         return contexts
 
     async def fetch_order_history_rows(

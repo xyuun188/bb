@@ -4066,6 +4066,20 @@ def _dashboard_position_close_origin(
 ) -> dict[str, Any]:
     """Classify a historical close from persisted OKX and order facts."""
 
+    def _protection_result_suffix(actual_side: str) -> str:
+        if actual_side != "tp":
+            return ""
+        gross_pnl = _safe_float(row.get("pnl") or row.get("gross_pnl"), None)
+        if gross_pnl is not None and gross_pnl < -1e-12:
+            return "\uff08\u6ed1\u70b9\u4e8f\u635f\uff09"
+        realized_pnl = _safe_float(
+            row.get("realizedPnl") or row.get("realized_pnl"),
+            None,
+        )
+        if realized_pnl is not None and realized_pnl < -1e-12:
+            return "\uff08\u8d39\u540e\u4e8f\u635f\uff09"
+        return ""
+
     liquidation_penalty = (
         _safe_float(
             row.get("liqPenalty") or row.get("liquidationPenalty"),
@@ -4094,7 +4108,11 @@ def _dashboard_position_close_origin(
         ):
             return {
                 "close_origin": "take_profit" if actual_side == "tp" else "stop_loss",
-                "close_origin_label": "止盈" if actual_side == "tp" else "止损",
+                "close_origin_label": (
+                    ("止盈" + _protection_result_suffix(actual_side))
+                    if actual_side == "tp"
+                    else "止损"
+                ),
                 "close_origin_source": "okx_protection_execution_lifecycle",
                 "close_origin_confirmed": True,
             }

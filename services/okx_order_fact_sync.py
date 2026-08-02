@@ -30,6 +30,10 @@ from db.session import get_engine, get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
 from models.trade import Order
+from services.exchange_exit_decision_lineage import (
+    ExitDecisionLineageAmbiguous,
+    recover_exit_decision_lineage_from_order_fact,
+)
 from services.normal_paper_trade import (
     normal_paper_decision_id_from_client_order_id,
     normal_paper_order_identity_reasons,
@@ -112,6 +116,7 @@ class OkxOrderFactSyncSummary:
     contract_size_deferred_count: int = 0
     protection_execution_count: int = 0
     position_lifecycle_recovered_count: int = 0
+    exit_lineage_recovered_count: int = 0
     protection_execution_error: str | None = None
     completed_stages: tuple[str, ...] = ()
     deferred_stages: tuple[str, ...] = ()
@@ -139,6 +144,7 @@ class OkxOrderFactSyncSummary:
             "contract_size_deferred_count": self.contract_size_deferred_count,
             "protection_execution_count": self.protection_execution_count,
             "position_lifecycle_recovered_count": self.position_lifecycle_recovered_count,
+            "exit_lineage_recovered_count": self.exit_lineage_recovered_count,
             "protection_execution_error": self.protection_execution_error,
             "completed_stages": list(self.completed_stages),
             "deferred_stages": list(self.deferred_stages),
@@ -442,6 +448,7 @@ class OkxOrderFactSyncService:
         priority_backfilled_count = 0
         priority_local_checked = 0
         priority_samples: list[dict[str, Any]] = []
+        exit_lineage_recovered_count = 0
         account_fills_complete = False
         account_orders_complete = False
         target_fill_order_ids: set[str] = set()
@@ -572,6 +579,8 @@ class OkxOrderFactSyncService:
                         priority_unverified_count,
                         priority_skipped_old_count,
                         local_priority_contract_size_deferred_count,
+                        priority_exit_lineage_recovered_count,
+                        priority_exit_lineage_errors,
                         local_priority_samples,
                     ) = await self._persist_priority_fill_facts(
                         since=since,
@@ -584,14 +593,18 @@ class OkxOrderFactSyncService:
                         local_priority_contract_size_deferred_count
                     )
                     priority_samples.extend(local_priority_samples)
+                    exit_lineage_recovered_count += priority_exit_lineage_recovered_count
+                    stage_errors.extend(priority_exit_lineage_errors)
                     completed_stages.append("priority_order_facts_persisted")
+                    if priority_exit_lineage_recovered_count:
+                        completed_stages.append("exit_decision_lineage_auto_recovered")
                     if (
                         not self.recovery_order_ids
                         and urgent_target_order_ids.issubset(targeted_fill_ids)
                     ):
                         status = (
                             "warning"
-                            if priority_unverified_count
+                            if priority_unverified_count or priority_exit_lineage_errors
                             else "deferred"
                             if priority_contract_size_deferred_count
                             else "ok"
@@ -612,6 +625,7 @@ class OkxOrderFactSyncService:
                             contract_size_deferred_count=(
                                 priority_contract_size_deferred_count
                             ),
+                            exit_lineage_recovered_count=exit_lineage_recovered_count,
                             completed_stages=tuple(completed_stages),
                             deferred_stages=("account_history_after_priority_fast_lane",),
                             skipped_old_count=priority_skipped_old_count,
@@ -644,8 +658,10 @@ class OkxOrderFactSyncService:
                     unverified_count=priority_unverified_count,
                     backfilled_count=priority_backfilled_count,
                     contract_size_deferred_count=priority_contract_size_deferred_count,
+                    exit_lineage_recovered_count=exit_lineage_recovered_count,
                     completed_stages=tuple(completed_stages),
                     deferred_stages=("priority_fill_not_yet_observed",),
+                    stage_errors=tuple(stage_errors),
                     skipped_old_count=priority_skipped_old_count,
                     samples=tuple(
                         [
@@ -929,6 +945,18 @@ class OkxOrderFactSyncService:
                     now=datetime.now(UTC),
                     samples=samples,
                 )
+            (
+                exit_lineage_recovered_count,
+                exit_lineage_errors,
+            ) = await self._recover_exit_decision_lineages(
+                session,
+                orders=writable_orders,
+                fills=fills,
+                samples=samples,
+            )
+            stage_errors.extend(exit_lineage_errors)
+            if exit_lineage_recovered_count:
+                completed_stages.append("exit_decision_lineage_auto_recovered")
             position_recovery_samples = await _recover_protection_position_links(
                 session,
                 mode=self.mode,
@@ -963,6 +991,7 @@ class OkxOrderFactSyncService:
             contract_size_deferred_count=contract_size_deferred_count,
             protection_execution_count=len(protection_execution_by_order_id),
             position_lifecycle_recovered_count=position_lifecycle_recovered_count,
+            exit_lineage_recovered_count=exit_lineage_recovered_count,
             protection_execution_error=protection_execution_error,
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
@@ -1020,6 +1049,15 @@ class OkxOrderFactSyncService:
                     samples=samples,
                 )
             )
+            exit_lineage_recovered_count, exit_lineage_errors = (
+                await self._recover_exit_decision_lineages(
+                    session,
+                    orders=writable_orders,
+                    fills=(),
+                    samples=samples,
+                )
+            )
+            stage_errors.extend(exit_lineage_errors)
             position_recovery_samples = await _recover_protection_position_links(
                 session,
                 mode=self.mode,
@@ -1039,6 +1077,7 @@ class OkxOrderFactSyncService:
             local_checked=len(stored_repair_orders),
             confirmed_count=confirmed_count,
             position_lifecycle_recovered_count=position_lifecycle_recovered_count,
+            exit_lineage_recovered_count=exit_lineage_recovered_count,
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
             stage_errors=tuple(stage_errors),
@@ -1065,6 +1104,92 @@ class OkxOrderFactSyncService:
             if refreshed_count:
                 await session.flush()
         return refreshed_count, samples
+
+    async def _recover_exit_decision_lineages(
+        self,
+        session: Any,
+        *,
+        orders: Iterable[Order],
+        fills: Iterable[OkxNativeFillGroup],
+        samples: list[dict[str, Any]],
+    ) -> tuple[int, list[str]]:
+        """Relink exact close-order facts after execution/reconciliation races."""
+
+        order_list = list(orders)
+        orders_by_exchange_id = {
+            exchange_order_id: order
+            for order in order_list
+            for exchange_order_id in _split_exchange_order_ids(
+                getattr(order, "exchange_order_id", None)
+            )
+        }
+        fills_by_exchange_id = {
+            str(fill.order_id or "").strip(): fill
+            for fill in fills
+            if str(fill.order_id or "").strip()
+        }
+        target_order_ids = set(fills_by_exchange_id) & set(orders_by_exchange_id)
+        target_order_ids.update(
+            exchange_order_id
+            for exchange_order_id, order in orders_by_exchange_id.items()
+            if _order_has_confirmed_okx_fill_fact(order)
+        )
+        recovered_count = 0
+        errors: list[str] = []
+        for close_order_id in sorted(target_order_ids):
+            order = orders_by_exchange_id.get(close_order_id)
+            if order is None:
+                order_result = await session.execute(
+                    select(Order)
+                    .where(
+                        Order.execution_mode == self.mode,
+                        Order.exchange_order_id == close_order_id,
+                    )
+                    .limit(1)
+                )
+                order = order_result.scalar_one_or_none()
+            if order is None:
+                continue
+            fill = fills_by_exchange_id.get(close_order_id)
+            close_fill = fill.as_dict() if fill is not None else None
+            try:
+                recovered = await recover_exit_decision_lineage_from_order_fact(
+                    session,
+                    order=order,
+                    close_fill=close_fill,
+                    now=datetime.now(UTC),
+                )
+            except ExitDecisionLineageAmbiguous as exc:
+                error = safe_error_text(exc, limit=180)
+                errors.append(f"exit_decision_lineage: {error}")
+                samples.append(
+                    {
+                        "kind": "exit_decision_lineage_ambiguous",
+                        "mode": self.mode,
+                        "exchange_order_id": close_order_id,
+                        "error": error,
+                    }
+                )
+                continue
+            if recovered is None:
+                continue
+            recovered_count += 1
+            samples.append(
+                {
+                    "kind": "exit_decision_lineage_auto_recovered",
+                    "mode": self.mode,
+                    "exchange_order_id": close_order_id,
+                    "authoritative_decision_id": recovered.get(
+                        "authoritative_decision_id"
+                    ),
+                    "superseded_decision_ids": list(
+                        recovered.get("superseded_decision_ids") or []
+                    ),
+                }
+            )
+        if recovered_count:
+            await session.flush()
+        return recovered_count, errors
 
     def _effective_since(self, now: datetime) -> datetime:
         """Return the Phase 3 clean-order boundary.
@@ -1218,7 +1343,7 @@ class OkxOrderFactSyncService:
         target_order_ids: set[str],
         fills: list[OkxNativeFillGroup],
         contract_sizes: dict[str, float],
-    ) -> tuple[int, int, int, int, int, list[dict[str, Any]]]:
+    ) -> tuple[int, int, int, int, int, int, list[str], list[dict[str, Any]]]:
         """Commit targeted native fills before slower account-wide history stages."""
 
         fills_by_order_id = {fill.order_id: fill for fill in fills if fill.order_id}
@@ -1269,12 +1394,22 @@ class OkxOrderFactSyncService:
                 since=since,
                 authoritative_absence_order_ids=set(),
             )
+            exit_lineage_recovered_count, exit_lineage_errors = (
+                await self._recover_exit_decision_lineages(
+                    session,
+                    orders=priority_orders,
+                    fills=fills,
+                    samples=samples,
+                )
+            )
             return (
                 len(priority_orders),
                 confirmed_count,
                 unverified_count,
                 skipped_old_count,
                 contract_size_deferred_count,
+                exit_lineage_recovered_count,
+                exit_lineage_errors,
                 samples,
             )
 

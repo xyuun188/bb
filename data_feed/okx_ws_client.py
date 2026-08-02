@@ -36,6 +36,10 @@ WS_PUBLIC_URL = OKX_WS_PUBLIC_URL
 WS_BUSINESS_URL = OKX_WS_BUSINESS_URL
 # Demo URL: blocked in some regions, not used
 WS_DEMO_URL = OKX_WS_DEMO_URL
+WS_RECEIVE_TIMEOUT_SECONDS = 30.0
+WS_MAX_CONSECUTIVE_RECEIVE_TIMEOUTS = 2
+WS_TICKER_STALE_RECONNECT_SECONDS = 90.0
+WS_RECONNECT_DELAY_SECONDS = 5.0
 
 
 class OKXWebSocketClient:
@@ -55,6 +59,9 @@ class OKXWebSocketClient:
         self._latest_klines: dict[str, list[dict]] = {}
         self._message_count = 0
         self._last_message_time = 0.0
+        self._last_ticker_time = 0.0
+        self._connected_at = 0.0
+        self._reconnect_count = 0
 
     @property
     def is_connected(self) -> bool:
@@ -87,6 +94,8 @@ class OKXWebSocketClient:
         try:
             self._ws = OkxPublicWebSocketSdkStream(self._ws_url)
             await self._ws.connect()
+            self._connected_at = time.time()
+            self._last_ticker_time = 0.0
             logger.info("OKX WebSocket connected")
             await self._subscribe()
         except Exception as e:
@@ -129,6 +138,8 @@ class OKXWebSocketClient:
         inst_id = data["arg"].get("instId", "")
 
         if channel == "tickers":
+            if data["data"]:
+                self._last_ticker_time = time.time()
             for ticker in data["data"]:
                 symbol = inst_id.replace("-SWAP", "").replace("-", "/")
                 last = safe_float(ticker.get("last"), 0.0)
@@ -201,12 +212,34 @@ class OKXWebSocketClient:
         if not self._ws:
             await self.connect()
 
+        consecutive_receive_timeouts = 0
         while self._running:
             try:
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
+                raw = await asyncio.wait_for(
+                    self._ws.recv(),
+                    timeout=WS_RECEIVE_TIMEOUT_SECONDS,
+                )
                 await self._handle_message(raw)
+                consecutive_receive_timeouts = 0
+                ticker_reference_time = self._last_ticker_time or self._connected_at
+                ticker_age = time.time() - ticker_reference_time if ticker_reference_time else 0.0
+                if ticker_age > WS_TICKER_STALE_RECONNECT_SECONDS:
+                    logger.warning(
+                        "OKX ticker stream stale; reconnecting",
+                        ticker_age_seconds=round(ticker_age, 3),
+                        stale_after_seconds=WS_TICKER_STALE_RECONNECT_SECONDS,
+                        messages_received=self._message_count,
+                    )
+                    break
             except TimeoutError:
-                # Send ping to keep alive
+                consecutive_receive_timeouts += 1
+                if consecutive_receive_timeouts >= WS_MAX_CONSECUTIVE_RECEIVE_TIMEOUTS:
+                    logger.warning(
+                        "OKX WebSocket receive timeout threshold reached; reconnecting",
+                        consecutive_timeouts=consecutive_receive_timeouts,
+                        timeout_seconds=WS_RECEIVE_TIMEOUT_SECONDS,
+                    )
+                    break
                 try:
                     await self._ws.send("ping")
                 except Exception:
@@ -236,9 +269,10 @@ class OKXWebSocketClient:
                         error=safe_error_text(exc),
                     )
             logger.info("reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+            await asyncio.sleep(WS_RECONNECT_DELAY_SECONDS)
             if not self._running:
                 return
+            self._reconnect_count += 1
             await self.connect()
             asyncio.create_task(self.listen())
 
@@ -299,11 +333,21 @@ class OKXWebSocketClient:
         logger.info("OKX WebSocket disconnected")
 
     def get_stats(self) -> dict[str, Any]:
+        now = time.time()
+        ticker_reference_time = self._last_ticker_time or self._connected_at
+        last_ticker_seconds_ago = now - ticker_reference_time if ticker_reference_time else None
         return {
             "connected": self.is_connected,
             "messages_received": self._message_count,
             "tracked_symbols": len(self._latest_tickers),
             "last_message_seconds_ago": (
-                time.time() - self._last_message_time if self._last_message_time else None
+                now - self._last_message_time if self._last_message_time else None
             ),
+            "last_ticker_seconds_ago": last_ticker_seconds_ago,
+            "ticker_stream_stale": bool(
+                last_ticker_seconds_ago is not None
+                and last_ticker_seconds_ago > WS_TICKER_STALE_RECONNECT_SECONDS
+            ),
+            "ticker_stale_after_seconds": WS_TICKER_STALE_RECONNECT_SECONDS,
+            "reconnect_count": self._reconnect_count,
         }

@@ -663,6 +663,7 @@ def test_linked_protection_fill_fact_enriches_existing_order() -> None:
         filled_at=filled_at,
         source="okx_linked_protection_fill_missing_local_order",
         okx_inst_id="SAND-USDT-SWAP",
+        decision_id=172901,
         contracts=426.0,
         contract_size=10.0,
         contract_size_source="okx_public_instruments",
@@ -680,6 +681,7 @@ def test_linked_protection_fill_fact_enriches_existing_order() -> None:
     )
 
     assert order.okx_inst_id == "SAND-USDT-SWAP"
+    assert order.decision_id == 172901
     assert order.okx_fill_contracts == pytest.approx(426.0)
     assert order.okx_sync_status == "okx_confirmed"
     assert order.okx_raw_fills["protection_execution"]["actual_side"] == "sl"

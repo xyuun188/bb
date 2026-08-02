@@ -5,8 +5,10 @@ import pytest
 
 from services.exchange_exit_decision_lineage import (
     ExitDecisionLineageAmbiguous,
+    ExitDecisionLineageResolution,
     apply_exit_decision_lineage,
     choose_exit_decision_lineage,
+    recover_exit_decision_lineage_from_order_fact,
 )
 
 
@@ -89,3 +91,70 @@ def test_multiple_production_decisions_for_one_order_fail_closed() -> None:
             [first, second],
             close_order_id="same-order",
         )
+
+
+@pytest.mark.asyncio
+async def test_native_order_fact_relinks_raced_reconciliation_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dynamic = _decision(
+        89216,
+        {"execution_result": {"exchange_order_id": "okx-raced-close"}},
+    )
+    synthetic = _decision(
+        89217,
+        {"close_fill": {"order_id": "okx-raced-close"}},
+        system_sync=True,
+    )
+    dynamic.action = "close_short"
+    synthetic.action = "close_short"
+    order = SimpleNamespace(
+        id=6214,
+        decision_id=89217,
+        model_name="ensemble_trader",
+        symbol="ETC/USDT",
+        execution_mode="live",
+        side="buy",
+        exchange_order_id="okx-raced-close",
+        price=19.0,
+        filled_at=datetime(2026, 7, 15, 12, tzinfo=UTC),
+        okx_raw_fills={},
+    )
+
+    class _Rows:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _Session:
+        async def get(self, _model, decision_id):
+            return {89217: synthetic}.get(int(decision_id))
+
+        async def execute(self, _statement):
+            return _Rows()
+
+    async def fake_load(*_args, **_kwargs):
+        return ExitDecisionLineageResolution(
+            authoritative=dynamic,
+            linked_order=order,
+            superseded=(synthetic,),
+            matched_decision_ids=(89216, 89217),
+        )
+
+    monkeypatch.setattr(
+        "services.exchange_exit_decision_lineage.load_exit_decision_lineage",
+        fake_load,
+    )
+    result = await recover_exit_decision_lineage_from_order_fact(
+        _Session(),
+        order=order,
+        close_fill={"order_id": "okx-raced-close", "avg_price": 19.0, "pnl": -0.5},
+        now=datetime(2026, 7, 15, 12, tzinfo=UTC),
+    )
+
+    assert result is not None
+    assert result["authoritative_decision_id"] == 89216
+    assert order.decision_id == 89216
+    assert synthetic.was_executed is False

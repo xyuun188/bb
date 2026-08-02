@@ -383,6 +383,135 @@ async def _init_test_db(tmp_path, monkeypatch: pytest.MonkeyPatch, name: str) ->
 
 
 @pytest.mark.asyncio
+async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "exit-lineage-auto-recovery.db")
+    now = datetime.now(UTC)
+    order_id = "act-raced-close"
+    fill = OkxNativeFillGroup(
+        order_id=order_id,
+        trade_ids=("trade-act-raced-close",),
+        inst_id="ACT-USDT-SWAP",
+        symbol="ACT/USDT",
+        side="buy",
+        pos_side="short",
+        contracts=4.0,
+        avg_price=0.00895,
+        fee_abs=0.001,
+        fill_pnl=-0.02,
+        timestamp_ms=float(_ms(now)),
+        timestamp=now,
+        raw_count=1,
+        rows=(_act_fill_row(now, order_id=order_id),),
+    )
+    try:
+        async with get_session_ctx() as session:
+            original = AIDecision(
+                model_name="ensemble_trader",
+                symbol="ACT/USDT",
+                action="close_short",
+                confidence=0.8,
+                is_paper=True,
+                was_executed=True,
+                raw_llm_response={
+                    "dynamic_exit_policy": {"eligible": True, "close_fraction": 1.0},
+                    "execution_result": {"exchange_order_id": order_id},
+                },
+            )
+            synthetic = AIDecision(
+                model_name="ensemble_trader",
+                symbol="ACT/USDT",
+                action="close_short",
+                confidence=1.0,
+                is_paper=True,
+                was_executed=True,
+                executed_at=now,
+                raw_llm_response={
+                    "system_sync": True,
+                    "source": "okx_position_reconcile",
+                    "close_fill": {"order_id": order_id},
+                },
+            )
+            session.add_all([original, synthetic])
+            await session.flush()
+            original_id = int(original.id)
+            synthetic_id = int(synthetic.id)
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ACT/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=4.0,
+                    price=0.00895,
+                    status="filled",
+                    fee=0.001,
+                    decision_id=synthetic_id,
+                    exchange_order_id=order_id,
+                    filled_at=now,
+                    created_at=now,
+                )
+            )
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="ACT/USDT",
+                    side="short",
+                    quantity=4.0,
+                    entry_price=0.009,
+                    realized_pnl=-0.02,
+                    is_open=False,
+                    closed_at=now,
+                    close_exchange_order_id=order_id,
+                )
+            )
+
+        service = OkxOrderFactSyncService(mode="paper")
+        samples: list[dict[str, Any]] = []
+        async with get_session_ctx() as session:
+            order = (
+                await session.execute(
+                    select(Order).where(Order.exchange_order_id == order_id)
+                )
+            ).scalar_one()
+            recovered_count, errors = await service._recover_exit_decision_lineages(
+                session,
+                orders=[order],
+                fills=[fill],
+                samples=samples,
+            )
+
+        assert recovered_count == 1
+        assert errors == []
+        assert samples[-1]["kind"] == "exit_decision_lineage_auto_recovered"
+        async with get_session_ctx() as session:
+            order = (
+                await session.execute(
+                    select(Order).where(Order.exchange_order_id == order_id)
+                )
+            ).scalar_one()
+            original = await session.get(AIDecision, original_id)
+            synthetic = await session.get(AIDecision, synthetic_id)
+            assert order.decision_id == original_id
+            assert original.was_executed is True
+            assert synthetic.was_executed is False
+            recovered_count, errors = await service._recover_exit_decision_lineages(
+                session,
+                orders=[order],
+                fills=[fill],
+                samples=[],
+            )
+            assert recovered_count == 0
+            assert errors == []
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_postgres_single_writer_lock_defers_overlapping_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

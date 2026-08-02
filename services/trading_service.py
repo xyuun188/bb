@@ -4309,6 +4309,10 @@ class TradingService:
                 market_state.last_error or position_state.last_error or self._last_round_error
             )
             okx_authoritative_sync = self._okx_authoritative_sync_status_payload(now)
+            data_service = getattr(self, "data_service", None)
+            ws_client = getattr(data_service, "ws_client", None)
+            ws_stats_reader = getattr(ws_client, "get_stats", None)
+            ws_stats = self._safe_dict(ws_stats_reader()) if callable(ws_stats_reader) else {}
             payload = {
                 "running": bool(self._running),
                 "mode": mode_manager.mode.value,
@@ -4380,6 +4384,7 @@ class TradingService:
                 ),
                 "market_analysis_deferred": self._market_defer_snapshot(),
                 "market_entry_pipeline": self._market_entry_pipeline_snapshot(),
+                "ws_stats": ws_stats,
                 "okx_authoritative_sync": okx_authoritative_sync,
                 "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
                 "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
