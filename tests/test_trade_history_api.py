@@ -11,7 +11,10 @@ from models.account import OkxAccountBill
 from models.decision import AIDecision
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from services.okx_position_history_store import upsert_okx_position_history_row
-from web_dashboard.api.dashboard import get_positions as get_dashboard_positions
+from web_dashboard.api.dashboard import (
+    _dashboard_pending_closed_position_rows,
+    get_positions as get_dashboard_positions,
+)
 from web_dashboard.api.trades import (
     _execution_status_label,
     _readable_execution_reason,
@@ -407,6 +410,99 @@ async def test_dashboard_position_history_shows_confirmed_close_awaiting_officia
         "official_position_history_identity_unresolved",
         "positions_history_no_matching_row",
     ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pending_settlement_does_not_cross_stitch_residual_lifecycles(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'dashboard-pending-cross-stitch.db').as_posix()}",
+    )
+    await init_db()
+    opened_at = datetime(2026, 7, 24, 1, 0, tzinfo=UTC)
+    later_at = opened_at + timedelta(days=9)
+
+    try:
+        async with get_session_ctx() as session:
+            repo = TradeRepository(session)
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "CHZ/USDT",
+                    "side": "long",
+                    "quantity": 5.0,
+                    "entry_price": 0.0146,
+                    "current_price": 0.0144,
+                    "settlement_status": "settlement_quarantined",
+                    "settlement_source": "okx_position_history_identity_quarantine",
+                    "is_open": False,
+                    "okx_inst_id": "CHZ-USDT-SWAP",
+                    "entry_exchange_order_id": "pending-entry",
+                    "close_exchange_order_id": "missing-close",
+                    "closed_at": opened_at + timedelta(hours=1),
+                    "created_at": opened_at,
+                }
+            )
+            await repo.open_position(
+                {
+                    "model_name": "ensemble_trader",
+                    "execution_mode": "paper",
+                    "symbol": "CHZ/USDT",
+                    "side": "short",
+                    "quantity": 10.0,
+                    "entry_price": 0.0128,
+                    "current_price": 0.0129,
+                    "settlement_status": "superseded_position_residual",
+                    "settlement_source": "okx_current_position_deduplication",
+                    "is_open": False,
+                    "okx_inst_id": "CHZ-USDT-SWAP",
+                    "entry_exchange_order_id": "later-sell",
+                    "close_exchange_order_id": "missing-later-buy",
+                    "closed_at": later_at + timedelta(hours=1),
+                    "created_at": later_at,
+                }
+            )
+            for order_id, side, quantity, filled_at in (
+                ("pending-entry", "buy", 5.0, opened_at),
+                ("later-sell", "sell", 10.0, later_at),
+            ):
+                await repo.create_order(
+                    {
+                        "model_name": "okx_authoritative_sync",
+                        "execution_mode": "paper",
+                        "symbol": "CHZ/USDT",
+                        "side": side,
+                        "order_type": "market",
+                        "quantity": quantity,
+                        "price": 0.013,
+                        "status": "filled",
+                        "fee": 0.001,
+                        "exchange_order_id": order_id,
+                        "filled_at": filled_at,
+                        "created_at": filled_at,
+                        "okx_inst_id": "CHZ-USDT-SWAP",
+                        "okx_fill_contracts": quantity,
+                        "okx_fill_pnl": 0.0,
+                        "okx_sync_status": OKX_SYNC_CONFIRMED,
+                        "okx_raw_fills": {
+                            "fills_history_confirmed": True,
+                            "base_quantity": quantity,
+                            "contract_size": 1.0,
+                        },
+                    }
+                )
+
+            rows = await _dashboard_pending_closed_position_rows(session, mode="paper")
+    finally:
+        await close_db()
+
+    assert rows == []
 
 
 @pytest.mark.asyncio

@@ -3758,6 +3758,12 @@ async def _dashboard_pending_closed_position_rows(
         .scalars()
         .all()
     )
+    pending_positions = [
+        position
+        for position in pending_positions
+        if str(getattr(position, "settlement_status", "") or "").strip()
+        != "superseded_position_residual"
+    ]
     if not pending_positions:
         return []
 
@@ -3818,9 +3824,11 @@ async def _dashboard_pending_closed_position_rows(
     groups = build_okx_position_ledger_groups(
         pending_positions,
         order_rows,
-        require_order_lifecycle_source_positions=True,
+        include_order_lifecycle_fragments=False,
     )
     for group in groups:
+        if not group.evidence_complete:
+            continue
         close_order_ids = set(group.close_order_ids)
         if not close_order_ids or not (close_order_ids & confirmed_order_ids):
             continue
