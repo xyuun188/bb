@@ -53,6 +53,8 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert "scripts/start_online_model_tunnels.py" in source
     assert "systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)}" in source
     assert "for port in (18000, 18001, 18002, 18003)" in source
+    assert "http.client.HTTPConnection('127.0.0.1', 18001" in source
+    assert "connection.request('GET', '/health'" in source
     assert "model-tunnels-ok" in source
     assert "model-tunnels-degraded" in source
     assert "--require-model-tunnels" in source
@@ -401,6 +403,49 @@ def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch
     assert transports[1] is not transports[0]
     assert transports[1] is not transports[2]
     assert transports[1] is not transports[3]
+
+
+def test_start_online_model_tunnels_restart_after_consecutive_quant_health_failures() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    specs = tunnels.build_default_tunnels()
+    failure_counts: dict[str, int] = {}
+    probes: list[tuple[str, str]] = []
+
+    def failed_probe(spec, path):
+        probes.append((spec.name, path))
+        return False, "ReadTimeout"
+
+    assert (
+        tunnels.check_required_tunnel_health(
+            specs,
+            failure_counts,
+            probe=failed_probe,
+            failure_limit=2,
+        )
+        == []
+    )
+    assert tunnels.check_required_tunnel_health(
+        specs,
+        failure_counts,
+        probe=failed_probe,
+        failure_limit=2,
+    ) == ["phase3-quant-api"]
+    assert probes == [
+        ("phase3-quant-api", "/health"),
+        ("phase3-quant-api", "/health"),
+    ]
+
+    assert (
+        tunnels.check_required_tunnel_health(
+            specs,
+            failure_counts,
+            probe=lambda _spec, _path: (True, ""),
+            failure_limit=2,
+        )
+        == []
+    )
+    assert failure_counts["phase3-quant-api"] == 0
 
 
 def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:

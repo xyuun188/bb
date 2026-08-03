@@ -8516,6 +8516,7 @@ async def test_refresh_position_prices_batches_loaded_position_updates(
     monkeypatch: pytest.MonkeyPatch,
 ):
     batch_updates: list[list[tuple[int, float, float]]] = []
+    position_write_lock = asyncio.Lock()
 
     class FakeTradeRepository:
         def __init__(self, _session):
@@ -8548,6 +8549,7 @@ async def test_refresh_position_prices_batches_loaded_position_updates(
             ]
 
         async def update_open_position_prices(self, updates):
+            assert position_write_lock.locked()
             batch_updates.append(
                 [
                     (pos.id, current_price, unrealized_pnl)
@@ -8566,6 +8568,7 @@ async def test_refresh_position_prices_batches_loaded_position_updates(
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
     service = OkxSyncService(
+        exchange_reconcile_lock=position_write_lock,
         position_profit_peak_recorder=lambda **_kwargs: None,
         position_age_minutes_provider=lambda _created_at: 12.5,
         position_profit_peak_pruner=lambda _open_context: None,
@@ -8581,6 +8584,46 @@ async def test_refresh_position_prices_batches_loaded_position_updates(
     assert batch_updates == [[(71, 110.0, 5.0), (72, 190.0, 2.5)]]
     assert result["updated_position_count"] == 2
     assert result["persist_updates_ms"] >= 0
+    assert position_write_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_defers_while_reconciliation_owns_write_lock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    position_write_lock = asyncio.Lock()
+    await position_write_lock.acquire()
+    session_opened = False
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        nonlocal session_opened
+        session_opened = True
+        yield object()
+
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(sync_module, "POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS", 0.01)
+    service = OkxSyncService(
+        exchange_reconcile_lock=position_write_lock,
+        position_profit_peak_recorder=lambda **_kwargs: None,
+        position_age_minutes_provider=lambda _created_at: 12.5,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    try:
+        result = await service.refresh_position_prices({})
+    finally:
+        position_write_lock.release()
+
+    assert result["database_deferred"] == {
+        "reason": "exchange_position_reconciliation_in_progress",
+        "timeout_seconds": 0.01,
+        "note": (
+            "Price persistence was deferred to avoid concurrent writes with "
+            "the authoritative position reconciliation transaction."
+        ),
+    }
+    assert session_opened is False
 
 
 @pytest.mark.asyncio

@@ -836,7 +836,7 @@ def main() -> None:
                 check=True,
             )
             model_tunnel_probe = "python3 -c " + _remote_quote(
-                "import socket, time\n"
+                "import http.client, socket, time\n"
                 "for port in (18000, 18001, 18002, 18003):\n"
                 "    deadline = time.time() + 20\n"
                 "    while True:\n"
@@ -846,6 +846,15 @@ def main() -> None:
                 "            if time.time() >= deadline:\n"
                 "                raise SystemExit(f'tunnel port {port} unavailable')\n"
                 "            time.sleep(1)\n"
+                "connection = http.client.HTTPConnection('127.0.0.1', 18001, timeout=8)\n"
+                "try:\n"
+                "    connection.request('GET', '/health', headers={'Connection': 'close'})\n"
+                "    response = connection.getresponse()\n"
+                "    response.read(1)\n"
+                "    if response.status != 200:\n"
+                "        raise SystemExit(f'quant tunnel health returned HTTP {response.status}')\n"
+                "finally:\n"
+                "    connection.close()\n"
                 "print('model-tunnels-ok')"
             )
             model_tunnel_failure_action = "exit 8" if args.require_model_tunnels else "true"

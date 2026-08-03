@@ -16,11 +16,13 @@ platform. Secrets are never printed.
 from __future__ import annotations
 
 import argparse
+import http.client
 import select
 import socketserver
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,10 @@ from services.model_server_config import (  # noqa: E402
 BUFFER_SIZE = 65_535
 SELECT_TIMEOUT_SECONDS = 1.0
 TRANSPORT_KEEPALIVE_SECONDS = 30
+TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS = 15.0
+TUNNEL_HEALTH_TIMEOUT_SECONDS = 5.0
+TUNNEL_HEALTH_FAILURE_LIMIT = 2
+REQUIRED_HTTP_HEALTH_PATHS = {"phase3-quant-api": "/health"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +55,58 @@ class TunnelSpec:
     local_port: int
     remote_host: str
     remote_port: int
+
+
+def probe_tunnel_http_health(spec: TunnelSpec, path: str) -> tuple[bool, str]:
+    """Verify that a forwarded endpoint responds, not only that its local port accepts TCP."""
+
+    connection = http.client.HTTPConnection(
+        spec.local_host,
+        spec.local_port,
+        timeout=TUNNEL_HEALTH_TIMEOUT_SECONDS,
+    )
+    try:
+        connection.request("GET", path, headers={"Connection": "close"})
+        response = connection.getresponse()
+        response.read(1)
+        if 200 <= int(response.status) < 300:
+            return True, ""
+        return False, f"HTTP {response.status}"
+    except Exception as exc:
+        return False, safe_error_text(exc, limit=120)
+    finally:
+        connection.close()
+
+
+def check_required_tunnel_health(
+    specs: list[TunnelSpec],
+    failure_counts: dict[str, int],
+    *,
+    probe: Callable[[TunnelSpec, str], tuple[bool, str]] = probe_tunnel_http_health,
+    failure_limit: int = TUNNEL_HEALTH_FAILURE_LIMIT,
+) -> list[str]:
+    """Return endpoints whose semantic health failed for the configured consecutive limit."""
+
+    unhealthy: list[str] = []
+    for spec in specs:
+        path = REQUIRED_HTTP_HEALTH_PATHS.get(spec.name)
+        if not path:
+            continue
+        healthy, error = probe(spec, path)
+        if healthy:
+            if failure_counts.get(spec.name, 0):
+                safe_print(f"{spec.name} tunnel health recovered")
+            failure_counts[spec.name] = 0
+            continue
+        count = failure_counts.get(spec.name, 0) + 1
+        failure_counts[spec.name] = count
+        safe_print(
+            f"{spec.name} tunnel health failed ({count}/{failure_limit}): "
+            f"{safe_error_text(error, limit=120)}"
+        )
+        if count >= max(int(failure_limit or 1), 1):
+            unhealthy.append(spec.name)
+    return unhealthy
 
 
 class ForwardServer(socketserver.ThreadingTCPServer):
@@ -216,6 +274,8 @@ def run_tunnels(specs: list[TunnelSpec]) -> None:
         ssh_clients, transports = open_dedicated_transports(specs, info)
         servers = start_servers(specs, transports)
         safe_print("online model tunnels ready with isolated transports")
+        health_failure_counts: dict[str, int] = {}
+        next_health_check = time.monotonic() + TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS
         while True:
             inactive_names = [
                 spec.name
@@ -226,6 +286,17 @@ def run_tunnels(specs: list[TunnelSpec]) -> None:
                 raise RuntimeError(
                     "SSH transport closed for: " + ", ".join(inactive_names)
                 )
+            now = time.monotonic()
+            if now >= next_health_check:
+                unhealthy_names = check_required_tunnel_health(
+                    specs,
+                    health_failure_counts,
+                )
+                if unhealthy_names:
+                    raise RuntimeError(
+                        "tunnel semantic health failed for: " + ", ".join(unhealthy_names)
+                    )
+                next_health_check = now + TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS
             time.sleep(5)
     finally:
         for server in servers:

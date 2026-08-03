@@ -65,6 +65,7 @@ RECONCILE_ORIGIN_EXTERNAL_OKX = "external_okx_sync"
 ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
+POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS = 0.1
 LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
 
 
@@ -1675,6 +1676,29 @@ class OkxSyncService:
                 "OKX position snapshot unavailable during price refresh; using feature prices",
                 error=safe_error_text(exc),
             )
+        position_write_lock = self.exchange_reconcile_lock
+        position_write_lock_acquired = False
+        if position_write_lock is not None:
+            try:
+                await asyncio.wait_for(
+                    position_write_lock.acquire(),
+                    timeout=POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS,
+                )
+            except TimeoutError:
+                diagnostics["database_deferred"] = {
+                    "reason": "exchange_position_reconciliation_in_progress",
+                    "timeout_seconds": POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS,
+                    "note": (
+                        "Price persistence was deferred to avoid concurrent writes with "
+                        "the authoritative position reconciliation transaction."
+                    ),
+                }
+                diagnostics["total_ms"] = round(
+                    (time.perf_counter() - refresh_started) * 1000,
+                    3,
+                )
+                return diagnostics
+            position_write_lock_acquired = True
         try:
             async with get_session_ctx() as session:
                 trade_repo = TradeRepository(session)
@@ -1786,6 +1810,9 @@ class OkxSyncService:
         except Exception as e:
             diagnostics["database_error"] = safe_error_text(e, limit=180)
             logger.warning("failed to refresh DB position prices", error=safe_error_text(e))
+        finally:
+            if position_write_lock_acquired and position_write_lock.locked():
+                position_write_lock.release()
         diagnostics["total_ms"] = round((time.perf_counter() - refresh_started) * 1000, 3)
         return diagnostics
 
