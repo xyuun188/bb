@@ -332,7 +332,7 @@ class Settings(BaseSettings):
     local_ai_tools_enabled: bool = False
     local_ai_tools_api_base: str = ""
     local_ai_tools_api_key: str = ""
-    local_ai_tools_timeout_seconds: float = 8.0
+    local_ai_tools_timeout_seconds: float = 12.0
     local_ai_tools_circuit_breaker_failures: int = 3
     local_ai_tools_circuit_breaker_cooldown_seconds: float = 45.0
     high_risk_review_enabled: bool = True

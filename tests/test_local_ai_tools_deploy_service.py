@@ -206,9 +206,41 @@ def test_local_ai_tools_training_parallelism_leaves_inference_headroom(
     classifier = module._make_classifier([0, 1, 0, 1])
 
     assert module._available_cpu_count() == 16
-    assert module._adaptive_training_worker_count() == 4
-    assert regressor.named_steps["model"].n_jobs == 4
-    assert classifier.named_steps["model"].n_jobs == 4
+    assert module._adaptive_training_worker_count() == 2
+    assert regressor.named_steps["model"].n_jobs == 2
+    assert classifier.named_steps["model"].n_jobs == 2
+
+
+def test_post_training_warmup_primes_every_market_inference_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_post_training_warmup_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    called: list[str] = []
+
+    monkeypatch.setattr(module, "load_bundle", lambda: {"metadata": {}})
+
+    def completed(name: str):
+        def predictor(request: object) -> dict[str, object]:
+            called.append(name)
+            assert getattr(request, "symbol") == "BTC/USDT"
+            return {"available": True}
+
+        return predictor
+
+    monkeypatch.setattr(module, "profit_predict", completed("profit_prediction"))
+    monkeypatch.setattr(module, "deep_sentiment_analyze", completed("sentiment_analysis"))
+    monkeypatch.setattr(module, "timeseries_predict", completed("time_series_prediction"))
+
+    result = module._post_training_inference_warmup()
+
+    assert result["status"] == "completed"
+    assert called == [
+        "profit_prediction",
+        "sentiment_analysis",
+        "time_series_prediction",
+    ]
+    assert all(item["status"] == "completed" for item in result["routes"].values())
 
 
 def test_local_ai_tools_loaded_bundle_forces_single_worker_inference(
@@ -662,6 +694,11 @@ def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -
 def test_deploy_smoke_verifies_timeseries_permission_contract() -> None:
     command = deploy._remote_smoke_command()
 
+    assert "sentiment = post('/sentiment/deep/analyze'" in command
+    assert "'recent_headlines': ['Market liquidity remains stable.']" in command
+    assert "'close_sequence': [100.0 + (index * 0.01) for index in range(30)]" in command
+    assert "sentiment.get('endpoint') == 'sentiment_deep'" in command
+    assert "'sentiment_contract':" in command
     assert "timeseries = post('/timeseries/predict'" in command
     assert "timeseries.get('prediction_quality', {}).get('paper_eligible')" in command
     assert "timeseries.get('prediction_quality', {}).get('production_eligible')" in command

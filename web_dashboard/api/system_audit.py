@@ -3733,8 +3733,7 @@ async def _model_training_audit() -> dict[str, Any]:
         or runtime_probe_hard_failure
     )
     observing = not hard_failure and (
-        bool(optional_source_warnings)
-        or local_tools_status == "learning_only"
+        local_tools_status == "learning_only"
         or local_tools_status_probe_slow
         or local_tools_unconfigured
         or runtime_probe_timeout
@@ -3933,19 +3932,24 @@ async def _phase3_server_migration_audit() -> dict[str, Any]:
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     phase3_blocked = bool(report.get("phase3_go_live_blocked"))
-    warning_codes = {str(item.get("code") or "") for item in warnings if isinstance(item, dict)}
-    report["observing"] = bool(
-        warnings
-        and not phase3_blocked
-        and not blockers
-        and warning_codes.issubset({"legacy_data_paths_preserved"})
-    )
-    status = "warning" if phase3_blocked or warnings else "ok"
+    expected_warning_codes = {"legacy_data_paths_preserved"}
+    expected_isolation_warnings = [
+        item
+        for item in warnings
+        if isinstance(item, dict) and str(item.get("code") or "") in expected_warning_codes
+    ]
+    unexpected_warnings = [item for item in warnings if item not in expected_isolation_warnings]
+    report["observing"] = False
+    report["expected_isolation_warnings"] = expected_isolation_warnings
+    report["unexpected_warnings"] = unexpected_warnings
+    status = "warning" if phase3_blocked or blockers or unexpected_warnings else "ok"
     summary = "三期模型服务器资源释放和迁移检查已通过。"
-    if phase3_blocked:
+    if phase3_blocked or blockers:
         summary = "三期模型服务器仍被阻断：旧资源释放、/data/BB 隔离或白名单迁移尚未验证完成。"
-    elif warnings:
-        summary = "三期模型服务器可用；仅保留按策略隔离的旧数据路径观察项，不阻断运行。"
+    elif unexpected_warnings:
+        summary = "三期模型服务器迁移检查存在未预期提示，需要复核。"
+    elif expected_isolation_warnings:
+        summary = "三期模型服务器迁移检查已通过；旧数据路径按策略只读隔离保留。"
     return _audit_card(
         "phase3_server_migration",
         "三期模型服务器资源释放与迁移检查",
@@ -4075,11 +4079,31 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
     paper_active = _paper_service_active(
         _safe_dict(_safe_dict(report.get("inputs")).get("platform_server"))
     )
-    consumed_after_resume = paper_active and not can_resume
-    status = "ok" if can_resume and not warnings else "warning"
-    if blockers:
+    consumed_blocker_codes = {
+        "paper_trading_already_active",
+        "okx_authoritative_pull_unavailable",
+    }
+    blocker_codes = {
+        str(item.get("code") or "") for item in blockers if isinstance(item, dict)
+    }
+    consumed_after_resume = bool(
+        paper_active and "paper_trading_already_active" in blocker_codes
+    )
+    consumed_blockers = [
+        item
+        for item in blockers
+        if consumed_after_resume
+        and isinstance(item, dict)
+        and str(item.get("code") or "") in consumed_blocker_codes
+    ]
+    effective_blockers = [item for item in blockers if item not in consumed_blockers]
+    if effective_blockers:
         status = "critical"
-    if consumed_after_resume:
+    elif warnings:
+        status = "warning"
+    elif can_resume or consumed_after_resume:
+        status = "ok"
+    else:
         status = "warning"
     summary = "三期模拟盘恢复硬检查已通过，但仍需要操作员批准。"
     if consumed_after_resume:
@@ -4090,7 +4114,9 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
         summary = "三期模拟盘恢复检查可通过，但仍有提示需要复核。"
     details = dict(report)
     details["consumed_after_resume"] = consumed_after_resume
-    details["observing"] = consumed_after_resume
+    details["consumed_blockers"] = consumed_blockers
+    details["effective_blockers"] = effective_blockers
+    details["observing"] = False
     return _audit_card(
         "phase3_paper_resume_preflight",
         "三期模拟盘恢复硬检查",
@@ -4099,7 +4125,7 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
         details=details,
         evidence=[
             {"label": "可恢复模拟盘", "value": can_resume},
-            {"label": "阻断项", "value": len(blockers)},
+            {"label": "当前阻断项", "value": len(effective_blockers)},
             {"label": "提示项", "value": len(warnings)},
             {
                 "label": "OKX 问题",

@@ -40,6 +40,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1109,7 +1110,7 @@ def _available_cpu_count() -> int:
 def _adaptive_training_worker_count() -> int:
     """Use sublinear training parallelism so live inference always has headroom."""
 
-    return max(int(math.sqrt(_available_cpu_count())), 1)
+    return max(min(int(math.sqrt(_available_cpu_count())), 2), 1)
 
 
 def _make_regressor(sample_count: int) -> Pipeline:
@@ -4589,6 +4590,68 @@ def _purged_chronological_holdout(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _post_training_inference_warmup() -> dict[str, Any]:
+    """Prime the retained champion before the training request releases its worker."""
+
+    started = time.monotonic()
+    if load_bundle() is None:
+        return {
+            "status": "skipped",
+            "reason": "current_artifact_unavailable",
+            "duration_sec": round(time.monotonic() - started, 4),
+        }
+    features = {
+        "symbol": "BTC/USDT",
+        "current_price": 100.0,
+        "close": 100.0,
+        "returns_1": 0.001,
+        "returns_5": 0.002,
+        "returns_20": 0.003,
+        "rsi_14": 52.0,
+        "volume_ratio": 1.0,
+        "news_sentiment_avg": 0.0,
+        "social_sentiment_avg": 0.0,
+        "recent_headlines": ["Market liquidity remains stable."],
+        "close_sequence": [100.0 + (index * 0.01) for index in range(30)],
+        "volume_sequence": [1000.0 + index for index in range(30)],
+    }
+    request = FeatureRequest.model_construct(symbol="BTC/USDT", features=features)
+    routes = (
+        ("profit_prediction", profit_predict),
+        ("sentiment_analysis", deep_sentiment_analyze),
+        ("time_series_prediction", timeseries_predict),
+    )
+    route_results: dict[str, dict[str, Any]] = {}
+    for name, predictor in routes:
+        route_started = time.monotonic()
+        try:
+            payload = predictor(request)
+            available = isinstance(payload, dict) and payload.get("available") is not False
+            route_results[name] = {
+                "status": "completed" if available else "unavailable",
+                "duration_sec": round(time.monotonic() - route_started, 4),
+            }
+        except Exception as exc:
+            route_results[name] = {
+                "status": "error",
+                "error": safe_error(exc, 180),
+                "duration_sec": round(time.monotonic() - route_started, 4),
+            }
+    completed = all(item.get("status") == "completed" for item in route_results.values())
+    return {
+        "status": "completed" if completed else "degraded",
+        "routes": route_results,
+        "duration_sec": round(time.monotonic() - started, 4),
+    }
+
+
+def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **payload,
+        "post_training_inference_warmup": _post_training_inference_warmup(),
+    }
+
+
 @app.post("/train")
 def train(req: TrainRequest) -> dict[str, Any]:
     rows = _market_training_rows(req.shadow_samples or [])
@@ -5093,17 +5156,17 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "profiles": profiles,
     }
     if not req.persist_artifact:
-        return {
+        return _with_post_training_inference_warmup({
             "trained": False,
             "reason": "phase3_preflight_no_artifact_write",
             **metadata,
-        }
+        })
     if not req.confirm_phase3_rebuild:
-        return {
+        return _with_post_training_inference_warmup({
             "trained": False,
             "reason": "phase3_rebuild_confirmation_required",
             **metadata,
-        }
+        })
     candidate = persist_candidate_bundle(bundle, metadata)
     activation_evidence = {
         field: metadata[field]
@@ -5130,7 +5193,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
             role="current",
             deserialize_bundle=False,
         )
-        return {
+        return _with_post_training_inference_warmup({
             "trained": True,
             "reason": "trained_challenger_rejected",
             "challenger_rejected": True,
@@ -5145,7 +5208,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
                 else None
             ),
             **metadata,
-        }
+        })
     activation_evidence["champion_comparison"] = champion_comparison
     current = activate_candidate_shadow(activation_evidence)
     if activation_stage in {"canary", "active"}:
@@ -5168,7 +5231,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
     loaded = load_bundle()
     if loaded is None:
         raise ValueError("Local AI artifact failed post-activation load verification.")
-    return {
+    return _with_post_training_inference_warmup({
         "trained": True,
         **current["metadata"],
         "artifact_version": current["version"],
@@ -5176,7 +5239,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "live_ml_ready": activation_stage == "active",
         "candidate_version": candidate["version"],
         "champion_comparison": champion_comparison,
-    }
+    })
 
 
 @app.post("/profit/predict")
@@ -6183,12 +6246,18 @@ def _remote_smoke_command() -> str:
         "    'returns_20': 0.03,\n"
         "    'rsi_14': 55.0,\n"
         "    'volume_ratio': 1.1,\n"
+        "    'news_sentiment_avg': 0.0,\n"
+        "    'social_sentiment_avg': 0.0,\n"
+        "    'recent_headlines': ['Market liquidity remains stable.'],\n"
+        "    'close_sequence': [100.0 + (index * 0.01) for index in range(30)],\n"
+        "    'volume_sequence': [1000.0 + index for index in range(30)],\n"
         "}\n"
         "health = get('/health')\n"
         "lifecycle = health.get('artifact_lifecycle')\n"
         "has_artifact = lifecycle in {'shadow', 'canary', 'active'}\n"
         "live = lifecycle == 'active'\n"
         "profit = post('/profit/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
+        "sentiment = post('/sentiment/deep/analyze', {'symbol': 'BTC/USDT', 'features': features})\n"
         "timeseries = post('/timeseries/predict', {'symbol': 'BTC/USDT', 'features': features})\n"
         "exit_advice = post('/exit/advise', {'symbol': 'BTC/USDT', 'features': features, 'open_positions': []})\n"
         "assert health.get('service') == 'phase3_quant_api', health\n"
@@ -6214,6 +6283,8 @@ def _remote_smoke_command() -> str:
         "assert set((profit.get('return_distribution_inputs') or {})) == {'long', 'short'}, profit\n"
         "assert all(item.get('production_eligible') is live for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
         "assert all(item.get('paper_eligible') is has_artifact for item in (profit.get('return_distribution_inputs') or {}).values()), profit\n"
+        "assert sentiment.get('endpoint') == 'sentiment_deep', sentiment\n"
+        "assert sentiment.get('production_permission') is live, sentiment\n"
         "assert timeseries.get('trained') is has_artifact, timeseries\n"
         "assert timeseries.get('production_permission') is live, timeseries\n"
         "assert timeseries.get('live_ml_ready') is live, timeseries\n"
@@ -6246,6 +6317,11 @@ def _remote_smoke_command() -> str:
         "        'promotion_flow': profit.get('promotion_flow'),\n"
         "        'production_eligible': profit.get('prediction_quality', {}).get('production_eligible'),\n"
         "        'production_permission': profit.get('production_permission'),\n"
+        "    },\n"
+        "    'sentiment_contract': {\n"
+        "        'endpoint': sentiment.get('endpoint'),\n"
+        "        'specialist_inference_active': sentiment.get('specialist_inference_active'),\n"
+        "        'production_permission': sentiment.get('production_permission'),\n"
         "    },\n"
         "    'timeseries_contract': {\n"
         "        'production_eligible': timeseries.get('prediction_quality', {}).get('production_eligible'),\n"

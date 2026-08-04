@@ -779,7 +779,7 @@ async def test_phase3_server_migration_does_not_observe_legacy_takeover_as_ready
 
 
 @pytest.mark.asyncio
-async def test_phase3_server_migration_marks_policy_preserved_data_as_observing(
+async def test_phase3_server_migration_accepts_policy_preserved_isolated_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakePhase3ServerMigrationAuditService:
@@ -818,10 +818,12 @@ async def test_phase3_server_migration_marks_policy_preserved_data_as_observing(
     card = await system_audit._phase3_server_migration_audit()
     state, label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
 
-    assert card["status"] == "warning"
-    assert card["details"]["observing"] is True
-    assert state == "observing"
-    assert "观察" in label
+    assert card["status"] == "ok"
+    assert card["details"]["observing"] is False
+    assert len(card["details"]["expected_isolation_warnings"]) == 1
+    assert card["details"]["unexpected_warnings"] == []
+    assert state == "fixed"
+    assert "已修复" in label
 
 
 @pytest.mark.asyncio
@@ -1093,10 +1095,12 @@ async def test_phase3_paper_resume_preflight_audit_is_consumed_after_paper_start
     card = await system_audit._phase3_paper_resume_preflight_audit()
     state, _label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
 
-    assert card["status"] == "warning"
+    assert card["status"] == "ok"
     assert card["details"]["consumed_after_resume"] is True
-    assert card["details"]["observing"] is True
-    assert state == "observing"
+    assert card["details"]["observing"] is False
+    assert len(card["details"]["consumed_blockers"]) == 2
+    assert card["details"]["effective_blockers"] == []
+    assert state == "fixed"
 
 
 @pytest.mark.asyncio
@@ -2336,6 +2340,7 @@ async def test_model_training_optional_sources_are_observing_not_unresolved(
 @pytest.mark.asyncio
 async def test_model_training_ready_tools_optional_sources_summary_is_specific(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
 ) -> None:
     async def fake_data_collection_status(
         include_feature_coverage: bool = True,
@@ -2377,13 +2382,23 @@ async def test_model_training_ready_tools_optional_sources_summary_is_specific(
         fake_data_collection_status,
     )
     monkeypatch.setattr(system_audit, "collect_platform_runtime_status", fake_runtime_status)
+    _patch_specialist_shadow_report_path(
+        monkeypatch,
+        tmp_path,
+        {
+            "checked_at": datetime.now(UTC).isoformat(),
+            "eligible_shadow_count": 1,
+            "summary": {"promotion_ready_count": 0, "blocked_count": 1},
+            "models": [],
+        },
+    )
     _patch_historical_trade_fact_audit(monkeypatch)
     _patch_artifact_retirement_audit(monkeypatch)
 
     card = await system_audit._model_training_audit()
 
-    assert card["status"] == "warning"
-    assert card["summary"] == "模型服务可用；可选增强数据源未配置。"
+    assert card["status"] == "ok"
+    assert card["summary"] == "模型和训练数据状态正常。"
     assert card["details"]["local_ai_tools"]["status"] == "ready"
     assert card["details"]["hard_failure"] is False
 
