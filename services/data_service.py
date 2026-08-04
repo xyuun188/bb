@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy import select
 
 from config.settings import settings
+from core.exceptions import WebSocketConnectionError
 from core.market_facts import (
     build_market_fact,
     build_market_source_consistency,
@@ -345,7 +346,13 @@ class DataService:
             self.ws_client._subscribe_symbols = settings.symbols
             self._kline_coverage_symbols = self._normalize_symbols(settings.symbols)
 
-        await self.ws_client.connect()
+        try:
+            await self.ws_client.connect()
+        except WebSocketConnectionError as exc:
+            logger.warning(
+                "initial OKX WebSocket connection failed; background recovery enabled",
+                error=safe_error_text(exc),
+            )
         asyncio.create_task(self.ws_client.listen())
         self._start_kline_coverage_refresh()
         await self.external_event_service.start_controller()

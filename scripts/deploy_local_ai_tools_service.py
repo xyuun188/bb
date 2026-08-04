@@ -4310,6 +4310,17 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@app.get("/health/live")
+async def liveness() -> dict[str, Any]:
+    """Return event-loop liveness without reading or serializing model metadata."""
+
+    return {
+        "ok": True,
+        "service": "phase3_quant_api",
+        "port": PHASE3_API_PORT,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     artifact_status = _model_artifact_status()

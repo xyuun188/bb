@@ -848,7 +848,7 @@ def main() -> None:
                 "            time.sleep(1)\n"
                 "connection = http.client.HTTPConnection('127.0.0.1', 18001, timeout=8)\n"
                 "try:\n"
-                "    connection.request('GET', '/health', headers={'Connection': 'close'})\n"
+                "    connection.request('GET', '/health/live', headers={'Connection': 'close'})\n"
                 "    response = connection.getresponse()\n"
                 "    response.read(1)\n"
                 "    if response.status != 200:\n"

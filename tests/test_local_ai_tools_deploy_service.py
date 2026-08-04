@@ -308,6 +308,8 @@ def test_local_ai_tools_generated_service_disables_local_high_risk_review() -> N
 def test_local_ai_tools_health_returns_service_status_without_trained_bundle() -> None:
     assert "def _model_artifact_status()" in SERVICE_CODE
     assert "def _status_metadata()" in SERVICE_CODE
+    assert '@app.get("/health/live")' in SERVICE_CODE
+    assert "async def liveness()" in SERVICE_CODE
     assert '"ok": True' in SERVICE_CODE
     assert '"service": "phase3_quant_api"' in SERVICE_CODE
     assert '"root": PHASE3_ROOT.as_posix()' in SERVICE_CODE
@@ -354,6 +356,23 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert health["port"] == 8101
     assert "live_mutation" not in health
     assert health["trained_models_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_liveness_does_not_read_artifact_metadata(monkeypatch) -> None:
+    module = ModuleType("local_ai_tools_api_liveness_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    def fail_artifact_status() -> None:
+        raise AssertionError("liveness must not read artifact metadata")
+
+    monkeypatch.setattr(module, "_model_artifact_status", fail_artifact_status)
+
+    assert await module.liveness() == {
+        "ok": True,
+        "service": "phase3_quant_api",
+        "port": 8101,
+    }
 
     payload = module.with_model_metadata(
         "profit_prediction",

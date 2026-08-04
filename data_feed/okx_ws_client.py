@@ -101,7 +101,7 @@ class OKXWebSocketClient:
         except Exception as e:
             error_text = safe_error_text(e)
             logger.error("OKX WebSocket connection failed", error=error_text)
-            self._running = False
+            self._ws = None
             raise WebSocketConnectionError(f"Failed to connect: {error_text}") from e
 
     async def _subscribe(self) -> None:
@@ -208,73 +208,94 @@ class OKXWebSocketClient:
                     )
 
     async def listen(self) -> None:
-        """Main message loop. Blocks until disconnected or stopped."""
-        if not self._ws:
-            await self.connect()
-
+        """Consume messages and keep reconnecting until explicitly stopped."""
         consecutive_receive_timeouts = 0
         while self._running:
-            try:
-                raw = await asyncio.wait_for(
-                    self._ws.recv(),
-                    timeout=WS_RECEIVE_TIMEOUT_SECONDS,
-                )
-                await self._handle_message(raw)
+            if self._ws is None:
+                if not await self._reconnect_until_available():
+                    return
                 consecutive_receive_timeouts = 0
-                ticker_reference_time = self._last_ticker_time or self._connected_at
-                ticker_age = time.time() - ticker_reference_time if ticker_reference_time else 0.0
-                if ticker_age > WS_TICKER_STALE_RECONNECT_SECONDS:
-                    logger.warning(
-                        "OKX ticker stream stale; reconnecting",
-                        ticker_age_seconds=round(ticker_age, 3),
-                        stale_after_seconds=WS_TICKER_STALE_RECONNECT_SECONDS,
-                        messages_received=self._message_count,
-                    )
-                    break
-            except TimeoutError:
-                consecutive_receive_timeouts += 1
-                if consecutive_receive_timeouts >= WS_MAX_CONSECUTIVE_RECEIVE_TIMEOUTS:
-                    logger.warning(
-                        "OKX WebSocket receive timeout threshold reached; reconnecting",
-                        consecutive_timeouts=consecutive_receive_timeouts,
-                        timeout_seconds=WS_RECEIVE_TIMEOUT_SECONDS,
-                    )
-                    break
+            while self._running and self._ws is not None:
                 try:
-                    await self._ws.send("ping")
-                except Exception:
-                    logger.warning("ping failed, reconnecting...")
-                    break
-            except Exception as e:
-                if "ConnectionClosed" in type(e).__name__ or hasattr(e, "code"):
-                    logger.warning(
-                        "websocket closed",
-                        code=getattr(e, "code", None),
-                        reason=getattr(e, "reason", None),
+                    raw = await asyncio.wait_for(
+                        self._ws.recv(),
+                        timeout=WS_RECEIVE_TIMEOUT_SECONDS,
                     )
-                else:
-                    logger.error("unexpected error in listen loop", error=safe_error_text(e))
-                break
+                    await self._handle_message(raw)
+                    consecutive_receive_timeouts = 0
+                    ticker_reference_time = self._last_ticker_time or self._connected_at
+                    ticker_age = (
+                        time.time() - ticker_reference_time if ticker_reference_time else 0.0
+                    )
+                    if ticker_age > WS_TICKER_STALE_RECONNECT_SECONDS:
+                        logger.warning(
+                            "OKX ticker stream stale; reconnecting",
+                            ticker_age_seconds=round(ticker_age, 3),
+                            stale_after_seconds=WS_TICKER_STALE_RECONNECT_SECONDS,
+                            messages_received=self._message_count,
+                        )
+                        break
+                except TimeoutError:
+                    consecutive_receive_timeouts += 1
+                    if consecutive_receive_timeouts >= WS_MAX_CONSECUTIVE_RECEIVE_TIMEOUTS:
+                        logger.warning(
+                            "OKX WebSocket receive timeout threshold reached; reconnecting",
+                            consecutive_timeouts=consecutive_receive_timeouts,
+                            timeout_seconds=WS_RECEIVE_TIMEOUT_SECONDS,
+                        )
+                        break
+                    try:
+                        await self._ws.send("ping")
+                    except Exception:
+                        logger.warning("ping failed, reconnecting...")
+                        break
+                except Exception as e:
+                    if "ConnectionClosed" in type(e).__name__ or hasattr(e, "code"):
+                        logger.warning(
+                            "websocket closed",
+                            code=getattr(e, "code", None),
+                            reason=getattr(e, "reason", None),
+                        )
+                    else:
+                        logger.error("unexpected error in listen loop", error=safe_error_text(e))
+                    break
+            if not self._running:
+                return
+            await self._close_current_stream()
 
-        # Auto-reconnect
-        if self._running:
-            stale_ws = self._ws
-            self._ws = None
-            if stale_ws is not None:
-                try:
-                    await stale_ws.close()
-                except Exception as exc:
-                    logger.debug(
-                        "stale OKX WebSocket close failed",
-                        error=safe_error_text(exc),
-                    )
+    async def _reconnect_until_available(self) -> bool:
+        """Retry connection setup until it succeeds or shutdown is requested."""
+
+        while self._running:
             logger.info("reconnecting in 5 seconds...")
             await asyncio.sleep(WS_RECONNECT_DELAY_SECONDS)
             if not self._running:
-                return
+                return False
             self._reconnect_count += 1
-            await self.connect()
-            asyncio.create_task(self.listen())
+            try:
+                await self.connect()
+            except WebSocketConnectionError as exc:
+                logger.warning(
+                    "OKX WebSocket reconnect failed; retrying",
+                    reconnect_count=self._reconnect_count,
+                    error=safe_error_text(exc),
+                )
+                continue
+            return True
+        return False
+
+    async def _close_current_stream(self) -> None:
+        stale_ws = self._ws
+        self._ws = None
+        if stale_ws is None:
+            return
+        try:
+            await stale_ws.close()
+        except Exception as exc:
+            logger.debug(
+                "stale OKX WebSocket close failed",
+                error=safe_error_text(exc),
+            )
 
     async def subscribe_symbol(self, symbol: str) -> None:
         """Dynamically subscribe to a new symbol's ticker channel."""

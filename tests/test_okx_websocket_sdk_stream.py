@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from core.exceptions import WebSocketConnectionError
 from data_feed import okx_ws_client
 from data_feed.okx_ws_client import OKXWebSocketClient
 from services.okx_perpetual_sdk import OkxPublicWebSocketSdkStream
@@ -149,3 +150,47 @@ async def test_ws_listener_reconnects_after_repeated_receive_timeouts(
     assert stream.sent == ["ping"]
     assert stream.closed is True
     assert client._ws is None
+
+
+@pytest.mark.asyncio
+async def test_ws_listener_keeps_retrying_after_reconnect_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedStream:
+        async def recv(self) -> str:
+            raise ConnectionError("stream failed")
+
+        async def close(self) -> None:
+            return None
+
+    client = OKXWebSocketClient()
+    client._running = True
+    client._ws = FailedStream()
+    connect_attempts = 0
+
+    class RecoveredStream:
+        async def recv(self) -> str:
+            client._running = False
+            return "{}"
+
+        async def close(self) -> None:
+            return None
+
+    async def reconnect() -> None:
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if connect_attempts == 1:
+            raise WebSocketConnectionError("temporary reconnect failure")
+        client._ws = RecoveredStream()
+
+    async def immediate_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(client, "connect", reconnect)
+    monkeypatch.setattr(okx_ws_client.asyncio, "sleep", immediate_sleep)
+
+    await client.listen()
+
+    assert connect_attempts == 2
+    assert client._reconnect_count == 2
+    assert client._running is False
