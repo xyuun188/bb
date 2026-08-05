@@ -448,6 +448,40 @@ def test_start_online_model_tunnels_restart_after_consecutive_quant_health_failu
     assert failure_counts["phase3-quant-api"] == 0
 
 
+def test_start_online_model_tunnels_default_health_limit_tolerates_brief_busy_periods() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    specs = tunnels.build_default_tunnels()
+    failure_counts: dict[str, int] = {}
+
+    assert tunnels.TUNNEL_HEALTH_FAILURE_LIMIT >= 6
+    for _ in range(tunnels.TUNNEL_HEALTH_FAILURE_LIMIT - 1):
+        assert (
+            tunnels.check_required_tunnel_health(
+                specs,
+                failure_counts,
+                probe=lambda _spec, _path: (False, "ReadTimeout"),
+            )
+            == []
+        )
+
+    assert tunnels.check_required_tunnel_health(
+        specs,
+        failure_counts,
+        probe=lambda _spec, _path: (False, "ReadTimeout"),
+    ) == ["phase3-quant-api"]
+
+    assert (
+        tunnels.check_required_tunnel_health(
+            specs,
+            failure_counts,
+            probe=lambda _spec, _path: (True, ""),
+        )
+        == []
+    )
+    assert failure_counts["phase3-quant-api"] == 0
+
+
 def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:
     source = (ROOT / "core" / "model_server_bridge.py").read_text(encoding="utf-8")
 

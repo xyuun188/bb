@@ -42,7 +42,9 @@ SELECT_TIMEOUT_SECONDS = 1.0
 TRANSPORT_KEEPALIVE_SECONDS = 30
 TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS = 15.0
 TUNNEL_HEALTH_TIMEOUT_SECONDS = 5.0
-TUNNEL_HEALTH_FAILURE_LIMIT = 2
+# Training can briefly saturate the quant API while the SSH transport remains healthy.
+# Require a sustained semantic outage before rebuilding all four isolated tunnels.
+TUNNEL_HEALTH_FAILURE_LIMIT = 6
 REQUIRED_HTTP_HEALTH_PATHS = {"phase3-quant-api": "/health/live"}
 
 
