@@ -174,9 +174,7 @@ class _SystemErrorOnceCcxt:
     def __init__(self) -> None:
         self.position_history_calls = 0
 
-    async def privateGetAccountPositionsHistory(
-        self, _params: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def privateGetAccountPositionsHistory(self, _params: dict[str, Any]) -> dict[str, Any]:
         self.position_history_calls += 1
         if self.position_history_calls == 1:
             raise ExchangeAPIError(
@@ -193,9 +191,7 @@ class _TemporaryServiceOnceCcxt:
     def __init__(self) -> None:
         self.position_calls = 0
 
-    async def privateGetAccountPositions(
-        self, _params: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
         self.position_calls += 1
         if self.position_calls == 1:
             raise ExchangeAPIError(
@@ -894,6 +890,35 @@ class _MovingEntryTickerCcxt(_EntryMaxMarketSizeCcxt):
         }
 
 
+class _AttachedTakeProfitRejectedOnceCcxt(_EntryMaxMarketSizeCcxt):
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        if params.get("attachAlgoOrds"):
+            self.create_calls.append((symbol, order_type, side, quantity, price, params))
+            raise ExchangeAPIError(
+                "OKX API error [51052]: Your TP price should be lower than the primary order price.",
+                code="51052",
+            )
+        order = await super().create_order(
+            symbol,
+            order_type,
+            side,
+            quantity,
+            price,
+            params,
+        )
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        info.pop("attachAlgoOrds", None)
+        return order
+
+
 class _InvalidEntryPriceLimitCcxt(_MovingEntryTickerCcxt):
     async def publicGetPublicPriceLimit(self, params: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1152,9 +1177,7 @@ class _NativeReduceNoPositionCcxt(_ExitMaxMarketSizeCcxt):
         raise ExchangeAPIError("native close-position unavailable")
 
     async def privatePostTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
-        raise ExchangeAPIError(
-            "OKX 51169: You don't have any positions in this direction."
-        )
+        raise ExchangeAPIError("OKX 51169: You don't have any positions in this direction.")
 
 
 class _NativeFullCloseFillsHistoryCcxt(_ExitMaxMarketSizeCcxt):
@@ -1215,6 +1238,7 @@ def _executor(exchange: Any) -> OKXExecutor:
     if not callable(getattr(exchange, "privateGetAccountBalance", None)) and not callable(
         getattr(exchange, "fetch_balance", None)
     ):
+
         async def fixed_balance_snapshot(_asset: str = "USDT") -> dict[str, Any]:
             return {
                 "free": 1000.0,
@@ -1305,9 +1329,12 @@ async def test_okx_with_retry_recovers_from_temporary_50001(
 
 
 def test_okx_retry_classifier_recognizes_busy_50013() -> None:
-    assert OKXExecutor._is_transient_system_error(
-        "OKX API error [50013]: Systems are busy. Please try again later."
-    ) is True
+    assert (
+        OKXExecutor._is_transient_system_error(
+            "OKX API error [50013]: Systems are busy. Please try again later."
+        )
+        is True
+    )
 
 
 def _exit_decision() -> DecisionOutput:
@@ -1613,9 +1640,7 @@ async def test_okx_expected_instrument_rejection_is_not_logged_as_exchange_error
 
     assert result["reason"] == "okx_private_entry_instrument_unavailable"
     assert not [event for event in fake_logger.events if event[0] == "error"]
-    assert ("debug", "OKX SDK expected capability rejection") == tuple(
-        fake_logger.events[-1][:2]
-    )
+    assert ("debug", "OKX SDK expected capability rejection") == tuple(fake_logger.events[-1][:2])
 
 
 @pytest.mark.asyncio
@@ -2143,6 +2168,62 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
 
 @pytest.mark.asyncio
+async def test_okx_entry_recovers_valid_take_profit_rejection_with_verified_oco(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _AttachedTakeProfitRejectedOnceCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.action = Action.SHORT
+    recovery_calls: list[dict[str, Any]] = []
+
+    async def ensure_protection(**kwargs: Any) -> dict[str, Any]:
+        recovery_calls.append(kwargs)
+        return {
+            "verified": True,
+            "created": True,
+            "created_algo_id": "standalone-oco-1",
+            "status": "created_and_verified",
+        }
+
+    monkeypatch.setattr(executor, "_ensure_partial_entry_protection", ensure_protection)
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.FILLED
+    assert len(exchange.create_calls) == 2
+    first_params = exchange.create_calls[0][5]
+    retry_params = exchange.create_calls[1][5]
+    assert first_params["attachAlgoOrds"]
+    assert "attachAlgoOrds" not in retry_params
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0]["filled_contracts"] == pytest.approx(50.0)
+    assert recovery_calls[0]["params"]["attachAlgoOrds"] == first_params["attachAlgoOrds"]
+
+    recovery = result.raw_response["entry_attached_protection_recovery"]
+    assert recovery["okx_error_code"] == "51052"
+    assert recovery["standalone_protection"]["verified"] is True
+    submission = result.raw_response["protection_submission"]
+    assert submission["exchange_confirmation_recorded"] is True
+    assert submission["state"] == "confirmed"
+    assert submission["algo_ids"] == ["standalone-oco-1"]
+    assert submission["submission_path"] == ("standalone_oco_after_attached_take_profit_rejection")
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_does_not_recover_take_profit_code_for_wrong_direction() -> None:
+    exchange = _AttachedTakeProfitRejectedOnceCcxt()
+    executor = _executor(exchange)
+
+    result = await executor.place_order(_entry_decision(), override_balance=100.0)
+
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response["okx_error_code"] == "51052"
+    assert "attached_protection_recovery" not in result.raw_response
+    assert len(exchange.create_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_okx_entry_rechecks_fresh_available_margin_before_submit() -> None:
     exchange = _EntryMaxMarketSizeCcxt()
     executor = _executor(exchange)
@@ -2172,10 +2253,7 @@ async def test_okx_entry_rejects_before_submit_when_native_price_limit_is_invali
     assert result.status.value == "rejected"
     assert result.raw_response["system_pre_submit_rejection"] is True
     assert result.raw_response["okx_rejection"] is False
-    assert (
-        result.raw_response["execution_blocker"]
-        == "okx_pre_submit_execution_quote_unavailable"
-    )
+    assert result.raw_response["execution_blocker"] == "okx_pre_submit_execution_quote_unavailable"
     assert "price limit has no positive bounds" in result.raw_response["raw_error"]
     assert exchange.create_calls == []
 

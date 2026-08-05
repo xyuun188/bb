@@ -60,6 +60,7 @@ OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
 OKX_MAX_LEVERAGE_RECOVERY_ATTEMPTS = 7
 
+
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
 
@@ -412,9 +413,7 @@ class OKXExecutor(AbstractExecutor):
         method_name = getattr(fn, "__name__", "")
         attempts = max(1, min(int(_max_attempts or MAX_RETRIES), MAX_RETRIES))
         expected_error_codes = {
-            str(code).strip()
-            for code in (_expected_error_codes or set())
-            if str(code).strip()
+            str(code).strip() for code in (_expected_error_codes or set()) if str(code).strip()
         }
         for attempt in range(attempts):
             try:
@@ -591,6 +590,7 @@ class OKXExecutor(AbstractExecutor):
         leverage_check: dict[str, Any] | None = None
         protection_submit_requested_at: datetime | None = None
         protection_submission: dict[str, Any] = {}
+        attached_protection_recovery: dict[str, Any] = {}
 
         try:
             okx_symbol = await self._resolve_swap_symbol(decision.symbol)
@@ -870,7 +870,7 @@ class OKXExecutor(AbstractExecutor):
                         status=OrderStatus.REJECTED,
                         raw_response={
                             "okx_exit_position_mismatch": diagnostics,
-                            "error": "OKX 当前没有对应方向的可平仓位，本轮未提交平仓订单。"
+                            "error": "OKX 当前没有对应方向的可平仓位，本轮未提交平仓订单。",
                         },
                     )
 
@@ -1496,12 +1496,75 @@ class OKXExecutor(AbstractExecutor):
             except ExchangeAPIError as e:
                 if decision.is_entry:
                     error_text = safe_error_text(e)
-                    capped_quantity = self._capped_quantity_from_position_limit_error(
-                        error_text,
-                        ccxt,
-                        market,
-                        order_quantity,
+                    attached_rejection_code = self._retryable_attached_take_profit_rejection_code(
+                        e,
+                        decision=decision,
+                        params=params,
+                        reference_price=price,
                     )
+                    if attached_rejection_code:
+                        rejected_params = {
+                            **params,
+                            "attachAlgoOrds": [
+                                dict(row)
+                                for row in (params.get("attachAlgoOrds") or [])
+                                if isinstance(row, dict)
+                            ],
+                        }
+                        params = {
+                            key: value for key, value in params.items() if key != "attachAlgoOrds"
+                        }
+                        attached_protection_recovery = {
+                            "version": "2026-08-05.okx-attached-protection-recovery.v1",
+                            "trigger": "okx_attached_take_profit_false_rejection",
+                            "okx_error_code": attached_rejection_code,
+                            "original_error": error_text,
+                            "original_request_params": rejected_params,
+                            "retry_request_params": dict(params),
+                            "standalone_protection_required": True,
+                        }
+                        logger.warning(
+                            "retrying entry after OKX rejected valid attached take profit",
+                            symbol=decision.symbol,
+                            okx_symbol=okx_symbol,
+                            action=decision.action.value,
+                            error_code=attached_rejection_code,
+                        )
+                        try:
+                            order = await self._create_order_with_client_recovery(
+                                ccxt,
+                                okx_symbol,
+                                side,
+                                order_quantity,
+                                params,
+                            )
+                        except ExchangeAPIError as retry_error:
+                            result = self._entry_exchange_rejection_result(
+                                decision=decision,
+                                side=side,
+                                price=price,
+                                exchange_error=retry_error,
+                                okx_symbol=okx_symbol,
+                                contract_size=contract_size,
+                                order_quantity=order_quantity,
+                                base_quantity=base_quantity,
+                                okx_order_rules=okx_order_rules,
+                                request_params=params,
+                                leverage_check=leverage_check,
+                            )
+                            result.raw_response["attached_protection_recovery"] = {
+                                **attached_protection_recovery,
+                                "retry_error": safe_error_text(retry_error),
+                            }
+                            return result
+                        capped_quantity = None
+                    else:
+                        capped_quantity = self._capped_quantity_from_position_limit_error(
+                            error_text,
+                            ccxt,
+                            market,
+                            order_quantity,
+                        )
                     if capped_quantity and capped_quantity < order_quantity:
                         order_resize_note = (
                             f"OKX 当前杠杆下最大允许 {capped_quantity:g} 张，"
@@ -1519,9 +1582,7 @@ class OKXExecutor(AbstractExecutor):
                         base_quantity = order_quantity * contract_size
                         retry_contract = reconcile_profit_risk_sizing(
                             decision,
-                            final_notional_usdt=(
-                                order_quantity * contract_size * max(price, 0.0)
-                            ),
+                            final_notional_usdt=(order_quantity * contract_size * max(price, 0.0)),
                             final_leverage=decision.suggested_leverage,
                             source="okx_51004_position_limit_retry",
                             execution_facts={
@@ -1556,7 +1617,7 @@ class OKXExecutor(AbstractExecutor):
                             order_quantity,
                             params,
                         )
-                    else:
+                    elif not attached_rejection_code:
                         return self._entry_exchange_rejection_result(
                             decision=decision,
                             side=side,
@@ -1582,7 +1643,34 @@ class OKXExecutor(AbstractExecutor):
             if decision.is_entry:
                 order = await self._finalize_partial_entry_order(ccxt, order, okx_symbol)
                 finalization = order.get("entry_partial_fill_finalization")
-                if (
+                recovered_filled_contracts = self._safe_float(order.get("filled"), 0.0)
+                if isinstance(finalization, dict):
+                    recovered_filled_contracts = max(
+                        recovered_filled_contracts,
+                        self._safe_float(finalization.get("filled_contracts"), 0.0),
+                    )
+                if attached_protection_recovery and recovered_filled_contracts > 0:
+                    original_params = attached_protection_recovery.get("original_request_params")
+                    original_params = original_params if isinstance(original_params, dict) else {}
+                    standalone_protection = await self._ensure_partial_entry_protection(
+                        decision=decision,
+                        params=original_params,
+                        filled_contracts=recovered_filled_contracts,
+                    )
+                    attached_protection_recovery = {
+                        **attached_protection_recovery,
+                        "standalone_protection": standalone_protection,
+                    }
+                    protection_submission = self._standalone_protection_submission_fact(
+                        recovery=attached_protection_recovery,
+                        requested_at=protection_submit_requested_at,
+                        acknowledged_at=datetime.now(UTC),
+                    )
+                    order = {
+                        **order,
+                        "entry_attached_protection_recovery": attached_protection_recovery,
+                    }
+                elif (
                     isinstance(finalization, dict)
                     and self._safe_float(finalization.get("filled_contracts"), 0.0) > 0
                 ):
@@ -1597,6 +1685,11 @@ class OKXExecutor(AbstractExecutor):
                     order = {
                         **order,
                         "entry_partial_fill_protection": partial_protection,
+                    }
+                elif attached_protection_recovery:
+                    order = {
+                        **order,
+                        "entry_attached_protection_recovery": attached_protection_recovery,
                     }
             result_symbol = self._execution_result_symbol(order, decision.symbol)
             filled_contracts = self._safe_float(order.get("filled"), 0.0)
@@ -1998,6 +2091,70 @@ class OKXExecutor(AbstractExecutor):
             error_text = safe_error_text(e)
             logger.error("order placement failed", error=error_text)
             raise OrderPlacementError(f"Failed to place order: {error_text}") from e
+
+    def _retryable_attached_take_profit_rejection_code(
+        self,
+        error: BaseException,
+        *,
+        decision: DecisionOutput,
+        params: dict[str, Any],
+        reference_price: float,
+    ) -> str | None:
+        """Identify an OKX false rejection of a locally valid attached take profit."""
+
+        code = str(getattr(error, "code", "") or "").strip()
+        if not code:
+            match = re.search(r"\b(51050|51052)\b", str(error or ""))
+            code = match.group(1) if match else ""
+        expected_code = "51050" if decision.action == Action.LONG else "51052"
+        if code != expected_code or decision.action not in {Action.LONG, Action.SHORT}:
+            return None
+
+        requested = params.get("attachAlgoOrds")
+        row = requested[0] if isinstance(requested, list) and requested else {}
+        row = row if isinstance(row, dict) else {}
+        take_profit = self._safe_float(row.get("tpTriggerPx"), 0.0)
+        stop_loss = self._safe_float(row.get("slTriggerPx"), 0.0)
+        reference = self._safe_float(reference_price, 0.0)
+        if decision.action == Action.LONG:
+            valid = 0 < stop_loss < reference < take_profit
+        else:
+            valid = 0 < take_profit < reference < stop_loss
+        return code if valid else None
+
+    @staticmethod
+    def _standalone_protection_submission_fact(
+        *,
+        recovery: dict[str, Any],
+        requested_at: datetime | None,
+        acknowledged_at: datetime,
+    ) -> dict[str, Any]:
+        standalone = recovery.get("standalone_protection")
+        standalone = standalone if isinstance(standalone, dict) else {}
+        confirmed = standalone.get("verified") is True
+        algo_id = str(standalone.get("created_algo_id") or "").strip()
+        original_params = recovery.get("original_request_params")
+        original_params = original_params if isinstance(original_params, dict) else {}
+        requested = original_params.get("attachAlgoOrds")
+        requested = requested if isinstance(requested, list) else []
+        return {
+            "version": "2026-08-05.okx-standalone-protection-submission.v1",
+            "source_authority": "local_submit_plus_okx_create_order_response",
+            "submission_path": "standalone_oco_after_attached_take_profit_rejection",
+            "client_submit_requested_at": (
+                requested_at.isoformat() if requested_at is not None else None
+            ),
+            "exchange_acknowledged_at": acknowledged_at.isoformat(),
+            "exchange_confirmation_recorded": confirmed,
+            "exchange_confirmed_at": acknowledged_at.isoformat() if confirmed else None,
+            "state": "confirmed" if confirmed else "submitted_unconfirmed",
+            "requested_attach_algo_orders": [
+                dict(row) for row in requested if isinstance(row, dict)
+            ],
+            "response_attach_algo_orders": ([{"algoId": algo_id}] if algo_id else []),
+            "algo_ids": [algo_id] if algo_id else [],
+            "okx_error_code": recovery.get("okx_error_code"),
+        }
 
     @staticmethod
     def _protection_submission_fact(
@@ -2867,9 +3024,7 @@ class OKXExecutor(AbstractExecutor):
                     continue
                 refreshed = {**refreshed, **detail}
                 detail_info = (
-                    refreshed.get("info")
-                    if isinstance(refreshed.get("info"), dict)
-                    else {}
+                    refreshed.get("info") if isinstance(refreshed.get("info"), dict) else {}
                 )
                 terminal_status = self._order_status_from_ccxt(
                     refreshed.get("status") or detail_info.get("state")
@@ -2890,8 +3045,7 @@ class OKXExecutor(AbstractExecutor):
 
         terminal = bool(
             cancel_response is not None
-            and terminal_status
-            in {OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.REJECTED}
+            and terminal_status in {OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.REJECTED}
         )
         amount_contracts = self._safe_float(
             refreshed.get("amount")
@@ -2988,8 +3142,7 @@ class OKXExecutor(AbstractExecutor):
                     if str(order.get("position_side") or "").lower() == target_side
                 ]
                 covered_contracts = sum(
-                    self._safe_float(order.get("contracts"), 0.0)
-                    for order in protection_orders
+                    self._safe_float(order.get("contracts"), 0.0) for order in protection_orders
                 )
                 if covered_contracts > 0:
                     break
@@ -3033,7 +3186,9 @@ class OKXExecutor(AbstractExecutor):
             )
             report["covered_contracts_after"] = covered_after
             report["verified"] = abs(covered_after - desired_contracts) <= tolerance
-            report["status"] = "created_and_verified" if report["verified"] else "verification_failed"
+            report["status"] = (
+                "created_and_verified" if report["verified"] else "verification_failed"
+            )
             return report
         except Exception as exc:
             report["error"] = safe_error_text(exc, limit=180)
@@ -3190,7 +3345,8 @@ class OKXExecutor(AbstractExecutor):
         )
         market_value = self._safe_float(market.get("contractSize"), 0.0)
         if info_value > 0 and (
-            market_value <= 0 or abs(info_value - market_value) > max(info_value, market_value) * 1e-12
+            market_value <= 0
+            or abs(info_value - market_value) > max(info_value, market_value) * 1e-12
         ):
             return info_value
         if market_value > 0:
@@ -3254,9 +3410,7 @@ class OKXExecutor(AbstractExecutor):
         buy_limit = self._safe_float(row.get("buyLmt"), 0.0)
         sell_limit = self._safe_float(row.get("sellLmt"), 0.0)
         if buy_limit <= 0 or sell_limit <= 0:
-            raise ExchangeAPIError(
-                f"OKX native price limit has no positive bounds: {inst_id}"
-            )
+            raise ExchangeAPIError(f"OKX native price limit has no positive bounds: {inst_id}")
         return {
             "buy_price_limit": buy_limit,
             "sell_price_limit": sell_limit,
@@ -3345,22 +3499,13 @@ class OKXExecutor(AbstractExecutor):
             symbol_normalizer=normalize_trading_symbol,
         )
         symbol = normalize_trading_symbol(
-            (snapshot or {}).get("symbol")
-            or info.get("instId")
-            or position.get("symbol")
-            or ""
+            (snapshot or {}).get("symbol") or info.get("instId") or position.get("symbol") or ""
         )
         raw_symbol = str(
-            (snapshot or {}).get("raw_symbol")
-            or info.get("instId")
-            or position.get("symbol")
-            or ""
+            (snapshot or {}).get("raw_symbol") or info.get("instId") or position.get("symbol") or ""
         ).strip()
         side = str(
-            (snapshot or {}).get("side")
-            or position.get("side")
-            or info.get("posSide")
-            or ""
+            (snapshot or {}).get("side") or position.get("side") or info.get("posSide") or ""
         ).lower()
         contracts = abs(
             self._safe_float((snapshot or {}).get("contracts"), 0.0)
@@ -3671,9 +3816,7 @@ class OKXExecutor(AbstractExecutor):
     def _is_order_pending_settlement_error(message: str) -> bool:
         text = str(message or "").lower()
         return (
-            "51410" in text
-            or "already in canceling status" in text
-            or "pending settlement" in text
+            "51410" in text or "already in canceling status" in text or "pending settlement" in text
         )
 
     def _entry_order_amount(
@@ -3758,9 +3901,7 @@ class OKXExecutor(AbstractExecutor):
         )
         min_notional = amount_min * contract_size * price if price > 0 else 0.0
         final_notional = max(final_contracts, 0.0) * contract_size * max(price, 0.0)
-        maximum_fill_notional = (
-            max(final_contracts, 0.0) * contract_size * sizing_price
-        )
+        maximum_fill_notional = max(final_contracts, 0.0) * contract_size * sizing_price
         effective_leverage = max(float(leverage or 1.0), 1.0)
         return {
             "okx_symbol": market.get("symbol"),
@@ -3843,9 +3984,7 @@ class OKXExecutor(AbstractExecutor):
                 ),
                 "raw_error": error_text,
                 "okx_error_code": error_code,
-                "okx_error_payload": (
-                    error_payload if isinstance(error_payload, dict) else None
-                ),
+                "okx_error_payload": (error_payload if isinstance(error_payload, dict) else None),
                 "execution_blocker": "okx_exchange_rejection",
                 "system_pre_submit_rejection": False,
                 "okx_rejection": True,
@@ -4186,8 +4325,7 @@ class OKXExecutor(AbstractExecutor):
                     symbol,
                 )
             recovered_terminal = bool(
-                finalization.get("terminal") is True
-                or forced_close.get("recovered") is True
+                finalization.get("terminal") is True or forced_close.get("recovered") is True
             )
             recovered.append(
                 {
@@ -4261,9 +4399,7 @@ class OKXExecutor(AbstractExecutor):
         existing_exit = await self._find_active_exit_order(ccxt, inst_id, exit_side)
         if existing_exit:
             existing_info = (
-                existing_exit.get("info")
-                if isinstance(existing_exit.get("info"), dict)
-                else {}
+                existing_exit.get("info") if isinstance(existing_exit.get("info"), dict) else {}
             )
             existing_exit_id = str(
                 existing_exit.get("id") or existing_info.get("ordId") or ""
@@ -4323,12 +4459,7 @@ class OKXExecutor(AbstractExecutor):
             after_contracts = await self._position_contracts_for_side(symbol, target_side)
             open_orders = await self.get_open_orders_strict(symbol)
             residual_active = any(
-                str(
-                    row.get("id")
-                    or (row.get("info") or {}).get("ordId")
-                    or ""
-                ).strip()
-                == order_id
+                str(row.get("id") or (row.get("info") or {}).get("ordId") or "").strip() == order_id
                 for row in open_orders
             )
             if after_contracts <= max(before_contracts * 0.001, 1e-8) and not residual_active:
@@ -4336,10 +4467,11 @@ class OKXExecutor(AbstractExecutor):
         report["position_contracts_after"] = after_contracts
         report["residual_order_active_after"] = residual_active
         report["recovered"] = bool(
-            after_contracts <= max(before_contracts * 0.001, 1e-8)
-            and not residual_active
+            after_contracts <= max(before_contracts * 0.001, 1e-8) and not residual_active
         )
-        report["status"] = "flattened_and_cancelled" if report["recovered"] else "verification_failed"
+        report["status"] = (
+            "flattened_and_cancelled" if report["recovered"] else "verification_failed"
+        )
         return report
 
     async def _cancel_order_native(
@@ -4619,7 +4751,9 @@ class OKXExecutor(AbstractExecutor):
                 0.0,
             ),
             mark_price=self._safe_float(
-                original.get("mark_price") or snapshot.get("current_price") or snapshot.get("close"),
+                original.get("mark_price")
+                or snapshot.get("current_price")
+                or snapshot.get("close"),
                 0.0,
             ),
             contract_spec=contract_spec,
@@ -4788,9 +4922,7 @@ class OKXExecutor(AbstractExecutor):
         if existing_position is not None:
             info = existing_position.get("info") or {}
             position_leverage = self._safe_float(
-                existing_position.get("leverage")
-                or info.get("lever")
-                or info.get("leverage"),
+                existing_position.get("leverage") or info.get("lever") or info.get("leverage"),
                 actual,
             )
             if position_leverage <= 0:
@@ -5057,8 +5189,7 @@ class OKXExecutor(AbstractExecutor):
                 else safe_error_text(set_error, limit=220)
             )
             message = (
-                f"OKX 杠杆设置失败，本次未开仓。目标杠杆 {leverage}x。"
-                f"OKX 返回：{set_error_text}"
+                f"OKX 杠杆设置失败，本次未开仓。目标杠杆 {leverage}x。OKX 返回：{set_error_text}"
             )
             if cleanup_result:
                 message += (
@@ -5571,26 +5702,25 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(symbol)
         position_symbols = [str(position.get("symbol") or "") for position in positions or []]
         requested_symbols = [symbol, *position_symbols]
-        balance_snapshot, contract_specs, leverage_tiers, instrument_availability = (
-            await asyncio.gather(
+        (
+            balance_snapshot,
+            contract_specs,
+            leverage_tiers,
+            instrument_availability,
+        ) = await asyncio.gather(
             self.get_balance_snapshot(),
             self._native_facts_client().fetch_contract_specs(symbols=requested_symbols),
             self._fetch_okx_leverage_tiers(okx_symbol),
             self.entry_instrument_availability(symbol, okx_symbol=okx_symbol),
-            )
         )
-        tier_leverages = [
-            self._safe_float(tier.get("maxLeverage"), 0.0) for tier in leverage_tiers
-        ]
+        tier_leverages = [self._safe_float(tier.get("maxLeverage"), 0.0) for tier in leverage_tiers]
         tier_leverages = [value for value in tier_leverages if value > 0]
         reported_max_leverage = max(tier_leverages) if tier_leverages else 0.0
         equity = max(self._safe_float(balance_snapshot.get("equity"), 0.0), 0.0)
         available_margin = max(self._safe_float(balance_snapshot.get("free"), 0.0), 0.0)
         target_inst_id = okx_inst_id_from_symbol(symbol)
         required_inst_ids = {
-            inst_id
-            for item in requested_symbols
-            if (inst_id := okx_inst_id_from_symbol(item))
+            inst_id for item in requested_symbols if (inst_id := okx_inst_id_from_symbol(item))
         }
         missing_specs = sorted(required_inst_ids.difference(contract_specs))
         reasons: list[str] = []
@@ -5844,9 +5974,7 @@ class OKXExecutor(AbstractExecutor):
             "ask": ask,
             "mark_price": mark_price,
             "spread_pct": (
-                (ask - bid) / ((ask + bid) / 2.0) * 100.0
-                if bid > 0 and ask >= bid
-                else 0.0
+                (ask - bid) / ((ask + bid) / 2.0) * 100.0 if bid > 0 and ask >= bid else 0.0
             ),
             "orderbook_bids": bids,
             "orderbook_asks": asks,
