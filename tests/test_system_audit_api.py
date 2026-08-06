@@ -1104,6 +1104,74 @@ async def test_phase3_paper_resume_preflight_audit_is_consumed_after_paper_start
 
 
 @pytest.mark.asyncio
+async def test_phase3_paper_resume_preflight_warning_is_observing_after_paper_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePhase3PaperResumePreflightService:
+        def __init__(self, *, model_server_timeout_seconds: int, **_kwargs: Any) -> None:
+            assert model_server_timeout_seconds == (
+                system_audit.PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS
+            )
+
+        async def report(self) -> dict[str, Any]:
+            return {
+                "status": "blocked",
+                "read_only": True,
+                "audit_only": True,
+                "mutates_database": False,
+                "starts_trading_service": False,
+                "submits_orders": False,
+                "changes_model_routing": False,
+                "can_resume_paper": False,
+                "requires_operator_start": True,
+                "blockers": [
+                    {
+                        "code": "paper_trading_already_active",
+                        "severity": "blocking",
+                        "message": "Preflight was already consumed.",
+                    },
+                ],
+                "warnings": [
+                    {
+                        "code": "okx_authoritative_sync_historical_differences_quarantined",
+                        "severity": "warning",
+                        "message": "Historical facts remain quarantined.",
+                    }
+                ],
+                "summary": {
+                    "okx_issue_count": 1,
+                    "model_server_runtime_ready": True,
+                    "phase3_quant_api_available": True,
+                },
+                "inputs": {
+                    "platform_server": {
+                        "services": [
+                            {"name": "bb-paper-trading.service", "active": True},
+                        ]
+                    }
+                },
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3PaperResumePreflightService",
+        FakePhase3PaperResumePreflightService,
+    )
+
+    card = await system_audit._phase3_paper_resume_preflight_audit()
+    state, _label = system_audit._issue_ledger_state(
+        card,
+        cards_by_key={card["key"]: card},
+    )
+
+    assert card["status"] == "warning"
+    assert card["details"]["consumed_after_resume"] is True
+    assert card["details"]["effective_blockers"] == []
+    assert card["details"]["observing"] is True
+    assert state == "observing"
+
+
+@pytest.mark.asyncio
 async def test_phase3_paper_resume_observation_audit_waits_for_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

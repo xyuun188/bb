@@ -4116,7 +4116,9 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
     details["consumed_after_resume"] = consumed_after_resume
     details["consumed_blockers"] = consumed_blockers
     details["effective_blockers"] = effective_blockers
-    details["observing"] = False
+    details["observing"] = bool(
+        consumed_after_resume and warnings and not effective_blockers
+    )
     return _audit_card(
         "phase3_paper_resume_preflight",
         "三期模拟盘恢复硬检查",
