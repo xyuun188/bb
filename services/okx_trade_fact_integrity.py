@@ -893,10 +893,9 @@ def _related_positions_for_order(
         # linked to the position above, but fuzzy matching must stay symbol-safe.
         if not symbol_matches:
             continue
-        lifecycle_match = (
-            entry_action
-            and symbol_matches
-            and _entry_position_lifecycle_contains_order(position, order_time)
+        lifecycle_match = symbol_matches and _entry_position_lifecycle_contains_order(
+            position,
+            order_time,
         )
         position_time = _position_match_time(position, entry_action=entry_action)
         if lifecycle_match:

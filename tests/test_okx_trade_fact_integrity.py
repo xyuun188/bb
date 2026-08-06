@@ -1217,6 +1217,71 @@ async def test_order_position_alignment_ignores_nearby_different_symbol_without_
 
 
 @pytest.mark.asyncio
+async def test_close_order_matches_open_position_lifecycle_without_false_warning(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        opened_at = _recent_filled_at(minutes_ago=90)
+        order_time = _recent_filled_at(minutes_ago=2)
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="OP/USDT",
+                action="close_short",
+                confidence=0.9,
+                raw_llm_response=_execution_raw(
+                    inst_id="OP-USDT-SWAP",
+                    contracts=1,
+                    contract_size=1,
+                    avg_price=0.0884,
+                ),
+                was_executed=True,
+                created_at=order_time - timedelta(seconds=5),
+            )
+            session.add(decision)
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="OP/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=1.0,
+                        price=0.0884,
+                        status="filled",
+                        decision_id=decision.id,
+                        exchange_order_id="op-open-position-reduce",
+                        filled_at=order_time,
+                        created_at=order_time,
+                    ),
+                    Position(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="OP/USDT",
+                        side="short",
+                        quantity=1887.0,
+                        entry_price=0.08844,
+                        current_price=0.0884,
+                        leverage=28.0,
+                        is_open=True,
+                        okx_inst_id="OP-USDT-SWAP",
+                        created_at=opened_at,
+                    ),
+                ]
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_filled_close_order_without_position_is_a_warning(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
