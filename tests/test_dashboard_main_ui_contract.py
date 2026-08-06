@@ -19,8 +19,9 @@ def test_dashboard_deduplicates_identical_inflight_reads() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "const inflightJSONRequests = new Map();" in script
-    assert "const existingRequest = inflightJSONRequests.get(requestKey);" in script
-    assert "if (existingRequest) return existingRequest;" in script
+    assert "const existingEntry = inflightJSONRequests.get(requestKey);" in script
+    assert "if (existingEntry) return existingEntry.promise;" in script
+    assert "const entry = { promise: request, controller };" in script
     assert "inflightJSONRequests.delete(requestKey);" in script
 
 
@@ -114,7 +115,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260728-menu-latency-v2" in html
+    assert "dashboard.js?v=20260806-summary-self-recovery-v3" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -185,7 +186,7 @@ def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
     assert "function updateRuntimeClock" in script
     assert "setInterval(updateRuntimeClock, 1000);" in script
     assert "updateStats(data.stats || {}, 'ws')" in script
-    assert "updateStats(data, 'summary')" in script
+    assert "updateStats(normalizedData, 'summary')" in script
     assert "state.lastStatsSource === 'summary'" in script
     assert "!hasRuntimeFields" in script
     assert "stats.started_at ||" in script
@@ -225,7 +226,7 @@ def test_live_mode_switch_requires_known_missing_okx_config() -> None:
 def test_dashboard_internal_api_requests_handle_auth_expiry() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     allowed_raw_fetches = {
-        "const res = await fetch(url, { cache: 'no-store' });",
+        "const res = await fetch(url, { cache: 'no-store', ...(controller ? { signal: controller.signal } : {}) });",
         "const res = await fetch(url, options);",
         "await fetch('/api/auth/logout', dashboardWriteOptions({",
     }
@@ -630,7 +631,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260728-menu-latency-v2" in html
+    assert "dashboard.js?v=20260806-summary-self-recovery-v3" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -770,7 +771,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260728-menu-latency-v2" in html
+    assert "dashboard.js?v=20260806-summary-self-recovery-v3" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -938,7 +939,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260728-menu-latency-v2" in html
+    assert "dashboard.js?v=20260806-summary-self-recovery-v3" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1072,6 +1073,29 @@ def test_fetch_json_throws_errors_so_page_fallbacks_run() -> None:
     assert "return null;" not in fetch_block
 
 
+def test_dashboard_summary_poll_recovers_without_browser_reload() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "const JSON_REQUEST_TIMEOUT_MS = 20000;" in script
+    assert "controller.abort();" in script
+    assert "inflightJSONRequests.delete(requestKey);" in script
+    assert "Dashboard summary refresh failed; the next poll will retry automatically." in script
+    assert "document.addEventListener('visibilitychange', recoverDashboardSummaryPolling);" in script
+    assert "window.addEventListener('online', recoverDashboardSummaryPolling);" in script
+
+
+def test_dashboard_balance_error_keeps_last_successful_numeric_snapshot() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "lastFreshAccountBalances: {}" in script
+    assert "function preserveLastGoodAccountBalance" in script
+    assert "const needsClientFallback = Boolean(account.balance_error)" in script
+    assert "account.balance_snapshot_stale = true;" in script
+    assert "account.balance_snapshot_age_seconds" in script
+    assert "if (account && account.balance_error) return '--';" not in script
+    assert "account.balance_error && account.balance_snapshot_stale !== true" in script
+
+
 def test_local_ml_loss_filter_uses_backend_model_contract() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     status_block = script[
@@ -1165,7 +1189,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260728-menu-latency-v2" in html
+    assert "/static/js/dashboard.js?v=20260806-summary-self-recovery-v3" in html
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:

@@ -42,6 +42,7 @@ from services.okx_order_fact_sync import (
     _rebuild_stored_slippage_fact,
     _repair_stored_fill_contract_size_from_instruments,
     _stored_slippage_fact_needs_refresh,
+    _target_fill_query_requires_historical,
 )
 
 
@@ -242,6 +243,21 @@ class _RecentOnlyCcxt(_FakeCcxt):
     ) -> dict[str, Any]:
         self.calls.append("fills")
         return {"data": []}
+
+
+class _HistoricalOnlyTargetCcxt(_FakeCcxt):
+    async def privateGetTradeFills(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append("fills_recent_targeted")
+        return {"data": []}
+
+    async def privateGetTradeFillsHistory(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls.append("fills_historical_targeted")
+        order_id = str(params.get("ordId") or "")
+        rows = [row for row in self.fills if not order_id or row.get("ordId") == order_id]
+        return {"data": rows}
 
 
 class _SlowAccountFastTargetCcxt(_FakeCcxt):
@@ -1032,6 +1048,87 @@ def test_targeted_fill_queries_prioritize_unconfirmed_recent_fill_over_slippage_
         [recent, incomplete_slippage],
         limit=1,
     ) == ["recent-generic"]
+
+
+def test_targeted_fill_query_uses_history_outside_okx_recent_retention() -> None:
+    now = datetime.now(UTC)
+    recent = SimpleNamespace(
+        exchange_order_id="recent-order",
+        filled_at=now - timedelta(hours=2),
+        created_at=now - timedelta(hours=2),
+    )
+    old = SimpleNamespace(
+        exchange_order_id="old-order",
+        filled_at=now - timedelta(days=4),
+        created_at=now - timedelta(days=4),
+    )
+
+    assert not _target_fill_query_requires_historical(
+        ["recent-order"],
+        orders=[recent, old],
+        now=now,
+    )
+    assert _target_fill_query_requires_historical(
+        ["old-order"],
+        orders=[recent, old],
+        now=now,
+    )
+    assert _target_fill_query_requires_historical(
+        ["explicit-recovery-without-local-row"],
+        orders=[recent, old],
+        now=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_old_targeted_fill_recovers_from_okx_historical_endpoint(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "old-targeted-historical-fill.db")
+    now = datetime.now(UTC)
+    filled_at = now - timedelta(days=4)
+    order_id = "historical-fill-order"
+    ccxt = _HistoricalOnlyTargetCcxt(
+        fills=[_fill_row(filled_at, order_id=order_id)],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=0.02,
+                    price=60000.0,
+                    status="filled",
+                    fee=0.0,
+                    exchange_order_id=order_id,
+                    created_at=filled_at,
+                    filled_at=filled_at,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=3.0,
+            priority_only=True,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert ccxt.calls[0] == "fills_historical_targeted"
+        assert "fills_recent_targeted" not in ccxt.calls
+        assert report["status"] == "ok"
+        assert report["confirmed_count"] == 1
+        assert report["unverified_count"] == 0
+        assert order.okx_sync_status == OKX_SYNC_CONFIRMED
+        assert order.okx_raw_fills["fills_history_confirmed"] is True
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

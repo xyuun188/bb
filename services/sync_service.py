@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isclose
 from types import SimpleNamespace
 from typing import Any
@@ -67,6 +67,8 @@ ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
 POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS = 0.1
 LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
+CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS = 10 * 60.0
+CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO = 0.005
 
 
 def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
@@ -113,6 +115,108 @@ def _entry_order_persistence_pending(
         (observed_at.astimezone(UTC) - timestamp.astimezone(UTC)).total_seconds(), 0.0
     )
     return age_seconds < LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS
+
+
+def _entry_order_matches_current_position(
+    order: Any,
+    *,
+    entry_price: float,
+    opened_at: datetime | None,
+) -> bool:
+    if order is None:
+        return False
+    order_price = _float_value(getattr(order, "price", None), 0.0)
+    if order_price > 0 and entry_price > 0:
+        price_tolerance = max(
+            abs(entry_price) * CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO,
+            1e-12,
+        )
+        if abs(order_price - entry_price) > price_tolerance:
+            return False
+
+    order_time = getattr(order, "filled_at", None) or getattr(order, "created_at", None)
+    if opened_at is not None and isinstance(order_time, datetime):
+        normalized_opened_at = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=UTC)
+        normalized_order_time = order_time if order_time.tzinfo else order_time.replace(tzinfo=UTC)
+        if (
+            abs(
+                (
+                    normalized_order_time.astimezone(UTC)
+                    - normalized_opened_at.astimezone(UTC)
+                ).total_seconds()
+            )
+            > CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS
+        ):
+            return False
+    return True
+
+
+async def _find_current_position_entry_order(
+    session: Any,
+    *,
+    symbol_variants: set[str],
+    entry_side: str,
+    entry_price: float,
+    opened_at: datetime | None,
+    confirmed_only: bool,
+) -> Order | None:
+    conditions = [
+        Order.execution_mode == "paper",
+        Order.symbol.in_(symbol_variants),
+        Order.side == entry_side,
+        Order.exchange_order_id.is_not(None),
+        Order.exchange_order_id != "",
+    ]
+    if confirmed_only:
+        conditions.extend(
+            [
+                Order.status == OrderStatus.FILLED.value,
+                Order.okx_sync_status.in_(sorted(TRUSTED_OKX_ORDER_SYNC_STATUSES)),
+            ]
+        )
+    else:
+        conditions.append(
+            Order.status.in_(
+                [
+                    OrderStatus.OPEN.value,
+                    OrderStatus.PENDING.value,
+                    OrderStatus.PARTIAL.value,
+                    OrderStatus.FILLED.value,
+                ]
+            )
+        )
+    if entry_price > 0:
+        price_tolerance = max(
+            abs(entry_price) * CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO,
+            1e-12,
+        )
+        conditions.append(
+            or_(
+                Order.price.is_(None),
+                func.abs(Order.price - entry_price) <= price_tolerance,
+            )
+        )
+    if opened_at is not None:
+        normalized_opened_at = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=UTC)
+        window = timedelta(seconds=CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS)
+        order_time = func.coalesce(Order.filled_at, Order.created_at)
+        conditions.extend(
+            [
+                order_time >= normalized_opened_at - window,
+                order_time <= normalized_opened_at + window,
+            ]
+        )
+    result = await session.execute(
+        select(Order).where(*conditions).order_by(Order.created_at.desc()).limit(1)
+    )
+    order = result.scalar_one_or_none()
+    if order is None or not _entry_order_matches_current_position(
+        order,
+        entry_price=entry_price,
+        opened_at=opened_at,
+    ):
+        return None
+    return order
 
 
 async def _find_reopenable_closed_position(
@@ -2496,6 +2600,14 @@ class OkxSyncService:
                     )
                     exchange_unrealized = parse_float(snapshot.get("upl"), 0.0)
                     exchange_realized = parse_float(exchange_pos.get("realizedPnl"), 0.0)
+                    opened_at = parse_position_time(
+                        _position_context_opened_at(exchange_pos, info)
+                    )
+                    if opened_at is None:
+                        opened_at = datetime_from_ms(
+                            info.get("cTime") or exchange_pos.get("timestamp")
+                        )
+                    entry_side = "buy" if side == "long" else "sell"
                     matching_local_positions = [
                         pos
                         for pos in positions
@@ -2528,6 +2640,48 @@ class OkxSyncService:
                                 .limit(1)
                             )
                             linked_order = linked_order_result.scalar_one_or_none()
+                        if (
+                            len(matching_local_positions) == 1
+                            and linked_entry_ids
+                            and not _entry_order_matches_current_position(
+                                linked_order,
+                                entry_price=entry_price,
+                                opened_at=opened_at,
+                            )
+                        ):
+                            replacement_order = await _find_current_position_entry_order(
+                                session,
+                                symbol_variants=symbol_variants,
+                                entry_side=entry_side,
+                                entry_price=entry_price,
+                                opened_at=opened_at,
+                                confirmed_only=True,
+                            )
+                            replacement_order_id = str(
+                                getattr(replacement_order, "exchange_order_id", "") or ""
+                            ).strip()
+                            if replacement_order_id and replacement_order_id not in linked_entry_ids:
+                                local_position = matching_local_positions[0]
+                                previous_entry_order_ids = sorted(linked_entry_ids)
+                                local_position.entry_exchange_order_id = replacement_order_id
+                                local_position.updated_at = datetime.now(UTC)
+                                linked_entry_ids = {replacement_order_id}
+                                linked_order = replacement_order
+                                reconciled.append(
+                                    {
+                                        "kind": "current_position_entry_order_reanchored",
+                                        "source": "okx_authoritative_current_position",
+                                        "position_id": getattr(local_position, "id", None),
+                                        "symbol": symbol,
+                                        "side": side,
+                                        "previous_entry_exchange_order_ids": previous_entry_order_ids,
+                                        "entry_exchange_order_id": replacement_order_id,
+                                        "note": (
+                                            "The local open position entry link was re-anchored to the "
+                                            "OKX-confirmed order for the current position lifecycle."
+                                        ),
+                                    }
+                                )
                         fallback_protection = await fallback_position_protection(
                             session,
                             symbol=symbol,
@@ -2689,28 +2843,14 @@ class OkxSyncService:
                             )
                         continue
 
-                    entry_side = "buy" if side == "long" else "sell"
-                    order_result = await session.execute(
-                        select(Order)
-                        .where(
-                            Order.execution_mode == "paper",
-                            Order.symbol.in_(symbol_variants),
-                            Order.side == entry_side,
-                            Order.exchange_order_id.is_not(None),
-                            Order.exchange_order_id != "",
-                            Order.status.in_(
-                                [
-                                    OrderStatus.OPEN.value,
-                                    OrderStatus.PENDING.value,
-                                    OrderStatus.PARTIAL.value,
-                                    OrderStatus.FILLED.value,
-                                ]
-                            ),
-                        )
-                        .order_by(Order.created_at.desc())
-                        .limit(1)
+                    order = await _find_current_position_entry_order(
+                        session,
+                        symbol_variants=symbol_variants,
+                        entry_side=entry_side,
+                        entry_price=entry_price,
+                        opened_at=opened_at,
+                        confirmed_only=False,
                     )
-                    order = order_result.scalar_one_or_none()
                     if not order:
                         continue
                     if _entry_order_persistence_pending(order):
@@ -2809,7 +2949,6 @@ class OkxSyncService:
                             ),
                         }
 
-                    opened_at = datetime_from_ms(exchange_pos.get("timestamp") or info.get("cTime"))
                     order.status = OrderStatus.FILLED.value
                     order.quantity = order.quantity or quantity
                     order.price = order.price or entry_price

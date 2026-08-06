@@ -45,6 +45,7 @@ const state = {
     priceChartSymbol: '',
     priceChartTimeframe: '1h',
     executionAccount: null,
+    lastFreshAccountBalances: {},
     okxConfig: {
         paperConfigured: true,
         liveConfigured: null,
@@ -159,10 +160,12 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchRiskEvents();
     fetchDashboardAuthStatus();
     setInterval(() => {
-        if (isPageActive('dashboard')) {
-            fetchDashboardSummary();
+        if (!document.hidden && isPageActive('dashboard')) {
+            void fetchDashboardSummary();
         }
     }, 10000);
+    document.addEventListener('visibilitychange', recoverDashboardSummaryPolling);
+    window.addEventListener('online', recoverDashboardSummaryPolling);
     setInterval(updateRuntimeClock, 1000);
     setInterval(() => {
         if (!document.hidden && isPageActive('dashboard')) fetchPnlHistory();
@@ -349,15 +352,38 @@ function apiErrorText(data, fallback = '未知错误') {
 
 const inflightJSONRequests = new Map();
 const paginatedRequestVersions = new Map();
+const JSON_REQUEST_TIMEOUT_MS = 20000;
+const DASHBOARD_BALANCE_FIELDS = [
+    'available_balance',
+    'okx_available_balance',
+    'remaining_allocation',
+    'current_balance',
+    'tradeable_balance',
+    'account_equity',
+    'okx_equity_balance',
+    'equity',
+    'wallet_balance',
+    'used_margin',
+    'okx_used_balance',
+    'position_margin_used',
+    'paper_execution_available_balance',
+    'paper_execution_used_margin',
+];
 
 async function fetchJSON(url) {
     const requestKey = String(url);
-    const existingRequest = inflightJSONRequests.get(requestKey);
-    if (existingRequest) return existingRequest;
+    const existingEntry = inflightJSONRequests.get(requestKey);
+    if (existingEntry) return existingEntry.promise;
 
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timedOut = false;
+    const timeoutId = controller ? window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, JSON_REQUEST_TIMEOUT_MS) : null;
     const request = (async () => {
         try {
-            const res = await fetch(url, { cache: 'no-store' });
+            const res = await fetch(url, { cache: 'no-store', ...(controller ? { signal: controller.signal } : {}) });
             const data = await res.json().catch(() => ({}));
             if (res.status === 401) {
                 const message = apiErrorText(data, '登录已过期，请重新登录。');
@@ -370,18 +396,34 @@ async function fetchJSON(url) {
             }
             return data;
         } catch (e) {
+            if (timedOut) {
+                const timeoutError = new Error(`请求超过 ${JSON_REQUEST_TIMEOUT_MS / 1000} 秒，已中止并等待自动重试。`);
+                console.warn(`Fetch timed out: ${url}`, timeoutError);
+                throw timeoutError;
+            }
             console.error(`Fetch failed: ${url}`, e);
             throw e;
+        } finally {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
         }
     })();
-    inflightJSONRequests.set(requestKey, request);
+    const entry = { promise: request, controller };
+    inflightJSONRequests.set(requestKey, entry);
     try {
         return await request;
     } finally {
-        if (inflightJSONRequests.get(requestKey) === request) {
+        if (inflightJSONRequests.get(requestKey) === entry) {
             inflightJSONRequests.delete(requestKey);
         }
     }
+}
+
+function cancelInflightJSONRequest(url) {
+    const requestKey = String(url);
+    const entry = inflightJSONRequests.get(requestKey);
+    if (!entry) return;
+    inflightJSONRequests.delete(requestKey);
+    if (entry.controller && !entry.controller.signal.aborted) entry.controller.abort();
 }
 
 async function fetchLatestPageJSON(requestKey, url) {
@@ -481,17 +523,89 @@ async function logoutDashboard() {
 }
 
 async function fetchDashboardSummary() {
-    const data = await fetchJSON('/api/dashboard/summary');
-    if (!data) return;
+    try {
+        const data = await fetchJSON('/api/dashboard/summary');
+        if (!data) return null;
 
-    updateModeDisplay(data.mode, data.paused);
-    updateExecutionAccountPanel(data.execution_account || {});
-    updateAccounts(data.accounts || [], data.execution_account || null);
-    updateMarketData(data.market || {}, data.accounts || []);
-    updateStats(data, 'summary');
-    updateDashboardDecisionCounts(data);
-    updateSymbolCount();
-    fetchModeCounts();
+        const executionAccount = preserveLastGoodAccountBalance(
+            data.execution_account || {},
+            data.mode,
+        );
+        const accounts = (data.accounts || []).map(account => (
+            preserveLastGoodAccountBalance(account, data.mode)
+        ));
+        const normalizedData = {
+            ...data,
+            execution_account: executionAccount,
+            accounts,
+        };
+        updateModeDisplay(normalizedData.mode, normalizedData.paused);
+        updateExecutionAccountPanel(executionAccount);
+        updateAccounts(accounts, executionAccount || null);
+        updateMarketData(normalizedData.market || {}, accounts);
+        updateStats(normalizedData, 'summary');
+        updateDashboardDecisionCounts(normalizedData);
+        updateSymbolCount();
+        fetchModeCounts();
+        return normalizedData;
+    } catch (error) {
+        console.warn('Dashboard summary refresh failed; the next poll will retry automatically.', error);
+        return null;
+    }
+}
+
+function preserveLastGoodAccountBalance(rawAccount, fallbackMode = 'paper') {
+    if (!rawAccount || !Object.keys(rawAccount).length) return rawAccount || {};
+    const account = { ...rawAccount };
+    const mode = account.mode === 'live' || fallbackMode === 'live' ? 'live' : 'paper';
+    const hasBalanceValue = DASHBOARD_BALANCE_FIELDS.some(field => (
+        valueNumber(account[field]) !== null
+    ));
+    const isFresh = hasBalanceValue
+        && !account.balance_error
+        && account.balance_snapshot_stale !== true;
+
+    if (isFresh) {
+        state.lastFreshAccountBalances[mode] = {
+            capturedAtMs: Date.now(),
+            values: Object.fromEntries(
+                DASHBOARD_BALANCE_FIELDS
+                    .filter(field => valueNumber(account[field]) !== null)
+                    .map(field => [field, account[field]]),
+            ),
+        };
+        return account;
+    }
+
+    const cached = state.lastFreshAccountBalances[mode];
+    const needsClientFallback = Boolean(account.balance_error)
+        && account.balance_snapshot_stale !== true;
+    let usedClientFallback = false;
+    if (cached && (!hasBalanceValue || needsClientFallback)) {
+        for (const [field, value] of Object.entries(cached.values)) {
+            if (needsClientFallback || valueNumber(account[field]) === null) account[field] = value;
+        }
+        usedClientFallback = true;
+    }
+    if ((account.balance_error || usedClientFallback) && (hasBalanceValue || usedClientFallback)) {
+        account.balance_snapshot_stale = true;
+        if (usedClientFallback) {
+            account.balance_snapshot_age_seconds = Math.max(
+                (Date.now() - cached.capturedAtMs) / 1000,
+                Number(account.balance_snapshot_age_seconds || 0),
+            );
+            account.balance_source = mode === 'live'
+                ? 'OKX 实盘最近成功快照'
+                : 'OKX 模拟盘最近成功快照';
+        }
+    }
+    return account;
+}
+
+function recoverDashboardSummaryPolling() {
+    if (document.hidden || !isPageActive('dashboard')) return;
+    cancelInflightJSONRequest('/api/dashboard/summary');
+    void fetchDashboardSummary();
 }
 
 async function fetchPnlHistory() {
@@ -817,7 +931,7 @@ function updateModelRankings(rankings) {
 }
 
 function accountMoneyText(value, account = null) {
-    if (account && account.balance_error) return '--';
+    if (account && account.balance_error && account.balance_snapshot_stale !== true) return '--';
     const number = valueNumber(value);
     return number === null ? '--' : fmtMoney(number);
 }
@@ -862,7 +976,7 @@ function updateExecutionAccountPanel(account) {
             <div class="exec-account-head">
                 <div>
                     <div class="exec-account-name">${escHtml(account.account_name || '多专家执行账户')}</div>
-                    <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${account.balance_snapshot_stale ? ` · 缓存 ${monitorNumber(account.balance_snapshot_stale_age_seconds, 1)}秒` : ''}</div>
+                    <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${account.balance_snapshot_stale ? ` · 缓存 ${monitorNumber(account.balance_snapshot_age_seconds, 1)}秒` : ''}</div>
                 </div>
                 <span class="badge ${account.risk_paused ? 'badge-short' : 'badge-long'}">${account.risk_paused ? '暂停开新仓' : '可分析'}</span>
             </div>

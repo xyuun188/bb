@@ -578,6 +578,10 @@ async def test_dashboard_okx_balance_failure_cache_prevents_retry(
     assert [event["source"] for event in dashboard_fallback_events] == ["isolated_executor"]
 
 
+def test_dashboard_okx_balance_failure_cache_retries_on_next_poll() -> None:
+    assert dashboard._DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS < 10.0
+
+
 async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

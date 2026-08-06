@@ -49,6 +49,31 @@ def _position_side(position: dict[str, Any]) -> str:
     return "long" if side in {"long", "buy"} else "short" if side in {"short", "sell"} else ""
 
 
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                numeric = float(text)
+            except (TypeError, ValueError):
+                return None
+            if numeric > 100_000_000_000:
+                numeric /= 1000.0
+            try:
+                parsed = datetime.fromtimestamp(numeric, UTC)
+            except (OverflowError, OSError, ValueError):
+                return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 @dataclass(frozen=True, slots=True)
 class DynamicExitAssessment:
     eligible: bool
@@ -58,6 +83,7 @@ class DynamicExitAssessment:
     gross_unrealized_pnl_usdt: float
     fee_after_unrealized_pnl_usdt: float
     fee_buffer_usdt: float
+    estimated_exit_cost_usdt: float
     execution_cost_complete: bool
     current_management_contract_complete: bool
     profit_retrace_ratio: float
@@ -76,6 +102,9 @@ class DynamicExitAssessment:
     model_exit_confidence: float
     model_exit_pressure: float
     planned_stop_crossed: bool
+    position_age_minutes: float | None
+    early_exit_observation_active: bool
+    economic_exit_evidence_complete: bool
     paper_canary_horizon_elapsed: bool
     paper_canary_horizon_minutes: int
     paper_canary_expires_at: str | None
@@ -134,6 +163,8 @@ def assess_dynamic_exit(
     management_pressure_values: list[float] = []
     canary_horizon_assessments: list[dict[str, Any]] = []
     training_horizon_assessments: list[dict[str, Any]] = []
+    position_ages_minutes: list[float] = []
+    observed_at = datetime.now(UTC)
     for position in matches:
         qty = abs(
             _safe_float(
@@ -226,6 +257,16 @@ def assess_dynamic_exit(
         management_contracts.append(management)
         canary_horizon_assessments.append(assess_paper_canary_position_horizon(position))
         training_horizon_assessments.append(assess_paper_training_position_horizon(position))
+        opened_at = _parse_utc_datetime(
+            position.get("created_at")
+            or position.get("opened_at")
+            or position.get("entry_time")
+            or position.get("entry_timestamp")
+        )
+        if opened_at is not None:
+            position_ages_minutes.append(
+                max((observed_at - opened_at).total_seconds(), 0.0) / 60.0
+            )
         if management.get("management_eligible") is True and not management.get("blockers"):
             management_pressure_values.append(
                 _clamp(_safe_float(management.get("portfolio_concentration_pressure"), 0.0))
@@ -239,6 +280,11 @@ def assess_dynamic_exit(
     exit_fee_rate = sum(exit_fee_rates) / len(exit_fee_rates) if exit_fee_rates else 0.0
     close_fee = notional * exit_fee_rate
     fee_buffer = entry_fees + close_fee
+    estimated_exit_cost_rate = max(
+        exit_fee_rate,
+        round_trip_cost_pct / 200.0 if execution_cost.get("production_eligible") is True else 0.0,
+    )
+    estimated_exit_cost = notional * estimated_exit_cost_rate
     net_pnl = gross_pnl - fee_buffer
     peak_profit = max(peak_profit, gross_pnl)
     retrace = _clamp((peak_profit - gross_pnl) / peak_profit) if peak_profit > 0 else 0.0
@@ -255,10 +301,12 @@ def assess_dynamic_exit(
         if item.get("authorized") is True and item.get("elapsed") is True
     ]
     paper_training_horizon_elapsed = bool(elapsed_training_horizons)
+    # Entry and estimated exit fees are already/inevitably paid costs, not
+    # evidence that market price has consumed the planned stop budget.
     stop_usage = (
-        _clamp(max(-net_pnl, 0.0) / planned_risk)
+        _clamp(max(-gross_pnl, 0.0) / planned_risk)
         if planned_risk > 0
-        else _clamp(max(-net_pnl, 0.0) / notional)
+        else _clamp(max(-gross_pnl, 0.0) / notional)
         if notional > 0
         else 0.0
     )
@@ -377,6 +425,22 @@ def assess_dynamic_exit(
             model_exit_pressure,
         )
     )
+    position_age_minutes = min(position_ages_minutes) if position_ages_minutes else None
+    early_exit_observation_active = bool(
+        not hard_risk
+        and position_age_minutes is not None
+        and position_age_minutes < 10.0
+        and close_fraction > 0.0
+        and close_fraction < 1.0
+    )
+    gross_move_value = abs(gross_pnl)
+    economic_exit_evidence_complete = bool(
+        not early_exit_observation_active
+        or gross_move_value + 1e-9 >= estimated_exit_cost
+        or model_exit_pressure > 0.0
+        or replacement_pressure > 0.0
+        or portfolio_pressure > 0.0
+    )
     reasons: list[str] = []
     if not matches:
         reasons.append("position_economics_missing")
@@ -394,6 +458,8 @@ def assess_dynamic_exit(
         reasons.append("fee_after_profit_not_positive")
     if not hard_risk and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
+    if not hard_risk and not economic_exit_evidence_complete:
+        reasons.append("early_exit_economic_evidence_insufficient")
     eligible = not reasons
     provenance = {
         "source": (
@@ -402,7 +468,7 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-07-27.dynamic-exit-risk-scaled-continuation.v8",
+        "strategy_version": "2026-08-06.dynamic-exit-gross-risk-and-economic-debounce.v9",
         "fallback_reason": ",".join(reasons),
     }
     return DynamicExitAssessment(
@@ -413,6 +479,7 @@ def assess_dynamic_exit(
         gross_unrealized_pnl_usdt=round(gross_pnl, 8),
         fee_after_unrealized_pnl_usdt=round(net_pnl, 8),
         fee_buffer_usdt=round(fee_buffer, 8),
+        estimated_exit_cost_usdt=round(estimated_exit_cost, 8),
         execution_cost_complete=execution_cost_complete,
         current_management_contract_complete=current_management_contract_complete,
         profit_retrace_ratio=round(retrace, 8),
@@ -435,6 +502,11 @@ def assess_dynamic_exit(
         model_exit_confidence=round(model_exit_confidence, 8),
         model_exit_pressure=round(model_exit_pressure, 8),
         planned_stop_crossed=planned_stop_crossed,
+        position_age_minutes=(
+            round(position_age_minutes, 8) if position_age_minutes is not None else None
+        ),
+        early_exit_observation_active=early_exit_observation_active,
+        economic_exit_evidence_complete=economic_exit_evidence_complete,
         paper_canary_horizon_elapsed=paper_canary_horizon_elapsed,
         paper_canary_horizon_minutes=max(
             (int(item.get("horizon_minutes") or 0) for item in elapsed_canary_horizons),

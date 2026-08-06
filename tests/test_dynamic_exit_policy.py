@@ -234,6 +234,62 @@ def test_loss_uses_planned_stop_budget_continuously() -> None:
     assert result.close_fraction == pytest.approx(result.stop_risk_usage)
 
 
+def test_fee_only_loss_does_not_consume_planned_stop_budget() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.fee_after_unrealized_pnl_usdt < 0.0
+    assert result.stop_risk_usage == 0.0
+    assert result.close_fraction == 0.0
+    assert result.eligible is False
+    assert "dynamic_exit_pressure_zero" in result.reason
+
+
+def test_early_non_hard_partial_exit_requires_price_move_to_cover_exit_cost() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_price=99.99,
+        notional_usdt=999.9,
+        unrealized_pnl=-0.1,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is False
+    assert result.planned_stop_crossed is False
+    assert result.early_exit_observation_active is True
+    assert result.estimated_exit_cost_usdt > abs(result.gross_unrealized_pnl_usdt)
+    assert result.economic_exit_evidence_complete is False
+    assert result.close_fraction == 0.0
+    assert "early_exit_economic_evidence_insufficient" in result.reason
+
+
+def test_early_observation_never_blocks_planned_stop_crossing() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_price=97.9,
+        notional_usdt=979.0,
+        unrealized_pnl=-21.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is True
+    assert result.planned_stop_crossed is True
+    assert result.early_exit_observation_active is False
+    assert result.economic_exit_evidence_complete is True
+    assert result.close_fraction == 1.0
+
+
 def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     decision = _decision()
     decision.feature_snapshot = {
@@ -258,7 +314,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-07-27.dynamic-exit-risk-scaled-continuation.v8"
+        "2026-08-06.dynamic-exit-gross-risk-and-economic-debounce.v9"
     )
 
 

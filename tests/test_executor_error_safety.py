@@ -890,7 +890,17 @@ class _MovingEntryTickerCcxt(_EntryMaxMarketSizeCcxt):
         }
 
 
-class _AttachedTakeProfitRejectedOnceCcxt(_EntryMaxMarketSizeCcxt):
+class _AttachedProtectionRejectedOnceCcxt(_EntryMaxMarketSizeCcxt):
+    def __init__(
+        self,
+        *,
+        error_code: str = "51052",
+        error_message: str = "Your TP price should be lower than the primary order price.",
+    ) -> None:
+        super().__init__()
+        self.error_code = error_code
+        self.error_message = error_message
+
     async def create_order(
         self,
         symbol: str,
@@ -903,8 +913,8 @@ class _AttachedTakeProfitRejectedOnceCcxt(_EntryMaxMarketSizeCcxt):
         if params.get("attachAlgoOrds"):
             self.create_calls.append((symbol, order_type, side, quantity, price, params))
             raise ExchangeAPIError(
-                "OKX API error [51052]: Your TP price should be lower than the primary order price.",
-                code="51052",
+                f"OKX API error [{self.error_code}]: {self.error_message}",
+                code=self.error_code,
             )
         order = await super().create_order(
             symbol,
@@ -2168,13 +2178,28 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
 
 @pytest.mark.asyncio
-async def test_okx_entry_recovers_valid_take_profit_rejection_with_verified_oco(
+@pytest.mark.parametrize(
+    ("action", "error_code", "error_message"),
+    [
+        (Action.LONG, "51050", "Your TP price should be higher than the primary order price."),
+        (Action.LONG, "51051", "Your SL price should be lower than the primary order price."),
+        (Action.SHORT, "51052", "Your TP price should be lower than the primary order price."),
+        (Action.SHORT, "51053", "Your SL price should be higher than the primary order price."),
+    ],
+)
+async def test_okx_entry_recovers_valid_attached_protection_rejection_with_verified_oco(
     monkeypatch: pytest.MonkeyPatch,
+    action: Action,
+    error_code: str,
+    error_message: str,
 ) -> None:
-    exchange = _AttachedTakeProfitRejectedOnceCcxt()
+    exchange = _AttachedProtectionRejectedOnceCcxt(
+        error_code=error_code,
+        error_message=error_message,
+    )
     executor = _executor(exchange)
     decision = _entry_decision()
-    decision.action = Action.SHORT
+    decision.action = action
     recovery_calls: list[dict[str, Any]] = []
 
     async def ensure_protection(**kwargs: Any) -> dict[str, Any]:
@@ -2201,18 +2226,22 @@ async def test_okx_entry_recovers_valid_take_profit_rejection_with_verified_oco(
     assert recovery_calls[0]["params"]["attachAlgoOrds"] == first_params["attachAlgoOrds"]
 
     recovery = result.raw_response["entry_attached_protection_recovery"]
-    assert recovery["okx_error_code"] == "51052"
+    assert recovery["okx_error_code"] == error_code
+    assert recovery["version"] == "2026-08-06.okx-attached-protection-recovery.v2"
+    assert recovery["trigger"] == "okx_attached_protection_false_rejection"
     assert recovery["standalone_protection"]["verified"] is True
     submission = result.raw_response["protection_submission"]
     assert submission["exchange_confirmation_recorded"] is True
     assert submission["state"] == "confirmed"
     assert submission["algo_ids"] == ["standalone-oco-1"]
-    assert submission["submission_path"] == ("standalone_oco_after_attached_take_profit_rejection")
+    assert submission["submission_path"] == (
+        "standalone_oco_after_attached_protection_rejection"
+    )
 
 
 @pytest.mark.asyncio
 async def test_okx_entry_does_not_recover_take_profit_code_for_wrong_direction() -> None:
-    exchange = _AttachedTakeProfitRejectedOnceCcxt()
+    exchange = _AttachedProtectionRejectedOnceCcxt()
     executor = _executor(exchange)
 
     result = await executor.place_order(_entry_decision(), override_balance=100.0)

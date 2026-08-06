@@ -71,6 +71,7 @@ DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 4
 DEFAULT_MAX_ORDER_GAP_QUERIES = 4
 ACCOUNT_HISTORY_MAX_PAGES = 5
 ACCOUNT_HISTORY_OVERLAP_HOURS = 6
+OKX_RECENT_FILL_RETENTION_HOURS = 72
 OKX_SYNC_CONFIRMED = "okx_confirmed"
 OKX_SYNC_UNVERIFIED = "okx_unverified"
 OKX_SYNC_OKX_ONLY = "okx_only_backfilled"
@@ -524,6 +525,11 @@ class OkxOrderFactSyncService:
                 overlap_hours=max(self.lookback_hours, ACCOUNT_HISTORY_OVERLAP_HOURS),
             )
             if priority_target_order_ids:
+                priority_include_historical = _target_fill_query_requires_historical(
+                    priority_target_order_ids,
+                    orders=[*local_orders, *submit_recovery_orders],
+                    now=datetime.now(UTC),
+                )
                 target_fills, target_fills_complete = await run_stage(
                     "fills_history_targeted",
                     lambda: native_facts.fetch_fill_groups(
@@ -534,9 +540,10 @@ class OkxOrderFactSyncService:
                         target_orders_only=True,
                         target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
                         include_historical=False,
+                        historical_only=priority_include_historical,
                         strict=True,
                     ),
-                    cap_seconds=2.0,
+                    cap_seconds=4.0 if priority_include_historical else 2.0,
                 )
                 fills = list(target_fills or [])
                 if target_fills_complete:
@@ -704,6 +711,11 @@ class OkxOrderFactSyncService:
                 if order_id not in seen_fill_order_ids
             )
             if missing_priority_ids:
+                missing_include_historical = _target_fill_query_requires_historical(
+                    missing_priority_ids,
+                    orders=[*local_orders, *submit_recovery_orders],
+                    now=datetime.now(UTC),
+                )
                 target_fills, target_fills_complete = await run_stage(
                     "fills_history_targeted",
                     lambda: native_facts.fetch_fill_groups(
@@ -714,9 +726,10 @@ class OkxOrderFactSyncService:
                         target_orders_only=True,
                         target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
                         include_historical=False,
+                        historical_only=missing_include_historical,
                         strict=True,
                     ),
-                    cap_seconds=2.0,
+                    cap_seconds=4.0 if missing_include_historical else 2.0,
                 )
                 fills = _dedupe_fills_by_order_id([*fills, *(target_fills or [])])
                 if target_fills_complete:
@@ -3698,6 +3711,38 @@ def _account_history_since(
         return _aware_utc(phase3_since)
     overlap = timedelta(hours=max(int(overlap_hours or 0), 1))
     return max(_aware_utc(phase3_since), max(confirmed_times) - overlap)
+
+
+def _target_fill_query_requires_historical(
+    order_ids: Iterable[Any],
+    *,
+    orders: Iterable[Order],
+    now: datetime,
+) -> bool:
+    """Use OKX fills-history when a targeted order may be outside recent retention."""
+
+    targets = {
+        token
+        for value in order_ids
+        for token in _split_exchange_order_ids(value)
+    }
+    if not targets:
+        return False
+    recent_since = _aware_utc(now) - timedelta(hours=OKX_RECENT_FILL_RETENTION_HOURS)
+    matched_ids: set[str] = set()
+    for order in orders:
+        exchange_ids = _split_exchange_order_ids(
+            getattr(order, "exchange_order_id", None)
+        )
+        matched = exchange_ids & targets
+        if not matched:
+            continue
+        matched_ids.update(matched)
+        order_time = _order_time(order)
+        if order_time is None or order_time < recent_since:
+            return True
+    # Explicit recovery IDs may not have a local order row, so their age is unknown.
+    return bool(targets - matched_ids)
 
 
 def _aware_utc(value: datetime | None) -> datetime:

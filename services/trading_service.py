@@ -1176,7 +1176,7 @@ class TradingService:
     def okx_order_fact_sync_timeout_seconds(self) -> float:
         """Keep background order facts independent from the current-position gate budget."""
 
-        return 30.0
+        return 45.0
 
     def okx_settlement_fact_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""

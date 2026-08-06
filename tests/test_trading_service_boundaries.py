@@ -683,7 +683,7 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     assert row["order_fact_sync"]["unverified_count"] == 0
     assert factory_kwargs["limit"] == 100
     assert factory_kwargs["priority_only"] is False
-    assert factory_kwargs["timeout_seconds"] == 30.0
+    assert factory_kwargs["timeout_seconds"] == 45.0
     assert row["sync_scope"] == "account_discovery"
     assert service._okx_order_fact_discovery_last_finished_at is not None
     service._okx_order_fact_sync_last_row = row
@@ -7977,6 +7977,215 @@ async def test_sync_service_does_not_reopen_closed_position_during_entry_persist
     assert unrelated_closed_position.is_open is False
     assert unrelated_closed_position.close_exchange_order_id == "old-pepe-close"
     assert opened_positions == []
+
+
+@pytest.mark.asyncio
+async def test_sync_service_does_not_link_stale_prior_lifecycle_entry_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    stale_order = SimpleNamespace(
+        model_name="ensemble_trader",
+        exchange_order_id="old-bome-entry",
+        status=OrderStatus.FILLED.value,
+        okx_sync_status="okx_only_backfilled",
+        quantity=282_000.0,
+        price=0.000629,
+        filled_at=now - timedelta(days=4),
+        created_at=now - timedelta(days=4),
+    )
+    opened_positions: list[dict[str, Any]] = []
+
+    class FakeScalarResult:
+        def scalar_one_or_none(self) -> Any:
+            return stale_order
+
+    class FakeSession:
+        async def execute(self, _statement: Any) -> FakeScalarResult:
+            return FakeScalarResult()
+
+    class FakePaperOKX:
+        async def get_positions_strict(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "symbol": "BOME/USDT:USDT",
+                    "side": "short",
+                    "contracts": 295.0,
+                    "contractSize": 1000.0,
+                    "entryPrice": 0.000566,
+                    "markPrice": 0.000567,
+                    "timestamp": str(int((now + timedelta(hours=12)).timestamp() * 1000)),
+                    "info": {
+                        "instId": "BOME-USDT-SWAP",
+                        "pos": "295",
+                        "cTime": str(int(now.timestamp() * 1000)),
+                    },
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_open_positions(self) -> list[Any]:
+            return []
+
+        async def open_position(self, payload: dict[str, Any]) -> None:
+            opened_positions.append(payload)
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def protection_map(
+        _paper_okx: Any,
+        _exchange_positions: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        return {}
+
+    async def fallback_protection(_session: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: now + timedelta(hours=12),
+        **_noop_reconcile_close_boundaries(),
+    ).reconcile_exchange_positions()
+
+    assert result == []
+    assert opened_positions == []
+
+
+@pytest.mark.asyncio
+async def test_sync_service_reanchors_stale_open_position_entry_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    stale_order = SimpleNamespace(
+        exchange_order_id="old-bome-entry",
+        status=OrderStatus.FILLED.value,
+        okx_sync_status="okx_only_backfilled",
+        price=0.000629,
+        filled_at=now - timedelta(days=4),
+        created_at=now - timedelta(days=4),
+    )
+    current_order = SimpleNamespace(
+        exchange_order_id="current-bome-entry",
+        status=OrderStatus.FILLED.value,
+        okx_sync_status="okx_only_backfilled",
+        price=0.000566,
+        filled_at=now - timedelta(seconds=30),
+        created_at=now - timedelta(seconds=30),
+    )
+    local_position = SimpleNamespace(
+        id=5837,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BOME/USDT",
+        side="short",
+        is_open=True,
+        quantity=295_000.0,
+        entry_price=0.000566,
+        current_price=0.000567,
+        unrealized_pnl=-0.295,
+        stop_loss_price=0.00058,
+        take_profit_price=0.00054,
+        entry_exchange_order_id="old-bome-entry",
+    )
+
+    class FakeScalarResult:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def scalar_one_or_none(self) -> Any:
+            return self.value
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.results = [stale_order, current_order]
+
+        async def execute(self, _statement: Any) -> FakeScalarResult:
+            return FakeScalarResult(self.results.pop(0))
+
+    class FakePaperOKX:
+        async def get_positions_strict(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "symbol": "BOME/USDT:USDT",
+                    "side": "short",
+                    "contracts": 295.0,
+                    "contractSize": 1000.0,
+                    "entryPrice": 0.000566,
+                    "markPrice": 0.000567,
+                    "timestamp": str(int((now + timedelta(hours=12)).timestamp() * 1000)),
+                    "info": {
+                        "instId": "BOME-USDT-SWAP",
+                        "pos": "295",
+                        "cTime": str(int(now.timestamp() * 1000)),
+                    },
+                }
+            ]
+
+    class FakeTradeRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_open_positions(self) -> list[Any]:
+            return [local_position]
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield FakeSession()
+
+    async def protection_map(
+        _paper_okx: Any,
+        _exchange_positions: list[dict[str, Any]],
+    ) -> None:
+        return None
+
+    async def fallback_protection(_session: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+
+    result = await OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: FakePaperOKX(),
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: now + timedelta(hours=12),
+        **_noop_reconcile_close_boundaries(),
+    ).reconcile_exchange_positions()
+
+    assert local_position.entry_exchange_order_id == "current-bome-entry"
+    assert result == [
+        {
+            "kind": "current_position_entry_order_reanchored",
+            "source": "okx_authoritative_current_position",
+            "position_id": 5837,
+            "symbol": "BOME/USDT",
+            "side": "short",
+            "previous_entry_exchange_order_ids": ["old-bome-entry"],
+            "entry_exchange_order_id": "current-bome-entry",
+            "note": (
+                "The local open position entry link was re-anchored to the "
+                "OKX-confirmed order for the current position lifecycle."
+            ),
+        }
+    ]
 
 
 @pytest.mark.asyncio

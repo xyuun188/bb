@@ -1496,7 +1496,7 @@ class OKXExecutor(AbstractExecutor):
             except ExchangeAPIError as e:
                 if decision.is_entry:
                     error_text = safe_error_text(e)
-                    attached_rejection_code = self._retryable_attached_take_profit_rejection_code(
+                    attached_rejection_code = self._retryable_attached_protection_rejection_code(
                         e,
                         decision=decision,
                         params=params,
@@ -1515,8 +1515,8 @@ class OKXExecutor(AbstractExecutor):
                             key: value for key, value in params.items() if key != "attachAlgoOrds"
                         }
                         attached_protection_recovery = {
-                            "version": "2026-08-05.okx-attached-protection-recovery.v1",
-                            "trigger": "okx_attached_take_profit_false_rejection",
+                            "version": "2026-08-06.okx-attached-protection-recovery.v2",
+                            "trigger": "okx_attached_protection_false_rejection",
                             "okx_error_code": attached_rejection_code,
                             "original_error": error_text,
                             "original_request_params": rejected_params,
@@ -1524,7 +1524,7 @@ class OKXExecutor(AbstractExecutor):
                             "standalone_protection_required": True,
                         }
                         logger.warning(
-                            "retrying entry after OKX rejected valid attached take profit",
+                            "retrying entry after OKX rejected valid attached protection",
                             symbol=decision.symbol,
                             okx_symbol=okx_symbol,
                             action=decision.action.value,
@@ -2092,7 +2092,7 @@ class OKXExecutor(AbstractExecutor):
             logger.error("order placement failed", error=error_text)
             raise OrderPlacementError(f"Failed to place order: {error_text}") from e
 
-    def _retryable_attached_take_profit_rejection_code(
+    def _retryable_attached_protection_rejection_code(
         self,
         error: BaseException,
         *,
@@ -2100,14 +2100,17 @@ class OKXExecutor(AbstractExecutor):
         params: dict[str, Any],
         reference_price: float,
     ) -> str | None:
-        """Identify an OKX false rejection of a locally valid attached take profit."""
+        """Identify an OKX false rejection of locally valid attached protection."""
 
         code = str(getattr(error, "code", "") or "").strip()
         if not code:
-            match = re.search(r"\b(51050|51052)\b", str(error or ""))
+            match = re.search(r"\b(51050|51051|51052|51053)\b", str(error or ""))
             code = match.group(1) if match else ""
-        expected_code = "51050" if decision.action == Action.LONG else "51052"
-        if code != expected_code or decision.action not in {Action.LONG, Action.SHORT}:
+        expected_codes = {
+            Action.LONG: {"51050", "51051"},
+            Action.SHORT: {"51052", "51053"},
+        }
+        if code not in expected_codes.get(decision.action, set()):
             return None
 
         requested = params.get("attachAlgoOrds")
@@ -2140,7 +2143,7 @@ class OKXExecutor(AbstractExecutor):
         return {
             "version": "2026-08-05.okx-standalone-protection-submission.v1",
             "source_authority": "local_submit_plus_okx_create_order_response",
-            "submission_path": "standalone_oco_after_attached_take_profit_rejection",
+            "submission_path": "standalone_oco_after_attached_protection_rejection",
             "client_submit_requested_at": (
                 requested_at.isoformat() if requested_at is not None else None
             ),
