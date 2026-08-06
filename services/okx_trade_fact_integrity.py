@@ -887,6 +887,12 @@ def _related_positions_for_order(
             continue
         position_symbol = _position_authoritative_symbol(position)
         symbol_matches = bool(position_symbol and position_symbol in expected_symbols)
+        # A nearby position with the same size/price is not enough evidence of
+        # association: concurrent symbols routinely share both attributes.
+        # Cross-symbol mismatches remain actionable when the order is explicitly
+        # linked to the position above, but fuzzy matching must stay symbol-safe.
+        if not symbol_matches:
+            continue
         lifecycle_match = (
             entry_action
             and symbol_matches
@@ -908,7 +914,7 @@ def _related_positions_for_order(
             abs(_safe_float(order.quantity)),
             QUANTITY_TOLERANCE_RATIO,
         )
-        if not (symbol_matches or price_matches or quantity_matches):
+        if not (price_matches or quantity_matches):
             continue
         score = time_delta
         if not symbol_matches:
