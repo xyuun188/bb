@@ -8766,44 +8766,72 @@ class TradingService:
     async def _ml_auto_train_loop(self) -> None:
         """Retrain local ML and server-side quant tools without blocking trading."""
         while self._running:
-            ml_result: dict[str, Any] = {}
-            local_tools_result: dict[str, Any] = {}
-            try:
-                ml_result = await self._run_local_ml_training_subprocess()
-                if ml_result.get("trained"):
-                    logger.info(
-                        "local ML signal model auto-trained",
-                        sample_count=ml_result.get("sample_count"),
-                        new_sample_count=ml_result.get("new_sample_count"),
-                    )
-                elif str(ml_result.get("reason") or "") in {
-                    "error",
-                    "load_samples_error",
-                    "timeout",
-                }:
+            async def run_ml_step() -> dict[str, Any]:
+                try:
+                    result = await self._run_local_ml_training_subprocess()
+                    if result.get("trained"):
+                        logger.info(
+                            "local ML signal model auto-trained",
+                            sample_count=result.get("sample_count"),
+                            new_sample_count=result.get("new_sample_count"),
+                        )
+                    elif str(result.get("reason") or "") in {
+                        "error",
+                        "load_samples_error",
+                        "timeout",
+                    }:
+                        logger.warning(
+                            "local ML signal auto-train failed",
+                            reason=result.get("reason"),
+                            error=result.get("error"),
+                        )
+                    elif result.get("reason") not in {"not_due", "training_in_progress"}:
+                        logger.info(
+                            "local ML signal auto-train waiting for mature data",
+                            reason=result.get("reason"),
+                            train_sample_count=result.get("train_sample_count"),
+                            train_decision_group_count=result.get("train_decision_group_count"),
+                            purged_training_sample_count=result.get(
+                                "purged_training_sample_count"
+                            ),
+                        )
+                    return result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
                     logger.warning(
-                        "local ML signal auto-train failed",
-                        reason=ml_result.get("reason"),
-                        error=ml_result.get("error"),
+                        "local ML signal auto-train loop error",
+                        error=safe_error_text(exc),
                     )
-                elif ml_result.get("reason") not in {"not_due", "training_in_progress"}:
-                    logger.info(
-                        "local ML signal auto-train waiting for mature data",
-                        reason=ml_result.get("reason"),
-                        train_sample_count=ml_result.get("train_sample_count"),
-                        train_decision_group_count=ml_result.get("train_decision_group_count"),
-                        purged_training_sample_count=ml_result.get("purged_training_sample_count"),
+                    return {
+                        "trained": False,
+                        "reason": "error",
+                        "error": safe_error_text(exc),
+                    }
+
+            async def run_local_tools_step() -> dict[str, Any]:
+                try:
+                    return await self._maybe_train_local_ai_tools()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "local AI tools auto-train loop error",
+                        error=safe_error_text(exc),
                     )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("local ML signal auto-train loop error", error=safe_error_text(e))
-            try:
-                local_tools_result = await self._maybe_train_local_ai_tools()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("local AI tools auto-train loop error", error=safe_error_text(e))
+                    return {
+                        "trained": False,
+                        "reason": "error",
+                        "error": safe_error_text(exc),
+                    }
+
+            # The ML subprocess can legitimately run for tens of minutes. Keep
+            # the independent local-AI trainer on its own cadence instead of
+            # making it wait behind the ML process.
+            ml_result, local_tools_result = await asyncio.gather(
+                run_ml_step(),
+                run_local_tools_step(),
+            )
             failed_reasons = {
                 "error",
                 "invalid_training_response",

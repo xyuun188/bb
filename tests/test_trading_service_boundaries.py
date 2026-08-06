@@ -2555,6 +2555,41 @@ async def test_local_ai_training_failure_uses_retry_interval(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_training_is_not_blocked_by_long_ml_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    ml_started = asyncio.Event()
+    ml_released = asyncio.Event()
+    ai_started_before_ml_release = False
+
+    async def slow_ml() -> dict[str, Any]:
+        ml_started.set()
+        await ml_released.wait()
+        return {"trained": False, "reason": "not_due"}
+
+    async def local_ai() -> dict[str, Any]:
+        nonlocal ai_started_before_ml_release
+        await ml_started.wait()
+        ai_started_before_ml_release = not ml_released.is_set()
+        ml_released.set()
+        return {"trained": False, "reason": "not_due"}
+
+    service._run_local_ml_training_subprocess = slow_ml  # type: ignore[method-assign]
+    service._maybe_train_local_ai_tools = local_ai  # type: ignore[method-assign]
+
+    async def stop_after_sleep(_delay: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", stop_after_sleep)
+
+    await service._ml_auto_train_loop()
+
+    assert ai_started_before_ml_release is True
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
