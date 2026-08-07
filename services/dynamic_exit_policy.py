@@ -18,6 +18,10 @@ from services.dynamic_policy_values import continuous_budget_fraction
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
 
+EARLY_EXIT_OBSERVATION_MINUTES = 10.0
+MIN_AUTOMATED_EXIT_FRACTION = 0.05
+MIN_EARLY_MODEL_EXIT_PRESSURE = MIN_AUTOMATED_EXIT_FRACTION * 2.0
+
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -429,15 +433,19 @@ def assess_dynamic_exit(
     early_exit_observation_active = bool(
         not hard_risk
         and position_age_minutes is not None
-        and position_age_minutes < 10.0
+        and position_age_minutes < EARLY_EXIT_OBSERVATION_MINUTES
         and close_fraction > 0.0
         and close_fraction < 1.0
     )
-    gross_move_value = abs(gross_pnl)
+    gross_profit_value = max(gross_pnl, 0.0)
+    significant_model_exit_pressure = bool(
+        model_requested_close_fraction + 1e-9 >= MIN_AUTOMATED_EXIT_FRACTION
+        and model_exit_pressure + 1e-9 >= MIN_EARLY_MODEL_EXIT_PRESSURE
+    )
     economic_exit_evidence_complete = bool(
         not early_exit_observation_active
-        or gross_move_value + 1e-9 >= estimated_exit_cost
-        or model_exit_pressure > 0.0
+        or gross_profit_value + 1e-9 >= estimated_exit_cost
+        or significant_model_exit_pressure
         or replacement_pressure > 0.0
         or portfolio_pressure > 0.0
     )
@@ -448,6 +456,12 @@ def assess_dynamic_exit(
         reasons.append("current_position_management_contract_incomplete")
     if not hard_risk and close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
+    if (
+        not hard_risk
+        and 0.0 < close_fraction
+        and close_fraction + 1e-9 < MIN_AUTOMATED_EXIT_FRACTION
+    ):
+        reasons.append("dynamic_exit_fraction_below_execution_minimum")
     if (
         not hard_risk
         and gross_pnl > 0
@@ -468,8 +482,11 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-08-06.dynamic-exit-gross-risk-and-economic-debounce.v9",
+        "strategy_version": "2026-08-07.dynamic-exit-executable-economic-debounce.v11",
         "fallback_reason": ",".join(reasons),
+        "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
+        "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
+        "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
     }
     return DynamicExitAssessment(
         eligible=eligible,

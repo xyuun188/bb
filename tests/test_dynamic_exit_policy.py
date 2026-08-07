@@ -272,6 +272,91 @@ def test_early_non_hard_partial_exit_requires_price_move_to_cover_exit_cost() ->
     assert "early_exit_economic_evidence_insufficient" in result.reason
 
 
+def test_early_loss_magnitude_does_not_count_as_exit_cost_coverage() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_price=99.9,
+        notional_usdt=99.9,
+        quantity=1.0,
+        entry_fee_usdt=0.05,
+        unrealized_pnl=-0.1,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is False
+    assert result.early_exit_observation_active is True
+    assert abs(result.gross_unrealized_pnl_usdt) > result.estimated_exit_cost_usdt
+    assert result.economic_exit_evidence_complete is False
+    assert result.close_fraction == 0.0
+    assert "early_exit_economic_evidence_insufficient" in result.reason
+
+
+@pytest.mark.parametrize("requested_fraction", [0.00449424, 0.06770709])
+def test_early_small_model_exit_cannot_bypass_economic_debounce(
+    requested_fraction: float,
+) -> None:
+    decision = _decision()
+    decision.suggested_close_fraction = requested_fraction
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(decision, [position])
+
+    assert result.hard_risk is False
+    assert result.early_exit_observation_active is True
+    assert result.model_requested_close_fraction == pytest.approx(requested_fraction)
+    assert result.model_exit_pressure < 0.1
+    assert result.economic_exit_evidence_complete is False
+    assert result.close_fraction == 0.0
+    assert "early_exit_economic_evidence_insufficient" in result.reason
+
+
+def test_early_significant_model_exit_remains_eligible() -> None:
+    decision = _decision()
+    decision.suggested_close_fraction = 0.25
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(decision, [position])
+
+    assert result.hard_risk is False
+    assert result.early_exit_observation_active is True
+    assert result.model_exit_pressure == pytest.approx(0.2)
+    assert result.economic_exit_evidence_complete is True
+    assert result.close_fraction == pytest.approx(0.2)
+
+
+def test_post_observation_subminimum_exit_fraction_fails_closed() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=20),
+        current_price=99.98,
+        notional_usdt=999.8,
+        unrealized_pnl=-0.2,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is False
+    assert result.early_exit_observation_active is False
+    assert 0.0 < result.stop_risk_usage < 0.05
+    assert result.economic_exit_evidence_complete is True
+    assert result.close_fraction == 0.0
+    assert "dynamic_exit_fraction_below_execution_minimum" in result.reason
+
+
 def test_early_observation_never_blocks_planned_stop_crossing() -> None:
     position = _position(
         created_at=datetime.now(UTC) - timedelta(minutes=2),
@@ -314,7 +399,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-06.dynamic-exit-gross-risk-and-economic-debounce.v9"
+        "2026-08-07.dynamic-exit-executable-economic-debounce.v11"
     )
 
 
