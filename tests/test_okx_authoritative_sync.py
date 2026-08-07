@@ -2415,6 +2415,67 @@ def _confirmed_lqty_order(
     )
 
 
+def _order_detail_confirmed_lqty_order(
+    *,
+    now: datetime,
+    raw_order_id: str = "persisted-order-detail",
+) -> Order:
+    fill_timestamp_ms = int((now - timedelta(minutes=5)).timestamp() * 1000)
+    return Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="LQTY/USDT",
+        side="buy",
+        order_type="market",
+        quantity=919.0,
+        price=0.19709989,
+        fee=0.0905674,
+        status="filled",
+        exchange_order_id="persisted-order-detail",
+        okx_inst_id="LQTY-USDT-SWAP",
+        okx_trade_ids="64790399",
+        okx_fill_contracts=919.0,
+        okx_fill_pnl=-0.12,
+        okx_sync_status="okx_order_detail_confirmed",
+        okx_raw_fills={
+            "source": "okx_order_detail",
+            "order_detail_confirmed": True,
+            "fills_history_confirmed": False,
+            "execution_result_confirmed": False,
+            "order_id": "persisted-order-detail",
+            "trade_ids": ["64790399"],
+            "inst_id": "LQTY-USDT-SWAP",
+            "contracts": 919.0,
+            "contract_size": 1.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": 919.0,
+            "avg_price": 0.19709989,
+            "fee_abs": 0.0905674,
+            "fill_pnl": -0.12,
+            "rows": [
+                {
+                    "ordId": raw_order_id,
+                    "tradeId": "64790399",
+                    "instId": "LQTY-USDT-SWAP",
+                    "side": "buy",
+                    "posSide": "net",
+                    "state": "filled",
+                    "accFillSz": "919",
+                    "fillSz": "400",
+                    "avgPx": "0.19709989",
+                    "fillPx": "0.1971",
+                    "fee": "-0.0905674",
+                    "pnl": "-0.12",
+                    "fillTime": str(fill_timestamp_ms),
+                }
+            ],
+        },
+        filled_at=now - timedelta(minutes=5),
+        created_at=now - timedelta(minutes=5),
+    )
+
+
 @pytest.mark.asyncio
 async def test_okx_authoritative_sync_expands_exchange_window_for_selected_local_fill(
     tmp_path,
@@ -2499,6 +2560,76 @@ async def test_okx_authoritative_sync_accepts_identity_complete_persisted_fill(
         assert "local_order_not_found_in_recent_okx_fills" not in issue_kinds
         assert "local_order_quantity_differs_from_okx_fill" not in issue_kinds
         assert "local_order_verified_from_persisted_okx_fills" in observation_kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_accepts_identity_complete_persisted_order_detail(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-persisted-order-detail.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(_order_detail_confirmed_lqty_order(now=datetime.now(UTC)))
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            executor_factory=_EmptyConfirmedFillExecutor,
+        ).collect()
+
+        issue_kinds = {issue["kind"] for issue in report["issues"]}
+        observation_kinds = {item["kind"] for item in report["observations"]}
+        assert "local_order_not_found_in_recent_okx_fills" not in issue_kinds
+        assert "local_order_quantity_differs_from_okx_fill" not in issue_kinds
+        assert (
+            "local_order_verified_from_persisted_okx_order_detail"
+            in observation_kinds
+        )
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_rejects_wrong_persisted_order_detail_identity(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-wrong-order-detail.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                _order_detail_confirmed_lqty_order(
+                    now=datetime.now(UTC),
+                    raw_order_id="different-order",
+                )
+            )
+
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            executor_factory=_EmptyConfirmedFillExecutor,
+        ).collect()
+
+        issue_kinds = {issue["kind"] for issue in report["issues"]}
+        observation_kinds = {item["kind"] for item in report["observations"]}
+        assert "local_order_not_found_in_recent_okx_fills" in issue_kinds
+        assert (
+            "local_order_verified_from_persisted_okx_order_detail"
+            not in observation_kinds
+        )
     finally:
         await close_db()
 

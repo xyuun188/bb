@@ -994,7 +994,7 @@ class DataService:
                 issue=ticker_consistency_issue,
                 age_seconds=self._ticker_snapshot_age_seconds(ticker),
             )
-        elif ticker:
+        elif ticker and not ticker_fresh:
             logger.info(
                 "ticker cache stale; refreshing from OKX REST",
                 symbol=normalized,

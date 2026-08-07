@@ -683,7 +683,7 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     assert row["order_fact_sync"]["unverified_count"] == 0
     assert factory_kwargs["limit"] == 100
     assert factory_kwargs["priority_only"] is False
-    assert factory_kwargs["timeout_seconds"] == 45.0
+    assert factory_kwargs["timeout_seconds"] == 60.0
     assert row["sync_scope"] == "account_discovery"
     assert service._okx_order_fact_discovery_last_finished_at is not None
     service._okx_order_fact_sync_last_row = row
@@ -755,6 +755,30 @@ async def test_okx_order_fact_sync_pull_degraded_does_not_create_state_differenc
     assert "不把拉取失败误判为当前状态差异" in row["note"]
     assert summary["requires_attention_count"] == 0
     assert summary["degraded_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_account_discovery_backs_off_before_retrying_full_scan() -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeOrderFactSyncService:
+        async def sync(self) -> dict[str, Any]:
+            return {
+                "status": "deferred",
+                "okx_pull_available": False,
+                "confirmed_count": 0,
+                "unverified_count": 0,
+                "backfilled_count": 0,
+                "error": "order_fact_sync_hard_deadline_exceeded",
+            }
+
+    service.okx_order_fact_sync_factory = lambda **_kwargs: FakeOrderFactSyncService()
+
+    row = await service._sync_okx_order_facts_for_loop()
+
+    assert row["sync_scope"] == "account_discovery"
+    assert service._okx_order_fact_discovery_last_attempt_at is not None
+    assert service._okx_order_fact_account_discovery_due() is False
 
 
 @pytest.mark.asyncio
@@ -956,7 +980,7 @@ def test_non_market_discovery_feature_fetch_keeps_complete_source_policy() -> No
         run_position_analysis=True,
     )
 
-    assert options["block_on_remote_ticker"] is True
+    assert options["block_on_remote_ticker"] is False
     assert options["block_on_remote_indicators"] is True
     assert options["block_on_remote_derivatives"] is True
     assert options["allow_cached_indicator_build"] is True

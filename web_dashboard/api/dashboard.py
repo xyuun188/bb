@@ -3941,6 +3941,11 @@ async def _dashboard_position_history_rows(
         for row in settled_rows
         for token in _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
     }
+    settled_entry_ids = {
+        token
+        for row in settled_rows
+        for token in _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
+    }
     settled_position_ids = {
         int(position_id)
         for row in settled_rows
@@ -3953,6 +3958,10 @@ async def _dashboard_position_history_rows(
         if not (
             _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
             & settled_close_ids
+        )
+        and not (
+            _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
+            & settled_entry_ids
         )
         and not (
             {

@@ -13,6 +13,9 @@ from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_
 from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api.dashboard import (
     _dashboard_pending_closed_position_rows,
+    _dashboard_position_history_rows,
+)
+from web_dashboard.api.dashboard import (
     get_positions as get_dashboard_positions,
 )
 from web_dashboard.api.trades import (
@@ -23,7 +26,9 @@ from web_dashboard.api.trades import (
     get_trade_detail,
     get_trades,
 )
-from web_dashboard.api.trades import get_positions as get_trade_positions
+from web_dashboard.api.trades import (
+    get_positions as get_trade_positions,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -410,6 +415,75 @@ async def test_dashboard_position_history_shows_confirmed_close_awaiting_officia
         "official_position_history_identity_unresolved",
         "positions_history_no_matching_row",
     ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_position_history_drops_pending_fragment_covered_by_settled_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_dashboard.api import dashboard as dashboard_api
+
+    settled_row = {
+        "id": "official-lifecycle",
+        "entry_order_ids": ["shared-entry"],
+        "close_order_ids": ["final-close"],
+        "position_ids": [10],
+        "closed_at": datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+    }
+    covered_fragment = {
+        "id": "covered-partial-close",
+        "entry_order_ids": ["shared-entry"],
+        "close_order_ids": ["early-partial-close"],
+        "position_ids": [11],
+        "closed_at": datetime(2026, 8, 5, 8, 0, tzinfo=UTC),
+    }
+    distinct_pending = {
+        "id": "distinct-pending-close",
+        "entry_order_ids": ["distinct-entry"],
+        "close_order_ids": ["distinct-close"],
+        "position_ids": [12],
+        "closed_at": datetime(2026, 8, 7, 8, 0, tzinfo=UTC),
+    }
+
+    async def fake_settled_rows(*_args, **_kwargs):
+        return [settled_row], 1, 1, 1, "okx_positions_history_official"
+
+    async def fake_pending_rows(*_args, **_kwargs):
+        return [covered_fragment, distinct_pending]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_closed_position_ledger_rows",
+        fake_settled_rows,
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_pending_closed_position_rows",
+        fake_pending_rows,
+    )
+
+    rows, total, page, pages, source, settled_count, pending_count = (
+        await _dashboard_position_history_rows(
+            None,
+            None,
+            mode="paper",
+            page=1,
+            page_size=20,
+        )
+    )
+
+    assert [row["id"] for row in rows] == [
+        "distinct-pending-close",
+        "official-lifecycle",
+    ]
+    assert total == 2
+    assert page == 1
+    assert pages == 1
+    assert source == (
+        "okx_positions_history_official_plus_okx_confirmed_pending_settlement"
+    )
+    assert settled_count == 1
+    assert pending_count == 1
 
 
 @pytest.mark.asyncio

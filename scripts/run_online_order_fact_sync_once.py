@@ -76,6 +76,9 @@ async def main():
             "unverified_count": report.get("unverified_count"),
             "backfilled_count": report.get("backfilled_count"),
             "contract_size_deferred_count": report.get("contract_size_deferred_count"),
+            "missing_closed_position_recovered_count": report.get(
+                "missing_closed_position_recovered_count"
+            ),
             "completed_stages": report.get("completed_stages", []),
             "deferred_stages": report.get("deferred_stages", []),
             "stage_errors": report.get("stage_errors", []),

@@ -1061,14 +1061,31 @@ class OkxAuthoritativeSyncService:
                             )
                         )
                         continue
+                    raw_fill = _safe_dict(getattr(order, "okx_raw_fills", None))
+                    order_detail_confirmed = bool(
+                        raw_fill.get("order_detail_confirmed") is True
+                        and raw_fill.get("fills_history_confirmed") is False
+                        and str(raw_fill.get("source") or "").strip()
+                        == "okx_order_detail"
+                    )
                     issues.append(
                         OkxAuthoritativeIssue(
-                            kind="local_order_verified_from_persisted_okx_fills",
+                            kind=(
+                                "local_order_verified_from_persisted_okx_order_detail"
+                                if order_detail_confirmed
+                                else "local_order_verified_from_persisted_okx_fills"
+                            ),
                             classification="observation",
                             severity="info",
                             reason=(
-                                "The bounded OKX pull omitted this order, but its persisted "
-                                "OKX-confirmed raw fill rows passed exact identity validation."
+                                "The bounded OKX fill pull omitted this order, but its "
+                                + (
+                                    "persisted OKX order-detail execution passed exact "
+                                    "identity validation."
+                                    if order_detail_confirmed
+                                    else "persisted OKX-confirmed raw fill rows passed "
+                                    "exact identity validation."
+                                )
                             ),
                             symbol=order_symbol,
                             side=str(order.side or "").lower(),
@@ -1835,12 +1852,23 @@ def _local_order_persisted_confirmed_okx_fill(
     *,
     exchange_order_id: str,
 ) -> OkxFillGroup | None:
-    """Rebuild a previously confirmed OKX fill only from identity-complete raw rows."""
+    """Rebuild a confirmed execution only from identity-complete persisted OKX rows."""
 
-    if str(getattr(order, "okx_sync_status", "") or "").strip() != "okx_confirmed":
-        return None
     raw = _safe_dict(getattr(order, "okx_raw_fills", None))
-    if raw.get("fills_history_confirmed") is not True:
+    sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
+    if (
+        sync_status == "okx_order_detail_confirmed"
+        and raw.get("order_detail_confirmed") is True
+        and raw.get("fills_history_confirmed") is False
+        and raw.get("execution_result_confirmed") is False
+        and str(raw.get("source") or "").strip() == "okx_order_detail"
+    ):
+        return _local_order_persisted_confirmed_okx_order_detail(
+            order,
+            exchange_order_id=exchange_order_id,
+            raw=raw,
+        )
+    if sync_status != "okx_confirmed" or raw.get("fills_history_confirmed") is not True:
         return None
     requested_order_id = str(exchange_order_id or "").strip()
     raw_order_id = str(raw.get("order_id") or "").strip()
@@ -1913,6 +1941,105 @@ def _local_order_persisted_confirmed_okx_fill(
         timestamp=group.timestamp,
         raw_count=group.raw_count,
         rows=group.rows,
+    )
+
+
+def _local_order_persisted_confirmed_okx_order_detail(
+    order: Order,
+    *,
+    exchange_order_id: str,
+    raw: dict[str, Any],
+) -> OkxFillGroup | None:
+    """Validate an aggregate OKX order detail without promoting it to fill history."""
+
+    requested_order_id = str(exchange_order_id or "").strip()
+    raw_order_id = str(raw.get("order_id") or "").strip()
+    raw_inst_id = str(raw.get("inst_id") or "").strip().upper()
+    local_inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+    local_side = str(getattr(order, "side", "") or "").strip().lower()
+    rows = raw.get("rows")
+    if (
+        not requested_order_id
+        or raw_order_id != requested_order_id
+        or not raw_inst_id
+        or local_inst_id != raw_inst_id
+        or not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], dict)
+    ):
+        return None
+
+    detail = rows[0]
+    detail_order_id = str(detail.get("ordId") or "").strip()
+    detail_inst_id = str(detail.get("instId") or "").strip().upper()
+    detail_side = str(detail.get("side") or "").strip().lower()
+    detail_state = str(detail.get("state") or "").strip().lower()
+    detail_trade_id = str(detail.get("tradeId") or "").strip()
+    detail_contracts = _safe_float(detail.get("accFillSz") or detail.get("fillSz"), 0.0)
+    detail_avg_price = _safe_float(detail.get("avgPx") or detail.get("fillPx"), 0.0)
+    detail_fee_abs = abs(_safe_float(detail.get("fee"), 0.0))
+    detail_fill_pnl = _safe_float(detail.get("fillPnl") or detail.get("pnl"), 0.0)
+    detail_timestamp_ms = _safe_float(
+        detail.get("fillTime") or detail.get("uTime") or detail.get("cTime"),
+        0.0,
+    )
+    raw_trade_id_values = raw.get("trade_ids")
+    if not isinstance(raw_trade_id_values, (list, tuple, set)):
+        return None
+    raw_trade_ids = {
+        str(item).strip() for item in raw_trade_id_values if str(item).strip()
+    }
+    stored_trade_ids = {
+        item.strip()
+        for item in str(getattr(order, "okx_trade_ids", "") or "").split(",")
+        if item.strip()
+    }
+    raw_contracts = _safe_float(raw.get("contracts"), 0.0)
+    stored_contracts = _safe_float(getattr(order, "okx_fill_contracts", None), 0.0)
+    raw_avg_price = _safe_float(raw.get("avg_price"), 0.0)
+    raw_fee_abs = _safe_float(raw.get("fee_abs"), -1.0)
+    raw_fill_pnl = _safe_float(raw.get("fill_pnl"), 0.0)
+    contract_size = _local_order_verified_okx_raw_contract_size(order)
+    identity_matches = bool(
+        detail_order_id == requested_order_id
+        and detail_inst_id == raw_inst_id
+        and detail_side == local_side
+        and detail_state == "filled"
+        and detail_trade_id
+        and raw_trade_ids == {detail_trade_id}
+        and (not stored_trade_ids or stored_trade_ids == raw_trade_ids)
+        and raw_contracts > 0
+        and stored_contracts > 0
+        and _relative_close_enough(detail_contracts, raw_contracts, 0.000001)
+        and _relative_close_enough(stored_contracts, raw_contracts, 0.000001)
+        and raw_avg_price > 0
+        and _relative_close_enough(detail_avg_price, raw_avg_price, 0.000001)
+        and detail.get("fee") is not None
+        and raw_fee_abs >= 0
+        and _relative_close_enough(detail_fee_abs, raw_fee_abs, 0.000001)
+        and _relative_close_enough(detail_fill_pnl, raw_fill_pnl, 0.000001)
+        and detail_timestamp_ms > 0
+        and contract_size > 0
+    )
+    if not identity_matches:
+        return None
+
+    timestamp = datetime.fromtimestamp(detail_timestamp_ms / 1000.0, tz=UTC)
+    return OkxFillGroup(
+        order_id=requested_order_id,
+        trade_ids=(detail_trade_id,),
+        inst_id=raw_inst_id,
+        symbol=symbol_from_okx_inst_id(raw_inst_id),
+        side=local_side,
+        pos_side=str(detail.get("posSide") or "").strip().lower(),
+        contracts=raw_contracts,
+        avg_price=raw_avg_price,
+        fee_abs=raw_fee_abs,
+        fill_pnl=raw_fill_pnl,
+        timestamp_ms=detail_timestamp_ms,
+        timestamp=timestamp,
+        raw_count=1,
+        rows=(dict(detail),),
     )
 
 

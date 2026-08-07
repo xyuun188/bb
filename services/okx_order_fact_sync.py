@@ -16,7 +16,7 @@ from math import isclose
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, exists, func, or_, select, text
 
 from config.settings import settings
 from core.safe_output import safe_error_text
@@ -29,7 +29,7 @@ from core.symbols import (
 from db.session import get_engine, get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
-from models.trade import Order
+from models.trade import Order, Position
 from services.exchange_exit_decision_lineage import (
     ExitDecisionLineageAmbiguous,
     recover_exit_decision_lineage_from_order_fact,
@@ -50,6 +50,11 @@ from services.okx_native_facts import (
 from services.okx_protection_position_recovery import (
     confirmed_protection_lifecycle,
     recover_protection_position_lifecycles,
+)
+from services.order_position_reconciliation import (
+    apply_missing_closed_position_plan,
+    classify_missing_closed_position_plan,
+    plan_missing_closed_position,
 )
 from services.paper_training import (
     paper_training_contract_reasons,
@@ -118,6 +123,7 @@ class OkxOrderFactSyncSummary:
     protection_execution_count: int = 0
     position_lifecycle_recovered_count: int = 0
     exit_lineage_recovered_count: int = 0
+    missing_closed_position_recovered_count: int = 0
     protection_execution_error: str | None = None
     completed_stages: tuple[str, ...] = ()
     deferred_stages: tuple[str, ...] = ()
@@ -146,6 +152,7 @@ class OkxOrderFactSyncSummary:
             "protection_execution_count": self.protection_execution_count,
             "position_lifecycle_recovered_count": self.position_lifecycle_recovered_count,
             "exit_lineage_recovered_count": self.exit_lineage_recovered_count,
+            "missing_closed_position_recovered_count": self.missing_closed_position_recovered_count,
             "protection_execution_error": self.protection_execution_error,
             "completed_stages": list(self.completed_stages),
             "deferred_stages": list(self.deferred_stages),
@@ -450,6 +457,7 @@ class OkxOrderFactSyncService:
         priority_local_checked = 0
         priority_samples: list[dict[str, Any]] = []
         exit_lineage_recovered_count = 0
+        missing_closed_position_recovered_count = 0
         account_fills_complete = False
         account_orders_complete = False
         target_fill_order_ids: set[str] = set()
@@ -587,6 +595,7 @@ class OkxOrderFactSyncService:
                         priority_skipped_old_count,
                         local_priority_contract_size_deferred_count,
                         priority_exit_lineage_recovered_count,
+                        priority_missing_closed_position_recovered_count,
                         priority_exit_lineage_errors,
                         local_priority_samples,
                     ) = await self._persist_priority_fill_facts(
@@ -601,10 +610,15 @@ class OkxOrderFactSyncService:
                     )
                     priority_samples.extend(local_priority_samples)
                     exit_lineage_recovered_count += priority_exit_lineage_recovered_count
+                    missing_closed_position_recovered_count += (
+                        priority_missing_closed_position_recovered_count
+                    )
                     stage_errors.extend(priority_exit_lineage_errors)
                     completed_stages.append("priority_order_facts_persisted")
                     if priority_exit_lineage_recovered_count:
                         completed_stages.append("exit_decision_lineage_auto_recovered")
+                    if priority_missing_closed_position_recovered_count:
+                        completed_stages.append("missing_closed_position_auto_recovered")
                     if (
                         not self.recovery_order_ids
                         and urgent_target_order_ids.issubset(targeted_fill_ids)
@@ -633,6 +647,9 @@ class OkxOrderFactSyncService:
                                 priority_contract_size_deferred_count
                             ),
                             exit_lineage_recovered_count=exit_lineage_recovered_count,
+                            missing_closed_position_recovered_count=(
+                                missing_closed_position_recovered_count
+                            ),
                             completed_stages=tuple(completed_stages),
                             deferred_stages=("account_history_after_priority_fast_lane",),
                             skipped_old_count=priority_skipped_old_count,
@@ -666,6 +683,9 @@ class OkxOrderFactSyncService:
                     backfilled_count=priority_backfilled_count,
                     contract_size_deferred_count=priority_contract_size_deferred_count,
                     exit_lineage_recovered_count=exit_lineage_recovered_count,
+                    missing_closed_position_recovered_count=(
+                        missing_closed_position_recovered_count
+                    ),
                     completed_stages=tuple(completed_stages),
                     deferred_stages=("priority_fill_not_yet_observed",),
                     stage_errors=tuple(stage_errors),
@@ -980,6 +1000,25 @@ class OkxOrderFactSyncService:
             samples.extend(position_recovery_samples)
             if confirmed_count or position_lifecycle_recovered_count:
                 await session.flush()
+            missing_position_orders = await self._load_missing_closed_position_recovery_orders(
+                session,
+                since_naive,
+            )
+            missing_closed_position_recovered_count += (
+                await self._recover_missing_closed_positions(
+                    session,
+                    orders=missing_position_orders,
+                    samples=samples,
+                )
+            )
+            if missing_closed_position_recovered_count:
+                completed_stages.append("missing_closed_position_auto_recovered")
+            if (
+                confirmed_count
+                or position_lifecycle_recovered_count
+                or missing_closed_position_recovered_count
+            ):
+                await session.flush()
 
         if not okx_pull_available:
             status = "degraded"
@@ -1005,6 +1044,7 @@ class OkxOrderFactSyncService:
             protection_execution_count=len(protection_execution_by_order_id),
             position_lifecycle_recovered_count=position_lifecycle_recovered_count,
             exit_lineage_recovered_count=exit_lineage_recovered_count,
+            missing_closed_position_recovered_count=missing_closed_position_recovered_count,
             protection_execution_error=protection_execution_error,
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
@@ -1080,6 +1120,25 @@ class OkxOrderFactSyncService:
             samples.extend(position_recovery_samples)
             if confirmed_count or position_lifecycle_recovered_count:
                 await session.flush()
+            missing_position_orders = await self._load_missing_closed_position_recovery_orders(
+                session,
+                since_naive,
+            )
+            missing_closed_position_recovered_count = (
+                await self._recover_missing_closed_positions(
+                    session,
+                    orders=missing_position_orders,
+                    samples=samples,
+                )
+            )
+            if missing_closed_position_recovered_count:
+                completed_stages.append("missing_closed_position_auto_recovered")
+            if (
+                confirmed_count
+                or position_lifecycle_recovered_count
+                or missing_closed_position_recovered_count
+            ):
+                await session.flush()
         return OkxOrderFactSyncSummary(
             status="degraded",
             mode=self.mode,
@@ -1091,6 +1150,7 @@ class OkxOrderFactSyncService:
             confirmed_count=confirmed_count,
             position_lifecycle_recovered_count=position_lifecycle_recovered_count,
             exit_lineage_recovered_count=exit_lineage_recovered_count,
+            missing_closed_position_recovered_count=missing_closed_position_recovered_count,
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
             stage_errors=tuple(stage_errors),
@@ -1203,6 +1263,101 @@ class OkxOrderFactSyncService:
         if recovered_count:
             await session.flush()
         return recovered_count, errors
+
+    async def _load_missing_closed_position_recovery_orders(
+        self,
+        session: Any,
+        since_naive: datetime,
+    ) -> list[Order]:
+        """Lock recent confirmed exits that have no exact local close link."""
+
+        exact_position_link = exists(
+            select(Position.id).where(
+                Position.execution_mode == Order.execution_mode,
+                Position.close_exchange_order_id == Order.exchange_order_id,
+            )
+        )
+        rows = await session.execute(
+            select(Order)
+            .join(AIDecision, AIDecision.id == Order.decision_id)
+            .where(
+                Order.execution_mode == self.mode,
+                Order.status == "filled",
+                Order.exchange_order_id.is_not(None),
+                Order.exchange_order_id != "",
+                or_(Order.created_at >= since_naive, Order.filled_at >= since_naive),
+                func.lower(AIDecision.action).in_(("close_long", "close_short")),
+                ~exact_position_link,
+            )
+            .order_by(Order.filled_at.desc().nullslast(), Order.created_at.desc())
+            .limit(min(self.limit, 100))
+            .with_for_update(skip_locked=True)
+        )
+        return list(rows.scalars().all())
+
+    async def _recover_missing_closed_positions(
+        self,
+        session: Any,
+        *,
+        orders: Iterable[Order],
+        samples: list[dict[str, Any]],
+    ) -> int:
+        """Create history only from two exact, OKX-confirmed local order facts."""
+
+        recovered_count = 0
+        for close_order in orders:
+            if not _order_has_confirmed_okx_fill_fact(
+                close_order,
+                require_verified_contract_size=True,
+            ):
+                continue
+            plan = await plan_missing_closed_position(session, close_order)
+            if plan is None:
+                continue
+            classification = classify_missing_closed_position_plan(plan)
+            if classification.get("status") != "repairable":
+                continue
+            if (
+                int(plan.entry_order_id or 0) <= 0
+                or int(plan.close_order_id or 0) != int(close_order.id or 0)
+                or plan.execution_mode != self.mode
+            ):
+                continue
+            entry_order = await session.get(Order, int(plan.entry_order_id))
+            if entry_order is None or not _order_has_confirmed_okx_fill_fact(
+                entry_order,
+                require_verified_contract_size=True,
+            ):
+                continue
+            if (
+                str(entry_order.exchange_order_id or "").strip()
+                != str(plan.entry_exchange_order_id or "").strip()
+                or str(close_order.exchange_order_id or "").strip()
+                != str(plan.close_exchange_order_id or "").strip()
+            ):
+                continue
+            position = await apply_missing_closed_position_plan(session, plan)
+            recovered_count += 1
+            sample = {
+                "kind": "missing_closed_position_auto_recovered",
+                "mode": self.mode,
+                "position_id": int(position.id),
+                **classification,
+            }
+            samples.append(sample)
+            logger.warning(
+                "recovered missing closed position from exact OKX order facts",
+                mode=self.mode,
+                position_id=position.id,
+                symbol=plan.symbol,
+                side=plan.side,
+                quantity=plan.quantity,
+                entry_order_id=plan.entry_order_id,
+                close_order_id=plan.close_order_id,
+            )
+        if recovered_count:
+            await session.flush()
+        return recovered_count
 
     def _effective_since(self, now: datetime) -> datetime:
         """Return the Phase 3 clean-order boundary.
@@ -1356,7 +1511,7 @@ class OkxOrderFactSyncService:
         target_order_ids: set[str],
         fills: list[OkxNativeFillGroup],
         contract_sizes: dict[str, float],
-    ) -> tuple[int, int, int, int, int, int, list[str], list[dict[str, Any]]]:
+    ) -> tuple[int, int, int, int, int, int, int, list[str], list[dict[str, Any]]]:
         """Commit targeted native fills before slower account-wide history stages."""
 
         fills_by_order_id = {fill.order_id: fill for fill in fills if fill.order_id}
@@ -1415,6 +1570,19 @@ class OkxOrderFactSyncService:
                     samples=samples,
                 )
             )
+            if confirmed_count or exit_lineage_recovered_count:
+                await session.flush()
+            missing_position_orders = await self._load_missing_closed_position_recovery_orders(
+                session,
+                since_naive,
+            )
+            missing_closed_position_recovered_count = (
+                await self._recover_missing_closed_positions(
+                    session,
+                    orders=missing_position_orders,
+                    samples=samples,
+                )
+            )
             return (
                 len(priority_orders),
                 confirmed_count,
@@ -1422,6 +1590,7 @@ class OkxOrderFactSyncService:
                 skipped_old_count,
                 contract_size_deferred_count,
                 exit_lineage_recovered_count,
+                missing_closed_position_recovered_count,
                 exit_lineage_errors,
                 samples,
             )

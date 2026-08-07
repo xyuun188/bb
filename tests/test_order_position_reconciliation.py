@@ -154,7 +154,7 @@ async def test_official_okx_history_prevents_duplicate_closed_position_repair(
     )
     await init_db()
     try:
-        opened_at = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)
+        opened_at = datetime.now(UTC) - timedelta(days=1)
         closed_at = opened_at + timedelta(minutes=12)
         async with get_session_ctx() as session:
             entry_decision = AIDecision(

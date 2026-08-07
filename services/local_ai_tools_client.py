@@ -79,6 +79,8 @@ class LocalAIToolsClient:
             "readtimeout" in lowered
             or "timed out" in lowered
             or "timeout" in lowered
+            or "batch budget" in lowered
+            or "inference queue" in lowered
             or "超时" in lowered
         )
 
@@ -282,10 +284,13 @@ class LocalAIToolsClient:
             data["errors"] = errors
         if errors and len(errors) == len(tool_specs):
             error_summary = "; ".join(errors.values())
-            self._record_failure(
-                error_summary,
-                open_circuit=not self._is_soft_timeout_failure(error_summary),
+            soft_timeout = all(
+                self._is_soft_timeout_failure(error) for error in errors.values()
             )
+            if soft_timeout:
+                data["soft_timeout"] = True
+            else:
+                self._record_failure(error_summary)
             data.update(self._breaker_fields())
         else:
             self._record_success()

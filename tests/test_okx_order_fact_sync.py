@@ -398,6 +398,30 @@ async def _init_test_db(tmp_path, monkeypatch: pytest.MonkeyPatch, name: str) ->
     await init_db()
 
 
+def _confirmed_order_fact(
+    *,
+    order_id: str,
+    inst_id: str,
+    quantity: float,
+    price: float,
+    fee: float,
+    confirmed: bool = True,
+) -> dict[str, Any]:
+    return {
+        "fills_history_confirmed": confirmed,
+        "order_id": order_id,
+        "trade_ids": [f"trade-{order_id}"],
+        "inst_id": inst_id,
+        "contracts": quantity,
+        "avg_price": price,
+        "contract_size": 1.0,
+        "contract_size_verified": True,
+        "contract_size_source": "okx_public_instruments",
+        "base_quantity": quantity,
+        "fee_abs": fee,
+    }
+
+
 @pytest.mark.asyncio
 async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
     tmp_path,
@@ -523,6 +547,216 @@ async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
             )
             assert recovered_count == 0
             assert errors == []
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_recovers_only_exact_confirmed_missing_closed_position(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "missing-position-auto-recovery.db")
+    opened_at = datetime.now(UTC) - timedelta(minutes=5)
+    closed_at = opened_at + timedelta(minutes=3)
+    try:
+        async with get_session_ctx() as session:
+            entry_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="OP/USDT",
+                action="long",
+                confidence=0.8,
+                is_paper=True,
+                was_executed=True,
+            )
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="OP/USDT",
+                action="close_long",
+                confidence=0.8,
+                is_paper=True,
+                was_executed=True,
+            )
+            session.add_all([entry_decision, close_decision])
+            await session.flush()
+            entry_order = Order(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="OP/USDT",
+                side="buy",
+                order_type="market",
+                quantity=1.0,
+                price=0.71,
+                status="filled",
+                fee=0.0001,
+                decision_id=entry_decision.id,
+                exchange_order_id="okx-op-entry",
+                okx_inst_id="OP-USDT-SWAP",
+                okx_raw_fills=_confirmed_order_fact(
+                    order_id="okx-op-entry",
+                    inst_id="OP-USDT-SWAP",
+                    quantity=1.0,
+                    price=0.71,
+                    fee=0.0001,
+                ),
+                filled_at=opened_at,
+                created_at=opened_at,
+            )
+            close_order = Order(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="OP/USDT",
+                side="sell",
+                order_type="market",
+                quantity=1.0,
+                price=0.7099,
+                status="filled",
+                fee=0.0001,
+                decision_id=close_decision.id,
+                exchange_order_id="okx-op-close",
+                okx_inst_id="OP-USDT-SWAP",
+                okx_raw_fills=_confirmed_order_fact(
+                    order_id="okx-op-close",
+                    inst_id="OP-USDT-SWAP",
+                    quantity=1.0,
+                    price=0.7099,
+                    fee=0.0001,
+                ),
+                filled_at=closed_at,
+                created_at=closed_at,
+            )
+            session.add_all([entry_order, close_order])
+
+        service = OkxOrderFactSyncService(mode="paper")
+        samples: list[dict[str, Any]] = []
+        since_naive = (opened_at - timedelta(minutes=1)).replace(tzinfo=None)
+        async with get_session_ctx() as session:
+            candidates = await service._load_missing_closed_position_recovery_orders(
+                session,
+                since_naive,
+            )
+            recovered = await service._recover_missing_closed_positions(
+                session,
+                orders=candidates,
+                samples=samples,
+            )
+
+        assert recovered == 1
+        assert samples[-1]["kind"] == "missing_closed_position_auto_recovered"
+        async with get_session_ctx() as session:
+            position = (await session.execute(select(Position))).scalar_one()
+            candidates = await service._load_missing_closed_position_recovery_orders(
+                session,
+                since_naive,
+            )
+            repeated = await service._recover_missing_closed_positions(
+                session,
+                orders=candidates,
+                samples=[],
+            )
+        assert position.close_exchange_order_id == "okx-op-close"
+        assert position.entry_exchange_order_id == "okx-op-entry"
+        assert position.settlement_source == "missing_closed_position_repair"
+        assert repeated == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_order_fact_sync_does_not_recover_with_unconfirmed_entry_fact(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "missing-position-unconfirmed-entry.db")
+    opened_at = datetime.now(UTC) - timedelta(minutes=5)
+    closed_at = opened_at + timedelta(minutes=3)
+    try:
+        async with get_session_ctx() as session:
+            entry_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="OP/USDT",
+                action="long",
+                confidence=0.8,
+                is_paper=True,
+                was_executed=True,
+            )
+            close_decision = AIDecision(
+                model_name="ensemble_trader",
+                symbol="OP/USDT",
+                action="close_long",
+                confidence=0.8,
+                is_paper=True,
+                was_executed=True,
+            )
+            session.add_all([entry_decision, close_decision])
+            await session.flush()
+            session.add_all(
+                [
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="OP/USDT",
+                        side="buy",
+                        order_type="market",
+                        quantity=1.0,
+                        price=0.71,
+                        status="filled",
+                        fee=0.0001,
+                        decision_id=entry_decision.id,
+                        exchange_order_id="okx-unconfirmed-entry",
+                        okx_inst_id="OP-USDT-SWAP",
+                        okx_raw_fills=_confirmed_order_fact(
+                            order_id="okx-unconfirmed-entry",
+                            inst_id="OP-USDT-SWAP",
+                            quantity=1.0,
+                            price=0.71,
+                            fee=0.0001,
+                            confirmed=False,
+                        ),
+                        filled_at=opened_at,
+                        created_at=opened_at,
+                    ),
+                    Order(
+                        model_name="ensemble_trader",
+                        execution_mode="paper",
+                        symbol="OP/USDT",
+                        side="sell",
+                        order_type="market",
+                        quantity=1.0,
+                        price=0.7099,
+                        status="filled",
+                        fee=0.0001,
+                        decision_id=close_decision.id,
+                        exchange_order_id="okx-confirmed-close",
+                        okx_inst_id="OP-USDT-SWAP",
+                        okx_raw_fills=_confirmed_order_fact(
+                            order_id="okx-confirmed-close",
+                            inst_id="OP-USDT-SWAP",
+                            quantity=1.0,
+                            price=0.7099,
+                            fee=0.0001,
+                        ),
+                        filled_at=closed_at,
+                        created_at=closed_at,
+                    ),
+                ]
+            )
+
+        service = OkxOrderFactSyncService(mode="paper")
+        async with get_session_ctx() as session:
+            candidates = await service._load_missing_closed_position_recovery_orders(
+                session,
+                (opened_at - timedelta(minutes=1)).replace(tzinfo=None),
+            )
+            recovered = await service._recover_missing_closed_positions(
+                session,
+                orders=candidates,
+                samples=[],
+            )
+        assert recovered == 0
+        async with get_session_ctx() as session:
+            positions = list((await session.execute(select(Position))).scalars().all())
+        assert positions == []
     finally:
         await close_db()
 

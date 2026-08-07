@@ -892,6 +892,7 @@ class TradingService:
         self._okx_order_fact_sync_task: asyncio.Task | None = None
         self._okx_order_fact_sync_last_started_at: datetime | None = None
         self._okx_order_fact_sync_last_finished_at: datetime | None = None
+        self._okx_order_fact_discovery_last_attempt_at: datetime | None = None
         self._okx_order_fact_discovery_last_finished_at: datetime | None = None
         self._okx_order_fact_sync_last_row: dict[str, Any] | None = None
         self._okx_order_fact_sync_last_error: str | None = None
@@ -1167,16 +1168,25 @@ class TradingService:
             "_okx_order_fact_discovery_last_finished_at",
             None,
         )
-        if not isinstance(last_finished_at, datetime):
+        last_attempt_at = getattr(
+            self,
+            "_okx_order_fact_discovery_last_attempt_at",
+            None,
+        )
+        reference_at = max(
+            (value for value in (last_finished_at, last_attempt_at) if isinstance(value, datetime)),
+            default=None,
+        )
+        if reference_at is None:
             return True
-        return (now - last_finished_at).total_seconds() >= (
+        return (now - reference_at).total_seconds() >= (
             self.okx_order_fact_discovery_interval_seconds()
         )
 
     def okx_order_fact_sync_timeout_seconds(self) -> float:
         """Keep background order facts independent from the current-position gate budget."""
 
-        return 45.0
+        return 60.0
 
     def okx_settlement_fact_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""
@@ -1392,6 +1402,11 @@ class TradingService:
             "_okx_order_fact_discovery_last_finished_at",
             None,
         )
+        discovery_attempt_at = getattr(
+            self,
+            "_okx_order_fact_discovery_last_attempt_at",
+            None,
+        )
         last_row = getattr(self, "_okx_order_fact_sync_last_row", None)
         last_finished_age_seconds = (
             max((now - finished_at).total_seconds(), 0.0)
@@ -1432,6 +1447,11 @@ class TradingService:
             "account_discovery_last_finished_at": (
                 discovery_finished_at.isoformat()
                 if isinstance(discovery_finished_at, datetime)
+                else None
+            ),
+            "account_discovery_last_attempt_at": (
+                discovery_attempt_at.isoformat()
+                if isinstance(discovery_attempt_at, datetime)
                 else None
             ),
             "account_discovery_age_seconds": (
@@ -1586,6 +1606,8 @@ class TradingService:
             }
         mode = "live" if mode_manager.mode.value == "live" else "paper"
         account_discovery = self._okx_order_fact_account_discovery_due()
+        if account_discovery:
+            self._okx_order_fact_discovery_last_attempt_at = datetime.now(UTC)
         report = await factory(
             mode=mode,
             lookback_hours=24,
@@ -4139,7 +4161,10 @@ class TradingService:
 
         market_only = bool(run_market_analysis and not run_position_analysis)
         return {
-            "block_on_remote_ticker": not market_only,
+            # Position review consumes the fresh websocket cache and the
+            # authoritative position snapshot. Final entry analysis still owns
+            # the blocking REST fallback when cached market facts are invalid.
+            "block_on_remote_ticker": False,
             "block_on_remote_indicators": not market_only,
             "block_on_remote_derivatives": not market_only,
             # Cached K-lines and background refreshes are local/read-only. They

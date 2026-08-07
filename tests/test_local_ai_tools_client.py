@@ -404,6 +404,7 @@ async def test_local_ai_tools_readtimeout_does_not_open_circuit(
     assert third["profit_prediction"]["path"] == "/profit/predict"
     assert third["profit_prediction"]["duration_sec"] > 0
     assert "circuit_open_until" not in third
+    assert third["failure_count"] == 0
     assert len(calls) == 9
 
 
@@ -414,6 +415,12 @@ def test_local_ai_tools_localizes_request_timeouts_and_keeps_them_soft() -> None
 
     assert message == "服务器量化工具读取响应超时"
     assert client._is_soft_timeout_failure(message) is True
+    assert client._is_soft_timeout_failure(
+        "server quant tool exceeded the remaining batch budget"
+    ) is True
+    assert client._is_soft_timeout_failure(
+        "local AI tools inference queue exhausted the batch budget"
+    ) is True
 
 
 def test_local_ai_tools_client_refreshes_runtime_settings(
