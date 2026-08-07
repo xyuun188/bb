@@ -21,8 +21,13 @@ if str(ROOT) not in sys.path:
 from config.settings import settings
 from core.remote_ssh import connect_remote_ssh, run_remote_text
 from core.safe_output import safe_print
+from core.symbols import normalize_trading_symbol
 from executor.okx_executor import OKXExecutor
-from services.position_protection_rebalance import apply_protection_repair_actions
+from services.position_protection_rebalance import (
+    PositionProtectionRebalanceError,
+    apply_protection_repair_actions,
+    rebalance_current_position_protection,
+)
 from services.protection_order_integrity import audit_protection_order_integrity
 
 
@@ -62,7 +67,9 @@ def _backup(payload: dict[str, Any]) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     path = directory / f"okx-protection-before-{timestamp}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
     return path
 
 
@@ -71,6 +78,48 @@ async def _apply_actions(
     actions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     return await apply_protection_repair_actions(executor, actions)
+
+
+def _amend_only(actions: list[dict[str, Any]]) -> bool:
+    return bool(actions) and all(
+        str(action.get("action") or "") == "amend_size" for action in actions
+    )
+
+
+async def _repair_unobserved_amends(
+    executor: OKXExecutor,
+    snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Use the runtime's verified create-before-cancel fallback per position key."""
+
+    report = snapshot["report"]
+    actions = list(report.get("repair_actions") or [])
+    if report.get("repair_ready") is not True or not _amend_only(actions):
+        return []
+    keys = sorted(
+        {
+            (
+                normalize_trading_symbol(str(action.get("inst_id") or "")),
+                str(action.get("position_side") or "").lower(),
+            )
+            for action in actions
+        }
+    )
+    results: list[dict[str, Any]] = []
+    for symbol, side in keys:
+        if not symbol or side not in {"long", "short"}:
+            continue
+        try:
+            result = await rebalance_current_position_protection(
+                executor,
+                symbol=symbol,
+                side=side,
+                observation_window="manual_repair_verified_amend_fallback",
+            )
+        except PositionProtectionRebalanceError as exc:
+            result = exc.report
+        results.append(result)
+    return results
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -91,7 +140,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         if not args.expected_fingerprint:
             raise RuntimeError("--apply requires --expected-fingerprint from a fresh dry-run")
         if args.expected_fingerprint != report.get("input_fingerprint"):
-            raise RuntimeError("Protection inventory changed after dry-run; refusing stale repair plan")
+            raise RuntimeError(
+                "Protection inventory changed after dry-run; refusing stale repair plan"
+            )
         if report.get("repair_ready") is not True:
             raise RuntimeError(
                 "Protection repair plan is blocked: "
@@ -99,11 +150,27 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             )
         backup_path = _backup(before)
         output["backup_path"] = str(backup_path)
+        original_actions = list(report.get("repair_actions") or [])
         output["applied_actions"] = await _apply_actions(
             executor,
-            list(report.get("repair_actions") or []),
+            original_actions,
         )
         after = await _snapshot(executor)
+        initial_positions_unchanged = bool(
+            report.get("position_inventory_fingerprint")
+            == after["report"].get("position_inventory_fingerprint")
+        )
+        fallback_rebalances: list[dict[str, Any]] = []
+        if (
+            initial_positions_unchanged
+            and _amend_only(original_actions)
+            and after["report"].get("coverage_mismatches")
+        ):
+            fallback_rebalances = await _repair_unobserved_amends(executor, after)
+            for fallback in fallback_rebalances:
+                output["applied_actions"].extend(fallback.get("applied_actions") or [])
+            after = await _snapshot(executor)
+        output["fallback_rebalances"] = fallback_rebalances
         output["after"] = after["report"]
         positions_unchanged = bool(
             report.get("position_inventory_fingerprint")
@@ -112,8 +179,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         output["positions_unchanged"] = positions_unchanged
         output["verified"] = bool(
             positions_unchanged
-            and
-            not after["report"].get("missing_keys")
+            and not after["report"].get("missing_keys")
             and not after["report"].get("orphan_keys")
             and not after["report"].get("coverage_mismatches")
             and not after["report"].get("invalid_orders")

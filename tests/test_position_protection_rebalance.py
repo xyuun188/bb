@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services import position_protection_rebalance
 from services.position_protection_rebalance import (
     PositionProtectionRebalanceError,
     rebalance_position_protection_after_exit,
@@ -19,11 +20,17 @@ class _Executor:
         protection_contracts: tuple[str, ...] = ("13",),
         fail_algo_id: str = "",
         stuck_algo_id: str = "",
+        ignored_amend_algo_id: str = "",
     ) -> None:
         self.position_contracts = position_contracts
         self.protection_contracts = list(protection_contracts)
+        self.protection_algo_ids = [
+            f"algo-{index}" for index in range(1, len(self.protection_contracts) + 1)
+        ]
+        self.next_algo_index = len(self.protection_contracts) + 1
         self.fail_algo_id = fail_algo_id
         self.stuck_algo_id = stuck_algo_id
+        self.ignored_amend_algo_id = ignored_amend_algo_id
         self.amend_calls: list[dict[str, Any]] = []
         self.create_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[dict[str, Any]] = []
@@ -48,7 +55,7 @@ class _Executor:
             {
                 "symbol": "IRYS/USDT",
                 "position_side": "short",
-                "algo_id": f"algo-{index}",
+                "algo_id": algo_id,
                 "contracts": contracts,
                 "reduce_only": True,
                 "state": "live",
@@ -58,7 +65,10 @@ class _Executor:
                 "created_at_ms": index,
                 "raw": {"info": {"instId": "IRYS-USDT-SWAP"}},
             }
-            for index, contracts in enumerate(self.protection_contracts, start=1)
+            for index, (algo_id, contracts) in enumerate(
+                zip(self.protection_algo_ids, self.protection_contracts, strict=True),
+                start=1,
+            )
         ]
 
     async def get_open_orders_strict(self, _symbol: str | None) -> list[dict[str, Any]]:
@@ -84,7 +94,9 @@ class _Executor:
             )
         if algo_id == self.fail_algo_id:
             return {"code": "1", "data": [{"algoId": algo_id, "sCode": "51000"}]}
-        index = int(algo_id.rsplit("-", 1)[-1]) - 1
+        if algo_id == self.ignored_amend_algo_id:
+            return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
+        index = self.protection_algo_ids.index(algo_id)
         self.protection_contracts[index] = str(contracts).removesuffix(".0")
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
@@ -95,7 +107,8 @@ class _Executor:
         algo_id: str,
     ) -> dict[str, Any]:
         self.cancel_calls.append({"inst_id": inst_id, "algo_id": algo_id})
-        index = int(algo_id.rsplit("-", 1)[-1]) - 1
+        index = self.protection_algo_ids.index(algo_id)
+        self.protection_algo_ids.pop(index)
         self.protection_contracts.pop(index)
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
@@ -120,7 +133,9 @@ class _Executor:
             }
         )
         self.protection_contracts.append(str(contracts).removesuffix(".0"))
-        algo_id = f"algo-{len(self.protection_contracts)}"
+        algo_id = f"algo-{self.next_algo_index}"
+        self.next_algo_index += 1
+        self.protection_algo_ids.append(algo_id)
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
 
@@ -186,7 +201,10 @@ async def test_resize_failure_rolls_back_prior_amendment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stuck_okx_amend_is_replaced_without_unprotected_gap() -> None:
+async def test_stuck_okx_amend_is_replaced_without_unprotected_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
     executor = _Executor(
         position_contracts="5",
         protection_contracts=("13",),
@@ -210,6 +228,38 @@ async def test_stuck_okx_amend_is_replaced_without_unprotected_gap() -> None:
     ]
     assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-1"}]
     assert result["applied_actions"][0]["action"]["action"] == "replace_stuck_amend"
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_but_unapplied_amend_uses_verified_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    executor = _Executor(
+        position_contracts="5",
+        protection_contracts=("13",),
+        ignored_amend_algo_id="algo-1",
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert result["status"] == "repaired"
+    assert result["fallback_reason"] == "okx_amend_acknowledged_but_not_observed"
+    assert result["amend_verification_attempts"] == 4
+    assert executor.protection_contracts == ["5"]
+    assert executor.create_calls == [
+        {
+            "inst_id": "IRYS-USDT-SWAP",
+            "position_side": "short",
+            "okx_position_side": "net",
+            "contracts": 5.0,
+            "stop_loss_price": 0.16,
+            "take_profit_price": 0.14,
+        }
+    ]
+    assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-1"}]
+    assert result["applied_actions"][-1]["action"]["action"] == "replace_stuck_amend"
 
 
 @pytest.mark.asyncio

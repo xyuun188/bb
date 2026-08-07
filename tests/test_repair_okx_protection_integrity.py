@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from scripts import repair_okx_protection_integrity as repair
+from services import position_protection_rebalance
 
 
 class _SpecsClient:
@@ -79,9 +80,7 @@ class _RepairExecutor:
         algo_id: str,
         contracts: float,
     ) -> dict[str, Any]:
-        self.amend_calls.append(
-            {"inst_id": inst_id, "algo_id": algo_id, "contracts": contracts}
-        )
+        self.amend_calls.append({"inst_id": inst_id, "algo_id": algo_id, "contracts": contracts})
         self.protection_contracts = str(contracts).removesuffix(".0")
         if type(self).mutate_position_on_apply:
             self.position_contracts = "12"
@@ -98,6 +97,77 @@ class _RepairExecutor:
 
     async def shutdown(self) -> None:
         self.shutdown_called = True
+
+
+class _IgnoredAmendRepairExecutor(_RepairExecutor):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        super().__init__(*_args, **_kwargs)
+        self.protection_orders = [("algo-irys", "20")]
+        self.create_calls: list[dict[str, Any]] = []
+
+    async def get_position_protection_orders(
+        self,
+        _symbol: str | None,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "symbol": "IRYS/USDT",
+                "position_side": "short",
+                "algo_id": algo_id,
+                "contracts": contracts,
+                "reduce_only": True,
+                "state": "live",
+                "order_type": "oco",
+                "stop_loss_price": 0.16,
+                "take_profit_price": 0.14,
+                "created_at_ms": index,
+                "raw": {"info": {"instId": "IRYS-USDT-SWAP"}},
+            }
+            for index, (algo_id, contracts) in enumerate(self.protection_orders, start=1)
+        ]
+
+    async def amend_position_protection_size(
+        self,
+        *,
+        inst_id: str,
+        algo_id: str,
+        contracts: float,
+    ) -> dict[str, Any]:
+        self.amend_calls.append({"inst_id": inst_id, "algo_id": algo_id, "contracts": contracts})
+        return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
+
+    async def create_position_protection_order(
+        self,
+        *,
+        inst_id: str,
+        position_side: str,
+        okx_position_side: str,
+        contracts: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+    ) -> dict[str, Any]:
+        self.create_calls.append(
+            {
+                "inst_id": inst_id,
+                "position_side": position_side,
+                "okx_position_side": okx_position_side,
+                "contracts": contracts,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
+            }
+        )
+        self.protection_orders.append(("algo-replacement", str(contracts).removesuffix(".0")))
+        return {"code": "0", "data": [{"algoId": "algo-replacement", "sCode": "0"}]}
+
+    async def cancel_position_protection_order(
+        self,
+        *,
+        inst_id: str,
+        algo_id: str,
+    ) -> dict[str, Any]:
+        self.cancel_calls.append({"inst_id": inst_id, "algo_id": algo_id})
+        self.protection_orders = [item for item in self.protection_orders if item[0] != algo_id]
+        return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
 
 def _args(*, apply: bool, fingerprint: str = "") -> argparse.Namespace:
@@ -209,3 +279,32 @@ async def test_apply_reports_failure_when_position_changes_during_protection_rep
     assert result["verified"] is False
     assert result["positions_unchanged"] is False
     assert "positions_changed_during_protection_repair" in result["verification_errors"]
+
+
+@pytest.mark.asyncio
+async def test_apply_replaces_acknowledged_but_unobserved_amend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(repair, "OKXExecutor", _IgnoredAmendRepairExecutor)
+    monkeypatch.setattr(repair, "_backup", _backup_to(tmp_path))
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    dry_run = await repair._run(_args(apply=False))
+
+    result = await repair._run(
+        _args(
+            apply=True,
+            fingerprint=dry_run["before"]["input_fingerprint"],
+        )
+    )
+    executor = _RepairExecutor.instances[-1]
+
+    assert result["verified"] is True
+    assert result["verification_errors"] == []
+    assert result["after"]["coverage_mismatches"] == []
+    assert result["fallback_rebalances"][0]["fallback_reason"] == (
+        "okx_amend_acknowledged_but_not_observed"
+    )
+    assert len(executor.amend_calls) == 2
+    assert executor.create_calls[0]["contracts"] == 13.0
+    assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-irys"}]
