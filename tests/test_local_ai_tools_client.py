@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from threading import get_ident
+from time import monotonic, sleep
 from typing import Any
 
 import httpx
@@ -9,6 +11,7 @@ import pytest
 
 from config.settings import settings
 from data_feed.feature_vector import FeatureVector
+from services import local_ai_tools_client as local_ai_tools_client_module
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
@@ -136,8 +139,11 @@ async def test_local_ai_tools_enrich_shares_configured_timeout_across_serial_rou
     assert result["status"] == "completed"
     assert len(timeouts) == 3
     assert all(timeout is not None and 0 < timeout <= 8.0 for timeout in timeouts)
-    assert timeouts == sorted(timeouts, reverse=True)
+    assert timeouts == sorted(timeouts)
     assert result["execution_mode"] == "sequential_cpu_bound"
+    assert result["batch_budget_policy"] == (
+        "remaining_budget_fair_share_with_carry_forward"
+    )
     assert result["batch_budget_seconds"] == 8.0
     assert result["profit_prediction"]["duration_sec"] > 0
     assert result["time_series_prediction"]["duration_sec"] > 0
@@ -215,6 +221,160 @@ async def test_local_ai_tools_keeps_completed_results_when_later_route_exhausts_
         "/sentiment/deep/analyze",
         "/timeseries/predict",
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_slow_first_route_cannot_starve_later_tools(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 0.6)
+    client = LocalAIToolsClient()
+    calls: list[str] = []
+
+    class StaleClient:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stale_client = StaleClient()
+    client._http_client = stale_client  # type: ignore[assignment]
+    client._http_client_base = "http://local-ai-tools.test"
+
+    async def slow_profit(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del payload, request_timeout
+        calls.append(path)
+        if path == "/profit/predict":
+            await asyncio.sleep(1.0)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post", slow_profit)
+
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+
+    assert result["status"] == "partial"
+    assert result["profit_prediction"]["status"] == "timeout"
+    assert result["sentiment_analysis"]["available"] is True
+    assert result["time_series_prediction"]["available"] is True
+    assert result["soft_timeout_tools"] == ["profit_prediction"]
+    assert result["http_connection_reset"] is True
+    assert stale_client.closed is True
+    assert client._http_client is None
+    assert calls == [
+        "/profit/predict",
+        "/sentiment/deep/analyze",
+        "/timeseries/predict",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_timeout_does_not_wait_for_stubborn_request_cleanup(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 0.6)
+    client = LocalAIToolsClient()
+
+    class StaleClient:
+        async def aclose(self) -> None:
+            return None
+
+    client._http_client = StaleClient()  # type: ignore[assignment]
+    client._http_client_base = "http://local-ai-tools.test"
+
+    async def stubborn_post(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del payload, request_timeout
+        if path == "/profit/predict":
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.15)
+                return {"available": True, "path": path}
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post", stubborn_post)
+
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+
+    assert result["profit_prediction"]["status"] == "timeout"
+    assert result["profit_prediction"]["duration_sec"] < 0.3
+    assert result["http_connection_reset"] is True
+    await asyncio.sleep(0.2)
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_client_reset_does_not_wait_for_stubborn_close_cleanup(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_ai_tools_client_module,
+        "_HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    client = LocalAIToolsClient()
+
+    class StubbornClient:
+        async def aclose(self) -> None:
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)
+
+    client._http_client = StubbornClient()  # type: ignore[assignment]
+    client._http_client_base = "http://local-ai-tools.test"
+
+    started = monotonic()
+    reset = await client._reset_http_client()
+    elapsed = monotonic() - started
+
+    assert reset is True
+    assert elapsed < 0.15
+    assert client._http_client is None
+    await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_quant_post_isolated_from_trading_event_loop(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 0.6)
+    client = LocalAIToolsClient()
+    caller_thread = get_ident()
+    worker_threads: set[int] = set()
+
+    def post_sync(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del payload, request_timeout
+        worker_threads.add(get_ident())
+        sleep(0.05)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post_sync", post_sync)
+    task = asyncio.create_task(client.enrich_with_context({"symbol": "BTC/USDT"}))
+    await asyncio.sleep(0.01)
+    sleep(0.3)  # noqa: ASYNC251 - deliberately starve the trading event loop.
+    result = await task
+
+    assert result["status"] == "completed"
+    assert result["profit_prediction"]["available"] is True
+    assert result["sentiment_analysis"]["available"] is True
+    assert result["time_series_prediction"]["available"] is True
+    assert worker_threads
+    assert caller_thread not in worker_threads
 
 
 def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> None:

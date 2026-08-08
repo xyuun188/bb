@@ -48,6 +48,7 @@ _STATUS_CACHE_TTL_SECONDS = 8.0
 _MAX_TIMESERIES_SEQUENCE_LENGTH = 80
 _HTTP_MAX_KEEPALIVE_CONNECTIONS = 4
 _HTTP_MAX_CONNECTIONS = 8
+_HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
 _BATCH_COMPLETION_RESERVE_MAX_SECONDS = 0.4
 _MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
 
@@ -68,6 +69,7 @@ class LocalAIToolsClient:
         self._inference_lock = asyncio.Lock()
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_base: str = ""
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     def _request_timeout(self) -> float:
         return min(max(self._timeout, 0.5), _MAX_REQUEST_TIMEOUT_SECONDS)
@@ -80,6 +82,7 @@ class LocalAIToolsClient:
             or "timed out" in lowered
             or "timeout" in lowered
             or "batch budget" in lowered
+            or "budget exhausted" in lowered
             or "inference queue" in lowered
             or "超时" in lowered
         )
@@ -168,7 +171,12 @@ class LocalAIToolsClient:
         if include_exit_advice and open_positions:
             tool_specs.append(("exit_advice", "/exit/advise"))
 
-        async def call_tool(name: str, path: str) -> dict[str, Any]:
+        async def call_tool(
+            name: str,
+            path: str,
+            *,
+            remaining_tool_count: int,
+        ) -> dict[str, Any]:
             tool_started = datetime.now(UTC)
             remaining_seconds = max(batch_deadline - monotonic(), 0.0)
             if remaining_seconds < _MIN_INFERENCE_ATTEMPT_SECONDS:
@@ -182,29 +190,51 @@ class LocalAIToolsClient:
                         4,
                     ),
                 }
-            tool_timeout = min(request_timeout, remaining_seconds)
-            try:
-                result = await asyncio.wait_for(
-                    self._post(path, payload, request_timeout=tool_timeout),
-                    timeout=tool_timeout,
-                )
-            except TimeoutError:
+            tool_timeout = min(
+                request_timeout,
+                remaining_seconds / max(int(remaining_tool_count or 0), 1),
+            )
+            if tool_timeout < _MIN_INFERENCE_ATTEMPT_SECONDS:
                 return {
                     "available": False,
                     "status": "timeout",
-                    "error": "server quant tool exceeded the remaining batch budget",
+                    "error": "local AI tools fair-share budget exhausted before request",
                     "path": path,
+                    "allocated_timeout_sec": round(tool_timeout, 4),
                     "duration_sec": round(
                         max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                         4,
                     ),
                 }
+            request_task = asyncio.create_task(
+                self._post(path, payload, request_timeout=tool_timeout)
+            )
+            done, _pending = await asyncio.wait({request_task}, timeout=tool_timeout)
+            if not done:
+                request_task.cancel()
+                self._track_background_task(request_task)
+                connection_reset = await self._reset_http_client()
+                return {
+                    "available": False,
+                    "status": "timeout",
+                    "error": "server quant tool exceeded the remaining batch budget",
+                    "path": path,
+                    "allocated_timeout_sec": round(tool_timeout, 4),
+                    "http_connection_reset": connection_reset,
+                    "duration_sec": round(
+                        max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
+                        4,
+                    ),
+                }
+            try:
+                result = request_task.result()
             except Exception as exc:
                 return {
                     "available": False,
                     "status": "error",
                     "error": safe_error_text(exc, limit=180),
                     "path": path,
+                    "allocated_timeout_sec": round(tool_timeout, 4),
                     "duration_sec": round(
                         max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                         4,
@@ -214,6 +244,7 @@ class LocalAIToolsClient:
             item.setdefault("available", True)
             item.setdefault("status", "returned")
             item.setdefault("path", path)
+            item["allocated_timeout_sec"] = round(tool_timeout, 4)
             item["duration_sec"] = round(
                 max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                 4,
@@ -239,8 +270,15 @@ class LocalAIToolsClient:
                     pass
             queue_wait_seconds = max(monotonic() - queue_started, 0.0)
             if lock_acquired:
-                for name, path in tool_specs:
-                    results.append(await call_tool(name, path))
+                tool_count = len(tool_specs)
+                for index, (name, path) in enumerate(tool_specs):
+                    results.append(
+                        await call_tool(
+                            name,
+                            path,
+                            remaining_tool_count=tool_count - index,
+                        )
+                    )
             else:
                 results.extend(
                     {
@@ -262,6 +300,7 @@ class LocalAIToolsClient:
             "started_at": started.isoformat(),
             "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
             "execution_mode": "sequential_cpu_bound",
+            "batch_budget_policy": "remaining_budget_fair_share_with_carry_forward",
             "batch_budget_seconds": round(request_timeout, 3),
             "queue_wait_seconds": round(queue_wait_seconds, 4),
         }
@@ -279,6 +318,21 @@ class LocalAIToolsClient:
                         fallback="local AI tools request failed",
                     )
                 data[name] = item
+        soft_timeout_tools = sorted(
+            name
+            for name, error in errors.items()
+            if self._is_soft_timeout_failure(error)
+        )
+        if soft_timeout_tools:
+            data["soft_timeout"] = True
+            data["soft_timeout_tools"] = soft_timeout_tools
+            http_connection_reset = any(
+                isinstance(item, dict) and item.get("http_connection_reset") is True
+                for item in results
+            )
+            if not http_connection_reset:
+                http_connection_reset = await self._reset_http_client()
+            data["http_connection_reset"] = http_connection_reset
         if errors:
             data["status"] = "partial" if len(errors) < len(tool_specs) else "unavailable"
             data["errors"] = errors
@@ -287,15 +341,30 @@ class LocalAIToolsClient:
             soft_timeout = all(
                 self._is_soft_timeout_failure(error) for error in errors.values()
             )
-            if soft_timeout:
-                data["soft_timeout"] = True
-            else:
+            if not soft_timeout:
                 self._record_failure(error_summary)
             data.update(self._breaker_fields())
         else:
             self._record_success()
             data.update(self._breaker_fields())
         return data
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug(
+                "local AI tools detached request finished with an error",
+                error=safe_error_text(exc, limit=120),
+            )
+
+    def _track_background_task(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._consume_background_task)
 
     def _normalize_signal(self, name: str, item: Any) -> dict[str, Any]:
         if not isinstance(item, dict):
@@ -868,10 +937,24 @@ class LocalAIToolsClient:
                 timeout=request_timeout or self._timeout,
             )
         except httpx.RequestError as exc:
+            await self._reset_http_client()
             raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
 
     async def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._post_sync,
+            path,
+            payload,
+            request_timeout,
+        )
+
+    def _post_sync(
         self,
         path: str,
         payload: dict[str, Any],
@@ -890,13 +973,18 @@ class LocalAIToolsClient:
                 pool=timeout_seconds,
             )
         try:
-            client = await self._shared_http_client(base)
-            response = await client.post(
-                f"{base}{path}",
-                json=payload,
-                headers=self._auth_headers(),
-                timeout=timeout,
-            )
+            with httpx.Client(
+                limits=httpx.Limits(
+                    max_keepalive_connections=0,
+                    max_connections=1,
+                )
+            ) as client:
+                response = client.post(
+                    f"{base}{path}",
+                    json=payload,
+                    headers=self._auth_headers(),
+                    timeout=timeout,
+                )
         except httpx.RequestError as exc:
             raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
@@ -937,6 +1025,39 @@ class LocalAIToolsClient:
             )
             self._http_client_base = base
         return self._http_client
+
+    async def _reset_http_client(self) -> bool:
+        client = self._http_client
+        self._http_client = None
+        self._http_client_base = ""
+        if client is None:
+            return False
+        self._track_background_task(
+            asyncio.create_task(self._close_stale_http_client(client))
+        )
+        return True
+
+    async def _close_stale_http_client(self, client: httpx.AsyncClient) -> None:
+        close_task = asyncio.create_task(client.aclose())
+        try:
+            done, _pending = await asyncio.wait(
+                {close_task},
+                timeout=_HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS,
+            )
+            if not done:
+                close_task.cancel()
+                self._track_background_task(close_task)
+                logger.info(
+                    "local AI tools stale HTTP client close deferred",
+                    timeout_seconds=_HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS,
+                )
+                return
+            close_task.result()
+        except Exception as exc:
+            logger.info(
+                "local AI tools stale HTTP client close deferred",
+                error=safe_error_text(exc, limit=120),
+            )
 
     async def close(self) -> None:
         client = self._http_client
