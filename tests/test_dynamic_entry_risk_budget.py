@@ -641,6 +641,73 @@ async def test_existing_portfolio_stress_does_not_reduce_normal_paper_risk_budge
 
 
 @pytest.mark.asyncio
+async def test_normal_paper_blocks_stressed_same_side_concentration() -> None:
+    decision = _decision()
+    open_positions = [
+        {
+            "symbol": "ETH/USDT",
+            "side": "long",
+            "contracts": 1.0,
+            "current_price": 100.0,
+            "stop_loss": 80.0,
+            "leverage": 5.0,
+            "notional": 100.0,
+            "is_open": True,
+            "info": {"instId": "ETH-USDT-SWAP", "ctVal": "1", "ctMult": "1"},
+        }
+    ]
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", open_positions)
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert sizing["direction_concentration_limit_applied"] is True
+    assert "normal_paper_same_side_concentration_limit" in sizing["reason"]
+
+
+@pytest.mark.asyncio
+async def test_normal_paper_allows_opposite_side_when_concentration_is_high() -> None:
+    decision = _decision()
+    decision.action = Action.SHORT
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="short",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.82,
+            "objective_net_return_pct": 0.52,
+            "loss_probability": 0.25,
+            "quant_evidence_families": ["local_ml"],
+            "strong_expert_opposition": False,
+        },
+    )
+    open_positions = [
+        {
+            "symbol": "ETH/USDT",
+            "side": "long",
+            "contracts": 1.0,
+            "current_price": 100.0,
+            "stop_loss": 80.0,
+            "leverage": 5.0,
+            "notional": 100.0,
+            "is_open": True,
+            "info": {"instId": "ETH-USDT-SWAP", "ctVal": "1", "ctMult": "1"},
+        }
+    ]
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", open_positions)
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["direction_concentration_limit_applied"] is False
+
+
+@pytest.mark.asyncio
 async def test_execution_reconciliation_rebuilds_every_notional_dependent_field() -> None:
     decision = _decision()
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)

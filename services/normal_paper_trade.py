@@ -30,6 +30,10 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
     "strategy_edge_selected",
 }
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
+# Keep paper training samples flowing while preventing a materially stressed
+# portfolio from continuing to stack one direction.
+NORMAL_PAPER_TRADE_MAX_DIRECTION_CONCENTRATION = 0.90
+NORMAL_PAPER_TRADE_MIN_CONCENTRATION_RISK_FRACTION = 0.01
 NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
 NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
 
