@@ -155,6 +155,8 @@ def test_fixed_ai_models_allow_keyless_loopback_tunnels() -> None:
     assert trend["api_key"] == ""
     assert trend["api_base"] == "http://127.0.0.1:8000/v1"
     assert trend["model"] == "qwen3-14b-trade"
+    assert trend["configured"] is True
+    assert trend["configuration_type"] == "keyless_loopback"
     assert [
         item["name"] for item in cfg.get_fixed_ai_models(include_empty=False)
     ] == ["trend_expert"]
@@ -174,6 +176,9 @@ def test_fixed_ai_models_still_require_keys_for_non_loopback_endpoints() -> None
     )
 
     assert cfg.get_fixed_ai_models(include_empty=False) == []
+    trend = cfg.get_fixed_ai_models(include_empty=True)[0]
+    assert trend["configured"] is False
+    assert trend["configuration_type"] == "missing"
 
 
 def test_dual_14b_config_script_generates_fixed_slot_routing(

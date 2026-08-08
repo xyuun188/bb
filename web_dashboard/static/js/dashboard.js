@@ -8385,8 +8385,9 @@ function renderModelList(models) {
 
     tbody.innerHTML = models.map(m => {
         const loading = m.loading === true;
-        const keyState = m.api_key
-            ? '<span style="color:var(--green);font-size:11px;">已设置</span>'
+        const configured = m.configured === true || Boolean(m.api_key);
+        const keyState = configured
+            ? `<span style="color:var(--green);font-size:11px;">${m.configuration_type === 'keyless_loopback' ? '已设置（本地免 Key）' : '已设置'}</span>`
             : `<span style="color:var(--text-muted);font-size:11px;">${loading ? '加载中' : '未设置'}</span>`;
         const actionButtons = loading
             ? '<button class="btn btn-sm" disabled title="配置加载中">编辑</button><button class="btn btn-sm" disabled title="配置加载中">测试</button>'

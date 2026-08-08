@@ -595,6 +595,14 @@ class Settings(BaseSettings):
                     str(merged.get("model") or ""),
                 )
             )
+            merged["configured"] = configured
+            merged["configuration_type"] = (
+                "api_key"
+                if merged.get("api_key")
+                else "keyless_loopback"
+                if configured
+                else "missing"
+            )
             if include_empty or configured:
                 result.append(merged)
         return result

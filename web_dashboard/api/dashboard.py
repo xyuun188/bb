@@ -3908,6 +3908,44 @@ async def _dashboard_pending_closed_position_rows(
     return rows
 
 
+def _dashboard_filter_pending_settlement_rows(
+    pending_rows: list[dict[str, Any]],
+    settled_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only pending lifecycles not already covered by official rows."""
+    settled_close_ids = {
+        token
+        for row in settled_rows
+        for token in _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
+    }
+    settled_entry_ids = {
+        token
+        for row in settled_rows
+        for token in _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
+    }
+    settled_position_ids = {
+        int(position_id)
+        for row in settled_rows
+        for position_id in row.get("position_ids", [])
+        if position_id is not None
+    }
+    filtered: list[dict[str, Any]] = []
+    for row in pending_rows:
+        row_position_ids = {
+            int(position_id)
+            for position_id in row.get("position_ids", [])
+            if position_id is not None
+        }
+        if _dashboard_split_exchange_order_ids(row.get("close_order_ids")) & settled_close_ids:
+            continue
+        if _dashboard_split_exchange_order_ids(row.get("entry_order_ids")) & settled_entry_ids:
+            continue
+        if row_position_ids & settled_position_ids:
+            continue
+        filtered.append(row)
+    return filtered
+
+
 async def _dashboard_position_history_rows(
     session: Any,
     repo: Any,
@@ -3936,42 +3974,7 @@ async def _dashboard_position_history_rows(
     ]
     pending_rows = await _dashboard_pending_closed_position_rows(session, mode=mode)
 
-    settled_close_ids = {
-        token
-        for row in settled_rows
-        for token in _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
-    }
-    settled_entry_ids = {
-        token
-        for row in settled_rows
-        for token in _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
-    }
-    settled_position_ids = {
-        int(position_id)
-        for row in settled_rows
-        for position_id in row.get("position_ids", [])
-        if position_id is not None
-    }
-    pending_rows = [
-        row
-        for row in pending_rows
-        if not (
-            _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
-            & settled_close_ids
-        )
-        and not (
-            _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
-            & settled_entry_ids
-        )
-        and not (
-            {
-                int(position_id)
-                for position_id in row.get("position_ids", [])
-                if position_id is not None
-            }
-            & settled_position_ids
-        )
-    ]
+    pending_rows = _dashboard_filter_pending_settlement_rows(pending_rows, settled_rows)
     combined_rows = sorted(
         [*settled_rows, *pending_rows],
         key=_dashboard_position_history_event_at,
@@ -9386,6 +9389,15 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
                 paginate=False,
             )
         )
+        pending_settlement_rows = await _dashboard_pending_closed_position_rows(
+            session,
+            mode=selected_mode,
+            model_names=EXECUTION_LEDGER_MODEL_NAMES,
+        )
+        pending_settlement_rows = _dashboard_filter_pending_settlement_rows(
+            pending_settlement_rows,
+            closed_ledger_rows,
+        )
         from models.account import ExecutionEquitySnapshot
 
         order_result = await session.execute(
@@ -9502,6 +9514,20 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     equity_by_date = {
         day: value for day, value in all_equity_by_date.items() if day in records
     }
+
+    # Pending settlement is a lifecycle-level state.  Counting close fills and
+    # subtracting grouped positions overstates it whenever one position has
+    # multiple partial-close fills or order fragments.
+    pending_settlement_by_date: dict[str, int] = {}
+    for pending_row in pending_settlement_rows:
+        pending_at = _as_utc_datetime(
+            pending_row.get("closed_at") or pending_row.get("history_event_at")
+        )
+        if pending_at is None or pending_at < start_utc:
+            continue
+        day = pending_at.astimezone(BEIJING_TZ).date().isoformat()
+        if day in records:
+            pending_settlement_by_date[day] = pending_settlement_by_date.get(day, 0) + 1
 
     for ledger_row in closed_ledger_rows:
         if not _daily_pnl_ledger_row_has_okx_realized_pnl(ledger_row):
@@ -9693,10 +9719,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
         row["cumulative_realized_pnl"] = round(cumulative, 8)
         row["settled_close_count"] = int(row["trade_count"] or 0)
-        row["pending_settlement_close_count"] = max(
-            int(row["close_filled_order_count"] or 0) - int(row["settled_close_count"] or 0),
-            0,
-        )
+        row["pending_settlement_close_count"] = int(pending_settlement_by_date.get(date_key, 0))
         row["okx_equity_series_start_date"] = equity_series_start_date
         row["okx_equity_series_complete"] = equity_series_complete
         row["okx_cumulative_equity_scope"] = (
