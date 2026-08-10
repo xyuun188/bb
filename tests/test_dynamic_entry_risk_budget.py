@@ -256,6 +256,38 @@ async def test_legacy_probe_and_evidence_payload_cannot_change_dynamic_sizing() 
 
 
 @pytest.mark.asyncio
+async def test_coarse_okx_contract_step_is_reserved_before_market_submit() -> None:
+    decision = _decision()
+    decision.stop_loss_pct = 0.01
+    decision.feature_snapshot["volatility_20"] = 0.003
+    decision.feature_snapshot["current_price"] = 46.14
+    facts = decision.raw_response["exchange_risk_facts"]
+    facts["target_inst_id"] = "BTC-USDT-SWAP"
+    facts["contract_specs"]["BTC-USDT-SWAP"] = {
+        "ctVal": "1",
+        "ctMult": "1",
+        "minSz": "0.1",
+        "lotSz": "0.1",
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    step_notional = 0.1 * 46.14
+    expected_step_reserve = step_notional / sizing["risk_limited_target_notional_usdt"]
+    assert sizing["production_eligible"] is True
+    assert sizing["contract_step_notional_usdt"] == pytest.approx(step_notional)
+    assert sizing["contract_step_fill_reserve_fraction"] == pytest.approx(
+        expected_step_reserve
+    )
+    assert sizing["estimated_fill_drift_reserve_fraction"] >= expected_step_reserve
+    assert sizing["target_notional_usdt"] * (
+        1.0 + sizing["estimated_fill_drift_reserve_fraction"]
+    ) <= sizing["fill_notional_ceiling_usdt"] + 1e-8
+
+
+@pytest.mark.asyncio
 async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
     small = _decision()
     large = deepcopy(small)

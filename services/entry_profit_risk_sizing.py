@@ -1484,10 +1484,6 @@ class EntryProfitRiskSizingPolicy:
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
         risk_budget = single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
-        fill_drift_reserve_fraction = max(
-            max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0) / 100.0,
-            NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
-        )
         risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
             target_contract_spec,
@@ -1496,6 +1492,21 @@ class EntryProfitRiskSizingPolicy:
         minimum_order_notional = max(
             _safe_float(minimum_order.get("minimum_notional_usdt"), 0.0),
             0.0,
+        )
+        contract_step_notional = max(
+            _safe_float(minimum_order.get("lot_size_contracts"), 0.0)
+            * _safe_float(minimum_order.get("contract_unit_notional_usdt"), 0.0),
+            0.0,
+        )
+        contract_step_fill_reserve_fraction = (
+            contract_step_notional / risk_and_liquidity_ceiling
+            if risk_and_liquidity_ceiling > 0.0
+            else 0.0
+        )
+        fill_drift_reserve_fraction = max(
+            max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0) / 100.0,
+            contract_step_fill_reserve_fraction,
+            NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
         )
         tier_target_notional = (
             risk_and_liquidity_ceiling / (1.0 + fill_drift_reserve_fraction)
@@ -1700,6 +1711,8 @@ class EntryProfitRiskSizingPolicy:
             "minimum_order_supported": minimum_order_supported,
             "fill_notional_ceiling_usdt": fill_notional_ceiling,
             "estimated_fill_drift_reserve_fraction": fill_drift_reserve_fraction,
+            "contract_step_notional_usdt": contract_step_notional,
+            "contract_step_fill_reserve_fraction": contract_step_fill_reserve_fraction,
             "final_notional_usdt": final_notional,
             "stressed_loss_fraction": stress_fraction,
             "expected_net_return_pct": expected_net,
@@ -1766,6 +1779,11 @@ class EntryProfitRiskSizingPolicy:
             "fill_notional_ceiling_usdt": round(fill_notional_ceiling, 8),
             "estimated_fill_drift_reserve_fraction": round(
                 fill_drift_reserve_fraction,
+                8,
+            ),
+            "contract_step_notional_usdt": round(contract_step_notional, 8),
+            "contract_step_fill_reserve_fraction": round(
+                contract_step_fill_reserve_fraction,
                 8,
             ),
             "model_requested_position_fraction": round(model_position_fraction, 8),

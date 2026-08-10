@@ -39,6 +39,7 @@ from services.ml_signal_service import (
     count_shadow_training_rows,
     decision_group_partition,
     load_shadow_training_rows,
+    persist_cached_training_candidate,
     select_shadow_training_rows,
     shadow_training_quality_report,
     train_from_frame,
@@ -1609,6 +1610,44 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     reason_codes = {item["code"] for item in result["candidate_readiness"]["blocking_reasons"]}
     assert "long_top_return_lcb_not_positive" in reason_codes
     assert "short_top_return_lcb_not_positive" in reason_codes
+
+
+def test_cached_dry_run_candidate_is_persisted_without_refitting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "training_run_mode": "dry_run",
+        "artifact_persisted": False,
+        "quality_report": {"totals": {"total": 12, "included": 12}},
+    }
+    bundle = {"metadata": metadata, "long_regressor": object()}
+    ml_signal_module._TRAINING_CANDIDATE_CACHE[id(metadata)] = (
+        bundle,
+        metadata,
+        "source-sha256:test",
+    )
+    persisted: list[tuple[dict[str, object], str]] = []
+
+    def persist_bundle(
+        cached_bundle: dict[str, object],
+        cached_metadata: dict[str, object],
+        *,
+        source_code_version: str,
+    ) -> dict[str, object]:
+        assert cached_bundle is bundle
+        persisted.append((cached_metadata, source_code_version))
+        return cached_metadata
+
+    monkeypatch.setattr(ml_signal_module, "_persist_training_bundle", persist_bundle)
+
+    result = persist_cached_training_candidate(metadata)
+
+    assert result is metadata
+    assert persisted == [(metadata, "source-sha256:test")]
+    assert metadata["training_run_mode"] == "persist"
+    assert metadata["artifact_persisted"] is True
+    assert metadata["governance_report"]["artifact_matches_quality"] is True
+    assert id(metadata) not in ml_signal_module._TRAINING_CANDIDATE_CACHE
 
 
 @pytest.mark.asyncio

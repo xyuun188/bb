@@ -103,11 +103,15 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
 LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
 LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX = "BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
-AUTO_TRAIN_LEASE_STALE_SECONDS = 60 * 60
+AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
 FEATURE_CONTRACT_VERSION = "2026-07-27.global-point-in-time-features.v1"
 MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-07-27.paper-multitask-prediction.v1"
 REPLAY_WEIGHT_POLICY_VERSION = "2026-07-27.recency-tail-hard-example.v1"
+_TRAINING_CANDIDATE_CACHE: dict[
+    int,
+    tuple[dict[str, Any], dict[str, Any], str],
+] = {}
 
 
 def _training_source_code_version() -> str:
@@ -2156,6 +2160,61 @@ def shadow_training_quality_report(rows: list[Any]) -> dict[str, Any]:
     }
 
 
+def _persist_training_bundle(
+    bundle: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    source_code_version: str,
+) -> dict[str, Any]:
+    if MODEL_PATH != MODEL_DIR / "net_return_model.joblib" or METADATA_PATH != (
+        MODEL_DIR / "net_return_model_metadata.json"
+    ):
+        dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
+        METADATA_PATH.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        resolved = ML_SIGNAL_ARTIFACT_REGISTRY.persist_candidate_joblib(
+            bundle,
+            metadata,
+            parent_model_identity=("sklearn RandomForest/Dummy classifier-regressor pipelines"),
+            code_version=source_code_version,
+        )
+        metadata.clear()
+        metadata.update(resolved.manifest)
+    return metadata
+
+
+def persist_cached_training_candidate(
+    candidate_metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Persist the exact dry-run fit so auto-training never fits one window twice."""
+
+    cached = _TRAINING_CANDIDATE_CACHE.pop(id(candidate_metadata), None)
+    if cached is None:
+        return None
+    bundle, cached_metadata, source_code_version = cached
+    if cached_metadata is not candidate_metadata:
+        return None
+    candidate_metadata.update(
+        {
+            "training_run_mode": "persist",
+            "artifact_persisted": True,
+            "governance_report": artifact_bound_governance_report(
+                _safe_dict(candidate_metadata.get("quality_report")),
+                persist_artifact=True,
+            ),
+        }
+    )
+    bundle["metadata"] = candidate_metadata
+    return _persist_training_bundle(
+        bundle,
+        candidate_metadata,
+        source_code_version=source_code_version,
+    )
+
+
 def train_from_frame(
     frame: pd.DataFrame,
     *,
@@ -2577,23 +2636,14 @@ def train_from_frame(
         "feature_keys": FEATURE_KEYS,
     }
     if persist_artifact:
-        if MODEL_PATH != MODEL_DIR / "net_return_model.joblib" or METADATA_PATH != (
-            MODEL_DIR / "net_return_model_metadata.json"
-        ):
-            dump_trusted_joblib(bundle, MODEL_PATH, trusted_root=MODEL_DIR)
-            METADATA_PATH.write_text(
-                json.dumps(metadata, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        else:
-            resolved = ML_SIGNAL_ARTIFACT_REGISTRY.persist_candidate_joblib(
-                bundle,
-                metadata,
-                parent_model_identity=("sklearn RandomForest/Dummy classifier-regressor pipelines"),
-                code_version=source_code_version,
-            )
-            metadata.clear()
-            metadata.update(resolved.manifest)
+        _persist_training_bundle(
+            bundle,
+            metadata,
+            source_code_version=source_code_version,
+        )
+    else:
+        _TRAINING_CANDIDATE_CACHE.clear()
+        _TRAINING_CANDIDATE_CACHE[id(metadata)] = (bundle, metadata, source_code_version)
     return metadata
 
 
@@ -3213,13 +3263,18 @@ class MLSignalService:
                     ),
                 }
                 trained_metadata = await asyncio.to_thread(
-                    train_from_frame,
-                    frame,
-                    completed_sample_count=completed_count,
-                    training_quality_report=quality_state["quality_report"],
-                    trade_samples=trade_samples,
-                    persist_artifact=True,
+                    persist_cached_training_candidate,
+                    candidate_metadata,
                 )
+                if trained_metadata is None:
+                    trained_metadata = await asyncio.to_thread(
+                        train_from_frame,
+                        frame,
+                        completed_sample_count=completed_count,
+                        training_quality_report=quality_state["quality_report"],
+                        trade_samples=trade_samples,
+                        persist_artifact=True,
+                    )
                 trained_influence = _influence_policy(trained_metadata)
                 trained_readiness = build_ml_readiness_report(
                     trained_metadata,
