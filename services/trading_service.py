@@ -1184,9 +1184,14 @@ class TradingService:
         )
 
     def okx_order_fact_sync_timeout_seconds(self) -> float:
-        """Keep background order facts independent from the current-position gate budget."""
+        """Bound targeted background order-fact recovery."""
 
         return 60.0
+
+    def okx_order_fact_discovery_timeout_seconds(self) -> float:
+        """Allow account-wide discovery to finish under normal runtime DB contention."""
+
+        return max(120.0, self.okx_order_fact_sync_timeout_seconds() * 2.0)
 
     def okx_settlement_fact_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""
@@ -1465,6 +1470,10 @@ class TradingService:
             "success_count": int(getattr(self, "_okx_order_fact_sync_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_okx_order_fact_sync_failure_count", 0) or 0),
             "timeout_seconds": round(self.okx_order_fact_sync_timeout_seconds(), 3),
+            "account_discovery_timeout_seconds": round(
+                self.okx_order_fact_discovery_timeout_seconds(),
+                3,
+            ),
             "normal_interval_seconds": round(self.okx_order_fact_sync_interval_seconds(), 3),
             "degraded_interval_seconds": round(
                 self.okx_order_fact_sync_degraded_interval_seconds(),
@@ -1608,12 +1617,17 @@ class TradingService:
         account_discovery = self._okx_order_fact_account_discovery_due()
         if account_discovery:
             self._okx_order_fact_discovery_last_attempt_at = datetime.now(UTC)
+        timeout_seconds = (
+            self.okx_order_fact_discovery_timeout_seconds()
+            if account_discovery
+            else self.okx_order_fact_sync_timeout_seconds()
+        )
         report = await factory(
             mode=mode,
             lookback_hours=24,
             limit=100,
             priority_only=not account_discovery,
-            timeout_seconds=self.okx_order_fact_sync_timeout_seconds(),
+            timeout_seconds=timeout_seconds,
         ).sync()
         report = dict(report if isinstance(report, dict) else {})
         report["sync_scope"] = "account_discovery" if account_discovery else "priority"

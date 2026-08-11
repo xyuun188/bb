@@ -683,7 +683,7 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     assert row["order_fact_sync"]["unverified_count"] == 0
     assert factory_kwargs["limit"] == 100
     assert factory_kwargs["priority_only"] is False
-    assert factory_kwargs["timeout_seconds"] == 60.0
+    assert factory_kwargs["timeout_seconds"] == 120.0
     assert row["sync_scope"] == "account_discovery"
     assert service._okx_order_fact_discovery_last_finished_at is not None
     service._okx_order_fact_sync_last_row = row
@@ -716,6 +716,7 @@ async def test_okx_order_fact_sync_uses_priority_scope_after_recent_account_disc
     row = await service._sync_okx_order_facts_for_loop()
 
     assert factory_kwargs["priority_only"] is True
+    assert factory_kwargs["timeout_seconds"] == 60.0
     assert row["sync_scope"] == "priority"
     service._okx_order_fact_sync_last_row = row
     assert service._okx_order_fact_sync_status_payload()["sync_scope"] == "priority"
